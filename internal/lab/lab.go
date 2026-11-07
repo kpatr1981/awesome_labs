@@ -555,15 +555,17 @@ func (m *Manager) Start(ctx context.Context, ex *exercise.Exercise, log io.Write
 		return err
 	}
 	fmt.Fprintf(log, "==> setting up %s: %s\n", ex.ID, ex.Title)
-	if ex.Setup != "" {
-		if _, err := m.root(ctx, env.Primary(), m.exScript(ex.Setup, false), nil, log); err != nil {
-			return fmt.Errorf("setup failed: %w", err)
-		}
-	}
+	// Worker first: control-plane setups often wait for its effects
+	// (e.g. node01 turning NotReady).
 	if ex.SetupWorker != "" {
 		w, _ := env.Worker()
 		if _, err := m.root(ctx, w, m.exScript(ex.SetupWorker, false), nil, log); err != nil {
 			return fmt.Errorf("worker setup failed: %w", err)
+		}
+	}
+	if ex.Setup != "" {
+		if _, err := m.root(ctx, env.Primary(), m.exScript(ex.Setup, false), nil, log); err != nil {
+			return fmt.Errorf("setup failed: %w", err)
 		}
 	}
 	if ex.Destructive {
