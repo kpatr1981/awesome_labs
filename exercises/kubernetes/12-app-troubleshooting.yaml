@@ -1,0 +1,871 @@
+track: kubernetes
+module: Troubleshooting applications
+profile: k8s
+order: 12
+exercises:
+
+- id: k8s-221
+  title: Stuck in ContainerCreating
+  difficulty: 2
+  kind: fix
+  tags: [troubleshooting, secret, volumes]
+  scenario: |
+    The **`mailer`** pod (namespace **`notify`**) has been in `ContainerCreating` for an
+    hour. Find out why and fix it. The SMTP password it expects is **`smtp-pass-42`**
+    (key `password`).
+  hints:
+    - "`kubectl describe pod mailer -n notify` → Events: *MountVolume.SetUp failed ... secret ... not found*."
+  solution: |
+    ```bash
+    kubectl describe pod mailer -n notify | tail -5
+    kubectl create secret generic smtp-credentials -n notify --from-literal=password=smtp-pass-42
+    ```
+    The kubelet retries the mount automatically.
+  setup: |
+    k_ns notify
+    kubectl apply -f - >/dev/null <<'EOF'
+    apiVersion: v1
+    kind: Pod
+    metadata: {name: mailer, namespace: notify}
+    spec:
+      containers:
+      - {name: mailer, image: "busybox:1.37", command: ["sh", "-c", "cat /etc/smtp/password; echo; sleep infinity"], volumeMounts: [{name: smtp, mountPath: /etc/smtp}]}
+      volumes: [{name: smtp, secret: {secretName: smtp-credentials}}]
+    EOF
+  check: |
+    wait_pod notify mailer 90
+    check "mailer is running" 'pod_ready notify mailer'
+    check "it read the password" 'kubectl -n notify logs mailer | grep -q smtp-pass-42'
+  solve: |
+    kubectl create secret generic smtp-credentials -n notify --from-literal=password=smtp-pass-42
+
+- id: k8s-222
+  title: command vs args
+  difficulty: 3
+  kind: fix
+  tags: [troubleshooting, command, args]
+  scenario: |
+    Someone wanted to run nginx with an extra flag and wrote this into the **`edge`**
+    deployment (namespace **`web`**):
+
+    ```yaml
+    command: ["-g", "daemon off; worker_processes 2;"]
+    ```
+
+    The pods now fail with *exec: "-g": executable file not found*. Fix the deployment so
+    nginx runs **with those options**.
+  hints:
+    - "`command` replaces the image's ENTRYPOINT; `args` replaces its CMD."
+    - "The nginx image's entrypoint is `/docker-entrypoint.sh`, its CMD `nginx -g 'daemon off;'`."
+  solution: |
+    ```yaml
+    command: ["nginx"]
+    args: ["-g", "daemon off; worker_processes 2;"]
+    ```
+    (or keep the entrypoint and use `args: ["nginx", "-g", "..."]`.)
+  setup: |
+    k_ns web
+    kubectl apply -f - >/dev/null <<'EOF'
+    apiVersion: apps/v1
+    kind: Deployment
+    metadata: {name: edge, namespace: web}
+    spec:
+      selector: {matchLabels: {app: edge}}
+      template:
+        metadata: {labels: {app: edge}}
+        spec:
+          containers:
+          - name: nginx
+            image: nginx:1.28-alpine
+            command: ["-g", "daemon off; worker_processes 2;"]
+    EOF
+  check: |
+    wait_deploy web edge 60
+    check "edge is running" 'deploy_ready web edge'
+    check_eq "2 worker processes" "$(kubectl -n web exec deploy/edge -- sh -c 'ps -o args | grep -c "^nginx: worker"' 2>/dev/null | tr -d ' ')" "2"
+  solve: |
+    kubectl patch deploy edge -n web --type=json -p '[{"op":"replace","path":"/spec/template/spec/containers/0/command","value":["nginx"]},{"op":"add","path":"/spec/template/spec/containers/0/args","value":["-g","daemon off; worker_processes 2;"]}]'
+
+- id: k8s-223
+  title: The pod that keeps completing
+  difficulty: 2
+  kind: fix
+  tags: [troubleshooting, crashloop, completed]
+  scenario: |
+    The **`heartbeat`** deployment (namespace **`ops`**) is in `CrashLoopBackOff`, but its
+    logs show no error — just `heartbeat sent` and then the container exits with code 0.
+
+    A Deployment's containers must keep running. Fix the deployment so it sends a
+    heartbeat **every 10 seconds, forever**.
+  hints:
+    - "Look at the command: it runs once and exits."
+    - "Wrap it in a loop: `while true; do ...; sleep 10; done`"
+  solution: |
+    ```bash
+    kubectl patch deploy heartbeat -n ops --type=json -p \
+      '[{"op":"replace","path":"/spec/template/spec/containers/0/command","value":["sh","-c","while true; do echo heartbeat sent; sleep 10; done"]}]'
+    ```
+    For genuinely one-off work, use a Job (or CronJob) instead.
+  setup: |
+    k_ns ops
+    kubectl -n ops create deployment heartbeat --image=busybox:1.37 -- sh -c 'echo heartbeat sent' >/dev/null
+  check: |
+    wait_deploy ops heartbeat 60
+    check "heartbeat is running" 'deploy_ready ops heartbeat'
+    sleep 12
+    p=$(kubectl -n ops get pods -l app=heartbeat -o json | jq -r '[.items[] | select(.metadata.deletionTimestamp == null)][0].metadata.name')
+    check "it keeps sending heartbeats" "[ \$(kubectl -n ops logs $p | grep -c 'heartbeat sent') -ge 2 ] && [ \"\$(restarts ops $p)\" = 0 ]"
+  solve: |
+    kubectl patch deploy heartbeat -n ops --type=json -p '[{"op":"replace","path":"/spec/template/spec/containers/0/command","value":["sh","-c","while true; do echo heartbeat sent; sleep 10; done"]}]'
+
+- id: k8s-224
+  title: A named port that doesn't exist
+  difficulty: 3
+  kind: fix
+  tags: [troubleshooting, service, named-ports]
+  scenario: |
+    After a refactoring, the **`catalog`** service (namespace **`store`**) has endpoints
+    but every request fails. The service uses `targetPort: http`.
+
+    Fix it — the service is right, the **deployment** changed.
+  hints:
+    - "`kubectl get deploy catalog -n store -o jsonpath='{.spec.template.spec.containers[0].ports}'`"
+  solution: |
+    ```bash
+    kubectl get deploy catalog -n store -o jsonpath='{.spec.template.spec.containers[0].ports}'   # name: web
+    kubectl patch deploy catalog -n store --type=json -p '[{"op":"replace","path":"/spec/template/spec/containers/0/ports/0/name","value":"http"}]'
+    ```
+  setup: |
+    k_ns store
+    kubectl apply -f - >/dev/null <<'EOF'
+    apiVersion: apps/v1
+    kind: Deployment
+    metadata: {name: catalog, namespace: store}
+    spec:
+      selector: {matchLabels: {app: catalog}}
+      template:
+        metadata: {labels: {app: catalog}}
+        spec:
+          containers:
+          - name: nginx
+            image: nginx:1.28-alpine
+            ports: [{name: web, containerPort: 80}]
+    ---
+    apiVersion: v1
+    kind: Service
+    metadata: {name: catalog, namespace: store}
+    spec:
+      selector: {app: catalog}
+      ports: [{port: 80, targetPort: http}]
+    EOF
+    kj -n store svc catalog '{.spec}' > $KL_STATE/answer
+  check: |
+    check "service unchanged" '[ "$(kj -n store svc catalog "{.spec}")" = "$(cat $KL_STATE/answer)" ]'
+    wait_deploy store catalog 60
+    check "service answers" 'k_curl store http://catalog | grep -q nginx'
+  solve: |
+    kubectl patch deploy catalog -n store --type=json -p '[{"op":"replace","path":"/spec/template/spec/containers/0/ports/0/name","value":"http"}]'
+
+- id: k8s-225
+  title: Read-only filesystem, writable /tmp
+  difficulty: 3
+  kind: fix
+  tags: [troubleshooting, readOnlyRootFilesystem, emptydir]
+  scenario: |
+    Security made the root filesystem of the **`thumbs`** deployment (namespace
+    **`media`**) read-only. Now the app crashes on start: it needs to write temporary files
+    to **`/tmp`** and nginx needs its cache directories.
+
+    Keep `readOnlyRootFilesystem: true` and make the pods run, by giving them writable
+    scratch space exactly where they need it: **`/tmp`**, **`/var/cache/nginx`** and
+    **`/var/run`**.
+  hints:
+    - "`kubectl logs` tells you which paths fail."
+    - "Mount an `emptyDir` at each path."
+  solution: |
+    ```yaml
+    volumeMounts:
+    - {name: tmp, mountPath: /tmp}
+    - {name: cache, mountPath: /var/cache/nginx}
+    - {name: run, mountPath: /var/run}
+    volumes:
+    - {name: tmp, emptyDir: {}}
+    - {name: cache, emptyDir: {}}
+    - {name: run, emptyDir: {}}
+    ```
+  setup: |
+    k_ns media
+    kubectl apply -f - >/dev/null <<'EOF'
+    apiVersion: apps/v1
+    kind: Deployment
+    metadata: {name: thumbs, namespace: media}
+    spec:
+      selector: {matchLabels: {app: thumbs}}
+      template:
+        metadata: {labels: {app: thumbs}}
+        spec:
+          containers:
+          - name: nginx
+            image: nginx:1.28-alpine
+            command: ["sh", "-c", "touch /tmp/thumb-cache || exit 1; exec nginx -g 'daemon off;'"]
+            securityContext: {readOnlyRootFilesystem: true}
+    EOF
+  check: |
+    check_eq "root fs still read-only" "$(kj -n media deploy thumbs '{.spec.template.spec.containers[0].securityContext.readOnlyRootFilesystem}')" "true"
+    wait_deploy media thumbs 60
+    check "thumbs is running" 'deploy_ready media thumbs'
+    check_not "/etc stays read-only" 'kubectl -n media exec deploy/thumbs -- touch /etc/kl-probe'
+  solve: |
+    kubectl patch deploy thumbs -n media --type=json -p '[{"op":"add","path":"/spec/template/spec/containers/0/volumeMounts","value":[{"name":"tmp","mountPath":"/tmp"},{"name":"cache","mountPath":"/var/cache/nginx"},{"name":"run","mountPath":"/var/run"}]},{"op":"add","path":"/spec/template/spec/volumes","value":[{"name":"tmp","emptyDir":{}},{"name":"cache","emptyDir":{}},{"name":"run","emptyDir":{}}]}]'
+
+- id: k8s-226
+  title: The namespace that won't die
+  difficulty: 4
+  kind: fix
+  tags: [troubleshooting, namespace, finalizers, crd]
+  scenario: |
+    `kubectl delete namespace old-operator` was run yesterday; the namespace is still
+    **`Terminating`**. The operator that managed its custom resources was uninstalled
+    *before* the namespace was deleted.
+
+    Get the namespace deleted. Do it the right way: find the objects blocking it and
+    remove **their** finalizers — don't force-finalize the namespace itself.
+  hints:
+    - "`kubectl get namespace old-operator -o yaml` → `status.conditions` names what's left."
+    - "`kubectl api-resources --verbs=list --namespaced -o name | xargs -n1 kubectl get -n old-operator --ignore-not-found`"
+  solution: |
+    ```bash
+    kubectl get ns old-operator -o jsonpath='{.status.conditions[*].message}'
+    kubectl get widgets.demo.example.com -n old-operator
+    for w in $(kubectl get widgets.demo.example.com -n old-operator -o name); do
+      kubectl patch $w -n old-operator --type=merge -p '{"metadata":{"finalizers":null}}'
+    done
+    kubectl get ns old-operator   # gone
+    ```
+  setup: |
+    kubectl apply -f - >/dev/null <<'EOF'
+    apiVersion: apiextensions.k8s.io/v1
+    kind: CustomResourceDefinition
+    metadata: {name: widgets.demo.example.com}
+    spec:
+      group: demo.example.com
+      scope: Namespaced
+      names: {plural: widgets, singular: widget, kind: Widget}
+      versions:
+      - {name: v1, served: true, storage: true, schema: {openAPIV3Schema: {type: object, x-kubernetes-preserve-unknown-fields: true}}}
+    EOF
+    sleep 3
+    k_ns old-operator
+    for w in alpha beta gamma; do
+      printf 'apiVersion: demo.example.com/v1\nkind: Widget\nmetadata:\n  name: %s\n  namespace: old-operator\n  finalizers: [demo.example.com/cleanup]\nspec: {size: 3}\n' $w | kubectl apply -f - >/dev/null
+    done
+    kubectl delete ns old-operator --wait=false >/dev/null
+    sleep 5
+  check: |
+    eventually 30 '! k_exists ns old-operator'
+    check "namespace old-operator is gone" '! k_exists ns old-operator'
+  solve: |
+    for w in $(kubectl get widgets.demo.example.com -n old-operator -o name); do
+      kubectl patch $w -n old-operator --type=merge -p '{"metadata":{"finalizers":null}}'
+    done
+
+- id: k8s-227
+  title: The autoscaler scales nothing
+  difficulty: 2
+  kind: fix
+  tags: [troubleshooting, hpa]
+  scenario: |
+    The HPA **`api`** (namespace **`shop`**) shows `<unknown>` and `kubectl describe hpa`
+    complains it can't get the scale of its target. The deployment `api` is fine.
+
+    Fix the HPA (keep its limits and target).
+  hints:
+    - "Compare `spec.scaleTargetRef` with the real deployment."
+  solution: |
+    ```bash
+    kubectl get hpa api -n shop -o jsonpath='{.spec.scaleTargetRef}'   # name: api-deployment
+    kubectl patch hpa api -n shop --type=merge -p '{"spec":{"scaleTargetRef":{"name":"api"}}}'
+    ```
+  setup: |
+    k_ns shop
+    kubectl -n shop create deployment api --image=nginx:1.28-alpine >/dev/null
+    kubectl -n shop set resources deploy/api --requests=cpu=50m >/dev/null
+    kubectl apply -f - >/dev/null <<'EOF'
+    apiVersion: autoscaling/v2
+    kind: HorizontalPodAutoscaler
+    metadata: {name: api, namespace: shop}
+    spec:
+      scaleTargetRef: {apiVersion: apps/v1, kind: Deployment, name: api-deployment}
+      minReplicas: 2
+      maxReplicas: 6
+      metrics:
+      - type: Resource
+        resource: {name: cpu, target: {type: Utilization, averageUtilization: 70}}
+    EOF
+  check: |
+    check_eq "target" "$(kj -n shop hpa api '{.spec.scaleTargetRef.name}')" "api"
+    check_eq "limits kept" "$(kj -n shop hpa api '{.spec.minReplicas}-{.spec.maxReplicas}')" "2-6"
+    eventually 60 '[ "$(kj -n shop deploy api "{.spec.replicas}")" -ge 2 ]'
+    check "HPA took over (min 2 replicas applied)" '[ "$(kj -n shop deploy api "{.spec.replicas}")" -ge 2 ]'
+  solve: |
+    kubectl patch hpa api -n shop --type=merge -p '{"spec":{"scaleTargetRef":{"name":"api"}}}'
+
+- id: k8s-228
+  title: Downtime on every deploy
+  difficulty: 3
+  kind: fix
+  tags: [readiness, rolling-update, zero-downtime]
+  scenario: |
+    Every rollout of **`checkout`** (namespace **`shop`**) causes a few seconds of errors:
+    the app needs **~8 seconds** to warm up after its process starts, but Kubernetes
+    sends it traffic immediately because nothing tells it otherwise.
+
+    Fix the deployment so new pods only receive traffic once they really answer on
+    **`/ready`** (port 8080), and old pods are only removed after new ones are ready.
+  hints:
+    - "A `readinessProbe` gates traffic; `maxUnavailable: 0` keeps old pods until new ones are Ready."
+  solution: |
+    ```yaml
+    strategy:
+      rollingUpdate: {maxUnavailable: 0, maxSurge: 1}
+    ...
+    readinessProbe:
+      httpGet: {path: /ready, port: 8080}
+      periodSeconds: 2
+    ```
+  setup: |
+    k_ns shop
+    kubectl -n shop create configmap checkout-app --from-literal=app.py='
+    import time
+    from http.server import BaseHTTPRequestHandler, HTTPServer
+    start = time.time()
+    class H(BaseHTTPRequestHandler):
+        def do_GET(self):
+            ok = time.time() - start > 8
+            self.send_response(200 if ok else 503); self.end_headers(); self.wfile.write(b"ready\n" if ok else b"warming up\n")
+        def log_message(self, *a): pass
+    HTTPServer(("0.0.0.0", 8080), H).serve_forever()
+    ' >/dev/null
+    kubectl apply -f - >/dev/null <<'EOF'
+    apiVersion: apps/v1
+    kind: Deployment
+    metadata: {name: checkout, namespace: shop}
+    spec:
+      replicas: 2
+      strategy: {rollingUpdate: {maxUnavailable: 1, maxSurge: 1}}
+      selector: {matchLabels: {app: checkout}}
+      template:
+        metadata: {labels: {app: checkout}}
+        spec:
+          containers:
+          - name: checkout
+            image: python:3.12-alpine
+            command: ["python", "/app/app.py"]
+            volumeMounts: [{name: app, mountPath: /app}]
+          volumes: [{name: app, configMap: {name: checkout-app}}]
+    EOF
+  check: |
+    rp=$(kj -n shop deploy checkout '{.spec.template.spec.containers[0].readinessProbe.httpGet.path}:{.spec.template.spec.containers[0].readinessProbe.httpGet.port}')
+    check_eq "readiness probe" "$rp" "/ready:8080"
+    check_eq "maxUnavailable" "$(kj -n shop deploy checkout '{.spec.strategy.rollingUpdate.maxUnavailable}')" "0"
+    wait_deploy shop checkout 90
+    check "pods are ready" 'deploy_ready shop checkout'
+  solve: |
+    kubectl patch deploy checkout -n shop --type=json -p '[{"op":"replace","path":"/spec/strategy/rollingUpdate/maxUnavailable","value":0},{"op":"add","path":"/spec/template/spec/containers/0/readinessProbe","value":{"httpGet":{"path":"/ready","port":8080},"periodSeconds":2}}]'
+
+- id: k8s-229
+  title: Who restarts the most?
+  difficulty: 2
+  kind: build
+  tags: [troubleshooting, restarts, jsonpath]
+  scenario: |
+    Across **all namespaces**, find the pod whose containers have **restarted the most**
+    and write it as `namespace/name` to **`/lab/most-restarts.txt`**.
+  hints:
+    - "`kubectl get pods -A --sort-by='.status.containerStatuses[0].restartCount'`"
+  solution: |
+    ```bash
+    kubectl get pods -A -o json | jq -r '.items[] | "\([.status.containerStatuses[]?.restartCount] | add // 0) \(.metadata.namespace)/\(.metadata.name)"' | sort -n | tail -1 | cut -d' ' -f2 > /lab/most-restarts.txt
+    ```
+  setup: |
+    k_ns flaky
+    kubectl -n flaky run crashy --image=busybox:1.37 -- sh -c 'sleep 2; exit 1' >/dev/null
+    kubectl -n flaky run stable --image=busybox:1.37 -- sleep infinity >/dev/null
+    eventually 90 '[ "$(restarts flaky crashy)" -ge 3 ]'
+  check: |
+    want=$(kubectl get pods -A -o json | jq -r '.items[] | "\([.status.containerStatuses[]?.restartCount] | add // 0) \(.metadata.namespace)/\(.metadata.name)"' | sort -n | tail -1 | cut -d' ' -f2)
+    check_eq "pod with most restarts" "$(tr -d '[:space:]' < /lab/most-restarts.txt 2>/dev/null)" "$want"
+  solve: |
+    kubectl get pods -A -o json | jq -r '.items[] | "\([.status.containerStatuses[]?.restartCount] | add // 0) \(.metadata.namespace)/\(.metadata.name)"' | sort -n | tail -1 | cut -d' ' -f2 > /lab/most-restarts.txt
+
+- id: k8s-230
+  title: Read the events
+  difficulty: 2
+  kind: build
+  tags: [troubleshooting, events]
+  scenario: |
+    Something in namespace **`orders`** is failing repeatedly. Using the **events**, find
+    the **name of the object** that has a `Warning` event with reason **`FailedMount`** and
+    write it to **`/lab/failing-object.txt`**.
+  hints:
+    - "`kubectl get events -n orders --field-selector type=Warning,reason=FailedMount`"
+  solution: |
+    ```bash
+    kubectl get events -n orders --field-selector type=Warning,reason=FailedMount \
+      -o jsonpath='{.items[0].involvedObject.name}' > /lab/failing-object.txt
+    ```
+  setup: |
+    k_ns orders
+    kubectl -n orders create deployment api --image=traefik/whoami:v1.10 --replicas=2 >/dev/null
+    kubectl -n orders run worker --image=busybox:1.37 --overrides='{"spec":{"containers":[{"name":"w","image":"busybox:1.37","command":["sleep","infinity"],"volumeMounts":[{"name":"c","mountPath":"/c"}]}],"volumes":[{"name":"c","configMap":{"name":"worker-config"}}]}}' >/dev/null
+    kubectl -n orders run broken-image --image=traefik/whoami:v0.0-nope >/dev/null
+    eventually 60 'kubectl get events -n orders --field-selector reason=FailedMount -o name | grep -q .'
+  check: |
+    check_eq "object" "$(tr -d '[:space:]' < /lab/failing-object.txt 2>/dev/null)" "worker"
+  solve: |
+    kubectl get events -n orders --field-selector type=Warning,reason=FailedMount -o jsonpath='{.items[0].involvedObject.name}' > /lab/failing-object.txt
+
+- id: k8s-231
+  title: Permission denied on a mounted script
+  difficulty: 3
+  kind: fix
+  tags: [troubleshooting, configmap, defaultMode]
+  scenario: |
+    The **`backup`** CronJob's pods (namespace **`ops`**) fail with
+    `/scripts/backup.sh: Permission denied`. The script comes from the ConfigMap
+    `backup-script` and is executed directly (not via `sh`).
+
+    Fix the **CronJob** so the mounted script is executable, then trigger a manual run
+    **`backup-test`** that succeeds.
+  hints:
+    - "ConfigMap volumes default to mode 0644. `defaultMode` (or per-item `mode`) changes that."
+    - "In JSON/YAML integers, 0755 octal is `493` decimal — YAML also accepts `0755`."
+  solution: |
+    ```bash
+    kubectl patch cronjob backup -n ops --type=json -p \
+      '[{"op":"add","path":"/spec/jobTemplate/spec/template/spec/volumes/0/configMap/defaultMode","value":493}]'
+    kubectl create job backup-test --from=cronjob/backup -n ops
+    ```
+  setup: |
+    k_ns ops
+    kubectl -n ops create configmap backup-script --from-literal=backup.sh=$'#!/bin/sh\necho "backup completed"\n' >/dev/null
+    kubectl apply -f - >/dev/null <<'EOF'
+    apiVersion: batch/v1
+    kind: CronJob
+    metadata: {name: backup, namespace: ops}
+    spec:
+      schedule: "0 1 * * *"
+      jobTemplate:
+        spec:
+          backoffLimit: 0
+          template:
+            spec:
+              restartPolicy: Never
+              containers:
+              - {name: backup, image: "busybox:1.37", command: ["/scripts/backup.sh"], volumeMounts: [{name: s, mountPath: /scripts}]}
+              volumes: [{name: s, configMap: {name: backup-script}}]
+    EOF
+  check: |
+    check "script mode is executable" 'kubectl -n ops get cronjob backup -o json | jq -e ".spec.jobTemplate.spec.template.spec.volumes[0].configMap | ((.defaultMode // 0) % 128 >= 64) or ((.items[0].mode // 0) % 128 >= 64)"'
+    k_exists -n ops job backup-test && kubectl -n ops wait --for=condition=complete job/backup-test --timeout=60s >/dev/null 2>&1
+    check "backup-test succeeded" '[ "$(kj -n ops job backup-test "{.status.succeeded}")" = 1 ] && kubectl -n ops logs job/backup-test | grep -q "backup completed"'
+  solve: |
+    kubectl patch cronjob backup -n ops --type=json -p '[{"op":"add","path":"/spec/jobTemplate/spec/template/spec/volumes/0/configMap/defaultMode","value":493}]'
+    kubectl create job backup-test --from=cronjob/backup -n ops
+
+- id: k8s-232
+  title: What did it say before it died?
+  difficulty: 2
+  kind: build
+  tags: [troubleshooting, logs, previous]
+  scenario: |
+    The **`ingestor`** pod (namespace **`data`**) is in `CrashLoopBackOff`. Its *current*
+    container has just started and logs nothing useful. The **previous** container
+    instance logged a line starting with `PANIC:` before crashing.
+
+    Write that **whole line** to **`/lab/panic.txt`**.
+  hints:
+    - "`kubectl logs POD --previous`"
+  solution: |
+    ```bash
+    kubectl logs ingestor -n data --previous | grep PANIC > /lab/panic.txt
+    ```
+  setup: |
+    k_ns data
+    code="E$RANDOM"
+    echo "PANIC: offset store corrupted ($code)" > $KL_STATE/answer
+    kubectl -n data run ingestor --image=busybox:1.37 -- sh -c "echo starting; sleep 3; echo 'PANIC: offset store corrupted ($code)'; exit 2" >/dev/null
+    eventually 90 '[ "$(restarts data ingestor)" -ge 1 ]'
+  check: |
+    check_eq "panic line" "$(head -1 /lab/panic.txt 2>/dev/null)" "$(cat $KL_STATE/answer)"
+  solve: |
+    for i in 1 2 3 4 5; do kubectl logs ingestor -n data --previous 2>/dev/null | grep PANIC | head -1 > /lab/panic.txt; [ -s /lab/panic.txt ] && break; sleep 2; done
+
+- id: k8s-233
+  title: The init container that waits for the wrong port
+  difficulty: 2
+  kind: fix
+  tags: [troubleshooting, init-containers]
+  scenario: |
+    The **`web`** pods (namespace **`cms`**) are stuck in `Init:0/1`. Their init container
+    waits for the database service **`cms-db`** — which is up and healthy.
+
+    Fix the **deployment**.
+  hints:
+    - "`kubectl logs deploy/web -n cms -c wait-for-db`"
+    - "Which port does the service actually expose?"
+  solution: |
+    ```bash
+    kubectl logs deploy/web -n cms -c wait-for-db | tail -2     # waiting for cms-db:3306
+    kubectl get svc cms-db -n cms                              # 5432/TCP
+    kubectl patch deploy web -n cms --type=json -p '[{"op":"replace","path":"/spec/template/spec/initContainers/0/command/2","value":"until nc -z -w 2 cms-db 5432; do echo waiting for cms-db:5432; sleep 2; done"}]'
+    ```
+  setup: |
+    k_ns cms
+    kubectl -n cms run cms-db --image=postgres:16-alpine --labels=app=cms-db --env=POSTGRES_PASSWORD=pw >/dev/null
+    kubectl -n cms expose pod cms-db --port=5432 >/dev/null
+    kubectl apply -f - >/dev/null <<'EOF'
+    apiVersion: apps/v1
+    kind: Deployment
+    metadata: {name: web, namespace: cms}
+    spec:
+      selector: {matchLabels: {app: web}}
+      template:
+        metadata: {labels: {app: web}}
+        spec:
+          initContainers:
+          - name: wait-for-db
+            image: busybox:1.37
+            command: ["sh", "-c", "until nc -z -w 2 cms-db 3306; do echo waiting for cms-db:3306; sleep 2; done"]
+          containers: [{name: web, image: "nginx:1.28-alpine"}]
+    EOF
+  check: |
+    wait_deploy cms web 90
+    check "web is running" 'deploy_ready cms web'
+  solve: |
+    kubectl patch deploy web -n cms --type=json -p '[{"op":"replace","path":"/spec/template/spec/initContainers/0/command/2","value":"until nc -z -w 2 cms-db 5432; do echo waiting for cms-db:5432; sleep 2; done"}]'
+
+- id: k8s-234
+  title: Quota blocks the rollout
+  difficulty: 3
+  kind: fix
+  tags: [troubleshooting, resourcequota, rolling-update]
+  scenario: |
+    A rollout of **`api`** (namespace **`team-b`**, 3 replicas) to a new image has been
+    stuck for an hour: no new pod gets created. The namespace has a pod quota of **3**.
+
+    Get the rollout to finish **without changing the quota** and without downtime beyond
+    one replica.
+  hints:
+    - "`kubectl describe rs -n team-b` → *exceeded quota: pods*."
+    - "The default rolling update *surges* (creates an extra pod first). With `maxSurge: 0, maxUnavailable: 1` it replaces in place."
+  solution: |
+    ```bash
+    kubectl describe rs -n team-b | grep -i quota
+    kubectl patch deploy api -n team-b -p '{"spec":{"strategy":{"rollingUpdate":{"maxSurge":0,"maxUnavailable":1}}}}'
+    kubectl rollout status deploy/api -n team-b
+    ```
+  setup: |
+    k_ns team-b
+    kubectl -n team-b create quota pods --hard=pods=3 >/dev/null
+    kubectl -n team-b create deployment api --image=nginx:1.28-alpine --replicas=3 >/dev/null
+    kubectl -n team-b patch deploy api -p '{"spec":{"strategy":{"rollingUpdate":{"maxSurge":1,"maxUnavailable":0}}}}' >/dev/null
+    kubectl -n team-b rollout status deploy/api --timeout=90s >/dev/null
+    kubectl -n team-b set image deploy/api nginx=nginx:1.29-alpine >/dev/null
+  check: |
+    check_eq "quota unchanged" "$(kj -n team-b quota pods '{.spec.hard.pods}')" "3"
+    check "maxUnavailable at most 1" '[ "$(kj -n team-b deploy api "{.spec.strategy.rollingUpdate.maxUnavailable}")" -le 1 ] 2>/dev/null'
+    wait_deploy team-b api 120
+    check "rollout finished on 1.29" 'deploy_ready team-b api && [ "$(deploy_images team-b api)" = nginx:1.29-alpine ]'
+  solve: |
+    kubectl patch deploy api -n team-b -p '{"spec":{"strategy":{"rollingUpdate":{"maxSurge":0,"maxUnavailable":1}}}}'
+
+- id: k8s-235
+  title: ConfigMap from another namespace
+  difficulty: 2
+  kind: fix
+  tags: [troubleshooting, configmap, namespaces]
+  scenario: |
+    The **`api`** pod in namespace **`team-c`** can't start: its volume references the
+    ConfigMap **`shared-tls-config`**, which exists — in namespace **`platform`**.
+
+    Pods can only use ConfigMaps from their own namespace. Make it work by giving
+    `team-c` its own **copy** of the ConfigMap (same name and content).
+  hints:
+    - "`kubectl get cm shared-tls-config -n platform -o yaml` → change the namespace, drop uid/resourceVersion, apply."
+  solution: |
+    ```bash
+    kubectl get cm shared-tls-config -n platform -o json \
+      | jq '.metadata = {name: .metadata.name, namespace: "team-c"}' | kubectl apply -f -
+    ```
+  setup: |
+    k_ns platform; k_ns team-c
+    kubectl -n platform create configmap shared-tls-config --from-literal=ciphers='TLS_AES_256_GCM_SHA384' --from-literal=min-version=1.3 >/dev/null
+    kubectl apply -f - >/dev/null <<'EOF'
+    apiVersion: v1
+    kind: Pod
+    metadata: {name: api, namespace: team-c}
+    spec:
+      containers:
+      - {name: api, image: "busybox:1.37", command: ["sh", "-c", "cat /etc/tls/min-version; sleep infinity"], volumeMounts: [{name: tls, mountPath: /etc/tls}]}
+      volumes: [{name: tls, configMap: {name: shared-tls-config}}]
+    EOF
+  check: |
+    check_eq "copy has the same data" "$(kj -n team-c cm shared-tls-config '{.data}')" "$(kj -n platform cm shared-tls-config '{.data}')"
+    wait_pod team-c api 90
+    check "api is running" 'pod_ready team-c api'
+  solve: |
+    kubectl get cm shared-tls-config -n platform -o json | jq '.metadata = {name: .metadata.name, namespace: "team-c"}' | kubectl apply -f -
+
+- id: k8s-236
+  title: No DNS servers at all
+  difficulty: 3
+  kind: fix
+  tags: [troubleshooting, dns, dnsPolicy]
+  scenario: |
+    The **`fetcher`** deployment (namespace **`crawler`**) can't resolve *any* name, not
+    even `kubernetes.default`. Other pods in the namespace are fine.
+
+    Fix the deployment so it uses the normal cluster DNS.
+  hints:
+    - "`kubectl exec deploy/fetcher -n crawler -- cat /etc/resolv.conf`"
+    - "Look at `dnsPolicy` and `dnsConfig` in the pod template."
+  solution: |
+    ```bash
+    kubectl get deploy fetcher -n crawler -o jsonpath='{.spec.template.spec.dnsPolicy} {.spec.template.spec.dnsConfig}'
+    # dnsPolicy: None with an empty nameserver list
+    kubectl patch deploy fetcher -n crawler --type=json -p '[{"op":"replace","path":"/spec/template/spec/dnsPolicy","value":"ClusterFirst"},{"op":"remove","path":"/spec/template/spec/dnsConfig"}]'
+    ```
+  setup: |
+    k_ns crawler
+    kubectl apply -f - >/dev/null <<'EOF'
+    apiVersion: apps/v1
+    kind: Deployment
+    metadata: {name: fetcher, namespace: crawler}
+    spec:
+      selector: {matchLabels: {app: fetcher}}
+      template:
+        metadata: {labels: {app: fetcher}}
+        spec:
+          dnsPolicy: None
+          dnsConfig:
+            nameservers: ["10.96.0.53"]
+            searches: [crawler.svc.cluster.local]
+          containers: [{name: f, image: "busybox:1.37", command: ["sleep", "infinity"]}]
+    EOF
+  check: |
+    wait_deploy crawler fetcher 60
+    check "fetcher resolves kubernetes.default" 'eventually 10 "kubectl -n crawler exec deploy/fetcher -- nslookup kubernetes.default.svc.cluster.local 2>/dev/null | grep -q \"Address: 10.96.0.1\""'
+  solve: |
+    kubectl patch deploy fetcher -n crawler --type=json -p '[{"op":"replace","path":"/spec/template/spec/dnsPolicy","value":"ClusterFirst"},{"op":"remove","path":"/spec/template/spec/dnsConfig"}]'
+
+- id: k8s-237
+  title: Two containers, one port
+  difficulty: 3
+  kind: fix
+  tags: [troubleshooting, multi-container, ports]
+  scenario: |
+    The **`api`** pod (namespace **`obs`**) runs the application plus a metrics sidecar.
+    One of the two containers keeps crashing with *address already in use*.
+
+    Containers in a pod share the network namespace. Fix the pod so both run: the
+    sidecar must listen on **9100** (it supports `--http-port`). Keep the app on 8080.
+  hints:
+    - "`kubectl logs api -n obs -c exporter --previous`"
+  solution: |
+    ```bash
+    kubectl get pod api -n obs -o json | jq '.spec.containers[1].args=["netexec","--http-port=9100","--udp-port=-1"]' > /lab/api.json
+    kubectl replace --force -f /lab/api.json
+    ```
+  setup: |
+    k_ns obs
+    kubectl apply -f - >/dev/null <<'EOF'
+    apiVersion: v1
+    kind: Pod
+    metadata: {name: api, namespace: obs}
+    spec:
+      containers:
+      - {name: app, image: "registry.k8s.io/e2e-test-images/agnhost:2.53", args: ["netexec", "--http-port=8080"]}
+      - {name: exporter, image: "registry.k8s.io/e2e-test-images/agnhost:2.53", args: ["netexec", "--http-port=8080", "--udp-port=-1"]}
+    EOF
+  check: |
+    wait_pod obs api 60
+    check "both containers ready" 'pod_ready obs api'
+    check "exporter on 9100" 'kj -n obs pod api "{.spec.containers[?(@.name==\"exporter\")].args}" | grep -q 9100'
+    check "app still on 8080" 'kj -n obs pod api "{.spec.containers[?(@.name==\"app\")].args}" | grep -q 8080'
+  solve: |
+    kubectl get pod api -n obs -o json | jq '.spec.containers[1].args=["netexec","--http-port=9100","--udp-port=-1"]' > /lab/api.json
+    kubectl replace --force -f /lab/api.json
+
+- id: k8s-238
+  title: Pods running an old version
+  difficulty: 3
+  kind: fix
+  tags: [troubleshooting, imagePullPolicy, tags]
+  scenario: |
+    The team pushes **`nginx:1.29-alpine`** fixes under the *same tag*... in this story,
+    the deployment **`portal`** (namespace **`web`**) uses a **mutable tag**, and some
+    nodes keep running stale cached images because of its pull policy.
+
+    Change the deployment so that it **always** pulls the image on pod start, and roll it
+    out. (In real life: better pin by digest.)
+  hints:
+    - "`imagePullPolicy: Always`"
+  solution: |
+    ```bash
+    kubectl patch deploy portal -n web --type=json -p '[{"op":"replace","path":"/spec/template/spec/containers/0/imagePullPolicy","value":"Always"}]'
+    kubectl rollout status deploy/portal -n web
+    ```
+    Even better: reference the image by digest (`nginx@sha256:...`) so every node runs
+    exactly the same bits.
+  setup: |
+    k_ns web
+    kubectl -n web create deployment portal --image=nginx:1.29-alpine >/dev/null
+    kubectl -n web patch deploy portal --type=json -p '[{"op":"add","path":"/spec/template/spec/containers/0/imagePullPolicy","value":"Never"}]' >/dev/null
+  check: |
+    check_eq "imagePullPolicy" "$(kj -n web deploy portal '{.spec.template.spec.containers[0].imagePullPolicy}')" "Always"
+    wait_deploy web portal 120
+    check "rollout complete" 'deploy_ready web portal'
+  solve: |
+    kubectl patch deploy portal -n web --type=json -p '[{"op":"replace","path":"/spec/template/spec/containers/0/imagePullPolicy","value":"Always"}]'
+
+- id: k8s-239
+  title: Exec into a running container
+  difficulty: 1
+  kind: build
+  tags: [exec, debugging]
+  scenario: |
+    The **`legacy-app`** pod (namespace **`legacy`**) writes its effective configuration to
+    **`/run/app/effective.conf`** inside its container at start-up. Copy that file to
+    **`/lab/effective.conf`** on the control plane.
+  hints:
+    - "`kubectl exec POD -- cat FILE > local-file`, or `kubectl cp NS/POD:PATH LOCAL`."
+  solution: |
+    ```bash
+    kubectl exec legacy-app -n legacy -- cat /run/app/effective.conf > /lab/effective.conf
+    ```
+  setup: |
+    k_ns legacy
+    v="max_connections=$((RANDOM % 900 + 100))"; echo "$v" > $KL_STATE/answer
+    kubectl -n legacy run legacy-app --image=busybox:1.37 -- sh -c "mkdir -p /run/app; echo '$v' > /run/app/effective.conf; sleep infinity" >/dev/null
+    kubectl -n legacy wait --for=condition=Ready pod/legacy-app --timeout=60s >/dev/null
+  check: |
+    check_eq "effective.conf" "$(cat /lab/effective.conf 2>/dev/null)" "$(cat $KL_STATE/answer)"
+  solve: |
+    kubectl exec legacy-app -n legacy -- cat /run/app/effective.conf > /lab/effective.conf
+
+- id: k8s-240
+  title: "Incident: the booking platform"
+  difficulty: 5
+  kind: fix
+  tags: [incident, troubleshooting]
+  scenario: |
+    The booking platform in namespace **`booking`** is down. Users hit
+    **`http://booking.example.com/`** (Traefik on port 30080). The chain is:
+
+    ```text
+    Ingress → web (nginx, proxies /api/ to api:8080) → api (agnhost) → db (postgres)
+    ```
+
+    Requirements: `/` serves the web page, `/api/hostname` returns the api pod's name,
+    `api` reaches `db` on 5432, all deployments fully ready. The nginx config in the
+    ConfigMap `web-config` is correct. Fix **everything** that's wrong.
+  hints:
+    - "Work from the outside in: Ingress → Service → EndpointSlices → Pods → logs."
+    - "Expect at least five separate problems across Ingress, Services, Deployments, ConfigMap usage and a Secret."
+  solution: |
+    ```bash
+    # 1) Ingress has no ingressClassName                       -> traefik
+    # 2) web Service selects app=frontend; pods are app=web    -> fix selector
+    # 3) web Deployment mounts the ConfigMap at /etc/nginx (replacing everything) -> /etc/nginx/conf.d
+    # 4) api Service targetPort 80, agnhost listens on 8080    -> 8080
+    # 5) db Deployment references secret key "pwd"; secret has "password" -> fix key
+    # 6) api has a readiness probe on /healthz:9090            -> /hostname:8080
+    ```
+  setup: |
+    k_ns booking
+    kubectl -n booking create configmap web-config --from-literal=default.conf='server {
+      listen 80;
+      resolver 10.96.0.10 valid=5s ipv6=off;
+      location /api/ { set $u http://api.booking.svc.cluster.local:8080; rewrite ^/api/(.*)$ /$1 break; proxy_pass $u; }
+      location / { default_type text/html; return 200 "<h1>Booking platform</h1>\n"; }
+    }' >/dev/null
+    kubectl -n booking create secret generic db --from-literal=password=book1ng >/dev/null
+    kubectl apply -f - >/dev/null <<'EOF'
+    apiVersion: networking.k8s.io/v1
+    kind: Ingress
+    metadata: {name: booking, namespace: booking}
+    spec:
+      rules:
+      - host: booking.example.com
+        http: {paths: [{path: /, pathType: Prefix, backend: {service: {name: web, port: {number: 80}}}}]}
+    ---
+    apiVersion: apps/v1
+    kind: Deployment
+    metadata: {name: web, namespace: booking}
+    spec:
+      selector: {matchLabels: {app: web}}
+      template:
+        metadata: {labels: {app: web}}
+        spec:
+          containers:
+          - {name: nginx, image: "nginx:1.28-alpine", volumeMounts: [{name: conf, mountPath: /etc/nginx}]}
+          volumes: [{name: conf, configMap: {name: web-config}}]
+    ---
+    apiVersion: v1
+    kind: Service
+    metadata: {name: web, namespace: booking}
+    spec: {selector: {app: frontend}, ports: [{port: 80}]}
+    ---
+    apiVersion: apps/v1
+    kind: Deployment
+    metadata: {name: api, namespace: booking}
+    spec:
+      replicas: 2
+      selector: {matchLabels: {app: api}}
+      template:
+        metadata: {labels: {app: api}}
+        spec:
+          containers:
+          - name: api
+            image: registry.k8s.io/e2e-test-images/agnhost:2.53
+            args: ["netexec", "--http-port=8080"]
+            readinessProbe: {httpGet: {path: /healthz, port: 9090}, periodSeconds: 3}
+          - {name: pgclient, image: "postgres:16-alpine", command: ["sleep", "infinity"]}
+    ---
+    apiVersion: v1
+    kind: Service
+    metadata: {name: api, namespace: booking}
+    spec: {selector: {app: api}, ports: [{port: 8080, targetPort: 80}]}
+    ---
+    apiVersion: apps/v1
+    kind: Deployment
+    metadata: {name: db, namespace: booking}
+    spec:
+      selector: {matchLabels: {app: db}}
+      template:
+        metadata: {labels: {app: db}}
+        spec:
+          containers:
+          - name: postgres
+            image: postgres:16-alpine
+            env: [{name: POSTGRES_PASSWORD, valueFrom: {secretKeyRef: {name: db, key: pwd}}}]
+    ---
+    apiVersion: v1
+    kind: Service
+    metadata: {name: db, namespace: booking}
+    spec: {selector: {app: db}, ports: [{port: 5432}]}
+    EOF
+  check: |
+    for d in web api db; do wait_deploy booking $d 90; done
+    for d in web api db; do check "$d fully ready" "deploy_ready booking $d"; done
+    check "/ serves the web page" 'eventually 20 "ing_get booking.example.com / | grep -q \"Booking platform\""'
+    check "/api/hostname returns an api pod" 'eventually 10 "ing_get booking.example.com /api/hostname | grep -q ^api-"'
+    check "api reaches db" 'kubectl -n booking exec deploy/api -c pgclient -- pg_isready -h db -t 3'
+  solve: |
+    kubectl -n booking patch ingress booking -p '{"spec":{"ingressClassName":"traefik"}}'
+    kubectl -n booking patch svc web -p '{"spec":{"selector":{"app":"web"}}}'
+    kubectl -n booking patch deploy web --type=json -p '[{"op":"replace","path":"/spec/template/spec/containers/0/volumeMounts/0/mountPath","value":"/etc/nginx/conf.d"}]'
+    kubectl -n booking patch svc api --type=json -p '[{"op":"replace","path":"/spec/ports/0/targetPort","value":8080}]'
+    kubectl -n booking patch deploy api --type=json -p '[{"op":"replace","path":"/spec/template/spec/containers/0/readinessProbe/httpGet","value":{"path":"/hostname","port":8080}}]'
+    kubectl -n booking patch deploy db --type=json -p '[{"op":"replace","path":"/spec/template/spec/containers/0/env/0/valueFrom/secretKeyRef/key","value":"password"}]'
