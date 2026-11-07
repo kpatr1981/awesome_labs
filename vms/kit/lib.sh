@@ -138,7 +138,9 @@ _pods_state() {
       elif any($p[]; (.status.phase == "Failed" or .status.phase == "Succeeded")
           or any(.status.conditions[]?; .type == "PodScheduled" and .status == "False")
           or any(.status.containerStatuses[]?, .status.initContainerStatuses[]?;
-               (.state.waiting.reason // "") | IN("ImagePullBackOff","ErrImagePull","CrashLoopBackOff","CreateContainerConfigError","InvalidImageName","RunContainerError","CreateContainerError"))) then "stuck"
+               (.state.waiting.reason // "") | IN("ImagePullBackOff","ErrImagePull","CrashLoopBackOff","CreateContainerConfigError","InvalidImageName","RunContainerError","CreateContainerError"))
+          or any(.status.containerStatuses[]?; .ready == false and .state.running.startedAt != null
+               and (now - (.state.running.startedAt | fromdateiso8601)) > 25)) then "stuck"
       else "wait" end' 2>/dev/null || echo stuck
 }
 # _wait_state SECONDS NS ARGS... — wait for ready; give up early once pods are clearly stuck

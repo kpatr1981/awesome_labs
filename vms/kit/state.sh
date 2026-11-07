@@ -112,10 +112,9 @@ restore() {
   for u in "${UNITS[@]}"; do
     systemctl unmask "$u" >/dev/null 2>&1 || true
     systemctl enable "$u" >/dev/null 2>&1 || true
-    if printf '%s\n' "${changed[@]}" | grep -qx "${u%.socket}"; then
-      systemctl restart "$u"
-    elif ! systemctl is-active -q "$u"; then
-      systemctl restart "$u"
+    if printf '%s\n' "${changed[@]}" | grep -qx "${u%.socket}" || ! systemctl is-active -q "$u"; then
+      systemctl reset-failed "$u" >/dev/null 2>&1 || true
+      systemctl restart "$u" || { sleep 3; systemctl reset-failed "$u" >/dev/null 2>&1; systemctl restart "$u"; }
     fi
   done
 }

@@ -14,6 +14,9 @@ docker network ls --format '{{.Name}}' | grep -vxE 'bridge|host|none' | xargs -r
 docker volume ls -q | xargs -r docker volume rm -f >/dev/null 2>&1
 docker images -q --no-trunc | sort -u >/tmp/kl-imgs
 comm -23 /tmp/kl-imgs "$P/images.txt" | xargs -r docker rmi -f >/dev/null 2>&1
+# extra tags pointing at pristine images
+docker images --format '{{.Repository}}:{{.Tag}}' | grep -v '<none>' | sort -u >/tmp/kl-refs
+comm -23 /tmp/kl-refs "$P/image-refs.txt" | xargs -r docker rmi >/dev/null 2>&1
 docker builder prune -af >/dev/null 2>&1
 docker buildx ls --format '{{.Name}}' 2>/dev/null | grep -vxE 'default|desktop-linux' | xargs -r -n1 docker buildx rm >/dev/null 2>&1
 # Re-tag pristine images in case an exercise removed/retagged them

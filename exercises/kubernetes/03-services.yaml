@@ -1,0 +1,885 @@
+track: kubernetes
+module: Services & DNS
+profile: k8s
+order: 3
+exercises:
+
+- id: k8s-041
+  title: Give the deployment a stable address
+  difficulty: 1
+  kind: build
+  tags: [service, clusterip, expose]
+  scenario: |
+    Pods come and go; their IPs change. Create a **ClusterIP** service **`web`** in
+    namespace **`shop`** that load-balances port **80** to the pods of the existing
+    deployment **`web`**.
+  hints:
+    - "`kubectl expose deployment web --port=80 -n shop`"
+  solution: |
+    ```bash
+    kubectl expose deployment web --port=80 -n shop
+    kubectl get svc,endpointslices -n shop
+    kubectl run tmp --rm -it --image=curlimages/curl:8.11.1 -n shop -- curl -s web
+    ```
+  setup: |
+    k_ns shop
+    kubectl -n shop create deployment web --image=nginx:1.28-alpine --replicas=2 >/dev/null
+  check: |
+    check_eq "service type" "$(kj -n shop svc web '{.spec.type}')" "ClusterIP"
+    check_eq "port" "$(kj -n shop svc web '{.spec.ports[0].port}')" "80"
+    wait_deploy shop web 60
+    check "service answers inside the cluster" 'k_curl shop http://web | grep -q "Welcome to nginx"'
+  solve: |
+    kubectl expose deployment web --port=80 -n shop
+
+- id: k8s-042
+  title: Reachable from outside the cluster
+  difficulty: 1
+  kind: build
+  tags: [service, nodeport]
+  scenario: |
+    The QA team, outside the cluster, needs to reach the **`api`** deployment (namespace
+    **`qa`**, container port 80).
+
+    Expose it with a **NodePort** service named **`api`** using node port **30100**.
+    `curl http://node01:30100` from the control plane must work.
+  hints:
+    - "`kubectl expose ... --type=NodePort` picks a random node port; set a fixed one by editing/patching `spec.ports[0].nodePort`, or write the YAML."
+  solution: |
+    ```yaml
+    apiVersion: v1
+    kind: Service
+    metadata: {name: api, namespace: qa}
+    spec:
+      type: NodePort
+      selector: {app: api}
+      ports:
+      - port: 80
+        targetPort: 80
+        nodePort: 30100
+    ```
+    ```bash
+    curl http://node01:30100
+    ```
+  setup: |
+    k_ns qa
+    kubectl -n qa create deployment api --image=traefik/whoami:v1.10 >/dev/null
+  check: |
+    check_eq "type" "$(kj -n qa svc api '{.spec.type}')" "NodePort"
+    check_eq "nodePort" "$(kj -n qa svc api '{.spec.ports[0].nodePort}')" "30100"
+    wait_deploy qa api 60
+    check "http://node01:30100 answers" 'eventually 15 "curl -fs -m 3 http://node01:30100 | grep -q Hostname"'
+  solve: |
+    kubectl -n qa expose deployment api --port=80 --type=NodePort --dry-run=client -o json | jq '.spec.ports[0].nodePort=30100' | kubectl apply -f -
+
+- id: k8s-043
+  title: The app listens on 8080
+  difficulty: 2
+  kind: build
+  tags: [service, targetport]
+  scenario: |
+    The **`echo`** deployment in namespace **`tools`** listens on **8080**, but clients
+    expect to talk to plain port **80**.
+
+    Create a service **`echo`** that listens on port **80** and forwards to the pods'
+    port **8080**.
+  hints:
+    - "`port` is what the service exposes, `targetPort` is the container port."
+  solution: |
+    ```bash
+    kubectl expose deployment echo -n tools --port=80 --target-port=8080
+    ```
+  setup: |
+    k_ns tools
+    kubectl -n tools create deployment echo --image=registry.k8s.io/e2e-test-images/agnhost:2.53 -- /agnhost netexec --http-port=8080 >/dev/null
+  check: |
+    check_eq "port" "$(kj -n tools svc echo '{.spec.ports[0].port}')" "80"
+    check_eq "targetPort" "$(kj -n tools svc echo '{.spec.ports[0].targetPort}')" "8080"
+    wait_deploy tools echo 60
+    check "http://echo/hostname answers" 'k_curl tools http://echo/hostname | grep -q echo-'
+  solve: |
+    kubectl expose deployment echo -n tools --port=80 --target-port=8080
+
+- id: k8s-044
+  title: A service with no endpoints
+  difficulty: 2
+  kind: fix
+  tags: [service, selector, troubleshooting]
+  scenario: |
+    Requests to the **`inventory`** service in namespace **`warehouse`** time out.
+    The deployment's pods are all healthy.
+
+    Fix the **service** so it routes to the `inventory` pods.
+  hints:
+    - "`kubectl get endpointslices -n warehouse -l kubernetes.io/service-name=inventory` — empty?"
+    - "Compare `kubectl get svc inventory -o jsonpath='{.spec.selector}'` with the pods' labels."
+  solution: |
+    ```bash
+    kubectl get svc inventory -n warehouse -o jsonpath='{.spec.selector}'   # {"app":"inventroy"}
+    kubectl get pods -n warehouse --show-labels
+    kubectl patch svc inventory -n warehouse -p '{"spec":{"selector":{"app":"inventory"}}}'
+    ```
+  setup: |
+    k_ns warehouse
+    kubectl -n warehouse create deployment inventory --image=traefik/whoami:v1.10 --replicas=2 >/dev/null
+    kubectl -n warehouse create service clusterip inventory --tcp=80:80 --dry-run=client -o json | jq '.spec.selector={"app":"inventroy"}' | kubectl apply -f - >/dev/null
+  check: |
+    wait_deploy warehouse inventory 60
+    check_eq "selector" "$(kj -n warehouse svc inventory '{.spec.selector.app}')" "inventory"
+    check "service answers" 'k_curl warehouse http://inventory | grep -q Hostname'
+  solve: |
+    kubectl patch svc inventory -n warehouse -p '{"spec":{"selector":{"app":"inventory"}}}'
+
+- id: k8s-045
+  title: Connection refused through the service
+  difficulty: 2
+  kind: fix
+  tags: [service, targetport, troubleshooting]
+  scenario: |
+    The **`reports`** service (namespace **`bi`**) has endpoints, but every request gets
+    *connection refused*. The pods serve HTTP on their declared container port.
+
+    Fix the service.
+  hints:
+    - "`kubectl describe svc reports -n bi` shows `TargetPort` and `Endpoints`."
+    - "Compare with the container's `ports` in the deployment."
+  solution: |
+    ```bash
+    kubectl describe svc reports -n bi          # TargetPort: 8000/TCP
+    kubectl get deploy reports -n bi -o jsonpath='{.spec.template.spec.containers[0].ports}'
+    kubectl patch svc reports -n bi --type=json -p '[{"op":"replace","path":"/spec/ports/0/targetPort","value":9000}]'
+    ```
+  setup: |
+    k_ns bi
+    kubectl apply -f - >/dev/null <<'EOF'
+    apiVersion: apps/v1
+    kind: Deployment
+    metadata: {name: reports, namespace: bi}
+    spec:
+      selector: {matchLabels: {app: reports}}
+      template:
+        metadata: {labels: {app: reports}}
+        spec:
+          containers:
+          - name: reports
+            image: registry.k8s.io/e2e-test-images/agnhost:2.53
+            args: ["netexec", "--http-port=9000"]
+            ports: [{containerPort: 9000}]
+    ---
+    apiVersion: v1
+    kind: Service
+    metadata: {name: reports, namespace: bi}
+    spec:
+      selector: {app: reports}
+      ports: [{port: 80, targetPort: 8000}]
+    EOF
+  check: |
+    wait_deploy bi reports 60
+    check_eq "targetPort" "$(kj -n bi svc reports '{.spec.ports[0].targetPort}')" "9000"
+    check "service answers" 'k_curl bi http://reports/hostname | grep -q reports-'
+  solve: |
+    kubectl patch svc reports -n bi --type=json -p '[{"op":"replace","path":"/spec/ports/0/targetPort","value":9000}]'
+
+- id: k8s-046
+  title: Named ports
+  difficulty: 2
+  kind: build
+  tags: [service, named-ports]
+  scenario: |
+    The platform team wants services to refer to container ports **by name**, so the
+    port number can change without touching services.
+
+    1. In deployment **`catalog`** (namespace **`store`**), name the container port 80
+       **`http`**.
+    2. Create a service **`catalog`** (port 80) whose `targetPort` is **`http`**.
+  hints:
+    - "`ports: [{name: http, containerPort: 80}]` in the container."
+    - "`targetPort: http` in the service."
+  solution: |
+    ```bash
+    kubectl patch deploy catalog -n store --type=json -p \
+      '[{"op":"add","path":"/spec/template/spec/containers/0/ports","value":[{"name":"http","containerPort":80}]}]'
+    kubectl expose deploy catalog -n store --port=80 --target-port=http
+    ```
+  setup: |
+    k_ns store
+    kubectl -n store create deployment catalog --image=nginx:1.28-alpine >/dev/null
+  check: |
+    check_eq "container port is named http" "$(kj -n store deploy catalog '{.spec.template.spec.containers[0].ports[?(@.containerPort==80)].name}')" "http"
+    check_eq "service targetPort" "$(kj -n store svc catalog '{.spec.ports[0].targetPort}')" "http"
+    wait_deploy store catalog 60
+    check "service answers" 'k_curl store http://catalog | grep -q nginx'
+  solve: |
+    kubectl patch deploy catalog -n store --type=json -p '[{"op":"add","path":"/spec/template/spec/containers/0/ports","value":[{"name":"http","containerPort":80}]}]'
+    kubectl expose deploy catalog -n store --port=80 --target-port=http
+
+- id: k8s-047
+  title: The full name of a service
+  difficulty: 1
+  kind: build
+  tags: [dns, fqdn]
+  scenario: |
+    An application in namespace **`frontend`** must connect to the PostgreSQL service
+    **`db`** in namespace **`data`**. The cluster domain is the default.
+
+    Write the service's **fully qualified DNS name** to **`/lab/db-fqdn.txt`**, and its
+    **ClusterIP** to **`/lab/db-ip.txt`**.
+  hints:
+    - "Pattern: `<service>.<namespace>.svc.<cluster-domain>`"
+  solution: |
+    ```bash
+    echo db.data.svc.cluster.local > /lab/db-fqdn.txt
+    kubectl get svc db -n data -o jsonpath='{.spec.clusterIP}' > /lab/db-ip.txt
+    kubectl run t --rm -it --image=busybox:1.37 -n frontend -- nslookup db.data.svc.cluster.local
+    ```
+  setup: |
+    k_ns data; k_ns frontend
+    kubectl -n data create deployment db --image=postgres:16-alpine >/dev/null
+    kubectl -n data set env deploy/db POSTGRES_PASSWORD=pw >/dev/null
+    kubectl -n data expose deploy db --port=5432 >/dev/null
+  check: |
+    check_eq "FQDN" "$(tr -d '[:space:]' < /lab/db-fqdn.txt 2>/dev/null | sed 's/\.$//')" "db.data.svc.cluster.local"
+    check_eq "ClusterIP" "$(tr -d '[:space:]' < /lab/db-ip.txt 2>/dev/null)" "$(kj -n data svc db '{.spec.clusterIP}')"
+  solve: |
+    echo db.data.svc.cluster.local > /lab/db-fqdn.txt
+    kubectl get svc db -n data -o jsonpath='{.spec.clusterIP}' > /lab/db-ip.txt
+
+- id: k8s-048
+  title: Talk to each peer directly
+  difficulty: 3
+  kind: build
+  tags: [headless, dns]
+  scenario: |
+    The **`gossip`** deployment (namespace **`cluster`**, 3 replicas) needs to discover all
+    of its peers' IPs via DNS instead of going through a load-balanced virtual IP.
+
+    Create a **headless** service **`gossip`** (port 7946) selecting `app=gossip`, so that
+    resolving `gossip.cluster.svc.cluster.local` returns the **IP of every pod**.
+  hints:
+    - "A headless service has `clusterIP: None`."
+  solution: |
+    ```yaml
+    apiVersion: v1
+    kind: Service
+    metadata: {name: gossip, namespace: cluster}
+    spec:
+      clusterIP: None
+      selector: {app: gossip}
+      ports: [{port: 7946}]
+    ```
+    ```bash
+    kubectl run t --rm -it --image=busybox:1.37 -n cluster -- nslookup gossip
+    ```
+  setup: |
+    k_ns cluster
+    kubectl -n cluster create deployment gossip --image=busybox:1.37 --replicas=3 -- sleep infinity >/dev/null
+  check: |
+    check_eq "clusterIP" "$(kj -n cluster svc gossip '{.spec.clusterIP}')" "None"
+    wait_deploy cluster gossip 60
+    want=$(kubectl -n cluster get pods -l app=gossip -o jsonpath='{.items[*].status.podIP}' | tr ' ' '\n' | sort | tr '\n' ' ')
+    got=$(kubectl -n cluster run kl-dns --rm -i --restart=Never --quiet --image=busybox:1.37 -- nslookup -type=a gossip.cluster.svc.cluster.local 2>/dev/null | awk '/^Address: /{print $2}' | sort | tr '\n' ' ')
+    check_eq "DNS returns all pod IPs" "$got" "$want"
+  solve: |
+    kubectl apply -f - <<'EOF'
+    apiVersion: v1
+    kind: Service
+    metadata: {name: gossip, namespace: cluster}
+    spec:
+      clusterIP: None
+      selector: {app: gossip}
+      ports: [{port: 7946}]
+    EOF
+
+- id: k8s-049
+  title: An alias for an external API
+  difficulty: 2
+  kind: build
+  tags: [externalname, dns]
+  scenario: |
+    Applications in namespace **`checkout`** call the payment provider at
+    `api.sandbox.paymentsco.example`. When the provider changes, nobody wants to redeploy
+    the apps.
+
+    Create a service **`payments`** in `checkout` so that the in-cluster name `payments`
+    is a **DNS alias (CNAME)** for `api.sandbox.paymentsco.example`.
+  hints:
+    - "`kubectl create service externalname NAME --external-name HOST`"
+  solution: |
+    ```bash
+    kubectl create service externalname payments -n checkout --external-name api.sandbox.paymentsco.example
+    kubectl run t --rm -it --image=busybox:1.37 -n checkout -- nslookup payments
+    ```
+  setup: |
+    k_ns checkout
+  check: |
+    check_eq "type" "$(kj -n checkout svc payments '{.spec.type}')" "ExternalName"
+    check_eq "externalName" "$(kj -n checkout svc payments '{.spec.externalName}')" "api.sandbox.paymentsco.example"
+  solve: |
+    kubectl create service externalname payments -n checkout --external-name api.sandbox.paymentsco.example
+
+- id: k8s-050
+  title: A service for a database outside the cluster
+  difficulty: 3
+  kind: build
+  tags: [service, endpointslice, external]
+  scenario: |
+    The legacy Oracle database runs on a VM at **`192.168.104.250:1521`**, outside
+    Kubernetes. Applications in namespace **`erp`** should still use a normal service name.
+
+    Create a service **`oracle`** (port **1521**) in `erp` **without a selector**, and an
+    **EndpointSlice** that points it at `192.168.104.250:1521`.
+  hints:
+    - "A service without `selector` gets no automatic endpoints."
+    - "The EndpointSlice needs the label `kubernetes.io/service-name: oracle`, `addressType: IPv4`, and a port with the same name as the service port."
+  solution: |
+    ```yaml
+    apiVersion: v1
+    kind: Service
+    metadata: {name: oracle, namespace: erp}
+    spec:
+      ports: [{name: sql, port: 1521, targetPort: 1521}]
+    ---
+    apiVersion: discovery.k8s.io/v1
+    kind: EndpointSlice
+    metadata:
+      name: oracle-1
+      namespace: erp
+      labels: {kubernetes.io/service-name: oracle}
+    addressType: IPv4
+    ports: [{name: sql, port: 1521, protocol: TCP}]
+    endpoints:
+    - addresses: ["192.168.104.250"]
+    ```
+  setup: |
+    k_ns erp
+  check: |
+    check "service oracle exists" 'k_exists -n erp svc oracle'
+    check_eq "no selector" "$(kj -n erp svc oracle '{.spec.selector}')" ""
+    check_eq "port" "$(kj -n erp svc oracle '{.spec.ports[0].port}')" "1521"
+    check_eq "endpoint address" "$(kj -n erp endpointslices -l kubernetes.io/service-name=oracle '{.items[*].endpoints[*].addresses[*]}')" "192.168.104.250"
+    check_eq "endpoint port" "$(kj -n erp endpointslices -l kubernetes.io/service-name=oracle '{.items[*].ports[*].port}')" "1521"
+  solve: |
+    kubectl apply -f - <<'EOF'
+    apiVersion: v1
+    kind: Service
+    metadata: {name: oracle, namespace: erp}
+    spec:
+      ports: [{name: sql, port: 1521, targetPort: 1521}]
+    ---
+    apiVersion: discovery.k8s.io/v1
+    kind: EndpointSlice
+    metadata:
+      name: oracle-1
+      namespace: erp
+      labels: {kubernetes.io/service-name: oracle}
+    addressType: IPv4
+    ports: [{name: sql, port: 1521, protocol: TCP}]
+    endpoints:
+    - addresses: ["192.168.104.250"]
+    EOF
+
+- id: k8s-051
+  title: Sticky sessions
+  difficulty: 2
+  kind: build
+  tags: [service, session-affinity]
+  scenario: |
+    The legacy **`cart`** app (namespace **`shop`**) keeps sessions in memory, so each
+    client must keep hitting the same pod.
+
+    Configure the existing service **`cart`** so requests from the same client IP always
+    go to the same pod, with a sticky timeout of **30 minutes**.
+  hints:
+    - "`spec.sessionAffinity: ClientIP` and `spec.sessionAffinityConfig.clientIP.timeoutSeconds`."
+  solution: |
+    ```bash
+    kubectl patch svc cart -n shop -p \
+      '{"spec":{"sessionAffinity":"ClientIP","sessionAffinityConfig":{"clientIP":{"timeoutSeconds":1800}}}}'
+    ```
+  setup: |
+    k_ns shop
+    kubectl -n shop create deployment cart --image=traefik/whoami:v1.10 --replicas=3 >/dev/null
+    kubectl -n shop expose deploy cart --port=80 >/dev/null
+  check: |
+    check_eq "sessionAffinity" "$(kj -n shop svc cart '{.spec.sessionAffinity}')" "ClientIP"
+    check_eq "timeout" "$(kj -n shop svc cart '{.spec.sessionAffinityConfig.clientIP.timeoutSeconds}')" "1800"
+    wait_deploy shop cart 60
+    n=$(kubectl -n shop run kl-sticky --rm -i --restart=Never --quiet --image=curlimages/curl:8.11.1 --command -- sh -c 'for i in 1 2 3 4 5 6; do curl -s cart | grep Hostname; done' 2>/dev/null | sort -u | wc -l)
+    check_eq "6 requests hit the same pod" "$n" "1"
+  solve: |
+    kubectl patch svc cart -n shop -p '{"spec":{"sessionAffinity":"ClientIP","sessionAffinityConfig":{"clientIP":{"timeoutSeconds":1800}}}}'
+
+- id: k8s-052
+  title: One service, two ports
+  difficulty: 2
+  kind: build
+  tags: [service, multi-port]
+  scenario: |
+    The **`ledger`** deployment (namespace **`finance`**) serves its API on **8080** and
+    Prometheus metrics on **9090** (both containers ports are declared).
+
+    Create a service **`ledger`** with two ports:
+
+    | name | port | targetPort |
+    |------|------|------------|
+    | `http` | 80 | 8080 |
+    | `metrics` | 9090 | 9090 |
+  hints:
+    - "With more than one port, every service port must have a `name`."
+  solution: |
+    ```yaml
+    apiVersion: v1
+    kind: Service
+    metadata: {name: ledger, namespace: finance}
+    spec:
+      selector: {app: ledger}
+      ports:
+      - {name: http, port: 80, targetPort: 8080}
+      - {name: metrics, port: 9090, targetPort: 9090}
+    ```
+  setup: |
+    k_ns finance
+    kubectl apply -f - >/dev/null <<'EOF'
+    apiVersion: apps/v1
+    kind: Deployment
+    metadata: {name: ledger, namespace: finance}
+    spec:
+      selector: {matchLabels: {app: ledger}}
+      template:
+        metadata: {labels: {app: ledger}}
+        spec:
+          containers:
+          - name: api
+            image: registry.k8s.io/e2e-test-images/agnhost:2.53
+            args: ["netexec", "--http-port=8080"]
+            ports: [{containerPort: 8080}]
+          - name: metrics
+            image: registry.k8s.io/e2e-test-images/agnhost:2.53
+            args: ["netexec", "--http-port=9090", "--udp-port=-1"]
+            ports: [{containerPort: 9090}]
+    EOF
+  check: |
+    check_eq "ports" "$(kj -n finance svc ledger '{range .spec.ports[*]}{.name}:{.port}:{.targetPort} {end}' | sed 's/ $//')" "http:80:8080 metrics:9090:9090"
+    wait_deploy finance ledger 60
+    check "http port works" 'k_curl finance http://ledger/hostname | grep -q ledger-'
+    check "metrics port works" 'k_curl finance http://ledger:9090/hostname | grep -q ledger-'
+  solve: |
+    kubectl apply -f - <<'EOF'
+    apiVersion: v1
+    kind: Service
+    metadata: {name: ledger, namespace: finance}
+    spec:
+      selector: {app: ledger}
+      ports:
+      - {name: http, port: 80, targetPort: 8080}
+      - {name: metrics, port: 9090, targetPort: 9090}
+    EOF
+
+- id: k8s-053
+  title: Nothing resolves anymore
+  difficulty: 2
+  kind: fix
+  tags: [dns, coredns, troubleshooting]
+  scenario: |
+    Since the last maintenance window, pods in **every** namespace fail to resolve any
+    name — `nslookup kubernetes.default` times out.
+
+    Restore cluster DNS.
+  hints:
+    - "Cluster DNS is served by CoreDNS in `kube-system` (`k8s-app=kube-dns`)."
+    - "`kubectl get deploy -n kube-system`"
+  solution: |
+    ```bash
+    kubectl get deploy coredns -n kube-system      # 0/0
+    kubectl scale deploy coredns -n kube-system --replicas=2
+    kubectl run t --rm -it --image=busybox:1.37 -- nslookup kubernetes.default
+    ```
+  setup: |
+    kubectl -n kube-system scale deploy coredns --replicas=0 >/dev/null
+  check: |
+    wait_deploy kube-system coredns 60
+    check "coredns has ready replicas" '[ "$(kj -n kube-system deploy coredns "{.status.readyReplicas}")" -ge 1 ] 2>/dev/null'
+    check "pods resolve kubernetes.default" 'kubectl run kl-dns --rm -i --restart=Never --quiet --image=busybox:1.37 -- nslookup kubernetes.default.svc.cluster.local 2>/dev/null | grep -q "Address: 10.96.0.1"'
+  solve: |
+    kubectl scale deploy coredns -n kube-system --replicas=2
+
+- id: k8s-054
+  title: CoreDNS forgot the cluster domain
+  difficulty: 3
+  kind: fix
+  tags: [dns, coredns, configmap, troubleshooting]
+  scenario: |
+    External names resolve fine from pods, but **service names don't**:
+    `nslookup kubernetes.default.svc.cluster.local` returns NXDOMAIN. Someone edited
+    CoreDNS's configuration.
+
+    Fix the CoreDNS configuration so cluster names resolve again.
+  hints:
+    - "CoreDNS reads its `Corefile` from the ConfigMap `coredns` in `kube-system`."
+    - "Look at the `kubernetes` plugin line — which zone does it serve?"
+    - "CoreDNS reloads its config automatically after a short while; `kubectl rollout restart` is faster."
+  solution: |
+    ```bash
+    kubectl -n kube-system get cm coredns -o yaml | grep kubernetes
+    #   kubernetes cluster.locl in-addr.arpa ip6.arpa {
+    kubectl -n kube-system edit cm coredns        # cluster.locl -> cluster.local
+    kubectl -n kube-system rollout restart deploy coredns
+    ```
+  setup: |
+    on_reset 'kubectl -n kube-system rollout restart deploy coredns'
+    kubectl -n kube-system get cm coredns -o json | jq '.data.Corefile |= sub("kubernetes cluster.local"; "kubernetes cluster.locl")' | kubectl replace -f - >/dev/null
+    kubectl -n kube-system rollout restart deploy coredns >/dev/null
+    kubectl -n kube-system rollout status deploy coredns --timeout=90s >/dev/null
+  check: |
+    check "Corefile serves cluster.local" 'kubectl -n kube-system get cm coredns -o jsonpath="{.data.Corefile}" | grep -q "kubernetes cluster.local "'
+    wait_deploy kube-system coredns 60
+    check "service names resolve" 'eventually 40 "kubectl run kl-dns-\$RANDOM --rm -i --restart=Never --quiet --image=busybox:1.37 -- nslookup kubernetes.default.svc.cluster.local 2>/dev/null | grep -q \"Address: 10.96.0.1\""'
+  solve: |
+    kubectl -n kube-system get cm coredns -o json | jq '.data.Corefile |= sub("kubernetes cluster.locl"; "kubernetes cluster.local")' | kubectl replace -f -
+    kubectl -n kube-system rollout restart deploy coredns
+    kubectl -n kube-system rollout status deploy coredns --timeout=90s
+
+- id: k8s-055
+  title: Custom DNS settings for one pod
+  difficulty: 3
+  kind: build
+  tags: [dns, dnsconfig]
+  scenario: |
+    A legacy app breaks with long search lists and needs exactly these resolver
+    settings. Create pod **`legacy-resolver`** in namespace **`legacy`** (`busybox:1.37`,
+    `sleep 3600`) whose `/etc/resolv.conf` contains **only**:
+
+    ```text
+    search legacy.svc.cluster.local corp.example
+    nameserver 10.96.0.10
+    options ndots:1
+    ```
+  hints:
+    - "`dnsPolicy: None` ignores the cluster defaults; then describe everything in `dnsConfig`."
+  solution: |
+    ```yaml
+    apiVersion: v1
+    kind: Pod
+    metadata: {name: legacy-resolver, namespace: legacy}
+    spec:
+      dnsPolicy: None
+      dnsConfig:
+        nameservers: ["10.96.0.10"]
+        searches: ["legacy.svc.cluster.local", "corp.example"]
+        options:
+        - name: ndots
+          value: "1"
+      containers:
+      - {name: app, image: "busybox:1.37", command: ["sleep", "3600"]}
+    ```
+  setup: |
+    k_ns legacy
+  check: |
+    wait_pod legacy legacy-resolver 60
+    rc=$(kubectl -n legacy exec legacy-resolver -- cat /etc/resolv.conf 2>/dev/null | grep -v '^#' | grep -v '^$')
+    check_eq "search" "$(grep ^search <<<"$rc")" "search legacy.svc.cluster.local corp.example"
+    check_eq "nameserver" "$(grep ^nameserver <<<"$rc")" "nameserver 10.96.0.10"
+    check_eq "options" "$(grep ^options <<<"$rc")" "options ndots:1"
+  solve: |
+    kubectl apply -f - <<'EOF'
+    apiVersion: v1
+    kind: Pod
+    metadata: {name: legacy-resolver, namespace: legacy}
+    spec:
+      dnsPolicy: None
+      dnsConfig:
+        nameservers: ["10.96.0.10"]
+        searches: ["legacy.svc.cluster.local", "corp.example"]
+        options:
+        - name: ndots
+          value: "1"
+      containers:
+      - {name: app, image: "busybox:1.37", command: ["sleep", "3600"]}
+    EOF
+
+- id: k8s-056
+  title: Keep the client's source IP
+  difficulty: 3
+  kind: build
+  tags: [nodeport, externalTrafficPolicy]
+  scenario: |
+    The **`audit-api`** NodePort service (namespace **`audit`**, node port **30200**) logs
+    the client IP of every request — but it only ever sees node IPs, because traffic is
+    SNAT-ed when it hops between nodes.
+
+    Configure the service so that the **original client source IP is preserved** and
+    traffic arriving at a node is only sent to pods on **that** node.
+  hints:
+    - "`spec.externalTrafficPolicy`"
+  solution: |
+    ```bash
+    kubectl patch svc audit-api -n audit -p '{"spec":{"externalTrafficPolicy":"Local"}}'
+    curl http://node01:30200     # RemoteAddr shows the real client
+    ```
+    Trade-off: nodes without a local pod drop the traffic (here only node01 runs pods).
+  setup: |
+    k_ns audit
+    kubectl -n audit create deployment audit-api --image=traefik/whoami:v1.10 >/dev/null
+    kubectl -n audit expose deploy audit-api --port=80 --type=NodePort --dry-run=client -o json | jq '.spec.ports[0].nodePort=30200' | kubectl apply -f - >/dev/null
+  check: |
+    check_eq "externalTrafficPolicy" "$(kj -n audit svc audit-api '{.spec.externalTrafficPolicy}')" "Local"
+    wait_deploy audit audit-api 60
+    check "node01:30200 still answers" 'eventually 15 "curl -fs -m 3 http://node01:30200 | grep -q Hostname"'
+  solve: |
+    kubectl patch svc audit-api -n audit -p '{"spec":{"externalTrafficPolicy":"Local"}}'
+
+- id: k8s-057
+  title: Port-forward for a quick look
+  difficulty: 2
+  kind: build
+  tags: [port-forward, debugging]
+  scenario: |
+    The **`admin-ui`** service in namespace **`internal`** is deliberately not exposed
+    outside the cluster. You need to read its version page once.
+
+    Use **`kubectl port-forward`** to reach the service from the control plane and save
+    the response of **`/version`** to **`/lab/admin-version.txt`**. Don't create any new
+    services.
+  hints:
+    - "`kubectl port-forward svc/admin-ui 8080:80 -n internal &` then `curl localhost:8080/version`."
+    - "Kill the background port-forward afterwards (`kill %1`)."
+  solution: |
+    ```bash
+    kubectl port-forward svc/admin-ui -n internal 8080:80 &
+    sleep 2
+    curl -s localhost:8080/version > /lab/admin-version.txt
+    kill %1
+    ```
+  setup: |
+    k_ns internal
+    v="admin-ui build $(date +%Y.%m).$RANDOM"; echo "$v" > $KL_STATE/answer
+    kubectl -n internal create configmap admin-ui --from-literal=version="$v" >/dev/null
+    kubectl apply -f - >/dev/null <<'EOF'
+    apiVersion: apps/v1
+    kind: Deployment
+    metadata: {name: admin-ui, namespace: internal}
+    spec:
+      selector: {matchLabels: {app: admin-ui}}
+      template:
+        metadata: {labels: {app: admin-ui}}
+        spec:
+          containers:
+          - name: nginx
+            image: nginx:1.28-alpine
+            volumeMounts: [{name: v, mountPath: /usr/share/nginx/html/version, subPath: version}]
+          volumes: [{name: v, configMap: {name: admin-ui}}]
+    EOF
+    kubectl -n internal expose deploy admin-ui --port=80 >/dev/null
+  check: |
+    check_eq "/lab/admin-version.txt" "$(cat /lab/admin-version.txt 2>/dev/null)" "$(cat $KL_STATE/answer)"
+    check_eq "no extra services" "$(kubectl -n internal get svc -o name | wc -l | tr -d ' ')" "1"
+  solve: |
+    kubectl -n internal rollout status deploy/admin-ui --timeout=60s
+    kubectl port-forward svc/admin-ui -n internal 18080:80 >/dev/null 2>&1 &
+    pf=$!; sleep 3
+    curl -s localhost:18080/version > /lab/admin-version.txt
+    kill $pf
+
+- id: k8s-058
+  title: Traffic leaking to the debug pod
+  difficulty: 3
+  kind: fix
+  tags: [service, selectors, troubleshooting]
+  scenario: |
+    About a third of the requests to the **`orders`** service (namespace **`shop`**)
+    return garbage. Someone started a debugging pod that happens to carry the label
+    `app=orders`.
+
+    Make the service send traffic **only to the pods of the `orders` deployment**, by
+    tightening the **service selector** (the deployment's pods have an additional label
+    you can use). Don't delete or relabel the debug pod — its owner is still using it.
+  hints:
+    - "`kubectl get pods -n shop --show-labels`"
+    - "Add a second key to the service selector."
+  solution: |
+    ```bash
+    kubectl get pods -n shop --show-labels
+    kubectl patch svc orders -n shop -p '{"spec":{"selector":{"app":"orders","component":"api"}}}'
+    ```
+  setup: |
+    k_ns shop
+    kubectl apply -f - >/dev/null <<'EOF'
+    apiVersion: apps/v1
+    kind: Deployment
+    metadata: {name: orders, namespace: shop}
+    spec:
+      replicas: 2
+      selector: {matchLabels: {app: orders, component: api}}
+      template:
+        metadata: {labels: {app: orders, component: api}}
+        spec:
+          containers: [{name: api, image: "traefik/whoami:v1.10"}]
+    ---
+    apiVersion: v1
+    kind: Service
+    metadata: {name: orders, namespace: shop}
+    spec:
+      selector: {app: orders}
+      ports: [{port: 80}]
+    ---
+    apiVersion: v1
+    kind: Pod
+    metadata: {name: debug-orders, namespace: shop, labels: {app: orders, owner: alice}}
+    spec:
+      containers: [{name: nginx, image: "nginx:1.28-alpine"}]
+    EOF
+  check: |
+    check "debug pod still exists with its labels" '[ "$(kj -n shop pod debug-orders "{.metadata.labels.app}")" = orders ]'
+    wait_deploy shop orders 60
+    want=$(kubectl -n shop get pods -l component=api -o jsonpath='{.items[*].status.podIP}' | tr ' ' '\n' | sort | tr '\n' ' ')
+    eventually 15 '[ "$(kubectl -n shop get endpointslices -l kubernetes.io/service-name=orders -o jsonpath="{.items[*].endpoints[*].addresses[*]}" | tr " " "\n" | sort | tr "\n" " ")" = "$want" ]'
+    got=$(kubectl -n shop get endpointslices -l kubernetes.io/service-name=orders -o jsonpath='{.items[*].endpoints[*].addresses[*]}' | tr ' ' '\n' | sort | tr '\n' ' ')
+    check_eq "endpoints are exactly the deployment's pods" "$got" "$want"
+  solve: |
+    kubectl patch svc orders -n shop -p '{"spec":{"selector":{"app":"orders","component":"api"}}}'
+
+- id: k8s-059
+  title: Which pods are out of rotation?
+  difficulty: 3
+  kind: build
+  tags: [endpointslice, readiness]
+  scenario: |
+    The **`search`** service (namespace **`catalog`**) is backed by 5 pods, but some of them
+    are failing their readiness probe and have been taken out of rotation.
+
+    Write the **names of the pods that are NOT receiving traffic**, one per line, to
+    **`/lab/out-of-rotation.txt`**.
+  hints:
+    - "EndpointSlices list every backend with `conditions.ready` and a `targetRef` naming the pod."
+    - "`kubectl get endpointslices -n catalog -l kubernetes.io/service-name=search -o yaml`"
+  solution: |
+    ```bash
+    kubectl get endpointslices -n catalog -l kubernetes.io/service-name=search \
+      -o jsonpath='{range .items[*].endpoints[?(@.conditions.ready==false)]}{.targetRef.name}{"\n"}{end}' \
+      > /lab/out-of-rotation.txt
+    ```
+    `kubectl get pods` (READY column `0/1`) tells you the same thing.
+  setup: |
+    k_ns catalog
+    for d in "search 3 /bin/true" "search-next 2 /bin/false"; do set -- $d
+      kubectl apply -f - >/dev/null <<EOF
+    apiVersion: apps/v1
+    kind: Deployment
+    metadata: {name: $1, namespace: catalog}
+    spec:
+      replicas: $2
+      selector: {matchLabels: {app: search, deploy: $1}}
+      template:
+        metadata: {labels: {app: search, deploy: $1}}
+        spec:
+          containers:
+          - name: search
+            image: busybox:1.37
+            command: ["sleep", "infinity"]
+            readinessProbe:
+              exec: {command: ["$3"]}
+              periodSeconds: 2
+    EOF
+    done
+    kubectl -n catalog create service clusterip search --tcp=80:80 --dry-run=client -o json | jq '.spec.selector={"app":"search"}' | kubectl apply -f - >/dev/null
+    sleep 15
+  check: |
+    want=$(kubectl -n catalog get pods -l app=search -o json | jq -r '.items[] | select(any(.status.conditions[]?; .type=="Ready" and .status!="True")) | .metadata.name' | sort | tr '\n' ' ')
+    check_eq "out-of-rotation pods" "$(grep -v '^\s*$' /lab/out-of-rotation.txt 2>/dev/null | sort | tr '\n' ' ')" "$want"
+  solve: |
+    kubectl get endpointslices -n catalog -l kubernetes.io/service-name=search -o jsonpath='{range .items[*].endpoints[?(@.conditions.ready==false)]}{.targetRef.name}{"\n"}{end}' > /lab/out-of-rotation.txt
+
+- id: k8s-060
+  title: "Incident: the storefront can't reach its backends"
+  difficulty: 4
+  kind: fix
+  tags: [service, dns, incident, troubleshooting]
+  scenario: |
+    The **`storefront`** pod (namespace **`web`**) calls two backends. Its logs show both
+    calls failing:
+
+    - `CART_URL` → the **`cart`** service in namespace **`cart`**
+    - `PRICES_URL` → the **`prices`** service in namespace **`web`**
+
+    Fix whatever is needed (services, deployment env) so that **both URLs return HTTP
+    200 from inside the storefront pod**. Don't change the backend deployments.
+  hints:
+    - "`kubectl logs deploy/storefront -n web`, then inspect each service: selector, ports, endpoints."
+    - "A short name like `cart` only resolves within the *same* namespace."
+  solution: |
+    ```bash
+    kubectl -n web logs deploy/storefront
+    # 1) CART_URL=http://cart  -> lives in namespace "cart": use http://cart.cart.svc.cluster.local
+    kubectl -n web set env deploy/storefront CART_URL=http://cart.cart.svc.cluster.local
+    # 2) cart service selects app=carts (typo)
+    kubectl -n cart patch svc cart -p '{"spec":{"selector":{"app":"cart"}}}'
+    # 3) prices service targetPort 80, but agnhost listens on 8080
+    kubectl -n web patch svc prices --type=json -p '[{"op":"replace","path":"/spec/ports/0/targetPort","value":8080}]'
+    ```
+  setup: |
+    k_ns web; k_ns cart
+    kubectl apply -f - >/dev/null <<'EOF'
+    apiVersion: apps/v1
+    kind: Deployment
+    metadata: {name: cart, namespace: cart}
+    spec:
+      selector: {matchLabels: {app: cart}}
+      template:
+        metadata: {labels: {app: cart}}
+        spec:
+          containers: [{name: cart, image: "traefik/whoami:v1.10"}]
+    ---
+    apiVersion: v1
+    kind: Service
+    metadata: {name: cart, namespace: cart}
+    spec:
+      selector: {app: carts}
+      ports: [{port: 80}]
+    ---
+    apiVersion: apps/v1
+    kind: Deployment
+    metadata: {name: prices, namespace: web}
+    spec:
+      selector: {matchLabels: {app: prices}}
+      template:
+        metadata: {labels: {app: prices}}
+        spec:
+          containers:
+          - {name: prices, image: "registry.k8s.io/e2e-test-images/agnhost:2.53", args: ["netexec", "--http-port=8080"]}
+    ---
+    apiVersion: v1
+    kind: Service
+    metadata: {name: prices, namespace: web}
+    spec:
+      selector: {app: prices}
+      ports: [{port: 80, targetPort: 80}]
+    ---
+    apiVersion: apps/v1
+    kind: Deployment
+    metadata: {name: storefront, namespace: web}
+    spec:
+      selector: {matchLabels: {app: storefront}}
+      template:
+        metadata: {labels: {app: storefront}}
+        spec:
+          containers:
+          - name: storefront
+            image: curlimages/curl:8.11.1
+            env:
+            - {name: CART_URL, value: "http://cart"}
+            - {name: PRICES_URL, value: "http://prices/hostname"}
+            command: ["sh", "-c", "while true; do for u in $CART_URL $PRICES_URL; do echo \"$u -> $(curl -s -o /dev/null -m 3 -w '%{http_code}' $u)\"; done; sleep 5; done"]
+    EOF
+  check: |
+    wait_deploy web storefront 60; wait_deploy web prices 60; wait_deploy cart cart 60
+    pod=$(kubectl -n web get pods -l app=storefront --sort-by=.metadata.creationTimestamp -o json 2>/dev/null | jq -r '[.items[] | select(.metadata.deletionTimestamp == null)] | last | .metadata.name')
+    cu=$(kubectl -n web exec "$pod" -- printenv CART_URL 2>/dev/null)
+    pu=$(kubectl -n web exec "$pod" -- printenv PRICES_URL 2>/dev/null)
+    check_eq "CART_URL returns 200" "$(kubectl -n web exec "$pod" -- curl -s -o /dev/null -m 5 -w '%{http_code}' "$cu" 2>/dev/null)" "200"
+    check_eq "PRICES_URL returns 200" "$(kubectl -n web exec "$pod" -- curl -s -o /dev/null -m 5 -w '%{http_code}' "$pu" 2>/dev/null)" "200"
+    check_eq "backend deployments unchanged (cart image)" "$(deploy_images cart cart)" "traefik/whoami:v1.10"
+  solve: |
+    kubectl -n web set env deploy/storefront CART_URL=http://cart.cart.svc.cluster.local
+    kubectl -n cart patch svc cart -p '{"spec":{"selector":{"app":"cart"}}}'
+    kubectl -n web patch svc prices --type=json -p '[{"op":"replace","path":"/spec/ports/0/targetPort","value":8080}]'
+    kubectl -n web rollout status deploy/storefront --timeout=60s

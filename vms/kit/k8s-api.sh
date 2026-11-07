@@ -28,7 +28,6 @@ snapshot() {
 
 reset() {
   wait_api 240 || { echo "API server not reachable" >&2; exit 1; }
-  /opt/kubelab/hooks.sh
   local k o n
   # kube-system core objects
   for o in $SYS_OBJS; do
@@ -36,6 +35,8 @@ reset() {
       kl_restore_obj "${o%/*}" "${o#*/}" && echo "restored kube-system $o"
     fi
   done
+  # exercise clean-up hooks (after core objects are back)
+  /opt/kubelab/hooks.sh
   # nodes: labels, taints, schedulability
   jq -c '.[]' "$P/nodes.json" | while read -r node; do
     n=$(jq -r .name <<<"$node")
