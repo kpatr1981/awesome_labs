@@ -129,15 +129,21 @@ func Run(ctx context.Context, name string, s Script, out io.Writer) (int, error)
 	body := pre.String() + s.Body
 
 	args := []string{"shell", "--workdir", wd, name, "--"}
+	sudo := ""
 	if s.AsRoot {
-		args = append(args, "sudo", "-H")
+		sudo = "sudo -H "
 	}
 	var stdin io.Reader
 	if s.Stdin != nil {
-		args = append(args, "bash", "-c", body)
+		args = append(args, "bash", "-c", sudo+"bash -c "+shellQuote(body))
 		stdin = s.Stdin
 	} else {
-		args = append(args, "bash", "-s")
+		// Upload the script to a temp file first, then run it with stdin from
+		// /dev/null: commands inside it (ssh, kubectl -f -, read...) must not be
+		// able to swallow the rest of the script.
+		runner := `f=$(mktemp /tmp/kubelab-XXXXXX.sh) && cat >"$f" && chmod 644 "$f" && ` +
+			sudo + `bash "$f" </dev/null; rc=$?; rm -f "$f"; exit $rc`
+		args = append(args, "bash", "-c", runner)
 		stdin = strings.NewReader(body)
 	}
 	cmd := exec.CommandContext(ctx, Binary, args...)

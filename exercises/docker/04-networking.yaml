@@ -1,0 +1,727 @@
+track: docker
+module: Networking
+profile: docker
+order: 4
+exercises:
+
+- id: docker-061
+  title: Containers that find each other by name
+  difficulty: 1
+  kind: build
+  tags: [network, dns]
+  scenario: |
+    Create a user-defined bridge network **`shopnet`**. On it, run:
+
+    - **`api`** from `traefik/whoami:v1.10`
+    - **`client`** from `busybox:1.37` running `sleep infinity`
+
+    From inside `client`, `wget -qO- http://api` must work — by name, no IPs.
+  hints:
+    - "`docker network create NAME`, then `docker run --network NAME ...`"
+  solution: |
+    ```bash
+    docker network create shopnet
+    docker run -d --name api --network shopnet traefik/whoami:v1.10
+    docker run -d --name client --network shopnet busybox:1.37 sleep infinity
+    docker exec client wget -qO- http://api
+    ```
+    User-defined networks come with an embedded DNS server (127.0.0.11) that resolves
+    container names. The default `bridge` network doesn't.
+  check: |
+    check "network shopnet exists" 'docker network inspect shopnet'
+    check "api and client are on shopnet" 'docker network inspect shopnet -f "{{range .Containers}}{{.Name}} {{end}}" | grep -qw api && docker network inspect shopnet -f "{{range .Containers}}{{.Name}} {{end}}" | grep -qw client'
+    check "client reaches api by name" 'docker exec client wget -qO- -T 3 http://api | grep -q Hostname'
+  solve: |
+    docker network create shopnet
+    docker run -d --name api --network shopnet traefik/whoami:v1.10
+    docker run -d --name client --network shopnet busybox:1.37 sleep infinity
+
+- id: docker-062
+  title: Admin panel for localhost only
+  difficulty: 1
+  kind: build
+  tags: [ports, security]
+  scenario: |
+    The **`admin`** panel (`nginx:1.28-alpine`) must be reachable on port **8100** of the
+    docker host **only from the host itself** — not from other machines on the network.
+  hints:
+    - "`-p` accepts an IP: `-p IP:HOSTPORT:CONTAINERPORT`."
+  solution: |
+    ```bash
+    docker run -d --name admin -p 127.0.0.1:8100:80 nginx:1.28-alpine
+    docker port admin     # 80/tcp -> 127.0.0.1:8100
+    ```
+    Without an IP, docker publishes on all interfaces (`0.0.0.0` and `::`).
+  check: |
+    check "admin is running" 'c_running admin'
+    check_eq "published only on 127.0.0.1:8100" "$(docker port admin 80/tcp 2>/dev/null | sort -u | tr '\n' ' ' | sed 's/ $//')" "127.0.0.1:8100"
+    check "http://127.0.0.1:8100 works" 'http_get 127.0.0.1:8100 | grep -q nginx'
+    ip=$(hostname -I | awk '{print $1}')
+    check_not "not reachable on the VM's external IP ($ip)" "curl -s -m 3 http://$ip:8100"
+  solve: |
+    docker run -d --name admin -p 127.0.0.1:8100:80 nginx:1.28-alpine
+
+- id: docker-063
+  title: Let docker pick the port
+  difficulty: 1
+  kind: build
+  tags: [ports]
+  scenario: |
+    For a throw-away test you don't care which host port is used.
+
+    Run **`scratchpad`** from `traefik/whoami:v1.10`, publishing its exposed port on a
+    **random host port chosen by docker**. Then write that port number to
+    **`/lab/port.txt`**.
+  hints:
+    - "`-P` (capital) publishes all `EXPOSE`d ports to random host ports."
+    - "`docker port scratchpad`"
+  solution: |
+    ```bash
+    docker run -d --name scratchpad -P traefik/whoami:v1.10
+    docker port scratchpad 80 | head -1 | cut -d: -f2 > /lab/port.txt
+    curl localhost:$(cat /lab/port.txt)
+    ```
+  check: |
+    check "scratchpad is running" 'c_running scratchpad'
+    check_eq "PublishAllPorts" "$(c_get scratchpad '{{.HostConfig.PublishAllPorts}}')" "true"
+    p=$(tr -d '[:space:]' < /lab/port.txt 2>/dev/null)
+    check "/lab/port.txt holds the published port" "docker port scratchpad 80 | grep -q \":$p\$\""
+    check "the port answers" "http_get localhost:$p | grep -q Hostname"
+  solve: |
+    docker run -d --name scratchpad -P traefik/whoami:v1.10
+    docker port scratchpad 80 | head -1 | awk -F: '{print $NF}' > /lab/port.txt
+
+- id: docker-064
+  title: Who is on the payments network?
+  difficulty: 1
+  kind: build
+  tags: [network, inspect]
+  scenario: |
+    An auditor asks which containers are attached to the network **`payments-net`**.
+
+    Write their names, one per line, to **`/lab/payments-members.txt`**.
+  hints:
+    - "`docker network inspect payments-net`"
+  solution: |
+    ```bash
+    docker network inspect payments-net -f '{{range .Containers}}{{println .Name}}{{end}}' > /lab/payments-members.txt
+    ```
+    or: `docker ps --filter network=payments-net --format '{{.Names}}'`
+  setup: |
+    docker network create payments-net >/dev/null
+    docker network create web-net >/dev/null
+    for n in ledger fraud-check; do docker run -d --name $n --network payments-net busybox:1.37 sleep infinity >/dev/null; done
+    for n in storefront search; do docker run -d --name $n --network web-net busybox:1.37 sleep infinity >/dev/null; done
+    docker run -d --name card-gateway --network web-net busybox:1.37 sleep infinity >/dev/null
+    docker network connect payments-net card-gateway
+  check: |
+    check_eq "members" "$(grep -v '^\s*$' /lab/payments-members.txt 2>/dev/null | sort | tr '\n' ' ' | sed 's/ $//')" "card-gateway fraud-check ledger"
+  solve: |
+    docker network inspect payments-net -f '{{range .Containers}}{{println .Name}}{{end}}' | grep -v '^$' > /lab/payments-members.txt
+
+- id: docker-065
+  title: The port mapping points nowhere
+  difficulty: 2
+  kind: fix
+  tags: [ports, troubleshooting]
+  scenario: |
+    **`profile-svc`** (`traefik/whoami:v1.10`) runs fine, but `curl localhost:8102` gives
+    *connection reset* / *empty reply*.
+
+    Fix it so **http://localhost:8102** answers. Keep the name and image.
+  hints:
+    - "`docker port profile-svc` — which *container* port is published?"
+    - "Which port does the app actually listen on? Check the image's `ExposedPorts`."
+  solution: |
+    ```bash
+    docker port profile-svc                    # 8080/tcp -> 0.0.0.0:8102
+    docker image inspect traefik/whoami:v1.10 -f '{{.Config.ExposedPorts}}'   # 80/tcp
+    docker rm -f profile-svc
+    docker run -d --name profile-svc -p 8102:80 traefik/whoami:v1.10
+    ```
+  setup: |
+    docker run -d --name profile-svc -p 8102:8080 traefik/whoami:v1.10 >/dev/null
+  check: |
+    check "profile-svc is running" 'c_running profile-svc'
+    check_eq "image" "$(c_get profile-svc '{{.Config.Image}}')" "traefik/whoami:v1.10"
+    check "http://localhost:8102 answers" 'http_get localhost:8102 | grep -q Hostname'
+  solve: |
+    docker rm -f profile-svc
+    docker run -d --name profile-svc -p 8102:80 traefik/whoami:v1.10
+
+- id: docker-066
+  title: "Name does not resolve"
+  difficulty: 2
+  kind: fix
+  tags: [network, dns, troubleshooting]
+  scenario: |
+    The **`app`** container is configured to talk to Redis at host **`cache`**, but
+    keeps logging `bad address 'cache'`. Both containers are running.
+
+    Fix the name resolution **without recreating either container**. Put the
+    containers on a new user-defined network called **`backend`**.
+  hints:
+    - "Which network are they on now? `docker inspect app -f '{{json .NetworkSettings.Networks}}'`"
+    - "`docker network connect NETWORK CONTAINER` attaches a running container."
+  solution: |
+    ```bash
+    docker network create backend
+    docker network connect backend cache
+    docker network connect backend app
+    docker exec app nslookup cache
+    ```
+    The default `bridge` network has no DNS for container names (only the deprecated
+    `--link`).
+  setup: |
+    docker run -d --name cache redis:7.4-alpine >/dev/null
+    docker run -d --name app busybox:1.37 sh -c 'while true; do if nc -z -w 2 cache 6379 2>&1; then echo "connected to cache"; else echo "bad address cache"; fi; sleep 3; done' >/dev/null
+    docker inspect -f '{{.Id}}' app > $KL_STATE/answer
+    docker inspect -f '{{.Id}}' cache >> $KL_STATE/answer
+  check: |
+    check_eq "containers were not recreated" "$( (c_get app '{{.Id}}'; c_get cache '{{.Id}}') | tr '\n' ' ')" "$(tr '\n' ' ' < $KL_STATE/answer)"
+    check "both are on network backend" '[ "$(docker network inspect backend -f "{{len .Containers}}" 2>/dev/null)" -ge 2 ] && docker network inspect backend | grep -q "\"Name\": \"app\"" && docker network inspect backend | grep -q "\"Name\": \"cache\""'
+    check "app reaches cache:6379 by name" 'docker exec app nc -z -w 3 cache 6379'
+  solve: |
+    docker network create backend
+    docker network connect backend cache
+    docker network connect backend app
+
+- id: docker-067
+  title: More than one name for the database
+  difficulty: 2
+  kind: build
+  tags: [network, alias]
+  scenario: |
+    Different legacy services expect the database under different host names.
+
+    On a new network **`data`**, run **`pg`** (`postgres:16-alpine`, password `pw`) so
+    that it can also be reached as **`db.internal`** and **`primary`**.
+    Run **`tester`** (`busybox:1.37`, `sleep infinity`) on the same network to prove it.
+  hints:
+    - "`docker run --network data --network-alias NAME ...` (repeatable)"
+  solution: |
+    ```bash
+    docker network create data
+    docker run -d --name pg --network data --network-alias db.internal --network-alias primary \
+      -e POSTGRES_PASSWORD=pw postgres:16-alpine
+    docker run -d --name tester --network data busybox:1.37 sleep infinity
+    docker exec tester nslookup db.internal
+    ```
+  check: |
+    check "pg and tester are running" 'c_running pg && c_running tester'
+    ip=$(c_get pg '{{range .NetworkSettings.Networks}}{{.IPAddress}}{{end}}')
+    for n in pg db.internal primary; do
+      check "'$n' resolves to pg" "docker exec tester nslookup -type=a $n. 2>/dev/null | grep -q 'Address: $ip'"
+    done
+  solve: |
+    docker network create data
+    docker run -d --name pg --network data --network-alias db.internal --network-alias primary -e POSTGRES_PASSWORD=pw postgres:16-alpine
+    docker run -d --name tester --network data busybox:1.37 sleep infinity
+
+- id: docker-068
+  title: A batch job with no network at all
+  difficulty: 2
+  kind: build
+  tags: [network, none, security]
+  scenario: |
+    A document-conversion job processes untrusted files and must have **no network
+    access whatsoever**.
+
+    Run **`converter`** from `busybox:1.37` (`sleep infinity`) with networking
+    **disabled** completely.
+  hints:
+    - "There's a built-in network called `none`."
+  solution: |
+    ```bash
+    docker run -d --name converter --network none busybox:1.37 sleep infinity
+    docker exec converter ip addr    # only lo
+    ```
+  check: |
+    check "converter is running" 'c_running converter'
+    check_eq "network mode" "$(c_get converter '{{.HostConfig.NetworkMode}}')" "none"
+    check_not "no interface besides lo" 'docker exec converter ip -o link | grep -v ": lo:"'
+  solve: |
+    docker run -d --name converter --network none busybox:1.37 sleep infinity
+
+- id: docker-069
+  title: Use the host's network stack
+  difficulty: 2
+  kind: build
+  tags: [network, host]
+  scenario: |
+    A latency-sensitive metrics endpoint should skip docker's NAT entirely.
+
+    Run **`edge-metrics`** from **`nginx:1.28-alpine`** using the **host's network
+    namespace**, so nginx listens directly on the docker host's port **80**.
+  hints:
+    - "`--network host` — and then `-p` is meaningless."
+  solution: |
+    ```bash
+    docker run -d --name edge-metrics --network host nginx:1.28-alpine
+    curl localhost:80
+    ```
+  check: |
+    check "edge-metrics is running" 'c_running edge-metrics'
+    check_eq "network mode" "$(c_get edge-metrics '{{.HostConfig.NetworkMode}}')" "host"
+    check "port 80 on the host serves nginx" 'http_get localhost:80 | grep -q nginx'
+  solve: |
+    docker run -d --name edge-metrics --network host nginx:1.28-alpine
+
+- id: docker-070
+  title: Pin a partner's address
+  difficulty: 2
+  kind: build
+  tags: [network, extra-hosts]
+  scenario: |
+    The payment partner's API is reachable at **10.20.30.40** through a VPN, but their
+    hostname **`payments.partner.local`** isn't in any DNS you control.
+
+    Run **`billing`** (`busybox:1.37`, `sleep infinity`) so that inside the container
+    `payments.partner.local` resolves to `10.20.30.40`.
+  hints:
+    - "`--add-host NAME:IP` writes an entry into the container's `/etc/hosts`."
+  solution: |
+    ```bash
+    docker run -d --name billing --add-host payments.partner.local:10.20.30.40 busybox:1.37 sleep infinity
+    docker exec billing cat /etc/hosts
+    ```
+  check: |
+    check "billing is running" 'c_running billing'
+    check "payments.partner.local -> 10.20.30.40" 'docker exec billing grep -E "^10\.20\.30\.40\s+payments\.partner\.local" /etc/hosts'
+  solve: |
+    docker run -d --name billing --add-host payments.partner.local:10.20.30.40 busybox:1.37 sleep infinity
+
+- id: docker-071
+  title: Corporate DNS settings
+  difficulty: 2
+  kind: build
+  tags: [dns]
+  scenario: |
+    Containers of the **`intranet`** service must use the corporate resolver
+    **`10.0.0.53`** and search domain **`corp.example`** (so `wiki` means
+    `wiki.corp.example`).
+
+    Run **`intranet`** (`busybox:1.37`, `sleep infinity`, default bridge network) with
+    those DNS settings.
+  hints:
+    - "`--dns` and `--dns-search`"
+  solution: |
+    ```bash
+    docker run -d --name intranet --dns 10.0.0.53 --dns-search corp.example busybox:1.37 sleep infinity
+    docker exec intranet cat /etc/resolv.conf
+    ```
+  check: |
+    check "intranet is running" 'c_running intranet'
+    rc=$(docker exec intranet cat /etc/resolv.conf 2>/dev/null)
+    check "nameserver 10.0.0.53" 'grep -q "^nameserver 10.0.0.53" <<<"$rc"'
+    check "search corp.example" 'grep -q "^search.*corp.example" <<<"$rc"'
+  solve: |
+    docker run -d --name intranet --dns 10.0.0.53 --dns-search corp.example busybox:1.37 sleep infinity
+
+- id: docker-072
+  title: Move a container between networks
+  difficulty: 2
+  kind: build
+  tags: [network, connect, disconnect]
+  scenario: |
+    **`reporting`** runs on the default `bridge` network. It should now live only on
+    the **`analytics`** network (which already exists, with the `warehouse` container on
+    it).
+
+    Attach `reporting` to `analytics` and **detach it from `bridge`** — without
+    restarting it.
+  hints:
+    - "`docker network connect` / `docker network disconnect`"
+  solution: |
+    ```bash
+    docker network connect analytics reporting
+    docker network disconnect bridge reporting
+    docker exec reporting ping -c1 warehouse
+    ```
+  setup: |
+    docker network create analytics >/dev/null
+    docker run -d --name warehouse --network analytics busybox:1.37 sleep infinity >/dev/null
+    docker run -d --name reporting busybox:1.37 sleep infinity >/dev/null
+    docker inspect -f '{{.State.StartedAt}}' reporting > $KL_STATE/answer
+  check: |
+    check_eq "not restarted" "$(c_get reporting '{{.State.StartedAt}}')" "$(cat $KL_STATE/answer)"
+    check_eq "networks" "$(c_get reporting '{{range $k, $v := .NetworkSettings.Networks}}{{$k}} {{end}}' | sed 's/ $//')" "analytics"
+    check "reporting reaches warehouse" 'docker exec reporting ping -c1 -W2 warehouse'
+  solve: |
+    docker network connect analytics reporting
+    docker network disconnect bridge reporting
+
+- id: docker-073
+  title: A network with no way out
+  difficulty: 3
+  kind: build
+  tags: [network, internal, security]
+  scenario: |
+    The secrets service must be reachable by its clients but must **never reach the
+    internet** (no data exfiltration).
+
+    - Create a network **`vault-net`** that has **no external connectivity**.
+    - Run **`vault`** (`traefik/whoami:v1.10`) and **`vault-client`** (`busybox:1.37`,
+      `sleep infinity`) on it.
+
+    `vault-client` must reach `http://vault`, but neither container may reach outside
+    addresses such as `1.1.1.1`.
+  hints:
+    - "`docker network create --internal`"
+  solution: |
+    ```bash
+    docker network create --internal vault-net
+    docker run -d --name vault --network vault-net traefik/whoami:v1.10
+    docker run -d --name vault-client --network vault-net busybox:1.37 sleep infinity
+    docker exec vault-client wget -qO- http://vault
+    docker exec vault-client wget -T 3 -qO- http://1.1.1.1   # fails
+    ```
+    An internal network gets no default route and no NAT to the outside.
+  check: |
+    check_eq "vault-net is internal" "$(docker network inspect vault-net -f '{{.Internal}}' 2>/dev/null)" "true"
+    check "vault-client reaches vault" 'docker exec vault-client wget -qO- -T 3 http://vault | grep -q Hostname'
+    check_not "vault-client cannot reach 1.1.1.1" 'docker exec vault-client wget -qO- -T 3 http://1.1.1.1'
+    check_eq "vault-client is only on vault-net" "$(c_get vault-client '{{range $k, $v := .NetworkSettings.Networks}}{{$k}} {{end}}' | sed 's/ $//')" "vault-net"
+    check_eq "vault is only on vault-net" "$(c_get vault '{{range $k, $v := .NetworkSettings.Networks}}{{$k}} {{end}}' | sed 's/ $//')" "vault-net"
+  solve: |
+    docker network create --internal vault-net
+    docker run -d --name vault --network vault-net traefik/whoami:v1.10
+    docker run -d --name vault-client --network vault-net busybox:1.37 sleep infinity
+
+- id: docker-074
+  title: A fixed subnet and a static IP
+  difficulty: 3
+  kind: build
+  tags: [network, ipam, static-ip]
+  scenario: |
+    A legacy licence server only accepts connections from a whitelisted address.
+
+    Create a network **`legacy-lan`** with subnet **`10.50.0.0/24`** and gateway
+    **`10.50.0.1`**. Run **`mainframe`** (`busybox:1.37`, `sleep infinity`) on it with the
+    fixed IP **`10.50.0.10`**.
+  hints:
+    - "`docker network create --subnet ... --gateway ...`"
+    - "`docker run --network legacy-lan --ip 10.50.0.10 ...` — static IPs require a user-defined subnet."
+  solution: |
+    ```bash
+    docker network create --subnet 10.50.0.0/24 --gateway 10.50.0.1 legacy-lan
+    docker run -d --name mainframe --network legacy-lan --ip 10.50.0.10 busybox:1.37 sleep infinity
+    ```
+  check: |
+    check_eq "subnet" "$(docker network inspect legacy-lan -f '{{range .IPAM.Config}}{{.Subnet}}{{end}}' 2>/dev/null)" "10.50.0.0/24"
+    check_eq "gateway" "$(docker network inspect legacy-lan -f '{{range .IPAM.Config}}{{.Gateway}}{{end}}' 2>/dev/null)" "10.50.0.1"
+    check_eq "mainframe IP" "$(c_get mainframe '{{(index .NetworkSettings.Networks "legacy-lan").IPAddress}}')" "10.50.0.10"
+    check_eq "IP is pinned in the config (survives restarts)" "$(c_get mainframe '{{(index .NetworkSettings.Networks "legacy-lan").IPAMConfig.IPv4Address}}')" "10.50.0.10"
+  solve: |
+    docker network create --subnet 10.50.0.0/24 --gateway 10.50.0.1 legacy-lan
+    docker run -d --name mainframe --network legacy-lan --ip 10.50.0.10 busybox:1.37 sleep infinity
+
+- id: docker-075
+  title: Published, but connection reset
+  difficulty: 3
+  kind: fix
+  tags: [ports, bind-address, troubleshooting]
+  scenario: |
+    **`stats`** serves a small dashboard on port 9000 inside the container, published as
+    **8101** on the host. Inside the container `wget -qO- localhost:9000` works, but from
+    the host `curl localhost:8101` fails.
+
+    Fix it so the dashboard answers on **http://localhost:8101**. Keep image and name.
+  hints:
+    - "`docker exec stats netstat -tln` — *which address* is the server listening on?"
+    - "Traffic from a published port arrives on the container's eth0, not on its loopback."
+  solution: |
+    ```bash
+    docker exec stats netstat -tln     # 127.0.0.1:9000
+    docker inspect stats --format '{{json .Config.Cmd}}'
+    docker rm -f stats
+    docker run -d --name stats -p 8101:9000 -v /lab/stats:/srv:ro -w /srv python:3.12-alpine \
+      python -m http.server 9000 --bind 0.0.0.0
+    ```
+    A server bound to 127.0.0.1 inside a container is only reachable from that same
+    container.
+  setup: |
+    echo '<h1>stats: 42 req/s</h1>' | lab_file /lab/stats/index.html
+    docker run -d --name stats -p 8101:9000 -v /lab/stats:/srv:ro -w /srv python:3.12-alpine python -m http.server 9000 --bind 127.0.0.1 >/dev/null
+  check: |
+    check "stats is running" 'c_running stats'
+    check_eq "image" "$(c_get stats '{{.Config.Image}}')" "python:3.12-alpine"
+    c_running stats && eventually 10 'http_get localhost:8101'
+    check "dashboard answers on 8101" 'http_get localhost:8101 | grep -q "42 req/s"'
+  solve: |
+    docker rm -f stats
+    docker run -d --name stats -p 8101:9000 -v /lab/stats:/srv:ro -w /srv python:3.12-alpine python -m http.server 9000 --bind 0.0.0.0
+
+- id: docker-076
+  title: Segment the network
+  difficulty: 3
+  kind: fix
+  tags: [network, segmentation]
+  scenario: |
+    Three tiers run on two networks:
+
+    | container | network |
+    |-----------|---------|
+    | `frontend` | `web-net` |
+    | `orders-api` | `api-net` |
+    | `orders-db` | `api-net` |
+
+    `frontend` must call `http://orders-api`, but it currently can't reach it. Fix this
+    so that **frontend reaches orders-api**, while **frontend still cannot reach
+    orders-db**. Don't recreate containers or merge the networks.
+  hints:
+    - "A container can be attached to several networks."
+    - "Which container needs to be on both networks?"
+  solution: |
+    ```bash
+    docker network connect web-net orders-api
+    docker exec frontend wget -qO- http://orders-api
+    docker exec frontend nc -z -w 2 orders-db 5432   # still fails
+    ```
+    Attach the *middle* tier to both networks; the database stays on the private one.
+  setup: |
+    docker network create web-net >/dev/null; docker network create api-net >/dev/null
+    docker run -d --name orders-db --network api-net -e POSTGRES_PASSWORD=pw postgres:16-alpine >/dev/null
+    docker run -d --name orders-api --network api-net traefik/whoami:v1.10 >/dev/null
+    docker run -d --name frontend --network web-net busybox:1.37 sleep infinity >/dev/null
+  check: |
+    check "frontend reaches orders-api" 'docker exec frontend wget -qO- -T 3 http://orders-api | grep -q Hostname'
+    check_not "frontend cannot reach orders-db" 'docker exec frontend nc -z -w 3 orders-db 5432'
+    check_eq "frontend stays on web-net only" "$(c_get frontend '{{range $k, $v := .NetworkSettings.Networks}}{{$k}} {{end}}' | sed 's/ $//')" "web-net"
+    check_eq "orders-db stays on api-net only" "$(c_get orders-db '{{range $k, $v := .NetworkSettings.Networks}}{{$k}} {{end}}' | sed 's/ $//')" "api-net"
+  solve: |
+    docker network connect web-net orders-api
+
+- id: docker-077
+  title: Poor man's load balancing
+  difficulty: 3
+  kind: build
+  tags: [network, alias, dns-round-robin]
+  scenario: |
+    Run **three** replicas of `traefik/whoami:v1.10` named **`web1`**, **`web2`** and
+    **`web3`** on a network **`lb`**, all answering to the shared DNS name **`backend`**.
+
+    Then run **`client`** (`busybox:1.37`, `sleep infinity`) on `lb`. Resolving `backend`
+    from the client must return **all three** IP addresses.
+  hints:
+    - "Give each replica the same `--network-alias`."
+  solution: |
+    ```bash
+    docker network create lb
+    for i in 1 2 3; do docker run -d --name web$i --network lb --network-alias backend traefik/whoami:v1.10; done
+    docker run -d --name client --network lb busybox:1.37 sleep infinity
+    docker exec client nslookup backend
+    for i in 1 2 3 4 5 6; do docker exec client wget -qO- http://backend | grep Hostname; done
+    ```
+    Docker's DNS returns all addresses of an alias in random order — simple
+    client-side round robin. (Compose does this automatically for scaled services.)
+  check: |
+    for i in 1 2 3; do check "web$i is running" "c_running web$i"; done
+    n=$(docker exec client nslookup -type=a backend. 2>/dev/null | grep -A10 "^Name:" | grep -c "^Address")
+    check_eq "backend resolves to 3 addresses" "$n" "3"
+    check "backend answers HTTP" 'docker exec client wget -qO- -T 3 http://backend | grep -q Hostname'
+  solve: |
+    docker network create lb
+    for i in 1 2 3; do docker run -d --name web$i --network lb --network-alias backend traefik/whoami:v1.10; done
+    docker run -d --name client --network lb busybox:1.37 sleep infinity
+
+- id: docker-078
+  title: A reverse proxy in front of the API
+  difficulty: 3
+  kind: build
+  tags: [reverse-proxy, nginx, network]
+  scenario: |
+    Put nginx in front of the API:
+
+    - network **`edge`**
+    - **`api`**: `traefik/whoami:v1.10` on `edge` (not published to the host)
+    - **`gateway`**: `nginx:1.28-alpine` on `edge`, published on **8103** → 80, using the
+      config in **`/lab/gateway/default.conf`** (finish the `TODO` in it)
+
+    Expected:
+    - `curl localhost:8103/` → nginx welcome page
+    - `curl localhost:8103/api/` → the whoami output from `api`
+  hints:
+    - "In the config: `proxy_pass http://api:80/;` — the trailing slash strips the `/api/` prefix."
+    - "Mount the file at `/etc/nginx/conf.d/default.conf`."
+  solution: |
+    ```nginx
+    server {
+        listen 80;
+        location / { root /usr/share/nginx/html; }
+        location /api/ {
+            proxy_pass http://api:80/;
+            proxy_set_header Host $host;
+        }
+    }
+    ```
+    ```bash
+    docker network create edge
+    docker run -d --name api --network edge traefik/whoami:v1.10
+    docker run -d --name gateway --network edge -p 8103:80 \
+      -v /lab/gateway/default.conf:/etc/nginx/conf.d/default.conf:ro nginx:1.28-alpine
+    curl localhost:8103/api/
+    ```
+  setup: |
+    lab_file /lab/gateway/default.conf <<'EOF'
+    server {
+        listen 80;
+        location / { root /usr/share/nginx/html; }
+        location /api/ {
+            # TODO: forward requests to the api container
+        }
+    }
+    EOF
+  check: |
+    check "api is not published on the host" '[ -z "$(docker port api 2>/dev/null)" ]'
+    check "gateway is running" 'c_running gateway'
+    check "/ shows the nginx page" 'http_get localhost:8103/ | grep -q "Welcome to nginx"'
+    check "/api/ is proxied to api" 'http_get localhost:8103/api/ | grep -q "Hostname: $(c_get api "{{.Config.Hostname}}")"'
+  solve: |
+    cat > /lab/gateway/default.conf <<'EOF'
+    server {
+        listen 80;
+        location / { root /usr/share/nginx/html; }
+        location /api/ {
+            proxy_pass http://api:80/;
+            proxy_set_header Host $host;
+        }
+    }
+    EOF
+    docker network create edge
+    docker run -d --name api --network edge traefik/whoami:v1.10
+    docker run -d --name gateway --network edge -p 8103:80 -v /lab/gateway/default.conf:/etc/nginx/conf.d/default.conf:ro nginx:1.28-alpine
+
+- id: docker-079
+  title: 502 after every backend redeploy
+  difficulty: 4
+  kind: fix
+  tags: [reverse-proxy, nginx, dns, troubleshooting]
+  scenario: |
+    The **`gateway`** (nginx, port **8104**) proxies to the **`app`** container on network
+    **`mesh`**. Every time `app` is redeployed, the gateway returns **502 Bad Gateway**
+    until somebody restarts it. `app` was redeployed ten minutes ago…
+
+    Fix the gateway's configuration (**`/lab/mesh-gateway/default.conf`**) so that it keeps
+    working **across future redeploys of `app`** without restarting nginx.
+    (You'll need to reload or restart it once to apply the new config.)
+  hints:
+    - "nginx resolves host names in `proxy_pass http://app:80` once, at start-up, and caches the IP forever."
+    - "Docker's embedded DNS server is `127.0.0.11`. With `resolver 127.0.0.11 valid=10s;` and a *variable* in `proxy_pass`, nginx resolves at request time."
+  solution: |
+    ```nginx
+    server {
+        listen 80;
+        resolver 127.0.0.11 valid=10s ipv6=off;
+        location / {
+            set $upstream http://app:80;
+            proxy_pass $upstream;
+        }
+    }
+    ```
+    ```bash
+    docker exec gateway nginx -s reload
+    curl localhost:8104
+    ```
+  setup: |
+    lab_file /lab/mesh-gateway/default.conf <<'EOF'
+    server {
+        listen 80;
+        location / {
+            proxy_pass http://app:80;
+        }
+    }
+    EOF
+    docker network create --subnet 10.77.0.0/24 mesh >/dev/null
+    docker run -d --name app --network mesh --ip 10.77.0.10 traefik/whoami:v1.10 >/dev/null
+    docker run -d --name gateway --network mesh --ip 10.77.0.2 -p 8104:80 -v /lab/mesh-gateway:/etc/nginx/conf.d:ro nginx:1.28-alpine >/dev/null
+    sleep 2
+    http_get localhost:8104 >/dev/null 2>&1
+    # the redeploy: new container, new IP
+    docker rm -f app >/dev/null
+    docker run -d --name app --network mesh --ip 10.77.0.20 traefik/whoami:v1.10 >/dev/null
+  check: |
+    check "gateway answers now" 'http_get localhost:8104 | grep -q Hostname'
+    # simulate another redeploy with a different IP
+    cur=$(c_get app '{{(index .NetworkSettings.Networks "mesh").IPAddress}}')
+    new=10.77.0.30; [ "$cur" = "$new" ] && new=10.77.0.40
+    docker rm -f app >/dev/null 2>&1
+    docker run -d --name app --network mesh --ip $new traefik/whoami:v1.10 >/dev/null 2>&1
+    sleep 12
+    check "gateway still answers after app is redeployed" 'eventually 10 "http_get localhost:8104 | grep -q Hostname"'
+  solve: |
+    cat > /lab/mesh-gateway/default.conf <<'EOF'
+    server {
+        listen 80;
+        resolver 127.0.0.11 valid=10s ipv6=off;
+        location / {
+            set $upstream http://app:80;
+            proxy_pass $upstream;
+        }
+    }
+    EOF
+    docker exec gateway nginx -s reload
+
+- id: docker-080
+  title: "Incident: the microservices can't talk"
+  difficulty: 4
+  kind: fix
+  tags: [network, incident, troubleshooting]
+  scenario: |
+    After a "network cleanup" the order flow is broken. The intended design:
+
+    ```text
+    host:8105 → storefront (nginx) → checkout (whoami) on network "shop"
+                                     checkout → payments (whoami) on network "pay"
+    ```
+
+    - `curl localhost:8105/checkout/` must return checkout's whoami page (the proxy config
+      in `/lab/storefront/default.conf` is correct — don't edit it).
+    - **`checkout`** must reach `http://payments`. (The whoami image has no shell; test
+      from its network namespace with
+      `docker run --rm --network container:checkout busybox:1.37 wget -qO- http://payments`.)
+    - **`storefront`** must **not** be able to reach `payments`.
+
+    Fix whatever is broken. Container names and images stay the same.
+  hints:
+    - "Map out the current state: `docker network ls`, `docker network inspect shop`, `docker port storefront`."
+    - "There are three separate problems."
+  solution: |
+    ```bash
+    docker network inspect shop pay --format '{{.Name}}: {{range .Containers}}{{.Name}} {{end}}'
+    # 1) checkout was disconnected from "shop"
+    docker network connect shop checkout
+    # 2) payments sits on "shop" instead of "pay"
+    docker network connect pay payments && docker network disconnect shop payments
+    # 3) checkout must also be on "pay" to reach payments
+    docker network connect pay checkout
+    # 4) storefront is published on 8150 instead of 8105 -> recreate
+    docker rm -f storefront
+    docker run -d --name storefront --network shop -p 8105:80 \
+      -v /lab/storefront/default.conf:/etc/nginx/conf.d/default.conf:ro nginx:1.28-alpine
+    ```
+  setup: |
+    lab_file /lab/storefront/default.conf <<'EOF'
+    server {
+        listen 80;
+        resolver 127.0.0.11 valid=5s ipv6=off;
+        location /checkout/ { set $u http://checkout:80; proxy_pass $u; }
+        location / { return 200 "storefront\n"; }
+    }
+    EOF
+    docker network create shop >/dev/null; docker network create pay >/dev/null
+    docker run -d --name payments --network shop traefik/whoami:v1.10 >/dev/null
+    docker run -d --name checkout --network bridge traefik/whoami:v1.10 >/dev/null
+    docker run -d --name storefront --network shop -p 8150:80 -v /lab/storefront/default.conf:/etc/nginx/conf.d/default.conf:ro nginx:1.28-alpine >/dev/null
+  check: |
+    check "storefront proxies /checkout/ on 8105" 'http_get localhost:8105/checkout/ | grep -q "Hostname: $(c_get checkout "{{.Config.Hostname}}")"'
+    check "checkout reaches payments" 'docker run --rm --network container:checkout busybox:1.37 wget -qO- -T 3 http://payments | grep -q Hostname'
+    check_not "storefront cannot reach payments" 'docker exec storefront wget -qO- -T 3 http://payments'
+    check "config file unchanged" 'grep -q "set \$u http://checkout:80" /lab/storefront/default.conf'
+  solve: |
+    docker network connect shop checkout
+    docker network connect pay checkout
+    docker network connect pay payments
+    docker network disconnect shop payments
+    docker rm -f storefront
+    docker run -d --name storefront --network shop -p 8105:80 -v /lab/storefront/default.conf:/etc/nginx/conf.d/default.conf:ro nginx:1.28-alpine
