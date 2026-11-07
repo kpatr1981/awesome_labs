@@ -1,0 +1,636 @@
+track: docker
+module: Security & resource limits
+profile: docker
+order: 7
+exercises:
+
+- id: docker-121
+  title: No privilege escalation
+  difficulty: 2
+  kind: build
+  tags: [security, no-new-privileges]
+  scenario: |
+    Policy: no process inside a container may gain more privileges than it started with
+    (e.g. through setuid binaries).
+
+    Run **`portal`** (`nginx:1.28-alpine`, port **8130** → 80) with that protection.
+  hints:
+    - "`--security-opt no-new-privileges`"
+  solution: |
+    ```bash
+    docker run -d --name portal --security-opt no-new-privileges -p 8130:80 nginx:1.28-alpine
+    docker exec portal grep NoNewPrivs /proc/1/status   # NoNewPrivs: 1
+    ```
+  check: |
+    check "portal is running" 'c_running portal'
+    check "no-new-privileges is set" 'c_get portal "{{.HostConfig.SecurityOpt}}" | grep -q no-new-privileges'
+    check "NoNewPrivs is active in the process" 'docker exec portal grep -q "NoNewPrivs:.*1" /proc/1/status'
+    check "portal serves on 8130" 'http_get localhost:8130 | grep -q nginx'
+  solve: |
+    docker run -d --name portal --security-opt no-new-privileges -p 8130:80 nginx:1.28-alpine
+
+- id: docker-122
+  title: Fork bomb insurance
+  difficulty: 2
+  kind: build
+  tags: [resources, pids-limit]
+  scenario: |
+    The **`sandbox`** container runs user-submitted scripts. A runaway script once
+    forked until the host fell over.
+
+    Run **`sandbox`** (`busybox:1.37`, `sleep infinity`) so that it can have at most
+    **100 processes**.
+  hints:
+    - "`--pids-limit`"
+  solution: |
+    ```bash
+    docker run -d --name sandbox --pids-limit 100 busybox:1.37 sleep infinity
+    ```
+  check: |
+    check "sandbox is running" 'c_running sandbox'
+    check_eq "PidsLimit" "$(c_get sandbox '{{.HostConfig.PidsLimit}}')" "100"
+    check_eq "pids.max inside the container" "$(docker exec sandbox cat /sys/fs/cgroup/pids.max 2>/dev/null)" "100"
+  solve: |
+    docker run -d --name sandbox --pids-limit 100 busybox:1.37 sleep infinity
+
+- id: docker-123
+  title: Too many open files
+  difficulty: 2
+  kind: build
+  tags: [ulimits]
+  scenario: |
+    The **`ws-gateway`** handles tens of thousands of websocket connections and runs out
+    of file descriptors with the default limit.
+
+    Run **`ws-gateway`** (`traefik/whoami:v1.10`) with a **nofile** limit of
+    **65536** (soft and hard).
+  hints:
+    - "`--ulimit nofile=SOFT:HARD`"
+  solution: |
+    ```bash
+    docker run -d --name ws-gateway --ulimit nofile=65536:65536 traefik/whoami:v1.10
+    ```
+  check: |
+    check "ws-gateway is running" 'c_running ws-gateway'
+    check_eq "nofile ulimit" "$(c_get ws-gateway '{{range .HostConfig.Ulimits}}{{.Name}}={{.Soft}}:{{.Hard}}{{end}}')" "nofile=65536:65536"
+  solve: |
+    docker run -d --name ws-gateway --ulimit nofile=65536:65536 traefik/whoami:v1.10
+
+- id: docker-124
+  title: Pin the batch job to one CPU
+  difficulty: 2
+  kind: build
+  tags: [resources, cpuset]
+  scenario: |
+    The nightly **`encoder`** job must never disturb the latency-critical services,
+    which own CPU 1. Run **`encoder`** (`busybox:1.37`, `sleep infinity`) restricted to
+    **CPU 0 only**, with a relative CPU weight (**cpu-shares**) of **256**.
+  hints:
+    - "`--cpuset-cpus` and `--cpu-shares`"
+  solution: |
+    ```bash
+    docker run -d --name encoder --cpuset-cpus 0 --cpu-shares 256 busybox:1.37 sleep infinity
+    docker exec encoder cat /sys/fs/cgroup/cpuset.cpus.effective
+    ```
+  check: |
+    check "encoder is running" 'c_running encoder'
+    check_eq "cpuset" "$(c_get encoder '{{.HostConfig.CpusetCpus}}')" "0"
+    check_eq "cpu shares" "$(c_get encoder '{{.HostConfig.CPUShares}}')" "256"
+    check_eq "effective CPUs inside" "$(docker exec encoder cat /sys/fs/cgroup/cpuset.cpus.effective 2>/dev/null)" "0"
+  solve: |
+    docker run -d --name encoder --cpuset-cpus 0 --cpu-shares 256 busybox:1.37 sleep infinity
+
+- id: docker-125
+  title: Who is hogging the memory?
+  difficulty: 2
+  kind: build
+  tags: [stats, monitoring]
+  scenario: |
+    The docker host is swapping. Find the container that **uses the most memory right
+    now** and write its name to **`/lab/memory-hog.txt`**.
+  hints:
+    - "`docker stats --no-stream`"
+  solution: |
+    ```bash
+    docker stats --no-stream --format '{{.MemUsage}}\t{{.Name}}' | sort -h | tail -1
+    ```
+  setup: |
+    names=(thumbnailer indexer mailer scheduler)
+    hog=${names[$((RANDOM % 4))]}; echo "$hog" > $KL_STATE/answer
+    for n in "${names[@]}"; do
+      mb=8; [ "$n" = "$hog" ] && mb=150
+      docker run -d --name "$n" python:3.12-alpine python -c "import time; b = bytearray($mb*1024*1024); time.sleep(36000)" >/dev/null
+    done
+    sleep 3
+  check: |
+    check_eq "memory hog" "$(tr -d '[:space:]' < /lab/memory-hog.txt 2>/dev/null)" "$(cat $KL_STATE/answer)"
+  solve: |
+    docker stats --no-stream --format '{{.MemPerc}} {{.Name}}' | tr -d '%' | sort -n | tail -1 | awk '{print $2}' > /lab/memory-hog.txt
+
+- id: docker-126
+  title: Retry flaky jobs, but not forever
+  difficulty: 2
+  kind: build
+  tags: [restart-policy]
+  scenario: |
+    The **`sync-job`** container sometimes fails because the remote API is flaky. It
+    should be retried automatically when it **fails**, but **at most 3 times**, and never
+    restarted after a successful run.
+
+    Run **`sync-job`** (`busybox:1.37`, command `sh -c 'echo syncing; exit 1'`) with that
+    policy.
+  hints:
+    - "`--restart on-failure:N`"
+  solution: |
+    ```bash
+    docker run -d --name sync-job --restart on-failure:3 busybox:1.37 sh -c 'echo syncing; exit 1'
+    sleep 20; docker inspect sync-job -f '{{.RestartCount}}'   # 3
+    ```
+  check: |
+    check_eq "restart policy" "$(c_get sync-job '{{.HostConfig.RestartPolicy.Name}}:{{.HostConfig.RestartPolicy.MaximumRetryCount}}')" "on-failure:3"
+    c_exists sync-job && eventually 40 '[ "$(c_get sync-job "{{.RestartCount}}")" = 3 ] && ! c_running sync-job'
+    check_eq "it was retried exactly 3 times" "$(c_get sync-job '{{.RestartCount}}')" "3"
+  solve: |
+    docker run -d --name sync-job --restart on-failure:3 busybox:1.37 sh -c 'echo syncing; exit 1'
+
+- id: docker-127
+  title: Exit code 137
+  difficulty: 2
+  kind: build
+  tags: [oom, troubleshooting]
+  scenario: |
+    The **`importer`** container died overnight with exit code 137.
+
+    Find out **why** and record it: write **`OOMKilled`** to **`/lab/importer-cause.txt`**
+    if the kernel's out-of-memory killer killed it, or **`SIGKILL`** if something else
+    killed it. Also write its **memory limit in MiB** (just the number) to
+    **`/lab/importer-limit.txt`**.
+  hints:
+    - "`docker inspect importer --format '{{.State.OOMKilled}} {{.State.ExitCode}}'`"
+    - "137 = 128 + 9 (SIGKILL). The OOM killer uses SIGKILL too — `.State.OOMKilled` tells them apart."
+  solution: |
+    ```bash
+    docker inspect importer --format '{{.State.OOMKilled}} {{.State.ExitCode}} {{.HostConfig.Memory}}'
+    echo OOMKilled > /lab/importer-cause.txt
+    echo $(( $(docker inspect importer --format '{{.HostConfig.Memory}}') / 1024 / 1024 )) > /lab/importer-limit.txt
+    ```
+  setup: |
+    lim=$(shuf -n1 -e 48 64 96); echo "$lim" > $KL_STATE/answer
+    docker run --name importer --memory ${lim}m --memory-swap ${lim}m python:3.12-alpine python -c "x = b'x' * (200*1024*1024)" >/dev/null 2>&1 || true
+  check: |
+    check_eq "cause" "$(tr -d '[:space:]' < /lab/importer-cause.txt 2>/dev/null)" "OOMKilled"
+    check_eq "limit in MiB" "$(tr -d '[:space:]' < /lab/importer-limit.txt 2>/dev/null)" "$(cat $KL_STATE/answer)"
+  solve: |
+    if [ "$(docker inspect importer --format '{{.State.OOMKilled}}')" = true ]; then echo OOMKilled; else echo SIGKILL; fi > /lab/importer-cause.txt
+    echo $(( $(docker inspect importer --format '{{.HostConfig.Memory}}') / 1024 / 1024 )) > /lab/importer-limit.txt
+
+- id: docker-128
+  title: More memory, same container
+  difficulty: 2
+  kind: fix
+  tags: [resources, update, oom]
+  scenario: |
+    **`search-index`** keeps getting OOM-killed and restarted: it needs about 150 MB but
+    is limited to 100 MiB.
+
+    Raise its memory limit to **256 MiB** (swap limit the same) **without recreating
+    the container**. It must stay up afterwards.
+  hints:
+    - "`docker update --memory ... --memory-swap ...`"
+    - "If the container is in a restart back-off, `docker start` / `docker restart` it after updating."
+  solution: |
+    ```bash
+    docker inspect search-index -f '{{.State.OOMKilled}} {{.RestartCount}}'
+    docker update --memory 256m --memory-swap 256m search-index
+    docker restart search-index
+    ```
+  setup: |
+    docker run -d --name search-index --restart always --memory 100m --memory-swap 100m python:3.12-alpine python -c "import time; x = bytearray(150*1024*1024); print('index loaded', flush=True); time.sleep(36000)" >/dev/null
+    docker inspect -f '{{.Id}}' search-index > $KL_STATE/answer
+    sleep 3
+  check: |
+    check_eq "same container" "$(c_get search-index '{{.Id}}')" "$(cat $KL_STATE/answer)"
+    check_eq "memory limit" "$(c_get search-index '{{.HostConfig.Memory}}')" "268435456"
+    sleep 3
+    check "search-index is up and loaded its index" 'c_running search-index && docker logs search-index 2>&1 | grep -q "index loaded"'
+  solve: |
+    docker update --memory 256m --memory-swap 256m search-index
+    docker restart search-index
+
+- id: docker-129
+  title: Seccomp was switched off
+  difficulty: 2
+  kind: fix
+  tags: [security, seccomp]
+  scenario: |
+    While debugging, someone started **`payments-worker`** with the seccomp filter
+    disabled (`seccomp=unconfined`) and never turned it back on.
+
+    Recreate **`payments-worker`** (same image and command) with docker's **default
+    seccomp profile**.
+  hints:
+    - "`docker inspect payments-worker -f '{{.HostConfig.SecurityOpt}}'`"
+    - "Simply don't pass any seccomp option — the default profile applies automatically."
+  solution: |
+    ```bash
+    docker inspect payments-worker -f '{{.HostConfig.SecurityOpt}} {{.Config.Image}} {{json .Config.Cmd}}'
+    docker rm -f payments-worker
+    docker run -d --name payments-worker busybox:1.37 sh -c 'while true; do echo processing; sleep 5; done'
+    docker exec payments-worker grep Seccomp /proc/1/status   # Seccomp: 2 (filtering)
+    ```
+  setup: |
+    docker run -d --name payments-worker --security-opt seccomp=unconfined busybox:1.37 sh -c 'while true; do echo processing; sleep 5; done' >/dev/null
+  check: |
+    check "payments-worker is running" 'c_running payments-worker'
+    check_not "no seccomp=unconfined" 'c_get payments-worker "{{.HostConfig.SecurityOpt}}" | grep -q unconfined'
+    check "seccomp filter active (mode 2)" 'docker exec payments-worker grep -q "Seccomp:.*2" /proc/1/status'
+    check_eq "same command" "$(c_get payments-worker '{{json .Config.Cmd}}')" '["sh","-c","while true; do echo processing; sleep 5; done"]'
+  solve: |
+    docker rm -f payments-worker
+    docker run -d --name payments-worker busybox:1.37 sh -c 'while true; do echo processing; sleep 5; done'
+
+- id: docker-130
+  title: AppArmor was switched off
+  difficulty: 2
+  kind: fix
+  tags: [security, apparmor]
+  scenario: |
+    The **`reverse-proxy`** container (`nginx:1.28-alpine`, port **8131**) was started with
+    **AppArmor disabled**. Recreate it so docker's default AppArmor profile
+    (`docker-default`) applies again.
+  hints:
+    - "`docker inspect reverse-proxy -f '{{.AppArmorProfile}}'`"
+  solution: |
+    ```bash
+    docker inspect reverse-proxy -f '{{.AppArmorProfile}}'    # unconfined
+    docker rm -f reverse-proxy
+    docker run -d --name reverse-proxy -p 8131:80 nginx:1.28-alpine
+    docker inspect reverse-proxy -f '{{.AppArmorProfile}}'    # docker-default
+    ```
+  setup: |
+    docker run -d --name reverse-proxy -p 8131:80 --security-opt apparmor=unconfined nginx:1.28-alpine >/dev/null
+  check: |
+    check "reverse-proxy is running" 'c_running reverse-proxy'
+    check_eq "AppArmor profile" "$(c_get reverse-proxy '{{.AppArmorProfile}}')" "docker-default"
+    check "serves on 8131" 'http_get localhost:8131 | grep -q nginx'
+  solve: |
+    docker rm -f reverse-proxy
+    docker run -d --name reverse-proxy -p 8131:80 nginx:1.28-alpine
+
+- id: docker-131
+  title: The docker group is root
+  difficulty: 2
+  kind: fix
+  tags: [security, docker-group]
+  scenario: |
+    An intern account **`intern`** was added to the **`docker`** group "so they can look
+    at logs". Membership of that group is equivalent to root on the host (anyone in it
+    can `docker run -v /:/host --privileged ...`).
+
+    Remove **`intern`** from the `docker` group — keep the account and its other groups.
+  hints:
+    - "`id intern`"
+    - "`sudo gpasswd -d intern docker`"
+  solution: |
+    ```bash
+    id intern
+    sudo gpasswd -d intern docker
+    id intern
+    ```
+  setup: |
+    groupadd -f developers
+    useradd -m -s /bin/bash -G developers,docker intern 2>/dev/null || usermod -aG developers,docker intern
+    on_reset 'userdel -r intern 2>/dev/null; groupdel developers 2>/dev/null'
+  check: |
+    check "account intern exists" 'id intern'
+    check_not "intern is not in the docker group" 'id -nG intern | grep -qw docker'
+    check "intern is still in developers" 'id -nG intern | grep -qw developers'
+  solve: |
+    sudo gpasswd -d intern docker
+
+- id: docker-132
+  title: A dashboard with the keys to the kingdom
+  difficulty: 3
+  kind: fix
+  tags: [security, docker-socket]
+  scenario: |
+    The **`status-board`** container only needs to serve a static page from
+    `/lab/status-board` on port **8132**, but whoever started it also mounted the
+    **docker socket** into it (copy-pasted from a monitoring tool). Anyone who breaks
+    into that web server controls the whole host.
+
+    Recreate **`status-board`** without access to the docker API. Keep the page and port.
+  hints:
+    - "`docker inspect status-board --format '{{json .Mounts}}'`"
+    - "A `:ro` socket mount is still full API access — read-only applies to the file, not to the API calls."
+  solution: |
+    ```bash
+    docker rm -f status-board
+    docker run -d --name status-board -p 8132:80 -v /lab/status-board:/usr/share/nginx/html:ro nginx:1.28-alpine
+    ```
+  setup: |
+    echo '<h1>All green</h1>' | lab_file /lab/status-board/index.html
+    docker run -d --name status-board -p 8132:80 -v /var/run/docker.sock:/var/run/docker.sock:ro -v /lab/status-board:/usr/share/nginx/html:ro nginx:1.28-alpine >/dev/null
+  check: |
+    check "status-board is running" 'c_running status-board'
+    check_not "no docker socket mounted" 'c_get status-board "{{json .Mounts}}" | grep -q docker.sock'
+    check "page served on 8132" 'http_get localhost:8132 | grep -q "All green"'
+  solve: |
+    docker rm -f status-board
+    docker run -d --name status-board -p 8132:80 -v /lab/status-board:/usr/share/nginx/html:ro nginx:1.28-alpine
+
+- id: docker-133
+  title: Least privilege on port 80
+  difficulty: 3
+  kind: build
+  tags: [security, capabilities, non-root]
+  scenario: |
+    Run a tiny web server **`tiny-web`** that is as locked down as possible:
+
+    - image `busybox:1.37`, command `httpd -f -p 80 -h /www`
+    - serve `/lab/tiny-web` mounted read-only at `/www`
+    - run as uid **1000**
+    - **drop all capabilities**, adding back **only** what is needed to bind port 80
+    - publish **8133** → 80
+  hints:
+    - "Ports below 1024 need `CAP_NET_BIND_SERVICE` — even inside a container — when you're not root."
+    - "`--cap-drop ALL --cap-add NET_BIND_SERVICE`"
+  solution: |
+    ```bash
+    docker run -d --name tiny-web -u 1000 --cap-drop ALL --cap-add NET_BIND_SERVICE \
+      -v /lab/tiny-web:/www:ro -p 8133:80 busybox:1.37 httpd -f -p 80 -h /www
+    docker exec tiny-web grep Cap /proc/1/status
+    ```
+  setup: |
+    echo '<h1>tiny</h1>' | lab_file /lab/tiny-web/index.html
+  check: |
+    check "tiny-web is running" 'c_running tiny-web'
+    check_eq "user" "$(c_get tiny-web '{{.Config.User}}')" "1000"
+    check_eq "dropped" "$(c_get tiny-web '{{.HostConfig.CapDrop}}')" "[ALL]"
+    check_match "added back only NET_BIND_SERVICE" "$(c_get tiny-web '{{.HostConfig.CapAdd}}')" '^\[(CAP_)?NET_BIND_SERVICE\]$'
+    check "page served on 8133" 'http_get localhost:8133 | grep -q tiny'
+  solve: |
+    docker run -d --name tiny-web -u 1000 --cap-drop ALL --cap-add NET_BIND_SERVICE -v /lab/tiny-web:/www:ro -p 8133:80 busybox:1.37 httpd -f -p 80 -h /www
+
+- id: docker-134
+  title: Privileged just to set the clock
+  difficulty: 3
+  kind: fix
+  tags: [security, privileged, capabilities]
+  scenario: |
+    **`clock-sync`** runs with `--privileged` because it needs to set the system time.
+    `--privileged` grants *every* capability and all devices.
+
+    Recreate **`clock-sync`** (same image and command) **without** `--privileged`,
+    granting only the single capability needed to change the clock.
+  hints:
+    - "`man 7 capabilities` → `CAP_SYS_TIME`"
+  solution: |
+    ```bash
+    docker inspect clock-sync -f '{{.HostConfig.Privileged}} {{json .Config.Cmd}}'
+    docker rm -f clock-sync
+    docker run -d --name clock-sync --cap-add SYS_TIME busybox:1.37 sh -c 'while true; do echo "would adjust clock"; sleep 30; done'
+    ```
+  setup: |
+    docker run -d --name clock-sync --privileged busybox:1.37 sh -c 'while true; do echo "would adjust clock"; sleep 30; done' >/dev/null
+  check: |
+    check "clock-sync is running" 'c_running clock-sync'
+    check_eq "not privileged" "$(c_get clock-sync '{{.HostConfig.Privileged}}')" "false"
+    check_match "CAP_SYS_TIME added" "$(c_get clock-sync '{{.HostConfig.CapAdd}}')" 'SYS_TIME'
+    check_eq "same command" "$(c_get clock-sync '{{json .Config.Cmd}}')" '["sh","-c","while true; do echo \"would adjust clock\"; sleep 30; done"]'
+  solve: |
+    docker rm -f clock-sync
+    docker run -d --name clock-sync --cap-add SYS_TIME busybox:1.37 sh -c 'while true; do echo "would adjust clock"; sleep 30; done'
+
+- id: docker-135
+  title: Passwords don't belong in docker inspect
+  difficulty: 3
+  kind: fix
+  tags: [security, secrets, files]
+  scenario: |
+    Anyone in the docker group can read the database password of **`orders-api`** with
+    `docker inspect` — it's passed as an environment variable.
+
+    Recreate **`orders-api`** (`busybox:1.37`, same command) so that:
+
+    - the password from **`/lab/secrets/db_password`** is mounted **read-only** at
+      **`/run/secrets/db_password`**
+    - the environment only contains **`DB_PASSWORD_FILE=/run/secrets/db_password`**
+    - the password no longer appears anywhere in `docker inspect orders-api`
+  hints:
+    - "The `_FILE` convention is supported by many official images (postgres, mysql, …)."
+  solution: |
+    ```bash
+    docker rm -f orders-api
+    docker run -d --name orders-api \
+      -v /lab/secrets/db_password:/run/secrets/db_password:ro \
+      -e DB_PASSWORD_FILE=/run/secrets/db_password \
+      busybox:1.37 sh -c 'while true; do echo "connecting with ${#DB_PASSWORD}${DB_PASSWORD_FILE:+ password file}"; sleep 10; done'
+    docker inspect orders-api | grep -c "$(cat /lab/secrets/db_password)"   # 0
+    ```
+  setup: |
+    pw="db-$(tr -dc a-zA-Z0-9 </dev/urandom | head -c16)"
+    mkdir -p /lab/secrets; echo -n "$pw" > /lab/secrets/db_password; chmod 600 /lab/secrets/db_password; chown -R $(lab_user): /lab/secrets; chmod 644 /lab/secrets/db_password
+    docker run -d --name orders-api -e DB_PASSWORD="$pw" busybox:1.37 sh -c 'while true; do echo "connecting with ${#DB_PASSWORD}${DB_PASSWORD_FILE:+ password file}"; sleep 10; done' >/dev/null
+  check: |
+    pw=$(cat /lab/secrets/db_password)
+    check "orders-api is running" 'c_running orders-api'
+    check_eq "password not in docker inspect" "$(docker inspect orders-api | grep -c -- "$pw")" "0"
+    check_eq "DB_PASSWORD_FILE" "$(docker exec orders-api printenv DB_PASSWORD_FILE 2>/dev/null)" "/run/secrets/db_password"
+    check_eq "secret file content" "$(docker exec orders-api cat /run/secrets/db_password 2>/dev/null)" "$pw"
+    check_eq "mounted read-only" "$(c_get orders-api '{{range .Mounts}}{{if eq .Destination "/run/secrets/db_password"}}{{.RW}}{{end}}{{end}}')" "false"
+  solve: |
+    docker rm -f orders-api
+    docker run -d --name orders-api -v /lab/secrets/db_password:/run/secrets/db_password:ro -e DB_PASSWORD_FILE=/run/secrets/db_password busybox:1.37 sh -c 'while true; do echo "connecting with ${#DB_PASSWORD}${DB_PASSWORD_FILE:+ password file}"; sleep 10; done'
+
+- id: docker-136
+  title: Secrets in compose
+  difficulty: 3
+  kind: build
+  tags: [compose, secrets, postgres]
+  scenario: |
+    In **`/lab/billing-db`**, run PostgreSQL with compose **using compose secrets**:
+
+    - a top-level secret **`pg_password`** from the file `./pg_password.txt`
+    - service **`db`** (`postgres:16-alpine`) gets the secret and reads it through
+      **`POSTGRES_PASSWORD_FILE=/run/secrets/pg_password`**
+    - no plain `POSTGRES_PASSWORD` anywhere
+  hints:
+    - "Top-level `secrets: {pg_password: {file: ./pg_password.txt}}`, and `secrets: [pg_password]` in the service."
+    - "Compose mounts secrets at `/run/secrets/<name>`."
+  solution: |
+    ```yaml
+    services:
+      db:
+        image: postgres:16-alpine
+        environment:
+          POSTGRES_PASSWORD_FILE: /run/secrets/pg_password
+        secrets: [pg_password]
+    secrets:
+      pg_password:
+        file: ./pg_password.txt
+    ```
+  setup: |
+    mkdir -p /lab/billing-db
+    tr -dc a-zA-Z0-9 </dev/urandom | head -c16 > /lab/billing-db/pg_password.txt
+    chown -R $(lab_user): /lab/billing-db
+  check: |
+    pw=$(cat /lab/billing-db/pg_password.txt)
+    check "db is running" 'cc_running billing-db db'
+    check_eq "POSTGRES_PASSWORD_FILE" "$(cc_exec billing-db db printenv POSTGRES_PASSWORD_FILE 2>/dev/null)" "/run/secrets/pg_password"
+    check_not "no POSTGRES_PASSWORD env" 'cc_exec billing-db db printenv POSTGRES_PASSWORD'
+    cc_running billing-db db && eventually 30 'cc_exec billing-db db pg_isready -U postgres'
+    check "the secret password works over TCP" "docker run --rm --network billing-db_default -e PGPASSWORD='$pw' postgres:16-alpine psql -h db -U postgres -c 'select 1'"
+  solve: |
+    cd /lab/billing-db
+    cat > compose.yaml <<'EOF'
+    services:
+      db:
+        image: postgres:16-alpine
+        environment:
+          POSTGRES_PASSWORD_FILE: /run/secrets/pg_password
+        secrets: [pg_password]
+    secrets:
+      pg_password:
+        file: ./pg_password.txt
+    EOF
+    docker compose up -d
+
+- id: docker-137
+  title: Logs into the system journal
+  difficulty: 3
+  kind: build
+  tags: [logging, journald]
+  scenario: |
+    The security team collects everything from **journald**. Run **`audit-trail`**
+    (`busybox:1.37`, command `sh -c 'while true; do echo "audit event $(date +%s)"; sleep 2; done'`)
+    with the **journald** log driver and the tag **`audit`**, so its lines can be found
+    with `journalctl -t audit`.
+  hints:
+    - "`--log-driver journald --log-opt tag=audit`"
+  solution: |
+    ```bash
+    docker run -d --name audit-trail --log-driver journald --log-opt tag=audit \
+      busybox:1.37 sh -c 'while true; do echo "audit event $(date +%s)"; sleep 2; done'
+    sudo journalctl -t audit -n 5
+    ```
+  check: |
+    check "audit-trail is running" 'c_running audit-trail'
+    check_eq "log driver" "$(c_get audit-trail '{{.HostConfig.LogConfig.Type}}')" "journald"
+    sleep 3
+    check "journalctl -t audit shows its lines" 'journalctl -t audit --since "-1min" --no-pager | grep -q "audit event"'
+  solve: |
+    docker run -d --name audit-trail --log-driver journald --log-opt tag=audit busybox:1.37 sh -c 'while true; do echo "audit event $(date +%s)"; sleep 2; done'
+
+- id: docker-138
+  title: Don't let backups saturate the disk
+  difficulty: 3
+  kind: build
+  tags: [resources, blkio]
+  scenario: |
+    The **`backup`** container's writes saturate the disk and slow down the databases.
+
+    Run **`backup`** (`busybox:1.37`, `sleep infinity`) so that its **write bandwidth to
+    the VM's root disk is limited to 10 MB/s**.
+  hints:
+    - "`findmnt -no SOURCE /` tells you the device (e.g. `/dev/vda1` → disk `/dev/vda`)."
+    - "`--device-write-bps DEVICE:RATE` works on the whole disk device."
+  solution: |
+    ```bash
+    lsblk
+    docker run -d --name backup --device-write-bps /dev/vda:10mb busybox:1.37 sleep infinity
+    ```
+  check: |
+    dev=/dev/$(lsblk -no PKNAME "$(findmnt -no SOURCE /)" | head -1)
+    check "backup is running" 'c_running backup'
+    check_eq "write limit" "$(c_get backup '{{range .HostConfig.BlkioDeviceWriteBps}}{{.Path}}={{.Rate}}{{end}}')" "$dev=10485760"
+  solve: |
+    dev=/dev/$(lsblk -no PKNAME "$(findmnt -no SOURCE /)" | head -1)
+    docker run -d --name backup --device-write-bps $dev:10mb busybox:1.37 sleep infinity
+
+- id: docker-139
+  title: Containers that survive daemon restarts
+  difficulty: 3
+  kind: build
+  tags: [daemon, live-restore]
+  scenario: |
+    Upgrading or restarting the docker daemon currently stops every container on the
+    host. Configure the daemon so **running containers keep running while the daemon is
+    down or restarting**, then apply the configuration.
+
+    The container **`always-on`** must not be restarted by a daemon restart afterwards
+    (its start time stays the same).
+  hints:
+    - "daemon.json: `\"live-restore\": true`"
+    - "`sudo systemctl reload docker` applies live-restore without restarting containers… but the first time you can also just restart."
+  solution: |
+    ```bash
+    echo '{"live-restore": true}' | sudo tee /etc/docker/daemon.json
+    sudo systemctl restart docker      # last time containers are stopped
+    docker start always-on
+    docker info | grep -i 'live restore'
+    sudo systemctl restart docker      # always-on keeps running now
+    ```
+  setup: |
+    docker run -d --name always-on traefik/whoami:v1.10 >/dev/null
+  check: |
+    check "live restore is enabled" 'docker info --format "{{.LiveRestoreEnabled}}" | grep -q true'
+    check "always-on is running" 'c_running always-on'
+    t0=$(c_get always-on '{{.State.StartedAt}}')
+    systemctl restart docker; eventually 30 'docker info'
+    check "always-on survived a daemon restart" '[ "$(c_get always-on "{{.State.StartedAt}}")" = "$t0" ] && c_running always-on'
+  solve: |
+    echo '{"live-restore": true}' | sudo tee /etc/docker/daemon.json
+    sudo systemctl restart docker
+    sleep 3
+    docker start always-on
+
+- id: docker-140
+  title: "Audit: fix the legacy admin container"
+  difficulty: 4
+  kind: fix
+  tags: [security, audit, incident]
+  scenario: |
+    A security audit flagged the **`legacy-admin`** container. Its job is simple: serve
+    the admin UI from **`/lab/admin-ui`** with nginx on port **8134**.
+
+    Recreate it so that it passes **all** of these audit rules, while still serving the
+    page on 8134:
+
+    1. not privileged, no host PID / host network namespaces
+    2. no docker socket, no host root filesystem mounted
+    3. the content is mounted read-only
+    4. `no-new-privileges` is set
+    5. memory limited to **128 MiB** and at most **200** processes
+    6. restart policy `unless-stopped`
+  hints:
+    - "`docker inspect legacy-admin` shows everything that's wrong — compare against the list."
+    - "Start from a plain `docker run -d --name legacy-admin -p 8134:80 nginx:1.28-alpine` and add only what's required."
+  solution: |
+    ```bash
+    docker rm -f legacy-admin
+    docker run -d --name legacy-admin -p 8134:80 \
+      -v /lab/admin-ui:/usr/share/nginx/html:ro \
+      --security-opt no-new-privileges \
+      --memory 128m --pids-limit 200 \
+      --restart unless-stopped \
+      nginx:1.28-alpine
+    ```
+  setup: |
+    echo '<h1>Admin UI</h1>' | lab_file /lab/admin-ui/index.html
+    docker run -d --name legacy-admin --privileged --pid host -p 8134:80 -v /var/run/docker.sock:/var/run/docker.sock -v /:/host -v /lab/admin-ui:/usr/share/nginx/html nginx:1.28-alpine >/dev/null
+  check: |
+    g() { c_get legacy-admin "$1"; }
+    check "legacy-admin is running" 'c_running legacy-admin'
+    check "page served on 8134" 'http_get localhost:8134 | grep -q "Admin UI"'
+    check_eq "privileged" "$(g '{{.HostConfig.Privileged}}')" "false"
+    check_not "host PID/network" 'g "{{.HostConfig.PidMode}} {{.HostConfig.NetworkMode}}" | grep -qw host'
+    check_not "no docker socket / host root" 'g "{{json .Mounts}}" | grep -qE "docker.sock|\"Source\":\"/\""'
+    check_eq "content read-only" "$(g '{{range .Mounts}}{{if eq .Destination "/usr/share/nginx/html"}}{{.RW}}{{end}}{{end}}')" "false"
+    check "no-new-privileges" 'g "{{.HostConfig.SecurityOpt}}" | grep -q no-new-privileges'
+    check_eq "memory 128 MiB" "$(g '{{.HostConfig.Memory}}')" "134217728"
+    check_eq "pids limit 200" "$(g '{{.HostConfig.PidsLimit}}')" "200"
+    check_eq "restart policy" "$(g '{{.HostConfig.RestartPolicy.Name}}')" "unless-stopped"
+  solve: |
+    docker rm -f legacy-admin
+    docker run -d --name legacy-admin -p 8134:80 -v /lab/admin-ui:/usr/share/nginx/html:ro --security-opt no-new-privileges --memory 128m --pids-limit 200 --restart unless-stopped nginx:1.28-alpine
