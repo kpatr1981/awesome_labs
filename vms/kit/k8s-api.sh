@@ -50,6 +50,11 @@ reset() {
       xargs -r kubectl label node "$n" --overwrite >/dev/null
     kubectl patch node "$n" --type=merge -p "{\"spec\":{\"taints\":$(jq -c .taints <<<"$node")}}" >/dev/null
   done
+  # exercise pods die immediately (no 30s grace period)
+  kubectl get ns -o name | sort >/tmp/kl-now
+  for n in $(comm -13 "$P/namespaces.txt" /tmp/kl-now) namespace/default namespace/kube-public; do
+    kubectl -n "${n#namespace/}" delete pods --all --grace-period=0 --force --wait=false >/dev/null 2>&1
+  done
   # namespaced junk in default + kube-public
   for n in default kube-public; do
     kubectl -n "$n" delete "$NS_KINDS" --all --wait=false --ignore-not-found >/dev/null 2>&1

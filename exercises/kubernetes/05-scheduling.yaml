@@ -1,0 +1,908 @@
+track: kubernetes
+module: Scheduling
+profile: k8s
+order: 5
+exercises:
+
+- id: k8s-081
+  title: Only in the EU zone
+  difficulty: 1
+  kind: build
+  tags: [nodeselector, labels]
+  scenario: |
+    For data-residency reasons the **`gdpr-export`** pod may only run on nodes labelled
+    **`zone=eu-1`**.
+
+    1. Label **node01** with `zone=eu-1`.
+    2. Run pod **`gdpr-export`** in namespace **`compliance`** (`busybox:1.37`,
+       `sleep 3600`) that can only be scheduled on such nodes.
+  hints:
+    - "`kubectl label node node01 zone=eu-1`"
+    - "`spec.nodeSelector: {zone: eu-1}`"
+  solution: |
+    ```bash
+    kubectl label node node01 zone=eu-1
+    kubectl run gdpr-export -n compliance --image=busybox:1.37 \
+      --overrides='{"spec":{"nodeSelector":{"zone":"eu-1"}}}' -- sleep 3600
+    ```
+  setup: |
+    k_ns compliance
+  check: |
+    check_eq "node01 label" "$(kj node node01 '{.metadata.labels.zone}')" "eu-1"
+    check_eq "pod nodeSelector" "$(kj -n compliance pod gdpr-export '{.spec.nodeSelector.zone}')" "eu-1"
+    wait_pod compliance gdpr-export 60
+    check "running on node01" '[ "$(kj -n compliance pod gdpr-export "{.spec.nodeName}")" = node01 ] && pod_ready compliance gdpr-export'
+  solve: |
+    kubectl label node node01 zone=eu-1
+    kubectl run gdpr-export -n compliance --image=busybox:1.37 --overrides='{"spec":{"nodeSelector":{"zone":"eu-1"}}}' -- sleep 3600
+
+- id: k8s-082
+  title: Keep new pods off node01
+  difficulty: 1
+  kind: build
+  tags: [cordon]
+  scenario: |
+    node01 is about to get a firmware update tonight. Make sure **no new pods** get
+    scheduled onto it, but **leave the pods that are already running** there alone.
+  hints:
+    - "`kubectl cordon`"
+  solution: |
+    ```bash
+    kubectl cordon node01
+    kubectl get nodes      # node01 Ready,SchedulingDisabled
+    ```
+  setup: |
+    k_ns shop
+    kubectl -n shop create deployment web --image=nginx:1.28-alpine --replicas=2 >/dev/null
+    kubectl -n shop rollout status deploy/web --timeout=90s >/dev/null
+    kubectl -n shop get pods -l app=web -o name | sort > $KL_STATE/answer
+  check: |
+    check_eq "node01 unschedulable" "$(kj node node01 '{.spec.unschedulable}')" "true"
+    check_eq "running pods untouched" "$(kubectl -n shop get pods -l app=web -o name | sort | tr '\n' ' ')" "$(tr '\n' ' ' < $KL_STATE/answer)"
+  solve: |
+    kubectl cordon node01
+
+- id: k8s-083
+  title: A node just for GPU jobs
+  difficulty: 2
+  kind: build
+  tags: [taints, tolerations]
+  scenario: |
+    node01 just got (pretend) GPUs. Reserve it:
+
+    1. **Taint** node01 with **`dedicated=gpu:NoSchedule`** so ordinary pods stay away.
+    2. Run pod **`trainer`** in namespace **`ml`** (`busybox:1.37`, `sleep 3600`) that
+       **tolerates** that taint.
+  hints:
+    - "`kubectl taint node node01 dedicated=gpu:NoSchedule`"
+    - "`tolerations: [{key: dedicated, operator: Equal, value: gpu, effect: NoSchedule}]`"
+  solution: |
+    ```bash
+    kubectl taint node node01 dedicated=gpu:NoSchedule
+    ```
+    ```yaml
+    spec:
+      tolerations:
+      - {key: dedicated, operator: Equal, value: gpu, effect: NoSchedule}
+    ```
+    A toleration *allows* scheduling on the tainted node; it doesn't *attract* the pod.
+    (Here node01 is the only schedulable node anyway.)
+  setup: |
+    k_ns ml
+  check: |
+    check "node01 has the taint" 'kubectl get node node01 -o json | jq -e ".spec.taints[] | select(.key==\"dedicated\" and .value==\"gpu\" and .effect==\"NoSchedule\")"'
+    wait_pod ml trainer 60
+    check "trainer runs on node01" '[ "$(kj -n ml pod trainer "{.spec.nodeName}")" = node01 ] && pod_ready ml trainer'
+    kubectl -n ml run kl-plain-$RANDOM --image=busybox:1.37 -- sleep 60 >/dev/null 2>&1; sleep 3
+    check "a pod without the toleration stays Pending" '[ -n "$(kubectl -n ml get pods -l run --field-selector=status.phase=Pending -o name | grep kl-plain)" ]'
+  solve: |
+    kubectl taint node node01 dedicated=gpu:NoSchedule
+    kubectl apply -f - <<'EOF'
+    apiVersion: v1
+    kind: Pod
+    metadata: {name: trainer, namespace: ml}
+    spec:
+      tolerations:
+      - {key: dedicated, operator: Equal, value: gpu, effect: NoSchedule}
+      containers:
+      - {name: trainer, image: "busybox:1.37", command: ["sleep", "3600"]}
+    EOF
+
+- id: k8s-084
+  title: Maintenance is over
+  difficulty: 2
+  kind: fix
+  tags: [taints, pending, troubleshooting]
+  scenario: |
+    Every new pod in the cluster is `Pending`. Last week's maintenance on node01 finished
+    days ago, but someone forgot to clean up after it.
+
+    Fix the **node** so the pending **`api`** deployment (namespace **`shop`**) gets
+    scheduled. Don't add tolerations to workloads.
+  hints:
+    - "`kubectl describe pod` → *had untolerated taint*."
+    - "`kubectl describe node node01 | grep Taints`; remove a taint with a trailing `-`."
+  solution: |
+    ```bash
+    kubectl describe node node01 | grep -A2 Taints
+    kubectl taint node node01 maintenance-
+    ```
+  setup: |
+    kubectl taint node node01 maintenance=true:NoSchedule --overwrite >/dev/null
+    k_ns shop
+    kubectl -n shop create deployment api --image=traefik/whoami:v1.10 --replicas=2 >/dev/null
+  check: |
+    check_not "maintenance taint removed" 'kubectl get node node01 -o json | jq -e ".spec.taints[]? | select(.key==\"maintenance\")"'
+    check_eq "no tolerations added" "$(kj -n shop deploy api '{.spec.template.spec.tolerations}')" ""
+    wait_deploy shop api 60
+    check "api is running" 'deploy_ready shop api'
+  solve: |
+    kubectl taint node node01 maintenance-
+
+- id: k8s-085
+  title: An agent on the control plane
+  difficulty: 2
+  kind: build
+  tags: [tolerations, control-plane, nodeselector]
+  scenario: |
+    The security team's **`cp-audit`** pod must run **on the control plane node** — and
+    only there. The control plane is tainted against ordinary workloads (and should stay
+    that way).
+
+    Run pod **`cp-audit`** in namespace **`security`** (`busybox:1.37`, `sleep 3600`) on
+    `controlplane`, using a **nodeSelector** and a **toleration** (not `nodeName`).
+  hints:
+    - "`kubectl describe node controlplane | grep Taints` → `node-role.kubernetes.io/control-plane:NoSchedule`"
+    - "The control plane also has the label `node-role.kubernetes.io/control-plane: \"\"`."
+  solution: |
+    ```yaml
+    spec:
+      nodeSelector:
+        node-role.kubernetes.io/control-plane: ""
+      tolerations:
+      - key: node-role.kubernetes.io/control-plane
+        operator: Exists
+        effect: NoSchedule
+    ```
+  setup: |
+    k_ns security
+  check: |
+    check "controlplane is still tainted" 'kubectl get node controlplane -o json | jq -e ".spec.taints[] | select(.key==\"node-role.kubernetes.io/control-plane\")"'
+    check "has a control-plane toleration" 'kubectl -n security get pod cp-audit -o json | jq -e ".spec.tolerations[] | select(.key==\"node-role.kubernetes.io/control-plane\")"'
+    wait_pod security cp-audit 60
+    check "runs on controlplane" '[ "$(kj -n security pod cp-audit "{.spec.nodeName}")" = controlplane ] && pod_ready security cp-audit'
+    check "uses a nodeSelector" '[ -n "$(kj -n security pod cp-audit "{.spec.nodeSelector}")" ]'
+  solve: |
+    kubectl apply -f - <<'EOF'
+    apiVersion: v1
+    kind: Pod
+    metadata: {name: cp-audit, namespace: security}
+    spec:
+      nodeSelector:
+        node-role.kubernetes.io/control-plane: ""
+      tolerations:
+      - key: node-role.kubernetes.io/control-plane
+        operator: Exists
+        effect: NoSchedule
+      containers:
+      - {name: audit, image: "busybox:1.37", command: ["sleep", "3600"]}
+    EOF
+
+- id: k8s-086
+  title: SSD or NVMe, nothing else
+  difficulty: 2
+  kind: build
+  tags: [node-affinity]
+  scenario: |
+    **`db-cache`** (namespace **`data`**) must run on a node whose `disktype` label is
+    **`ssd` or `nvme`** — a plain nodeSelector can't express "or".
+
+    node01 is labelled `disktype=nvme`. Run pod **`db-cache`** (`redis:7.4-alpine`) with
+    a **required node affinity** rule expressing that.
+  hints:
+    - "`affinity.nodeAffinity.requiredDuringSchedulingIgnoredDuringExecution.nodeSelectorTerms[].matchExpressions: [{key: disktype, operator: In, values: [ssd, nvme]}]`"
+  solution: |
+    ```yaml
+    spec:
+      affinity:
+        nodeAffinity:
+          requiredDuringSchedulingIgnoredDuringExecution:
+            nodeSelectorTerms:
+            - matchExpressions:
+              - {key: disktype, operator: In, values: [ssd, nvme]}
+    ```
+  setup: |
+    k_ns data
+    kubectl label node node01 disktype=nvme --overwrite >/dev/null
+  check: |
+    m=$(kubectl -n data get pod db-cache -o json 2>/dev/null | jq -c '.spec.affinity.nodeAffinity.requiredDuringSchedulingIgnoredDuringExecution.nodeSelectorTerms[0].matchExpressions[0] // {}')
+    check_eq "key/operator" "$(jq -r '"\(.key) \(.operator)"' <<<"$m")" "disktype In"
+    check_eq "values" "$(jq -r '.values | sort | join(",")' <<<"$m" 2>/dev/null)" "nvme,ssd"
+    wait_pod data db-cache 60
+    check "db-cache runs on node01" '[ "$(kj -n data pod db-cache "{.spec.nodeName}")" = node01 ]'
+  solve: |
+    kubectl apply -f - <<'EOF'
+    apiVersion: v1
+    kind: Pod
+    metadata: {name: db-cache, namespace: data}
+    spec:
+      affinity:
+        nodeAffinity:
+          requiredDuringSchedulingIgnoredDuringExecution:
+            nodeSelectorTerms:
+            - matchExpressions:
+              - {key: disktype, operator: In, values: [ssd, nvme]}
+      containers:
+      - {name: redis, image: "redis:7.4-alpine"}
+    EOF
+
+- id: k8s-087
+  title: Prefer, but don't insist
+  difficulty: 3
+  kind: build
+  tags: [node-affinity, preferred]
+  scenario: |
+    The **`thumbnailer`** deployment (namespace **`media`**, 2 replicas,
+    `busybox:1.37` `sleep infinity`) runs best on nodes labelled **`cpu=fast`**, but it
+    must still run if no such node exists.
+
+    Create it with a **preferred** node affinity for `cpu=fast` with **weight 80**.
+    (No node has that label — the pods must still be scheduled.)
+  hints:
+    - "`preferredDuringSchedulingIgnoredDuringExecution: [{weight: 80, preference: {matchExpressions: [...]}}]`"
+  solution: |
+    ```yaml
+    affinity:
+      nodeAffinity:
+        preferredDuringSchedulingIgnoredDuringExecution:
+        - weight: 80
+          preference:
+            matchExpressions:
+            - {key: cpu, operator: In, values: [fast]}
+    ```
+  setup: |
+    k_ns media
+  check: |
+    p=$(kj -n media deploy thumbnailer '{.spec.template.spec.affinity.nodeAffinity.preferredDuringSchedulingIgnoredDuringExecution}')
+    check_eq "weight" "$(jq -r '.[0].weight' <<<"$p" 2>/dev/null)" "80"
+    check_eq "preference" "$(jq -r '.[0].preference.matchExpressions[0] | "\(.key)=\(.values[0])"' <<<"$p" 2>/dev/null)" "cpu=fast"
+    wait_deploy media thumbnailer 60
+    check "both replicas run anyway" 'deploy_ready media thumbnailer'
+  solve: |
+    kubectl apply -f - <<'EOF'
+    apiVersion: apps/v1
+    kind: Deployment
+    metadata: {name: thumbnailer, namespace: media}
+    spec:
+      replicas: 2
+      selector: {matchLabels: {app: thumbnailer}}
+      template:
+        metadata: {labels: {app: thumbnailer}}
+        spec:
+          affinity:
+            nodeAffinity:
+              preferredDuringSchedulingIgnoredDuringExecution:
+              - weight: 80
+                preference:
+                  matchExpressions:
+                  - {key: cpu, operator: In, values: [fast]}
+          containers:
+          - {name: t, image: "busybox:1.37", command: ["sleep", "infinity"]}
+    EOF
+
+- id: k8s-088
+  title: Never on the same node
+  difficulty: 3
+  kind: build
+  tags: [pod-anti-affinity, high-availability]
+  scenario: |
+    The **`etcd-proxy`** deployment (namespace **`infra`**) runs 2 replicas, and both
+    must **never** land on the same node — otherwise a single node failure takes both
+    down.
+
+    Create it (`traefik/whoami:v1.10`, label `app=etcd-proxy`) with a **required pod
+    anti-affinity** on `kubernetes.io/hostname`. This cluster has only two nodes and one
+    of them is the control plane, so the pods also need to **tolerate the control-plane
+    taint**. End state: one replica on each node.
+  hints:
+    - "`podAntiAffinity.requiredDuringSchedulingIgnoredDuringExecution: [{labelSelector: {matchLabels: {app: etcd-proxy}}, topologyKey: kubernetes.io/hostname}]`"
+  solution: |
+    ```yaml
+    spec:
+      tolerations:
+      - {key: node-role.kubernetes.io/control-plane, operator: Exists, effect: NoSchedule}
+      affinity:
+        podAntiAffinity:
+          requiredDuringSchedulingIgnoredDuringExecution:
+          - labelSelector:
+              matchLabels: {app: etcd-proxy}
+            topologyKey: kubernetes.io/hostname
+    ```
+  setup: |
+    k_ns infra
+  check: |
+    wait_deploy infra etcd-proxy 90
+    check "2 replicas ready" 'deploy_ready infra etcd-proxy && [ "$(kj -n infra deploy etcd-proxy "{.status.readyReplicas}")" = 2 ]'
+    check_eq "spread over both nodes" "$(kubectl -n infra get pods -l app=etcd-proxy -o jsonpath='{.items[*].spec.nodeName}' | tr ' ' '\n' | sort -u | tr '\n' ' ')" "controlplane node01 "
+    check_eq "anti-affinity topologyKey" "$(kj -n infra deploy etcd-proxy '{.spec.template.spec.affinity.podAntiAffinity.requiredDuringSchedulingIgnoredDuringExecution[0].topologyKey}')" "kubernetes.io/hostname"
+  solve: |
+    kubectl apply -f - <<'EOF'
+    apiVersion: apps/v1
+    kind: Deployment
+    metadata: {name: etcd-proxy, namespace: infra}
+    spec:
+      replicas: 2
+      selector: {matchLabels: {app: etcd-proxy}}
+      template:
+        metadata: {labels: {app: etcd-proxy}}
+        spec:
+          tolerations:
+          - {key: node-role.kubernetes.io/control-plane, operator: Exists, effect: NoSchedule}
+          affinity:
+            podAntiAffinity:
+              requiredDuringSchedulingIgnoredDuringExecution:
+              - labelSelector:
+                  matchLabels: {app: etcd-proxy}
+                topologyKey: kubernetes.io/hostname
+          containers:
+          - {name: proxy, image: "traefik/whoami:v1.10"}
+    EOF
+
+- id: k8s-089
+  title: Keep the cache next to the API
+  difficulty: 3
+  kind: build
+  tags: [pod-affinity]
+  scenario: |
+    Latency matters: the **`session-cache`** pod (namespace **`web`**) must always run on
+    the **same node** as a pod of the **`api`** deployment (label `app=api`).
+
+    The `api` pod has been pinned to `controlplane` for this exercise. Create pod
+    **`session-cache`** (`redis:7.4-alpine`) with a **required pod affinity** that makes
+    it follow the api — it will also need to tolerate the control-plane taint.
+  hints:
+    - "`podAffinity.requiredDuringSchedulingIgnoredDuringExecution: [{labelSelector: {matchLabels: {app: api}}, topologyKey: kubernetes.io/hostname}]`"
+  solution: |
+    ```yaml
+    spec:
+      tolerations:
+      - {key: node-role.kubernetes.io/control-plane, operator: Exists, effect: NoSchedule}
+      affinity:
+        podAffinity:
+          requiredDuringSchedulingIgnoredDuringExecution:
+          - labelSelector:
+              matchLabels: {app: api}
+            topologyKey: kubernetes.io/hostname
+    ```
+  setup: |
+    k_ns web
+    kubectl apply -f - >/dev/null <<'EOF'
+    apiVersion: apps/v1
+    kind: Deployment
+    metadata: {name: api, namespace: web}
+    spec:
+      selector: {matchLabels: {app: api}}
+      template:
+        metadata: {labels: {app: api}}
+        spec:
+          nodeSelector: {kubernetes.io/hostname: controlplane}
+          tolerations:
+          - {key: node-role.kubernetes.io/control-plane, operator: Exists, effect: NoSchedule}
+          containers: [{name: api, image: "traefik/whoami:v1.10"}]
+    EOF
+  check: |
+    check_eq "uses podAffinity on app=api" "$(kj -n web pod session-cache '{.spec.affinity.podAffinity.requiredDuringSchedulingIgnoredDuringExecution[0].labelSelector.matchLabels.app}')" "api"
+    check_eq "no hard-coded node" "$(kj -n web pod session-cache '{.spec.nodeSelector}')" ""
+    wait_pod web session-cache 60
+    check_eq "session-cache runs next to api" "$(kj -n web pod session-cache '{.spec.nodeName}')" "controlplane"
+  solve: |
+    kubectl apply -f - <<'EOF'
+    apiVersion: v1
+    kind: Pod
+    metadata: {name: session-cache, namespace: web}
+    spec:
+      tolerations:
+      - {key: node-role.kubernetes.io/control-plane, operator: Exists, effect: NoSchedule}
+      affinity:
+        podAffinity:
+          requiredDuringSchedulingIgnoredDuringExecution:
+          - labelSelector:
+              matchLabels: {app: api}
+            topologyKey: kubernetes.io/hostname
+      containers:
+      - {name: redis, image: "redis:7.4-alpine"}
+    EOF
+
+- id: k8s-090
+  title: Spread evenly
+  difficulty: 3
+  kind: build
+  tags: [topology-spread]
+  scenario: |
+    Create a deployment **`frontend`** in namespace **`spread`** with **4 replicas** of
+    `traefik/whoami:v1.10` (label `app=frontend`) that are spread **evenly** across
+    nodes: the replica count per node may differ by at most **1**, and the scheduler must
+    **refuse** to violate that. Allow the pods on the control plane.
+
+    End state: 2 replicas on each node.
+  hints:
+    - "`topologySpreadConstraints: [{maxSkew: 1, topologyKey: kubernetes.io/hostname, whenUnsatisfiable: DoNotSchedule, labelSelector: {matchLabels: {app: frontend}}}]`"
+  solution: |
+    ```yaml
+    spec:
+      tolerations:
+      - {key: node-role.kubernetes.io/control-plane, operator: Exists, effect: NoSchedule}
+      topologySpreadConstraints:
+      - maxSkew: 1
+        topologyKey: kubernetes.io/hostname
+        whenUnsatisfiable: DoNotSchedule
+        labelSelector:
+          matchLabels: {app: frontend}
+    ```
+  setup: |
+    k_ns spread
+  check: |
+    c=$(kj -n spread deploy frontend '{.spec.template.spec.topologySpreadConstraints[0]}')
+    check_eq "constraint" "$(jq -r '"\(.maxSkew) \(.topologyKey) \(.whenUnsatisfiable)"' <<<"$c" 2>/dev/null)" "1 kubernetes.io/hostname DoNotSchedule"
+    wait_deploy spread frontend 90
+    check_eq "2 per node" "$(kubectl -n spread get pods -l app=frontend -o jsonpath='{.items[*].spec.nodeName}' | tr ' ' '\n' | sort | uniq -c | awk '{print $1}' | tr '\n' ' ')" "2 2 "
+  solve: |
+    kubectl apply -f - <<'EOF'
+    apiVersion: apps/v1
+    kind: Deployment
+    metadata: {name: frontend, namespace: spread}
+    spec:
+      replicas: 4
+      selector: {matchLabels: {app: frontend}}
+      template:
+        metadata: {labels: {app: frontend}}
+        spec:
+          tolerations:
+          - {key: node-role.kubernetes.io/control-plane, operator: Exists, effect: NoSchedule}
+          topologySpreadConstraints:
+          - maxSkew: 1
+            topologyKey: kubernetes.io/hostname
+            whenUnsatisfiable: DoNotSchedule
+            labelSelector:
+              matchLabels: {app: frontend}
+          containers:
+          - {name: web, image: "traefik/whoami:v1.10"}
+    EOF
+
+- id: k8s-091
+  title: A priority for critical workloads
+  difficulty: 2
+  kind: build
+  tags: [priorityclass]
+  scenario: |
+    Create a PriorityClass **`business-critical`** with value **`100000`** and the
+    description `Revenue-generating services`. It must **not** be the cluster default.
+
+    Then run pod **`checkout`** in namespace **`shop`** (`traefik/whoami:v1.10`) with that
+    priority class.
+  hints:
+    - "`kubectl create priorityclass NAME --value=... --description=...`"
+    - "`spec.priorityClassName`"
+  solution: |
+    ```bash
+    kubectl create priorityclass business-critical --value=100000 --description="Revenue-generating services"
+    kubectl run checkout -n shop --image=traefik/whoami:v1.10 --overrides='{"spec":{"priorityClassName":"business-critical"}}'
+    kubectl get pod checkout -n shop -o jsonpath='{.spec.priority}'
+    ```
+  setup: |
+    k_ns shop
+  check: |
+    check_eq "value" "$(kj priorityclass business-critical '{.value}')" "100000"
+    check_eq "description" "$(kj priorityclass business-critical '{.description}')" "Revenue-generating services"
+    check_not "not global default" '[ "$(kj priorityclass business-critical "{.globalDefault}")" = true ]'
+    check_eq "pod priority" "$(kj -n shop pod checkout '{.spec.priorityClassName} {.spec.priority}')" "business-critical 100000"
+  solve: |
+    kubectl create priorityclass business-critical --value=100000 --description="Revenue-generating services"
+    kubectl run checkout -n shop --image=traefik/whoami:v1.10 --overrides='{"spec":{"priorityClassName":"business-critical"}}'
+
+- id: k8s-092
+  title: Make room for what matters
+  difficulty: 3
+  kind: fix
+  tags: [priority, preemption, pending]
+  scenario: |
+    node01 is full of low-value **`batch`** pods (namespace **`jobs`**). The payment
+    service **`payments`** (namespace **`pay`**) is `Pending` — *Insufficient cpu*.
+
+    Make the scheduler **evict batch pods to make room** for `payments`: create a
+    PriorityClass **`payments-high`** (value **1000000**) and recreate the `payments`
+    pod with it. Don't touch the batch deployment.
+  hints:
+    - "Pending pods with a higher priority can **preempt** lower-priority pods."
+    - "A pod's priority can't be changed in place — recreate it."
+  solution: |
+    ```bash
+    kubectl create priorityclass payments-high --value=1000000
+    kubectl get pod payments -n pay -o yaml > /lab/payments.yaml
+    # add: spec.priorityClassName: payments-high   (and remove spec.priority if present)
+    kubectl replace --force -f /lab/payments.yaml
+    kubectl get events -n jobs | grep -i preempt
+    ```
+  setup: |
+    k_ns jobs; k_ns pay
+    free=$(kubectl get node node01 -o jsonpath='{.status.allocatable.cpu}')
+    case $free in *m) free=${free%m};; *) free=$((free*1000));; esac
+    used=$(kubectl get pods -A --field-selector spec.nodeName=node01 -o json | jq '[.items[].spec.containers[].resources.requests.cpu // "0" | if endswith("m") then (.[:-1]|tonumber) else ((tonumber)*1000) end] | add')
+    per=$(( (free - used - 50) / 4 ))
+    kubectl apply -f - >/dev/null <<EOF
+    apiVersion: apps/v1
+    kind: Deployment
+    metadata: {name: batch, namespace: jobs}
+    spec:
+      replicas: 4
+      selector: {matchLabels: {app: batch}}
+      template:
+        metadata: {labels: {app: batch}}
+        spec:
+          terminationGracePeriodSeconds: 1
+          containers:
+          - {name: b, image: "busybox:1.37", command: ["sleep", "infinity"], resources: {requests: {cpu: "${per}m"}}}
+    EOF
+    kubectl -n jobs rollout status deploy/batch --timeout=90s >/dev/null
+    kubectl apply -f - >/dev/null <<EOF
+    apiVersion: v1
+    kind: Pod
+    metadata: {name: payments, namespace: pay}
+    spec:
+      containers:
+      - {name: p, image: "traefik/whoami:v1.10", resources: {requests: {cpu: "$((per + 100))m"}}}
+    EOF
+    kubectl -n jobs get deploy batch -o jsonpath='{.metadata.generation}' > $KL_STATE/answer
+  check: |
+    check_eq "payments-high value" "$(kj priorityclass payments-high '{.value}')" "1000000"
+    check_eq "payments uses it" "$(kj -n pay pod payments '{.spec.priorityClassName}')" "payments-high"
+    wait_pod pay payments 90
+    check "payments is running" 'pod_ready pay payments'
+    check_eq "batch deployment untouched" "$(kj -n jobs deploy batch '{.metadata.generation}')" "$(cat $KL_STATE/answer)"
+  solve: |
+    kubectl create priorityclass payments-high --value=1000000
+    kubectl get pod payments -n pay -o json | jq 'del(.spec.priority) | .spec.priorityClassName="payments-high"' > /lab/payments.json
+    kubectl replace --force -f /lab/payments.json
+
+- id: k8s-093
+  title: Drain node01 for maintenance
+  difficulty: 3
+  kind: build
+  tags: [drain, maintenance]
+  scenario: |
+    node01 needs a kernel upgrade. **Drain** it: mark it unschedulable and evict every
+    pod, except those managed by DaemonSets (they'd come straight back). Some pods use
+    `emptyDir` volumes — their scratch data may be discarded.
+
+    End state: node01 is cordoned and runs **only DaemonSet pods**.
+  hints:
+    - "`kubectl drain node01 --ignore-daemonsets --delete-emptydir-data`"
+    - "Pods that no controller manages block a drain unless you `--force` it."
+  solution: |
+    ```bash
+    kubectl drain node01 --ignore-daemonsets --delete-emptydir-data --force
+    kubectl get pods -A -o wide --field-selector spec.nodeName=node01
+    ```
+    Evicted deployment pods become `Pending` here — there's no other worker. In a real
+    cluster they'd move to other nodes.
+  setup: |
+    k_ns maint
+    kubectl -n maint create deployment web --image=nginx:1.28-alpine --replicas=2 >/dev/null
+    kubectl -n maint run scratch --image=busybox:1.37 --overrides='{"spec":{"volumes":[{"name":"tmp","emptyDir":{}}],"containers":[{"name":"scratch","image":"busybox:1.37","command":["sleep","infinity"],"volumeMounts":[{"name":"tmp","mountPath":"/tmp"}]}]}}' >/dev/null
+    kubectl -n maint rollout status deploy/web --timeout=90s >/dev/null
+  check: |
+    check_eq "node01 unschedulable" "$(kj node node01 '{.spec.unschedulable}')" "true"
+    left=$(kubectl get pods -A --field-selector spec.nodeName=node01 -o json | jq -r '.items[] | select(.metadata.deletionTimestamp == null) | select((.metadata.ownerReferences // []) | map(.kind) | index("DaemonSet") | not) | select(.metadata.annotations["kubernetes.io/config.mirror"] == null) | "\(.metadata.namespace)/\(.metadata.name)"')
+    check "only DaemonSet pods left on node01 ($(echo $left | wc -w) others)" '[ -z "$left" ]'
+  solve: |
+    kubectl drain node01 --ignore-daemonsets --delete-emptydir-data --force --timeout=180s
+
+- id: k8s-094
+  title: Everything is Pending
+  difficulty: 2
+  kind: fix
+  tags: [cordon, pending, troubleshooting]
+  scenario: |
+    New deployments in namespace **`reports`** never start; the pods stay `Pending` with
+    *0/2 nodes are available: 1 node(s) had untolerated taint
+    {node-role.kubernetes.io/control-plane}, 1 node(s) were unschedulable*.
+
+    Fix the cluster so the **`builder`** deployment runs.
+  hints:
+    - "*unschedulable* = cordoned."
+  solution: |
+    ```bash
+    kubectl get nodes          # node01 Ready,SchedulingDisabled
+    kubectl uncordon node01
+    ```
+  setup: |
+    kubectl cordon node01 >/dev/null
+    k_ns reports
+    kubectl -n reports create deployment builder --image=busybox:1.37 --replicas=2 -- sleep infinity >/dev/null
+  check: |
+    check_not "node01 schedulable" '[ "$(kj node node01 "{.spec.unschedulable}")" = true ]'
+    wait_deploy reports builder 60
+    check "builder is running" 'deploy_ready reports builder'
+  solve: |
+    kubectl uncordon node01
+
+- id: k8s-095
+  title: How much room is left?
+  difficulty: 2
+  kind: build
+  tags: [capacity, allocatable, requests]
+  scenario: |
+    Before scheduling a big job you need two numbers for **node01**:
+
+    1. its **allocatable CPU** in millicores → **`/lab/node01-allocatable-cpu.txt`**
+    2. the **sum of CPU requests** of all pods currently on it, in millicores →
+       **`/lab/node01-requested-cpu.txt`**
+
+    (Just the numbers, e.g. `2000` and `350`.)
+  hints:
+    - "`kubectl describe node node01` → *Allocatable* and *Allocated resources*."
+  solution: |
+    ```bash
+    kubectl describe node node01 | sed -n '/Allocatable/,/System Info/p'
+    kubectl describe node node01 | sed -n '/Allocated resources/,/Events/p'
+    ```
+  check: |
+    a=$(kj node node01 '{.status.allocatable.cpu}'); case $a in *m) a=${a%m};; *) a=$((a*1000));; esac
+    r=$(kubectl describe node node01 | awk '/Allocated resources/{f=1} f&&$1=="cpu"{print $2; exit}' | sed 's/m//')
+    check_eq "allocatable CPU" "$(tr -d '[:space:]m' < /lab/node01-allocatable-cpu.txt 2>/dev/null)" "$a"
+    check_eq "requested CPU" "$(tr -d '[:space:]m' < /lab/node01-requested-cpu.txt 2>/dev/null)" "$r"
+  solve: |
+    a=$(kubectl get node node01 -o jsonpath='{.status.allocatable.cpu}'); case $a in *m) a=${a%m};; *) a=$((a*1000));; esac
+    echo $a > /lab/node01-allocatable-cpu.txt
+    kubectl describe node node01 | awk '/Allocated resources/{f=1} f&&$1=="cpu"{print $2; exit}' | sed 's/m//' > /lab/node01-requested-cpu.txt
+
+- id: k8s-096
+  title: node-01 or node01?
+  difficulty: 2
+  kind: fix
+  tags: [node-affinity, troubleshooting]
+  scenario: |
+    The **`ingest`** deployment (namespace **`pipeline`**) is supposed to be pinned to
+    node01 but its pods are `Pending`. Fix the **deployment's** scheduling rule.
+  hints:
+    - "`kubectl describe pod -n pipeline` → *didn't match Pod's node affinity/selector*."
+    - "`kubectl get nodes --show-labels | grep hostname`"
+  solution: |
+    ```bash
+    kubectl get deploy ingest -n pipeline -o jsonpath='{.spec.template.spec.affinity}'
+    kubectl patch deploy ingest -n pipeline --type=json -p \
+      '[{"op":"replace","path":"/spec/template/spec/affinity/nodeAffinity/requiredDuringSchedulingIgnoredDuringExecution/nodeSelectorTerms/0/matchExpressions/0/values","value":["node01"]}]'
+    ```
+  setup: |
+    k_ns pipeline
+    kubectl apply -f - >/dev/null <<'EOF'
+    apiVersion: apps/v1
+    kind: Deployment
+    metadata: {name: ingest, namespace: pipeline}
+    spec:
+      selector: {matchLabels: {app: ingest}}
+      template:
+        metadata: {labels: {app: ingest}}
+        spec:
+          affinity:
+            nodeAffinity:
+              requiredDuringSchedulingIgnoredDuringExecution:
+                nodeSelectorTerms:
+                - matchExpressions:
+                  - {key: kubernetes.io/hostname, operator: In, values: [node-01]}
+          containers: [{name: ingest, image: "busybox:1.37", command: ["sleep", "infinity"]}]
+    EOF
+  check: |
+    wait_deploy pipeline ingest 60
+    check "ingest is running" 'deploy_ready pipeline ingest'
+    check_eq "pinned to node01" "$(kubectl -n pipeline get pods -l app=ingest -o jsonpath='{.items[*].spec.nodeName}' | tr ' ' '\n' | sort -u)" "node01"
+  solve: |
+    kubectl patch deploy ingest -n pipeline --type=json -p '[{"op":"replace","path":"/spec/template/spec/affinity/nodeAffinity/requiredDuringSchedulingIgnoredDuringExecution/nodeSelectorTerms/0/matchExpressions/0/values","value":["node01"]}]'
+
+- id: k8s-097
+  title: Waiting for a scheduler that doesn't exist
+  difficulty: 3
+  kind: fix
+  tags: [scheduler, pending, troubleshooting]
+  scenario: |
+    The pod **`ml-train`** (namespace **`ml`**) has been `Pending` for a day — and unlike
+    other pending pods, it has **no events at all**. Its manifest came from a cluster
+    that ran a custom scheduler.
+
+    Get it running on this cluster (the default scheduler is fine).
+  hints:
+    - "No *FailedScheduling* events means no scheduler even looked at it."
+    - "`kubectl get pod ml-train -n ml -o jsonpath='{.spec.schedulerName}'`"
+  solution: |
+    ```bash
+    kubectl get pod ml-train -n ml -o jsonpath='{.spec.schedulerName}'   # volcano
+    kubectl get pod ml-train -n ml -o json | jq 'del(.spec.schedulerName)' > /lab/ml-train.json
+    kubectl replace --force -f /lab/ml-train.json
+    ```
+  setup: |
+    k_ns ml
+    kubectl apply -f - >/dev/null <<'EOF'
+    apiVersion: v1
+    kind: Pod
+    metadata: {name: ml-train, namespace: ml}
+    spec:
+      schedulerName: volcano
+      containers: [{name: train, image: "busybox:1.37", command: ["sleep", "infinity"]}]
+    EOF
+  check: |
+    check_match "default scheduler" "$(kj -n ml pod ml-train '{.spec.schedulerName}')" '^(default-scheduler)?$'
+    wait_pod ml ml-train 60
+    check "ml-train is running" 'pod_ready ml ml-train'
+  solve: |
+    kubectl get pod ml-train -n ml -o json | jq 'del(.spec.schedulerName)' > /lab/ml-train.json
+    kubectl replace --force -f /lab/ml-train.json
+
+- id: k8s-098
+  title: Survive a flaky network taint
+  difficulty: 3
+  kind: build
+  tags: [taints, noexecute, tolerationSeconds]
+  scenario: |
+    When node01's network gets flaky, an automation taints it with
+    **`network=degraded:NoExecute`** — which **evicts** running pods that don't tolerate it.
+
+    The **`collector`** pod (namespace **`telemetry`**) should keep running through such
+    events for up to **one hour**, then be evicted. Create pod **`collector`**
+    (`busybox:1.37`, `sleep infinity`) accordingly, then apply the taint to node01 and
+    confirm the collector survives it.
+  hints:
+    - "`tolerations: [{key: network, operator: Equal, value: degraded, effect: NoExecute, tolerationSeconds: 3600}]`"
+  solution: |
+    ```yaml
+    tolerations:
+    - key: network
+      operator: Equal
+      value: degraded
+      effect: NoExecute
+      tolerationSeconds: 3600
+    ```
+    ```bash
+    kubectl taint node node01 network=degraded:NoExecute
+    kubectl get pods -A -o wide | grep node01   # other pods get evicted, collector stays
+    ```
+  setup: |
+    k_ns telemetry
+  check: |
+    check "node01 tainted network=degraded:NoExecute" 'kubectl get node node01 -o json | jq -e ".spec.taints[] | select(.key==\"network\" and .effect==\"NoExecute\")"'
+    t=$(kubectl -n telemetry get pod collector -o json 2>/dev/null | jq -c '.spec.tolerations[] | select(.key=="network")')
+    check_eq "toleration" "$(jq -r '"\(.value) \(.effect) \(.tolerationSeconds)"' <<<"$t" 2>/dev/null)" "degraded NoExecute 3600"
+    check "collector still running on node01" 'pod_ready telemetry collector && [ "$(kj -n telemetry pod collector "{.spec.nodeName}")" = node01 ]'
+  solve: |
+    kubectl apply -f - <<'EOF'
+    apiVersion: v1
+    kind: Pod
+    metadata: {name: collector, namespace: telemetry}
+    spec:
+      tolerations:
+      - {key: network, operator: Equal, value: degraded, effect: NoExecute, tolerationSeconds: 3600}
+      containers:
+      - {name: c, image: "busybox:1.37", command: ["sleep", "infinity"]}
+    EOF
+    kubectl -n telemetry wait --for=condition=Ready pod/collector --timeout=60s
+    kubectl taint node node01 network=degraded:NoExecute
+    sleep 5
+
+- id: k8s-099
+  title: Pin a pod without the scheduler
+  difficulty: 2
+  kind: build
+  tags: [nodename, scheduler]
+  scenario: |
+    The scheduler is being debugged and you need a pod on **node01** *now*, bypassing the
+    scheduler entirely.
+
+    Create pod **`emergency-shell`** in namespace **`ops`** (`busybox:1.37`,
+    `sleep 3600`) that is assigned to node01 **directly in its spec**.
+  hints:
+    - "`spec.nodeName` skips the scheduler — the kubelet on that node just runs it."
+  solution: |
+    ```bash
+    kubectl run emergency-shell -n ops --image=busybox:1.37 \
+      --overrides='{"spec":{"nodeName":"node01"}}' -- sleep 3600
+    ```
+  setup: |
+    k_ns ops
+  check: |
+    wait_pod ops emergency-shell 60
+    check_eq "nodeName" "$(kj -n ops pod emergency-shell '{.spec.nodeName}')" "node01"
+    check "no scheduling event (bypassed the scheduler)" '! kubectl -n ops get events --field-selector involvedObject.name=emergency-shell,reason=Scheduled -o name | grep -q .'
+    check "running" 'pod_ready ops emergency-shell'
+  solve: |
+    kubectl run emergency-shell -n ops --image=busybox:1.37 --overrides='{"spec":{"nodeName":"node01"}}' -- sleep 3600
+
+- id: k8s-100
+  title: "Incident: nothing new can be scheduled"
+  difficulty: 4
+  kind: fix
+  tags: [scheduling, incident, troubleshooting]
+  scenario: |
+    It's release day. In namespace **`release`**, four deployments are stuck — each
+    one `Pending` for a **different** reason:
+
+    - **`web`**, **`api`**, **`worker`**, **`metrics`**
+
+    Make all four run with all replicas ready. Rules: don't remove the control-plane
+    taint, don't use `nodeName`, and keep each deployment's **intent**: `api` needs a node
+    with `tier=backend`; `metrics` must run on every node it can (it tolerates the control
+    plane); `worker` really needs `200m` CPU per replica.
+  hints:
+    - "`kubectl describe pod` for one pod of each deployment — the FailedScheduling message tells you exactly what's wrong."
+    - "Some problems are in the node, some in the deployment."
+  solution: |
+    ```bash
+    kubectl get pods -n release
+    # web:     node01 has a leftover taint "reserved=batch:NoSchedule"     -> kubectl taint node node01 reserved-
+    # api:     needs tier=backend; no node has it                         -> kubectl label node node01 tier=backend
+    # worker:  requests cpu: "200" (200 cores!) instead of 200m           -> kubectl set resources deploy/worker --requests=cpu=200m
+    # metrics: toleration key misspelled (control-plne)                   -> fix the toleration key
+    ```
+  setup: |
+    k_ns release
+    kubectl taint node node01 reserved=batch:NoSchedule --overwrite >/dev/null
+    kubectl apply -f - >/dev/null <<'EOF'
+    apiVersion: apps/v1
+    kind: Deployment
+    metadata: {name: web, namespace: release}
+    spec:
+      replicas: 2
+      selector: {matchLabels: {app: web}}
+      template:
+        metadata: {labels: {app: web}}
+        spec:
+          containers: [{name: web, image: "nginx:1.28-alpine"}]
+    ---
+    apiVersion: apps/v1
+    kind: Deployment
+    metadata: {name: api, namespace: release}
+    spec:
+      selector: {matchLabels: {app: api}}
+      template:
+        metadata: {labels: {app: api}}
+        spec:
+          nodeSelector: {tier: backend}
+          tolerations: [{key: reserved, operator: Exists}]
+          containers: [{name: api, image: "traefik/whoami:v1.10"}]
+    ---
+    apiVersion: apps/v1
+    kind: Deployment
+    metadata: {name: worker, namespace: release}
+    spec:
+      selector: {matchLabels: {app: worker}}
+      template:
+        metadata: {labels: {app: worker}}
+        spec:
+          tolerations: [{key: reserved, operator: Exists}]
+          containers:
+          - {name: worker, image: "busybox:1.37", command: ["sleep", "infinity"], resources: {requests: {cpu: "200"}}}
+    ---
+    apiVersion: apps/v1
+    kind: Deployment
+    metadata: {name: metrics, namespace: release}
+    spec:
+      replicas: 2
+      selector: {matchLabels: {app: metrics}}
+      template:
+        metadata: {labels: {app: metrics}}
+        spec:
+          nodeSelector: {kubernetes.io/hostname: controlplane}
+          tolerations:
+          - {key: node-role.kubernetes.io/control-plne, operator: Exists, effect: NoSchedule}
+          containers: [{name: m, image: "busybox:1.37", command: ["sleep", "infinity"]}]
+    EOF
+  check: |
+    for d in web api worker metrics; do wait_deploy release $d 60; done
+    for d in web api worker metrics; do check "$d is fully ready" "deploy_ready release $d"; done
+    check "control-plane taint still there" 'kubectl get node controlplane -o json | jq -e ".spec.taints[] | select(.key==\"node-role.kubernetes.io/control-plane\")"'
+    check_eq "api still requires tier=backend" "$(kj -n release deploy api '{.spec.template.spec.nodeSelector.tier}')" "backend"
+    check_eq "worker requests 200m" "$(kj -n release deploy worker '{.spec.template.spec.containers[0].resources.requests.cpu}')" "200m"
+    check_eq "no nodeName used" "$(kubectl -n release get deploy -o jsonpath='{.items[*].spec.template.spec.nodeName}')" ""
+  solve: |
+    kubectl taint node node01 reserved-
+    kubectl label node node01 tier=backend
+    kubectl -n release set resources deploy/worker --requests=cpu=200m
+    kubectl -n release patch deploy metrics --type=json -p '[{"op":"replace","path":"/spec/template/spec/tolerations/0/key","value":"node-role.kubernetes.io/control-plane"}]'
