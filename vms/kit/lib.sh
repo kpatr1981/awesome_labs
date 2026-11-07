@@ -1,0 +1,129 @@
+# kubelab helper library — sourced by every setup / check / solve script.
+# shellcheck shell=bash
+
+export LAB=/lab
+export KL_STATE=/var/lib/kubelab
+export PATH=/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin:$PATH
+if [ -z "${KUBECONFIG:-}" ]; then
+  if [ "$(id -u)" = 0 ] && [ -r /etc/kubernetes/admin.conf ]; then
+    export KUBECONFIG=/etc/kubernetes/admin.conf
+  elif [ -r "$HOME/.kube/config" ]; then
+    export KUBECONFIG=$HOME/.kube/config
+  fi
+fi
+
+_kl_fails=0
+_kl_checks=0
+
+# ---------- reporting ----------
+pass() { _kl_checks=$((_kl_checks + 1)); printf '  \033[32m✔\033[0m %s\n' "$*"; }
+fail() { _kl_checks=$((_kl_checks + 1)); _kl_fails=$((_kl_fails + 1)); printf '  \033[31m✘\033[0m %s\n' "$*"; }
+info() { printf '  \033[36m·\033[0m %s\n' "$*"; }
+
+# check "description" 'shell expression'  -> pass when the expression succeeds
+check() {
+  local desc=$1; shift
+  if ( eval "$*" ) >/dev/null 2>&1; then pass "$desc"; else fail "$desc"; fi
+}
+
+# check_not "description" 'shell expression' -> pass when the expression fails
+check_not() {
+  local desc=$1; shift
+  if ( eval "$*" ) >/dev/null 2>&1; then fail "$desc"; else pass "$desc"; fi
+}
+
+# check_eq "description" "actual" "expected"
+check_eq() {
+  if [ "$2" = "$3" ]; then pass "$1"; else fail "$1 (got '${2}', want '${3}')"; fi
+}
+
+# check_match "description" "actual" 'regex'
+check_match() {
+  if [[ $2 =~ $3 ]]; then pass "$1"; else fail "$1 (got '${2}')"; fi
+}
+
+# eventually SECONDS 'shell expression' -> retry until true or timeout
+eventually() {
+  local t=$1; shift
+  local end=$((SECONDS + t))
+  while true; do
+    if ( eval "$*" ) >/dev/null 2>&1; then return 0; fi
+    [ $SECONDS -ge $end ] && return 1
+    sleep 2
+  done
+}
+
+kl_finish() {
+  echo
+  if [ "$_kl_fails" -eq 0 ]; then
+    printf '\033[1;32mPASSED\033[0m — %d/%d checks\n' "$_kl_checks" "$_kl_checks"
+    exit 0
+  fi
+  printf '\033[1;31mNOT YET\033[0m — %d of %d checks failing\n' "$_kl_fails" "$_kl_checks"
+  exit 1
+}
+
+# ---------- setup helpers ----------
+# lab_user — the interactive (non-root) user
+lab_user() { cat "$KL_STATE/user" 2>/dev/null || echo "${SUDO_USER:-$USER}"; }
+lab_home() { getent passwd "$(lab_user)" | cut -d: -f6; }
+
+# as_user cmd... — run a command as the lab user
+as_user() { sudo -u "$(lab_user)" -H bash -lc "$*"; }
+
+# lab_file PATH [MODE] <<'EOF' ... EOF — write a file owned by the lab user
+lab_file() {
+  local p=$1 mode=${2:-0644}
+  case "$p" in /*) ;; *) p="$LAB/$p" ;; esac
+  mkdir -p "$(dirname "$p")"
+  cat >"$p"
+  chmod "$mode" "$p"
+  chown -R "$(lab_user)": "$LAB" 2>/dev/null || true
+  [[ $p == "$LAB"* ]] || chown "$(lab_user)": "$p"
+}
+
+# on_reset 'command' — register a cleanup command for the next reset
+on_reset() {
+  mkdir -p "$KL_STATE/cleanup.d"
+  printf '%s\n' "$*" >>"$KL_STATE/cleanup.d/$(date +%s%N).sh"
+}
+
+# ---------- docker helpers ----------
+c_running() { [ "$(docker inspect -f '{{.State.Running}}' "$1" 2>/dev/null)" = true ]; }
+c_exists() { docker inspect "$1" >/dev/null 2>&1; }
+c_get() { docker inspect -f "$2" "$1" 2>/dev/null; } # c_get NAME '{{go template}}'
+img_exists() { docker image inspect "$1" >/dev/null 2>&1; }
+http_get() { curl -fsS -m 5 "$@"; }
+http_code() { curl -s -o /dev/null -m 5 -w '%{http_code}' "$1"; }
+
+# ---------- kubernetes helpers ----------
+k() { kubectl "$@"; }
+# kj RESOURCE... JSONPATH — e.g. kj -n web deploy api '{.spec.replicas}'
+kj() {
+  local jp="${*: -1}"
+  kubectl get "${@:1:$#-1}" -o jsonpath="$jp" 2>/dev/null
+}
+# kapply — apply a manifest from stdin
+kapply() { kubectl apply -f - >/dev/null; }
+k_exists() { kubectl get "$@" >/dev/null 2>&1; }
+# ready_pods NS SELECTOR -> number of Ready pods
+ready_pods() {
+  kubectl get pods -n "$1" -l "$2" -o jsonpath='{range .items[*]}{.status.conditions[?(@.type=="Ready")].status}{"\n"}{end}' 2>/dev/null | grep -c True
+}
+# wait_deploy NS NAME [TIMEOUT]
+wait_deploy() { kubectl -n "$1" rollout status "deploy/$2" --timeout="${3:-120s}" >/dev/null 2>&1; }
+# k_ns NAME — (re)create a namespace for the exercise
+k_ns() { kubectl create namespace "$1" --dry-run=client -o yaml | kubectl apply -f - >/dev/null; }
+# k_run_curl NS URL -> output of curl from inside the cluster
+k_curl() {
+  kubectl -n "$1" run "kl-curl-$RANDOM" --rm -i --restart=Never --quiet \
+    --image=curlimages/curl:8.11.1 --command -- curl -s -m 5 "$2" 2>/dev/null
+}
+# restore a kube-system object saved at snapshot time
+kl_restore_obj() { # kl_restore_obj configmap coredns
+  local f="$KL_STATE/pristine/obj/$1-$2.yaml"
+  [ -f "$f" ] && kubectl -n kube-system replace --force -f "$f" >/dev/null 2>&1
+}
+# api_up — is the API server answering?
+api_up() { kubectl get --raw=/readyz >/dev/null 2>&1; }
+wait_api() { eventually "${1:-180}" api_up; }
