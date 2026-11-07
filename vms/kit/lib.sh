@@ -202,3 +202,10 @@ cc_count() { cc_ids "$1" "$2" | wc -l | tr -d ' '; }
 cc_get() { local id; id=$(cc_id "$1" "$2"); [ -n "$id" ] && docker inspect -f "$3" "$id"; }
 # cc_exec PROJECT SERVICE cmd... — exec in the first container of a service
 cc_exec() { local p=$1 s=$2 id; shift 2; id=$(cc_id "$p" "$s"); [ -n "$id" ] && docker exec "$id" "$@"; }
+# ---------- ingress / gateway helpers (Traefik NodePorts: web 30080, websecure 30443) ----------
+# ing_get HOST PATH [curl args...] — HTTP request through the ingress controller
+ing_get() { local h=$1 p=$2; shift 2; curl -s -m 5 -H "Host: $h" "$@" "http://node01:30080$p"; }
+# ing_code HOST PATH -> HTTP status code through the ingress controller
+ing_code() { curl -s -o /dev/null -m 5 -w '%{http_code}' -H "Host: $1" "http://node01:30080$2"; }
+# ing_tls HOST PATH [curl args...] — HTTPS through the ingress controller (SNI = HOST)
+ing_tls() { local h=$1 p=$2; shift 2; curl -s -m 5 --resolve "$h:30443:$(getent hosts node01 | awk '{print $1}')" "$@" "https://$h:30443$p"; }

@@ -1,0 +1,1279 @@
+track: kubernetes
+module: Network policies
+profile: k8s
+order: 10
+exercises:
+
+- id: k8s-181
+  title: Deny everything coming in
+  difficulty: 1
+  kind: build
+  tags: [networkpolicy, default-deny]
+  scenario: |
+    The cluster's CNI (Calico) enforces NetworkPolicies. Namespace **`vault`** must start
+    from **zero trust**: create a NetworkPolicy **`default-deny-ingress`** that blocks
+    **all incoming traffic** to every pod in `vault`.
+
+    (Outgoing traffic stays allowed.)
+  hints:
+    - "An empty `podSelector: {}` selects all pods; listing `Ingress` in `policyTypes` with no rules denies everything."
+  solution: |
+    ```yaml
+    apiVersion: networking.k8s.io/v1
+    kind: NetworkPolicy
+    metadata: {name: default-deny-ingress, namespace: vault}
+    spec:
+      podSelector: {}
+      policyTypes: [Ingress]
+    ```
+  setup: |
+    k_ns vault; k_ns client
+    kubectl -n vault create deployment secrets --image=nginx:1.28-alpine >/dev/null
+    kubectl -n vault expose deploy secrets --port=80 >/dev/null
+  check: |
+    check_eq "policy selects all pods" "$(kj -n vault netpol default-deny-ingress '{.spec.podSelector}')" "{}"
+    check_eq "policy types" "$(kj -n vault netpol default-deny-ingress '{.spec.policyTypes[*]}')" "Ingress"
+    wait_deploy vault secrets 60
+    check_not "traffic from another namespace is blocked" 'k_curl client http://secrets.vault | grep -q nginx'
+  solve: |
+    kubectl apply -f - <<'EOF'
+    apiVersion: networking.k8s.io/v1
+    kind: NetworkPolicy
+    metadata: {name: default-deny-ingress, namespace: vault}
+    spec:
+      podSelector: {}
+      policyTypes: [Ingress]
+    EOF
+
+- id: k8s-182
+  title: Only the frontend may call the backend
+  difficulty: 2
+  kind: build
+  tags: [networkpolicy, podSelector]
+  scenario: |
+    In namespace **`app`**, the pods labelled **`tier=backend`** (port 80) must accept
+    traffic **only** from pods labelled **`tier=frontend`** in the same namespace.
+
+    Create NetworkPolicy **`backend-from-frontend`**.
+  hints:
+    - "`podSelector` picks the pods the policy *protects*; `ingress[].from[].podSelector` picks who may connect."
+  solution: |
+    ```yaml
+    apiVersion: networking.k8s.io/v1
+    kind: NetworkPolicy
+    metadata: {name: backend-from-frontend, namespace: app}
+    spec:
+      podSelector:
+        matchLabels: {tier: backend}
+      policyTypes: [Ingress]
+      ingress:
+      - from:
+        - podSelector:
+            matchLabels: {tier: frontend}
+        ports:
+        - {protocol: TCP, port: 80}
+    ```
+  setup: |
+    k_ns app
+    kubectl -n app create deployment backend --image=traefik/whoami:v1.10 >/dev/null
+    kubectl -n app patch deploy backend --type=json -p '[{"op":"add","path":"/spec/template/metadata/labels/tier","value":"backend"}]' >/dev/null
+    kubectl -n app expose deploy backend --port=80 >/dev/null
+    kubectl -n app run frontend --image=curlimages/curl:8.11.1 --labels=tier=frontend --command -- sleep infinity >/dev/null
+    kubectl -n app run intruder --image=curlimages/curl:8.11.1 --labels=tier=batch --command -- sleep infinity >/dev/null
+  check: |
+    wait_deploy app backend 60; wait_pod app frontend 60; wait_pod app intruder 60
+    check "frontend reaches backend" 'eventually 10 "kubectl -n app exec frontend -- curl -s -m 3 http://backend | grep -q Hostname"'
+    check_not "intruder is blocked" 'kubectl -n app exec intruder -- curl -s -m 3 http://backend | grep -q Hostname'
+  solve: |
+    kubectl apply -f - <<'EOF'
+    apiVersion: networking.k8s.io/v1
+    kind: NetworkPolicy
+    metadata: {name: backend-from-frontend, namespace: app}
+    spec:
+      podSelector:
+        matchLabels: {tier: backend}
+      policyTypes: [Ingress]
+      ingress:
+      - from:
+        - podSelector:
+            matchLabels: {tier: frontend}
+        ports:
+        - {protocol: TCP, port: 80}
+    EOF
+
+- id: k8s-183
+  title: Allow a whole namespace
+  difficulty: 2
+  kind: build
+  tags: [networkpolicy, namespaceSelector]
+  scenario: |
+    The **`reports`** API in namespace **`bi`** (label `app=reports`) may be called by
+    **any pod in namespaces labelled `team=analytics`** — and nothing else.
+
+    Label the existing namespace **`analysts`** with `team=analytics` and create the
+    NetworkPolicy **`reports-from-analytics`** in `bi`.
+  hints:
+    - "`from: [{namespaceSelector: {matchLabels: {team: analytics}}}]`"
+  solution: |
+    ```bash
+    kubectl label namespace analysts team=analytics
+    ```
+    ```yaml
+    apiVersion: networking.k8s.io/v1
+    kind: NetworkPolicy
+    metadata: {name: reports-from-analytics, namespace: bi}
+    spec:
+      podSelector: {matchLabels: {app: reports}}
+      policyTypes: [Ingress]
+      ingress:
+      - from:
+        - namespaceSelector:
+            matchLabels: {team: analytics}
+    ```
+  setup: |
+    k_ns bi; k_ns analysts; k_ns marketing
+    kubectl -n bi create deployment reports --image=traefik/whoami:v1.10 >/dev/null
+    kubectl -n bi expose deploy reports --port=80 >/dev/null
+  check: |
+    check_eq "analysts labelled" "$(kj ns analysts '{.metadata.labels.team}')" "analytics"
+    wait_deploy bi reports 60
+    check "analysts can call reports" 'k_curl analysts http://reports.bi | grep -q Hostname'
+    check_not "marketing cannot" 'k_curl marketing http://reports.bi | grep -q Hostname'
+  solve: |
+    kubectl label namespace analysts team=analytics
+    kubectl apply -f - <<'EOF'
+    apiVersion: networking.k8s.io/v1
+    kind: NetworkPolicy
+    metadata: {name: reports-from-analytics, namespace: bi}
+    spec:
+      podSelector: {matchLabels: {app: reports}}
+      policyTypes: [Ingress]
+      ingress:
+      - from:
+        - namespaceSelector:
+            matchLabels: {team: analytics}
+    EOF
+
+- id: k8s-184
+  title: Lock down egress — but keep DNS
+  difficulty: 3
+  kind: build
+  tags: [networkpolicy, egress, dns]
+  scenario: |
+    Pods in namespace **`locked`** may only talk to:
+
+    - **cluster DNS** (CoreDNS pods in `kube-system`, UDP and TCP 53)
+    - the **`api`** service in their own namespace (pods `app=api`, port 80)
+
+    Everything else outbound must be blocked. Create a single NetworkPolicy **`egress`**
+    that does this for all pods in `locked`.
+  hints:
+    - "`policyTypes: [Egress]` and two `egress` rules."
+    - "Select CoreDNS with `namespaceSelector: {matchLabels: {kubernetes.io/metadata.name: kube-system}}` **and** `podSelector: {matchLabels: {k8s-app: kube-dns}}` in the same `to` entry."
+  solution: |
+    ```yaml
+    apiVersion: networking.k8s.io/v1
+    kind: NetworkPolicy
+    metadata: {name: egress, namespace: locked}
+    spec:
+      podSelector: {}
+      policyTypes: [Egress]
+      egress:
+      - to:
+        - namespaceSelector: {matchLabels: {kubernetes.io/metadata.name: kube-system}}
+          podSelector: {matchLabels: {k8s-app: kube-dns}}
+        ports:
+        - {protocol: UDP, port: 53}
+        - {protocol: TCP, port: 53}
+      - to:
+        - podSelector: {matchLabels: {app: api}}
+        ports:
+        - {protocol: TCP, port: 80}
+    ```
+  setup: |
+    k_ns locked; k_ns outside
+    kubectl -n locked create deployment api --image=traefik/whoami:v1.10 >/dev/null
+    kubectl -n locked expose deploy api --port=80 >/dev/null
+    kubectl -n outside create deployment web --image=nginx:1.28-alpine >/dev/null
+    kubectl -n outside expose deploy web --port=80 >/dev/null
+    kubectl -n locked run client --image=curlimages/curl:8.11.1 --command -- sleep infinity >/dev/null
+  check: |
+    wait_deploy locked api 60; wait_deploy outside web 60; wait_pod locked client 60
+    x() { kubectl -n locked exec client -- "$@" 2>/dev/null; }
+    check "DNS works" 'x nslookup api.locked.svc.cluster.local | grep -q Address'
+    check "api reachable" 'x curl -s -m 3 http://api | grep -q Hostname'
+    check_not "other namespaces blocked" 'x curl -s -m 3 http://web.outside | grep -q nginx'
+    check_not "internet blocked" 'x curl -s -m 3 -o /dev/null -w "%{http_code}" http://1.1.1.1 | grep -q "^[1-5]"'
+  solve: |
+    kubectl apply -f - <<'EOF'
+    apiVersion: networking.k8s.io/v1
+    kind: NetworkPolicy
+    metadata: {name: egress, namespace: locked}
+    spec:
+      podSelector: {}
+      policyTypes: [Egress]
+      egress:
+      - to:
+        - namespaceSelector: {matchLabels: {kubernetes.io/metadata.name: kube-system}}
+          podSelector: {matchLabels: {k8s-app: kube-dns}}
+        ports:
+        - {protocol: UDP, port: 53}
+        - {protocol: TCP, port: 53}
+      - to:
+        - podSelector: {matchLabels: {app: api}}
+        ports:
+        - {protocol: TCP, port: 80}
+    EOF
+
+- id: k8s-185
+  title: Nothing resolves since the security change
+  difficulty: 3
+  kind: fix
+  tags: [networkpolicy, egress, dns, troubleshooting]
+  scenario: |
+    The security team applied **`deny-all-egress`** in namespace **`payments`** plus a
+    policy allowing the **`gateway`** pods to reach the external **`psp`** service.
+    Now `gateway` logs *bad address 'psp.payments.svc.cluster.local'* — **name
+    resolution** fails.
+
+    Add a NetworkPolicy **`allow-dns`** so that **all pods in `payments`** can query
+    cluster DNS. Don't modify or delete the existing policies.
+  hints:
+    - "Egress to CoreDNS on UDP and TCP port 53."
+  solution: |
+    ```yaml
+    apiVersion: networking.k8s.io/v1
+    kind: NetworkPolicy
+    metadata: {name: allow-dns, namespace: payments}
+    spec:
+      podSelector: {}
+      policyTypes: [Egress]
+      egress:
+      - to:
+        - namespaceSelector: {matchLabels: {kubernetes.io/metadata.name: kube-system}}
+          podSelector: {matchLabels: {k8s-app: kube-dns}}
+        ports:
+        - {protocol: UDP, port: 53}
+        - {protocol: TCP, port: 53}
+    ```
+    NetworkPolicies are additive: the new allow rule is OR-ed with the existing ones.
+  setup: |
+    k_ns payments
+    kubectl -n payments create deployment psp --image=traefik/whoami:v1.10 >/dev/null
+    kubectl -n payments expose deploy psp --port=80 >/dev/null
+    kubectl -n payments run gateway --image=curlimages/curl:8.11.1 --labels=app=gateway --command -- sh -c 'while true; do curl -s -m 3 -o /dev/null -w "%{http_code}\n" http://psp.payments.svc.cluster.local || echo "bad address"; sleep 3; done' >/dev/null
+    kubectl apply -f - >/dev/null <<'EOF'
+    apiVersion: networking.k8s.io/v1
+    kind: NetworkPolicy
+    metadata: {name: deny-all-egress, namespace: payments}
+    spec:
+      podSelector: {}
+      policyTypes: [Egress]
+    ---
+    apiVersion: networking.k8s.io/v1
+    kind: NetworkPolicy
+    metadata: {name: gateway-to-psp, namespace: payments}
+    spec:
+      podSelector: {matchLabels: {app: gateway}}
+      policyTypes: [Egress]
+      egress:
+      - to: [{podSelector: {matchLabels: {app: psp}}}]
+        ports: [{protocol: TCP, port: 80}]
+    EOF
+    kubectl -n payments get netpol -o json | jq -c '[.items[] | {n: .metadata.name, s: .spec}] | sort_by(.n)' > $KL_STATE/answer
+  check: |
+    check_eq "existing policies untouched" "$(kubectl -n payments get netpol -o json | jq -c '[.items[] | select(.metadata.name != "allow-dns") | {n: .metadata.name, s: .spec}] | sort_by(.n)')" "$(cat $KL_STATE/answer)"
+    check "allow-dns exists" 'k_exists -n payments netpol allow-dns'
+    wait_deploy payments psp 60; wait_pod payments gateway 60
+    check "gateway resolves and reaches psp" 'eventually 15 "kubectl -n payments exec gateway -- curl -s -m 3 http://psp.payments.svc.cluster.local | grep -q Hostname"'
+  solve: |
+    kubectl apply -f - <<'EOF'
+    apiVersion: networking.k8s.io/v1
+    kind: NetworkPolicy
+    metadata: {name: allow-dns, namespace: payments}
+    spec:
+      podSelector: {}
+      policyTypes: [Egress]
+      egress:
+      - to:
+        - namespaceSelector: {matchLabels: {kubernetes.io/metadata.name: kube-system}}
+          podSelector: {matchLabels: {k8s-app: kube-dns}}
+        ports:
+        - {protocol: UDP, port: 53}
+        - {protocol: TCP, port: 53}
+    EOF
+
+- id: k8s-186
+  title: Only through the ingress controller
+  difficulty: 3
+  kind: build
+  tags: [networkpolicy, ingress-controller]
+  scenario: |
+    The **`shop`** web pods (namespace **`web`**, label `app=shop`) must be reachable
+    **only through the ingress controller** (Traefik runs in namespace **`traefik`**) —
+    not directly from other pods in the cluster.
+
+    Create NetworkPolicy **`only-from-traefik`**. The Ingress for `shop.example.com`
+    already exists.
+  hints:
+    - "Traefik's pods live in namespace `traefik` — `kubernetes.io/metadata.name: traefik` is set on every namespace automatically."
+  solution: |
+    ```yaml
+    apiVersion: networking.k8s.io/v1
+    kind: NetworkPolicy
+    metadata: {name: only-from-traefik, namespace: web}
+    spec:
+      podSelector: {matchLabels: {app: shop}}
+      policyTypes: [Ingress]
+      ingress:
+      - from:
+        - namespaceSelector:
+            matchLabels: {kubernetes.io/metadata.name: traefik}
+    ```
+  setup: |
+    k_ns web; k_ns other
+    kubectl -n web create deployment shop --image=nginx:1.28-alpine >/dev/null
+    kubectl -n web expose deploy shop --port=80 >/dev/null
+    kubectl -n web create ingress shop --class=traefik --rule='shop.example.com/*=shop:80' >/dev/null
+  check: |
+    wait_deploy web shop 60
+    check "works through the ingress" 'eventually 15 "ing_get shop.example.com / | grep -q \"Welcome to nginx\""'
+    check_not "direct pod-to-pod blocked" 'k_curl other http://shop.web | grep -q nginx'
+    check "policy exists" 'k_exists -n web netpol only-from-traefik'
+  solve: |
+    kubectl apply -f - <<'EOF'
+    apiVersion: networking.k8s.io/v1
+    kind: NetworkPolicy
+    metadata: {name: only-from-traefik, namespace: web}
+    spec:
+      podSelector: {matchLabels: {app: shop}}
+      policyTypes: [Ingress]
+      ingress:
+      - from:
+        - namespaceSelector:
+            matchLabels: {kubernetes.io/metadata.name: traefik}
+    EOF
+
+- id: k8s-187
+  title: The policy that selects nothing
+  difficulty: 2
+  kind: fix
+  tags: [networkpolicy, labels, troubleshooting]
+  scenario: |
+    The NetworkPolicy **`allow-web-to-api`** (namespace **`portal`**) should let the
+    **`web`** pods call the **`api`** pods. There's also a default-deny policy. Since it
+    was applied, `web` can't reach `api` anymore.
+
+    Fix **`allow-web-to-api`** (the default-deny must stay).
+  hints:
+    - "Compare the labels in the policy (`kubectl describe netpol`) with the real pod labels (`kubectl get pods --show-labels`)."
+  solution: |
+    ```bash
+    kubectl describe netpol allow-web-to-api -n portal
+    kubectl get pods -n portal --show-labels
+    # the policy uses app=frontend, the web pods are app=web
+    kubectl patch netpol allow-web-to-api -n portal --type=json -p '[{"op":"replace","path":"/spec/ingress/0/from/0/podSelector/matchLabels/app","value":"web"}]'
+    ```
+  setup: |
+    k_ns portal
+    kubectl -n portal create deployment api --image=traefik/whoami:v1.10 >/dev/null
+    kubectl -n portal expose deploy api --port=80 >/dev/null
+    kubectl -n portal run web --image=curlimages/curl:8.11.1 --labels=app=web --command -- sleep infinity >/dev/null
+    kubectl apply -f - >/dev/null <<'EOF'
+    apiVersion: networking.k8s.io/v1
+    kind: NetworkPolicy
+    metadata: {name: default-deny, namespace: portal}
+    spec:
+      podSelector: {}
+      policyTypes: [Ingress]
+    ---
+    apiVersion: networking.k8s.io/v1
+    kind: NetworkPolicy
+    metadata: {name: allow-web-to-api, namespace: portal}
+    spec:
+      podSelector: {matchLabels: {app: api}}
+      policyTypes: [Ingress]
+      ingress:
+      - from: [{podSelector: {matchLabels: {app: frontend}}}]
+    EOF
+  check: |
+    check "default-deny still there" 'k_exists -n portal netpol default-deny'
+    wait_deploy portal api 60; wait_pod portal web 60
+    check "web reaches api" 'eventually 10 "kubectl -n portal exec web -- curl -s -m 3 http://api | grep -q Hostname"'
+  solve: |
+    kubectl patch netpol allow-web-to-api -n portal --type=json -p '[{"op":"replace","path":"/spec/ingress/0/from/0/podSelector/matchLabels/app","value":"web"}]'
+
+- id: k8s-188
+  title: AND, not OR
+  difficulty: 4
+  kind: fix
+  tags: [networkpolicy, semantics, security]
+  scenario: |
+    The policy **`metrics-scrape`** (namespace **`prod`**) was meant to allow scraping of
+    port 9090 on the `api` pods **only by Prometheus**, i.e. pods labelled
+    `app=prometheus` **in** the namespace `monitoring`.
+
+    A pentest found that **every pod in `monitoring`** — and every `app=prometheus` pod
+    in **any** namespace — can reach it. Fix the policy's semantics.
+  hints:
+    - "Two items in a `from` list are OR-ed. A `namespaceSelector` and a `podSelector` in the **same** item are AND-ed."
+    - "Watch the YAML dashes."
+  solution: |
+    ```yaml
+    ingress:
+    - from:
+      - namespaceSelector: {matchLabels: {kubernetes.io/metadata.name: monitoring}}
+        podSelector: {matchLabels: {app: prometheus}}     # same list item → AND
+      ports: [{protocol: TCP, port: 9090}]
+    ```
+  setup: |
+    k_ns prod; k_ns monitoring; k_ns sandbox
+    kubectl apply -f - >/dev/null <<'EOF'
+    apiVersion: apps/v1
+    kind: Deployment
+    metadata: {name: api, namespace: prod}
+    spec:
+      selector: {matchLabels: {app: api}}
+      template:
+        metadata: {labels: {app: api}}
+        spec:
+          containers:
+          - {name: metrics, image: "registry.k8s.io/e2e-test-images/agnhost:2.53", args: ["netexec", "--http-port=9090"]}
+    ---
+    apiVersion: v1
+    kind: Service
+    metadata: {name: api, namespace: prod}
+    spec:
+      selector: {app: api}
+      ports: [{name: metrics, port: 9090}]
+    ---
+    apiVersion: networking.k8s.io/v1
+    kind: NetworkPolicy
+    metadata: {name: metrics-scrape, namespace: prod}
+    spec:
+      podSelector: {matchLabels: {app: api}}
+      policyTypes: [Ingress]
+      ingress:
+      - from:
+        - namespaceSelector: {matchLabels: {kubernetes.io/metadata.name: monitoring}}
+        - podSelector: {matchLabels: {app: prometheus}}
+        ports: [{protocol: TCP, port: 9090}]
+    EOF
+    for p in "monitoring prometheus prometheus" "monitoring grafana grafana" "sandbox fake-prom prometheus"; do set -- $p
+      kubectl -n $1 run $2 --image=curlimages/curl:8.11.1 --labels=app=$3 --command -- sleep infinity >/dev/null
+    done
+  check: |
+    wait_deploy prod api 60
+    for p in "monitoring prometheus" "monitoring grafana" "sandbox fake-prom"; do set -- $p; wait_pod $1 $2 60; done
+    t() { kubectl -n $1 exec $2 -- curl -s -m 3 http://api.prod:9090/hostname 2>/dev/null | grep -q api-; }
+    check "prometheus in monitoring can scrape" 'eventually 10 "t monitoring prometheus"'
+    check_not "grafana in monitoring cannot" 't monitoring grafana'
+    check_not "app=prometheus in sandbox cannot" 't sandbox fake-prom'
+  solve: |
+    kubectl apply -f - <<'EOF'
+    apiVersion: networking.k8s.io/v1
+    kind: NetworkPolicy
+    metadata: {name: metrics-scrape, namespace: prod}
+    spec:
+      podSelector: {matchLabels: {app: api}}
+      policyTypes: [Ingress]
+      ingress:
+      - from:
+        - namespaceSelector: {matchLabels: {kubernetes.io/metadata.name: monitoring}}
+          podSelector: {matchLabels: {app: prometheus}}
+        ports: [{protocol: TCP, port: 9090}]
+    EOF
+
+- id: k8s-189
+  title: Talk among yourselves only
+  difficulty: 2
+  kind: build
+  tags: [networkpolicy, namespace-isolation]
+  scenario: |
+    Tenant namespace **`tenant-a`** must be isolated: its pods may receive traffic **from
+    pods in `tenant-a` only**.
+
+    Create NetworkPolicy **`same-namespace-only`** in `tenant-a`.
+  hints:
+    - "`from: [{podSelector: {}}]` means *all pods in this policy's namespace*."
+  solution: |
+    ```yaml
+    apiVersion: networking.k8s.io/v1
+    kind: NetworkPolicy
+    metadata: {name: same-namespace-only, namespace: tenant-a}
+    spec:
+      podSelector: {}
+      policyTypes: [Ingress]
+      ingress:
+      - from:
+        - podSelector: {}
+    ```
+  setup: |
+    k_ns tenant-a; k_ns tenant-b
+    kubectl -n tenant-a create deployment app --image=traefik/whoami:v1.10 >/dev/null
+    kubectl -n tenant-a expose deploy app --port=80 >/dev/null
+  check: |
+    wait_deploy tenant-a app 60
+    check "same namespace allowed" 'k_curl tenant-a http://app | grep -q Hostname'
+    check_not "tenant-b blocked" 'k_curl tenant-b http://app.tenant-a | grep -q Hostname'
+  solve: |
+    kubectl apply -f - <<'EOF'
+    apiVersion: networking.k8s.io/v1
+    kind: NetworkPolicy
+    metadata: {name: same-namespace-only, namespace: tenant-a}
+    spec:
+      podSelector: {}
+      policyTypes: [Ingress]
+      ingress:
+      - from:
+        - podSelector: {}
+    EOF
+
+- id: k8s-190
+  title: A range of ports
+  difficulty: 2
+  kind: build
+  tags: [networkpolicy, endPort]
+  scenario: |
+    The **`streamer`** pods (namespace **`media`**, label `app=streamer`) serve on ports
+    **8000 to 8010**. Allow incoming traffic **only on that port range** (from anywhere).
+    Create NetworkPolicy **`streamer-ports`** using a single port entry.
+  hints:
+    - "`ports: [{protocol: TCP, port: 8000, endPort: 8010}]`"
+  solution: |
+    ```yaml
+    apiVersion: networking.k8s.io/v1
+    kind: NetworkPolicy
+    metadata: {name: streamer-ports, namespace: media}
+    spec:
+      podSelector: {matchLabels: {app: streamer}}
+      policyTypes: [Ingress]
+      ingress:
+      - ports:
+        - {protocol: TCP, port: 8000, endPort: 8010}
+    ```
+  setup: |
+    k_ns media
+    kubectl apply -f - >/dev/null <<'EOF'
+    apiVersion: apps/v1
+    kind: Deployment
+    metadata: {name: streamer, namespace: media}
+    spec:
+      selector: {matchLabels: {app: streamer}}
+      template:
+        metadata: {labels: {app: streamer}}
+        spec:
+          containers:
+          - {name: s1, image: "registry.k8s.io/e2e-test-images/agnhost:2.53", args: ["netexec", "--http-port=8005", "--udp-port=-1"]}
+          - {name: s2, image: "registry.k8s.io/e2e-test-images/agnhost:2.53", args: ["netexec", "--http-port=9000", "--udp-port=-1"]}
+    ---
+    apiVersion: v1
+    kind: Service
+    metadata: {name: streamer, namespace: media}
+    spec:
+      selector: {app: streamer}
+      ports: [{name: a, port: 8005}, {name: b, port: 9000}]
+    EOF
+  check: |
+    check_eq "port range" "$(kj -n media netpol streamer-ports '{.spec.ingress[0].ports[0].port}-{.spec.ingress[0].ports[0].endPort}')" "8000-8010"
+    wait_deploy media streamer 60
+    check "8005 allowed" 'k_curl media http://streamer:8005/hostname | grep -q streamer'
+    check_not "9000 blocked" 'k_curl media http://streamer:9000/hostname | grep -q streamer'
+  solve: |
+    kubectl apply -f - <<'EOF'
+    apiVersion: networking.k8s.io/v1
+    kind: NetworkPolicy
+    metadata: {name: streamer-ports, namespace: media}
+    spec:
+      podSelector: {matchLabels: {app: streamer}}
+      policyTypes: [Ingress]
+      ingress:
+      - ports:
+        - {protocol: TCP, port: 8000, endPort: 8010}
+    EOF
+
+- id: k8s-191
+  title: Protect the database
+  difficulty: 3
+  kind: build
+  tags: [networkpolicy, database, egress]
+  scenario: |
+    In namespace **`erp`**, the **`db`** pods (label `app=db`, PostgreSQL on 5432) must:
+
+    - accept connections **only from `app=api` pods, on port 5432**
+    - make **no outbound connections at all** (a compromised database can't phone home)
+
+    Create NetworkPolicy **`db-lockdown`** (one policy, both directions).
+  hints:
+    - "`policyTypes: [Ingress, Egress]` with an ingress rule and **no** egress rules."
+  solution: |
+    ```yaml
+    apiVersion: networking.k8s.io/v1
+    kind: NetworkPolicy
+    metadata: {name: db-lockdown, namespace: erp}
+    spec:
+      podSelector: {matchLabels: {app: db}}
+      policyTypes: [Ingress, Egress]
+      ingress:
+      - from: [{podSelector: {matchLabels: {app: api}}}]
+        ports: [{protocol: TCP, port: 5432}]
+    ```
+  setup: |
+    k_ns erp
+    kubectl -n erp run db --image=postgres:16-alpine --labels=app=db --env=POSTGRES_PASSWORD=pw >/dev/null
+    kubectl -n erp expose pod db --port=5432 >/dev/null
+    kubectl -n erp run api --image=postgres:16-alpine --labels=app=api --command -- sleep infinity >/dev/null
+    kubectl -n erp run batch --image=postgres:16-alpine --labels=app=batch --command -- sleep infinity >/dev/null
+  check: |
+    check_eq "policy types" "$(kj -n erp netpol db-lockdown '{.spec.policyTypes[*]}' | tr ' ' '\n' | sort | tr '\n' ' ')" "Egress Ingress "
+    for p in db api batch; do wait_pod erp $p 90; done
+    eventually 30 'kubectl -n erp exec db -- pg_isready -h 127.0.0.1'
+    check "api connects" 'eventually 10 "kubectl -n erp exec api -- pg_isready -h db.erp.svc.cluster.local -t 3"'
+    check_not "batch cannot" 'kubectl -n erp exec batch -- pg_isready -h db.erp.svc.cluster.local -t 3'
+    check_not "db cannot connect out" 'kubectl -n erp exec db -- sh -c "nc -z -w 3 1.1.1.1 80"'
+  solve: |
+    kubectl apply -f - <<'EOF'
+    apiVersion: networking.k8s.io/v1
+    kind: NetworkPolicy
+    metadata: {name: db-lockdown, namespace: erp}
+    spec:
+      podSelector: {matchLabels: {app: db}}
+      policyTypes: [Ingress, Egress]
+      ingress:
+      - from: [{podSelector: {matchLabels: {app: api}}}]
+        ports: [{protocol: TCP, port: 5432}]
+    EOF
+
+- id: k8s-192
+  title: Policies with named ports
+  difficulty: 2
+  kind: build
+  tags: [networkpolicy, named-ports]
+  scenario: |
+    The **`billing`** pods (namespace **`fin`**) declare a container port named
+    **`grpc`** (its number changes between releases). Allow ingress to the billing pods
+    **only on the port named `grpc`**, from any pod in the namespace.
+
+    Create NetworkPolicy **`billing-grpc`**, referring to the port **by name**.
+  hints:
+    - "`ports: [{protocol: TCP, port: grpc}]`"
+  solution: |
+    ```yaml
+    apiVersion: networking.k8s.io/v1
+    kind: NetworkPolicy
+    metadata: {name: billing-grpc, namespace: fin}
+    spec:
+      podSelector: {matchLabels: {app: billing}}
+      policyTypes: [Ingress]
+      ingress:
+      - from: [{podSelector: {}}]
+        ports: [{protocol: TCP, port: grpc}]
+    ```
+  setup: |
+    k_ns fin
+    kubectl apply -f - >/dev/null <<'EOF'
+    apiVersion: apps/v1
+    kind: Deployment
+    metadata: {name: billing, namespace: fin}
+    spec:
+      selector: {matchLabels: {app: billing}}
+      template:
+        metadata: {labels: {app: billing}}
+        spec:
+          containers:
+          - name: billing
+            image: registry.k8s.io/e2e-test-images/agnhost:2.53
+            args: ["netexec", "--http-port=7070"]
+            ports: [{name: grpc, containerPort: 7070}, {name: debug, containerPort: 8081, protocol: UDP}]
+          - name: admin
+            image: registry.k8s.io/e2e-test-images/agnhost:2.53
+            args: ["netexec", "--http-port=9999", "--udp-port=-1"]
+    ---
+    apiVersion: v1
+    kind: Service
+    metadata: {name: billing, namespace: fin}
+    spec:
+      selector: {app: billing}
+      ports: [{name: grpc, port: 7070}, {name: admin, port: 9999}]
+    EOF
+  check: |
+    check_eq "port by name" "$(kj -n fin netpol billing-grpc '{.spec.ingress[0].ports[0].port}')" "grpc"
+    wait_deploy fin billing 60
+    check "grpc port allowed" 'k_curl fin http://billing:7070/hostname | grep -q billing'
+    check_not "admin port blocked" 'k_curl fin http://billing:9999/hostname | grep -q billing'
+  solve: |
+    kubectl apply -f - <<'EOF'
+    apiVersion: networking.k8s.io/v1
+    kind: NetworkPolicy
+    metadata: {name: billing-grpc, namespace: fin}
+    spec:
+      podSelector: {matchLabels: {app: billing}}
+      policyTypes: [Ingress]
+      ingress:
+      - from: [{podSelector: {}}]
+        ports: [{protocol: TCP, port: grpc}]
+    EOF
+
+- id: k8s-193
+  title: The policy that blocked all egress by accident
+  difficulty: 3
+  kind: fix
+  tags: [networkpolicy, policyTypes, troubleshooting]
+  scenario: |
+    Someone wanted to restrict **incoming** traffic to the **`worker`** pods (namespace
+    **`jobs`**) to the `scheduler` pods. Since then the workers can't reach **anything**
+    — not even the queue service `redis` in the same namespace.
+
+    Fix **`worker-policy`** so it only restricts ingress, as intended.
+  hints:
+    - "Look at `policyTypes`. Listing `Egress` with no egress rules denies all outgoing traffic."
+  solution: |
+    ```bash
+    kubectl get netpol worker-policy -n jobs -o jsonpath='{.spec.policyTypes}'   # ["Ingress","Egress"]
+    kubectl patch netpol worker-policy -n jobs --type=merge -p '{"spec":{"policyTypes":["Ingress"]}}'
+    ```
+  setup: |
+    k_ns jobs
+    kubectl -n jobs create deployment redis --image=redis:7.4-alpine >/dev/null
+    kubectl -n jobs expose deploy redis --port=6379 >/dev/null
+    kubectl -n jobs run worker --image=redis:7.4-alpine --labels=app=worker --command -- sleep infinity >/dev/null
+    kubectl apply -f - >/dev/null <<'EOF'
+    apiVersion: networking.k8s.io/v1
+    kind: NetworkPolicy
+    metadata: {name: worker-policy, namespace: jobs}
+    spec:
+      podSelector: {matchLabels: {app: worker}}
+      policyTypes: [Ingress, Egress]
+      ingress:
+      - from: [{podSelector: {matchLabels: {app: scheduler}}}]
+    EOF
+  check: |
+    check_eq "policy types" "$(kj -n jobs netpol worker-policy '{.spec.policyTypes[*]}')" "Ingress"
+    check_eq "ingress rule kept" "$(kj -n jobs netpol worker-policy '{.spec.ingress[0].from[0].podSelector.matchLabels.app}')" "scheduler"
+    wait_deploy jobs redis 60; wait_pod jobs worker 60
+    check "worker reaches redis" 'eventually 10 "kubectl -n jobs exec worker -- redis-cli -h redis ping | grep -q PONG"'
+  solve: |
+    kubectl patch netpol worker-policy -n jobs --type=merge -p '{"spec":{"policyTypes":["Ingress"]}}'
+
+- id: k8s-194
+  title: Which policy is blocking me?
+  difficulty: 3
+  kind: build
+  tags: [networkpolicy, investigation]
+  scenario: |
+    Namespace **`maze`** has six NetworkPolicies. Traffic from the **`client`** pod to the
+    **`target`** service on port 80 is blocked, and you need to tell the owning team
+    **which policies select the `target` pods** (those are the ones that decide).
+
+    Write the names of all policies whose `podSelector` matches the `target` pods, one per
+    line, to **`/lab/target-policies.txt`**.
+  hints:
+    - "`kubectl get pods -n maze --show-labels`, then compare with each policy's `podSelector` (`kubectl get netpol -n maze -o yaml`)."
+    - "An empty podSelector `{}` matches every pod."
+  solution: |
+    ```bash
+    kubectl get pod -n maze -l app=target --show-labels
+    kubectl get netpol -n maze -o custom-columns=NAME:.metadata.name,SELECTOR:.spec.podSelector
+    ```
+  setup: |
+    k_ns maze
+    kubectl -n maze run target --image=traefik/whoami:v1.10 --labels=app=target,tier=api,env=prod >/dev/null
+    kubectl -n maze run client --image=curlimages/curl:8.11.1 --labels=app=client --command -- sleep infinity >/dev/null
+    kubectl apply -f - >/dev/null <<'EOF'
+    apiVersion: networking.k8s.io/v1
+    kind: NetworkPolicy
+    metadata: {name: deny-all, namespace: maze}
+    spec: {podSelector: {}, policyTypes: [Ingress]}
+    ---
+    apiVersion: networking.k8s.io/v1
+    kind: NetworkPolicy
+    metadata: {name: api-from-gateway, namespace: maze}
+    spec:
+      podSelector: {matchLabels: {tier: api}}
+      policyTypes: [Ingress]
+      ingress: [{from: [{podSelector: {matchLabels: {app: gateway}}}]}]
+    ---
+    apiVersion: networking.k8s.io/v1
+    kind: NetworkPolicy
+    metadata: {name: web-public, namespace: maze}
+    spec:
+      podSelector: {matchLabels: {tier: web}}
+      policyTypes: [Ingress]
+      ingress: [{}]
+    ---
+    apiVersion: networking.k8s.io/v1
+    kind: NetworkPolicy
+    metadata: {name: prod-monitoring, namespace: maze}
+    spec:
+      podSelector: {matchExpressions: [{key: env, operator: In, values: [prod, staging]}]}
+      policyTypes: [Ingress]
+      ingress: [{ports: [{port: 9090}]}]
+    ---
+    apiVersion: networking.k8s.io/v1
+    kind: NetworkPolicy
+    metadata: {name: client-egress, namespace: maze}
+    spec:
+      podSelector: {matchLabels: {app: client}}
+      policyTypes: [Egress]
+      egress: [{}]
+    ---
+    apiVersion: networking.k8s.io/v1
+    kind: NetworkPolicy
+    metadata: {name: legacy-target, namespace: maze}
+    spec:
+      podSelector: {matchLabels: {app: target, version: v1}}
+      policyTypes: [Ingress]
+      ingress: [{}]
+    EOF
+  check: |
+    check_eq "policies selecting target" "$(grep -v '^\s*$' /lab/target-policies.txt 2>/dev/null | sort | tr '\n' ' ')" "api-from-gateway deny-all prod-monitoring "
+  solve: |
+    printf 'deny-all\napi-from-gateway\nprod-monitoring\n' > /lab/target-policies.txt
+
+- id: k8s-195
+  title: Default-deny for every production namespace
+  difficulty: 2
+  kind: build
+  tags: [networkpolicy, default-deny, automation]
+  scenario: |
+    There's no cluster-wide NetworkPolicy object in vanilla Kubernetes. Apply a
+    **`default-deny`** policy (deny all ingress **and** egress) to **every namespace
+    labelled `env=prod`** — there are several.
+  hints:
+    - "`for ns in $(kubectl get ns -l env=prod -o name); do ...; done`"
+  solution: |
+    ```bash
+    for ns in $(kubectl get ns -l env=prod -o jsonpath='{.items[*].metadata.name}'); do
+      kubectl apply -n $ns -f - <<'EOF'
+    apiVersion: networking.k8s.io/v1
+    kind: NetworkPolicy
+    metadata: {name: default-deny}
+    spec:
+      podSelector: {}
+      policyTypes: [Ingress, Egress]
+    EOF
+    done
+    ```
+  setup: |
+    for n in orders-prod catalog-prod search-prod; do k_ns $n; kubectl label ns $n env=prod >/dev/null; done
+    for n in orders-dev catalog-dev; do k_ns $n; kubectl label ns $n env=dev >/dev/null; done
+  check: |
+    for n in orders-prod catalog-prod search-prod; do
+      check "$n has default-deny (in+out)" "[ \"\$(kj -n $n netpol default-deny '{.spec.policyTypes[*]}' | tr ' ' '\n' | sort | tr '\n' ' ')\" = 'Egress Ingress ' ] && [ \"\$(kj -n $n netpol default-deny '{.spec.podSelector}')\" = '{}' ]"
+    done
+    for n in orders-dev catalog-dev; do check_not "$n untouched" "k_exists -n $n netpol default-deny"; done
+  solve: |
+    for ns in $(kubectl get ns -l env=prod -o jsonpath='{.items[*].metadata.name}'); do
+      printf 'apiVersion: networking.k8s.io/v1\nkind: NetworkPolicy\nmetadata: {name: default-deny}\nspec:\n  podSelector: {}\n  policyTypes: [Ingress, Egress]\n' | kubectl apply -n $ns -f -
+    done
+
+- id: k8s-196
+  title: Let Prometheus in
+  difficulty: 2
+  kind: fix
+  tags: [networkpolicy, monitoring]
+  scenario: |
+    Namespace **`checkout`** has a default-deny ingress policy. Since then the
+    **Prometheus** pod in namespace **`monitoring`** can't scrape the checkout pods'
+    metrics on port **9090** anymore.
+
+    Add a NetworkPolicy **`allow-prometheus`** in `checkout` allowing exactly that: pods
+    `app=prometheus` from namespace `monitoring` → all checkout pods, port 9090.
+  hints:
+    - "namespaceSelector **and** podSelector in the same `from` item."
+  solution: |
+    ```yaml
+    apiVersion: networking.k8s.io/v1
+    kind: NetworkPolicy
+    metadata: {name: allow-prometheus, namespace: checkout}
+    spec:
+      podSelector: {}
+      policyTypes: [Ingress]
+      ingress:
+      - from:
+        - namespaceSelector: {matchLabels: {kubernetes.io/metadata.name: monitoring}}
+          podSelector: {matchLabels: {app: prometheus}}
+        ports: [{protocol: TCP, port: 9090}]
+    ```
+  setup: |
+    k_ns checkout; k_ns monitoring
+    kubectl -n checkout create deployment cart --image=registry.k8s.io/e2e-test-images/agnhost:2.53 -- /agnhost netexec --http-port=9090 >/dev/null
+    kubectl -n checkout expose deploy cart --port=9090 >/dev/null
+    kubectl -n checkout apply -f - >/dev/null <<'EOF'
+    apiVersion: networking.k8s.io/v1
+    kind: NetworkPolicy
+    metadata: {name: default-deny}
+    spec: {podSelector: {}, policyTypes: [Ingress]}
+    EOF
+    kubectl -n monitoring run prometheus --image=curlimages/curl:8.11.1 --labels=app=prometheus --command -- sleep infinity >/dev/null
+    kubectl -n monitoring run alertmanager --image=curlimages/curl:8.11.1 --labels=app=alertmanager --command -- sleep infinity >/dev/null
+  check: |
+    wait_deploy checkout cart 60; wait_pod monitoring prometheus 60; wait_pod monitoring alertmanager 60
+    t() { kubectl -n monitoring exec $1 -- curl -s -m 3 http://cart.checkout:9090/hostname 2>/dev/null | grep -q cart-; }
+    check "prometheus scrapes" 'eventually 10 "t prometheus"'
+    check_not "alertmanager still blocked" 't alertmanager'
+    check "default-deny still there" 'k_exists -n checkout netpol default-deny'
+  solve: |
+    kubectl apply -f - <<'EOF'
+    apiVersion: networking.k8s.io/v1
+    kind: NetworkPolicy
+    metadata: {name: allow-prometheus, namespace: checkout}
+    spec:
+      podSelector: {}
+      policyTypes: [Ingress]
+      ingress:
+      - from:
+        - namespaceSelector: {matchLabels: {kubernetes.io/metadata.name: monitoring}}
+          podSelector: {matchLabels: {app: prometheus}}
+        ports: [{protocol: TCP, port: 9090}]
+    EOF
+
+- id: k8s-197
+  title: Egress to one external address
+  difficulty: 3
+  kind: build
+  tags: [networkpolicy, ipBlock, egress]
+  scenario: |
+    The **`fx-rates`** pod (namespace **`treasury`**) may only reach the external rates
+    provider at **`1.1.1.1`** on **TCP 80** (plus cluster DNS). Every other outbound
+    connection must be blocked.
+
+    Create NetworkPolicy **`fx-egress`**.
+  hints:
+    - "`to: [{ipBlock: {cidr: 1.1.1.1/32}}]`"
+  solution: |
+    ```yaml
+    apiVersion: networking.k8s.io/v1
+    kind: NetworkPolicy
+    metadata: {name: fx-egress, namespace: treasury}
+    spec:
+      podSelector: {matchLabels: {app: fx-rates}}
+      policyTypes: [Egress]
+      egress:
+      - to: [{ipBlock: {cidr: 1.1.1.1/32}}]
+        ports: [{protocol: TCP, port: 80}]
+      - to:
+        - namespaceSelector: {matchLabels: {kubernetes.io/metadata.name: kube-system}}
+          podSelector: {matchLabels: {k8s-app: kube-dns}}
+        ports: [{protocol: UDP, port: 53}, {protocol: TCP, port: 53}]
+    ```
+  setup: |
+    k_ns treasury
+    kubectl -n treasury run fx-rates --image=curlimages/curl:8.11.1 --labels=app=fx-rates --command -- sleep infinity >/dev/null
+    kubectl -n treasury create deployment internal --image=nginx:1.28-alpine >/dev/null
+    kubectl -n treasury expose deploy internal --port=80 >/dev/null
+  check: |
+    wait_pod treasury fx-rates 60; wait_deploy treasury internal 60
+    x() { kubectl -n treasury exec fx-rates -- "$@" 2>/dev/null; }
+    check "1.1.1.1:80 reachable" 'eventually 10 "x curl -s -m 4 -o /dev/null -w %{http_code} http://1.1.1.1 | grep -q \"^[23]\""'
+    check_not "other in-cluster services blocked" 'x curl -s -m 3 http://internal | grep -q nginx'
+    check_not "1.0.0.1:80 blocked" 'x curl -s -m 3 -o /dev/null -w %{http_code} http://1.0.0.1 | grep -q "^[23]"'
+    check "DNS still works" 'x nslookup kubernetes.default.svc.cluster.local | grep -q Address'
+  solve: |
+    kubectl apply -f - <<'EOF'
+    apiVersion: networking.k8s.io/v1
+    kind: NetworkPolicy
+    metadata: {name: fx-egress, namespace: treasury}
+    spec:
+      podSelector: {matchLabels: {app: fx-rates}}
+      policyTypes: [Egress]
+      egress:
+      - to: [{ipBlock: {cidr: 1.1.1.1/32}}]
+        ports: [{protocol: TCP, port: 80}]
+      - to:
+        - namespaceSelector: {matchLabels: {kubernetes.io/metadata.name: kube-system}}
+          podSelector: {matchLabels: {k8s-app: kube-dns}}
+        ports: [{protocol: UDP, port: 53}, {protocol: TCP, port: 53}]
+    EOF
+
+- id: k8s-198
+  title: Tenants can't see each other
+  difficulty: 3
+  kind: build
+  tags: [networkpolicy, multi-tenancy]
+  scenario: |
+    Two tenants share the cluster: namespaces **`acme`** and **`globex`**, each with an
+    `app` service exposed through the ingress controller (`acme.example.com`,
+    `globex.example.com`).
+
+    In **both** namespaces create a NetworkPolicy **`tenant-isolation`** so that their pods
+    accept traffic **only from their own namespace and from the ingress controller**
+    (namespace `traefik`). Both public URLs must keep working.
+  hints:
+    - "Two `from` items: `{podSelector: {}}` and `{namespaceSelector: {matchLabels: {kubernetes.io/metadata.name: traefik}}}`."
+  solution: |
+    ```yaml
+    spec:
+      podSelector: {}
+      policyTypes: [Ingress]
+      ingress:
+      - from:
+        - podSelector: {}
+        - namespaceSelector: {matchLabels: {kubernetes.io/metadata.name: traefik}}
+    ```
+  setup: |
+    for t in acme globex; do
+      k_ns $t
+      kubectl -n $t create deployment app --image=traefik/whoami:v1.10 >/dev/null
+      kubectl -n $t set env deploy/app WHOAMI_NAME=$t >/dev/null
+      kubectl -n $t expose deploy app --port=80 >/dev/null
+      kubectl -n $t create ingress app --class=traefik --rule="$t.example.com/*=app:80" >/dev/null
+    done
+  check: |
+    wait_deploy acme app 60; wait_deploy globex app 60
+    for t in acme globex; do check "$t has tenant-isolation" "k_exists -n $t netpol tenant-isolation"; done
+    check "acme.example.com works" 'eventually 15 "ing_get acme.example.com / | grep -q \"Name: acme\""'
+    check "globex.example.com works" 'ing_get globex.example.com / | grep -q "Name: globex"'
+    check_not "globex pods can't reach acme" 'k_curl globex http://app.acme | grep -q Hostname'
+    check_not "acme pods can't reach globex" 'k_curl acme http://app.globex | grep -q Hostname'
+    check "acme pods reach acme" 'k_curl acme http://app | grep -q "Name: acme"'
+  solve: |
+    for t in acme globex; do
+      printf 'apiVersion: networking.k8s.io/v1\nkind: NetworkPolicy\nmetadata: {name: tenant-isolation}\nspec:\n  podSelector: {}\n  policyTypes: [Ingress]\n  ingress:\n  - from:\n    - podSelector: {}\n    - namespaceSelector: {matchLabels: {kubernetes.io/metadata.name: traefik}}\n' | kubectl apply -n $t -f -
+    done
+
+- id: k8s-199
+  title: Egress to a service in another namespace
+  difficulty: 3
+  kind: build
+  tags: [networkpolicy, egress, cross-namespace]
+  scenario: |
+    Namespace **`frontend`** has a default-deny **egress** policy. The **`web`** pods
+    (label `app=web`) must be allowed to call the **`catalog`** API (pods `app=catalog`,
+    port 80) in namespace **`backend`** — and DNS, of course.
+
+    Create NetworkPolicy **`web-egress`** in `frontend`. Nothing else may be opened.
+  hints:
+    - "NetworkPolicies work on **pods**, not services: target the catalog pods with namespaceSelector + podSelector."
+  solution: |
+    ```yaml
+    apiVersion: networking.k8s.io/v1
+    kind: NetworkPolicy
+    metadata: {name: web-egress, namespace: frontend}
+    spec:
+      podSelector: {matchLabels: {app: web}}
+      policyTypes: [Egress]
+      egress:
+      - to:
+        - namespaceSelector: {matchLabels: {kubernetes.io/metadata.name: backend}}
+          podSelector: {matchLabels: {app: catalog}}
+        ports: [{protocol: TCP, port: 80}]
+      - to:
+        - namespaceSelector: {matchLabels: {kubernetes.io/metadata.name: kube-system}}
+          podSelector: {matchLabels: {k8s-app: kube-dns}}
+        ports: [{protocol: UDP, port: 53}, {protocol: TCP, port: 53}]
+    ```
+  setup: |
+    k_ns frontend; k_ns backend
+    kubectl -n backend create deployment catalog --image=traefik/whoami:v1.10 >/dev/null
+    kubectl -n backend expose deploy catalog --port=80 >/dev/null
+    kubectl -n backend create deployment inventory --image=traefik/whoami:v1.10 >/dev/null
+    kubectl -n backend expose deploy inventory --port=80 >/dev/null
+    kubectl -n frontend run web --image=curlimages/curl:8.11.1 --labels=app=web --command -- sleep infinity >/dev/null
+    kubectl -n frontend apply -f - >/dev/null <<'EOF'
+    apiVersion: networking.k8s.io/v1
+    kind: NetworkPolicy
+    metadata: {name: default-deny-egress}
+    spec: {podSelector: {}, policyTypes: [Egress]}
+    EOF
+  check: |
+    wait_pod frontend web 60; wait_deploy backend catalog 60; wait_deploy backend inventory 60
+    x() { kubectl -n frontend exec web -- "$@" 2>/dev/null; }
+    check "web reaches catalog.backend" 'eventually 10 "x curl -s -m 3 http://catalog.backend | grep -q Hostname"'
+    check_not "web cannot reach inventory.backend" 'x curl -s -m 3 http://inventory.backend | grep -q Hostname'
+  solve: |
+    kubectl apply -f - <<'EOF'
+    apiVersion: networking.k8s.io/v1
+    kind: NetworkPolicy
+    metadata: {name: web-egress, namespace: frontend}
+    spec:
+      podSelector: {matchLabels: {app: web}}
+      policyTypes: [Egress]
+      egress:
+      - to:
+        - namespaceSelector: {matchLabels: {kubernetes.io/metadata.name: backend}}
+          podSelector: {matchLabels: {app: catalog}}
+        ports: [{protocol: TCP, port: 80}]
+      - to:
+        - namespaceSelector: {matchLabels: {kubernetes.io/metadata.name: kube-system}}
+          podSelector: {matchLabels: {k8s-app: kube-dns}}
+        ports: [{protocol: UDP, port: 53}, {protocol: TCP, port: 53}]
+    EOF
+
+- id: k8s-200
+  title: "Incident: zero trust broke the shop"
+  difficulty: 4
+  kind: fix
+  tags: [networkpolicy, incident]
+  scenario: |
+    The security team rolled out NetworkPolicies to namespace **`shop`** on Friday
+    evening. Now:
+
+    - `http://shop.example.com/` (through Traefik) times out
+    - the **`web`** pods can't reach the **`api`** service
+    - the **`api`** pods can't reach the **`db`** (postgres, 5432)
+
+    Intended flows: Traefik → `web:80`, `web` → `api:80`, `api` → `db:5432`, plus DNS for
+    everyone. **Keep** the default-deny policies (ingress and egress) and add or fix
+    whatever is necessary — nothing more.
+  hints:
+    - "`kubectl get netpol -n shop -o yaml` — read every policy; some exist but are subtly wrong."
+    - "Remember both directions: for `web` → `api` you need egress on web **and** ingress on api."
+  solution: |
+    ```bash
+    kubectl get netpol -n shop
+    # problems: no DNS egress; allow-traefik uses podSelector app=traefik (wrong: it's another namespace);
+    # api-ingress uses port 8080; api has no egress to db; web has no egress to api.
+    ```
+    One clean set of policies: `allow-dns` (all pods, egress 53), `web-ingress` (from ns
+    traefik, port 80), `web-egress` (to api:80), `api-ingress` (from web, port 80),
+    `api-egress` (to db:5432), `db-ingress` (from api, port 5432).
+  setup: |
+    k_ns shop
+    kubectl apply -f - >/dev/null <<'EOF'
+    apiVersion: apps/v1
+    kind: Deployment
+    metadata: {name: web, namespace: shop}
+    spec:
+      selector: {matchLabels: {app: web}}
+      template:
+        metadata: {labels: {app: web}}
+        spec:
+          containers: [{name: nginx, image: "nginx:1.28-alpine"}]
+    ---
+    apiVersion: v1
+    kind: Service
+    metadata: {name: web, namespace: shop}
+    spec: {selector: {app: web}, ports: [{port: 80}]}
+    ---
+    apiVersion: apps/v1
+    kind: Deployment
+    metadata: {name: api, namespace: shop}
+    spec:
+      selector: {matchLabels: {app: api}}
+      template:
+        metadata: {labels: {app: api}}
+        spec:
+          containers:
+          - {name: http, image: "traefik/whoami:v1.10"}
+          - {name: pgclient, image: "postgres:16-alpine", command: ["sleep", "infinity"]}
+    ---
+    apiVersion: v1
+    kind: Service
+    metadata: {name: api, namespace: shop}
+    spec: {selector: {app: api}, ports: [{port: 80, targetPort: 80}]}
+    ---
+    apiVersion: apps/v1
+    kind: Deployment
+    metadata: {name: db, namespace: shop}
+    spec:
+      selector: {matchLabels: {app: db}}
+      template:
+        metadata: {labels: {app: db}}
+        spec:
+          containers: [{name: db, image: "postgres:16-alpine", env: [{name: POSTGRES_PASSWORD, value: pw}]}]
+    ---
+    apiVersion: v1
+    kind: Service
+    metadata: {name: db, namespace: shop}
+    spec: {selector: {app: db}, ports: [{port: 5432}]}
+    ---
+    apiVersion: networking.k8s.io/v1
+    kind: Ingress
+    metadata: {name: shop, namespace: shop}
+    spec:
+      ingressClassName: traefik
+      rules:
+      - host: shop.example.com
+        http: {paths: [{path: /, pathType: Prefix, backend: {service: {name: web, port: {number: 80}}}}]}
+    ---
+    apiVersion: networking.k8s.io/v1
+    kind: NetworkPolicy
+    metadata: {name: default-deny-ingress, namespace: shop}
+    spec: {podSelector: {}, policyTypes: [Ingress]}
+    ---
+    apiVersion: networking.k8s.io/v1
+    kind: NetworkPolicy
+    metadata: {name: default-deny-egress, namespace: shop}
+    spec: {podSelector: {}, policyTypes: [Egress]}
+    ---
+    apiVersion: networking.k8s.io/v1
+    kind: NetworkPolicy
+    metadata: {name: allow-traefik, namespace: shop}
+    spec:
+      podSelector: {matchLabels: {app: web}}
+      policyTypes: [Ingress]
+      ingress: [{from: [{podSelector: {matchLabels: {app.kubernetes.io/name: traefik}}}], ports: [{port: 80}]}]
+    ---
+    apiVersion: networking.k8s.io/v1
+    kind: NetworkPolicy
+    metadata: {name: api-ingress, namespace: shop}
+    spec:
+      podSelector: {matchLabels: {app: api}}
+      policyTypes: [Ingress]
+      ingress: [{from: [{podSelector: {matchLabels: {app: web}}}], ports: [{port: 8080}]}]
+    ---
+    apiVersion: networking.k8s.io/v1
+    kind: NetworkPolicy
+    metadata: {name: db-ingress, namespace: shop}
+    spec:
+      podSelector: {matchLabels: {app: db}}
+      policyTypes: [Ingress]
+      ingress: [{from: [{podSelector: {matchLabels: {app: api}}}], ports: [{port: 5432}]}]
+    EOF
+  check: |
+    wait_deploy shop web 60; wait_deploy shop api 90; wait_deploy shop db 90
+    check "default-deny policies kept" 'k_exists -n shop netpol default-deny-ingress && k_exists -n shop netpol default-deny-egress'
+    check "shop.example.com works" 'eventually 15 "ing_get shop.example.com / | grep -q \"Welcome to nginx\""'
+    w=$(kubectl -n shop get pods -l app=web -o jsonpath='{.items[0].metadata.name}')
+    a=$(kubectl -n shop get pods -l app=api -o jsonpath='{.items[0].metadata.name}')
+    check "web reaches api" 'eventually 10 "kubectl -n shop exec $w -- wget -qO- -T 3 http://api | grep -q Hostname"'
+    check "api reaches db" 'eventually 15 "kubectl -n shop exec $a -c pgclient -- pg_isready -h db -t 3"'
+    check_not "web cannot reach db directly" 'kubectl -n shop exec $w -- nc -z -w 3 db 5432'
+  solve: |
+    kubectl -n shop delete netpol allow-traefik api-ingress
+    kubectl apply -n shop -f - <<'EOF'
+    apiVersion: networking.k8s.io/v1
+    kind: NetworkPolicy
+    metadata: {name: allow-dns}
+    spec:
+      podSelector: {}
+      policyTypes: [Egress]
+      egress:
+      - to:
+        - namespaceSelector: {matchLabels: {kubernetes.io/metadata.name: kube-system}}
+          podSelector: {matchLabels: {k8s-app: kube-dns}}
+        ports: [{protocol: UDP, port: 53}, {protocol: TCP, port: 53}]
+    ---
+    apiVersion: networking.k8s.io/v1
+    kind: NetworkPolicy
+    metadata: {name: web-ingress}
+    spec:
+      podSelector: {matchLabels: {app: web}}
+      policyTypes: [Ingress]
+      ingress: [{from: [{namespaceSelector: {matchLabels: {kubernetes.io/metadata.name: traefik}}}], ports: [{port: 80}]}]
+    ---
+    apiVersion: networking.k8s.io/v1
+    kind: NetworkPolicy
+    metadata: {name: web-egress}
+    spec:
+      podSelector: {matchLabels: {app: web}}
+      policyTypes: [Egress]
+      egress: [{to: [{podSelector: {matchLabels: {app: api}}}], ports: [{port: 80}]}]
+    ---
+    apiVersion: networking.k8s.io/v1
+    kind: NetworkPolicy
+    metadata: {name: api-ingress}
+    spec:
+      podSelector: {matchLabels: {app: api}}
+      policyTypes: [Ingress]
+      ingress: [{from: [{podSelector: {matchLabels: {app: web}}}], ports: [{port: 80}]}]
+    ---
+    apiVersion: networking.k8s.io/v1
+    kind: NetworkPolicy
+    metadata: {name: api-egress}
+    spec:
+      podSelector: {matchLabels: {app: api}}
+      policyTypes: [Egress]
+      egress: [{to: [{podSelector: {matchLabels: {app: db}}}], ports: [{port: 5432}]}]
+    EOF
