@@ -1,0 +1,881 @@
+track: kubernetes
+module: Health, resources & autoscaling
+profile: k8s
+order: 8
+exercises:
+
+- id: k8s-141
+  title: Restart it when it hangs
+  difficulty: 2
+  kind: build
+  tags: [liveness, probes]
+  scenario: |
+    Create a deployment **`api`** in namespace **`health`** (`nginx:1.28-alpine`) with a
+    **liveness probe** that does an HTTP GET on `/` port 80 every **10 seconds**, starting
+    after **5 seconds**, and restarts the container after **3** consecutive failures.
+  hints:
+    - "`livenessProbe: {httpGet: {path: /, port: 80}, initialDelaySeconds: 5, periodSeconds: 10, failureThreshold: 3}`"
+  solution: |
+    ```yaml
+    livenessProbe:
+      httpGet: {path: /, port: 80}
+      initialDelaySeconds: 5
+      periodSeconds: 10
+      failureThreshold: 3
+    ```
+  setup: |
+    k_ns health
+  check: |
+    p=$(kj -n health deploy api '{.spec.template.spec.containers[0].livenessProbe}')
+    check_eq "httpGet" "$(jq -r '"\(.httpGet.path) \(.httpGet.port)"' <<<"$p" 2>/dev/null)" "/ 80"
+    check_eq "timing" "$(jq -r '"\(.initialDelaySeconds) \(.periodSeconds) \(.failureThreshold)"' <<<"$p" 2>/dev/null)" "5 10 3"
+    wait_deploy health api 60
+    check "api is ready" 'deploy_ready health api'
+  solve: |
+    kubectl apply -f - <<'EOF'
+    apiVersion: apps/v1
+    kind: Deployment
+    metadata: {name: api, namespace: health}
+    spec:
+      selector: {matchLabels: {app: api}}
+      template:
+        metadata: {labels: {app: api}}
+        spec:
+          containers:
+          - name: nginx
+            image: nginx:1.28-alpine
+            livenessProbe:
+              httpGet: {path: /, port: 80}
+              initialDelaySeconds: 5
+              periodSeconds: 10
+              failureThreshold: 3
+    EOF
+
+- id: k8s-142
+  title: A probe for a TCP service
+  difficulty: 2
+  kind: build
+  tags: [probes, tcp]
+  scenario: |
+    Redis doesn't speak HTTP. Create pod **`cache`** in namespace **`health`**
+    (`redis:7.4-alpine`) with a **readiness probe** that checks that **TCP port 6379**
+    accepts connections every 5 seconds, and a **liveness probe** that runs
+    **`redis-cli ping`** inside the container every 10 seconds.
+  hints:
+    - "`readinessProbe.tcpSocket.port` and `livenessProbe.exec.command`."
+  solution: |
+    ```yaml
+    readinessProbe:
+      tcpSocket: {port: 6379}
+      periodSeconds: 5
+    livenessProbe:
+      exec: {command: ["redis-cli", "ping"]}
+      periodSeconds: 10
+    ```
+  setup: |
+    k_ns health
+  check: |
+    wait_pod health cache 60
+    check_eq "readiness tcp port" "$(kj -n health pod cache '{.spec.containers[0].readinessProbe.tcpSocket.port}')" "6379"
+    check_eq "liveness exec" "$(kj -n health pod cache '{.spec.containers[0].livenessProbe.exec.command[*]}')" "redis-cli ping"
+    check "cache is ready" 'pod_ready health cache'
+  solve: |
+    kubectl apply -f - <<'EOF'
+    apiVersion: v1
+    kind: Pod
+    metadata: {name: cache, namespace: health}
+    spec:
+      containers:
+      - name: redis
+        image: redis:7.4-alpine
+        readinessProbe:
+          tcpSocket: {port: 6379}
+          periodSeconds: 5
+        livenessProbe:
+          exec: {command: ["redis-cli", "ping"]}
+          periodSeconds: 10
+    EOF
+
+- id: k8s-143
+  title: Killed before it could start
+  difficulty: 3
+  kind: fix
+  tags: [startupProbe, liveness, crashloop]
+  scenario: |
+    The legacy **`erp`** deployment (namespace **`legacy`**) needs about **40 seconds** to
+    start. Its liveness probe kills it long before that, so it restarts forever.
+
+    Fix it with a **startup probe** (same check as the liveness probe) that gives the app
+    up to **2 minutes** to start — **without** weakening the liveness probe itself.
+  hints:
+    - "While a startupProbe hasn't succeeded, liveness and readiness probes are disabled."
+    - "`failureThreshold × periodSeconds` ≥ 120"
+  solution: |
+    ```yaml
+    startupProbe:
+      httpGet: {path: /, port: 8080}
+      periodSeconds: 5
+      failureThreshold: 24
+    ```
+  setup: |
+    k_ns legacy
+    kubectl apply -f - >/dev/null <<'EOF'
+    apiVersion: apps/v1
+    kind: Deployment
+    metadata: {name: erp, namespace: legacy}
+    spec:
+      selector: {matchLabels: {app: erp}}
+      template:
+        metadata: {labels: {app: erp}}
+        spec:
+          containers:
+          - name: erp
+            image: registry.k8s.io/e2e-test-images/agnhost:2.53
+            command: ["sh", "-c", "echo booting...; sleep 40; exec /agnhost netexec --http-port=8080"]
+            livenessProbe:
+              httpGet: {path: /, port: 8080}
+              periodSeconds: 5
+              failureThreshold: 2
+    EOF
+  check: |
+    lp=$(kj -n legacy deploy erp '{.spec.template.spec.containers[0].livenessProbe}')
+    sp=$(kj -n legacy deploy erp '{.spec.template.spec.containers[0].startupProbe}')
+    check_eq "liveness unchanged" "$(jq -r '"\(.periodSeconds) \(.failureThreshold)"' <<<"$lp")" "5 2"
+    check "startup probe allows >=120s" '[ "$(jq -r "(.periodSeconds // 10) * (.failureThreshold // 3)" <<<"$sp")" -ge 120 ] 2>/dev/null'
+    k_exists -n legacy deploy erp && [ -n "$sp" ] && eventually 120 'deploy_ready legacy erp'
+    check "erp becomes ready" 'deploy_ready legacy erp'
+    pod=$(kubectl -n legacy get pods -l app=erp -o json | jq -r '[.items[] | select(.metadata.deletionTimestamp == null)][-1].metadata.name')
+    check_eq "and was not restarted" "$(restarts legacy $pod)" "0"
+  solve: |
+    kubectl -n legacy patch deploy erp --type=json -p '[{"op":"add","path":"/spec/template/spec/containers/0/startupProbe","value":{"httpGet":{"path":"/","port":8080},"periodSeconds":5,"failureThreshold":24}}]'
+
+- id: k8s-144
+  title: The probe that times out
+  difficulty: 3
+  kind: fix
+  tags: [liveness, timeouts, troubleshooting]
+  scenario: |
+    **`search`** (namespace **`catalog`**) restarts every minute or so. Its `/healthz`
+    endpoint checks the search index and takes about **2 seconds** to answer — which is
+    fine for the team.
+
+    Fix the liveness probe so healthy pods stop getting killed. Keep the same endpoint.
+  hints:
+    - "`kubectl describe pod` → *Liveness probe failed: ... context deadline exceeded*."
+    - "`timeoutSeconds` defaults to 1."
+  solution: |
+    ```bash
+    kubectl patch deploy search -n catalog --type=json -p \
+      '[{"op":"replace","path":"/spec/template/spec/containers/0/livenessProbe/timeoutSeconds","value":5}]'
+    ```
+  setup: |
+    k_ns catalog
+    kubectl -n catalog create configmap search-app --from-literal=app.py='
+    import time
+    from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
+    class H(BaseHTTPRequestHandler):
+        def do_GET(self):
+            if self.path == "/healthz": time.sleep(2)
+            self.send_response(200); self.end_headers(); self.wfile.write(b"ok")
+        def log_message(self, *a): pass
+    ThreadingHTTPServer(("0.0.0.0", 8000), H).serve_forever()
+    ' >/dev/null
+    kubectl apply -f - >/dev/null <<'EOF'
+    apiVersion: apps/v1
+    kind: Deployment
+    metadata: {name: search, namespace: catalog}
+    spec:
+      selector: {matchLabels: {app: search}}
+      template:
+        metadata: {labels: {app: search}}
+        spec:
+          containers:
+          - name: search
+            image: python:3.12-alpine
+            command: ["python", "/app/app.py"]
+            volumeMounts: [{name: app, mountPath: /app}]
+            livenessProbe:
+              httpGet: {path: /healthz, port: 8000}
+              periodSeconds: 5
+              timeoutSeconds: 1
+              failureThreshold: 2
+          volumes: [{name: app, configMap: {name: search-app}}]
+    EOF
+  check: |
+    check_eq "endpoint unchanged" "$(kj -n catalog deploy search '{.spec.template.spec.containers[0].livenessProbe.httpGet.path}')" "/healthz"
+    check "timeout > 2s" '[ "$(kj -n catalog deploy search "{.spec.template.spec.containers[0].livenessProbe.timeoutSeconds}")" -gt 2 ]'
+    wait_deploy catalog search 60
+    pod=$(kubectl -n catalog get pods -l app=search -o json | jq -r '[.items[] | select(.metadata.deletionTimestamp == null)][-1].metadata.name')
+    sleep 25
+    check_eq "no restarts over 25s" "$(restarts catalog $pod)" "0"
+  solve: |
+    kubectl patch deploy search -n catalog --type=json -p '[{"op":"replace","path":"/spec/template/spec/containers/0/livenessProbe/timeoutSeconds","value":5}]'
+
+- id: k8s-145
+  title: Sensible defaults for every container
+  difficulty: 2
+  kind: build
+  tags: [limitrange]
+  scenario: |
+    Developers in namespace **`dev`** never set resources. Create a **LimitRange**
+    **`defaults`** so that every container that doesn't specify anything gets:
+
+    - requests: `cpu: 100m`, `memory: 128Mi`
+    - limits: `cpu: 500m`, `memory: 256Mi`
+
+    and no container may ask for more than **1 CPU / 1Gi** (limit).
+  hints:
+    - "`spec.limits[0]: {type: Container, defaultRequest: ..., default: ..., max: ...}`"
+  solution: |
+    ```yaml
+    apiVersion: v1
+    kind: LimitRange
+    metadata: {name: defaults, namespace: dev}
+    spec:
+      limits:
+      - type: Container
+        defaultRequest: {cpu: 100m, memory: 128Mi}
+        default: {cpu: 500m, memory: 256Mi}
+        max: {cpu: "1", memory: 1Gi}
+    ```
+  setup: |
+    k_ns dev
+  check: |
+    l=$(kubectl -n dev get limitrange defaults -o json 2>/dev/null | jq -c '.spec.limits[] | select(.type=="Container")')
+    check_eq "defaultRequest" "$(jq -r '"\(.defaultRequest.cpu) \(.defaultRequest.memory)"' <<<"$l")" "100m 128Mi"
+    check_eq "default" "$(jq -r '"\(.default.cpu) \(.default.memory)"' <<<"$l")" "500m 256Mi"
+    check_eq "max" "$(jq -r '"\(.max.cpu) \(.max.memory)"' <<<"$l")" "1 1Gi"
+    n=kl-$RANDOM; kubectl -n dev run $n --image=busybox:1.37 --restart=Never -- true >/dev/null 2>&1
+    check_eq "a plain pod gets the defaults" "$(kj -n dev pod $n '{.spec.containers[0].resources.requests.cpu} {.spec.containers[0].resources.limits.memory}')" "100m 256Mi"
+    kubectl -n dev delete pod $n --wait=false >/dev/null 2>&1
+  solve: |
+    kubectl apply -f - <<'EOF'
+    apiVersion: v1
+    kind: LimitRange
+    metadata: {name: defaults, namespace: dev}
+    spec:
+      limits:
+      - type: Container
+        defaultRequest: {cpu: 100m, memory: 128Mi}
+        default: {cpu: 500m, memory: 256Mi}
+        max: {cpu: "1", memory: 1Gi}
+    EOF
+
+- id: k8s-146
+  title: A budget for the team
+  difficulty: 2
+  kind: build
+  tags: [resourcequota]
+  scenario: |
+    Team **`marketing`** gets a fixed slice of the cluster. Create a ResourceQuota
+    **`team-budget`** in their namespace limiting the totals to:
+
+    - requests: **1 CPU**, **1Gi** memory
+    - limits: **2 CPU**, **2Gi** memory
+    - at most **10 pods** and **5 services**
+  hints:
+    - "`kubectl create quota NAME --hard=requests.cpu=1,requests.memory=1Gi,...`"
+  solution: |
+    ```bash
+    kubectl create quota team-budget -n marketing \
+      --hard=requests.cpu=1,requests.memory=1Gi,limits.cpu=2,limits.memory=2Gi,pods=10,services=5
+    kubectl describe quota team-budget -n marketing
+    ```
+  setup: |
+    k_ns marketing
+  check: |
+    h=$(kubectl -n marketing get quota team-budget -o json 2>/dev/null | jq -c .spec.hard)
+    for kv in requests.cpu=1 requests.memory=1Gi limits.cpu=2 limits.memory=2Gi pods=10 services=5; do
+      check "$kv" "[ \"\$(jq -r '.\"${kv%%=*}\"' <<<'$h')\" = '${kv#*=}' ]"
+    done
+  solve: |
+    kubectl create quota team-budget -n marketing --hard=requests.cpu=1,requests.memory=1Gi,limits.cpu=2,limits.memory=2Gi,pods=10,services=5
+
+- id: k8s-147
+  title: "must specify limits.cpu"
+  difficulty: 3
+  kind: fix
+  tags: [resourcequota, limitrange, troubleshooting]
+  scenario: |
+    After a quota was added to namespace **`sales`**, the **`crm`** deployment can't
+    create pods anymore (`kubectl get rs -n sales` shows 0/2, events say *failed quota:
+    must specify limits.cpu, ...*).
+
+    The development team doesn't want to touch their manifests. Fix it **at the
+    namespace level** so that pods without resources get defaults (requests `100m`/`64Mi`,
+    limits `200m`/`128Mi`) and the deployment comes up. Don't change the quota.
+  hints:
+    - "A quota on `limits.cpu` rejects every pod that doesn't declare one."
+    - "A LimitRange with `default` and `defaultRequest` fills them in at admission time."
+    - "The ReplicaSet controller retries with back-off; `kubectl rollout restart` speeds it up."
+  solution: |
+    ```yaml
+    apiVersion: v1
+    kind: LimitRange
+    metadata: {name: defaults, namespace: sales}
+    spec:
+      limits:
+      - type: Container
+        defaultRequest: {cpu: 100m, memory: 64Mi}
+        default: {cpu: 200m, memory: 128Mi}
+    ```
+    ```bash
+    kubectl rollout restart deploy/crm -n sales
+    ```
+  setup: |
+    k_ns sales
+    kubectl -n sales create quota sales-quota --hard=requests.cpu=2,requests.memory=2Gi,limits.cpu=4,limits.memory=4Gi >/dev/null
+    kubectl -n sales create deployment crm --image=traefik/whoami:v1.10 --replicas=2 >/dev/null
+    kubectl -n sales get quota sales-quota -o jsonpath='{.spec.hard}' > $KL_STATE/answer
+  check: |
+    check_eq "quota unchanged" "$(kj -n sales quota sales-quota '{.spec.hard}')" "$(cat $KL_STATE/answer)"
+    check_eq "deployment has no explicit resources" "$(kj -n sales deploy crm '{.spec.template.spec.containers[0].resources}')" "{}"
+    check "a LimitRange provides defaults" '[ -n "$(kubectl -n sales get limitrange -o jsonpath="{.items[*].spec.limits[*].default.cpu}")" ]'
+    wait_deploy sales crm 60
+    check "crm is running" 'deploy_ready sales crm'
+  solve: |
+    kubectl apply -f - <<'EOF'
+    apiVersion: v1
+    kind: LimitRange
+    metadata: {name: defaults, namespace: sales}
+    spec:
+      limits:
+      - type: Container
+        defaultRequest: {cpu: 100m, memory: 64Mi}
+        default: {cpu: 200m, memory: 128Mi}
+    EOF
+    kubectl rollout restart deploy/crm -n sales
+
+- id: k8s-148
+  title: Autoscale on CPU
+  difficulty: 2
+  kind: build
+  tags: [hpa, autoscaling]
+  scenario: |
+    Create a **HorizontalPodAutoscaler** for the deployment **`web`** in namespace
+    **`autoscale`**: keep average CPU utilisation at **50%** of requests, between **1** and
+    **5** replicas.
+  hints:
+    - "`kubectl autoscale deployment web --cpu-percent=50 --min=1 --max=5`"
+    - "The HPA needs metrics-server (installed) and CPU requests on the pods (present)."
+  solution: |
+    ```bash
+    kubectl autoscale deployment web -n autoscale --cpu-percent=50 --min=1 --max=5
+    kubectl get hpa -n autoscale
+    ```
+  setup: |
+    k_ns autoscale
+    kubectl -n autoscale create deployment web --image=nginx:1.28-alpine >/dev/null
+    kubectl -n autoscale set resources deploy/web --requests=cpu=50m,memory=32Mi >/dev/null
+  check: |
+    h=$(kubectl -n autoscale get hpa -o json | jq -c '[.items[] | select(.spec.scaleTargetRef.name=="web")][0]')
+    check_eq "min/max" "$(jq -r '"\(.spec.minReplicas) \(.spec.maxReplicas)"' <<<"$h" 2>/dev/null)" "1 5"
+    check_eq "cpu target" "$(jq -r '.spec.metrics[0].resource.target.averageUtilization' <<<"$h" 2>/dev/null)" "50"
+  solve: |
+    kubectl autoscale deployment web -n autoscale --cpu-percent=50 --min=1 --max=5
+
+- id: k8s-149
+  title: Watch it scale
+  difficulty: 3
+  kind: build
+  tags: [hpa, autoscaling, load]
+  scenario: |
+    The **`burner`** deployment (namespace **`autoscale`**) does CPU-heavy work all the
+    time. Create an HPA for it (target **50%** CPU, **1–4** replicas) and wait until the
+    autoscaler has actually **scaled it up to at least 3 replicas**.
+  hints:
+    - "`kubectl get hpa -w` — metrics appear after ~30-60 seconds."
+  solution: |
+    ```bash
+    kubectl autoscale deployment burner -n autoscale --cpu-percent=50 --min=1 --max=4
+    kubectl get hpa burner -n autoscale -w
+    ```
+  setup: |
+    k_ns autoscale
+    kubectl apply -f - >/dev/null <<'EOF'
+    apiVersion: apps/v1
+    kind: Deployment
+    metadata: {name: burner, namespace: autoscale}
+    spec:
+      selector: {matchLabels: {app: burner}}
+      template:
+        metadata: {labels: {app: burner}}
+        spec:
+          containers:
+          - name: burner
+            image: busybox:1.37
+            command: ["sh", "-c", "while true; do :; done"]
+            resources: {requests: {cpu: 50m}, limits: {cpu: 100m}}
+    EOF
+  check: |
+    check "an HPA targets burner" 'kubectl -n autoscale get hpa -o json | jq -e ".items[] | select(.spec.scaleTargetRef.name==\"burner\")"'
+    kubectl -n autoscale get hpa -o name 2>/dev/null | grep -q . && eventually 180 '[ "$(kj -n autoscale deploy burner "{.spec.replicas}")" -ge 3 ]'
+    check "scaled up to >= 3 replicas ($(kj -n autoscale deploy burner '{.spec.replicas}'))" '[ "$(kj -n autoscale deploy burner "{.spec.replicas}")" -ge 3 ]'
+    check "max 4" '[ "$(kj -n autoscale deploy burner "{.spec.replicas}")" -le 4 ]'
+  solve: |
+    kubectl autoscale deployment burner -n autoscale --cpu-percent=50 --min=1 --max=4
+
+- id: k8s-150
+  title: TARGETS <unknown>
+  difficulty: 2
+  kind: fix
+  tags: [hpa, requests, troubleshooting]
+  scenario: |
+    The HPA **`reports`** in namespace **`bi`** shows `cpu: <unknown>/60%` and never
+    scales. metrics-server is fine (`kubectl top pods -n bi` works).
+
+    Fix the **deployment** so the HPA can compute utilisation. Give each container a CPU
+    request of **100m**.
+  hints:
+    - "`kubectl describe hpa reports -n bi` → *missing request for cpu*."
+    - "Utilisation is measured *relative to requests*."
+  solution: |
+    ```bash
+    kubectl describe hpa reports -n bi | tail
+    kubectl set resources deploy/reports -n bi --requests=cpu=100m
+    kubectl get hpa reports -n bi -w
+    ```
+  setup: |
+    k_ns bi
+    kubectl -n bi create deployment reports --image=nginx:1.28-alpine >/dev/null
+    kubectl -n bi autoscale deployment reports --cpu-percent=60 --min=1 --max=3 >/dev/null
+  check: |
+    check_eq "cpu request" "$(kj -n bi deploy reports '{.spec.template.spec.containers[0].resources.requests.cpu}')" "100m"
+    wait_deploy bi reports 60
+    eventually 120 '[ -n "$(kj -n bi hpa reports "{.status.currentMetrics[0].resource.current.averageUtilization}")" ]'
+    check "HPA reports a CPU utilisation" '[ -n "$(kj -n bi hpa reports "{.status.currentMetrics[0].resource.current.averageUtilization}")" ]'
+  solve: |
+    kubectl set resources deploy/reports -n bi --requests=cpu=100m
+
+- id: k8s-151
+  title: Guaranteed quality of service
+  difficulty: 2
+  kind: build
+  tags: [qos, resources]
+  scenario: |
+    Under memory pressure the kubelet evicts **BestEffort** pods first and **Guaranteed**
+    pods last. The **`ledger`** pod (namespace **`fin`**) must be as safe as possible.
+
+    Create pod **`ledger`** (`busybox:1.37`, `sleep infinity`) with QoS class
+    **Guaranteed**, using **250m** CPU and **128Mi** memory.
+  hints:
+    - "Guaranteed = every container has CPU and memory requests **equal** to limits."
+  solution: |
+    ```yaml
+    resources:
+      requests: {cpu: 250m, memory: 128Mi}
+      limits:   {cpu: 250m, memory: 128Mi}
+    ```
+  setup: |
+    k_ns fin
+  check: |
+    wait_pod fin ledger 60
+    check_eq "QoS class" "$(kj -n fin pod ledger '{.status.qosClass}')" "Guaranteed"
+    check_eq "resources" "$(kj -n fin pod ledger '{.spec.containers[0].resources.limits.cpu} {.spec.containers[0].resources.limits.memory}')" "250m 128Mi"
+  solve: |
+    kubectl apply -f - <<'EOF'
+    apiVersion: v1
+    kind: Pod
+    metadata: {name: ledger, namespace: fin}
+    spec:
+      containers:
+      - name: ledger
+        image: busybox:1.37
+        command: ["sleep", "infinity"]
+        resources:
+          requests: {cpu: 250m, memory: 128Mi}
+          limits: {cpu: 250m, memory: 128Mi}
+    EOF
+
+- id: k8s-152
+  title: Who is eating the CPU?
+  difficulty: 2
+  kind: build
+  tags: [metrics, top]
+  scenario: |
+    Namespace **`noisy`** has several pods. Find the pod using the **most CPU right now**
+    and write its name to **`/lab/top-cpu-pod.txt`**.
+  hints:
+    - "`kubectl top pods -n noisy --sort-by=cpu` (metrics need ~1 minute after pods start)."
+  solution: |
+    ```bash
+    kubectl top pods -n noisy --sort-by=cpu
+    kubectl top pods -n noisy --sort-by=cpu --no-headers | head -1 | awk '{print $1}' > /lab/top-cpu-pod.txt
+    ```
+  setup: |
+    k_ns noisy
+    names=(indexer mailer resizer auditor)
+    hot=${names[$((RANDOM % 4))]}; echo "$hot" > $KL_STATE/answer
+    for n in "${names[@]}"; do
+      cmd='sleep infinity'; [ "$n" = "$hot" ] && cmd='while true; do :; done'
+      kubectl -n noisy run "$n" --image=busybox:1.37 --overrides="{\"spec\":{\"containers\":[{\"name\":\"$n\",\"image\":\"busybox:1.37\",\"command\":[\"sh\",\"-c\",\"$cmd\"],\"resources\":{\"limits\":{\"cpu\":\"300m\"}}}]}}" >/dev/null
+    done
+    eventually 120 'kubectl top pods -n noisy --no-headers 2>/dev/null | grep -q .'
+  check: |
+    check_eq "top CPU pod" "$(tr -d '[:space:]' < /lab/top-cpu-pod.txt 2>/dev/null)" "$(cat $KL_STATE/answer)"
+  solve: |
+    kubectl top pods -n noisy --sort-by=cpu --no-headers | head -1 | awk '{print $1}' > /lab/top-cpu-pod.txt
+
+- id: k8s-153
+  title: Keep two replicas during maintenance
+  difficulty: 2
+  kind: build
+  tags: [pdb, disruptions]
+  scenario: |
+    The **`api`** deployment (namespace **`prod`**, 3 replicas, label `app=api`) must keep
+    **at least 2 pods available** during voluntary disruptions such as node drains.
+
+    Create a **PodDisruptionBudget** **`api-pdb`** for it.
+  hints:
+    - "`kubectl create pdb NAME --selector=app=api --min-available=2`"
+  solution: |
+    ```bash
+    kubectl create pdb api-pdb -n prod --selector=app=api --min-available=2
+    kubectl get pdb -n prod    # ALLOWED DISRUPTIONS 1
+    ```
+  setup: |
+    k_ns prod
+    kubectl -n prod create deployment api --image=traefik/whoami:v1.10 --replicas=3 >/dev/null
+  check: |
+    check_eq "minAvailable" "$(kj -n prod pdb api-pdb '{.spec.minAvailable}')" "2"
+    check_eq "selector" "$(kj -n prod pdb api-pdb '{.spec.selector.matchLabels.app}')" "api"
+    wait_deploy prod api 60
+    eventually 20 '[ "$(kj -n prod pdb api-pdb "{.status.disruptionsAllowed}")" = 1 ]'
+    check_eq "disruptions allowed" "$(kj -n prod pdb api-pdb '{.status.disruptionsAllowed}')" "1"
+  solve: |
+    kubectl create pdb api-pdb -n prod --selector=app=api --min-available=2
+
+- id: k8s-154
+  title: The drain that never finishes
+  difficulty: 3
+  kind: fix
+  tags: [pdb, drain, troubleshooting]
+  scenario: |
+    `kubectl drain node01 --ignore-daemonsets --delete-emptydir-data` hangs forever with
+    *Cannot evict pod as it would violate the pod's disruption budget*. The culprit is the
+    PDB of the **`payments`** deployment (namespace **`pay`**, 2 replicas).
+
+    Its owners agree that **one** of the two replicas may be unavailable during
+    maintenance. Fix the **PDB** accordingly, then drain node01 successfully.
+  hints:
+    - "`kubectl get pdb -A` — look at ALLOWED DISRUPTIONS."
+    - "`maxUnavailable: 0` blocks every voluntary eviction."
+  solution: |
+    ```bash
+    kubectl get pdb -n pay
+    kubectl patch pdb payments-pdb -n pay --type=merge -p '{"spec":{"maxUnavailable":1}}'
+    kubectl drain node01 --ignore-daemonsets --delete-emptydir-data
+    ```
+  setup: |
+    k_ns pay
+    kubectl -n pay create deployment payments --image=traefik/whoami:v1.10 --replicas=2 >/dev/null
+    kubectl -n pay create pdb payments-pdb --selector=app=payments --max-unavailable=0 >/dev/null
+    kubectl -n pay rollout status deploy/payments --timeout=90s >/dev/null
+  check: |
+    check_eq "PDB allows one disruption" "$(kj -n pay pdb payments-pdb '{.spec.maxUnavailable}')" "1"
+    check_eq "node01 cordoned" "$(kj node node01 '{.spec.unschedulable}')" "true"
+    left=$(kubectl get pods -A --field-selector spec.nodeName=node01 -o json | jq -r '.items[] | select(.metadata.deletionTimestamp == null) | select((.metadata.ownerReferences // []) | map(.kind) | index("DaemonSet") | not) | select(.metadata.annotations["kubernetes.io/config.mirror"] == null) | .metadata.name')
+    check "node01 drained ($(echo $left | wc -w) pods left)" '[ -z "$left" ]'
+  solve: |
+    kubectl patch pdb payments-pdb -n pay --type=merge -p '{"spec":{"maxUnavailable":1}}'
+    kubectl drain node01 --ignore-daemonsets --delete-emptydir-data --force --timeout=180s
+
+- id: k8s-155
+  title: Resize a pod without restarting it
+  difficulty: 3
+  kind: build
+  tags: [in-place-resize, resources]
+  scenario: |
+    The **`analytics`** pod (namespace **`bi`**) is a long-running computation that must
+    not be restarted, but it needs more CPU.
+
+    Raise its CPU **request to 300m** and **limit to 600m** **in place** — the pod (and
+    its container) must keep running without a restart.
+  hints:
+    - "Recent Kubernetes supports in-place resize via the `resize` subresource: `kubectl patch pod NAME --subresource resize --patch ...`"
+    - "The container's `resizePolicy` controls whether a restart is needed (CPU defaults to NotRequired)."
+  solution: |
+    ```bash
+    kubectl patch pod analytics -n bi --subresource resize --patch \
+      '{"spec":{"containers":[{"name":"analytics","resources":{"requests":{"cpu":"300m"},"limits":{"cpu":"600m"}}}]}}'
+    kubectl get pod analytics -n bi -o jsonpath='{.status.containerStatuses[0].resources}'
+    ```
+  setup: |
+    k_ns bi
+    kubectl apply -f - >/dev/null <<'EOF'
+    apiVersion: v1
+    kind: Pod
+    metadata: {name: analytics, namespace: bi}
+    spec:
+      containers:
+      - name: analytics
+        image: busybox:1.37
+        command: ["sleep", "infinity"]
+        resources:
+          requests: {cpu: 100m, memory: 64Mi}
+          limits: {cpu: 200m, memory: 128Mi}
+    EOF
+    kubectl -n bi wait --for=condition=Ready pod/analytics --timeout=60s >/dev/null
+    kj -n bi pod analytics '{.metadata.uid}' > $KL_STATE/answer
+  check: |
+    check_eq "same pod" "$(kj -n bi pod analytics '{.metadata.uid}')" "$(cat $KL_STATE/answer)"
+    check_eq "spec cpu" "$(kj -n bi pod analytics '{.spec.containers[0].resources.requests.cpu} {.spec.containers[0].resources.limits.cpu}')" "300m 600m"
+    eventually 30 '[ "$(kj -n bi pod analytics "{.status.containerStatuses[0].resources.limits.cpu}")" = 600m ]'
+    check_eq "applied to the running container" "$(kj -n bi pod analytics '{.status.containerStatuses[0].resources.limits.cpu}')" "600m"
+    check_eq "no restart" "$(restarts bi analytics)" "0"
+  solve: |
+    kubectl patch pod analytics -n bi --subresource resize --patch '{"spec":{"containers":[{"name":"analytics","resources":{"requests":{"cpu":"300m"},"limits":{"cpu":"600m"}}}]}}'
+
+- id: k8s-156
+  title: Evicted for filling the disk
+  difficulty: 3
+  kind: fix
+  tags: [ephemeral-storage, eviction]
+  scenario: |
+    The **`cache-warmer`** pod (namespace **`edge`**) writes temporary files to an
+    `emptyDir` without bounds; on a busy day it filled node01's disk and the kubelet had to
+    evict pods at random.
+
+    Recreate it so that it can use at most **200Mi** of scratch space (cap the `emptyDir`)
+    and declare an **ephemeral-storage limit of 300Mi** for the container — then it is the
+    one that gets evicted if it misbehaves, not its neighbours.
+  hints:
+    - "`emptyDir.sizeLimit` and `resources.limits.ephemeral-storage`."
+  solution: |
+    ```yaml
+    containers:
+    - name: warmer
+      resources:
+        requests: {ephemeral-storage: 100Mi}
+        limits: {ephemeral-storage: 300Mi}
+    volumes:
+    - name: scratch
+      emptyDir: {sizeLimit: 200Mi}
+    ```
+  setup: |
+    k_ns edge
+    kubectl apply -f - >/dev/null <<'EOF'
+    apiVersion: v1
+    kind: Pod
+    metadata: {name: cache-warmer, namespace: edge}
+    spec:
+      containers:
+      - name: warmer
+        image: busybox:1.37
+        command: ["sh", "-c", "dd if=/dev/zero of=/scratch/blob bs=1M count=50 2>/dev/null; sleep infinity"]
+        volumeMounts: [{name: scratch, mountPath: /scratch}]
+      volumes: [{name: scratch, emptyDir: {}}]
+    EOF
+  check: |
+    check_eq "emptyDir sizeLimit" "$(kj -n edge pod cache-warmer '{.spec.volumes[?(@.name=="scratch")].emptyDir.sizeLimit}')" "200Mi"
+    check_eq "ephemeral-storage limit" "$(kj -n edge pod cache-warmer '{.spec.containers[0].resources.limits.ephemeral-storage}')" "300Mi"
+    wait_pod edge cache-warmer 60
+    check "cache-warmer runs" 'pod_ready edge cache-warmer'
+  solve: |
+    kubectl get pod cache-warmer -n edge -o json | jq '.spec.volumes |= map(if .name=="scratch" then .emptyDir={"sizeLimit":"200Mi"} else . end) | .spec.containers[0].resources={"requests":{"ephemeral-storage":"100Mi"},"limits":{"ephemeral-storage":"300Mi"}}' > /lab/cw.json
+    kubectl replace --force -f /lab/cw.json
+
+- id: k8s-157
+  title: Don't flap
+  difficulty: 3
+  kind: build
+  tags: [hpa, behavior]
+  scenario: |
+    The HPA **`checkout`** (namespace **`shop`**) scales down too eagerly after traffic
+    spikes and then has to scale up again.
+
+    Configure its **behaviour**:
+
+    - scale **down** only after the recommendation has been lower for **5 minutes**, and
+      remove at most **1 pod per minute**
+    - scale **up** immediately, adding at most **4 pods every 15 seconds**
+  hints:
+    - "`spec.behavior.scaleDown.stabilizationWindowSeconds`, `policies: [{type: Pods, value: 1, periodSeconds: 60}]`"
+  solution: |
+    ```yaml
+    behavior:
+      scaleDown:
+        stabilizationWindowSeconds: 300
+        policies: [{type: Pods, value: 1, periodSeconds: 60}]
+      scaleUp:
+        stabilizationWindowSeconds: 0
+        policies: [{type: Pods, value: 4, periodSeconds: 15}]
+    ```
+  setup: |
+    k_ns shop
+    kubectl -n shop create deployment checkout --image=nginx:1.28-alpine >/dev/null
+    kubectl -n shop set resources deploy/checkout --requests=cpu=50m >/dev/null
+    kubectl -n shop autoscale deployment checkout --cpu-percent=60 --min=2 --max=10 >/dev/null
+  check: |
+    b=$(kj -n shop hpa checkout '{.spec.behavior}')
+    check_eq "scaleDown window" "$(jq -r .scaleDown.stabilizationWindowSeconds <<<"$b")" "300"
+    check_eq "scaleDown policy" "$(jq -r '.scaleDown.policies[0] | "\(.type) \(.value) \(.periodSeconds)"' <<<"$b")" "Pods 1 60"
+    check_eq "scaleUp window" "$(jq -r .scaleUp.stabilizationWindowSeconds <<<"$b")" "0"
+    check "scaleUp policy 4 pods / 15s" 'jq -e ".scaleUp.policies[] | select(.type==\"Pods\" and .value==4 and .periodSeconds==15)" <<<"$b"'
+  solve: |
+    kubectl patch hpa checkout -n shop --type=merge -p '{"spec":{"behavior":{"scaleDown":{"stabilizationWindowSeconds":300,"policies":[{"type":"Pods","value":1,"periodSeconds":60}]},"scaleUp":{"stabilizationWindowSeconds":0,"policies":[{"type":"Pods","value":4,"periodSeconds":15}]}}}}'
+
+- id: k8s-158
+  title: Which node is under memory pressure?
+  difficulty: 2
+  kind: build
+  tags: [top, nodes, metrics]
+  scenario: |
+    Write the **memory usage percentage** of each node (as reported by `kubectl top
+    nodes`) to **`/lab/node-memory.txt`**, one line per node in the form `NODE PERCENT`
+    (e.g. `node01 41%`).
+  hints:
+    - "`kubectl top nodes --no-headers` — columns: NAME CPU(cores) CPU% MEMORY(bytes) MEMORY%"
+  solution: |
+    ```bash
+    kubectl top nodes --no-headers | awk '{print $1, $5}' > /lab/node-memory.txt
+    ```
+  check: |
+    want=$(kubectl top nodes --no-headers 2>/dev/null | awk '{print $1}' | sort | tr '\n' ' ')
+    check_eq "one line per node" "$(awk '{print $1}' /lab/node-memory.txt 2>/dev/null | sort | tr '\n' ' ')" "$want"
+    while read -r n p; do
+      cur=$(kubectl top node "$n" --no-headers 2>/dev/null | awk '{print $5}' | tr -d %); p=${p%\%}
+      check "$n percentage plausible ($p% vs $cur% now)" "[ ${p:-0} -gt 0 ] && [ \$(( ${p:-0} - ${cur:-0} )) -le 10 ] && [ \$(( ${cur:-0} - ${p:-0} )) -le 10 ]"
+    done < /lab/node-memory.txt
+  solve: |
+    kubectl top nodes --no-headers | awk '{print $1, $5}' > /lab/node-memory.txt
+
+- id: k8s-159
+  title: Too big to be admitted
+  difficulty: 2
+  kind: fix
+  tags: [limitrange, admission, troubleshooting]
+  scenario: |
+    The **`video-encoder`** deployment (namespace **`media`**) has 0 pods. Its ReplicaSet
+    events say *forbidden: maximum memory usage per Container is 512Mi, but limit is 2Gi*.
+
+    The team measured that the encoder really needs **only 400Mi** of memory (limit) and
+    **300Mi** request. Fix the **deployment** (not the namespace policy).
+  hints:
+    - "`kubectl describe rs -n media`"
+    - "`kubectl set resources deploy/video-encoder --limits=memory=400Mi --requests=memory=300Mi`"
+  solution: |
+    ```bash
+    kubectl describe rs -n media | grep -i forbidden
+    kubectl set resources deploy/video-encoder -n media --limits=memory=400Mi --requests=memory=300Mi
+    ```
+  setup: |
+    k_ns media
+    kubectl apply -f - >/dev/null <<'EOF'
+    apiVersion: v1
+    kind: LimitRange
+    metadata: {name: container-max, namespace: media}
+    spec:
+      limits:
+      - type: Container
+        max: {memory: 512Mi}
+    ---
+    apiVersion: apps/v1
+    kind: Deployment
+    metadata: {name: video-encoder, namespace: media}
+    spec:
+      selector: {matchLabels: {app: video-encoder}}
+      template:
+        metadata: {labels: {app: video-encoder}}
+        spec:
+          containers:
+          - name: encoder
+            image: busybox:1.37
+            command: ["sleep", "infinity"]
+            resources:
+              requests: {memory: 1Gi}
+              limits: {memory: 2Gi}
+    EOF
+  check: |
+    check_eq "LimitRange unchanged" "$(kj -n media limitrange container-max '{.spec.limits[0].max.memory}')" "512Mi"
+    check_eq "memory" "$(kj -n media deploy video-encoder '{.spec.template.spec.containers[0].resources.requests.memory} {.spec.template.spec.containers[0].resources.limits.memory}')" "300Mi 400Mi"
+    wait_deploy media video-encoder 60
+    check "encoder is running" 'deploy_ready media video-encoder'
+  solve: |
+    kubectl set resources deploy/video-encoder -n media --limits=memory=400Mi --requests=memory=300Mi
+
+- id: k8s-160
+  title: "Incident: the namespace is out of budget"
+  difficulty: 4
+  kind: fix
+  tags: [quota, limitrange, probes, incident]
+  scenario: |
+    Namespace **`webshop`** is a mess after a "resource governance" initiative. Three
+    deployments should be running with all replicas ready:
+
+    - **`frontend`** — 2 replicas
+    - **`cart`** — 2 replicas
+    - **`recommendations`** — 1 replica
+
+    Constraints: the ResourceQuota **`webshop-quota`** stays as it is; don't scale anything
+    down; fix the workloads (and add namespace defaults if you like).
+  hints:
+    - "`kubectl describe quota -n webshop`, `kubectl describe rs -n webshop`, `kubectl describe pod -n webshop`."
+    - "One deployment requests far more than it needs, one has no resources at all, one has a broken probe."
+  solution: |
+    ```bash
+    kubectl describe quota webshop-quota -n webshop
+    # frontend: requests 1500m CPU per replica -> quota exhausted; it needs 100m
+    kubectl set resources deploy/frontend -n webshop --requests=cpu=100m,memory=64Mi --limits=cpu=200m,memory=128Mi
+    # cart: no resources -> rejected by the quota (limits required)
+    kubectl set resources deploy/cart -n webshop --requests=cpu=100m,memory=64Mi --limits=cpu=200m,memory=128Mi
+    # recommendations: readiness probe on port 8081, app listens on 8080
+    kubectl patch deploy recommendations -n webshop --type=json -p '[{"op":"replace","path":"/spec/template/spec/containers/0/readinessProbe/httpGet/port","value":8080}]'
+    ```
+  setup: |
+    k_ns webshop
+    kubectl -n webshop create quota webshop-quota --hard=requests.cpu=1500m,limits.cpu=3,requests.memory=1Gi,limits.memory=2Gi,pods=8 >/dev/null
+    kubectl apply -f - >/dev/null <<'EOF'
+    apiVersion: apps/v1
+    kind: Deployment
+    metadata: {name: frontend, namespace: webshop}
+    spec:
+      replicas: 2
+      selector: {matchLabels: {app: frontend}}
+      template:
+        metadata: {labels: {app: frontend}}
+        spec:
+          containers:
+          - name: web
+            image: nginx:1.28-alpine
+            resources: {requests: {cpu: 1500m, memory: 64Mi}, limits: {cpu: 1500m, memory: 128Mi}}
+    ---
+    apiVersion: apps/v1
+    kind: Deployment
+    metadata: {name: cart, namespace: webshop}
+    spec:
+      replicas: 2
+      selector: {matchLabels: {app: cart}}
+      template:
+        metadata: {labels: {app: cart}}
+        spec:
+          containers: [{name: cart, image: "redis:7.4-alpine"}]
+    ---
+    apiVersion: apps/v1
+    kind: Deployment
+    metadata: {name: recommendations, namespace: webshop}
+    spec:
+      selector: {matchLabels: {app: recommendations}}
+      template:
+        metadata: {labels: {app: recommendations}}
+        spec:
+          containers:
+          - name: reco
+            image: registry.k8s.io/e2e-test-images/agnhost:2.53
+            args: ["netexec", "--http-port=8080"]
+            resources: {requests: {cpu: 100m, memory: 64Mi}, limits: {cpu: 200m, memory: 128Mi}}
+            readinessProbe:
+              httpGet: {path: /, port: 8081}
+              periodSeconds: 3
+    EOF
+    kubectl -n webshop get quota webshop-quota -o jsonpath='{.spec.hard}' > $KL_STATE/answer
+  check: |
+    check_eq "quota unchanged" "$(kj -n webshop quota webshop-quota '{.spec.hard}')" "$(cat $KL_STATE/answer)"
+    for d in frontend cart recommendations; do wait_deploy webshop $d 90; done
+    check_eq "frontend replicas" "$(kj -n webshop deploy frontend '{.spec.replicas}/{.status.readyReplicas}')" "2/2"
+    check_eq "cart replicas" "$(kj -n webshop deploy cart '{.spec.replicas}/{.status.readyReplicas}')" "2/2"
+    check_eq "recommendations replicas" "$(kj -n webshop deploy recommendations '{.spec.replicas}/{.status.readyReplicas}')" "1/1"
+  solve: |
+    kubectl set resources deploy/frontend -n webshop --requests=cpu=100m,memory=64Mi --limits=cpu=200m,memory=128Mi
+    kubectl set resources deploy/cart -n webshop --requests=cpu=100m,memory=64Mi --limits=cpu=200m,memory=128Mi
+    kubectl patch deploy recommendations -n webshop --type=json -p '[{"op":"replace","path":"/spec/template/spec/containers/0/readinessProbe/httpGet/port","value":8080}]'

@@ -1,0 +1,949 @@
+track: kubernetes
+module: Jobs, CronJobs, DaemonSets & more
+profile: k8s
+order: 7
+exercises:
+
+- id: k8s-121
+  title: A one-off Job
+  difficulty: 1
+  kind: build
+  tags: [job]
+  scenario: |
+    Run a **Job** **`report`** in namespace **`batch`** (`busybox:1.37`) that prints
+    `monthly report generated` and exits. It must complete successfully.
+  hints:
+    - "`kubectl create job NAME --image=IMAGE -- COMMAND...`"
+  solution: |
+    ```bash
+    kubectl create job report -n batch --image=busybox:1.37 -- echo "monthly report generated"
+    kubectl wait --for=condition=complete job/report -n batch
+    kubectl logs job/report -n batch
+    ```
+  setup: |
+    k_ns batch
+  check: |
+    k_exists -n batch job report && kubectl -n batch wait --for=condition=complete job/report --timeout=60s >/dev/null 2>&1
+    check_eq "job succeeded" "$(kj -n batch job report '{.status.succeeded}')" "1"
+    check "output" 'kubectl -n batch logs job/report | grep -q "monthly report generated"'
+  solve: |
+    kubectl create job report -n batch --image=busybox:1.37 -- echo "monthly report generated"
+
+- id: k8s-122
+  title: Five thumbnails, two at a time
+  difficulty: 2
+  kind: build
+  tags: [job, completions, parallelism]
+  scenario: |
+    Create a Job **`thumbnails`** in namespace **`media`** that runs a pod **5 times**
+    successfully, with at most **2 pods running at once**. Each pod (`busybox:1.37`) runs
+    `sh -c 'echo resized; sleep 2'`.
+  hints:
+    - "`spec.completions` and `spec.parallelism`"
+  solution: |
+    ```yaml
+    apiVersion: batch/v1
+    kind: Job
+    metadata: {name: thumbnails, namespace: media}
+    spec:
+      completions: 5
+      parallelism: 2
+      template:
+        spec:
+          restartPolicy: Never
+          containers:
+          - name: resize
+            image: busybox:1.37
+            command: ["sh", "-c", "echo resized; sleep 2"]
+    ```
+  setup: |
+    k_ns media
+  check: |
+    check_eq "completions/parallelism" "$(kj -n media job thumbnails '{.spec.completions}/{.spec.parallelism}')" "5/2"
+    k_exists -n media job thumbnails && kubectl -n media wait --for=condition=complete job/thumbnails --timeout=90s >/dev/null 2>&1
+    check_eq "5 succeeded" "$(kj -n media job thumbnails '{.status.succeeded}')" "5"
+  solve: |
+    kubectl apply -f - <<'EOF'
+    apiVersion: batch/v1
+    kind: Job
+    metadata: {name: thumbnails, namespace: media}
+    spec:
+      completions: 5
+      parallelism: 2
+      template:
+        spec:
+          restartPolicy: Never
+          containers:
+          - name: resize
+            image: busybox:1.37
+            command: ["sh", "-c", "echo resized; sleep 2"]
+    EOF
+
+- id: k8s-123
+  title: Give up after a while
+  difficulty: 2
+  kind: build
+  tags: [job, backoffLimit, activeDeadlineSeconds]
+  scenario: |
+    The **`sync-crm`** Job (namespace **`integrations`**) talks to a flaky partner API.
+    Create it so that:
+
+    - it is retried at most **3 times** before being marked failed
+    - it is **killed after 120 seconds** in total, no matter what
+    - finished Jobs are **deleted automatically 10 minutes** after they finish
+
+    Image `busybox:1.37`, command `sh -c 'echo syncing; sleep 5'`.
+  hints:
+    - "`backoffLimit`, `activeDeadlineSeconds`, `ttlSecondsAfterFinished`"
+  solution: |
+    ```yaml
+    spec:
+      backoffLimit: 3
+      activeDeadlineSeconds: 120
+      ttlSecondsAfterFinished: 600
+      template:
+        spec:
+          restartPolicy: Never
+          containers:
+          - {name: sync, image: busybox:1.37, command: ["sh", "-c", "echo syncing; sleep 5"]}
+    ```
+  setup: |
+    k_ns integrations
+  check: |
+    check_eq "settings" "$(kj -n integrations job sync-crm '{.spec.backoffLimit} {.spec.activeDeadlineSeconds} {.spec.ttlSecondsAfterFinished}')" "3 120 600"
+    check_match "restartPolicy" "$(kj -n integrations job sync-crm '{.spec.template.spec.restartPolicy}')" '^(Never|OnFailure)$'
+  solve: |
+    kubectl apply -f - <<'EOF'
+    apiVersion: batch/v1
+    kind: Job
+    metadata: {name: sync-crm, namespace: integrations}
+    spec:
+      backoffLimit: 3
+      activeDeadlineSeconds: 120
+      ttlSecondsAfterFinished: 600
+      template:
+        spec:
+          restartPolicy: Never
+          containers:
+          - {name: sync, image: "busybox:1.37", command: ["sh", "-c", "echo syncing; sleep 5"]}
+    EOF
+
+- id: k8s-124
+  title: The Job that keeps failing
+  difficulty: 2
+  kind: fix
+  tags: [job, troubleshooting]
+  scenario: |
+    The data-migration Job **`migrate-v42`** (namespace **`release`**) has failed. Look at
+    its pod logs, figure out the problem and run the migration **successfully** under the
+    same Job name. (The script lives in the ConfigMap `migrate-script`, which is correct.)
+  hints:
+    - "`kubectl logs -n release -l job-name=migrate-v42`"
+    - "A Job's pod template is immutable — delete the Job and create it again."
+  solution: |
+    ```bash
+    kubectl logs -n release -l job-name=migrate-v42 --tail=5
+    # sh: /scripts/migrate.sh: not found   (mounted at /script, called as /scripts/...)
+    kubectl get job migrate-v42 -n release -o json > /lab/job.json
+    # fix the mountPath (or the command), remove status/selector/controller-uid labels, recreate
+    kubectl delete job migrate-v42 -n release
+    kubectl apply -f /lab/job.json
+    ```
+  setup: |
+    k_ns release
+    kubectl -n release create configmap migrate-script --from-literal=migrate.sh=$'echo "applying migration 42"\necho "done"\n' >/dev/null
+    kubectl apply -f - >/dev/null <<'EOF'
+    apiVersion: batch/v1
+    kind: Job
+    metadata: {name: migrate-v42, namespace: release}
+    spec:
+      backoffLimit: 1
+      template:
+        spec:
+          restartPolicy: Never
+          containers:
+          - name: migrate
+            image: busybox:1.37
+            command: ["sh", "/scripts/migrate.sh"]
+            volumeMounts: [{name: s, mountPath: /script}]
+          volumes: [{name: s, configMap: {name: migrate-script}}]
+    EOF
+  check: |
+    k_exists -n release job migrate-v42 && kubectl -n release wait --for=condition=complete job/migrate-v42 --timeout=60s >/dev/null 2>&1
+    check_eq "migrate-v42 succeeded" "$(kj -n release job migrate-v42 '{.status.succeeded}')" "1"
+    check "migration ran" 'kubectl -n release logs job/migrate-v42 | grep -q "applying migration 42"'
+  solve: |
+    kubectl get job migrate-v42 -n release -o json | jq 'del(.status, .metadata.resourceVersion, .metadata.uid, .metadata.creationTimestamp, .metadata.generation, .metadata.labels, .spec.selector, .spec.template.metadata.labels) | .spec.template.spec.containers[0].volumeMounts[0].mountPath="/scripts"' > /lab/job.json
+    kubectl delete job migrate-v42 -n release --wait=true
+    kubectl apply -f /lab/job.json
+
+- id: k8s-125
+  title: A nightly CronJob
+  difficulty: 2
+  kind: build
+  tags: [cronjob]
+  scenario: |
+    Create a CronJob **`db-backup`** in namespace **`ops`** that runs **every day at
+    02:30** (`busybox:1.37`, `sh -c 'echo backing up'`), with these safety settings:
+
+    - never run two backups at the same time
+    - keep the last **3** successful and **1** failed Jobs
+    - if a run was missed (cluster down), start it at most **10 minutes** late
+  hints:
+    - "`concurrencyPolicy: Forbid`, `successfulJobsHistoryLimit`, `failedJobsHistoryLimit`, `startingDeadlineSeconds`"
+  solution: |
+    ```yaml
+    apiVersion: batch/v1
+    kind: CronJob
+    metadata: {name: db-backup, namespace: ops}
+    spec:
+      schedule: "30 2 * * *"
+      concurrencyPolicy: Forbid
+      successfulJobsHistoryLimit: 3
+      failedJobsHistoryLimit: 1
+      startingDeadlineSeconds: 600
+      jobTemplate:
+        spec:
+          template:
+            spec:
+              restartPolicy: OnFailure
+              containers:
+              - {name: backup, image: busybox:1.37, command: ["sh", "-c", "echo backing up"]}
+    ```
+  setup: |
+    k_ns ops
+  check: |
+    check_eq "schedule" "$(kj -n ops cronjob db-backup '{.spec.schedule}')" "30 2 * * *"
+    check_eq "concurrencyPolicy" "$(kj -n ops cronjob db-backup '{.spec.concurrencyPolicy}')" "Forbid"
+    check_eq "history limits" "$(kj -n ops cronjob db-backup '{.spec.successfulJobsHistoryLimit}/{.spec.failedJobsHistoryLimit}')" "3/1"
+    check_eq "startingDeadlineSeconds" "$(kj -n ops cronjob db-backup '{.spec.startingDeadlineSeconds}')" "600"
+  solve: |
+    kubectl apply -f - <<'EOF'
+    apiVersion: batch/v1
+    kind: CronJob
+    metadata: {name: db-backup, namespace: ops}
+    spec:
+      schedule: "30 2 * * *"
+      concurrencyPolicy: Forbid
+      successfulJobsHistoryLimit: 3
+      failedJobsHistoryLimit: 1
+      startingDeadlineSeconds: 600
+      jobTemplate:
+        spec:
+          template:
+            spec:
+              restartPolicy: OnFailure
+              containers:
+              - {name: backup, image: "busybox:1.37", command: ["sh", "-c", "echo backing up"]}
+    EOF
+
+- id: k8s-126
+  title: Run the CronJob now
+  difficulty: 1
+  kind: build
+  tags: [cronjob, manual-trigger]
+  scenario: |
+    The weekly **`invoice-run`** CronJob (namespace **`billing`**) must be run **right now**
+    because of a hotfix. Trigger it manually as a Job named **`invoice-run-manual`**,
+    using the CronJob's own template.
+  hints:
+    - "`kubectl create job NAME --from=cronjob/CRONJOB`"
+  solution: |
+    ```bash
+    kubectl create job invoice-run-manual --from=cronjob/invoice-run -n billing
+    kubectl logs job/invoice-run-manual -n billing
+    ```
+  setup: |
+    k_ns billing
+    kubectl -n billing create cronjob invoice-run --image=busybox:1.37 --schedule="0 6 * * 1" -- sh -c 'echo "invoices sent: 1287"' >/dev/null
+  check: |
+    check_eq "created from the cronjob" "$(kj -n billing job invoice-run-manual '{.metadata.annotations.cronjob\.kubernetes\.io/instantiate}')" "manual"
+    k_exists -n billing job invoice-run-manual && kubectl -n billing wait --for=condition=complete job/invoice-run-manual --timeout=60s >/dev/null 2>&1
+    check "it ran" 'kubectl -n billing logs job/invoice-run-manual | grep -q "invoices sent"'
+  solve: |
+    kubectl create job invoice-run-manual --from=cronjob/invoice-run -n billing
+
+- id: k8s-127
+  title: Pause the CronJob
+  difficulty: 1
+  kind: build
+  tags: [cronjob, suspend]
+  scenario: |
+    The data warehouse is being migrated. Stop the **`etl-hourly`** CronJob (namespace
+    **`dwh`**) from creating new Jobs — **without deleting it**.
+  hints:
+    - "`spec.suspend`"
+  solution: |
+    ```bash
+    kubectl patch cronjob etl-hourly -n dwh -p '{"spec":{"suspend":true}}'
+    ```
+  setup: |
+    k_ns dwh
+    kubectl -n dwh create cronjob etl-hourly --image=busybox:1.37 --schedule="0 * * * *" -- echo etl >/dev/null
+  check: |
+    check_eq "suspended" "$(kj -n dwh cronjob etl-hourly '{.spec.suspend}')" "true"
+  solve: |
+    kubectl patch cronjob etl-hourly -n dwh -p '{"spec":{"suspend":true}}'
+
+- id: k8s-128
+  title: The CronJob that never fires
+  difficulty: 2
+  kind: fix
+  tags: [cronjob, schedule, troubleshooting]
+  scenario: |
+    **`cleanup`** (namespace **`ops`**) is supposed to run **every 2 minutes**. It has
+    never run once (`LAST SCHEDULE: <none>`), although it isn't suspended.
+
+    Fix it, and make sure it actually runs.
+  hints:
+    - "Read the schedule carefully. When would `0 0 31 2 *` fire?"
+    - "Every 2 minutes is `*/2 * * * *`."
+  solution: |
+    ```bash
+    kubectl get cronjob cleanup -n ops     # SCHEDULE 0 0 31 2 *   (31st of February...)
+    kubectl patch cronjob cleanup -n ops -p '{"spec":{"schedule":"*/2 * * * *"}}'
+    kubectl get jobs -n ops -w
+    ```
+  setup: |
+    k_ns ops
+    kubectl -n ops create cronjob cleanup --image=busybox:1.37 --schedule="0 0 31 2 *" -- sh -c 'echo cleaned' >/dev/null
+  check: |
+    check_eq "schedule" "$(kj -n ops cronjob cleanup '{.spec.schedule}')" "*/2 * * * *"
+    check_not "not suspended" '[ "$(kj -n ops cronjob cleanup "{.spec.suspend}")" = true ]'
+  solve: |
+    kubectl patch cronjob cleanup -n ops -p '{"spec":{"schedule":"*/2 * * * *"}}'
+
+- id: k8s-129
+  title: An agent on every node
+  difficulty: 2
+  kind: build
+  tags: [daemonset, tolerations]
+  scenario: |
+    Deploy the node log collector **`node-logger`** as a **DaemonSet** in namespace
+    **`logging`** (`busybox:1.37`, `sh -c 'tail -F /host/var/log/syslog'`) with the
+    node's `/var/log` mounted read-only at `/host/var/log`.
+
+    It must run on **every** node — **including the control plane**.
+  hints:
+    - "`kubectl create deployment ... --dry-run=client -o yaml`, change `kind` to DaemonSet and drop `replicas`/`strategy`."
+    - "Control plane: tolerate `node-role.kubernetes.io/control-plane:NoSchedule`."
+  solution: |
+    ```yaml
+    apiVersion: apps/v1
+    kind: DaemonSet
+    metadata: {name: node-logger, namespace: logging}
+    spec:
+      selector: {matchLabels: {app: node-logger}}
+      template:
+        metadata: {labels: {app: node-logger}}
+        spec:
+          tolerations:
+          - {key: node-role.kubernetes.io/control-plane, operator: Exists, effect: NoSchedule}
+          containers:
+          - name: logger
+            image: busybox:1.37
+            command: ["sh", "-c", "tail -F /host/var/log/syslog"]
+            volumeMounts: [{name: varlog, mountPath: /host/var/log, readOnly: true}]
+          volumes:
+          - name: varlog
+            hostPath: {path: /var/log}
+    ```
+  setup: |
+    k_ns logging
+  check: |
+    eventually 60 '[ "$(kj -n logging ds node-logger "{.status.numberReady}")" = 2 ]'
+    check_eq "ready on both nodes" "$(kj -n logging ds node-logger '{.status.desiredNumberScheduled}/{.status.numberReady}')" "2/2"
+    check_eq "hostPath /var/log" "$(kj -n logging ds node-logger '{.spec.template.spec.volumes[0].hostPath.path}')" "/var/log"
+  solve: |
+    kubectl apply -f - <<'EOF'
+    apiVersion: apps/v1
+    kind: DaemonSet
+    metadata: {name: node-logger, namespace: logging}
+    spec:
+      selector: {matchLabels: {app: node-logger}}
+      template:
+        metadata: {labels: {app: node-logger}}
+        spec:
+          tolerations:
+          - {key: node-role.kubernetes.io/control-plane, operator: Exists, effect: NoSchedule}
+          containers:
+          - name: logger
+            image: busybox:1.37
+            command: ["sh", "-c", "tail -F /host/var/log/syslog"]
+            volumeMounts: [{name: varlog, mountPath: /host/var/log, readOnly: true}]
+          volumes:
+          - name: varlog
+            hostPath: {path: /var/log}
+    EOF
+
+- id: k8s-130
+  title: The DaemonSet that skips a node
+  difficulty: 2
+  kind: fix
+  tags: [daemonset, tolerations, troubleshooting]
+  scenario: |
+    The security agent DaemonSet **`falco-lite`** (namespace **`security`**) shows
+    `DESIRED 1` — but the cluster has **two** nodes and the agent must run on both.
+
+    Fix the DaemonSet.
+  hints:
+    - "Which node is missing, and what's special about it?"
+  solution: |
+    ```bash
+    kubectl get pods -n security -o wide    # only on node01
+    kubectl patch ds falco-lite -n security --type=json -p \
+      '[{"op":"add","path":"/spec/template/spec/tolerations","value":[{"key":"node-role.kubernetes.io/control-plane","operator":"Exists","effect":"NoSchedule"}]}]'
+    ```
+  setup: |
+    k_ns security
+    kubectl apply -f - >/dev/null <<'EOF'
+    apiVersion: apps/v1
+    kind: DaemonSet
+    metadata: {name: falco-lite, namespace: security}
+    spec:
+      selector: {matchLabels: {app: falco-lite}}
+      template:
+        metadata: {labels: {app: falco-lite}}
+        spec:
+          containers: [{name: agent, image: "busybox:1.37", command: ["sleep", "infinity"]}]
+    EOF
+  check: |
+    eventually 60 '[ "$(kj -n security ds falco-lite "{.status.numberReady}")" = 2 ]'
+    check_eq "desired/ready" "$(kj -n security ds falco-lite '{.status.desiredNumberScheduled}/{.status.numberReady}')" "2/2"
+  solve: |
+    kubectl patch ds falco-lite -n security --type=json -p '[{"op":"add","path":"/spec/template/spec/tolerations","value":[{"key":"node-role.kubernetes.io/control-plane","operator":"Exists","effect":"NoSchedule"}]}]'
+
+- id: k8s-131
+  title: Roll the agent out node by node
+  difficulty: 2
+  kind: build
+  tags: [daemonset, rolling-update]
+  scenario: |
+    Upgrade the DaemonSet **`node-exporter`** (namespace **`monitoring`**) from
+    `nginx:1.28-alpine` to **`nginx:1.29-alpine`** (pretend it's an exporter), making sure
+    that at most **one node** is without a ready exporter at any time.
+  hints:
+    - "`spec.updateStrategy: {type: RollingUpdate, rollingUpdate: {maxUnavailable: 1}}`"
+    - "`kubectl set image ds/node-exporter ...`"
+  solution: |
+    ```bash
+    kubectl patch ds node-exporter -n monitoring -p '{"spec":{"updateStrategy":{"type":"RollingUpdate","rollingUpdate":{"maxUnavailable":1}}}}'
+    kubectl set image ds/node-exporter -n monitoring exporter=nginx:1.29-alpine
+    kubectl rollout status ds/node-exporter -n monitoring
+    ```
+  setup: |
+    k_ns monitoring
+    kubectl apply -f - >/dev/null <<'EOF'
+    apiVersion: apps/v1
+    kind: DaemonSet
+    metadata: {name: node-exporter, namespace: monitoring}
+    spec:
+      updateStrategy: {type: OnDelete}
+      selector: {matchLabels: {app: node-exporter}}
+      template:
+        metadata: {labels: {app: node-exporter}}
+        spec:
+          tolerations: [{key: node-role.kubernetes.io/control-plane, operator: Exists, effect: NoSchedule}]
+          containers: [{name: exporter, image: "nginx:1.28-alpine"}]
+    EOF
+  check: |
+    check_eq "update strategy" "$(kj -n monitoring ds node-exporter '{.spec.updateStrategy.type} {.spec.updateStrategy.rollingUpdate.maxUnavailable}')" "RollingUpdate 1"
+    k_exists -n monitoring ds node-exporter && kubectl -n monitoring rollout status ds/node-exporter --timeout=90s >/dev/null 2>&1
+    check_eq "all pods run 1.29" "$(kubectl -n monitoring get pods -l app=node-exporter -o jsonpath='{.items[*].spec.containers[0].image}' | tr ' ' '\n' | sort -u)" "nginx:1.29-alpine"
+  solve: |
+    kubectl patch ds node-exporter -n monitoring -p '{"spec":{"updateStrategy":{"type":"RollingUpdate","rollingUpdate":{"maxUnavailable":1}}}}'
+    kubectl set image ds/node-exporter -n monitoring exporter=nginx:1.29-alpine
+
+- id: k8s-132
+  title: Don't start before the database
+  difficulty: 2
+  kind: build
+  tags: [init-containers]
+  scenario: |
+    The **`orders`** pod (namespace **`shop`**) crashes if it starts before its database
+    is reachable. Create pod **`orders`** (`traefik/whoami:v1.10`) with an **init
+    container** **`wait-for-db`** (`busybox:1.37`) that loops until the TCP port **5432**
+    of the service **`orders-db`** accepts connections.
+
+    The database (service + pod) is being created right now and becomes reachable after
+    about 30 seconds.
+  hints:
+    - "`until nc -z orders-db 5432; do echo waiting; sleep 2; done`"
+  solution: |
+    ```yaml
+    spec:
+      initContainers:
+      - name: wait-for-db
+        image: busybox:1.37
+        command: ["sh", "-c", "until nc -z -w 2 orders-db 5432; do echo waiting for db; sleep 2; done"]
+      containers:
+      - name: orders
+        image: traefik/whoami:v1.10
+    ```
+  setup: |
+    k_ns shop
+    kubectl -n shop create service clusterip orders-db --tcp=5432:5432 >/dev/null
+    kubectl apply -f - >/dev/null <<'EOF'
+    apiVersion: v1
+    kind: Pod
+    metadata: {name: orders-db, namespace: shop, labels: {app: orders-db}}
+    spec:
+      containers:
+      - {name: db, image: "postgres:16-alpine", env: [{name: POSTGRES_PASSWORD, value: pw}], command: ["sh", "-c", "sleep 30; exec docker-entrypoint.sh postgres"]}
+    EOF
+  check: |
+    check_eq "init container name" "$(kj -n shop pod orders '{.spec.initContainers[0].name}')" "wait-for-db"
+    check "it waits for orders-db:5432" 'kj -n shop pod orders "{.spec.initContainers[0].command}" | grep -q "orders-db" && kj -n shop pod orders "{.spec.initContainers[0].command}" | grep -q 5432'
+    k_exists -n shop pod orders && eventually 90 'pod_ready shop orders'
+    check "orders is running" 'pod_ready shop orders'
+  solve: |
+    kubectl apply -f - <<'EOF'
+    apiVersion: v1
+    kind: Pod
+    metadata: {name: orders, namespace: shop}
+    spec:
+      initContainers:
+      - name: wait-for-db
+        image: busybox:1.37
+        command: ["sh", "-c", "until nc -z -w 2 orders-db 5432; do echo waiting for db; sleep 2; done"]
+      containers:
+      - name: orders
+        image: traefik/whoami:v1.10
+    EOF
+
+- id: k8s-133
+  title: Prepare content in an init container
+  difficulty: 2
+  kind: build
+  tags: [init-containers, emptydir]
+  scenario: |
+    The **`landing`** pod (namespace **`web`**) must serve a page that is generated at
+    start-up. Create pod **`landing`** with:
+
+    - an init container **`render`** (`busybox:1.37`) that writes
+      `<h1>Rendered at startup</h1>` to `/work/index.html`
+    - a main container **`nginx`** (`nginx:1.28-alpine`) that serves it from
+      `/usr/share/nginx/html`
+    - a shared `emptyDir` between them
+  hints:
+    - "Mount the same emptyDir at `/work` in the init container and at `/usr/share/nginx/html` in nginx."
+  solution: |
+    ```yaml
+    spec:
+      volumes: [{name: html, emptyDir: {}}]
+      initContainers:
+      - name: render
+        image: busybox:1.37
+        command: ["sh", "-c", "echo '<h1>Rendered at startup</h1>' > /work/index.html"]
+        volumeMounts: [{name: html, mountPath: /work}]
+      containers:
+      - name: nginx
+        image: nginx:1.28-alpine
+        volumeMounts: [{name: html, mountPath: /usr/share/nginx/html}]
+    ```
+  setup: |
+    k_ns web
+  check: |
+    wait_pod web landing 60
+    check "served page was rendered by the init container" 'kubectl -n web exec landing -c nginx -- wget -qO- http://127.0.0.1/ | grep -q "Rendered at startup"'
+    check_eq "init container" "$(kj -n web pod landing '{.spec.initContainers[0].name}')" "render"
+  solve: |
+    kubectl apply -f - <<'EOF'
+    apiVersion: v1
+    kind: Pod
+    metadata: {name: landing, namespace: web}
+    spec:
+      volumes: [{name: html, emptyDir: {}}]
+      initContainers:
+      - name: render
+        image: busybox:1.37
+        command: ["sh", "-c", "echo '<h1>Rendered at startup</h1>' > /work/index.html"]
+        volumeMounts: [{name: html, mountPath: /work}]
+      containers:
+      - name: nginx
+        image: nginx:1.28-alpine
+        volumeMounts: [{name: html, mountPath: /usr/share/nginx/html}]
+    EOF
+
+- id: k8s-134
+  title: A native sidecar
+  difficulty: 3
+  kind: build
+  tags: [sidecar, init-containers, restartPolicy]
+  scenario: |
+    Classic sidecars (a second container) have two problems: they may start **after** the
+    app, and in Jobs they keep the pod running forever.
+
+    Create a **Job** **`etl`** in namespace **`pipeline`** whose pod has:
+
+    - a **native sidecar** **`log-shipper`** (`busybox:1.37`, `sh -c 'touch /logs/app.log; tail -F /logs/app.log'`)
+      that starts **before** the main container and keeps running alongside it
+    - the main container **`etl`** (`busybox:1.37`) that writes 3 lines to
+      `/logs/app.log` and exits
+
+    The Job must **complete** (the sidecar must not keep it alive). Share an emptyDir at
+    `/logs`.
+  hints:
+    - "A native sidecar is an **init container** with `restartPolicy: Always`."
+  solution: |
+    ```yaml
+    apiVersion: batch/v1
+    kind: Job
+    metadata: {name: etl, namespace: pipeline}
+    spec:
+      template:
+        spec:
+          restartPolicy: Never
+          volumes: [{name: logs, emptyDir: {}}]
+          initContainers:
+          - name: log-shipper
+            image: busybox:1.37
+            restartPolicy: Always
+            command: ["sh", "-c", "touch /logs/app.log; tail -F /logs/app.log"]
+            volumeMounts: [{name: logs, mountPath: /logs}]
+          containers:
+          - name: etl
+            image: busybox:1.37
+            command: ["sh", "-c", "for i in 1 2 3; do echo row $i >> /logs/app.log; sleep 1; done"]
+            volumeMounts: [{name: logs, mountPath: /logs}]
+    ```
+  setup: |
+    k_ns pipeline
+  check: |
+    check_eq "log-shipper is a native sidecar" "$(kj -n pipeline job etl '{.spec.template.spec.initContainers[?(@.name=="log-shipper")].restartPolicy}')" "Always"
+    k_exists -n pipeline job etl && kubectl -n pipeline wait --for=condition=complete job/etl --timeout=90s >/dev/null 2>&1
+    check_eq "job completed" "$(kj -n pipeline job etl '{.status.succeeded}')" "1"
+    check "sidecar shipped the rows" 'kubectl -n pipeline logs job/etl -c log-shipper | grep -q "row 3"'
+  solve: |
+    kubectl apply -f - <<'EOF'
+    apiVersion: batch/v1
+    kind: Job
+    metadata: {name: etl, namespace: pipeline}
+    spec:
+      template:
+        spec:
+          restartPolicy: Never
+          volumes: [{name: logs, emptyDir: {}}]
+          initContainers:
+          - name: log-shipper
+            image: busybox:1.37
+            restartPolicy: Always
+            command: ["sh", "-c", "touch /logs/app.log; tail -F /logs/app.log"]
+            volumeMounts: [{name: logs, mountPath: /logs}]
+          containers:
+          - name: etl
+            image: busybox:1.37
+            command: ["sh", "-c", "for i in 1 2 3; do echo row $i >> /logs/app.log; sleep 1; done"]
+            volumeMounts: [{name: logs, mountPath: /logs}]
+    EOF
+
+- id: k8s-135
+  title: Clean up after yourself
+  difficulty: 2
+  kind: fix
+  tags: [job, ttl, cleanup]
+  scenario: |
+    Namespace **`ci`** is full of hundreds of finished Jobs from the build pipeline.
+
+    1. Delete **all completed Jobs** in `ci` (leave the running `build-live` Job alone).
+    2. Change the CronJob **`nightly-build`** so its future Jobs are deleted
+       automatically **5 minutes** after they finish.
+  hints:
+    - "`kubectl delete jobs -n ci --field-selector status.successful=1`"
+    - "`spec.jobTemplate.spec.ttlSecondsAfterFinished`"
+  solution: |
+    ```bash
+    kubectl delete jobs -n ci --field-selector status.successful=1
+    kubectl patch cronjob nightly-build -n ci -p '{"spec":{"jobTemplate":{"spec":{"ttlSecondsAfterFinished":300}}}}'
+    ```
+  setup: |
+    k_ns ci
+    for i in $(seq 1 8); do kubectl -n ci create job build-$i --image=busybox:1.37 -- true >/dev/null; done
+    kubectl -n ci create job build-live --image=busybox:1.37 -- sleep 3600 >/dev/null
+    kubectl -n ci create cronjob nightly-build --image=busybox:1.37 --schedule="0 3 * * *" -- echo build >/dev/null
+    for i in $(seq 1 8); do kubectl -n ci wait --for=condition=complete job/build-$i --timeout=60s >/dev/null 2>&1; done
+  check: |
+    check_eq "no completed jobs left" "$(kubectl -n ci get jobs -o json | jq '[.items[] | select(.status.succeeded == 1)] | length')" "0"
+    check "build-live still exists" 'k_exists -n ci job build-live'
+    check_eq "cronjob ttl" "$(kj -n ci cronjob nightly-build '{.spec.jobTemplate.spec.ttlSecondsAfterFinished}')" "300"
+  solve: |
+    kubectl delete jobs -n ci --field-selector status.successful=1
+    kubectl patch cronjob nightly-build -n ci -p '{"spec":{"jobTemplate":{"spec":{"ttlSecondsAfterFinished":300}}}}'
+
+- id: k8s-136
+  title: An indexed work queue
+  difficulty: 3
+  kind: build
+  tags: [job, indexed]
+  scenario: |
+    Three shards of a dataset must be processed, one pod per shard, each knowing **which**
+    shard it is.
+
+    Create a Job **`shards`** in namespace **`data`** with **3 completions**, **3 in
+    parallel**, in **Indexed** completion mode. Each pod (`busybox:1.37`) prints
+    `processing shard N` where N is its index (0, 1, 2).
+  hints:
+    - "`completionMode: Indexed` sets the env var `JOB_COMPLETION_INDEX` in each pod."
+  solution: |
+    ```yaml
+    spec:
+      completions: 3
+      parallelism: 3
+      completionMode: Indexed
+      template:
+        spec:
+          restartPolicy: Never
+          containers:
+          - name: worker
+            image: busybox:1.37
+            command: ["sh", "-c", "echo processing shard $JOB_COMPLETION_INDEX"]
+    ```
+  setup: |
+    k_ns data
+  check: |
+    check_eq "mode" "$(kj -n data job shards '{.spec.completionMode} {.spec.completions} {.spec.parallelism}')" "Indexed 3 3"
+    k_exists -n data job shards && kubectl -n data wait --for=condition=complete job/shards --timeout=90s >/dev/null 2>&1
+    out=$(for p in $(kubectl -n data get pods -l job-name=shards -o name); do kubectl -n data logs $p; done | sort | tr '\n' '|')
+    check_eq "each shard processed once" "$out" "processing shard 0|processing shard 1|processing shard 2|"
+  solve: |
+    kubectl apply -f - <<'EOF'
+    apiVersion: batch/v1
+    kind: Job
+    metadata: {name: shards, namespace: data}
+    spec:
+      completions: 3
+      parallelism: 3
+      completionMode: Indexed
+      template:
+        spec:
+          restartPolicy: Never
+          containers:
+          - name: worker
+            image: busybox:1.37
+            command: ["sh", "-c", "echo processing shard $JOB_COMPLETION_INDEX"]
+    EOF
+
+- id: k8s-137
+  title: Scale a StatefulSet in parallel
+  difficulty: 3
+  kind: build
+  tags: [statefulset, scaling, podManagementPolicy]
+  scenario: |
+    Create a StatefulSet **`cassandra-lite`** in namespace **`nosql`** (`busybox:1.37`,
+    `sleep infinity`, headless service `cassandra-lite`) with **3 replicas** whose pods are
+    started **all at once** instead of one after another — the app handles its own
+    bootstrap ordering.
+  hints:
+    - "`podManagementPolicy: Parallel` (default `OrderedReady`). It can only be set at creation time."
+  solution: |
+    ```yaml
+    apiVersion: apps/v1
+    kind: StatefulSet
+    metadata: {name: cassandra-lite, namespace: nosql}
+    spec:
+      serviceName: cassandra-lite
+      replicas: 3
+      podManagementPolicy: Parallel
+      selector: {matchLabels: {app: cassandra-lite}}
+      template:
+        metadata: {labels: {app: cassandra-lite}}
+        spec:
+          containers:
+          - {name: node, image: busybox:1.37, command: ["sleep", "infinity"]}
+    ```
+  setup: |
+    k_ns nosql
+  check: |
+    check_eq "podManagementPolicy" "$(kj -n nosql sts cassandra-lite '{.spec.podManagementPolicy}')" "Parallel"
+    check "headless service" '[ "$(kj -n nosql svc cassandra-lite "{.spec.clusterIP}")" = None ]'
+    k_exists -n nosql sts cassandra-lite && eventually 60 '[ "$(kj -n nosql sts cassandra-lite "{.status.readyReplicas}")" = 3 ]'
+    check_eq "3 ready" "$(kj -n nosql sts cassandra-lite '{.status.readyReplicas}')" "3"
+  solve: |
+    kubectl apply -f - <<'EOF'
+    apiVersion: v1
+    kind: Service
+    metadata: {name: cassandra-lite, namespace: nosql}
+    spec:
+      clusterIP: None
+      selector: {app: cassandra-lite}
+      ports: [{port: 9042}]
+    ---
+    apiVersion: apps/v1
+    kind: StatefulSet
+    metadata: {name: cassandra-lite, namespace: nosql}
+    spec:
+      serviceName: cassandra-lite
+      replicas: 3
+      podManagementPolicy: Parallel
+      selector: {matchLabels: {app: cassandra-lite}}
+      template:
+        metadata: {labels: {app: cassandra-lite}}
+        spec:
+          containers:
+          - {name: node, image: "busybox:1.37", command: ["sleep", "infinity"]}
+    EOF
+
+- id: k8s-138
+  title: Canary a StatefulSet with partitions
+  difficulty: 3
+  kind: build
+  tags: [statefulset, rolling-update, partition]
+  scenario: |
+    The **`ledger`** StatefulSet (namespace **`fin`**, 3 replicas, `nginx:1.28-alpine`) must
+    be upgraded to **`nginx:1.29-alpine`** carefully: for now **only `ledger-2`** may get
+    the new version; `ledger-0` and `ledger-1` must stay on 1.28.
+  hints:
+    - "`spec.updateStrategy.rollingUpdate.partition: N` updates only pods with ordinal ≥ N."
+  solution: |
+    ```bash
+    kubectl patch sts ledger -n fin -p '{"spec":{"updateStrategy":{"type":"RollingUpdate","rollingUpdate":{"partition":2}}}}'
+    kubectl set image sts/ledger -n fin nginx=nginx:1.29-alpine
+    kubectl get pods -n fin -L controller-revision-hash
+    ```
+    Lower the partition step by step to roll the rest.
+  setup: |
+    k_ns fin
+    kubectl apply -f - >/dev/null <<'EOF'
+    apiVersion: apps/v1
+    kind: StatefulSet
+    metadata: {name: ledger, namespace: fin}
+    spec:
+      serviceName: ledger
+      replicas: 3
+      selector: {matchLabels: {app: ledger}}
+      template:
+        metadata: {labels: {app: ledger}}
+        spec:
+          containers: [{name: nginx, image: "nginx:1.28-alpine"}]
+    EOF
+    kubectl -n fin rollout status sts/ledger --timeout=120s >/dev/null
+  check: |
+    check_eq "template image" "$(kj -n fin sts ledger '{.spec.template.spec.containers[0].image}')" "nginx:1.29-alpine"
+    eventually 60 '[ "$(kj -n fin pod ledger-2 "{.spec.containers[0].image}")" = nginx:1.29-alpine ] && pod_ready fin ledger-2'
+    for i in 0 1; do check "ledger-$i still on 1.28" "[ \"\$(kj -n fin pod ledger-$i '{.spec.containers[0].image}')\" = nginx:1.28-alpine ]"; done
+    check "ledger-2 on 1.29 and ready" '[ "$(kj -n fin pod ledger-2 "{.spec.containers[0].image}")" = nginx:1.29-alpine ] && pod_ready fin ledger-2'
+  solve: |
+    kubectl patch sts ledger -n fin -p '{"spec":{"updateStrategy":{"type":"RollingUpdate","rollingUpdate":{"partition":2}}}}'
+    kubectl set image sts/ledger -n fin nginx=nginx:1.29-alpine
+
+- id: k8s-139
+  title: Drain connections before shutdown
+  difficulty: 2
+  kind: build
+  tags: [lifecycle, preStop, graceful-shutdown]
+  scenario: |
+    When a **`gateway`** pod is terminated, the load balancer needs ~10 seconds to stop
+    sending it traffic. Create deployment **`gateway`** in namespace **`edge`**
+    (`nginx:1.28-alpine`, 2 replicas) with:
+
+    - a **preStop** hook that sleeps **10 seconds** before nginx is told to stop
+    - a termination grace period of **45 seconds**
+  hints:
+    - "`lifecycle.preStop.exec.command: [\"sleep\", \"10\"]` (or the newer `preStop.sleep.seconds`)"
+    - "`terminationGracePeriodSeconds` is a pod-level field."
+  solution: |
+    ```yaml
+    spec:
+      terminationGracePeriodSeconds: 45
+      containers:
+      - name: nginx
+        image: nginx:1.28-alpine
+        lifecycle:
+          preStop:
+            sleep: {seconds: 10}
+    ```
+  setup: |
+    k_ns edge
+  check: |
+    wait_deploy edge gateway 60
+    check_eq "grace period" "$(kj -n edge deploy gateway '{.spec.template.spec.terminationGracePeriodSeconds}')" "45"
+    ps=$(kj -n edge deploy gateway '{.spec.template.spec.containers[0].lifecycle.preStop}')
+    check "preStop sleeps 10s" 'jq -e "(.sleep.seconds == 10) or (.exec.command | join(\" \") | test(\"sleep 10\"))" <<<"$ps"'
+    check "2 replicas ready" 'deploy_ready edge gateway && [ "$(kj -n edge deploy gateway "{.status.readyReplicas}")" = 2 ]'
+  solve: |
+    kubectl apply -f - <<'EOF'
+    apiVersion: apps/v1
+    kind: Deployment
+    metadata: {name: gateway, namespace: edge}
+    spec:
+      replicas: 2
+      selector: {matchLabels: {app: gateway}}
+      template:
+        metadata: {labels: {app: gateway}}
+        spec:
+          terminationGracePeriodSeconds: 45
+          containers:
+          - name: nginx
+            image: nginx:1.28-alpine
+            lifecycle:
+              preStop:
+                sleep: {seconds: 10}
+    EOF
+
+- id: k8s-140
+  title: "Incident: the nightly batch pile-up"
+  difficulty: 4
+  kind: fix
+  tags: [cronjob, job, incident]
+  scenario: |
+    The **`reconcile`** CronJob (namespace **`finance`**) runs every minute. Every run
+    fails, runs forever, and they pile up: there are already a dozen pods.
+
+    Fix it so that:
+
+    - runs **succeed** (the script it should run is `/scripts/reconcile.sh` from the
+      ConfigMap `reconcile-script`)
+    - a new run is **never started while the previous one is still running**
+    - a run that takes longer than **50 seconds** is killed
+    - only the **last 2** successful Jobs are kept
+    - all the **currently piled-up Jobs are gone**
+
+    Then trigger one run manually as Job **`reconcile-now`** and make sure it succeeds.
+  hints:
+    - "`kubectl get cronjob reconcile -n finance -o yaml` — check the image, the command, the volume, `concurrencyPolicy`."
+    - "`kubectl delete jobs -n finance --all`"
+  solution: |
+    ```bash
+    kubectl -n finance patch cronjob reconcile --type=merge -p '{"spec":{"concurrencyPolicy":"Forbid","successfulJobsHistoryLimit":2,"jobTemplate":{"spec":{"activeDeadlineSeconds":50}}}}'
+    # the script is mounted at /script but the command waits for /scripts/reconcile.sh -> fix the mountPath
+    kubectl -n finance patch cronjob reconcile --type=json -p '[{"op":"replace","path":"/spec/jobTemplate/spec/template/spec/containers/0/volumeMounts/0/mountPath","value":"/scripts"}]'
+    kubectl -n finance delete jobs --all
+    kubectl -n finance create job reconcile-now --from=cronjob/reconcile
+    ```
+  setup: |
+    k_ns finance
+    kubectl -n finance create configmap reconcile-script --from-literal=reconcile.sh=$'echo "reconciled $(date)"\n' >/dev/null
+    kubectl apply -f - >/dev/null <<'EOF'
+    apiVersion: batch/v1
+    kind: CronJob
+    metadata: {name: reconcile, namespace: finance}
+    spec:
+      schedule: "* * * * *"
+      concurrencyPolicy: Allow
+      jobTemplate:
+        spec:
+          backoffLimit: 0
+          template:
+            spec:
+              restartPolicy: Never
+              containers:
+              - name: reconcile
+                image: busybox:1.37
+                command: ["sh", "-c", "while [ ! -f /scripts/reconcile.sh ]; do echo waiting for script; sleep 5; done; sh /scripts/reconcile.sh"]
+                volumeMounts: [{name: s, mountPath: /script}]
+              volumes: [{name: s, configMap: {name: reconcile-script}}]
+    EOF
+    for i in 1 2 3 4 5 6; do kubectl -n finance create job reconcile-backlog-$i --from=cronjob/reconcile >/dev/null; done
+  check: |
+    cj=$(kubectl -n finance get cronjob reconcile -o json 2>/dev/null)
+    check_eq "concurrencyPolicy" "$(jq -r .spec.concurrencyPolicy <<<"$cj")" "Forbid"
+    check_eq "activeDeadlineSeconds" "$(jq -r .spec.jobTemplate.spec.activeDeadlineSeconds <<<"$cj")" "50"
+    check_eq "successfulJobsHistoryLimit" "$(jq -r .spec.successfulJobsHistoryLimit <<<"$cj")" "2"
+    check_eq "no backlog jobs" "$(kubectl -n finance get jobs -o name | grep -c reconcile-backlog)" "0"
+    k_exists -n finance job reconcile-now && kubectl -n finance wait --for=condition=complete job/reconcile-now --timeout=60s >/dev/null 2>&1
+    check "reconcile-now succeeded" '[ "$(kj -n finance job reconcile-now "{.status.succeeded}")" = 1 ] && kubectl -n finance logs job/reconcile-now | grep -q reconciled'
+  solve: |
+    kubectl -n finance patch cronjob reconcile --type=merge -p '{"spec":{"concurrencyPolicy":"Forbid","successfulJobsHistoryLimit":2,"jobTemplate":{"spec":{"activeDeadlineSeconds":50}}}}'
+    kubectl -n finance patch cronjob reconcile --type=json -p '[{"op":"replace","path":"/spec/jobTemplate/spec/template/spec/containers/0/volumeMounts/0/mountPath","value":"/scripts"}]'
+    kubectl -n finance delete jobs --all
+    kubectl -n finance create job reconcile-now --from=cronjob/reconcile
