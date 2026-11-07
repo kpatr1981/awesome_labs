@@ -110,8 +110,6 @@ k_exists() { kubectl get "$@" >/dev/null 2>&1; }
 ready_pods() {
   kubectl get pods -n "$1" -l "$2" -o jsonpath='{range .items[*]}{.status.conditions[?(@.type=="Ready")].status}{"\n"}{end}' 2>/dev/null | grep -c True
 }
-# wait_deploy NS NAME [TIMEOUT]
-wait_deploy() { kubectl -n "$1" rollout status "deploy/$2" --timeout="${3:-120s}" >/dev/null 2>&1; }
 # k_ns NAME — (re)create a namespace for the exercise
 k_ns() { kubectl create namespace "$1" --dry-run=client -o yaml | kubectl apply -f - >/dev/null; }
 # k_run_curl NS URL -> output of curl from inside the cluster
@@ -163,3 +161,35 @@ wait_pods() { _wait_state "${3:-60}" "$1" -l "$2"; }
 restarts() { kj -n "$1" pod "$2" '{range .status.containerStatuses[*]}{.restartCount}{"\n"}{end}' | awk '{s+=$1} END {print s+0}'; }
 # on_node01 'cmd' — run a command as root on node01 (from the control plane)
 on_node01() { sudo -u "$(lab_user)" ssh -o BatchMode=yes node01 sudo bash -c "$(printf '%q' "$*")"; }
+# deploy_ready NS NAME -> the deployment's latest spec is fully rolled out and Ready
+deploy_ready() {
+  local j; j=$(kubectl -n "$1" get deploy "$2" -o json 2>/dev/null) || return 1
+  jq -e '(.status.observedGeneration // 0) >= .metadata.generation
+    and (.spec.replicas // 1) == (.status.updatedReplicas // 0)
+    and (.spec.replicas // 1) == (.status.readyReplicas // 0)
+    and (.spec.replicas // 1) == (.status.replicas // 0)' <<<"$j" >/dev/null
+}
+# wait_deploy NS NAME [SECONDS] — wait for a complete rollout; give up early if pods are stuck
+wait_deploy() {
+  k_exists -n "$1" deploy "$2" || return 1
+  local end=$((SECONDS + ${3:-90})) grace=$((SECONDS + 10)) sel
+  sel=$(kubectl -n "$1" get deploy "$2" -o json | jq -r '.spec.selector.matchLabels // {} | to_entries | map("\(.key)=\(.value)") | join(",")')
+  while :; do
+    deploy_ready "$1" "$2" && return 0
+    [ $SECONDS -ge $grace ] && [ "$(_pods_state "$1" -l "$sel")" = stuck ] && return 1
+    [ $SECONDS -ge $end ] && return 1
+    sleep 2
+  done
+}
+# deploy_images NS NAME -> images of the pod template
+deploy_images() { kj -n "$1" deploy "$2" '{.spec.template.spec.containers[*].image}'; }
+# ---------- docker compose helpers ----------
+# cc_ids PROJECT SERVICE -> ids of running containers of a compose service
+cc_ids() { docker ps -q --filter "label=com.docker.compose.project=$1" --filter "label=com.docker.compose.service=$2"; }
+cc_id() { cc_ids "$1" "$2" | head -1; }
+cc_running() { [ -n "$(cc_ids "$1" "$2")" ]; }
+cc_count() { cc_ids "$1" "$2" | wc -l | tr -d ' '; }
+# cc_get PROJECT SERVICE '{{template}}' — inspect the first container of a service
+cc_get() { local id; id=$(cc_id "$1" "$2"); [ -n "$id" ] && docker inspect -f "$3" "$id"; }
+# cc_exec PROJECT SERVICE cmd... — exec in the first container of a service
+cc_exec() { local p=$1 s=$2 id; shift 2; id=$(cc_id "$p" "$s"); [ -n "$id" ] && docker exec "$id" "$@"; }
