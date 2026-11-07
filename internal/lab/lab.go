@@ -299,9 +299,9 @@ func (m *Manager) pushKit(ctx context.Context, env Env, log io.Writer) error {
 	for _, vm := range env.VMs {
 		code, err := lima.Run(ctx, vm.Name, lima.Script{
 			AsRoot: true,
-			Body:   "mkdir -p /opt/kubelab /var/lib/kubelab && tar -xzf - -C /opt/kubelab",
+			Body:   "mkdir -p /opt/kubelab /var/lib/kubelab && tar -m --warning=no-timestamp -xzf - -C /opt/kubelab",
 			Stdin:  bytes.NewReader(buf.Bytes()),
-		}, log)
+		}, m.detail(log))
 		if err != nil || code != 0 {
 			return fmt.Errorf("copy kit to %s failed (exit %d): %v", vm.Name, code, err)
 		}
@@ -569,7 +569,8 @@ func (m *Manager) Start(ctx context.Context, ex *exercise.Exercise, log io.Write
 	if ex.Destructive {
 		m.SetTainted(env, true)
 	}
-	_, _ = m.root(ctx, env.Primary(), "echo "+ex.ID+" > /var/lib/kubelab/current", nil, io.Discard)
+	task := fmt.Sprintf("# %s — %s\n\n%s\n", ex.ID, ex.Title, strings.TrimSpace(ex.Scenario))
+	_, _ = m.root(ctx, env.Primary(), fmt.Sprintf("echo %s > /var/lib/kubelab/current\nsource /opt/kubelab/lib.sh\nlab_file /lab/TASK.md <<'KUBELAB_TASK_EOF'\n%s\nKUBELAB_TASK_EOF", ex.ID, task), nil, io.Discard)
 	fmt.Fprintf(log, "==> ready: open a terminal and solve the task\n")
 	return nil
 }
