@@ -127,3 +127,39 @@ kl_restore_obj() { # kl_restore_obj configmap coredns
 # api_up — is the API server answering?
 api_up() { kubectl get --raw=/readyz >/dev/null 2>&1; }
 wait_api() { eventually "${1:-180}" api_up; }
+# pod_ready NS NAME -> pod has condition Ready=True
+pod_ready() { [ "$(kj -n "$1" pod "$2" '{.status.conditions[?(@.type=="Ready")].status}')" = True ]; }
+# _pods_state NS ARGS... -> "ready", "stuck" or "wait" for the selected pods
+_pods_state() {
+  local ns=$1 j; shift
+  j=$(kubectl -n "$ns" get pods "$@" -o json 2>/dev/null) || { echo stuck; return; }
+  jq -r <<<"$j" '
+    (if .kind == "List" then .items else [.] end) as $p
+    | if ($p | length) == 0 then "stuck"
+      elif all($p[]; any(.status.conditions[]?; .type == "Ready" and .status == "True")) then "ready"
+      elif any($p[]; (.status.phase == "Failed" or .status.phase == "Succeeded")
+          or any(.status.conditions[]?; .type == "PodScheduled" and .status == "False")
+          or any(.status.containerStatuses[]?, .status.initContainerStatuses[]?;
+               (.state.waiting.reason // "") | IN("ImagePullBackOff","ErrImagePull","CrashLoopBackOff","CreateContainerConfigError","InvalidImageName","RunContainerError","CreateContainerError"))) then "stuck"
+      else "wait" end' 2>/dev/null || echo stuck
+}
+# _wait_state SECONDS NS ARGS... — wait for ready; give up early once pods are clearly stuck
+_wait_state() {
+  local t=$1 ns=$2; shift 2
+  local end=$((SECONDS + t)) grace=$((SECONDS + 8)) st
+  while :; do
+    st=$(_pods_state "$ns" "$@")
+    [ "$st" = ready ] && return 0
+    [ "$st" = stuck ] && [ $SECONDS -ge $grace ] && return 1
+    [ $SECONDS -ge $end ] && return 1
+    sleep 2
+  done
+}
+# wait_pod NS NAME [SECONDS] — wait until the pod is Ready (returns early if it is stuck)
+wait_pod() { k_exists -n "$1" pod "$2" && _wait_state "${3:-60}" "$1" "$2"; }
+# wait_pods NS SELECTOR [SECONDS]
+wait_pods() { _wait_state "${3:-60}" "$1" -l "$2"; }
+# restarts NS POD -> total container restarts
+restarts() { kj -n "$1" pod "$2" '{range .status.containerStatuses[*]}{.restartCount}{"\n"}{end}' | awk '{s+=$1} END {print s+0}'; }
+# on_node01 'cmd' — run a command as root on node01 (from the control plane)
+on_node01() { sudo -u "$(lab_user)" ssh -o BatchMode=yes node01 sudo bash -c "$(printf '%q' "$*")"; }

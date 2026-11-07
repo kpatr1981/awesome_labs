@@ -1,0 +1,730 @@
+track: docker
+module: Volumes & storage
+profile: docker
+order: 3
+exercises:
+
+- id: docker-041
+  title: Give the database a real volume
+  difficulty: 1
+  kind: build
+  tags: [volume, postgres]
+  scenario: |
+    Containers are disposable, data is not.
+
+    1. Create a named volume **`pgdata`**.
+    2. Run PostgreSQL as container **`db`** (`postgres:16-alpine`, password `devpass`)
+       with that volume mounted at **`/var/lib/postgresql/data`**.
+  hints:
+    - "`docker volume create NAME`, then `-v NAME:/path` on `docker run`."
+  solution: |
+    ```bash
+    docker volume create pgdata
+    docker run -d --name db -e POSTGRES_PASSWORD=devpass \
+      -v pgdata:/var/lib/postgresql/data postgres:16-alpine
+    docker volume inspect pgdata
+    ```
+  check: |
+    check "volume pgdata exists" 'docker volume inspect pgdata'
+    check "db is running" 'c_running db'
+    check_eq "pgdata is mounted at the data dir" "$(c_get db '{{range .Mounts}}{{if eq .Name "pgdata"}}{{.Destination}}{{end}}{{end}}')" "/var/lib/postgresql/data"
+    c_running db && eventually 30 'docker exec db pg_isready'
+    check "postgres initialised its files in the volume" 'test -f "$(docker volume inspect -f "{{.Mountpoint}}" pgdata)/PG_VERSION"'
+  solve: |
+    docker volume create pgdata
+    docker run -d --name db -e POSTGRES_PASSWORD=devpass -v pgdata:/var/lib/postgresql/data postgres:16-alpine
+
+- id: docker-042
+  title: Configuration from a bind mount
+  difficulty: 1
+  kind: build
+  tags: [bind-mount, nginx]
+  scenario: |
+    Ops maintains nginx configuration on the host in **`/lab/edge/default.conf`**.
+
+    Run **`edge`** from **`nginx:1.28-alpine`** on port **8090** → 80 with that file
+    **bind-mounted read-only** as `/etc/nginx/conf.d/default.conf`.
+    `curl localhost:8090/ping` must answer `pong`.
+  hints:
+    - "`-v /host/file:/container/file:ro` mounts a single file."
+  solution: |
+    ```bash
+    docker run -d --name edge -p 8090:80 \
+      -v /lab/edge/default.conf:/etc/nginx/conf.d/default.conf:ro nginx:1.28-alpine
+    curl localhost:8090/ping
+    ```
+  setup: |
+    lab_file /lab/edge/default.conf <<'EOF'
+    server {
+        listen 80;
+        location /ping { default_type text/plain; return 200 "pong\n"; }
+        location / { root /usr/share/nginx/html; }
+    }
+    EOF
+  check: |
+    check "edge is running" 'c_running edge'
+    check_eq "the config is a read-only bind mount" "$(c_get edge '{{range .Mounts}}{{if eq .Destination "/etc/nginx/conf.d/default.conf"}}{{.Type}}:{{.RW}}{{end}}{{end}}')" "bind:false"
+    check "/ping answers pong" 'http_get localhost:8090/ping | grep -qx pong'
+  solve: |
+    docker run -d --name edge -p 8090:80 -v /lab/edge/default.conf:/etc/nginx/conf.d/default.conf:ro nginx:1.28-alpine
+
+- id: docker-043
+  title: Scratch space in memory
+  difficulty: 1
+  kind: build
+  tags: [tmpfs]
+  scenario: |
+    The image converter writes large temporary files that must never touch the disk.
+
+    Run **`cruncher`** from **`busybox:1.37`** with the command `sleep infinity` and a
+    **tmpfs** mounted at **`/scratch`**, limited to **64 MiB**.
+  hints:
+    - "`--tmpfs /path:size=64m` or `--mount type=tmpfs,destination=/path,tmpfs-size=...`"
+  solution: |
+    ```bash
+    docker run -d --name cruncher --tmpfs /scratch:size=64m busybox:1.37 sleep infinity
+    docker exec cruncher df -h /scratch
+    ```
+  check: |
+    check "cruncher is running" 'c_running cruncher'
+    check "/scratch is a tmpfs" 'docker exec cruncher grep -q " /scratch tmpfs " /proc/mounts'
+    sz=$(docker exec cruncher df -k /scratch 2>/dev/null | awk 'NR==2{print $2}')
+    check_eq "tmpfs size is 64 MiB" "${sz:-0}" "65536"
+  solve: |
+    docker run -d --name cruncher --tmpfs /scratch:size=64m busybox:1.37 sleep infinity
+
+- id: docker-044
+  title: Sessions vanish on every deploy
+  difficulty: 2
+  kind: fix
+  tags: [volume, redis, persistence]
+  scenario: |
+    Every deployment of the **`sessions`** Redis container logs all users out: data is
+    stored inside the container, and deployments recreate it.
+
+    Recreate **`sessions`** (`redis:7.4-alpine`, port **6379**) so its data directory
+    **`/data`** lives on a named volume called **`sessions-data`**, and Redis writes an
+    **append-only file** (`--appendonly yes`) so that every write is persisted.
+  hints:
+    - "Redis keeps its files in `/data` in the official image."
+    - "Arguments after the image name are passed to `redis-server`... but the image's command is `redis-server`, so you need to repeat it: `redis-server --appendonly yes`."
+  solution: |
+    ```bash
+    docker rm -f sessions
+    docker run -d --name sessions -p 6379:6379 -v sessions-data:/data \
+      redis:7.4-alpine redis-server --appendonly yes
+    ```
+  setup: |
+    docker run -d --name sessions -p 6379:6379 redis:7.4-alpine >/dev/null
+  check: |
+    check "sessions is running" 'c_running sessions'
+    check_eq "/data is the sessions-data volume" "$(c_get sessions '{{range .Mounts}}{{if eq .Destination "/data"}}{{.Name}}{{end}}{{end}}')" "sessions-data"
+    check_eq "appendonly is enabled" "$(docker exec sessions redis-cli config get appendonly 2>/dev/null | tail -1)" "yes"
+    docker exec sessions redis-cli set kl:probe 42 >/dev/null 2>&1; sleep 1
+    check "writes land in the volume" 'ls -R "$(docker volume inspect -f "{{.Mountpoint}}" sessions-data)" | grep -q "aof"'
+  solve: |
+    docker rm -f sessions
+    docker run -d --name sessions -p 6379:6379 -v sessions-data:/data redis:7.4-alpine redis-server --appendonly yes
+
+- id: docker-045
+  title: Which volume is eating the disk?
+  difficulty: 2
+  kind: build
+  tags: [system-df, disk]
+  scenario: |
+    Disk usage on the docker host is climbing. There are several volumes.
+
+    Find the **largest volume** and write its name to **`/lab/biggest-volume.txt`**.
+  hints:
+    - "`docker system df -v` lists volumes with their sizes."
+  solution: |
+    ```bash
+    docker system df -v | sed -n '/VOLUME NAME/,/^$/p'
+    echo media-cache > /lab/biggest-volume.txt
+    ```
+  setup: |
+    names=(audit-logs media-cache build-cache tmp-exports)
+    big=${names[$((RANDOM % 4))]}; echo "$big" > $KL_STATE/answer
+    for v in "${names[@]}"; do
+      docker volume create "$v" >/dev/null
+      mb=5; [ "$v" = "$big" ] && mb=60
+      docker run --rm -v "$v":/v busybox:1.37 sh -c "dd if=/dev/zero of=/v/data bs=1M count=$mb 2>/dev/null"
+    done
+    docker run -d --name media -v media-cache:/cache busybox:1.37 sleep infinity >/dev/null
+  check: |
+    check_eq "/lab/biggest-volume.txt" "$(tr -d '[:space:]' < /lab/biggest-volume.txt 2>/dev/null)" "$(cat $KL_STATE/answer)"
+  solve: |
+    for v in $(docker volume ls -q); do echo "$(sudo du -s $(docker volume inspect -f '{{.Mountpoint}}' $v) | cut -f1) $v"; done | sort -n | tail -1 | awk '{print $2}' > /lab/biggest-volume.txt
+
+- id: docker-046
+  title: Who is holding this volume?
+  difficulty: 2
+  kind: build
+  tags: [volume, filter]
+  scenario: |
+    You want to delete the volume **`ledger`**, but docker says *volume is in use*.
+
+    Find the container(s) using it and write their names, one per line, to
+    **`/lab/ledger-users.txt`**. Don't remove anything yet.
+  hints:
+    - "`docker ps -a --filter volume=ledger`"
+  solution: |
+    ```bash
+    docker ps -a --filter volume=ledger --format '{{.Names}}' > /lab/ledger-users.txt
+    ```
+    Stopped containers count too — that's why `docker volume rm` fails even if nothing
+    is running.
+  setup: |
+    docker volume create ledger >/dev/null
+    for n in api worker cron; do docker run -d --name $n busybox:1.37 sleep infinity >/dev/null; done
+    docker run -d --name accounting -v ledger:/data busybox:1.37 sleep infinity >/dev/null
+    docker create --name old-import -v ledger:/import busybox:1.37 true >/dev/null
+  check: |
+    check_eq "the right containers" "$(sort /lab/ledger-users.txt 2>/dev/null | tr -s '[:space:]' ' ' | sed 's/ $//')" "accounting old-import"
+    check "volume ledger still exists" 'docker volume inspect ledger'
+  solve: |
+    docker ps -a --filter volume=ledger --format '{{.Names}}' > /lab/ledger-users.txt
+
+- id: docker-047
+  title: One writer, one reader
+  difficulty: 2
+  kind: build
+  tags: [volume, read-only]
+  scenario: |
+    A feed generator produces a file that a publisher only needs to read.
+
+    - Create a volume **`feed`**.
+    - Run **`writer`** (`busybox:1.37`) with `feed` mounted **read-write** at `/out`,
+      running: `sh -c 'while true; do date > /out/latest.txt; sleep 2; done'`
+    - Run **`reader`** (`busybox:1.37`, `sleep infinity`) with `feed` mounted
+      **read-only** at `/in`.
+  hints:
+    - "Append `:ro` to the volume spec for the reader."
+  solution: |
+    ```bash
+    docker volume create feed
+    docker run -d --name writer -v feed:/out busybox:1.37 sh -c 'while true; do date > /out/latest.txt; sleep 2; done'
+    docker run -d --name reader -v feed:/in:ro busybox:1.37 sleep infinity
+    docker exec reader cat /in/latest.txt
+    ```
+  check: |
+    check "writer and reader are running" 'c_running writer && c_running reader'
+    check_eq "writer mount" "$(c_get writer '{{range .Mounts}}{{.Name}}:{{.Destination}}:{{.RW}}{{end}}')" "feed:/out:true"
+    check_eq "reader mount" "$(c_get reader '{{range .Mounts}}{{.Name}}:{{.Destination}}:{{.RW}}{{end}}')" "feed:/in:false"
+    check "reader sees the writer's file" 'docker exec reader test -s /in/latest.txt'
+    check "reader cannot write" '! docker exec reader touch /in/x'
+  solve: |
+    docker volume create feed
+    docker run -d --name writer -v feed:/out busybox:1.37 sh -c 'while true; do date > /out/latest.txt; sleep 2; done'
+    docker run -d --name reader -v feed:/in:ro busybox:1.37 sleep infinity
+
+- id: docker-048
+  title: 403 Forbidden from a bind mount
+  difficulty: 2
+  kind: fix
+  tags: [permissions, bind-mount, troubleshooting]
+  scenario: |
+    The **`handbook`** container serves the employee handbook from **`/lab/handbook`**
+    (bind-mounted into nginx). Since the last content update, every page returns
+    **403 Forbidden**.
+
+    Fix it so **http://localhost:8091/** and **/policies/leave.html** are served again.
+    Don't change the container.
+  hints:
+    - "`docker logs handbook` — nginx says *Permission denied*."
+    - "nginx's worker processes run as the `nginx` user (uid 101), not as you. Look at `ls -la /lab/handbook`."
+  solution: |
+    ```bash
+    docker logs handbook | tail -3   # open() ... failed (13: Permission denied)
+    ls -laR /lab/handbook
+    chmod -R a+rX /lab/handbook      # files readable, directories traversable for everyone
+    curl localhost:8091/policies/leave.html
+    ```
+    `X` (capital) adds execute only to directories, which is what "traversable" needs.
+  setup: |
+    lab_file /lab/handbook/index.html <<'EOF'
+    <h1>Employee handbook</h1><a href="policies/leave.html">Leave policy</a>
+    EOF
+    lab_file /lab/handbook/policies/leave.html <<'EOF'
+    <h1>Leave policy</h1><p>25 days per year.</p>
+    EOF
+    chmod 600 /lab/handbook/index.html /lab/handbook/policies/leave.html
+    chmod 700 /lab/handbook/policies
+    docker run -d --name handbook -p 8091:80 -v /lab/handbook:/usr/share/nginx/html:ro nginx:1.28-alpine >/dev/null
+    docker inspect -f '{{.Id}}' handbook > $KL_STATE/answer
+  check: |
+    check_eq "same container" "$(c_get handbook '{{.Id}}')" "$(cat $KL_STATE/answer)"
+    check "index page is served" 'http_get localhost:8091/ | grep -q "Employee handbook"'
+    check "leave policy is served" 'http_get localhost:8091/policies/leave.html | grep -q "25 days"'
+  solve: |
+    chmod -R a+rX /lab/handbook
+
+- id: docker-049
+  title: Files owned by root in my project
+  difficulty: 2
+  kind: fix
+  tags: [bind-mount, uid, dev-workflow]
+  scenario: |
+    Developers generate reports with:
+
+    ```bash
+    docker run --rm -v /lab/reports:/out python:3.12-alpine \
+      python -c "open('/out/summary.txt','w').write('ok\n')"
+    ```
+
+    The file ends up **owned by root**, and they can't edit or delete it without sudo.
+
+    Produce **`/lab/reports/summary.txt`** with the same command, but make sure the file
+    is owned by **your user and group**. (The stray root-owned file from last time has
+    been removed already.)
+  hints:
+    - "The container runs as root (uid 0) unless told otherwise."
+    - "`--user \"$(id -u):$(id -g)\"`"
+  solution: |
+    ```bash
+    docker run --rm --user "$(id -u):$(id -g)" -v /lab/reports:/out python:3.12-alpine \
+      python -c "open('/out/summary.txt','w').write('ok\n')"
+    ls -l /lab/reports
+    ```
+  setup: |
+    mkdir -p /lab/reports && chown $(lab_user): /lab/reports
+  check: |
+    check "summary.txt exists" 'test -f /lab/reports/summary.txt'
+    check_eq "owner" "$(stat -c '%U:%G' /lab/reports/summary.txt 2>/dev/null)" "$(lab_user):$(id -gn $(lab_user))"
+  solve: |
+    docker run --rm --user "$(id -u):$(id -g)" -v /lab/reports:/out python:3.12-alpine python -c "open('/out/summary.txt','w').write('ok\n')"
+
+- id: docker-050
+  title: Back up a volume
+  difficulty: 2
+  kind: build
+  tags: [backup, volume]
+  scenario: |
+    The **`wiki`** container keeps its pages in the volume **`wiki-data`** (mounted at
+    `/var/www/data`). Before an upgrade you need a backup.
+
+    Create **`/lab/backups/wiki-data.tar.gz`** containing the **contents** of the volume
+    (paths in the archive relative to the volume root, e.g. `./pages/home.md`).
+  hints:
+    - "Use a throwaway container that mounts the volume and the backup directory: `docker run --rm -v wiki-data:/data:ro -v /lab/backups:/backup busybox ...`"
+    - "`--volumes-from wiki` is another way to get the same mounts."
+  solution: |
+    ```bash
+    mkdir -p /lab/backups
+    docker run --rm -v wiki-data:/data:ro -v /lab/backups:/backup busybox:1.37 \
+      tar -czf /backup/wiki-data.tar.gz -C /data .
+    tar -tzf /lab/backups/wiki-data.tar.gz
+    ```
+  setup: |
+    docker volume create wiki-data >/dev/null
+    docker run --rm -v wiki-data:/d busybox:1.37 sh -c 'mkdir -p /d/pages /d/uploads; echo "# Home" > /d/pages/home.md; echo "# On-call" > /d/pages/oncall.md; echo PNG > /d/uploads/logo.png'
+    docker run -d --name wiki -v wiki-data:/var/www/data busybox:1.37 sleep infinity >/dev/null
+    mkdir -p /lab/backups && chown $(lab_user): /lab/backups
+  check: |
+    check "backup exists" 'test -s /lab/backups/wiki-data.tar.gz'
+    list=$(tar -tzf /lab/backups/wiki-data.tar.gz 2>/dev/null | sed 's|^\./||')
+    for f in pages/home.md pages/oncall.md uploads/logo.png; do check "contains $f" "grep -qx '$f' <<<'$list'"; done
+    check "wiki still running" 'c_running wiki'
+  solve: |
+    docker run --rm -v wiki-data:/data:ro -v /lab/backups:/backup busybox:1.37 tar -czf /backup/wiki-data.tar.gz -C /data .
+
+- id: docker-051
+  title: Restore a volume from backup
+  difficulty: 2
+  kind: build
+  tags: [restore, volume]
+  scenario: |
+    The shop's product images were lost. Luckily there's a backup:
+    **`/lab/backups/product-images.tar.gz`**.
+
+    Restore it into a **new** volume **`product-images`**, then run **`images`**
+    (`nginx:1.28-alpine`, port **8092** → 80) serving the volume from
+    `/usr/share/nginx/html` (read-only). `curl localhost:8092/catalog.txt` must work.
+  hints:
+    - "Extract the archive with a throwaway container that mounts both the volume and `/lab/backups`."
+  solution: |
+    ```bash
+    docker volume create product-images
+    docker run --rm -v product-images:/data -v /lab/backups:/backup:ro busybox:1.37 \
+      tar -xzf /backup/product-images.tar.gz -C /data
+    docker run -d --name images -p 8092:80 -v product-images:/usr/share/nginx/html:ro nginx:1.28-alpine
+    ```
+  setup: |
+    T=$(mktemp -d); chmod 755 $T; mkdir -p $T/sku
+    echo "SKU-1001 kettle" > $T/catalog.txt; echo JPEG > $T/sku/1001.jpg; echo JPEG > $T/sku/1002.jpg
+    mkdir -p /lab/backups && tar -czf /lab/backups/product-images.tar.gz -C $T . && rm -rf $T
+    chown -R $(lab_user): /lab/backups
+  check: |
+    check "volume product-images exists" 'docker volume inspect product-images'
+    check "images is running" 'c_running images'
+    check_eq "volume mounted read-only" "$(c_get images '{{range .Mounts}}{{if eq .Destination "/usr/share/nginx/html"}}{{.Name}}:{{.RW}}{{end}}{{end}}')" "product-images:false"
+    check "catalog.txt is served" 'http_get localhost:8092/catalog.txt | grep -q SKU-1001'
+    check "sku images restored" 'http_get localhost:8092/sku/1002.jpg | grep -q JPEG'
+  solve: |
+    docker volume create product-images
+    docker run --rm -v product-images:/data -v /lab/backups:/backup:ro busybox:1.37 tar -xzf /backup/product-images.tar.gz -C /data
+    docker run -d --name images -p 8092:80 -v product-images:/usr/share/nginx/html:ro nginx:1.28-alpine
+
+- id: docker-052
+  title: Rename a volume
+  difficulty: 3
+  kind: build
+  tags: [volume, migration]
+  scenario: |
+    The volume **`old-uploads`** has to be called **`uploads`** to match the new naming
+    convention. Docker has no `volume rename`.
+
+    End state: a volume **`uploads`** with **all the files** (including permissions and
+    hidden files) of `old-uploads`, the container **`cms`** recreated to use it at
+    `/srv/uploads` (image `busybox:1.37`, command `sleep infinity`), and `old-uploads`
+    **deleted**.
+  hints:
+    - "Copy with a helper container mounting both volumes: `cp -a /from/. /to/`"
+    - "You have to remove `cms` before you can delete the old volume."
+  solution: |
+    ```bash
+    docker volume create uploads
+    docker run --rm -v old-uploads:/from:ro -v uploads:/to busybox:1.37 cp -a /from/. /to/
+    docker rm -f cms
+    docker run -d --name cms -v uploads:/srv/uploads busybox:1.37 sleep infinity
+    docker volume rm old-uploads
+    ```
+  setup: |
+    docker volume create old-uploads >/dev/null
+    docker run --rm -v old-uploads:/d busybox:1.37 sh -c 'mkdir -p /d/2025/10; echo a > /d/2025/10/report.pdf; echo s > /d/.htaccess; echo k > /d/private.key; chmod 600 /d/private.key; chown 33:33 /d/private.key'
+    docker run -d --name cms -v old-uploads:/srv/uploads busybox:1.37 sleep infinity >/dev/null
+  check: |
+    check "old-uploads is gone" '! docker volume inspect old-uploads'
+    check "uploads exists" 'docker volume inspect uploads'
+    mp=$(docker volume inspect -f '{{.Mountpoint}}' uploads 2>/dev/null)
+    check "files copied (incl. hidden)" "test -f $mp/2025/10/report.pdf && test -f $mp/.htaccess"
+    check_eq "permissions and owner kept on private.key" "$(stat -c '%a %u' $mp/private.key 2>/dev/null)" "600 33"
+    check_eq "cms uses uploads" "$(c_get cms '{{range .Mounts}}{{.Name}}:{{.Destination}}{{end}}')" "uploads:/srv/uploads"
+    check "cms is running" 'c_running cms'
+  solve: |
+    docker volume create uploads
+    docker run --rm -v old-uploads:/from:ro -v uploads:/to busybox:1.37 cp -a /from/. /to/
+    docker rm -f cms
+    docker run -d --name cms -v uploads:/srv/uploads busybox:1.37 sleep infinity
+    docker volume rm old-uploads
+
+- id: docker-053
+  title: Prune volumes nobody uses
+  difficulty: 2
+  kind: fix
+  tags: [prune, cleanup, disk]
+  scenario: |
+    Months of experiments left lots of volumes behind — named and anonymous.
+
+    Delete **every volume that is not used by any container** (running or stopped).
+    Volumes in use must survive.
+  hints:
+    - "Since Docker 23, `docker volume prune` only removes *anonymous* volumes by default."
+    - "`docker volume prune --all`"
+  solution: |
+    ```bash
+    docker volume prune --all -f
+    docker volume ls
+    ```
+  setup: |
+    for v in exp-1 exp-2 old-cache scratch-2024; do docker volume create $v >/dev/null; done
+    for i in 1 2 3; do docker run -v /data busybox:1.37 true >/dev/null; done
+    docker container prune -f >/dev/null
+    docker volume create live-db >/dev/null; docker volume create paused-jobs >/dev/null
+    docker run -d --name db -v live-db:/data busybox:1.37 sleep infinity >/dev/null
+    docker create --name jobs -v paused-jobs:/data busybox:1.37 true >/dev/null
+  check: |
+    check_eq "only volumes in use remain" "$(docker volume ls -q | sort | tr '\n' ' ' | sed 's/ $//')" "live-db paused-jobs"
+  solve: |
+    docker volume prune --all -f
+
+- id: docker-054
+  title: A RAM-backed named volume
+  difficulty: 3
+  kind: build
+  tags: [volume, driver-opts, tmpfs]
+  scenario: |
+    Two cooperating containers need a fast shared scratch area that lives in memory and
+    is shared between them — a plain `--tmpfs` can't be shared.
+
+    Create a named volume **`ramdisk`** with the **local** driver backed by **tmpfs**
+    and limited to **32 MiB**. Run **`producer`** and **`consumer`** (`busybox:1.37`,
+    `sleep infinity`) both mounting it at **`/shm`**.
+  hints:
+    - "`docker volume create --driver local --opt type=tmpfs --opt device=tmpfs --opt o=size=32m ramdisk`"
+  solution: |
+    ```bash
+    docker volume create --driver local --opt type=tmpfs --opt device=tmpfs --opt o=size=32m ramdisk
+    docker run -d --name producer -v ramdisk:/shm busybox:1.37 sleep infinity
+    docker run -d --name consumer -v ramdisk:/shm busybox:1.37 sleep infinity
+    docker exec producer sh -c 'echo hi > /shm/x'; docker exec consumer cat /shm/x
+    ```
+  check: |
+    check_eq "driver options" "$(docker volume inspect -f '{{.Options.type}} {{.Options.device}} {{.Options.o}}' ramdisk 2>/dev/null)" "tmpfs tmpfs size=32m"
+    check "both containers run" 'c_running producer && c_running consumer'
+    docker exec producer sh -c 'echo kl-$$ > /shm/probe' 2>/dev/null
+    check "data is shared" 'docker exec consumer cat /shm/probe | grep -q kl-'
+    check "it is tmpfs inside the container" 'docker exec consumer grep -q " /shm tmpfs " /proc/mounts'
+  solve: |
+    docker volume create --driver local --opt type=tmpfs --opt device=tmpfs --opt o=size=32m ramdisk
+    docker run -d --name producer -v ramdisk:/shm busybox:1.37 sleep infinity
+    docker run -d --name consumer -v ramdisk:/shm busybox:1.37 sleep infinity
+
+- id: docker-055
+  title: Permission denied for a non-root container
+  difficulty: 3
+  kind: fix
+  tags: [permissions, uid, troubleshooting]
+  scenario: |
+    The **`exporter`** container (it runs as uid **1500**, as required by policy) keeps
+    restarting. It should write a CSV export to **`/lab/exports`** on the host every few
+    seconds.
+
+    Fix the problem **on the host side** — the container must keep running as uid 1500
+    and must not be recreated. Other users on the host should not get write access.
+  hints:
+    - "`docker logs exporter`"
+    - "Compare `ls -ld /lab/exports` with the uid the container runs as."
+  solution: |
+    ```bash
+    docker logs exporter | tail -2      # can't create /exports/report.csv: Permission denied
+    ls -ld /lab/exports                 # drwxr-xr-x root root
+    sudo chown 1500 /lab/exports
+    docker logs -f exporter
+    ```
+    Numeric uids are what count across the container boundary — the host doesn't need a
+    user called 1500.
+  setup: |
+    mkdir -p /lab/exports && chown root:root /lab/exports && chmod 755 /lab/exports
+    docker run -d --name exporter --restart always -u 1500 -v /lab/exports:/exports busybox:1.37 sh -c 'while true; do date > /exports/report.csv || exit 1; echo exported; sleep 3; done' >/dev/null
+    docker inspect -f '{{.Id}}' exporter > $KL_STATE/answer
+  check: |
+    check_eq "same container" "$(c_get exporter '{{.Id}}')" "$(cat $KL_STATE/answer)"
+    check_eq "still runs as 1500" "$(c_get exporter '{{.Config.User}}')" "1500"
+    sleep 4
+    check "report.csv is being written" 'test -s /lab/exports/report.csv && [ $(( $(date +%s) - $(stat -c %Y /lab/exports/report.csv) )) -lt 10 ]'
+    check "directory is not world-writable" '[ "$(stat -c %a /lab/exports | cut -c3)" != 7 ] && [ "$(stat -c %a /lab/exports | cut -c3)" != 6 ]'
+  solve: |
+    sudo chown 1500 /lab/exports
+
+- id: docker-056
+  title: Where did my website go?
+  difficulty: 3
+  kind: fix
+  tags: [volume, mounts, troubleshooting]
+  scenario: |
+    Yesterday someone "added a volume for the logs" to the **`docs`** container. Since
+    then the site shows nginx's default page instead of the documentation that was
+    baked into the **`docs:1.0`** image.
+
+    Recreate **`docs`** (image `docs:1.0`, port **8093** → 80) so the documentation is
+    served again, with the volume **`docs-logs`** mounted where nginx keeps its logs
+    (`/var/log/nginx`). The volume's current content is useless and may be discarded.
+  hints:
+    - "`docker inspect docs --format '{{json .Mounts}}'` — where is the volume mounted?"
+    - "nginx logs to `/var/log/nginx`."
+  solution: |
+    ```bash
+    docker inspect docs --format '{{json .Mounts}}'   # docs-logs -> /usr/share/nginx/html !
+    docker rm -f docs
+    docker volume rm docs-logs   # it was initialised with the default nginx page
+    docker run -d --name docs -p 8093:80 -v docs-logs:/var/log/nginx docs:1.0
+    ```
+    A volume mounted over a directory hides what the image put there. Because the volume
+    was empty the first time, docker copied the image's directory into it — which is
+    why you saw the default page instead of an empty directory.
+
+    Gotcha: the official nginx image symlinks `access.log`/`error.log` to
+    stdout/stderr, and those symlinks get copied into the fresh volume too. To really
+    write log files there, remove the symlinks (`docker exec docs sh -c 'rm
+    /var/log/nginx/*.log && nginx -s reopen'`) — or simply keep using `docker logs`.
+  setup: |
+    T=$(mktemp -d)
+    printf 'FROM nginx:1.28-alpine\nRUN echo "<h1>Platform documentation</h1>" > /usr/share/nginx/html/index.html\n' > $T/Dockerfile
+    docker build -q -t docs:1.0 $T >/dev/null; rm -rf $T
+    docker volume create docs-logs >/dev/null
+    docker run --rm -v docs-logs:/x nginx:1.28-alpine sh -c 'cp -a /usr/share/nginx/html/. /x/'
+    docker run -d --name docs -p 8093:80 -v docs-logs:/usr/share/nginx/html docs:1.0 >/dev/null
+  check: |
+    check "docs is running" 'c_running docs'
+    check_eq "docs uses image docs:1.0" "$(c_get docs '{{.Config.Image}}')" "docs:1.0"
+    check "documentation is served" 'http_get localhost:8093/ | grep -q "Platform documentation"'
+    check_eq "docs-logs is mounted at /var/log/nginx" "$(c_get docs '{{range .Mounts}}{{if eq .Name "docs-logs"}}{{.Destination}}{{end}}{{end}}')" "/var/log/nginx"
+    check_not "the old default page is no longer in the logs volume" 'test -f "$(docker volume inspect -f "{{.Mountpoint}}" docs-logs)/50x.html"'
+  solve: |
+    docker rm -f docs
+    docker volume rm docs-logs
+    docker run -d --name docs -p 8093:80 -v docs-logs:/var/log/nginx docs:1.0
+
+- id: docker-057
+  title: I edited the config but nothing changed
+  difficulty: 3
+  kind: fix
+  tags: [bind-mount, inode, gotcha]
+  scenario: |
+    The **`proxy`** container bind-mounts the single file **`/lab/proxy/nginx.conf`**.
+    A teammate updated the file (with `sed -i`) so that `/version` returns `v2`, and ran
+    `docker exec proxy nginx -s reload` — but `curl localhost:8094/version` still says
+    `v1`. `docker exec proxy cat /etc/nginx/conf.d/default.conf` even shows the *old*
+    content!
+
+    Make the running proxy serve **`v2`**. Bonus: understand why it happened.
+  hints:
+    - "Compare `ls -i /lab/proxy/nginx.conf` with `docker exec proxy ls -i /etc/nginx/conf.d/default.conf` — hmm, inode numbers…"
+    - "`sed -i` doesn't edit a file in place: it writes a new file and renames it over the old one. A single-file bind mount stays attached to the *old* inode."
+  solution: |
+    ```bash
+    docker restart proxy        # re-resolves the bind mount to the current file
+    curl localhost:8094/version # v2
+    ```
+    Single-file bind mounts point at an inode. Editors and `sed -i` replace the file
+    (new inode) so the container keeps seeing the old one. Restart the container, or —
+    better — bind-mount the **directory** instead of the file.
+  setup: |
+    lab_file /lab/proxy/nginx.conf <<'EOF'
+    server {
+        listen 80;
+        location /version { default_type text/plain; return 200 "v1\n"; }
+    }
+    EOF
+    docker run -d --name proxy -p 8094:80 -v /lab/proxy/nginx.conf:/etc/nginx/conf.d/default.conf:ro nginx:1.28-alpine >/dev/null
+    sleep 1
+    sed -i 's/v1/v2/' /lab/proxy/nginx.conf
+    docker exec proxy nginx -s reload >/dev/null 2>&1
+  check: |
+    check "proxy is running" 'c_running proxy'
+    check "the host file says v2" 'grep -q v2 /lab/proxy/nginx.conf'
+    check_eq "/version" "$(http_get localhost:8094/version 2>/dev/null)" "v2"
+  solve: |
+    docker restart proxy
+
+- id: docker-058
+  title: Pre-populate a volume from the image
+  difficulty: 3
+  kind: build
+  tags: [volume, initialisation]
+  scenario: |
+    The marketing team wants to drop extra files into the web root of the **`assets`**
+    web server without rebuilding the image — but the image's own default files must stay.
+
+    Run **`assets`** from **`nginx:1.28-alpine`** (port **8095** → 80) with a new named volume
+    **`assets`** mounted at `/usr/share/nginx/html`, so the volume starts with the image's
+    files. Then add **`/lab/logo.svg`** to the volume so it is served as `/logo.svg`.
+  hints:
+    - "When an *empty named volume* is mounted over a directory that has content in the image, docker copies that content into the volume."
+    - "`docker cp` into the container writes into the volume."
+  solution: |
+    ```bash
+    docker run -d --name assets -p 8095:80 -v assets:/usr/share/nginx/html nginx:1.28-alpine
+    docker cp /lab/logo.svg assets:/usr/share/nginx/html/logo.svg
+    curl localhost:8095/ ; curl localhost:8095/logo.svg
+    ```
+    This copy-on-first-mount only happens for named/anonymous volumes, never for bind mounts.
+  setup: |
+    echo '<svg xmlns="http://www.w3.org/2000/svg"><text>ACME</text></svg>' | lab_file /lab/logo.svg
+  check: |
+    mp=$(docker volume inspect -f '{{.Mountpoint}}' assets 2>/dev/null)
+    check "volume assets exists" '[ -n "$mp" ]'
+    check "image files were copied into the volume" "test -f $mp/index.html && test -f $mp/50x.html"
+    check "logo.svg is in the volume" "test -f $mp/logo.svg"
+    check "/ serves the nginx page" 'http_get localhost:8095/ | grep -q "Welcome to nginx"'
+    check "/logo.svg is served" 'http_get localhost:8095/logo.svg | grep -q ACME'
+  solve: |
+    docker run -d --name assets -p 8095:80 -v assets:/usr/share/nginx/html nginx:1.28-alpine
+    docker cp /lab/logo.svg assets:/usr/share/nginx/html/logo.svg
+
+- id: docker-059
+  title: Move a live database onto a volume
+  difficulty: 4
+  kind: fix
+  tags: [postgres, migration, volume]
+  scenario: |
+    **`crm-db`** was started months ago **without a volume** (its data lives in the
+    container's writable layer). It contains the precious `customers` table.
+
+    Move the data onto a named volume **`crm-pgdata`** **without losing anything**, and
+    end up with **`crm-db`** running `postgres:16-alpine` (password `crm`, port
+    **5434** → 5432) with `crm-pgdata` mounted at `/var/lib/postgresql/data`.
+  hints:
+    - "Stop the database first so the files on disk are consistent."
+    - "`docker cp crm-db:/var/lib/postgresql/data/. ...` copies out of a stopped container; or `pg_dumpall` while it runs and restore into the new one."
+    - "Postgres is picky about ownership: files must belong to the `postgres` user (uid 70 in the alpine image)."
+  solution: |
+    ```bash
+    docker stop crm-db
+    docker volume create crm-pgdata
+    # copy the data dir from the stopped container into the volume, keeping ownership
+    docker run --rm --volumes-from crm-db -v crm-pgdata:/new busybox:1.37 \
+      sh -c 'cp -a /var/lib/postgresql/data/. /new/'
+    docker rm crm-db
+    docker run -d --name crm-db -e POSTGRES_PASSWORD=crm -p 5434:5432 \
+      -v crm-pgdata:/var/lib/postgresql/data postgres:16-alpine
+    docker exec crm-db psql -U postgres -c 'select count(*) from customers'
+    ```
+    `--volumes-from` works here because the postgres image declares
+    `VOLUME /var/lib/postgresql/data`, so the "unmounted" data was actually in an
+    anonymous volume. `docker cp` + `chown -R 70:70` works too, as does `pg_dumpall`.
+  setup: |
+    docker run -d --name crm-db -e POSTGRES_PASSWORD=crm -p 5434:5432 postgres:16-alpine >/dev/null
+    eventually 60 'docker exec crm-db pg_isready -U postgres'; sleep 2
+    n=$((RANDOM % 500 + 100)); echo $n > $KL_STATE/answer
+    docker exec crm-db psql -q -U postgres -c "create table customers(id serial primary key, name text); insert into customers(name) select 'customer-'||g from generate_series(1,$n) g;" >/dev/null
+  check: |
+    check "crm-db is running" 'c_running crm-db'
+    check_eq "crm-pgdata is mounted at the data dir" "$(c_get crm-db '{{range .Mounts}}{{if eq .Destination "/var/lib/postgresql/data"}}{{.Name}}{{end}}{{end}}')" "crm-pgdata"
+    c_running crm-db && eventually 30 'docker exec crm-db pg_isready -U postgres'
+    check_eq "all customers survived" "$(docker exec crm-db psql -tA -U postgres -c 'select count(*) from customers' 2>/dev/null)" "$(cat $KL_STATE/answer)"
+    check "port 5434 published" 'docker port crm-db 5432 | grep -q 5434'
+  solve: |
+    docker stop crm-db
+    docker volume create crm-pgdata
+    docker run --rm --volumes-from crm-db -v crm-pgdata:/new busybox:1.37 sh -c 'cp -a /var/lib/postgresql/data/. /new/'
+    docker rm crm-db
+    docker run -d --name crm-db -e POSTGRES_PASSWORD=crm -p 5434:5432 -v crm-pgdata:/var/lib/postgresql/data postgres:16-alpine
+
+- id: docker-060
+  title: "Incident: the disk is full"
+  difficulty: 4
+  kind: fix
+  tags: [logs, disk, log-rotation, incident]
+  scenario: |
+    Alert: **/var/lib/docker is filling up fast**. The culprit is the **`chatty`**
+    container — it logs like crazy and its JSON log file is already huge.
+
+    1. Reclaim the space taken by `chatty`'s current log.
+    2. Make sure it can't happen again **for this container**: recreate `chatty` (same
+       image and command — see `docker inspect`) with log rotation: at most
+       **3 files of 10 MB** each.
+
+    `chatty` must be running at the end.
+  hints:
+    - "`docker inspect -f '{{.LogPath}}' chatty` shows where the log lives; `du -h` it."
+    - "Recreating the container deletes its old log file."
+    - "`--log-opt max-size=10m --log-opt max-file=3`"
+  solution: |
+    ```bash
+    sudo du -h "$(docker inspect -f '{{.LogPath}}' chatty)"
+    docker inspect chatty --format '{{.Config.Image}} {{json .Config.Cmd}}'
+    docker rm -f chatty            # removes the log file too
+    docker run -d --name chatty --log-opt max-size=10m --log-opt max-file=3 \
+      busybox:1.37 sh -c 'while true; do echo "$(date) DEBUG cache miss for key user:$RANDOM"; done'
+    ```
+    In an emergency you can also `truncate -s 0` the log file of a running container.
+    For a host-wide default, set `log-opts` in `/etc/docker/daemon.json` (see the daemon
+    module).
+  setup: |
+    docker run -d --name chatty busybox:1.37 sh -c 'while true; do echo "$(date) DEBUG cache miss for key user:$RANDOM"; done' >/dev/null
+    lp=$(docker inspect -f '{{.LogPath}}' chatty)
+    sleep 8
+    # simulate weeks of logging
+    for i in 1 2 3; do head -c 100M /dev/zero | tr '\0' 'x' | fold -w 200 | sed 's/^/{"log":"/;s/$/\\n","stream":"stdout","time":"2026-01-01T00:00:00Z"}/' >> "$lp"; done
+  check: |
+    check "chatty is running" 'c_running chatty'
+    check_eq "log max-size" "$(c_get chatty '{{index .HostConfig.LogConfig.Config "max-size"}}')" "10m"
+    check_eq "log max-file" "$(c_get chatty '{{index .HostConfig.LogConfig.Config "max-file"}}')" "3"
+    lp=$(c_get chatty '{{.LogPath}}'); sz=$(du -cm ${lp}* 2>/dev/null | tail -1 | cut -f1)
+    check "chatty's logs use less than 40 MB (${sz:-?} MB)" "[ ${sz:-999} -lt 40 ]"
+    check_eq "same command" "$(c_get chatty '{{json .Config.Cmd}}')" '["sh","-c","while true; do echo \"$(date) DEBUG cache miss for key user:$RANDOM\"; done"]'
+  solve: |
+    docker rm -f chatty
+    docker run -d --name chatty --log-opt max-size=10m --log-opt max-file=3 busybox:1.37 sh -c 'while true; do echo "$(date) DEBUG cache miss for key user:$RANDOM"; done'
