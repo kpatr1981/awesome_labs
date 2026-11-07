@@ -1,0 +1,909 @@
+track: docker
+module: Troubleshooting in the real world
+profile: docker
+order: 10
+exercises:
+
+- id: docker-181
+  title: Forensics on a crashed container
+  difficulty: 2
+  kind: build
+  tags: [forensics, cp, exited]
+  scenario: |
+    The **`importer`** container crashed last night and wrote a crash report to
+    **`/var/crash/report.txt`** inside its filesystem before dying. It's stopped, not
+    removed. Don't start it again (it would overwrite the report).
+
+    Copy the report out to **`/lab/crash-report.txt`**.
+  hints:
+    - "`docker cp` works on stopped containers too."
+  solution: |
+    ```bash
+    docker ps -a --filter name=importer
+    docker cp importer:/var/crash/report.txt /lab/crash-report.txt
+    ```
+  setup: |
+    id="CRASH-$RANDOM"; echo "$id" > $KL_STATE/answer
+    docker run --name importer busybox:1.37 sh -c "mkdir -p /var/crash; echo 'segfault in parser, incident $id' > /var/crash/report.txt; exit 139" >/dev/null 2>&1 || true
+    docker inspect -f '{{.State.FinishedAt}}' importer >> $KL_STATE/answer
+  check: |
+    check "report copied" "grep -q '$(head -1 $KL_STATE/answer)' /lab/crash-report.txt"
+    check_eq "importer was not restarted" "$(c_get importer '{{.State.FinishedAt}}')" "$(sed -n 2p $KL_STATE/answer)"
+  solve: |
+    docker cp importer:/var/crash/report.txt /lab/crash-report.txt
+
+- id: docker-182
+  title: Wrong time zone in the logs
+  difficulty: 2
+  kind: fix
+  tags: [timezone, env]
+  scenario: |
+    The finance team reads the **`ledger-report`** container's timestamps as Athens time,
+    but it prints UTC.
+
+    Recreate **`ledger-report`** (`debian:bookworm-slim`, same command) so that `date`
+    inside it shows the **Europe/Athens** time zone.
+  hints:
+    - "Most images honour the `TZ` environment variable if time-zone data is installed."
+  solution: |
+    ```bash
+    docker rm -f ledger-report
+    docker run -d --name ledger-report -e TZ=Europe/Athens debian:bookworm-slim \
+      sh -c 'while true; do date; sleep 10; done'
+    docker exec ledger-report date +%Z      # EET or EEST
+    ```
+  setup: |
+    docker run -d --name ledger-report debian:bookworm-slim sh -c 'while true; do date; sleep 10; done' >/dev/null
+  check: |
+    check "ledger-report is running" 'c_running ledger-report'
+    check_match "time zone" "$(docker exec ledger-report date +%Z 2>/dev/null)" '^EES?T$'
+    check_eq "same command" "$(c_get ledger-report '{{json .Config.Cmd}}')" '["sh","-c","while true; do date; sleep 10; done"]'
+  solve: |
+    docker rm -f ledger-report
+    docker run -d --name ledger-report -e TZ=Europe/Athens debian:bookworm-slim sh -c 'while true; do date; sleep 10; done'
+
+- id: docker-183
+  title: "exec /entrypoint.sh: permission denied"
+  difficulty: 3
+  kind: fix
+  tags: [dockerfile, permissions, entrypoint]
+  scenario: |
+    **`/lab/agent`** builds fine, but `docker run --rm agent:1.0` fails with
+    *permission denied* (exit code **126**). The developer works on a filesystem that
+    doesn't keep the executable bit.
+
+    Fix the **Dockerfile** (not the file on disk — assume you can't change its mode in
+    git) so the image works. Rebuild **`agent:1.0`**.
+  hints:
+    - "Exit code 126 = found but not executable."
+    - "`COPY --chmod=755 ...` sets the mode at copy time (BuildKit)."
+  solution: |
+    ```dockerfile
+    FROM alpine:3.22
+    COPY --chmod=755 entrypoint.sh /entrypoint.sh
+    ENTRYPOINT ["/entrypoint.sh"]
+    ```
+  setup: |
+    D=/lab/agent; mkdir -p $D
+    printf '#!/bin/sh\necho "agent registered with $(hostname)"\n' > $D/entrypoint.sh
+    chmod 644 $D/entrypoint.sh
+    printf 'FROM alpine:3.22\nCOPY entrypoint.sh /entrypoint.sh\nENTRYPOINT ["/entrypoint.sh"]\n' > $D/Dockerfile
+    chown -R $(lab_user): $D
+  check: |
+    check_eq "entrypoint.sh on disk is still 644" "$(stat -c %a /lab/agent/entrypoint.sh)" "644"
+    check "agent:1.0 runs" 'docker run --rm agent:1.0 | grep -q "agent registered"'
+  solve: |
+    printf 'FROM alpine:3.22\nCOPY --chmod=755 entrypoint.sh /entrypoint.sh\nENTRYPOINT ["/entrypoint.sh"]\n' > /lab/agent/Dockerfile
+    docker build -t agent:1.0 /lab/agent
+
+- id: docker-184
+  title: Unhealthy forever
+  difficulty: 3
+  kind: fix
+  tags: [healthcheck, troubleshooting]
+  scenario: |
+    **`catalog`** (port **8190**) serves requests perfectly, yet docker reports it as
+    **unhealthy** and the load balancer drops it. Its health check was copied from
+    another project.
+
+    Recreate **`catalog`** (same image, port) with a health check that **works** for this
+    image, checking `http://localhost/` every 5 seconds.
+  hints:
+    - "`docker inspect catalog --format '{{json .State.Health}}'` shows the probe's output."
+    - "Which port does nginx listen on inside this container?"
+  solution: |
+    ```bash
+    docker inspect catalog --format '{{range .State.Health.Log}}{{.Output}}{{end}}'
+    # wget: can't connect to remote host: Connection refused   (port 8080 — nginx listens on 80)
+    docker rm -f catalog
+    docker run -d --name catalog -p 8190:80 --health-cmd 'wget -qO- http://localhost/ || exit 1' \
+      --health-interval 5s nginx:1.28-alpine
+    ```
+  setup: |
+    docker run -d --name catalog -p 8190:80 --health-cmd 'wget -qO- http://localhost:8080/ || exit 1' --health-interval 3s --health-retries 2 nginx:1.28-alpine >/dev/null
+  check: |
+    check "catalog is running" 'c_running catalog'
+    check_eq "image" "$(c_get catalog '{{.Config.Image}}')" "nginx:1.28-alpine"
+    c_running catalog && eventually 30 '[ "$(c_get catalog "{{.State.Health.Status}}")" = healthy ]'
+    check_eq "health" "$(c_get catalog '{{.State.Health.Status}}')" "healthy"
+    check "port 8190" 'http_get localhost:8190 | grep -q nginx'
+  solve: |
+    docker rm -f catalog
+    docker run -d --name catalog -p 8190:80 --health-cmd 'wget -qO- http://localhost/ || exit 1' --health-interval 5s nginx:1.28-alpine
+
+- id: docker-185
+  title: The health check that times out
+  difficulty: 3
+  kind: fix
+  tags: [healthcheck, timeouts]
+  scenario: |
+    **`reports-api`** (port **8191**) needs about **2 seconds** to answer its `/health`
+    endpoint (it checks the database). It flaps between *healthy* and *unhealthy*.
+
+    Recreate it from **`/lab/reports-api`** (rebuild `reports-api:1.0`) so the health
+    check gives the endpoint enough time — **5 seconds** timeout, 10s interval — and the
+    container becomes stably healthy. Fix it **in the Dockerfile**.
+  hints:
+    - "`HEALTHCHECK --timeout` defaults to 30s, but this Dockerfile sets 1s."
+  solution: |
+    ```dockerfile
+    HEALTHCHECK --interval=10s --timeout=5s --retries=3 CMD wget -qO- http://127.0.0.1:8000/health || exit 1
+    ```
+    ```bash
+    docker build -t reports-api:1.0 /lab/reports-api
+    docker rm -f reports-api && docker run -d --name reports-api -p 8191:8000 reports-api:1.0
+    ```
+  setup: |
+    D=/lab/reports-api; mkdir -p $D
+    cat > $D/app.py <<'EOF'
+    import time
+    from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
+    class H(BaseHTTPRequestHandler):
+        def do_GET(self):
+            if self.path == "/health":
+                time.sleep(2)
+            self.send_response(200); self.end_headers(); self.wfile.write(b"ok\n")
+        def log_message(self, *a): pass
+    ThreadingHTTPServer(("0.0.0.0", 8000), H).serve_forever()
+    EOF
+    printf 'FROM python:3.12-alpine\nCOPY app.py /app.py\nHEALTHCHECK --interval=3s --timeout=1s --retries=2 CMD wget -qO- http://127.0.0.1:8000/health || exit 1\nCMD ["python", "/app.py"]\n' > $D/Dockerfile
+    chown -R $(lab_user): $D
+    as_user "docker build -q -t reports-api:1.0 $D && docker run -d --name reports-api -p 8191:8000 reports-api:1.0" >/dev/null 2>&1
+  check: |
+    check_match "image health timeout is 5s" "$(docker image inspect -f '{{.Config.Healthcheck.Timeout}}' reports-api:1.0 2>/dev/null)" '^(5s|5000000000)$'
+    check "reports-api runs the rebuilt image" '[ "$(c_get reports-api "{{.Image}}")" = "$(docker image inspect -f "{{.Id}}" reports-api:1.0)" ]'
+    c_running reports-api && eventually 40 '[ "$(c_get reports-api "{{.State.Health.Status}}")" = healthy ]'
+    check_eq "healthy" "$(c_get reports-api '{{.State.Health.Status}}')" "healthy"
+  solve: |
+    sed -i 's/--interval=3s --timeout=1s --retries=2/--interval=10s --timeout=5s --retries=3/' /lab/reports-api/Dockerfile
+    docker build -t reports-api:1.0 /lab/reports-api
+    docker rm -f reports-api
+    docker run -d --name reports-api -p 8191:8000 reports-api:1.0
+
+- id: docker-186
+  title: Zombies in the container
+  difficulty: 3
+  kind: fix
+  tags: [pid1, zombies, init]
+  scenario: |
+    `docker exec spawner ps` shows a growing list of `[sh] <defunct>` processes. The app
+    starts short-lived child processes but its main process (PID 1) never reaps them.
+    Eventually the PID limit will be hit.
+
+    Recreate **`spawner`** (same image and command) so zombies get reaped
+    automatically. You can't change the app.
+  hints:
+    - "PID 1 is responsible for reaping orphaned children. A real init does that."
+  solution: |
+    ```bash
+    docker exec spawner ps | grep -c defunct
+    docker rm -f spawner
+    docker run -d --name spawner --init python:3.12-alpine python -c "$(cat <<'EOF' ... EOF)"
+    ```
+    (Take the exact command from `docker inspect spawner --format '{{json .Config.Cmd}}'`.)
+    With `--init`, `docker-init` is PID 1 and reaps zombies.
+  setup: |
+    docker run -d --name spawner python:3.12-alpine python -c "import os, time
+    while True:
+        pid = os.fork()
+        if pid == 0:
+            if os.fork() == 0:
+                time.sleep(0.2)
+                os._exit(0)
+            os._exit(0)
+        os.waitpid(pid, 0)
+        time.sleep(0.5)" >/dev/null
+    docker inspect -f '{{json .Config.Cmd}}' spawner > $KL_STATE/answer
+    sleep 4
+  check: |
+    check "spawner is running" 'c_running spawner'
+    check_eq "same command" "$(c_get spawner '{{json .Config.Cmd}}')" "$(cat $KL_STATE/answer)"
+    sleep 4
+    z=$(docker exec spawner ps -o stat 2>/dev/null | grep -c '^Z')
+    check "no zombies accumulate ($z)" "[ $z -le 2 ]"
+  solve: |
+    cmd=$(docker inspect -f '{{index .Config.Cmd 2}}' spawner)
+    docker rm -f spawner
+    docker run -d --name spawner --init python:3.12-alpine python -c "$cmd"
+
+- id: docker-187
+  title: /dev/shm is too small
+  difficulty: 3
+  kind: fix
+  tags: [shm, resources]
+  scenario: |
+    **`renderer`** (a headless-browser style workload) crashes with *No space left on
+    device* when writing **100 MB** to shared memory (`/dev/shm`). Docker gives containers
+    only **64 MB** of shm by default.
+
+    Recreate **`renderer`** (same image and command) with **256 MB** of shared memory.
+  hints:
+    - "`--shm-size`"
+  solution: |
+    ```bash
+    docker rm -f renderer
+    docker run -d --name renderer --shm-size 256m busybox:1.37 sh -c 'dd if=/dev/zero of=/dev/shm/frame bs=1M count=100 && echo rendered && sleep infinity'
+    docker logs renderer
+    ```
+  setup: |
+    docker run -d --name renderer busybox:1.37 sh -c 'dd if=/dev/zero of=/dev/shm/frame bs=1M count=100 && echo rendered && sleep infinity' >/dev/null
+  check: |
+    check_eq "shm size" "$(c_get renderer '{{.HostConfig.ShmSize}}')" "268435456"
+    check "renderer is running and rendered" 'c_running renderer && docker logs renderer 2>&1 | grep -q rendered'
+  solve: |
+    docker rm -f renderer
+    docker run -d --name renderer --shm-size 256m busybox:1.37 sh -c 'dd if=/dev/zero of=/dev/shm/frame bs=1M count=100 && echo rendered && sleep infinity'
+
+- id: docker-188
+  title: Something on the host already uses the port
+  difficulty: 3
+  kind: fix
+  tags: [ports, systemd, troubleshooting]
+  scenario: |
+    You need to run **`wiki`** (`nginx:1.28-alpine`) on port **8192**, but docker says the
+    address is already in use — and **no container** is using it.
+
+    Find what on the **host** listens on 8192, stop it **permanently** (it's an obsolete
+    service and must not come back after a reboot), and run `wiki` on 8192.
+  hints:
+    - "`sudo ss -ltnp 'sport = :8192'` shows the process."
+    - "`systemctl status <pid>` tells you which unit started it."
+  solution: |
+    ```bash
+    sudo ss -ltnp 'sport = :8192'
+    systemctl status $(sudo ss -ltnpH 'sport = :8192' | grep -o 'pid=[0-9]*' | cut -d= -f2)
+    sudo systemctl disable --now legacy-wiki.service
+    docker run -d --name wiki -p 8192:80 nginx:1.28-alpine
+    ```
+  setup: |
+    cat > /etc/systemd/system/legacy-wiki.service <<'EOF'
+    [Unit]
+    Description=Legacy wiki (python)
+    [Service]
+    ExecStart=/usr/bin/python3 -m http.server 8192 --directory /tmp
+    Restart=always
+    [Install]
+    WantedBy=multi-user.target
+    EOF
+    systemctl daemon-reload
+    systemctl enable --now legacy-wiki.service >/dev/null 2>&1
+    on_reset 'systemctl disable --now legacy-wiki.service; rm -f /etc/systemd/system/legacy-wiki.service; systemctl daemon-reload'
+    sleep 1
+  check: |
+    check_not "legacy-wiki is not running" 'systemctl is-active -q legacy-wiki'
+    check_not "legacy-wiki is not enabled" 'systemctl is-enabled -q legacy-wiki'
+    check "wiki runs on 8192" 'c_running wiki && http_get localhost:8192 | grep -q nginx'
+  solve: |
+    sudo systemctl disable --now legacy-wiki.service
+    docker run -d --name wiki -p 8192:80 nginx:1.28-alpine
+
+- id: docker-189
+  title: Reach a service on the docker host
+  difficulty: 3
+  kind: build
+  tags: [networking, host-gateway]
+  scenario: |
+    A license server runs **directly on the docker host** on port **9999** (not in a
+    container). The **`app`** container must reach it by the name
+    **`host.docker.internal`** — like on Docker Desktop, which Linux doesn't do
+    automatically.
+
+    Run **`app`** (`busybox:1.37`, `sleep infinity`) so that
+    `wget -qO- http://host.docker.internal:9999/` works inside it.
+  hints:
+    - "`--add-host host.docker.internal:host-gateway` — `host-gateway` is a magic value resolved by docker."
+  solution: |
+    ```bash
+    docker run -d --name app --add-host host.docker.internal:host-gateway busybox:1.37 sleep infinity
+    docker exec app wget -qO- http://host.docker.internal:9999/
+    ```
+  setup: |
+    mkdir -p /tmp/kl-lic && echo "LICENSE OK" > /tmp/kl-lic/index.html
+    systemd-run --unit kl-license --quiet /usr/bin/python3 -m http.server 9999 --bind 0.0.0.0 --directory /tmp/kl-lic
+    on_reset 'systemctl stop kl-license; rm -rf /tmp/kl-lic'
+    sleep 1
+  check: |
+    check "app is running" 'c_running app'
+    check "app reaches host.docker.internal:9999" 'docker exec app wget -qO- -T 3 http://host.docker.internal:9999/ | grep -q "LICENSE OK"'
+  solve: |
+    docker run -d --name app --add-host host.docker.internal:host-gateway busybox:1.37 sleep infinity
+
+- id: docker-190
+  title: Which value wins?
+  difficulty: 3
+  kind: fix
+  tags: [compose, env, precedence]
+  scenario: |
+    In **`/lab/precedence`**, **`api`** must run with **`LOG_LEVEL=debug`**. The developer
+    set it in `.env`, but the container still shows `warn`.
+
+    Find out where `warn` comes from and fix the project so `LOG_LEVEL` is `debug`,
+    **without** deleting `api.env` (it holds other settings the service needs).
+  hints:
+    - "`.env` is only for **substitution** in the compose file; `env_file:` sets container variables; `environment:` beats `env_file:`."
+    - "`docker compose config` shows the final environment."
+  solution: |
+    ```bash
+    cd /lab/precedence
+    docker compose config | grep -A5 environment
+    # compose.yaml: environment: LOG_LEVEL: warn  (hard-coded, overrides api.env)
+    # change it to: LOG_LEVEL: ${LOG_LEVEL:-info}   (then .env's LOG_LEVEL=debug applies)
+    docker compose up -d
+    ```
+  setup: |
+    D=/lab/precedence; mkdir -p $D
+    echo "LOG_LEVEL=debug" > $D/.env
+    printf 'DB_HOST=db\nLOG_LEVEL=error\nREGION=eu\n' > $D/api.env
+    printf 'services:\n  api:\n    image: busybox:1.37\n    command: sleep infinity\n    env_file: api.env\n    environment:\n      LOG_LEVEL: warn\n' > $D/compose.yaml
+    chown -R $(lab_user): $D
+    as_user "cd $D && docker compose up -d" >/dev/null 2>&1
+  check: |
+    check "api.env still exists" 'test -f /lab/precedence/api.env'
+    check_eq "LOG_LEVEL in the container" "$(cc_exec precedence api printenv LOG_LEVEL 2>/dev/null)" "debug"
+    check_eq "DB_HOST from api.env" "$(cc_exec precedence api printenv DB_HOST 2>/dev/null)" "db"
+  solve: |
+    cd /lab/precedence
+    sed -i 's/LOG_LEVEL: warn/LOG_LEVEL: ${LOG_LEVEL:-info}/' compose.yaml
+    docker compose up -d
+
+- id: docker-191
+  title: The config directory that appeared from nowhere
+  difficulty: 3
+  kind: fix
+  tags: [bind-mount, gotcha]
+  scenario: |
+    **`notifier`** (`busybox:1.37`) should read its rules from **`/lab/notifier/config`**
+    (bind-mounted at `/etc/notifier`). It starts, but logs `no rules found`. You notice a
+    new, **root-owned, empty** directory on the host that nobody created on purpose.
+
+    Fix the container so it reads the real rules, and remove the stray directory.
+  hints:
+    - "`docker inspect notifier --format '{{json .Mounts}}'` — look at the `Source`."
+    - "If a bind-mount source doesn't exist, docker silently creates it as an empty root-owned directory."
+  solution: |
+    ```bash
+    docker inspect notifier --format '{{range .Mounts}}{{.Source}}{{end}}'   # /lab/notifier/confg
+    docker rm -f notifier
+    sudo rmdir /lab/notifier/confg
+    docker run -d --name notifier -v /lab/notifier/config:/etc/notifier:ro busybox:1.37 \
+      sh -c 'if ls /etc/notifier/*.rule >/dev/null 2>&1; then echo "loaded $(ls /etc/notifier/*.rule | wc -l) rules"; else echo "no rules found"; fi; sleep infinity'
+    ```
+    `--mount type=bind,src=...` refuses to start when the source is missing — safer than `-v`.
+  setup: |
+    mkdir -p /lab/notifier/config
+    echo "page oncall on 5xx" > /lab/notifier/config/errors.rule
+    echo "mail on deploy" > /lab/notifier/config/deploys.rule
+    chown -R $(lab_user): /lab/notifier
+    docker run -d --name notifier -v /lab/notifier/confg:/etc/notifier:ro busybox:1.37 sh -c 'if ls /etc/notifier/*.rule >/dev/null 2>&1; then echo "loaded $(ls /etc/notifier/*.rule | wc -l) rules"; else echo "no rules found"; fi; sleep infinity' >/dev/null
+  check: |
+    check "stray directory removed" '! test -e /lab/notifier/confg'
+    check "notifier is running" 'c_running notifier'
+    check "notifier loaded 2 rules" 'docker logs notifier 2>&1 | grep -q "loaded 2 rules"'
+  solve: |
+    docker rm -f notifier
+    sudo rmdir /lab/notifier/confg
+    docker run -d --name notifier -v /lab/notifier/config:/etc/notifier:ro busybox:1.37 sh -c 'if ls /etc/notifier/*.rule >/dev/null 2>&1; then echo "loaded $(ls /etc/notifier/*.rule | wc -l) rules"; else echo "no rules found"; fi; sleep infinity'
+
+- id: docker-192
+  title: Shell form swallows SIGTERM
+  difficulty: 3
+  kind: fix
+  tags: [dockerfile, signals, graceful-shutdown]
+  scenario: |
+    **`order-processor`** (built from **`/lab/order-processor`**) is supposed to finish
+    its current order and log **`graceful shutdown`** when stopped. Instead, `docker stop`
+    hangs for 10 seconds and the process is killed — orders get lost.
+
+    The Python code handles `SIGTERM` correctly. Fix the **Dockerfile**, rebuild
+    `order-processor:1.0` and run it as **`order-processor`**.
+  hints:
+    - "`CMD python app.py` (shell form) runs `/bin/sh -c \"python app.py\"` — the shell is PID 1 and doesn't forward signals."
+    - "Use the exec (JSON array) form."
+  solution: |
+    ```dockerfile
+    CMD ["python", "-u", "app.py"]
+    ```
+    ```bash
+    docker build -t order-processor:1.0 /lab/order-processor
+    docker rm -f order-processor; docker run -d --name order-processor order-processor:1.0
+    time docker stop order-processor; docker logs order-processor | tail -1
+    ```
+  setup: |
+    D=/lab/order-processor; mkdir -p $D
+    cat > $D/app.py <<'EOF'
+    import signal, sys, time
+    def stop(sig, frame):
+        print("graceful shutdown: finished current order", flush=True)
+        sys.exit(0)
+    signal.signal(signal.SIGTERM, stop)
+    print("processing orders", flush=True)
+    while True:
+        time.sleep(1)
+    EOF
+    printf 'FROM python:3.12-alpine\nWORKDIR /app\nCOPY app.py .\nCMD python -u app.py\n' > $D/Dockerfile
+    chown -R $(lab_user): $D
+  check: |
+    check "CMD uses exec form" 'grep -qE "^CMD \[" /lab/order-processor/Dockerfile'
+    check "order-processor is running" 'c_running order-processor'
+    t0=$(date +%s); docker stop order-processor >/dev/null 2>&1; t1=$(date +%s)
+    check "stops in under 3s ($((t1-t0))s)" "[ $((t1-t0)) -lt 3 ]"
+    check "logged graceful shutdown" 'docker logs order-processor 2>&1 | grep -q "graceful shutdown"'
+    docker start order-processor >/dev/null 2>&1
+  solve: |
+    sed -i 's/^CMD python -u app.py$/CMD ["python", "-u", "app.py"]/' /lab/order-processor/Dockerfile
+    docker build -t order-processor:1.0 /lab/order-processor
+    docker rm -f order-processor 2>/dev/null || true
+    docker run -d --name order-processor order-processor:1.0
+
+- id: docker-193
+  title: The build that never uses the cache
+  difficulty: 3
+  kind: fix
+  tags: [build-cache, arg]
+  scenario: |
+    CI passes a fresh **`BUILD_DATE`** build argument on every build of **`/lab/indexer`**
+    — and every build re-runs the slow dependency step, even though nothing else changed.
+
+    Fix the **Dockerfile** so that changing `BUILD_DATE` only invalidates the cheap
+    last steps. The image must still carry the label
+    `org.opencontainers.image.created=<BUILD_DATE>`.
+  hints:
+    - "An `ARG` invalidates the cache of every `RUN` that follows it (the value becomes part of the step's environment)."
+    - "Declare `ARG BUILD_DATE` as late as possible — right before the `LABEL`."
+  solution: |
+    ```dockerfile
+    FROM alpine:3.22
+    COPY deps.txt /deps.txt
+    RUN sh -c 'for d in $(cat /deps.txt); do echo "compiling $d"; sleep 3; done'
+    COPY indexer.sh /indexer.sh
+    ARG BUILD_DATE
+    LABEL org.opencontainers.image.created=$BUILD_DATE
+    CMD ["sh", "/indexer.sh"]
+    ```
+  setup: |
+    D=/lab/indexer; mkdir -p $D
+    printf 'lucene\nicu\n' > $D/deps.txt
+    echo 'echo indexing' > $D/indexer.sh
+    cat > $D/Dockerfile <<'EOF'
+    FROM alpine:3.22
+    ARG BUILD_DATE
+    COPY deps.txt /deps.txt
+    RUN sh -c 'for d in $(cat /deps.txt); do echo "compiling $d"; sleep 3; done'
+    COPY indexer.sh /indexer.sh
+    LABEL org.opencontainers.image.created=$BUILD_DATE
+    CMD ["sh", "/indexer.sh"]
+    EOF
+    chown -R $(lab_user): $D
+  check: |
+    docker build -q --build-arg BUILD_DATE=2026-01-01T00:00:00Z -t kl-idx /lab/indexer >/dev/null 2>&1
+    t0=$(date +%s); docker build -q --build-arg BUILD_DATE=2026-02-02T00:00:00Z -t kl-idx /lab/indexer >/dev/null 2>&1; rc=$?; t1=$(date +%s)
+    check "builds" "[ $rc -eq 0 ]"
+    check "a new BUILD_DATE rebuilds quickly ($((t1-t0))s)" "[ $((t1-t0)) -lt 4 ]"
+    check_eq "label" "$(docker image inspect -f '{{index .Config.Labels "org.opencontainers.image.created"}}' kl-idx 2>/dev/null)" "2026-02-02T00:00:00Z"
+    docker rmi -f kl-idx >/dev/null 2>&1
+  solve: |
+    cat > /lab/indexer/Dockerfile <<'EOF'
+    FROM alpine:3.22
+    COPY deps.txt /deps.txt
+    RUN sh -c 'for d in $(cat /deps.txt); do echo "compiling $d"; sleep 3; done'
+    COPY indexer.sh /indexer.sh
+    ARG BUILD_DATE
+    LABEL org.opencontainers.image.created=$BUILD_DATE
+    CMD ["sh", "/indexer.sh"]
+    EOF
+
+- id: docker-194
+  title: 413 Request Entity Too Large
+  difficulty: 3
+  kind: fix
+  tags: [nginx, reverse-proxy, uploads]
+  scenario: |
+    Users can't upload files bigger than about 1 MB through **`upload-gw`** (nginx, port
+    **8193**, config in **`/lab/upload-gw/default.conf`**), which proxies to the `uploader`
+    backend. They get **413**.
+
+    Allow uploads up to **50 MB** and apply the change without recreating the container.
+  hints:
+    - "nginx's `client_max_body_size` defaults to 1m."
+  solution: |
+    ```nginx
+    server {
+        listen 80;
+        client_max_body_size 50m;
+        ...
+    }
+    ```
+    ```bash
+    docker exec upload-gw nginx -t && docker exec upload-gw nginx -s reload
+    ```
+  setup: |
+    mkdir -p /lab/upload-gw
+    printf 'server {\n    listen 80;\n    location / { proxy_pass http://uploader:80; }\n}\n' > /lab/upload-gw/default.conf
+    chown -R $(lab_user): /lab/upload-gw
+    docker network create uploads >/dev/null
+    cat > /lab/upload-gw/receiver.py <<'PY'
+    from http.server import BaseHTTPRequestHandler, HTTPServer
+    class H(BaseHTTPRequestHandler):
+        def do_POST(self):
+            n = int(self.headers.get("Content-Length", 0)); left = n
+            while left > 0:
+                left -= len(self.rfile.read(min(left, 1 << 20)))
+            self.send_response(200); self.end_headers(); self.wfile.write(f"received {n} bytes\n".encode())
+    HTTPServer(("0.0.0.0", 80), H).serve_forever()
+    PY
+    docker run -d --name uploader --network uploads -v /lab/upload-gw/receiver.py:/receiver.py:ro python:3.12-alpine python /receiver.py >/dev/null
+    mkdir -p /lab/upload-gw/conf.d && mv /lab/upload-gw/default.conf /lab/upload-gw/conf.d/default.conf
+    chown -R $(lab_user): /lab/upload-gw
+    docker run -d --name upload-gw --network uploads -p 8193:80 -v /lab/upload-gw/conf.d:/etc/nginx/conf.d:ro nginx:1.28-alpine >/dev/null
+    docker inspect -f '{{.Id}}' upload-gw > $KL_STATE/answer
+  check: |
+    check_eq "same container" "$(c_get upload-gw '{{.Id}}')" "$(cat $KL_STATE/answer)"
+    sleep 1
+    head -c 10M /dev/urandom > /tmp/kl-10m.bin
+    check_eq "10 MB upload" "$(curl -s -o /dev/null -w '%{http_code}' -X POST --data-binary @/tmp/kl-10m.bin localhost:8193/upload)" "200"
+    head -c 60M /dev/urandom > /tmp/kl-60m.bin
+    check_eq "60 MB upload is still rejected" "$(curl -s -o /dev/null -w '%{http_code}' -X POST --data-binary @/tmp/kl-60m.bin localhost:8193/upload)" "413"
+    rm -f /tmp/kl-10m.bin /tmp/kl-60m.bin
+  solve: |
+    sed -i 's/    listen 80;/    listen 80;\n    client_max_body_size 50m;/' /lab/upload-gw/conf.d/default.conf
+    docker exec upload-gw nginx -t
+    docker exec upload-gw nginx -s reload
+
+- id: docker-195
+  title: Two projects called "app"
+  difficulty: 4
+  kind: fix
+  tags: [compose, project-name, gotcha]
+  scenario: |
+    Two teams deploy from **`/lab/team-a/app`** and **`/lab/team-b/app`**. Every time team B
+    runs `docker compose up -d`, team A's **`web`** container gets **replaced** by team B's
+    — and vice versa.
+
+    Fix both projects so they can run side by side: team A's project must be called
+    **`team-a`** and team B's **`team-b`**, set **inside each compose file** (so a plain
+    `docker compose up -d` does the right thing). Bring both up: team A on port **8194**,
+    team B on **8195**.
+  hints:
+    - "The default project name is the directory name — both are `app`."
+    - "Top-level `name:` in the compose file sets the project name."
+  solution: |
+    ```yaml
+    # /lab/team-a/app/compose.yaml
+    name: team-a
+    services:
+      web: ...
+    ```
+    ```bash
+    cd /lab/team-a/app && docker compose -p app down   # clean up the shared old project
+    docker compose up -d
+    cd /lab/team-b/app && docker compose up -d
+    ```
+  setup: |
+    for t in a b; do
+      D=/lab/team-$t/app; mkdir -p $D
+      port=$([ $t = a ] && echo 8194 || echo 8195)
+      printf 'services:\n  web:\n    image: traefik/whoami:v1.10\n    environment: {WHOAMI_NAME: team-%s}\n    ports: ["%s:80"]\n' "$t" "$port" > $D/compose.yaml
+    done
+    chown -R $(lab_user): /lab
+    as_user "cd /lab/team-a/app && docker compose up -d && cd /lab/team-b/app && docker compose up -d" >/dev/null 2>&1
+  check: |
+    check_eq "team-a name in compose.yaml" "$(cd /lab/team-a/app && docker compose config --format json 2>/dev/null | jq -r .name)" "team-a"
+    check_eq "team-b name in compose.yaml" "$(cd /lab/team-b/app && docker compose config --format json 2>/dev/null | jq -r .name)" "team-b"
+    check "team A serves on 8194" 'http_get localhost:8194 | grep -q "Name: team-a"'
+    check "team B serves on 8195" 'http_get localhost:8195 | grep -q "Name: team-b"'
+    check "no leftover project 'app'" '[ -z "$(docker ps -aq --filter label=com.docker.compose.project=app)" ]'
+  solve: |
+    cd /lab/team-a/app && docker compose -p app down
+    sed -i '1i name: team-a' /lab/team-a/app/compose.yaml
+    sed -i '1i name: team-b' /lab/team-b/app/compose.yaml
+    cd /lab/team-a/app && docker compose up -d
+    cd /lab/team-b/app && docker compose up -d
+
+- id: docker-196
+  title: The app that's slow only in production
+  difficulty: 3
+  kind: fix
+  tags: [resources, cpu, throttling]
+  scenario: |
+    **`pricing-engine`** (port **8196**) answers in ~10 ms on developers' laptops but takes
+    **seconds** on this host. The hardware is the same and nothing else is running.
+
+    Find the cause and fix it **without recreating** the container, so that a request to
+    `http://localhost:8196/quote` completes in **under 1 second**.
+  hints:
+    - "`docker stats pricing-engine` — look at CPU %."
+    - "`docker inspect pricing-engine --format '{{.HostConfig.NanoCpus}}'`"
+  solution: |
+    ```bash
+    docker inspect pricing-engine --format '{{.HostConfig.NanoCpus}}'    # 20000000 = 0.02 CPU
+    docker update --cpus 1 pricing-engine
+    time curl -s localhost:8196/quote
+    ```
+    Someone typed `--cpus 0.02` instead of `--cpus 2`. CFS throttling makes the process
+    sleep most of each 100 ms period.
+  setup: |
+    D=/lab/pricing; mkdir -p $D
+    cat > $D/app.py <<'EOF'
+    from http.server import BaseHTTPRequestHandler, HTTPServer
+    class H(BaseHTTPRequestHandler):
+        def do_GET(self):
+            x = 0
+            for i in range(3000000):
+                x += i * i
+            self.send_response(200); self.end_headers(); self.wfile.write(b"quote: 42.00\n")
+        def log_message(self, *a): pass
+    HTTPServer(("0.0.0.0", 8000), H).serve_forever()
+    EOF
+    chown -R $(lab_user): $D
+    docker run -d --name pricing-engine --cpus 0.02 -p 8196:8000 -v $D:/app:ro python:3.12-alpine python /app/app.py >/dev/null
+    docker inspect -f '{{.Id}}' pricing-engine > $KL_STATE/answer
+    sleep 3
+  check: |
+    check_eq "same container" "$(c_get pricing-engine '{{.Id}}')" "$(cat $KL_STATE/answer)"
+    eventually 30 '[ "$(curl -s -o /dev/null -m 25 -w "%{http_code}" localhost:8196/quote)" = 200 ]'
+    r=$(curl -s -o /dev/null -m 20 -w '%{http_code} %{time_total}' localhost:8196/quote); t=${r#* }
+    check "a quote returns 200 in less than 1s ($r)" "[ '${r% *}' = 200 ] && awk 'BEGIN{exit !($t < 1)}'"
+  solve: |
+    docker update --cpus 1 pricing-engine
+
+- id: docker-197
+  title: Works on my machine
+  difficulty: 3
+  kind: fix
+  tags: [dockerignore, config, build-context]
+  scenario: |
+    The **`geo-api`** image built from **`/lab/geo-api`** tries to connect to
+    **`localhost:5432`** in production, although the production config clearly says
+    `db.prod.internal`. On the developer's laptop everything works.
+
+    Find out why and fix the **build** (don't delete the developer's local file — they
+    need it). Rebuild **`geo-api:1.0`**; `docker run --rm geo-api:1.0` must print
+    `connecting to db.prod.internal:5432`.
+  hints:
+    - "`docker run --rm geo-api:1.0 ls -la /app` — which config files ended up in the image?"
+    - "Read `app.py`: which file wins?"
+  solution: |
+    ```bash
+    docker run --rm geo-api:1.0 ls /app      # config.json  config.local.json  app.py ...
+    echo "config.local.json" >> /lab/geo-api/.dockerignore
+    docker build -t geo-api:1.0 /lab/geo-api
+    ```
+    The app prefers `config.local.json` when present; `COPY . .` shipped the developer's
+    local override into the image.
+  setup: |
+    D=/lab/geo-api; mkdir -p $D
+    echo '{"db_host": "db.prod.internal", "db_port": 5432}' > $D/config.json
+    echo '{"db_host": "localhost", "db_port": 5432}' > $D/config.local.json
+    cat > $D/app.py <<'EOF'
+    import json, os
+    path = "config.local.json" if os.path.exists("config.local.json") else "config.json"
+    cfg = json.load(open(path))
+    print(f"connecting to {cfg['db_host']}:{cfg['db_port']}")
+    EOF
+    printf 'FROM python:3.12-alpine\nWORKDIR /app\nCOPY . .\nCMD ["python", "app.py"]\n' > $D/Dockerfile
+    chown -R $(lab_user): $D
+    as_user "docker build -q -t geo-api:1.0 $D" >/dev/null
+  check: |
+    check "config.local.json still exists on disk" 'test -f /lab/geo-api/config.local.json'
+    check_eq "geo-api:1.0 output" "$(docker run --rm geo-api:1.0 2>/dev/null)" "connecting to db.prod.internal:5432"
+  solve: |
+    echo "config.local.json" >> /lab/geo-api/.dockerignore
+    docker build -t geo-api:1.0 /lab/geo-api
+
+- id: docker-198
+  title: No logs, no clue
+  difficulty: 3
+  kind: fix
+  tags: [logging, troubleshooting]
+  scenario: |
+    **`ingest`** keeps crashing and restarting, but `docker logs ingest` says *configured
+    logging driver does not support reading*. You have no idea why it crashes.
+
+    1. Recreate **`ingest`** (same image, command and restart policy) with the default
+       **json-file** logging so you can read its output.
+    2. Find the error code it prints before crashing (format `ERR-XXXX`) and write it to
+       **`/lab/ingest-error.txt`**.
+  hints:
+    - "`docker inspect ingest --format '{{.HostConfig.LogConfig.Type}}'` → `none`."
+  solution: |
+    ```bash
+    docker inspect ingest --format '{{json .Config.Cmd}} {{.HostConfig.RestartPolicy.Name}}'
+    docker rm -f ingest
+    docker run -d --name ingest --restart always busybox:1.37 sh -c '...same command...'
+    sleep 5; docker logs ingest | grep -o 'ERR-[0-9]*' | head -1 > /lab/ingest-error.txt
+    ```
+  setup: |
+    code="ERR-$((RANDOM % 9000 + 1000))"; echo "$code" > $KL_STATE/answer
+    docker run -d --name ingest --restart always --log-driver none busybox:1.37 sh -c "echo starting ingest; sleep 1; echo 'fatal: upstream rejected batch ($code)'; exit 1" >/dev/null
+    docker inspect -f '{{json .Config.Cmd}}' ingest >> $KL_STATE/answer
+  check: |
+    check_eq "log driver" "$(c_get ingest '{{.HostConfig.LogConfig.Type}}')" "json-file"
+    check_eq "same command" "$(c_get ingest '{{json .Config.Cmd}}')" "$(sed -n 2p $KL_STATE/answer)"
+    check_eq "restart policy" "$(c_get ingest '{{.HostConfig.RestartPolicy.Name}}')" "always"
+    check_eq "error code" "$(tr -d '[:space:]' < /lab/ingest-error.txt 2>/dev/null)" "$(head -1 $KL_STATE/answer)"
+  solve: |
+    cmd=$(docker inspect -f '{{index .Config.Cmd 2}}' ingest)
+    docker rm -f ingest
+    docker run -d --name ingest --restart always busybox:1.37 sh -c "$cmd"
+    sleep 4
+    docker logs ingest 2>&1 | grep -o 'ERR-[0-9]*' | head -1 > /lab/ingest-error.txt
+
+- id: docker-199
+  title: Restart loop hides a missing file
+  difficulty: 3
+  kind: fix
+  tags: [troubleshooting, config, restart-loop]
+  scenario: |
+    **`gateway`** (nginx, port **8197**, restart `always`) has restarted hundreds of
+    times. Its TLS configuration in **`/lab/gw/conf.d/tls.conf`** expects the certificate
+    files to be mounted at **`/etc/nginx/certs`** — they are in **`/lab/gw/certs`** on the
+    host.
+
+    Get **`gateway`** stable: HTTPS on **8443**, the plain-HTTP port **8197** still
+    serving the site. Don't change the nginx config files.
+  hints:
+    - "`docker logs gateway | tail` — nginx tells you which file it can't open."
+    - "`docker inspect gateway --format '{{json .Mounts}}'`"
+  solution: |
+    ```bash
+    docker logs --tail 3 gateway   # cannot load certificate "/etc/nginx/certs/gw.crt"
+    docker rm -f gateway
+    docker run -d --name gateway --restart always -p 8197:80 -p 8443:443 \
+      -v /lab/gw/conf.d:/etc/nginx/conf.d:ro -v /lab/gw/certs:/etc/nginx/certs:ro nginx:1.28-alpine
+    ```
+  setup: |
+    mkdir -p /lab/gw/conf.d /lab/gw/certs
+    openssl req -x509 -newkey rsa:2048 -nodes -days 30 -subj "/CN=gw.lab" -keyout /lab/gw/certs/gw.key -out /lab/gw/certs/gw.crt 2>/dev/null
+    chmod 644 /lab/gw/certs/gw.key
+    printf 'server {\n  listen 80;\n  root /usr/share/nginx/html;\n}\n' > /lab/gw/conf.d/http.conf
+    printf 'server {\n  listen 443 ssl;\n  ssl_certificate /etc/nginx/certs/gw.crt;\n  ssl_certificate_key /etc/nginx/certs/gw.key;\n  root /usr/share/nginx/html;\n}\n' > /lab/gw/conf.d/tls.conf
+    chown -R $(lab_user): /lab/gw
+    sha256sum /lab/gw/conf.d/*.conf > $KL_STATE/answer
+    docker run -d --name gateway --restart always -p 8197:80 -p 8443:443 -v /lab/gw/conf.d:/etc/nginx/conf.d:ro nginx:1.28-alpine >/dev/null
+  check: |
+    check "config files unchanged" 'sha256sum -c --quiet $KL_STATE/answer'
+    check "gateway is running" 'c_running gateway'
+    r1=$(c_get gateway '{{.RestartCount}}'); sleep 4; r2=$(c_get gateway '{{.RestartCount}}')
+    check "gateway is stable (restarts $r1 → $r2)" "[ '$r1' = '$r2' ]"
+    check "HTTPS on 8443" 'curl -fsk https://localhost:8443/ | grep -q nginx'
+    check "HTTP on 8197" 'http_get localhost:8197 | grep -q nginx'
+  solve: |
+    docker rm -f gateway
+    docker run -d --name gateway --restart always -p 8197:80 -p 8443:443 -v /lab/gw/conf.d:/etc/nginx/conf.d:ro -v /lab/gw/certs:/etc/nginx/certs:ro nginx:1.28-alpine
+
+- id: docker-200
+  title: "Final boss: Black Friday outage"
+  difficulty: 5
+  kind: fix
+  tags: [incident, compose, daemon, networking]
+  scenario: |
+    It's Black Friday and the shop (**`/lab/blackfriday`**, compose project
+    **`blackfriday`**) is down. You're the last line of defence. Requirements:
+
+    - `http://localhost:8198/` → storefront page (served by **`web`**, nginx)
+    - `http://localhost:8198/api/` → proxied to **`api`** (whoami)
+    - **`api`** reaches Redis **`cache`** (password from `./secrets/redis.pass`) — test:
+      `docker compose exec cache redis-cli -a "$(cat secrets/redis.pass)" ping` → PONG
+    - **`db`** (postgres) healthy, data on a named volume
+    - every container's logs rotate (max-size 10m)
+    - the docker daemon must be running with its existing config intent
+
+    Fix everything — daemon, compose file, whatever it takes.
+  hints:
+    - "Start from the bottom: is the daemon running (`systemctl status docker`)? Why not?"
+    - "Then `docker compose config`, `up -d`, `ps -a`, `logs` — one service at a time."
+    - "The nginx config in `./nginx/` is correct; check that compose mounts it where nginx reads it."
+  solution: |
+    ```bash
+    # 1) daemon: daemon.json has "log-opts": {"max-size": 10} (number) -> must be "10m"
+    echo '{"log-driver":"json-file","log-opts":{"max-size":"10m","max-file":"3"}}' | sudo tee /etc/docker/daemon.json
+    sudo systemctl reset-failed docker; sudo systemctl start docker
+    # 2) compose fixes:
+    #    - web mounts ./nginx/site.conf at /etc/nginx/site.conf  -> /etc/nginx/conf.d/default.conf
+    #    - web and api on different networks -> same default network
+    #    - cache: --requirepass reads REDIS_PASSWORD but env_file points to ./secret/redis.env -> ./secrets/redis.env
+    #    - db healthcheck uses user "admin" which doesn't exist -> postgres
+    #    - db volume declared as "dbdata" but service uses "db-data"
+    docker compose up -d --wait
+    ```
+  setup: |
+    D=/lab/blackfriday; mkdir -p $D/nginx $D/secrets
+    printf 'server {\n  listen 80;\n  resolver 127.0.0.11 valid=5s ipv6=off;\n  location /api/ { set $u http://api:80; proxy_pass $u; }\n  location / { return 200 "BLACK FRIDAY -70%%\\n"; }\n}\n' > $D/nginx/site.conf
+    pw=$(tr -dc a-z0-9 </dev/urandom | head -c12); echo -n "$pw" > $D/secrets/redis.pass
+    echo "REDIS_PASSWORD=$pw" > $D/secrets/redis.env
+    cat > $D/compose.yaml <<'EOF'
+    name: blackfriday
+    services:
+      web:
+        image: nginx:1.28-alpine
+        ports: ["8198:80"]
+        volumes: ["./nginx/site.conf:/etc/nginx/site.conf:ro"]
+        networks: [front]
+      api:
+        image: traefik/whoami:v1.10
+        networks: [back]
+      cache:
+        image: redis:7.4-alpine
+        env_file: ./secret/redis.env
+        command: ["sh", "-c", "exec redis-server --requirepass \"$$REDIS_PASSWORD\""]
+        networks: [back]
+      db:
+        image: postgres:16-alpine
+        environment: {POSTGRES_PASSWORD: bf}
+        volumes: ["db-data:/var/lib/postgresql/data"]
+        healthcheck:
+          test: ["CMD-SHELL", "pg_isready -U admin -d admin"]
+          interval: 2s
+          retries: 20
+        networks: [back]
+    networks:
+      front: {}
+      back: {}
+    volumes:
+      dbdata: {}
+    EOF
+    chown -R $(lab_user): $D
+    printf '{\n  "log-driver": "json-file",\n  "log-opts": {"max-size": 10, "max-file": "3"}\n}\n' > /etc/docker/daemon.json
+    systemctl restart docker >/dev/null 2>&1 || true
+  check: |
+    check "docker is running" 'systemctl is-active -q docker'
+    check_eq "daemon log max-size" "$(jq -r '."log-opts"."max-size"' /etc/docker/daemon.json 2>/dev/null)" "10m"
+    check "storefront on 8198" 'http_get localhost:8198/ | grep -q "BLACK FRIDAY"'
+    check "/api/ proxied to api" 'http_get localhost:8198/api/ | grep -q Hostname'
+    pw=$(cat /lab/blackfriday/secrets/redis.pass)
+    check "cache requires and accepts the password" "cc_exec blackfriday cache redis-cli ping 2>&1 | grep -q NOAUTH && cc_exec blackfriday cache redis-cli -a '$pw' --no-auth-warning ping | grep -q PONG"
+    check_eq "db healthy" "$(cc_get blackfriday db '{{.State.Health.Status}}')" "healthy"
+    check "db data on a named volume" '[ "$(cc_get blackfriday db "{{range .Mounts}}{{if eq .Destination \"/var/lib/postgresql/data\"}}{{.Type}}{{end}}{{end}}")" = volume ]'
+    for s in web api cache db; do check "$s logs rotate at 10m" "[ \"\$(cc_get blackfriday $s '{{index .HostConfig.LogConfig.Config \"max-size\"}}')\" = 10m ]"; done
+  solve: |
+    printf '{\n  "log-driver": "json-file",\n  "log-opts": {"max-size": "10m", "max-file": "3"}\n}\n' | sudo tee /etc/docker/daemon.json
+    sudo systemctl reset-failed docker docker.socket || true
+    sudo systemctl start docker
+    sleep 3
+    cd /lab/blackfriday
+    cat > compose.yaml <<'EOF'
+    name: blackfriday
+    services:
+      web:
+        image: nginx:1.28-alpine
+        ports: ["8198:80"]
+        volumes: ["./nginx/site.conf:/etc/nginx/conf.d/default.conf:ro"]
+        depends_on: [api]
+      api:
+        image: traefik/whoami:v1.10
+      cache:
+        image: redis:7.4-alpine
+        env_file: ./secrets/redis.env
+        command: ["sh", "-c", "exec redis-server --requirepass \"$$REDIS_PASSWORD\""]
+      db:
+        image: postgres:16-alpine
+        environment: {POSTGRES_PASSWORD: bf}
+        volumes: ["dbdata:/var/lib/postgresql/data"]
+        healthcheck:
+          test: ["CMD-SHELL", "pg_isready -U postgres"]
+          interval: 2s
+          retries: 20
+    volumes:
+      dbdata: {}
+    EOF
+    docker compose up -d --wait
