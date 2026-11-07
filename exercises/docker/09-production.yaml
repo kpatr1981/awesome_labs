@@ -1,0 +1,1089 @@
+track: docker
+module: Production patterns
+profile: docker
+order: 9
+exercises:
+
+- id: docker-161
+  title: Seed the database on first start
+  difficulty: 2
+  kind: build
+  tags: [postgres, initdb]
+  scenario: |
+    New developers should get a ready-to-use database. **`/lab/catalog-db/init/`**
+    contains `01-schema.sql` and `02-seed.sql`.
+
+    Run **`catalog-db`** (`postgres:16-alpine`, password `dev`) so that those scripts run
+    **automatically on first start**, creating and filling the `products` table.
+  hints:
+    - "The official image executes `*.sql`/`*.sh` files from `/docker-entrypoint-initdb.d/` when the data directory is empty."
+  solution: |
+    ```bash
+    docker run -d --name catalog-db -e POSTGRES_PASSWORD=dev \
+      -v /lab/catalog-db/init:/docker-entrypoint-initdb.d:ro postgres:16-alpine
+    docker exec catalog-db psql -U postgres -c 'select count(*) from products'
+    ```
+    Init scripts run only once — on an empty data directory.
+  setup: |
+    mkdir -p /lab/catalog-db/init
+    echo "create table products(id serial primary key, name text not null, price numeric(10,2));" > /lab/catalog-db/init/01-schema.sql
+    echo "insert into products(name, price) values ('kettle', 29.90), ('toaster', 39.00), ('espresso machine', 249.00);" > /lab/catalog-db/init/02-seed.sql
+    chown -R $(lab_user): /lab/catalog-db
+  check: |
+    check "catalog-db is running" 'c_running catalog-db'
+    c_running catalog-db && eventually 40 'docker exec catalog-db psql -U postgres -tAc "select count(*) from products" 2>/dev/null | grep -qx 3'
+    check_eq "products seeded" "$(docker exec catalog-db psql -U postgres -tAc 'select count(*) from products' 2>/dev/null)" "3"
+  solve: |
+    docker run -d --name catalog-db -e POSTGRES_PASSWORD=dev -v /lab/catalog-db/init:/docker-entrypoint-initdb.d:ro postgres:16-alpine
+
+- id: docker-162
+  title: Restore a dump into a running database
+  difficulty: 2
+  kind: build
+  tags: [postgres, restore]
+  scenario: |
+    Analytics sent a plain SQL dump: **`/lab/analytics.sql`**. Load it into the database
+    **`analytics`** of the running container **`analytics-db`** (user `postgres`). The
+    database already exists and is empty.
+  hints:
+    - "`docker exec -i` passes your stdin into the container: `docker exec -i analytics-db psql -U postgres -d analytics < /lab/analytics.sql`"
+  solution: |
+    ```bash
+    docker exec -i analytics-db psql -U postgres -d analytics < /lab/analytics.sql
+    docker exec analytics-db psql -U postgres -d analytics -c '\dt'
+    ```
+  setup: |
+    docker run -d --name analytics-db -e POSTGRES_PASSWORD=pw -e POSTGRES_DB=analytics postgres:16-alpine >/dev/null
+    n=$((RANDOM % 300 + 200)); echo $n > $KL_STATE/answer
+    {
+      echo "create table page_views(id serial primary key, url text, ts timestamptz default now());"
+      echo "insert into page_views(url) select '/product/' || g from generate_series(1,$n) g;"
+    } | lab_file /lab/analytics.sql
+    eventually 60 'docker exec analytics-db pg_isready -U postgres'
+  check: |
+    check_eq "page_views rows" "$(docker exec analytics-db psql -U postgres -d analytics -tAc 'select count(*) from page_views' 2>/dev/null)" "$(cat $KL_STATE/answer)"
+  solve: |
+    docker exec -i analytics-db psql -U postgres -d analytics < /lab/analytics.sql
+
+- id: docker-163
+  title: Redis with a real configuration file
+  difficulty: 2
+  kind: build
+  tags: [redis, config-file]
+  scenario: |
+    Ops wrote **`/lab/redis/redis.conf`**. Run **`sessions`** (`redis:7.4-alpine`, port
+    **6390** → 6379) that **uses that file**, mounted read-only at
+    `/usr/local/etc/redis/redis.conf`, with its data on the volume **`sessions-aof`**.
+  hints:
+    - "Redis doesn't read a config file unless you pass its path: `redis-server /usr/local/etc/redis/redis.conf`."
+  solution: |
+    ```bash
+    docker run -d --name sessions -p 6390:6379 \
+      -v /lab/redis/redis.conf:/usr/local/etc/redis/redis.conf:ro \
+      -v sessions-aof:/data redis:7.4-alpine redis-server /usr/local/etc/redis/redis.conf
+    ```
+  setup: |
+    mkdir -p /lab/redis
+    pw=$(tr -dc a-z0-9 </dev/urandom | head -c10)
+    printf 'appendonly yes\nmaxmemory 64mb\nmaxmemory-policy allkeys-lru\nrequirepass %s\n' "$pw" > /lab/redis/redis.conf
+    chown -R $(lab_user): /lab/redis
+  check: |
+    pw=$(sed -n 's/^requirepass //p' /lab/redis/redis.conf)
+    r() { docker exec sessions redis-cli -a "$pw" --no-auth-warning "$@" 2>/dev/null; }
+    check "sessions is running" 'c_running sessions'
+    check_eq "maxmemory-policy from the file" "$(r config get maxmemory-policy | tail -1)" "allkeys-lru"
+    check_eq "appendonly" "$(r config get appendonly | tail -1)" "yes"
+    check_eq "data volume" "$(c_get sessions '{{range .Mounts}}{{if eq .Destination "/data"}}{{.Name}}{{end}}{{end}}')" "sessions-aof"
+    check "published on 6390" 'docker port sessions 6379 | grep -q 6390'
+  solve: |
+    docker run -d --name sessions -p 6390:6379 -v /lab/redis/redis.conf:/usr/local/etc/redis/redis.conf:ro -v sessions-aof:/data redis:7.4-alpine redis-server /usr/local/etc/redis/redis.conf
+
+- id: docker-164
+  title: Password-protect the admin area
+  difficulty: 2
+  kind: build
+  tags: [nginx, basic-auth]
+  scenario: |
+    **`intranet`** (nginx, port **8180**) serves `/lab/intranet/site`. Everything under
+    **`/admin/`** must require HTTP basic auth: user **`ops`**, password **`letmein-2026`**.
+    The rest of the site stays public.
+
+    Finish **`/lab/intranet/default.conf`** and run the container (mount the config, the
+    site and your htpasswd file).
+  hints:
+    - "`htpasswd -c -B /lab/intranet/htpasswd ops`"
+    - "In the location: `auth_basic \"Admin\"; auth_basic_user_file /etc/nginx/htpasswd;`"
+  solution: |
+    ```bash
+    htpasswd -bcB /lab/intranet/htpasswd ops letmein-2026
+    ```
+    ```nginx
+    server {
+        listen 80;
+        root /usr/share/nginx/html;
+        location /admin/ {
+            auth_basic "Admin";
+            auth_basic_user_file /etc/nginx/htpasswd;
+        }
+    }
+    ```
+    ```bash
+    docker run -d --name intranet -p 8180:80 \
+      -v /lab/intranet/default.conf:/etc/nginx/conf.d/default.conf:ro \
+      -v /lab/intranet/htpasswd:/etc/nginx/htpasswd:ro \
+      -v /lab/intranet/site:/usr/share/nginx/html:ro nginx:1.28-alpine
+    ```
+  setup: |
+    D=/lab/intranet; mkdir -p $D/site/admin
+    echo '<h1>Intranet</h1>' > $D/site/index.html
+    echo '<h1>Admin console</h1>' > $D/site/admin/index.html
+    printf 'server {\n    listen 80;\n    root /usr/share/nginx/html;\n    # TODO: protect /admin/\n}\n' > $D/default.conf
+    chown -R $(lab_user): $D
+  check: |
+    check "intranet is running" 'c_running intranet'
+    check_eq "/ is public" "$(http_code localhost:8180/)" "200"
+    check_eq "/admin/ without credentials" "$(http_code localhost:8180/admin/)" "401"
+    check "/admin/ with ops:letmein-2026" 'curl -fs -u ops:letmein-2026 localhost:8180/admin/ | grep -q "Admin console"'
+    check_eq "wrong password rejected" "$(curl -s -o /dev/null -w '%{http_code}' -u ops:wrong localhost:8180/admin/)" "401"
+  solve: |
+    htpasswd -bcB /lab/intranet/htpasswd ops letmein-2026
+    printf 'server {\n    listen 80;\n    root /usr/share/nginx/html;\n    location /admin/ {\n        auth_basic "Admin";\n        auth_basic_user_file /etc/nginx/htpasswd;\n    }\n}\n' > /lab/intranet/default.conf
+    chmod 644 /lab/intranet/htpasswd
+    docker run -d --name intranet -p 8180:80 -v /lab/intranet/default.conf:/etc/nginx/conf.d/default.conf:ro -v /lab/intranet/htpasswd:/etc/nginx/htpasswd:ro -v /lab/intranet/site:/usr/share/nginx/html:ro nginx:1.28-alpine
+
+- id: docker-165
+  title: HTTPS with a self-signed certificate
+  difficulty: 3
+  kind: build
+  tags: [nginx, tls, certificates]
+  scenario: |
+    Run **`secure-web`** (`nginx:1.28-alpine`) that:
+
+    - serves **HTTPS** on host port **8443** with a self-signed certificate for
+      **`shop.lab.internal`** (put `server.crt`/`server.key` in **`/lab/tls`**)
+    - on host port **8181** (plain HTTP) **redirects** every request to
+      `https://shop.lab.internal:8443$request_uri` with a **301**
+
+    Write the nginx config to **`/lab/tls/default.conf`**.
+  hints:
+    - "`openssl req -x509 -newkey rsa:2048 -nodes -days 365 -subj '/CN=shop.lab.internal' -addext 'subjectAltName=DNS:shop.lab.internal' -keyout server.key -out server.crt`"
+    - "Two `server` blocks: `listen 443 ssl;` with `ssl_certificate`/`ssl_certificate_key`, and `listen 80;` with `return 301 ...`."
+  solution: |
+    ```nginx
+    server {
+        listen 80;
+        return 301 https://shop.lab.internal:8443$request_uri;
+    }
+    server {
+        listen 443 ssl;
+        server_name shop.lab.internal;
+        ssl_certificate     /etc/nginx/tls/server.crt;
+        ssl_certificate_key /etc/nginx/tls/server.key;
+        root /usr/share/nginx/html;
+    }
+    ```
+    ```bash
+    docker run -d --name secure-web -p 8181:80 -p 8443:443 -v /lab/tls:/etc/nginx/tls:ro \
+      -v /lab/tls/default.conf:/etc/nginx/conf.d/default.conf:ro nginx:1.28-alpine
+    curl -k --resolve shop.lab.internal:8443:127.0.0.1 https://shop.lab.internal:8443/
+    ```
+  setup: |
+    mkdir -p /lab/tls && chown $(lab_user): /lab/tls
+  check: |
+    check "secure-web is running" 'c_running secure-web'
+    check "HTTPS answers with the certificate for shop.lab.internal" 'echo | openssl s_client -connect 127.0.0.1:8443 -servername shop.lab.internal 2>/dev/null | openssl x509 -noout -ext subjectAltName 2>/dev/null | grep -q "DNS:shop.lab.internal"'
+    check "HTTPS serves the site" 'curl -fsk --resolve shop.lab.internal:8443:127.0.0.1 https://shop.lab.internal:8443/ | grep -q nginx'
+    check_eq "HTTP returns 301" "$(http_code localhost:8181/x?y=1)" "301"
+    check_eq "redirect target" "$(curl -s -o /dev/null -w '%{redirect_url}' localhost:8181/x?y=1)" "https://shop.lab.internal:8443/x?y=1"
+  solve: |
+    cd /lab/tls
+    openssl req -x509 -newkey rsa:2048 -nodes -days 365 -subj '/CN=shop.lab.internal' -addext 'subjectAltName=DNS:shop.lab.internal' -keyout server.key -out server.crt 2>/dev/null
+    chmod 644 server.key
+    cat > default.conf <<'EOF'
+    server {
+        listen 80;
+        return 301 https://shop.lab.internal:8443$request_uri;
+    }
+    server {
+        listen 443 ssl;
+        server_name shop.lab.internal;
+        ssl_certificate     /etc/nginx/tls/server.crt;
+        ssl_certificate_key /etc/nginx/tls/server.key;
+        root /usr/share/nginx/html;
+    }
+    EOF
+    docker run -d --name secure-web -p 8181:80 -p 8443:443 -v /lab/tls:/etc/nginx/tls:ro -v /lab/tls/default.conf:/etc/nginx/conf.d/default.conf:ro nginx:1.28-alpine
+
+- id: docker-166
+  title: Configuration through templates
+  difficulty: 3
+  kind: build
+  tags: [nginx, templates, envsubst]
+  scenario: |
+    The same nginx image must proxy to different backends per environment, configured
+    **only via environment variables**.
+
+    The official nginx image renders `/etc/nginx/templates/*.template` with `envsubst`
+    at start-up. Use **`/lab/proxy-tpl/default.conf.template`** (finish it so the
+    upstream comes from **`${BACKEND_URL}`**) and run **`env-proxy`** on network
+    **`tpl-net`**, port **8182** → 80, with `BACKEND_URL=http://backend-a:80`, in front
+    of a **`backend-a`** container (`traefik/whoami:v1.10`, also on `tpl-net`).
+  hints:
+    - "Mount the template directory at `/etc/nginx/templates`; the rendered file lands in `/etc/nginx/conf.d/default.conf`."
+    - "In the template: `proxy_pass ${BACKEND_URL};`"
+  solution: |
+    ```nginx
+    server {
+        listen 80;
+        location / {
+            proxy_pass ${BACKEND_URL};
+        }
+    }
+    ```
+    ```bash
+    docker network create tpl-net
+    docker run -d --name backend-a --network tpl-net traefik/whoami:v1.10
+    docker run -d --name env-proxy --network tpl-net -p 8182:80 -e BACKEND_URL=http://backend-a:80 \
+      -v /lab/proxy-tpl:/etc/nginx/templates:ro nginx:1.28-alpine
+    docker exec env-proxy cat /etc/nginx/conf.d/default.conf
+    ```
+  setup: |
+    mkdir -p /lab/proxy-tpl
+    printf 'server {\n    listen 80;\n    location / {\n        # TODO: proxy to the backend given in BACKEND_URL\n    }\n}\n' > /lab/proxy-tpl/default.conf.template
+    chown -R $(lab_user): /lab/proxy-tpl
+  check: |
+    check "template uses \${BACKEND_URL}" 'grep -q "\${BACKEND_URL}" /lab/proxy-tpl/default.conf.template'
+    check "rendered config contains the URL" 'docker exec env-proxy grep -q "http://backend-a:80" /etc/nginx/conf.d/default.conf'
+    check "8182 proxies to backend-a" 'http_get localhost:8182 | grep -q "Hostname: $(c_get backend-a "{{.Config.Hostname}}")"'
+  solve: |
+    printf 'server {\n    listen 80;\n    location / {\n        proxy_pass ${BACKEND_URL};\n    }\n}\n' > /lab/proxy-tpl/default.conf.template
+    docker network create tpl-net
+    docker run -d --name backend-a --network tpl-net traefik/whoami:v1.10
+    docker run -d --name env-proxy --network tpl-net -p 8182:80 -e BACKEND_URL=http://backend-a:80 -v /lab/proxy-tpl:/etc/nginx/templates:ro nginx:1.28-alpine
+
+- id: docker-167
+  title: Load balance three replicas with HAProxy
+  difficulty: 3
+  kind: build
+  tags: [haproxy, load-balancing, compose]
+  scenario: |
+    In **`/lab/lb`**, write a compose project:
+
+    - **`app`**: `traefik/whoami:v1.10`, **3 replicas**
+    - **`lb`**: `haproxy:3.0-alpine` on port **8183** → 80, round-robin over all app
+      replicas, using **`/lab/lb/haproxy.cfg`** (write it)
+
+    Requests through `localhost:8183` must be spread over the replicas.
+  hints:
+    - "HAProxy can discover all replicas through Docker's DNS: `resolvers docker` + `nameserver dns 127.0.0.11:53` and `server-template app 3 app:80 check resolvers docker init-addr none`."
+    - "Mount the file at `/usr/local/etc/haproxy/haproxy.cfg`."
+  solution: |
+    ```text
+    # haproxy.cfg
+    global
+      log stdout format raw local0
+    defaults
+      mode http
+      timeout connect 5s
+      timeout client 30s
+      timeout server 30s
+    resolvers docker
+      nameserver dns 127.0.0.11:53
+    frontend web
+      bind :80
+      default_backend apps
+    backend apps
+      balance roundrobin
+      server-template app 3 app:80 check resolvers docker init-addr none
+    ```
+    ```yaml
+    services:
+      app:
+        image: traefik/whoami:v1.10
+        deploy: {replicas: 3}
+      lb:
+        image: haproxy:3.0-alpine
+        ports: ["8183:80"]
+        volumes: ["./haproxy.cfg:/usr/local/etc/haproxy/haproxy.cfg:ro"]
+        depends_on: [app]
+    ```
+  setup: |
+    mkdir -p /lab/lb && chown $(lab_user): /lab/lb
+  check: |
+    check_eq "3 app replicas" "$(cc_count lb app)" "3"
+    check "lb is running" 'cc_running lb lb'
+    eventually 20 'http_get localhost:8183'
+    n=$(for i in $(seq 1 12); do http_get localhost:8183 | grep Hostname; done | sort -u | wc -l)
+    check_eq "requests reach all 3 replicas" "$n" "3"
+  solve: |
+    cd /lab/lb
+    cat > haproxy.cfg <<'EOF'
+    global
+      log stdout format raw local0
+    defaults
+      mode http
+      timeout connect 5s
+      timeout client 30s
+      timeout server 30s
+    resolvers docker
+      nameserver dns 127.0.0.11:53
+    frontend web
+      bind :80
+      default_backend apps
+    backend apps
+      balance roundrobin
+      server-template app 3 app:80 check resolvers docker init-addr none
+    EOF
+    cat > compose.yaml <<'EOF'
+    services:
+      app:
+        image: traefik/whoami:v1.10
+        deploy: {replicas: 3}
+      lb:
+        image: haproxy:3.0-alpine
+        ports: ["8183:80"]
+        volumes: ["./haproxy.cfg:/usr/local/etc/haproxy/haproxy.cfg:ro"]
+        depends_on: [app]
+    EOF
+    docker compose up -d
+    sleep 5
+
+- id: docker-168
+  title: Run migrations before the app
+  difficulty: 3
+  kind: build
+  tags: [compose, depends_on, init]
+  scenario: |
+    In **`/lab/release`**, the **`app`** service must only start after the one-shot
+    **`migrate`** service has **finished successfully** (and `migrate` itself must wait
+    for a healthy `db`).
+
+    Complete the compose file and start the stack.
+  hints:
+    - "`depends_on: {migrate: {condition: service_completed_successfully}}`"
+  solution: |
+    ```yaml
+      app:
+        image: traefik/whoami:v1.10
+        depends_on:
+          migrate:
+            condition: service_completed_successfully
+      migrate:
+        ...
+        depends_on:
+          db:
+            condition: service_healthy
+    ```
+  setup: |
+    D=/lab/release; mkdir -p $D
+    cat > $D/compose.yaml <<'EOF'
+    services:
+      db:
+        image: postgres:16-alpine
+        environment: {POSTGRES_PASSWORD: pw}
+        healthcheck:
+          test: ["CMD-SHELL", "pg_isready -U postgres"]
+          interval: 2s
+          retries: 30
+      migrate:
+        image: postgres:16-alpine
+        environment: {PGPASSWORD: pw}
+        command: ["psql", "-h", "db", "-U", "postgres", "-c", "create table if not exists release(v text); insert into release values ('2026.11');"]
+        # TODO: wait for a healthy db
+      app:
+        image: traefik/whoami:v1.10
+        ports: ["8184:80"]
+        # TODO: start only after migrate completed successfully
+    EOF
+    chown -R $(lab_user): $D
+  check: |
+    cfg=$(cd /lab/release && docker compose config --format json 2>/dev/null)
+    check_eq "migrate waits for healthy db" "$(jq -r '.services.migrate.depends_on.db.condition' <<<"$cfg")" "service_healthy"
+    check_eq "app waits for migrate" "$(jq -r '.services.app.depends_on.migrate.condition' <<<"$cfg")" "service_completed_successfully"
+    check "app is running" 'cc_running release app && http_get localhost:8184 | grep -q Hostname'
+    check "migration applied" 'cc_exec release db psql -U postgres -tAc "select v from release" | grep -qx 2026.11'
+  solve: |
+    cd /lab/release
+    cat > compose.yaml <<'EOF'
+    services:
+      db:
+        image: postgres:16-alpine
+        environment: {POSTGRES_PASSWORD: pw}
+        healthcheck:
+          test: ["CMD-SHELL", "pg_isready -U postgres"]
+          interval: 2s
+          retries: 30
+      migrate:
+        image: postgres:16-alpine
+        environment: {PGPASSWORD: pw}
+        command: ["psql", "-h", "db", "-U", "postgres", "-c", "create table if not exists release(v text); insert into release values ('2026.11');"]
+        depends_on:
+          db:
+            condition: service_healthy
+      app:
+        image: traefik/whoami:v1.10
+        ports: ["8184:80"]
+        depends_on:
+          migrate:
+            condition: service_completed_successfully
+    EOF
+    docker compose up -d
+
+- id: docker-169
+  title: A database backup job
+  difficulty: 3
+  kind: build
+  tags: [compose, backup, pg_dump]
+  scenario: |
+    Add a **`backup`** service to **`/lab/crm-stack/compose.yaml`** that, when run with
+    `docker compose run --rm backup`, writes a **pg_dump** of the database `crm` to
+    **`/lab/crm-stack/backups/crm.sql`** on the host. It must **not** start with a plain
+    `docker compose up`.
+
+    Then run it once.
+  hints:
+    - "Use the `postgres:16-alpine` image (it has `pg_dump`), bind-mount `./backups`, and put it in a profile."
+    - "`pg_dump -h db -U postgres crm > /backups/crm.sql` (needs a shell: `sh -c`)."
+  solution: |
+    ```yaml
+      backup:
+        image: postgres:16-alpine
+        profiles: [tools]
+        environment: {PGPASSWORD: crm}
+        volumes: ["./backups:/backups"]
+        command: ["sh", "-c", "pg_dump -h db -U postgres crm > /backups/crm.sql"]
+        depends_on: [db]
+    ```
+    ```bash
+    docker compose run --rm backup
+    ```
+  setup: |
+    D=/lab/crm-stack; mkdir -p $D/backups
+    printf 'services:\n  db:\n    image: postgres:16-alpine\n    environment:\n      POSTGRES_PASSWORD: crm\n      POSTGRES_DB: crm\n' > $D/compose.yaml
+    chown -R $(lab_user): $D
+    as_user "cd $D && docker compose up -d" >/dev/null 2>&1
+    eventually 60 'cc_exec crm-stack db pg_isready -U postgres'; sleep 2
+    cc_exec crm-stack db psql -q -U postgres -d crm -c "create table leads(id serial, email text); insert into leads(email) values ('kubelab-probe@example.com');" >/dev/null
+  check: |
+    cfg=$(cd /lab/crm-stack && docker compose config --format json 2>/dev/null)
+    check "backup is not in the default stack" '! jq -e ".services.backup" <<<"$cfg"'
+    check "dump file exists" 'test -s /lab/crm-stack/backups/crm.sql'
+    check "dump contains the leads table data" 'grep -q "kubelab-probe@example.com" /lab/crm-stack/backups/crm.sql'
+  solve: |
+    cd /lab/crm-stack
+    cat >> compose.yaml <<'EOF'
+      backup:
+        image: postgres:16-alpine
+        profiles: [tools]
+        environment: {PGPASSWORD: crm}
+        volumes: ["./backups:/backups"]
+        command: ["sh", "-c", "pg_dump -h db -U postgres crm > /backups/crm.sql"]
+        depends_on: [db]
+    EOF
+    docker compose run --rm backup
+
+- id: docker-170
+  title: Scheduled jobs in a container
+  difficulty: 3
+  kind: build
+  tags: [cron, busybox]
+  scenario: |
+    Run **`scheduler`** (`busybox:1.37`) that executes **`/lab/cron/cleanup.sh`** **every
+    minute** using busybox `crond` in the foreground, with the schedule from
+    **`/lab/cron/crontab`** (write it). The script appends to
+    `/var/log/jobs/cleanup.log`; mount **`/lab/cron/logs`** there so the log is visible on
+    the host.
+  hints:
+    - "busybox crond reads `/var/spool/cron/crontabs/<user>` and silently ignores files not owned by that user — so mount your crontab elsewhere and copy it into place when the container starts."
+    - "Crontab line: `* * * * * sh /jobs/cleanup.sh`; run crond with `crond -f -d 8` (foreground, log to stderr)."
+  solution: |
+    ```bash
+    echo '* * * * * sh /jobs/cleanup.sh' > /lab/cron/crontab
+    docker run -d --name scheduler \
+      -v /lab/cron/crontab:/config/crontab:ro \
+      -v /lab/cron/cleanup.sh:/jobs/cleanup.sh:ro \
+      -v /lab/cron/logs:/var/log/jobs \
+      busybox:1.37 sh -c 'mkdir -p /var/spool/cron/crontabs && cp /config/crontab /var/spool/cron/crontabs/root && exec crond -f -d 8'
+    sleep 70; cat /lab/cron/logs/cleanup.log
+    ```
+    `exec` makes crond PID 1 so `docker stop` signals it directly.
+  setup: |
+    mkdir -p /lab/cron/logs
+    printf '#!/bin/sh\necho "$(date) cleaned up tmp files" >> /var/log/jobs/cleanup.log\n' > /lab/cron/cleanup.sh
+    chown -R $(lab_user): /lab/cron; chmod 777 /lab/cron/logs
+  check: |
+    check "scheduler is running" 'c_running scheduler'
+    check "crontab runs cleanup.sh every minute" 'grep -E "^\* \* \* \* \* .*cleanup.sh" /lab/cron/crontab'
+    c_running scheduler && eventually 75 'grep -q "cleaned up" /lab/cron/logs/cleanup.log'
+    check "the job has run" 'grep -q "cleaned up" /lab/cron/logs/cleanup.log'
+  solve: |
+    echo '* * * * * sh /jobs/cleanup.sh' > /lab/cron/crontab
+    docker run -d --name scheduler -v /lab/cron/crontab:/config/crontab:ro -v /lab/cron/cleanup.sh:/jobs/cleanup.sh:ro -v /lab/cron/logs:/var/log/jobs busybox:1.37 sh -c 'mkdir -p /var/spool/cron/crontabs && cp /config/crontab /var/spool/cron/crontabs/root && exec crond -f -d 8'
+
+- id: docker-171
+  title: Graceful shutdown for nginx
+  difficulty: 2
+  kind: build
+  tags: [signals, stop-signal]
+  scenario: |
+    On deploys, nginx is killed with `SIGTERM`, which makes it drop in-flight downloads.
+    nginx shuts down **gracefully** on **`SIGQUIT`**.
+
+    Run **`downloads`** (`nginx:1.28-alpine`, port **8185**) so that `docker stop` sends
+    **SIGQUIT** and waits up to **60 seconds** before killing it.
+  hints:
+    - "`--stop-signal` and `--stop-timeout`"
+  solution: |
+    ```bash
+    docker run -d --name downloads -p 8185:80 --stop-signal SIGQUIT --stop-timeout 60 nginx:1.28-alpine
+    ```
+    (The official nginx image already sets `STOPSIGNAL SIGQUIT` in its Dockerfile —
+    being explicit doesn't hurt and documents the intent.)
+  check: |
+    check "downloads is running" 'c_running downloads'
+    check_eq "stop signal" "$(c_get downloads '{{.Config.StopSignal}}')" "SIGQUIT"
+    check_eq "stop timeout" "$(c_get downloads '{{.Config.StopTimeout}}')" "60"
+  solve: |
+    docker run -d --name downloads -p 8185:80 --stop-signal SIGQUIT --stop-timeout 60 nginx:1.28-alpine
+
+- id: docker-172
+  title: Resource limits in compose
+  difficulty: 2
+  kind: build
+  tags: [compose, resources]
+  scenario: |
+    Add limits to **`/lab/media/compose.yaml`**: the **`transcoder`** service may use at
+    most **0.5 CPU** and **256 MiB** of memory, and should have **64 MiB** reserved.
+    Apply it.
+  hints:
+    - "`deploy.resources.limits` and `deploy.resources.reservations` work with `docker compose up`."
+  solution: |
+    ```yaml
+    services:
+      transcoder:
+        image: busybox:1.37
+        command: sleep infinity
+        deploy:
+          resources:
+            limits: {cpus: "0.5", memory: 256M}
+            reservations: {memory: 64M}
+    ```
+  setup: |
+    mkdir -p /lab/media
+    printf 'services:\n  transcoder:\n    image: busybox:1.37\n    command: sleep infinity\n' > /lab/media/compose.yaml
+    chown -R $(lab_user): /lab/media
+  check: |
+    check_eq "memory limit" "$(cc_get media transcoder '{{.HostConfig.Memory}}')" "268435456"
+    check_eq "cpu limit" "$(cc_get media transcoder '{{.HostConfig.NanoCpus}}')" "500000000"
+    check_eq "memory reservation" "$(cc_get media transcoder '{{.HostConfig.MemoryReservation}}')" "67108864"
+  solve: |
+    cd /lab/media
+    cat > compose.yaml <<'EOF'
+    services:
+      transcoder:
+        image: busybox:1.37
+        command: sleep infinity
+        deploy:
+          resources:
+            limits: {cpus: "0.5", memory: 256M}
+            reservations: {memory: 64M}
+    EOF
+    docker compose up -d
+
+- id: docker-173
+  title: A sidecar in the same network namespace
+  difficulty: 2
+  kind: build
+  tags: [network, sidecar, container-mode]
+  scenario: |
+    The **`shop`** container (nginx) exposes a status page only on its loopback
+    interface (`http://127.0.0.1/status`). A metrics sidecar must scrape it.
+
+    Run **`exporter`** (`busybox:1.37`, `sleep infinity`) **sharing `shop`'s network
+    namespace**, so that `docker exec exporter wget -qO- http://127.0.0.1/status` works.
+  hints:
+    - "`--network container:NAME`"
+  solution: |
+    ```bash
+    docker run -d --name exporter --network container:shop busybox:1.37 sleep infinity
+    docker exec exporter wget -qO- http://127.0.0.1/status
+    ```
+    This is exactly how containers in a Kubernetes pod share `localhost`.
+  setup: |
+    mkdir -p /lab/shop
+    printf 'server {\n  listen 127.0.0.1:80;\n  location /status { stub_status; }\n}\n' > /lab/shop/status.conf
+    chown -R $(lab_user): /lab/shop
+    docker run -d --name shop -v /lab/shop/status.conf:/etc/nginx/conf.d/default.conf:ro nginx:1.28-alpine >/dev/null
+  check: |
+    check "exporter is running" 'c_running exporter'
+    check_eq "network mode" "$(c_get exporter '{{.HostConfig.NetworkMode}}')" "container:$(c_get shop '{{.Id}}')"
+    check "exporter scrapes 127.0.0.1/status" 'docker exec exporter wget -qO- http://127.0.0.1/status | grep -q "Active connections"'
+  solve: |
+    docker run -d --name exporter --network container:shop busybox:1.37 sleep infinity
+
+- id: docker-174
+  title: See another container's processes
+  difficulty: 2
+  kind: build
+  tags: [pid-namespace, debugging]
+  scenario: |
+    **`worker`** is misbehaving and you want to inspect its processes with tools its image
+    doesn't have.
+
+    Run a debug container **`inspector`** (`busybox:1.37`, `sleep infinity`) that **shares
+    `worker`'s PID namespace**, then write the PID (as seen inside that namespace) of the
+    process running **`sleep 3600`** to **`/lab/worker-sleep-pid.txt`**.
+  hints:
+    - "`--pid container:worker`"
+  solution: |
+    ```bash
+    docker run -d --name inspector --pid container:worker busybox:1.37 sleep infinity
+    docker exec inspector ps
+    ```
+  setup: |
+    docker run -d --name worker busybox:1.37 sh -c 'sleep 3600 & while true; do sleep 5; done' >/dev/null
+  check: |
+    check "inspector is running" 'c_running inspector'
+    check_eq "pid mode" "$(c_get inspector '{{.HostConfig.PidMode}}')" "container:$(c_get worker '{{.Id}}')"
+    want=$(docker exec worker sh -c "ps | awk '\$NF==\"3600\" && \$(NF-1)==\"sleep\" {print \$1}'" 2>/dev/null)
+    check_eq "PID of sleep 3600" "$(tr -d '[:space:]' < /lab/worker-sleep-pid.txt 2>/dev/null)" "$want"
+  solve: |
+    docker run -d --name inspector --pid container:worker busybox:1.37 sleep infinity
+    docker exec inspector sh -c "ps | awk '\$NF==\"3600\" && \$(NF-1)==\"sleep\" {print \$1}'" > /lab/worker-sleep-pid.txt
+
+- id: docker-175
+  title: Don't repeat yourself in compose
+  difficulty: 3
+  kind: fix
+  tags: [compose, anchors, extension-fields]
+  scenario: |
+    **`/lab/workers/compose.yaml`** defines three workers that repeat the same image,
+    environment, logging options and restart policy — and they have already drifted
+    apart (one has the wrong log size, one lacks `QUEUE_HOST`).
+
+    Refactor it with a top-level **`x-worker`** extension field and a YAML **anchor**
+    so the common settings exist **once**. Every worker must end up with: image
+    `busybox:1.37`, `restart: unless-stopped`, env `QUEUE_HOST=queue`, json-file logging
+    with `max-size: 5m`. Keep each worker's own `command`. Start the project.
+  hints:
+    - "`x-worker: &worker { image: ..., restart: ..., ... }` and in each service `<<: *worker`."
+    - "Compose ignores top-level keys starting with `x-`."
+  solution: |
+    ```yaml
+    x-worker: &worker
+      image: busybox:1.37
+      restart: unless-stopped
+      environment:
+        QUEUE_HOST: queue
+      logging:
+        driver: json-file
+        options: {max-size: 5m}
+
+    services:
+      emails:
+        <<: *worker
+        command: sh -c 'while true; do echo sending emails via $$QUEUE_HOST; sleep 5; done'
+      thumbnails:
+        <<: *worker
+        command: sh -c 'while true; do echo resizing images via $$QUEUE_HOST; sleep 5; done'
+      reports:
+        <<: *worker
+        command: sh -c 'while true; do echo building reports via $$QUEUE_HOST; sleep 5; done'
+    ```
+  setup: |
+    D=/lab/workers; mkdir -p $D
+    cat > $D/compose.yaml <<'EOF'
+    services:
+      emails:
+        image: busybox:1.37
+        restart: unless-stopped
+        environment: {QUEUE_HOST: queue}
+        logging: {driver: json-file, options: {max-size: 5m}}
+        command: sh -c 'while true; do echo sending emails via $$QUEUE_HOST; sleep 5; done'
+      thumbnails:
+        image: busybox:1.37
+        restart: unless-stopped
+        logging: {driver: json-file, options: {max-size: 5m}}
+        command: sh -c 'while true; do echo resizing images via $$QUEUE_HOST; sleep 5; done'
+      reports:
+        image: busybox:1.37
+        restart: always
+        environment: {QUEUE_HOST: queue}
+        logging: {driver: json-file, options: {max-size: 50m}}
+        command: sh -c 'while true; do echo building reports via $$QUEUE_HOST; sleep 5; done'
+    EOF
+    chown -R $(lab_user): $D
+  check: |
+    check "uses an x-worker anchor" 'grep -qE "^x-worker: *&" /lab/workers/compose.yaml'
+    check_eq "image defined once" "$(grep -c 'image:' /lab/workers/compose.yaml)" "1"
+    for s in emails thumbnails reports; do
+      check_eq "$s settings" "$(cc_get workers $s '{{.Config.Image}} {{.HostConfig.RestartPolicy.Name}} {{index .HostConfig.LogConfig.Config "max-size"}}')" "busybox:1.37 unless-stopped 5m"
+      check "$s has QUEUE_HOST=queue" "cc_exec workers $s printenv QUEUE_HOST | grep -qx queue"
+    done
+  solve: |
+    cd /lab/workers
+    cat > compose.yaml <<'EOF'
+    x-worker: &worker
+      image: busybox:1.37
+      restart: unless-stopped
+      environment:
+        QUEUE_HOST: queue
+      logging:
+        driver: json-file
+        options: {max-size: 5m}
+
+    services:
+      emails:
+        <<: *worker
+        command: sh -c 'while true; do echo sending emails via $$QUEUE_HOST; sleep 5; done'
+      thumbnails:
+        <<: *worker
+        command: sh -c 'while true; do echo resizing images via $$QUEUE_HOST; sleep 5; done'
+      reports:
+        <<: *worker
+        command: sh -c 'while true; do echo building reports via $$QUEUE_HOST; sleep 5; done'
+    EOF
+    docker compose up -d
+
+- id: docker-176
+  title: Build the dev image, not the prod one
+  difficulty: 3
+  kind: build
+  tags: [compose, build-target, multi-stage]
+  scenario: |
+    **`/lab/api-dev`** has a multi-stage Dockerfile with stages `dev` (includes a debugger
+    marker file `/debug-tools`) and `prod`. The compose file for local development builds
+    the **default (last)** stage — so developers get the prod image.
+
+    Make the compose service **`api`** build the **`dev`** stage, tagged
+    **`api:dev`**, and start it.
+  hints:
+    - "`build: {context: ., target: dev}`"
+  solution: |
+    ```yaml
+    services:
+      api:
+        build:
+          context: .
+          target: dev
+        image: api:dev
+    ```
+    ```bash
+    docker compose up -d --build
+    ```
+  setup: |
+    D=/lab/api-dev; mkdir -p $D
+    cat > $D/Dockerfile <<'EOF'
+    FROM busybox:1.37 AS base
+    RUN echo "api" > /app
+
+    FROM base AS dev
+    RUN echo "delve, strace, tcpdump" > /debug-tools
+    CMD ["sh", "-c", "echo dev mode; sleep infinity"]
+
+    FROM base AS prod
+    CMD ["sh", "-c", "echo prod mode; sleep infinity"]
+    EOF
+    printf 'services:\n  api:\n    build: .\n    image: api:dev\n' > $D/compose.yaml
+    chown -R $(lab_user): $D
+  check: |
+    check_eq "compose builds target dev" "$(cd /lab/api-dev && docker compose config --format json 2>/dev/null | jq -r '.services.api.build.target')" "dev"
+    check "api runs the dev stage" 'cc_running api-dev api && cc_exec api-dev api test -f /debug-tools'
+  solve: |
+    cd /lab/api-dev
+    printf 'services:\n  api:\n    build:\n      context: .\n      target: dev\n    image: api:dev\n' > compose.yaml
+    docker compose up -d --build
+
+- id: docker-177
+  title: Switch traffic from blue to green
+  difficulty: 3
+  kind: build
+  tags: [blue-green, nginx, zero-downtime]
+  scenario: |
+    **`front`** (nginx, port **8186**) proxies to **`app-blue`** on network **`bg`**,
+    using the config **`/lab/bg/upstream.conf`** (bind-mounted into the container's
+    `conf.d` directory). The new version **`app-green`** is already running.
+
+    Switch all traffic to **green** **without restarting `front`** (no dropped
+    connections) and then stop `app-blue`.
+  hints:
+    - "Edit the config, test it with `docker exec front nginx -t`, and apply with `nginx -s reload`."
+  solution: |
+    ```bash
+    sed -i 's/app-blue/app-green/' /lab/bg/upstream.conf
+    docker exec front nginx -t && docker exec front nginx -s reload
+    docker stop app-blue
+    ```
+  setup: |
+    mkdir -p /lab/bg
+    printf 'server {\n  listen 80;\n  location / { proxy_pass http://app-blue:80; }\n}\n' > /lab/bg/upstream.conf
+    chown -R $(lab_user): /lab/bg
+    docker network create bg >/dev/null
+    docker run -d --name app-blue --network bg -e WHOAMI_NAME=blue traefik/whoami:v1.10 >/dev/null
+    docker run -d --name app-green --network bg -e WHOAMI_NAME=green traefik/whoami:v1.10 >/dev/null
+    docker run -d --name front --network bg -p 8186:80 -v /lab/bg:/etc/nginx/conf.d:ro nginx:1.28-alpine >/dev/null
+    sleep 1
+    docker inspect -f '{{.State.StartedAt}}' front > $KL_STATE/answer
+  check: |
+    check_eq "front was not restarted" "$(c_get front '{{.State.StartedAt}}')" "$(cat $KL_STATE/answer)"
+    check "traffic goes to green" 'http_get localhost:8186 | grep -q "Name: green"'
+    check "app-blue is stopped" '! c_running app-blue'
+  solve: |
+    sed -i 's/app-blue/app-green/' /lab/bg/upstream.conf
+    docker exec front nginx -t
+    docker exec front nginx -s reload
+    docker stop app-blue
+
+- id: docker-178
+  title: Per-service logging in compose
+  difficulty: 2
+  kind: build
+  tags: [compose, logging]
+  scenario: |
+    In **`/lab/noisy`**, the **`chatter`** service logs a lot while **`quiet`** doesn't.
+    Configure logging per service:
+
+    - `chatter`: json-file, **max-size 1m, max-file 2**
+    - `quiet`: **no logs stored at all**
+
+    Apply it.
+  hints:
+    - "`logging: {driver: ..., options: {...}}` per service; the `none` driver discards everything."
+  solution: |
+    ```yaml
+    services:
+      chatter:
+        logging:
+          driver: json-file
+          options: {max-size: 1m, max-file: "2"}
+      quiet:
+        logging:
+          driver: none
+    ```
+  setup: |
+    D=/lab/noisy; mkdir -p $D
+    printf 'services:\n  chatter:\n    image: busybox:1.37\n    command: sh -c "while true; do echo chatter; sleep 1; done"\n  quiet:\n    image: busybox:1.37\n    command: sleep infinity\n' > $D/compose.yaml
+    chown -R $(lab_user): $D
+  check: |
+    check_eq "chatter logging" "$(cc_get noisy chatter '{{.HostConfig.LogConfig.Type}} {{index .HostConfig.LogConfig.Config "max-size"}} {{index .HostConfig.LogConfig.Config "max-file"}}')" "json-file 1m 2"
+    check_eq "quiet logging" "$(cc_get noisy quiet '{{.HostConfig.LogConfig.Type}}')" "none"
+  solve: |
+    cd /lab/noisy
+    cat > compose.yaml <<'EOF'
+    services:
+      chatter:
+        image: busybox:1.37
+        command: sh -c "while true; do echo chatter; sleep 1; done"
+        logging:
+          driver: json-file
+          options: {max-size: 1m, max-file: "2"}
+      quiet:
+        image: busybox:1.37
+        command: sleep infinity
+        logging:
+          driver: none
+    EOF
+    docker compose up -d
+
+- id: docker-179
+  title: A static site built in a container
+  difficulty: 3
+  kind: build
+  tags: [multi-stage, node, nginx]
+  scenario: |
+    **`/lab/docs-site`** contains a tiny static-site generator (`build.js`, plain Node.js,
+    no dependencies) that turns `content/*.md` into `dist/*.html`.
+
+    Write a **multi-stage** Dockerfile: run `node build.js` in `node:22-alpine`, then serve
+    `dist/` with `nginx:1.28-alpine`. Build **`docs-site:1.0`** and run it as **`docs-site`**
+    on port **8187**. The final image must not contain Node.js.
+  hints:
+    - "`COPY --from=build /src/dist/ /usr/share/nginx/html/`"
+  solution: |
+    ```dockerfile
+    FROM node:22-alpine AS build
+    WORKDIR /src
+    COPY . .
+    RUN node build.js
+
+    FROM nginx:1.28-alpine
+    COPY --from=build /src/dist/ /usr/share/nginx/html/
+    ```
+  setup: |
+    D=/lab/docs-site; mkdir -p $D/content
+    cat > $D/build.js <<'EOF'
+    const fs = require("fs");
+    fs.mkdirSync("dist", { recursive: true });
+    for (const f of fs.readdirSync("content")) {
+      const md = fs.readFileSync("content/" + f, "utf8");
+      const html = md.replace(/^# (.*)$/m, "<h1>$1</h1>").replace(/\n\n/g, "<p>");
+      fs.writeFileSync("dist/" + f.replace(/\.md$/, ".html"), "<html><body>" + html + "</body></html>");
+    }
+    console.log("built", fs.readdirSync("dist").length, "pages");
+    EOF
+    printf '# Welcome\n\nThese are the docs.\n' > $D/content/index.md
+    printf '# Install\n\nRun the installer.\n' > $D/content/install.md
+    chown -R $(lab_user): $D
+  check: |
+    check "image docs-site:1.0 exists" 'img_exists docs-site:1.0'
+    check_not "no node in the final image" 'docker run --rm --entrypoint sh docs-site:1.0 -c "command -v node"'
+    check "docs-site is running" 'c_running docs-site'
+    check "index.html served" 'http_get localhost:8187/index.html | grep -q "<h1>Welcome</h1>"'
+    check "install.html served" 'http_get localhost:8187/install.html | grep -q "<h1>Install</h1>"'
+  solve: |
+    cat > /lab/docs-site/Dockerfile <<'EOF'
+    FROM node:22-alpine AS build
+    WORKDIR /src
+    COPY . .
+    RUN node build.js
+
+    FROM nginx:1.28-alpine
+    COPY --from=build /src/dist/ /usr/share/nginx/html/
+    EOF
+    docker build -t docs-site:1.0 /lab/docs-site
+    docker run -d --name docs-site -p 8187:80 docs-site:1.0
+
+- id: docker-180
+  title: "Incident: the e-commerce stack"
+  difficulty: 4
+  kind: fix
+  tags: [compose, incident, troubleshooting]
+  scenario: |
+    The shop stack in **`/lab/eshop`** has been "improved" by three different people and
+    nothing works. Requirements:
+
+    - **`proxy`** (nginx, port **8188**) serves `/` and proxies `/api/` to **`api`** —
+      its config `/lab/eshop/nginx/default.conf` is correct
+    - **`api`** (whoami) starts only after **`db`** is healthy
+    - **`db`** (postgres) uses the password from the secret file `./secrets/db_password`
+      via `POSTGRES_PASSWORD_FILE`, data on volume `pgdata`
+    - **`cache`** (redis) with `--appendonly yes`, data on volume `redisdata`
+    - all services restart `unless-stopped`
+
+    Fix `compose.yaml` and bring everything up.
+  hints:
+    - "`docker compose config` first. Then `up -d`, `ps -a` and `logs` for every service that isn't healthy."
+    - "Check volume definitions, secret paths, healthcheck command, and the proxy's mounts."
+  solution: |
+    ```yaml
+    x-common: &common
+      restart: unless-stopped
+    services:
+      proxy:
+        <<: *common
+        image: nginx:1.28-alpine
+        ports: ["8188:80"]
+        volumes: ["./nginx/default.conf:/etc/nginx/conf.d/default.conf:ro"]
+        depends_on: [api]
+      api:
+        <<: *common
+        image: traefik/whoami:v1.10
+        depends_on:
+          db: {condition: service_healthy}
+      db:
+        <<: *common
+        image: postgres:16-alpine
+        environment: {POSTGRES_PASSWORD_FILE: /run/secrets/db_password}
+        secrets: [db_password]
+        volumes: ["pgdata:/var/lib/postgresql/data"]
+        healthcheck:
+          test: ["CMD-SHELL", "pg_isready -U postgres"]
+          interval: 2s
+          retries: 30
+      cache:
+        <<: *common
+        image: redis:7.4-alpine
+        command: ["redis-server", "--appendonly", "yes"]
+        volumes: ["redisdata:/data"]
+    secrets:
+      db_password: {file: ./secrets/db_password}
+    volumes:
+      pgdata: {}
+      redisdata: {}
+    ```
+  setup: |
+    D=/lab/eshop; mkdir -p $D/nginx $D/secrets
+    printf 'server {\n  listen 80;\n  resolver 127.0.0.11 valid=5s ipv6=off;\n  location /api/ { set $u http://api:80; proxy_pass $u; }\n  location / { return 200 "eshop home\\n"; }\n}\n' > $D/nginx/default.conf
+    tr -dc a-zA-Z0-9 </dev/urandom | head -c16 > $D/secrets/db_password
+    cat > $D/compose.yaml <<'EOF'
+    x-common: &common
+      restart: unless-stopped
+    services:
+      proxy:
+        <<: *common
+        image: nginx:1.28-alpine
+        ports: ["8188:80"]
+        volumes: ["./nginx/default.conf:/etc/nginx/conf.d/nginx.conf.bak:ro"]
+      api:
+        <<: *common
+        image: traefik/whoami:v1.10
+        depends_on:
+          db: {condition: service_healthy}
+      db:
+        <<: *common
+        image: postgres:16-alpine
+        environment: {POSTGRES_PASSWORD_FILE: /run/secrets/db_pass}
+        secrets: [db_password]
+        volumes: ["pgdata:/var/lib/postgresql/data"]
+        healthcheck:
+          test: ["CMD-SHELL", "pg_isready -U postgress -h 127.0.0.1 -p 5433"]
+          interval: 2s
+          retries: 30
+      cache:
+        image: redis:7.4-alpine
+        command: ["redis-server", "--appendonly", "yes"]
+        volumes: ["redisdata:/var/lib/redis"]
+    secrets:
+      db_password: {file: ./secret/db_password}
+    volumes:
+      pgdata: {}
+    EOF
+    chown -R $(lab_user): $D
+  check: |
+    check "proxy serves / on 8188" 'http_get localhost:8188/ | grep -q "eshop home"'
+    check "proxy forwards /api/ to api" 'http_get localhost:8188/api/ | grep -q Hostname'
+    check_eq "db is healthy" "$(cc_get eshop db '{{.State.Health.Status}}')" "healthy"
+    pw=$(cat /lab/eshop/secrets/db_password)
+    check "db password comes from the secret" "docker run --rm --network eshop_default -e PGPASSWORD='$pw' postgres:16-alpine psql -h db -U postgres -c 'select 1'"
+    check_eq "cache data on redisdata:/data" "$(cc_get eshop cache '{{range .Mounts}}{{if eq .Name "eshop_redisdata"}}{{.Destination}}{{end}}{{end}}')" "/data"
+    for s in proxy api db cache; do check "$s restarts unless-stopped" "[ \"\$(cc_get eshop $s '{{.HostConfig.RestartPolicy.Name}}')\" = unless-stopped ]"; done
+  solve: |
+    cd /lab/eshop
+    cat > compose.yaml <<'EOF'
+    x-common: &common
+      restart: unless-stopped
+    services:
+      proxy:
+        <<: *common
+        image: nginx:1.28-alpine
+        ports: ["8188:80"]
+        volumes: ["./nginx/default.conf:/etc/nginx/conf.d/default.conf:ro"]
+        depends_on: [api]
+      api:
+        <<: *common
+        image: traefik/whoami:v1.10
+        depends_on:
+          db: {condition: service_healthy}
+      db:
+        <<: *common
+        image: postgres:16-alpine
+        environment: {POSTGRES_PASSWORD_FILE: /run/secrets/db_password}
+        secrets: [db_password]
+        volumes: ["pgdata:/var/lib/postgresql/data"]
+        healthcheck:
+          test: ["CMD-SHELL", "pg_isready -U postgres"]
+          interval: 2s
+          retries: 30
+      cache:
+        <<: *common
+        image: redis:7.4-alpine
+        command: ["redis-server", "--appendonly", "yes"]
+        volumes: ["redisdata:/data"]
+    secrets:
+      db_password: {file: ./secrets/db_password}
+    volumes:
+      pgdata: {}
+      redisdata: {}
+    EOF
+    docker compose down --remove-orphans
+    docker compose up -d --wait

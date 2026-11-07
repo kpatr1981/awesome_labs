@@ -112,10 +112,17 @@ ready_pods() {
 }
 # k_ns NAME — (re)create a namespace for the exercise
 k_ns() { kubectl create namespace "$1" --dry-run=client -o yaml | kubectl apply -f - >/dev/null; }
-# k_run_curl NS URL -> output of curl from inside the cluster
+# k_curl NS URL -> output of curl from a throw-away pod (retried: new
+# services take a moment to be programmed into kube-proxy)
 k_curl() {
-  kubectl -n "$1" run "kl-curl-$RANDOM" --rm -i --restart=Never --quiet \
-    --image=curlimages/curl:8.11.1 --command -- curl -s -m 5 "$2" 2>/dev/null
+  local out i
+  for i in 1 2 3; do
+    out=$(kubectl -n "$1" run "kl-curl-$RANDOM" --rm -i --restart=Never --quiet \
+      --image=curlimages/curl:8.11.1 --command -- curl -s -m 4 "$2" 2>/dev/null)
+    [ -n "$out" ] && { printf '%s\n' "$out"; return 0; }
+    sleep 2
+  done
+  return 1
 }
 # restore a kube-system object saved at snapshot time
 kl_restore_obj() { # kl_restore_obj configmap coredns
