@@ -347,10 +347,11 @@ func (m *model) viewEnv() string {
 		if m.mgr.Tainted(env) {
 			tainted = sWarn.Render("  (will be rebuilt before the next exercise)")
 		}
-		fmt.Fprintf(&b, "%s%-22s %s%s\n     %s\n\n", cur, env.Title, stStyle.Render(st), tainted, sMuted.Render(strings.Join(vms, " · ")))
+		fmt.Fprintf(&b, "%s%-22s %s%s\n", cur, env.Title, stStyle.Render(st), tainted)
+		fmt.Fprintf(&b, "     %s\n\n", sMuted.Render(strings.Join(vms, " · ")))
 	}
-	b.WriteString(sMuted.Render(fmt.Sprintf("  Kubernetes v%s · Calico %s · Traefik ingress/gateway · metrics-server · local-path storage\n", lab.K8sVersion, lab.CalicoVersion)))
-	b.WriteString(sMuted.Render("  Full log: "+m.mgr.LogPath()) + "\n\n")
+	b.WriteString(sMuted.Render(fmt.Sprintf("  Kubernetes v%s · Calico %s · Traefik ingress/gateway · metrics-server · local-path storage", lab.K8sVersion, lab.CalicoVersion)) + "\n")
+	b.WriteString(sMuted.Render("  First start of an environment takes 5–15 minutes. Full log: "+m.mgr.LogPath()) + "\n\n")
 	if o := m.output["env"]; o != nil && o.Len() > 0 {
 		lines := strings.Split(strings.TrimRight(o.String(), "\n"), "\n")
 		keep := max(3, m.h-18)

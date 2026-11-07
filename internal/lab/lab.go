@@ -624,6 +624,18 @@ func (m *Manager) Solve(ctx context.Context, ex *exercise.Exercise, log io.Write
 	return nil
 }
 
+// VMRunning reports whether the VM a shell would open on is running.
+func (m *Manager) VMRunning(env Env, worker bool) bool {
+	vm := env.Primary()
+	if worker {
+		if w, ok := env.Worker(); ok {
+			vm = w
+		}
+	}
+	st, err := lima.Status(context.Background(), vm.Name)
+	return err == nil && st == "Running"
+}
+
 // ShellCommand returns an interactive shell into a VM of the environment.
 func (m *Manager) ShellCommand(env Env, worker bool) *exec.Cmd {
 	vm := env.Primary()

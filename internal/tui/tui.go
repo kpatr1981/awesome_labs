@@ -5,7 +5,6 @@ import (
 	"context"
 	"fmt"
 	"io"
-	"os"
 	"strings"
 	"sync"
 
@@ -276,13 +275,16 @@ func (m *model) cmdCheck() tea.Cmd {
 
 func (m *model) cmdShell(worker bool) tea.Cmd {
 	env := lab.EnvFor(m.cur.Profile)
+	if !m.mgr.VMRunning(env, worker) {
+		m.flash = "the " + env.Title + " is not running — press s to prepare the lab first"
+		return nil
+	}
 	c := m.mgr.ShellCommand(env, worker)
 	c.Stdin, c.Stdout, c.Stderr = nil, nil, nil
 	where := env.Primary().Hostname
 	if worker {
 		where = "node01"
 	}
-	fmt.Fprintf(os.Stdout, "\n")
 	m.flash = "returned from " + where + " shell — press c to check your work"
 	return tea.ExecProcess(c, func(err error) tea.Msg { return shellDoneMsg{err} })
 }
