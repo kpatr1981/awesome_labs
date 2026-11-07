@@ -8,6 +8,7 @@ docker swarm leave --force >/dev/null 2>&1 || true
 docker ps -aq 2>/dev/null | xargs -r docker rm -f >/dev/null 2>&1
 /opt/kubelab/state.sh restore docker
 eventually 90 'docker info' || { echo "docker did not come back" >&2; exit 1; }
+chgrp docker /var/run/docker.sock 2>/dev/null; chmod 660 /var/run/docker.sock 2>/dev/null
 /opt/kubelab/hooks.sh
 docker ps -aq | xargs -r docker rm -f >/dev/null 2>&1
 docker network ls --format '{{.Name}}' | grep -vxE 'bridge|host|none' | xargs -r docker network rm >/dev/null 2>&1
