@@ -31,6 +31,7 @@ const (
 	scrExamSetup
 	scrExam
 	scrExamResult
+	scrStarted
 )
 
 type tab int
@@ -100,6 +101,10 @@ type model struct {
 	// env screen
 	envStatus map[exercise.Profile]string
 	envCursor int
+
+	// started-labs screen
+	startedCursor int
+	started       []*exercise.Exercise
 
 	style   string
 	mdMu    sync.Mutex
@@ -500,6 +505,8 @@ func (m *model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 			return m.updateExam(msg)
 		case scrExamResult:
 			return m.updateExamResult(msg)
+		case scrStarted:
+			return m.updateStarted(msg)
 		}
 	}
 	return m, nil
@@ -589,6 +596,8 @@ func (m *model) updateBrowse(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 	case "e":
 		m.screen = scrEnv
 		return m, m.cmdEnvStatus()
+	case "S":
+		m.openStarted()
 	case "L":
 		m.screen = scrPaths
 	case "X":
@@ -795,6 +804,88 @@ func (m *model) askForget() {
 		m.vp.GotoTop()
 		return nil
 	}
+}
+
+// startedLabs returns the exercises started but not yet solved, in catalog order.
+func (m *model) startedLabs() []*exercise.Exercise {
+	var out []*exercise.Exercise
+	for _, e := range m.cat.Exercises {
+		p := m.prog.Get(e.ID)
+		if !p.Started.IsZero() && p.Solved.IsZero() {
+			out = append(out, e)
+		}
+	}
+	return out
+}
+
+func (m *model) openStarted() {
+	m.started = m.startedLabs()
+	if m.startedCursor >= len(m.started) {
+		m.startedCursor = max(0, len(m.started)-1)
+	}
+	m.screen = scrStarted
+	m.flash = ""
+}
+
+func (m *model) resetStarted() {
+	m.started = m.startedLabs()
+	if m.startedCursor >= len(m.started) {
+		m.startedCursor = max(0, len(m.started)-1)
+	}
+}
+
+func (m *model) updateStarted(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
+	switch msg.String() {
+	case "esc", "q", "S":
+		m.screen = scrBrowse
+	case "up", "k":
+		if m.startedCursor > 0 {
+			m.startedCursor--
+		}
+	case "down", "j":
+		if m.startedCursor < len(m.started)-1 {
+			m.startedCursor++
+		}
+	case "enter":
+		if m.startedCursor < len(m.started) {
+			m.openDetail(m.started[m.startedCursor])
+		}
+	case "r":
+		if m.startedCursor >= len(m.started) {
+			return m, nil
+		}
+		ex := m.started[m.startedCursor]
+		if m.exam != nil && !m.exam.Over() && m.exam.Has(ex.ID) {
+			m.flash = "can't reset a question of the running exam"
+			return m, nil
+		}
+		m.confirm = "Reset progress on " + ex.ID + "? (y/n)"
+		m.onYes = func() tea.Cmd {
+			m.prog.Reset(ex.ID)
+			delete(m.result, ex.ID)
+			m.resetStarted()
+			m.flash = "reset " + ex.ID
+			return nil
+		}
+	case "A":
+		if len(m.started) == 0 {
+			return m, nil
+		}
+		m.confirm = fmt.Sprintf("Reset progress on all %d started labs? (y/n)", len(m.started))
+		m.onYes = func() tea.Cmd {
+			for _, e := range m.started {
+				if m.exam != nil && !m.exam.Over() && m.exam.Has(e.ID) {
+					continue
+				}
+				m.prog.Reset(e.ID)
+				delete(m.result, e.ID)
+			}
+			m.resetStarted()
+			m.flash = "reset started labs"
+			return nil
+		}
+	}
+	return m, nil
 }
 
 func (m *model) updateEnv(msg tea.KeyMsg) (tea.Model, tea.Cmd) {

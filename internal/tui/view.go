@@ -88,6 +88,8 @@ func (m *model) View() string {
 		body = m.viewDetail()
 	case scrEnv:
 		body = m.viewEnv()
+	case scrStarted:
+		body = m.viewStarted()
 	case scrPaths:
 		body = m.viewPaths()
 	case scrExamSetup:
@@ -240,7 +242,7 @@ func (m *model) viewBrowse() string {
 	}
 	prevBox := sBorder.Width(prevW - 2).Height(lh).Render(prev)
 
-	help := "↑↓ move · enter open · / filter · tab track · n/p module · u unsolved · L paths · X exam · e envs · q quit · Q quit+stop VMs"
+	help := "↑↓ move · enter open · / filter · tab track · n/p module · u unsolved · L paths · X exam · e envs · S started · q quit · Q quit+stop VMs"
 	return lipgloss.JoinVertical(lipgloss.Left,
 		m.header(), bar,
 		lipgloss.JoinHorizontal(lipgloss.Top, list, prevBox),
@@ -376,6 +378,28 @@ func (m *model) refreshViewport(follow bool) {
 	if follow && m.tab == tabOutput {
 		m.vp.GotoBottom()
 	}
+}
+
+func (m *model) viewStarted() string {
+	title := sTitle.Render(" Started labs ") + sMuted.Render("in progress, not yet solved")
+	if len(m.started) == 0 {
+		return lipgloss.JoinVertical(lipgloss.Left, title, "",
+			sMuted.Render("  Nothing in progress. Start a lab with s on an exercise."),
+			m.statusLine("esc back"))
+	}
+	var b strings.Builder
+	for i, e := range m.started {
+		p := m.prog.Get(e.ID)
+		line := fmt.Sprintf("%-10s %s %s", e.ID, trunc(e.Title, 40),
+			sMuted.Render("· started "+p.Started.Format("2006-01-02 15:04")))
+		if i == m.startedCursor {
+			b.WriteString(sTitle.Render("▸ ") + line + "\n")
+		} else {
+			b.WriteString("  " + line + "\n")
+		}
+	}
+	help := "↑↓ move · enter open · r reset selected · A reset all · esc back"
+	return lipgloss.JoinVertical(lipgloss.Left, title, "", b.String(), m.statusLine(help))
 }
 
 func (m *model) markdown(key, src string, w int) string {
