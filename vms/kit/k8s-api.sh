@@ -69,10 +69,17 @@ reset() {
   for n in $(comm -13 "$P/namespaces.txt" /tmp/kl-now) namespace/default namespace/kube-public; do
     kubectl -n "${n#namespace/}" delete pods --all --grace-period=0 --force --wait=false >/dev/null 2>&1
   done
-  # namespaced junk in default + kube-public
+  # namespaced junk in default + kube-public (never the objects the cluster itself owns)
   for n in default kube-public; do
-    kubectl -n "$n" delete "$NS_KINDS" --all --wait=false --ignore-not-found >/dev/null 2>&1
+    kubectl -n "$n" get "$NS_KINDS" -o name 2>/dev/null |
+      grep -vE '/(kubernetes|cluster-info|kube-root-ca\.crt|default|kubeadm:.*|system:.*)$' |
+      xargs -r kubectl -n "$n" delete --wait=false --ignore-not-found >/dev/null 2>&1
   done
+  # kubeadm's discovery ConfigMap + its RBAC are needed to join nodes
+  if ! kubectl -n kube-public get configmap cluster-info >/dev/null 2>&1 ||
+     ! kubectl -n kube-public get role kubeadm:bootstrap-signer-clusterinfo >/dev/null 2>&1; then
+    kubeadm init phase bootstrap-token --kubeconfig /etc/kubernetes/admin.conf >/dev/null 2>&1 && echo "restored cluster-info"
+  fi
   # cluster-scoped objects that were not there at snapshot time
   for k in $CLUSTER_KINDS; do
     kubectl get "$k" -o name 2>/dev/null | sort >/tmp/kl-now
