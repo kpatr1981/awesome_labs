@@ -1,16 +1,17 @@
 # awesome_labs
 
-**Hands-on Docker, Kubernetes & offensive-security exercises on your own machine** —
-real VMs, real breakage, automatic grading.
+**Hands-on labs on your own machine** for Docker, Kubernetes, Linux, networking, cloud,
+databases, security and programming — real VMs, real breakage, automatic grading.
 
 awesome_labs creates [Lima](https://lima-vm.io) virtual machines, puts each exercise's
 scenario in place (a broken deployment, a crashed daemon, a half-finished compose
 project…), drops you into a shell, and checks your work when you're done. Every
-exercise has a scenario, progressive hints and a full solution you can reveal.
+exercise has a scenario, progressive hints and a full solution you can reveal, and most
+have a short tutorial on the concepts and commands to read first.
 
 ```text
- awesome_labs Docker & Kubernetes labs                                ✔ 37/500 solved  ● 2 in progress
- All  Docker  Kubernetes
+ awesome_labs Docker & Kubernetes labs                                ✔ 37/630 solved  ● 2 in progress
+ All  Docker  Kubernetes  Offensive Sec  Linux  Networking  Cloud  Data  Defensive Sec  Programming
 ╭──────────────────────────────────────────────╮╭───────────────────────────────────────────────╮
 │▸ Kubernetes · Troubleshooting the cluster     ││k8s-245 — The API server is gone               │
 │ ✔ k8s-241   ●●○○○ fix   node01 is NotReady    ││●●●○○ Medium · Fix something · Kubernetes      │
@@ -27,7 +28,7 @@ exercise has a scenario, progressive hints and a full solution you can reveal.
 |-------|---------|-----------|
 | **Docker** | containers · images & Dockerfiles · volumes · networking · Compose · registries · security & limits · the daemon & host · production patterns · real-world troubleshooting | 200 |
 | **Kubernetes** | pods · deployments · services & DNS · ConfigMaps & Secrets · scheduling · storage · Jobs/CronJobs/DaemonSets · probes, resources & autoscaling · Ingress & Gateway API · NetworkPolicies · RBAC & pod security · app troubleshooting · cluster troubleshooting · cluster administration · Helm, Kustomize & CRDs | 300 |
-| **Offensive Security** | web exploitation (recon · SQL injection · path traversal · command injection · IDOR · SSRF · XXE · JWT · remediation) privilege escalation · *(more modules in progress)* | 40 |
+| **Offensive Security** | web exploitation (recon · SQL injection · path traversal · command injection · IDOR · SSRF · XXE · JWT · remediation) · privilege escalation · *(more modules in progress)* | 40 |
 | **Linux** | disks, systemd, shell, Git, cgroups, namespaces, LVM *(growing)* | 15 |
 | **Networking** | routing, NAT, firewalls, DNS, TLS, proxies, WireGuard, netem *(growing)* | 15 |
 | **Cloud** | AWS CLI and CloudFormation against a local emulator *(growing)* | 15 |
@@ -35,11 +36,19 @@ exercise has a scenario, progressive hints and a full solution you can reveal.
 | **Defensive Security** | incident response and hardening *(growing)* | 15 |
 | **Programming** | Python and Go *(growing)* | 15 |
 
-Each module has 20 exercises of increasing difficulty (1 = beginner … 5 = expert),
-mixing **build** tasks ("create X" / "capture the flag") and **fix** tasks ("X is
-broken — find out why" / "patch the vulnerability"). Each module ends with a
-multi-problem *incident*. Offensive-security exercises are self-contained: every
-target runs on the lab's own VM and nothing reaches the outside network.
+That's 630 exercises so far, growing toward 400 per topic; ideas for what comes next are
+in [docs/PENDING.md](docs/PENDING.md).
+
+Difficulty rises through each module (1 = beginner … 5 = expert), mixing **build** tasks
+("create X" / "capture the flag") and **fix** tasks ("X is broken — find out why" /
+"patch the vulnerability"). The Docker and Kubernetes modules end with a multi-problem
+*incident*.
+
+## Responsible use
+
+The offensive-security exercises are for learning, and they are self-contained: every
+target runs on the lab's own VM and nothing reaches the outside network. Only use these
+techniques on systems you own or are explicitly authorized to test.
 
 ## The lab environments
 
@@ -75,6 +84,8 @@ reset can't undo; awesome_labs rebuilds the cluster before your next Kubernetes 
 ## Build & run
 
 ```bash
+git clone https://github.com/kpatr1981/awesome_labs.git
+cd awesome_labs
 make build          # or: go build -o awesome_labs .
 ./awesome_labs           # interactive browser
 ```
@@ -160,10 +171,10 @@ awesome_labs list [filter]              # list exercises (✔ solved, ● starte
 awesome_labs paths [path-id]            # learning paths and progress
 awesome_labs show k8s-101 [--solution]
 awesome_labs start docker-042           # prepare the lab
-awesome_labs shell docker|k8s|node01    # open a shell
+awesome_labs shell docker|k8s|node01|offsec    # open a shell
 awesome_labs check docker-042           # grade (exit code 0 = solved)
 awesome_labs forget docker-042          # erase progress on one exercise
-awesome_labs env status|up|stop|reset|rebuild|destroy [docker|k8s]
+awesome_labs env status|up|stop|reset|rebuild|destroy [docker|k8s|offsec]
 ```
 
 Progress is stored in `~/.awesome_labs/progress.json`, logs in `~/.awesome_labs/logs/`.
@@ -199,5 +210,5 @@ learning-paths.yaml        curated paths
 vms/*.yaml                 Lima templates
 vms/bootstrap/             one-time provisioning (kubeadm init, add-ons, image pre-pulls)
 vms/kit/                   copied to /opt/kubelab in every VM: lib.sh helpers, reset & snapshot scripts
-exercises/                 the 500 exercises
+exercises/                 the exercises, one folder per track
 ```
