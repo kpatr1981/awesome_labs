@@ -10,7 +10,7 @@ exercise has a scenario, progressive hints and a full solution you can reveal, a
 have a short tutorial on the concepts and commands to read first.
 
 ```text
- awesome_labs Docker & Kubernetes labs                                ✔ 37/630 solved  ● 2 in progress
+ awesome_labs hands-on labs                                           ✔ 37/630 solved  ● 2 in progress
  All  Docker  Kubernetes  Offensive Sec  Linux  Networking  Cloud  Data  Defensive Sec  Programming
 ╭──────────────────────────────────────────────╮╭───────────────────────────────────────────────╮
 │▸ Kubernetes · Troubleshooting the cluster     ││k8s-245 — The API server is gone               │
@@ -71,6 +71,8 @@ Two exercises (the cluster upgrade and encryption-at-rest) change the cluster in
 reset can't undo; awesome_labs rebuilds the cluster before your next Kubernetes exercise.
 
 ## Requirements
+
+Tested on Fedora 45 (x86_64).
 
 - macOS (Apple Silicon or Intel) or Linux with [Lima](https://lima-vm.io) ≥ 2.0
   (`brew install lima`)
@@ -212,3 +214,7 @@ vms/bootstrap/             one-time provisioning (kubeadm init, add-ons, image p
 vms/kit/                   copied to /opt/kubelab in every VM: lib.sh helpers, reset & snapshot scripts
 exercises/                 the exercises, one folder per track
 ```
+
+## License
+
+[MIT](LICENSE)

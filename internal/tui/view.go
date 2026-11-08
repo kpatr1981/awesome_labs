@@ -104,7 +104,7 @@ func (m *model) header() string {
 		ids = append(ids, e.ID)
 	}
 	solved, started := m.prog.Counts(ids)
-	left := sTitle.Render(" awesome_labs ") + sMuted.Render("Docker & Kubernetes labs")
+	left := sTitle.Render(" awesome_labs ") + sMuted.Render("hands-on labs")
 	if m.exam != nil {
 		left += "   " + sBigOKInline(m.exam)
 	}

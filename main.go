@@ -1,4 +1,4 @@
-// awesome_labs — hands-on Docker & Kubernetes exercises on local Lima VMs.
+// awesome_labs — hands-on infrastructure and security labs on local Lima VMs.
 package main
 
 import (
@@ -27,7 +27,7 @@ import (
 var assets embed.FS
 
 func usage() {
-	fmt.Fprint(os.Stderr, `awesome_labs — Docker & Kubernetes exercises on Lima VMs
+	fmt.Fprint(os.Stderr, `awesome_labs — hands-on infrastructure and security labs on Lima VMs
 
 usage:
   awesome_labs                         open the interactive exercise browser
