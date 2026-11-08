@@ -55,6 +55,9 @@ reset can't undo; kubelab rebuilds the cluster before your next Kubernetes exerc
 
 - macOS (Apple Silicon or Intel) or Linux with [Lima](https://lima-vm.io) ≥ 2.0
   (`brew install lima`)
+  - On Linux, kubelab runs QEMU through a small generated wrapper in `~/.kubelab/qemu`
+    to avoid a [QEMU crash on Lima's `user-v2` network](https://github.com/lima-vm/lima/issues/5722).
+    Starting the `kl-cp` or `kl-worker` VMs with `limactl` directly skips it.
 - Go ≥ 1.24 to build
 - ~6 GiB of free RAM (one environment at a time; ~9 GiB with both), ~40 GiB of disk
 - Internet access (packages and images are downloaded on first start)

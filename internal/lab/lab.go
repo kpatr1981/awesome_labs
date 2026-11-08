@@ -122,6 +122,9 @@ func NewManager(assets fs.FS) (*Manager, error) {
 		return nil, err
 	}
 	m.logFile = &syncWriter{w: f}
+	if err := lima.UseQEMUStreamNetdev(dir); err != nil {
+		fmt.Fprintln(m.logFile, "warning: QEMU user-v2 workaround not applied:", err)
+	}
 	return m, nil
 }
 
