@@ -164,7 +164,9 @@ kubelab verify [id-prefix ...]
 ```
 
 runs each one end to end — *reset → setup → check must fail → solve → check must
-pass* — which is how the whole catalogue is tested. Set `KUBELAB_EXERCISES=./exercises`
+pass* — which is how the whole catalogue is tested. Each exercise gets 25 minutes (50 for the
+destructive ones), and while a verify run is going its environment is marked busy, so
+auto-stop or `Q` in another kubelab leaves it alone. Set `KUBELAB_EXERCISES=./exercises`
 to work on exercise files without rebuilding.
 
 ## Project layout
