@@ -27,7 +27,13 @@ exercise has a scenario, progressive hints and a full solution you can reveal.
 |-------|---------|-----------|
 | **Docker** | containers · images & Dockerfiles · volumes · networking · Compose · registries · security & limits · the daemon & host · production patterns · real-world troubleshooting | 200 |
 | **Kubernetes** | pods · deployments · services & DNS · ConfigMaps & Secrets · scheduling · storage · Jobs/CronJobs/DaemonSets · probes, resources & autoscaling · Ingress & Gateway API · NetworkPolicies · RBAC & pod security · app troubleshooting · cluster troubleshooting · cluster administration · Helm, Kustomize & CRDs | 300 |
-| **Offensive Security** | web exploitation (recon · SQL injection · path traversal · command injection · IDOR · SSRF · XXE · JWT · remediation) · *(more modules in progress)* | 20 |
+| **Offensive Security** | web exploitation (recon · SQL injection · path traversal · command injection · IDOR · SSRF · XXE · JWT · remediation) privilege escalation · *(more modules in progress)* | 40 |
+| **Linux** | disks, systemd, shell, Git, cgroups, namespaces, LVM *(growing)* | 15 |
+| **Networking** | routing, NAT, firewalls, DNS, TLS, proxies, WireGuard, netem *(growing)* | 15 |
+| **Cloud** | AWS CLI and CloudFormation against a local emulator *(growing)* | 15 |
+| **Data** | SQL, PostgreSQL operations and Redis *(growing)* | 15 |
+| **Security** | incident response and hardening *(growing)* | 15 |
+| **Programming** | Python and Go *(growing)* | 15 |
 
 Each module has 20 exercises of increasing difficulty (1 = beginner … 5 = expert),
 mixing **build** tasks ("create X" / "capture the flag") and **fix** tasks ("X is
@@ -79,7 +85,7 @@ make build          # or: go build -o kubelab .
 |-----|--------|
 | `↑↓` / `j k` | move · `n`/`p` next/previous module |
 | `/` | filter by id, title, tag, module or difficulty |
-| `tab` | All / Docker / Kubernetes |
+| `tab` | switch track |
 | `u` | show only unsolved |
 | `enter` | open an exercise |
 | `L` | **learning paths** — focus the list on a curated path, with progress |
@@ -98,7 +104,7 @@ make build          # or: go build -o kubelab .
 | `h` | reveal the next **hint** |
 | `v` | reveal the **solution** (asks first) |
 | `R` | **reset progress** on this exercise (asks first) |
-| `1`–`4` / `tab` | Scenario · Hints · Solution · Output |
+| `1`–`5` / `tab` | Scenario · Learn · Hints · Solution · Output |
 | `n` / `N` | next / previous exercise |
 
 Inside the VMs the scenario is also in **`/lab/TASK.md`**; `/lab` is your working

@@ -1,0 +1,294 @@
+track: security
+module: Defensive security — first response
+profile: offsec
+order: 1
+exercises:
+
+- id: sec-001
+  title: Who got in?
+  difficulty: 1
+  kind: build
+  tags: [logs, forensics, ssh]
+  tutorial: |
+    **Concept.** Authentication logs record failures and successes per source address. Spotting a successful break-in means correlating the two sets rather than counting only failures.
+
+    **Read up on:**
+    - `awk` — arrays keyed by IP, counting matches by pattern
+    - The `sshd` log wording — find the lines for failed and accepted logins and the field holding the IP
+    - `grep -c`, `sort | uniq -c` — quick counts
+    - Brute-force pattern — many failures followed by a success
+    - Log order — a success after the failures matters
+  scenario: |
+    **`/lab/auth.log`** is the SSH log from a server exposed to the internet. Plenty of
+    addresses tried and failed to log in.
+
+    One address made **at least 20 failed attempts and then logged in successfully**.
+    Write just that IP to **`/lab/answer.txt`**.
+
+    The address with the most failures isn't necessarily the one that got in.
+  hints:
+    - "`grep 'Accepted password' /lab/auth.log` shows every successful login."
+    - "Count failures per IP, then see which of those also appear in the successful logins."
+  solution: |
+    Count failures per IP, record which IPs succeeded, and print those with both:
+
+    ```bash
+    awk '/Failed password/ {f[$(NF-3)]++}
+         /Accepted password/ {a[$(NF-3)] = 1}
+         END {for (ip in a) if (f[ip] >= 20) print ip}' /lab/auth.log > /lab/answer.txt
+    ```
+  setup: |
+    python3 - <<'PY'
+    import random
+    ips = [f"198.51.100.{i}" for i in random.sample(range(2, 250), 14)]
+    attacker, noisy, staff = ips[0], ips[1], ips[2:6]
+    events = [(attacker, "Failed", "root") for _ in range(45)]
+    events += [(noisy, "Failed", "admin") for _ in range(400)]
+    for ip in ips[6:]:
+        events += [(ip, "Failed", "test")] * random.randint(3, 15)
+    for ip in staff:
+        events += [(ip, "Failed", "alice")] * random.randint(0, 2)
+    random.shuffle(events)
+    # successful logins come after the noise, so the attacker's follows its failures
+    late = [(ip, "Accepted", "alice") for ip in staff] + [(attacker, "Accepted", "root")]
+    random.shuffle(late)
+    events += late
+    with open("/lab/auth.log", "w") as f:
+        for n, (ip, what, user) in enumerate(events):
+            f.write(f"Nov  8 {n // 3600:02d}:{n // 60 % 60:02d}:{n % 60:02d} web sshd[{1000 + n}]: {what} password for {user} from {ip} port {20000 + n} ssh2\n")
+    open("/var/lib/kubelab/answer", "w").write(attacker + "\n")
+    PY
+    chown "$(lab_user):" /lab/auth.log
+  check: |
+    check_eq "attacker named in /lab/answer.txt" "$(tr -d '[:space:]' 2>/dev/null </lab/answer.txt)" "$(cat "$KL_STATE/answer")"
+  solve: |
+    awk '/Failed password/ {f[$(NF-3)]++} /Accepted password/ {a[$(NF-3)] = 1} END {for (ip in a) if (f[ip] >= 20) print ip}' /lab/auth.log > /lab/answer.txt
+
+- id: sec-002
+  title: The new SUID binary
+  difficulty: 2
+  kind: fix
+  tags: [suid, forensics, hardening]
+  tutorial: |
+    **Concept.** SUID binaries run with their owner's privileges, which makes unexpected ones a classic persistence trick. Auditing means comparing current state to a known baseline.
+
+    **Read up on:**
+    - `find / -perm -4000` — locate SUID files (see `man find` for permission tests)
+    - `comm` — compare two sorted lists
+    - `sort` — comm needs sorted input
+    - `chmod u-s` — removing the bit
+    - `ls -l` and `stat` — view mode and owner
+  scenario: |
+    An intruder may have left a way back to root on this host.
+
+    **`/lab/suid-baseline.txt`** lists every SUID program that existed when the server
+    was built. Compare it with what's on disk now, then:
+
+    1. Write the **full path** of the new SUID file to **`/lab/answer.txt`**.
+    2. **Remove its SUID bit**, but keep the file, because it's evidence.
+  hints:
+    - "`sudo find / -xdev -type f -perm -4000 2>/dev/null | sort` lists SUID files."
+    - "`comm -13 old new` prints lines that appear only in the second sorted file."
+  solution: |
+    ```bash
+    sudo find / -xdev -type f -perm -4000 2>/dev/null | sort > /tmp/suid-now.txt
+    comm -13 /lab/suid-baseline.txt /tmp/suid-now.txt > /lab/answer.txt
+    sudo chmod u-s "$(cat /lab/answer.txt)"
+    ```
+  setup: |
+    find / -xdev -type f -perm -4000 2>/dev/null | sort > /lab/suid-baseline.txt
+    chown "$(lab_user):" /lab/suid-baseline.txt
+    p=/usr/local/lib/.cache-helper-$RANDOM
+    install -m 4755 -o root /usr/bin/find "$p"
+    on_reset "rm -f $p"
+    echo "$p" > "$KL_STATE/answer"
+  check: |
+    p=$(cat "$KL_STATE/answer")
+    check_eq "file named in /lab/answer.txt" "$(tr -d '[:space:]' 2>/dev/null </lab/answer.txt)" "$p"
+    check "the file was kept as evidence" '[ -f "$p" ]'
+    check_not "the SUID bit is gone" '[ -u "$p" ]'
+  solve: |
+    sudo find / -xdev -type f -perm -4000 2>/dev/null | sort > /tmp/suid-now.txt
+    comm -13 /lab/suid-baseline.txt /tmp/suid-now.txt > /lab/answer.txt
+    sudo chmod u-s "$(cat /lab/answer.txt)"
+
+- id: sec-003
+  title: Something runs every minute
+  difficulty: 2
+  kind: fix
+  tags: [persistence, cron, forensics]
+  tutorial: |
+    **Concept.** Cron runs commands on a schedule from several places. Malware often hides in a drop-in file and calls a script in an unusual location.
+
+    **Read up on:**
+    - `/etc/cron.d`, `crontab -l` and `man 5 crontab` — the fields and file format
+    - `grep -r` — search config files and scripts for patterns
+    - `cat` / `less` on a suspect script — read before you delete
+    - Regular expressions for IPv4 addresses with `grep -oE`
+    - `rm` — and check for hidden dot-files in the script's directory
+  scenario: |
+    Monitoring caught this host trying to contact an unknown address once a minute.
+    Look for a scheduled job in **`/etc/cron.d`** that doesn't belong.
+
+    1. Read the script it runs and write the **command-and-control IP** configured in it
+       to **`/lab/answer.txt`**.
+    2. Remove **the malicious cron entry and the script**.
+
+    The legitimate backup job in the same directory must stay.
+  hints:
+    - "`grep -r . /etc/cron.d` shows every job. Which one runs every minute, from an odd location?"
+    - "Read the script before you delete it. It's only a harmless stand-in here."
+  solution: |
+    ```bash
+    grep -H '' /etc/cron.d/*
+    cat /var/tmp/.updater
+    grep -oE '[0-9]+(\.[0-9]+){3}' /var/tmp/.updater > /lab/answer.txt
+    sudo rm /etc/cron.d/kl-sysstat /var/tmp/.updater
+    ```
+  setup: |
+    ip=203.0.113.$((RANDOM % 200 + 20))
+    echo "$ip" > "$KL_STATE/answer"
+    cat >/var/tmp/.updater <<EOF
+    #!/bin/sh
+    # stand-in for a real implant: it never contacts anything
+    C2=$ip
+    exit 0
+    EOF
+    chmod 755 /var/tmp/.updater
+    on_reset 'rm -f /var/tmp/.updater'
+    echo '* * * * * root /var/tmp/.updater' > /etc/cron.d/kl-sysstat
+    echo '0 3 * * * root /bin/true # nightly backup' > /etc/cron.d/kl-backup
+  check: |
+    check_eq "C2 address in /lab/answer.txt" "$(tr -d '[:space:]' 2>/dev/null </lab/answer.txt)" "$(cat "$KL_STATE/answer")"
+    check_not "no cron entry runs the script" 'grep -rq updater /etc/cron.d'
+    check_not "the script is gone" '[ -e /var/tmp/.updater ]'
+    check "the backup job is still there" 'grep -q "nightly backup" /etc/cron.d/kl-backup'
+  solve: |
+    grep -oE '[0-9]+(\.[0-9]+){3}' /var/tmp/.updater > /lab/answer.txt
+    sudo rm /etc/cron.d/kl-sysstat /var/tmp/.updater
+
+- id: sec-004
+  title: The extra SSH key
+  difficulty: 3
+  kind: fix
+  tags: [ssh, persistence, forensics]
+  tutorial: |
+    **Concept.** SSH authorises keys listed in `authorized_keys`. A key's comment is free text, so identity is established by its fingerprint, a hash of the public key.
+
+    **Read up on:**
+    - `ssh-keygen -l -f FILE` — fingerprint every key in an authorized_keys file
+    - `man sshd`, AUTHORIZED_KEYS FILE FORMAT section
+    - Fingerprint formats — SHA256 versus MD5
+    - `sed -i` or an editor — remove a single line
+    - `ls -l` — keep ownership and permissions of the file intact
+  scenario: |
+    The account **`kl-deploy`** has three keys in its `~/.ssh/authorized_keys`, but only
+    two were ever approved. Their fingerprints are in **`/lab/approved-keys.txt`**.
+
+    Remove the unapproved key and keep the two approved ones.
+
+    Don't trust the comments at the end of each key: anyone can write anything there.
+  hints:
+    - "`sudo ssh-keygen -lf /home/kl-deploy/.ssh/authorized_keys` prints a fingerprint for each key."
+    - "Keep the file's owner and permissions. Editing it in place with `sudo` does that."
+  solution: |
+    Compare fingerprints rather than comments, and delete the line that isn't approved:
+
+    ```bash
+    sudo ssh-keygen -lf /home/kl-deploy/.ssh/authorized_keys
+    cat /lab/approved-keys.txt
+    sudo sed -i 'LINEd' /home/kl-deploy/.ssh/authorized_keys   # the line number of the bad key
+    ```
+  setup: |
+    useradd -m -s /bin/bash kl-deploy
+    on_reset 'userdel -rf kl-deploy 2>/dev/null'
+    t=$(mktemp -d)
+    d=/home/kl-deploy/.ssh
+    install -d -m 700 -o kl-deploy -g kl-deploy "$d"
+    ssh-keygen -q -t ed25519 -N '' -C 'alice@laptop' -f "$t/alice"
+    ssh-keygen -q -t ed25519 -N '' -C 'ci@build' -f "$t/ci"
+    ssh-keygen -q -t ed25519 -N '' -C 'ci@build' -f "$t/evil"
+    for k in alice ci; do ssh-keygen -lf "$t/$k.pub" | awk '{print $2}'; done > /lab/approved-keys.txt
+    chown "$(lab_user):" /lab/approved-keys.txt
+    cat $(printf '%s\n' "$t/alice.pub" "$t/ci.pub" "$t/evil.pub" | shuf) > "$d/authorized_keys"
+    chown kl-deploy:kl-deploy "$d/authorized_keys"; chmod 600 "$d/authorized_keys"
+    rm -rf "$t"
+  check: |
+    f=/home/kl-deploy/.ssh/authorized_keys
+    check_eq "only the approved keys remain" "$(ssh-keygen -lf "$f" 2>/dev/null | awk '{print $2}' | sort | tr '\n' ' ')" "$(sort /lab/approved-keys.txt | tr '\n' ' ')"
+    check_eq "owner and mode are intact" "$(stat -c '%U %a' "$f")" "kl-deploy 600"
+  solve: |
+    f=/home/kl-deploy/.ssh/authorized_keys
+    n=0
+    sudo cat "$f" > /tmp/keys.txt
+    while read -r line; do
+      n=$((n + 1))
+      fp=$(ssh-keygen -lf - <<<"$line" | awk '{print $2}')
+      grep -qxF "$fp" /lab/approved-keys.txt || sudo sed -i "${n}d" "$f"
+    done < /tmp/keys.txt
+    rm -f /tmp/keys.txt
+
+- id: sec-005
+  title: One file was changed
+  difficulty: 3
+  kind: fix
+  tags: [integrity, forensics]
+  tutorial: |
+    **Concept.** Checksums detect modification even when size and timestamps match. Verifying against a trusted list shows which files differ, and a clean release lets you restore them.
+
+    **Read up on:**
+    - `sha256sum -c` — verify files against a list, with `--quiet` for failures only
+    - `man tar` — extracting a single member from an archive
+    - `diff` and `cmp` — compare a file to the original
+    - Why timestamps and sizes are poor integrity checks
+    - `install` or `cp -p` — restore with ownership and mode preserved
+  scenario: |
+    An application is deployed in **`/srv/kl/app`**. Its checksums are in
+    **`/srv/kl/SHA256SUMS`**, and the clean release is **`/srv/kl/app-release.tar.gz`**.
+
+    Someone changed one file, keeping its size and timestamp the same.
+
+    1. Write the tampered file's path, relative to the app directory (for example
+       `lib/foo.py`), to **`/lab/answer.txt`**.
+    2. Restore **only that file** from the release archive.
+  hints:
+    - "`sha256sum -c` run from the app directory reports which file doesn't match."
+    - "`tar` can extract a single member if you name it exactly: see `tar -tzf`."
+  solution: |
+    ```bash
+    cd /srv/kl/app
+    f=$(sha256sum -c --quiet /srv/kl/SHA256SUMS 2>/dev/null | cut -d: -f1)
+    echo "${f#./}" > /lab/answer.txt
+    sudo tar -xzf /srv/kl/app-release.tar.gz -C /srv/kl/app "$f"
+    ```
+  setup: |
+    mkdir -p /srv/kl/app/lib /srv/kl/app/web /srv/kl/app/tools
+    for d in lib web tools; do
+      for i in $(seq 1 10); do
+        head -c 512 /dev/urandom | od -An -tx1 | sed 's/^/# /' > "/srv/kl/app/$d/mod$i.py"
+      done
+    done
+    cd /srv/kl/app
+    find . -type f | sort | xargs sha256sum > /srv/kl/SHA256SUMS
+    tar -czf /srv/kl/app-release.tar.gz .
+    f=$(find . -type f | shuf -n1)
+    # change one byte in the same position so the size stays the same
+    stamp=$(stat -c %y "$f")
+    printf 'f' | dd of="$f" bs=1 seek=4 conv=notrunc status=none
+    printf 'e' | dd of="$f" bs=1 seek=5 conv=notrunc status=none
+    touch -d "$stamp" "$f"
+    if sha256sum -c --quiet /srv/kl/SHA256SUMS >/dev/null 2>&1; then
+      printf 'd' | dd of="$f" bs=1 seek=6 conv=notrunc status=none; touch -d "$stamp" "$f"
+    fi
+    echo "${f#./}" > "$KL_STATE/answer"
+    # snapshot of what must stay untouched
+    find . -type f ! -path "$f" | sort | xargs stat -c '%n %i' > "$KL_STATE/inodes"
+  check: |
+    check_eq "file named in /lab/answer.txt" "$(tr -d '[:space:]' 2>/dev/null </lab/answer.txt | sed 's#^\./##')" "$(cat "$KL_STATE/answer")"
+    check "every file matches its checksum" 'cd /srv/kl/app && sha256sum -c --quiet /srv/kl/SHA256SUMS'
+    check_eq "only that file was restored" "$(cd /srv/kl/app && xargs stat -c '%n %i' < <(awk '{print $1}' "$KL_STATE/inodes") | sha256sum)" "$(sha256sum <"$KL_STATE/inodes")"
+  solve: |
+    cd /srv/kl/app
+    f=$(sha256sum -c --quiet /srv/kl/SHA256SUMS 2>/dev/null | cut -d: -f1)
+    echo "${f#./}" > /lab/answer.txt
+    sudo tar -xzf /srv/kl/app-release.tar.gz -C /srv/kl/app "$f"

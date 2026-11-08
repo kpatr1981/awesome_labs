@@ -1,0 +1,564 @@
+track: networking
+module: Switching, services & tunnels
+profile: docker
+order: 2
+exercises:
+
+- id: net-006
+  title: Tag it with a VLAN
+  difficulty: 2
+  kind: build
+  tags: [vlan, layer2, netns]
+  tutorial: |
+    **Concept.** A VLAN tags Ethernet frames so one physical link can carry several isolated networks. Both ends must agree on the tag, and Linux represents each VLAN as a sub-interface.
+
+    **Read up on:**
+    - `man ip-link` — the `vlan` link type and its `id` parameter
+    - `ip -d link show` — verify the VLAN details of an interface
+    - `ip addr add` — assigning addresses to the new interface
+    - Why a new interface must be set up before it passes traffic
+    - 802.1Q — how the tag fits into a frame
+  scenario: |
+    Hosts **`h1`** and **`h2`** are joined by a trunk link on their `eth0` interfaces.
+
+    On each host, create a **VLAN 100** interface named **`eth0.100`**. Give h1
+    `10.100.0.1/24` and h2 `10.100.0.2/24` on it, so they can ping over the VLAN.
+  hints:
+    - "`ip link add link eth0 name eth0.100 type vlan id 100`"
+    - "A new interface starts down, so bring it up after adding the address."
+  solution: |
+    ```bash
+    sudo ip netns exec h1 bash -c 'ip link add link eth0 name eth0.100 type vlan id 100; ip addr add 10.100.0.1/24 dev eth0.100; ip link set eth0.100 up'
+    sudo ip netns exec h2 bash -c 'ip link add link eth0 name eth0.100 type vlan id 100; ip addr add 10.100.0.2/24 dev eth0.100; ip link set eth0.100 up'
+    ```
+  setup: |
+    modprobe 8021q
+    netns_new h1 h2
+    netns_link h1 eth0 h2 eth0
+  check: |
+    for n in h1 h2; do
+      check "$n has eth0.100 on VLAN 100" 'ip -n $n -d link show eth0.100 | grep -q "vlan protocol 802.1Q id 100"'
+    done
+    check "h1 can ping h2 over the VLAN" 'ip netns exec h1 ping -c1 -W2 -I eth0.100 10.100.0.2'
+  solve: |
+    sudo ip netns exec h1 bash -c 'ip link add link eth0 name eth0.100 type vlan id 100; ip addr add 10.100.0.1/24 dev eth0.100; ip link set eth0.100 up'
+    sudo ip netns exec h2 bash -c 'ip link add link eth0 name eth0.100 type vlan id 100; ip addr add 10.100.0.2/24 dev eth0.100; ip link set eth0.100 up'
+
+- id: net-007
+  title: Build a switch
+  difficulty: 3
+  kind: build
+  tags: [bridge, layer2, netns]
+  tutorial: |
+    **Concept.** A switch learns which MAC addresses sit behind which port and forwards frames accordingly. In Linux a bridge device does this job, and ports are interfaces enslaved to it.
+
+    **Read up on:**
+    - `man ip-link` — the `bridge` type and the `master` option
+    - `bridge link` and `bridge fdb` — show ports and the learned MAC table
+    - `ip link set ... up` — bring devices up
+    - Layer 2 versus layer 3 — why hosts on a bridge need addresses but the bridge doesn't
+    - `ping` between all pairs to confirm
+  scenario: |
+    Hosts **`h1`**, **`h2`** and **`h3`** (10.30.0.1 to .3) are each cabled to the
+    namespace **`sw`**, on its ports `p1`, `p2` and `p3`.
+
+    Turn `sw` into a switch: create a bridge called **`br0`** with all three ports in it,
+    so that every host can reach the others.
+  hints:
+    - "`ip link add br0 type bridge`"
+    - "`ip link set p1 master br0` adds a port. The bridge must also be brought up."
+  solution: |
+    ```bash
+    sudo ip netns exec sw bash -c '
+      ip link add br0 type bridge
+      for p in p1 p2 p3; do ip link set $p master br0; done
+      ip link set br0 up'
+    ```
+  setup: |
+    netns_new h1 h2 h3 sw
+    for i in 1 2 3; do
+      netns_link "h$i" eth0 sw "p$i"
+      ip -n "h$i" addr add "10.30.0.$i/24" dev eth0
+    done
+  check: |
+    check_eq "br0 has three ports" "$(ip -n sw -o link show master br0 2>/dev/null | wc -l)" 3
+    check "h1 can reach h3" 'ip netns exec h1 ping -c1 -W2 10.30.0.3'
+    check "h2 can reach h1" 'ip netns exec h2 ping -c1 -W2 10.30.0.1'
+  solve: |
+    sudo ip netns exec sw bash -c '
+      ip link add br0 type bridge
+      for p in p1 p2 p3; do ip link set $p master br0; done
+      ip link set br0 up'
+
+- id: net-008
+  title: Two uplinks, one rule
+  difficulty: 3
+  kind: build
+  tags: [routing, policy-routing, netns]
+  tutorial: |
+    **Concept.** Normally routing looks only at the destination. Policy routing adds rules that choose a routing table based on other fields, such as the source address.
+
+    **Read up on:**
+    - `man ip-rule` — rule selectors and the action that points at a table
+    - `man ip-route` — populating a specific table with `table`
+    - `ip route show table N` — view a table
+    - `ip route get ... from ...` — test the path for a given source
+    - How the main table and rule priorities interact
+  scenario: |
+    Host **`h`** has two uplinks: `eth0` to gateway `10.70.0.1`, its default route, and
+    `eth1` to gateway `10.80.0.1`. It also has a service address, `10.90.0.5`, on `lo`.
+
+    Traffic **sourced from 10.90.0.5** must leave through **10.80.0.1**, using routing
+    table **100**. All other traffic must keep using 10.70.0.1.
+  hints:
+    - "Normal routes can't choose by source address, but `ip rule` can."
+    - "Add a default route to table 100, then a rule sending that source to the table."
+    - "`ip route get 1.1.1.1 from 10.90.0.5` tests it."
+  solution: |
+    ```bash
+    sudo ip netns exec h ip route add default via 10.80.0.1 dev eth1 table 100
+    sudo ip netns exec h ip rule add from 10.90.0.5 lookup 100
+    sudo ip netns exec h ip route get 1.1.1.1 from 10.90.0.5
+    ```
+  setup: |
+    netns_new h g1 g2
+    netns_link h eth0 g1 eth0
+    netns_link h eth1 g2 eth0
+    ip -n h addr add 10.70.0.2/24 dev eth0
+    ip -n g1 addr add 10.70.0.1/24 dev eth0
+    ip -n h addr add 10.80.0.2/24 dev eth1
+    ip -n g2 addr add 10.80.0.1/24 dev eth0
+    ip -n h addr add 10.90.0.5/32 dev lo
+    ip -n h route add default via 10.70.0.1
+  check: |
+    check_match "the service address uses gateway 2" "$(ip -n h route get 1.1.1.1 from 10.90.0.5 2>/dev/null)" 'via 10\.80\.0\.1'
+    check_match "other traffic uses gateway 1" "$(ip -n h route get 1.1.1.1 2>/dev/null)" 'via 10\.70\.0\.1'
+    check "the rule uses table 100" 'ip -n h rule | grep -qE "from 10\.90\.0\.5 lookup 100"'
+  solve: |
+    sudo ip netns exec h ip route add default via 10.80.0.1 dev eth1 table 100
+    sudo ip netns exec h ip rule add from 10.90.0.5 lookup 100
+
+- id: net-009
+  title: One client, one port
+  difficulty: 3
+  kind: build
+  tags: [firewall, nftables, netns]
+  tutorial: |
+    **Concept.** A host firewall evaluates each incoming packet against chains of rules. A default-deny policy is only usable if you explicitly permit replies to your own connections and local traffic.
+
+    **Read up on:**
+    - `man nft` — families, hooks, and `policy` on base chains
+    - Connection tracking states — `ct state established,related`
+    - Matching on `ip saddr`, `tcp dport` and `iif`
+    - `nft list ruleset` — verify what is active
+    - Rule order — rules are evaluated top to bottom
+  scenario: |
+    On one network segment are **`h1`** (10.40.0.1), **`h2`** (10.40.0.2) and **`h3`**
+    (10.40.0.3). `h2` runs a web server on port 8080.
+
+    Use **nftables on h2** to:
+
+    - drop all incoming traffic by default,
+    - allow port 8080 **only from h1**,
+    - still let h2 start its own connections and get the replies.
+  hints:
+    - "`type filter hook input priority filter; policy drop;` sets the default."
+    - "`ct state established,related accept` allows replies to h2's own traffic."
+    - "`ip saddr 10.40.0.1 tcp dport 8080 accept`"
+  solution: |
+    ```bash
+    sudo ip netns exec h2 nft -f - <<'EOF'
+    table inet filter {
+      chain input {
+        type filter hook input priority filter; policy drop;
+        ct state established,related accept
+        iif lo accept
+        ip saddr 10.40.0.1 tcp dport 8080 accept
+      }
+    }
+    EOF
+    ```
+  setup: |
+    netns_new h1 h2 h3 sw
+    ip -n sw link add br0 type bridge
+    ip -n sw link set br0 up
+    for i in 1 2 3; do
+      netns_link "h$i" eth0 sw "p$i"
+      ip -n sw link set "p$i" master br0
+      ip -n "h$i" addr add "10.40.0.$i/24" dev eth0
+    done
+    on_reset 'systemctl stop kl-web 2>/dev/null; systemctl reset-failed kl-web 2>/dev/null; rm -rf /srv/kl-web'
+    mkdir -p /srv/kl-web
+    echo hello > /srv/kl-web/index.html
+    systemd-run --quiet --unit=kl-web --working-directory=/srv/kl-web ip netns exec h2 python3 -m http.server 8080
+    eventually 15 'ip netns exec h1 curl -fsS -m2 http://10.40.0.2:8080/'
+  check: |
+    check "h1 reaches port 8080" 'ip netns exec h1 curl -fsS -m3 http://10.40.0.2:8080/'
+    check_not "h3 is blocked" 'ip netns exec h3 curl -fsS -m2 http://10.40.0.2:8080/'
+    check "the input policy is drop" 'ip netns exec h2 nft list ruleset | grep -q "policy drop"'
+    check "h2 can still start connections" 'ip netns exec h2 ping -c1 -W2 10.40.0.1'
+  solve: |
+    sudo ip netns exec h2 nft -f - <<'EOF'
+    table inet filter {
+      chain input {
+        type filter hook input priority filter; policy drop;
+        ct state established,related accept
+        iif lo accept
+        ip saddr 10.40.0.1 tcp dport 8080 accept
+      }
+    }
+    EOF
+
+- id: net-010
+  title: Where does the mail go?
+  difficulty: 2
+  kind: build
+  tags: [dns, dig, mx]
+  tutorial: |
+    **Concept.** DNS answers questions by record type. MX records name mail servers, each with a preference number, and mail goes to the lowest number first.
+
+    **Read up on:**
+    - `man dig` — querying a specific server (`@server`) and a non-default port (`-p`)
+    - MX records — what the preference value means
+    - `dig +short` — terse output suitable for scripts
+    - `sort -n` — ordering numerically
+    - Trailing dot in DNS names — fully qualified form
+  scenario: |
+    A DNS server is listening on **127.0.0.1, port 5353**. The domain **`example.test`**
+    has two mail servers.
+
+    Find the one mail gets delivered to **first**, and write its hostname to
+    **`/lab/answer.txt`**.
+  hints:
+    - "`dig @127.0.0.1 -p 5353 example.test MX`"
+    - "For MX records, the **lowest** preference number wins."
+  solution: |
+    ```bash
+    dig +short @127.0.0.1 -p 5353 example.test MX | sort -n | head -1 | awk '{print $2}' | sed 's/\.$//' > /lab/answer.txt
+    ```
+  setup: |
+    on_reset 'systemctl stop kl-dns 2>/dev/null; systemctl reset-failed kl-dns 2>/dev/null; rm -rf /srv/kl-dns'
+    mkdir -p /srv/kl-dns
+    if [ $((RANDOM % 2)) = 0 ]; then a=10 b=20 first=mail-a; else a=20 b=10 first=mail-b; fi
+    echo "$first.example.test" > "$KL_STATE/answer"
+    cat >/srv/kl-dns/dnsmasq.conf <<EOF
+    mx-host=example.test,mail-a.example.test,$a
+    mx-host=example.test,mail-b.example.test,$b
+    EOF
+    systemd-run --quiet --unit=kl-dns dnsmasq --no-daemon --no-resolv --no-hosts --user=nobody --port=5353 --listen-address=127.0.0.1 --bind-interfaces --local=/test/ -C /srv/kl-dns/dnsmasq.conf
+    eventually 15 'dig +short +time=1 @127.0.0.1 -p 5353 example.test MX | grep -q mail'
+  check: |
+    check_eq "primary mail server in /lab/answer.txt" "$(sed 's/\.$//' /lab/answer.txt 2>/dev/null | tr -d '[:space:]')" "$(cat "$KL_STATE/answer")"
+  solve: |
+    dig +short @127.0.0.1 -p 5353 example.test MX | sort -n | head -1 | awk '{print $2}' | sed 's/\.$//' > /lab/answer.txt
+
+- id: net-011
+  title: The name that won't resolve
+  difficulty: 2
+  kind: fix
+  tags: [dns, dnsmasq]
+  tutorial: |
+    **Concept.** A DNS daemon serves records from its config file. If a name does not resolve, check what is configured, whether the service loaded it, and what the server actually answers.
+
+    **Read up on:**
+    - `dig @127.0.0.1 -p PORT name` — query this server directly
+    - `man dnsmasq` — record directives such as `host-record`, `cname` and `address`
+    - `dnsmasq --test` — check a config file's syntax
+    - `systemctl restart` and `journalctl -u` — apply changes and read errors
+    - Compare each configured record against what `dig` returns
+  scenario: |
+    A DNS server is running on **127.0.0.1, port 5353**, as the systemd service
+    **`kl-dns`**, using the config file **`/srv/kl-dns/dnsmasq.conf`**.
+
+    `app.example.test` and its alias `www.example.test` don't resolve. Both should give
+    **`10.5.0.20`**. Fix the config, restart the service, and keep the other records.
+  hints:
+    - "`dig @127.0.0.1 -p 5353 app.example.test` shows the failure. Then read the config closely."
+    - "dnsmasq only reads its config at startup."
+  solution: |
+    The `host-record` has a typo: `ap` instead of `app`.
+
+    ```bash
+    sed -i 's/^host-record=ap\.example/host-record=app.example/' /srv/kl-dns/dnsmasq.conf
+    sudo systemctl restart kl-dns
+    dig +short @127.0.0.1 -p 5353 www.example.test
+    ```
+  setup: |
+    on_reset 'systemctl stop kl-dns 2>/dev/null; systemctl reset-failed kl-dns 2>/dev/null; rm -rf /srv/kl-dns'
+    mkdir -p /srv/kl-dns
+    cat >/srv/kl-dns/dnsmasq.conf <<'EOF'
+    host-record=ap.example.test,10.5.0.20
+    host-record=db.example.test,10.5.0.30
+    cname=www.example.test,app.example.test
+    EOF
+    chown -R "$(lab_user):" /srv/kl-dns
+    systemd-run --quiet --unit=kl-dns dnsmasq --no-daemon --no-resolv --no-hosts --user=nobody --port=5353 --listen-address=127.0.0.1 --bind-interfaces --local=/test/ -C /srv/kl-dns/dnsmasq.conf
+    eventually 15 'dig +short +time=1 @127.0.0.1 -p 5353 db.example.test | grep -q 10.5'
+  check: |
+    q() { dig +short +time=2 @127.0.0.1 -p 5353 "$1" A | tail -1; }
+    check_eq "app.example.test resolves" "$(q app.example.test)" 10.5.0.20
+    check_eq "www.example.test resolves" "$(q www.example.test)" 10.5.0.20
+    check_eq "db.example.test still resolves" "$(q db.example.test)" 10.5.0.30
+  solve: |
+    sed -i 's/^host-record=ap\.example/host-record=app.example/' /srv/kl-dns/dnsmasq.conf
+    sudo systemctl restart kl-dns
+
+- id: net-012
+  title: Read the certificate
+  difficulty: 2
+  kind: build
+  tags: [tls, openssl]
+  tutorial: |
+    **Concept.** A TLS server presents an X.509 certificate with a subject, optional subject alternative names, and a validity period. Modern clients match hostnames against the SANs, not the common name.
+
+    **Read up on:**
+    - `openssl s_client -connect host:port` — fetch the certificate a server presents
+    - `openssl x509 -noout` — options like `-subject`, `-enddate` and `-ext`
+    - Subject Alternative Name versus Common Name — which one clients check
+    - `-dateopt` or `date -d` — convert an expiry into the format asked for
+    - `</dev/null` — stop `s_client` waiting for input
+  scenario: |
+    A TLS server is running on **127.0.0.1:8443**. Inspect the certificate it presents:
+
+    1. Write its **DNS subject alternative name** to **`/lab/answer.txt`**. It isn't the
+       same as the common name.
+    2. Write its **expiry date** in UTC, as `YYYY-MM-DD`, to **`/lab/expiry.txt`**.
+  hints:
+    - "`openssl s_client -connect 127.0.0.1:8443 </dev/null` prints the certificate."
+    - "Pipe that into `openssl x509 -noout -ext subjectAltName -enddate`."
+    - "`date -u -d \"Jan  2 03:04:05 2030 GMT\" +%F` converts the date."
+  solution: |
+    ```bash
+    openssl s_client -connect 127.0.0.1:8443 </dev/null 2>/dev/null | openssl x509 > /lab/c.pem
+    openssl x509 -in /lab/c.pem -noout -ext subjectAltName | grep -oE 'DNS:[^, ]+' | cut -d: -f2 > /lab/answer.txt
+    date -u -d "$(openssl x509 -in /lab/c.pem -noout -enddate | cut -d= -f2)" +%F > /lab/expiry.txt
+    ```
+  setup: |
+    on_reset 'rm -rf /srv/kl-tls'
+    mkdir -p /srv/kl-tls
+    name=svc-$RANDOM.internal.test
+    days=$((100 + RANDOM % 900))
+    openssl req -x509 -newkey rsa:2048 -nodes -keyout /srv/kl-tls/k.pem -out /srv/kl-tls/c.pem -days "$days" -subj "/CN=legacy-name" -addext "subjectAltName=DNS:$name" 2>/dev/null
+    chmod 644 /srv/kl-tls/k.pem
+    echo "$name" > "$KL_STATE/answer"
+    date -u -d "$(openssl x509 -in /srv/kl-tls/c.pem -noout -enddate | cut -d= -f2)" +%F > "$KL_STATE/expiry"
+    cat >/srv/kl-tls/default.conf <<'EOF'
+    server {
+      listen 8443 ssl;
+      ssl_certificate /t/c.pem;
+      ssl_certificate_key /t/k.pem;
+      return 200 "ok\n";
+    }
+    EOF
+    docker run -d --name kl-tls -p 127.0.0.1:8443:8443 -v /srv/kl-tls:/t:ro -v /srv/kl-tls/default.conf:/etc/nginx/conf.d/default.conf:ro nginx:1.27-alpine >/dev/null
+    eventually 15 'curl -kfsS -m2 https://127.0.0.1:8443/'
+  check: |
+    check_eq "name in /lab/answer.txt" "$(tr -d '[:space:]' 2>/dev/null </lab/answer.txt)" "$(cat "$KL_STATE/answer")"
+    check_eq "date in /lab/expiry.txt" "$(tr -d '[:space:]' 2>/dev/null </lab/expiry.txt)" "$(cat "$KL_STATE/expiry")"
+  solve: |
+    openssl s_client -connect 127.0.0.1:8443 </dev/null 2>/dev/null | openssl x509 > /lab/c.pem
+    openssl x509 -in /lab/c.pem -noout -ext subjectAltName | grep -oE 'DNS:[^, ]+' | cut -d: -f2 > /lab/answer.txt
+    date -u -d "$(openssl x509 -in /lab/c.pem -noout -enddate | cut -d= -f2)" +%F > /lab/expiry.txt
+
+- id: net-013
+  title: Run your own CA
+  difficulty: 4
+  kind: build
+  tags: [tls, pki, openssl]
+  tutorial: |
+    **Concept.** A private CA is a key pair plus a self-signed certificate. It signs certificate requests from servers, and clients trust those certificates if they trust the CA.
+
+    **Read up on:**
+    - `man openssl-req` — generating keys, requests and self-signed certificates
+    - `man openssl-x509` — signing a request with a CA (`-CA`, `-CAkey`)
+    - Subject alternative names — how to put a DNS name into the signed certificate
+    - `openssl verify -CAfile` — check the chain
+    - Extension config files or `-addext` — adding fields to a certificate
+  scenario: |
+    Create a small private certificate authority and issue a server certificate from it.
+    Put these files in **`/lab/tls`**:
+
+    | File | Contents |
+    |---|---|
+    | `ca.crt` | your CA's certificate |
+    | `server.key` | the server's private key |
+    | `server.crt` | the server's certificate, **signed by your CA**, valid for the DNS name **`app.test`** |
+
+    The check starts a real nginx with these files and connects with `curl`, trusting
+    only your CA. Modern clients ignore the common name, so the certificate must have a
+    **subject alternative name**.
+  hints:
+    - "Make the CA with `openssl req -x509 -newkey rsa:2048 -nodes`."
+    - "For the server, create a key and CSR, then sign it with `openssl x509 -req -CA ca.crt -CAkey ca.key -CAcreateserial`."
+    - "Pass `-extfile <(echo subjectAltName=DNS:app.test)` when signing, or the SAN is lost."
+  solution: |
+    ```bash
+    mkdir -p /lab/tls && cd /lab/tls
+    openssl req -x509 -newkey rsa:2048 -nodes -keyout ca.key -out ca.crt -days 365 -subj "/CN=Lab CA"
+    openssl req -newkey rsa:2048 -nodes -keyout server.key -out server.csr -subj "/CN=app.test"
+    openssl x509 -req -in server.csr -CA ca.crt -CAkey ca.key -CAcreateserial -out server.crt -days 90 \
+      -extfile <(echo subjectAltName=DNS:app.test)
+    ```
+  setup: |
+    mkdir -p /srv/kl-tls2
+    on_reset 'rm -rf /srv/kl-tls2'
+    cat >/srv/kl-tls2/default.conf <<'EOF'
+    server {
+      listen 9443 ssl;
+      ssl_certificate /t/server.crt;
+      ssl_certificate_key /t/server.key;
+      return 200 "secure\n";
+    }
+    EOF
+  check: |
+    t=/lab/tls
+    if [ -f $t/ca.crt ] && [ -f $t/server.crt ] && [ -f $t/server.key ]; then
+      check "server.crt is signed by your CA" 'openssl verify -CAfile $t/ca.crt $t/server.crt'
+      check_not "server.crt isn't self-signed" '[ "$(openssl x509 -in $t/server.crt -noout -subject_hash)" = "$(openssl x509 -in $t/server.crt -noout -issuer_hash)" ]'
+      docker rm -f kl-tls-check >/dev/null 2>&1
+      docker run -d --name kl-tls-check -p 127.0.0.1:9443:9443 -v $t:/t:ro -v /srv/kl-tls2/default.conf:/etc/nginx/conf.d/default.conf:ro nginx:1.27-alpine >/dev/null 2>&1
+      eventually 12 'curl -kfsS -m2 https://127.0.0.1:9443/ >/dev/null' || true
+      check_eq "curl trusts the server as app.test" "$(curl -fsS -m4 --cacert $t/ca.crt --resolve app.test:9443:127.0.0.1 https://app.test:9443/ 2>/dev/null)" secure
+      docker rm -f kl-tls-check >/dev/null 2>&1
+    else
+      fail "ca.crt, server.crt and server.key exist in /lab/tls"
+    fi
+  solve: |
+    mkdir -p /lab/tls && cd /lab/tls
+    openssl req -x509 -newkey rsa:2048 -nodes -keyout ca.key -out ca.crt -days 365 -subj "/CN=Lab CA" 2>/dev/null
+    openssl req -newkey rsa:2048 -nodes -keyout server.key -out server.csr -subj "/CN=app.test" 2>/dev/null
+    openssl x509 -req -in server.csr -CA ca.crt -CAkey ca.key -CAcreateserial -out server.crt -days 90 -extfile <(echo subjectAltName=DNS:app.test) 2>/dev/null
+    chmod 644 server.key
+
+- id: net-014
+  title: 502 Bad Gateway
+  difficulty: 2
+  kind: fix
+  tags: [nginx, proxy, http]
+  tutorial: |
+    **Concept.** A reverse proxy forwards requests to an upstream. A 502 means the proxy could not get a valid answer from that upstream, so check the address it uses and what the upstream actually serves.
+
+    **Read up on:**
+    - `docker logs` — nginx's error log shows what failed
+    - `docker exec ... nginx -t` — test config syntax before reloading
+    - nginx `proxy_pass` — how upstream host and port are specified
+    - `docker inspect` and `docker port` — what a container exposes
+    - `curl -v` — test both proxy and upstream directly
+  scenario: |
+    nginx (container **`kl-proxy`**) answers on **http://127.0.0.1:8088/** and should
+    forward to the app in container **`kl-app`**, but every request returns **502**.
+
+    Its config is **`/lab/nginx/default.conf`**. Fix it and reload nginx:
+
+    ```bash
+    docker exec kl-proxy nginx -s reload
+    ```
+
+    The app itself is fine, so don't touch `kl-app`.
+  hints:
+    - "`docker logs kl-proxy` shows what nginx tried and why it failed."
+    - "Compare the port in `proxy_pass` with what the app actually listens on: `docker inspect kl-app`."
+  solution: |
+    `proxy_pass` uses port 8080, but the app listens on port 80.
+
+    ```bash
+    sed -i 's#http://kl-app:8080#http://kl-app:80#' /lab/nginx/default.conf
+    docker exec kl-proxy nginx -s reload
+    curl -s http://127.0.0.1:8088/
+    ```
+  setup: |
+    docker network create kl-net >/dev/null
+    docker run -d --name kl-app --network kl-net traefik/whoami:v1.10 >/dev/null
+    mkdir -p /lab/nginx
+    cat >/lab/nginx/default.conf <<'EOF'
+    server {
+      listen 80;
+      location / {
+        proxy_pass http://kl-app:8080;
+      }
+    }
+    EOF
+    chown -R "$(lab_user):" /lab/nginx
+    docker run -d --name kl-proxy --network kl-net -p 127.0.0.1:8088:80 -v /lab/nginx:/etc/nginx/conf.d:ro nginx:1.27-alpine >/dev/null
+    eventually 15 '[ "$(curl -s -o /dev/null -m2 -w "%{http_code}" http://127.0.0.1:8088/)" = 502 ]'
+    docker inspect -f '{{.Id}}' kl-app > "$KL_STATE/answer"
+  check: |
+    # nginx -s reload returns before the new workers are serving
+    eventually 6 'curl -s -m2 http://127.0.0.1:8088/ | grep -q Hostname:' || true
+    check_match "the proxy reaches the app" "$(curl -s -m4 http://127.0.0.1:8088/)" 'Hostname:'
+    check_eq "kl-app was left alone" "$(docker inspect -f '{{.Id}}' kl-app)" "$(cat "$KL_STATE/answer")"
+  solve: |
+    sed -i 's#http://kl-app:8080#http://kl-app:80#' /lab/nginx/default.conf
+    docker exec kl-proxy nginx -s reload
+
+- id: net-015
+  title: A WireGuard tunnel
+  difficulty: 4
+  kind: build
+  tags: [vpn, wireguard, netns]
+  tutorial: |
+    **Concept.** WireGuard builds an encrypted tunnel between peers. Each side has a private key, trusts the other's public key, and lists which addresses may be sent through that peer.
+
+    **Read up on:**
+    - `man wg` — `genkey`, `pubkey`, and `set` with `peer`, `allowed-ips` and `endpoint`
+    - `man ip-link` — creating a link of type `wireguard`
+    - `wg show` — latest handshake and transfer counters
+    - Allowed IPs — it acts as routing table and filter
+    - `ip addr add` and `ip link set up` — configuring the interface
+  scenario: |
+    Hosts **`h1`** (10.0.0.1) and **`h2`** (10.0.0.2) are connected directly on `eth0`.
+
+    Build a WireGuard tunnel between them:
+
+    - each host gets an interface called **`wg0`**, listening on UDP **51820**,
+    - h1's tunnel address is **`172.16.0.1/24`**, and h2's is **`172.16.0.2/24`**,
+    - h1 must be able to ping `172.16.0.2`.
+
+    `wg` takes keys from files, and `/lab` is a handy place for them.
+  hints:
+    - "`wg genkey | tee h1.key | wg pubkey > h1.pub` makes a key pair."
+    - "`ip link add wg0 type wireguard`, then `wg set wg0 private-key FILE listen-port 51820 peer PUB allowed-ips IP/32 endpoint IP:PORT`."
+    - "Each side needs the *other* side's public key."
+  solution: |
+    ```bash
+    cd /lab
+    for h in h1 h2; do wg genkey | tee $h.key | wg pubkey > $h.pub; done
+
+    sudo ip netns exec h1 bash -c "
+      ip link add wg0 type wireguard
+      wg set wg0 private-key /lab/h1.key listen-port 51820 peer $(cat h2.pub) allowed-ips 172.16.0.2/32 endpoint 10.0.0.2:51820
+      ip addr add 172.16.0.1/24 dev wg0
+      ip link set wg0 up"
+
+    sudo ip netns exec h2 bash -c "
+      ip link add wg0 type wireguard
+      wg set wg0 private-key /lab/h2.key listen-port 51820 peer $(cat h1.pub) allowed-ips 172.16.0.1/32 endpoint 10.0.0.1:51820
+      ip addr add 172.16.0.2/24 dev wg0
+      ip link set wg0 up"
+    ```
+  setup: |
+    modprobe wireguard
+    netns_new h1 h2
+    netns_link h1 eth0 h2 eth0
+    ip -n h1 addr add 10.0.0.1/24 dev eth0
+    ip -n h2 addr add 10.0.0.2/24 dev eth0
+  check: |
+    for n in h1 h2; do
+      check "$n has a WireGuard wg0" 'ip -n $n -d link show wg0 | grep -q wireguard'
+    done
+    check "h1 can ping through the tunnel" 'ip netns exec h1 ping -c2 -W2 172.16.0.2'
+    check_match "the peers completed a handshake" "$(ip netns exec h1 wg show wg0 latest-handshakes 2>/dev/null | awk '{print $2}')" '^[1-9]'
+    check_eq "h1 listens on 51820" "$(ip netns exec h1 wg show wg0 listen-port 2>/dev/null)" 51820
+  solve: |
+    cd /lab
+    for h in h1 h2; do wg genkey | tee $h.key | wg pubkey > $h.pub; done
+    sudo ip netns exec h1 bash -c "
+      ip link add wg0 type wireguard
+      wg set wg0 private-key /lab/h1.key listen-port 51820 peer $(cat h2.pub) allowed-ips 172.16.0.2/32 endpoint 10.0.0.2:51820
+      ip addr add 172.16.0.1/24 dev wg0
+      ip link set wg0 up"
+    sudo ip netns exec h2 bash -c "
+      ip link add wg0 type wireguard
+      wg set wg0 private-key /lab/h2.key listen-port 51820 peer $(cat h1.pub) allowed-ips 172.16.0.1/32 endpoint 10.0.0.1:51820
+      ip addr add 172.16.0.2/24 dev wg0
+      ip link set wg0 up"

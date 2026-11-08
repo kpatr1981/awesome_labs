@@ -88,6 +88,75 @@ on_reset() {
   printf '%s\n' "$*" >>"$KL_STATE/cleanup.d/$(date +%s%N).sh"
 }
 
+# ---------- network namespace helpers ----------
+# netns_new NAME... -> create namespaces with lo up; removed on reset
+netns_new() {
+  local n
+  for n in "$@"; do
+    ip netns add "$n"
+    ip -n "$n" link set lo up
+    on_reset "ip netns del $n 2>/dev/null"
+  done
+}
+# netns_link NS1 IF1 NS2 IF2 -> connect two namespaces with a veth pair, both ends up
+netns_link() {
+  # build under temporary names: IF1/IF2 may match an interface on the VM itself
+  local a="klv$RANDOM" b="klv$RANDOM"
+  ip link add "$a" type veth peer name "$b"
+  ip link set "$a" netns "$1" name "$2"
+  ip link set "$b" netns "$3" name "$4"
+  ip -n "$1" link set "$2" up
+  ip -n "$3" link set "$4" up
+}
+
+# ---------- AWS emulator helper ----------
+# moto_start -> run the emulator on 127.0.0.1:5000 and install an `aws` command
+# that talks to it. The CLI runs in a container that can only see /lab.
+moto_start() {
+  docker rm -f kl-moto >/dev/null 2>&1 || true
+  docker run -d --name kl-moto --network host motoserver/moto:5.2.4 -H 127.0.0.1 -p 5000 >/dev/null
+  cat >/usr/local/bin/aws <<'WRAP'
+#!/bin/bash
+exec docker run --rm -i --network host \
+  -e AWS_ENDPOINT_URL=http://127.0.0.1:5000 -e AWS_ACCESS_KEY_ID=test -e AWS_SECRET_ACCESS_KEY=test \
+  -e AWS_DEFAULT_REGION=us-east-1 -e AWS_PAGER= -v /lab:/lab -w /lab amazon/aws-cli:2.39.0 "$@"
+WRAP
+  chmod 755 /usr/local/bin/aws
+  on_reset 'rm -f /usr/local/bin/aws'
+  eventually 30 'curl -fsS -m 2 http://127.0.0.1:5000/moto-api/ >/dev/null'
+}
+
+# ---------- Go helper ----------
+# go_test <<'GO' ... GO -> run a hidden test file against the learner's /lab/*.go
+go_test() {
+  local d rc
+  d=$(mktemp -d)
+  cp /lab/*.go "$d"/ 2>/dev/null
+  cat >"$d/zz_hidden_test.go"
+  timeout 180 docker run --rm -v "$d:/src" -v kl-gocache:/root/.cache -w /src golang:1.24-alpine \
+    sh -c 'go mod init lab >/dev/null 2>&1; go test ./...' 2>&1 | tail -15
+  rc=${PIPESTATUS[0]}
+  rm -rf "$d"
+  return "$rc"
+}
+
+# ---------- PostgreSQL helper ----------
+# pg_start -> run PostgreSQL as container kl-pg (database and user "lab")
+pg_start() {
+  docker rm -f kl-pg >/dev/null 2>&1 || true
+  docker run -d --name kl-pg -e POSTGRES_USER=lab -e POSTGRES_PASSWORD=lab -e POSTGRES_DB=lab postgres:16-alpine >/dev/null
+  # the image restarts the server after init, so require a real TCP connection
+  eventually 60 "docker exec kl-pg psql -h 127.0.0.1 -U lab -d lab -c 'select 1'"
+}
+# pg_sql 'SQL' -> run SQL and print bare rows; pg_sql with no argument reads stdin
+pg_sql() {
+  if [ $# -gt 0 ]; then
+    docker exec -i kl-pg psql -h 127.0.0.1 -U lab -d lab -v ON_ERROR_STOP=1 -qAt -c "$1"
+  else
+    docker exec -i kl-pg psql -h 127.0.0.1 -U lab -d lab -v ON_ERROR_STOP=1 -qAt
+  fi
+}
+
 # ---------- docker helpers ----------
 c_running() { [ "$(docker inspect -f '{{.State.Running}}' "$1" 2>/dev/null)" = true ]; }
 c_exists() { docker inspect "$1" >/dev/null 2>&1; }

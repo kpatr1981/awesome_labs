@@ -58,6 +58,18 @@ func trackLabel(t string) string {
 		return "Kubernetes"
 	case "offsec":
 		return "Offensive Sec"
+	case "linux":
+		return "Linux"
+	case "networking":
+		return "Networking"
+	case "cloud":
+		return "Cloud"
+	case "data":
+		return "Data"
+	case "security":
+		return "Security"
+	case "programming":
+		return "Programming"
 	}
 	return t
 }
@@ -287,6 +299,14 @@ func (m *model) refreshViewport(follow bool) {
 	case m.tab == tabScenario:
 		intro := sMuted.Render("Press s to prepare the lab, then t to open a terminal. The task is also in /lab/TASK.md.")
 		content = intro + "\n" + m.markdown("sc:"+m.cur.ID, m.cur.Scenario, w)
+	case m.tab == tabLearn && m.examLocked(m.cur):
+		content = sMuted.Render("\n  🔒 Tutorials are locked during the exam.")
+	case m.tab == tabLearn:
+		if strings.TrimSpace(m.cur.Tutorial) == "" {
+			content = sMuted.Render("\n  No tutorial for this one yet.")
+			break
+		}
+		content = m.markdown("learn:"+m.cur.ID, m.cur.Tutorial, w)
 	case m.tab == tabHints && m.examLocked(m.cur):
 		content = sMuted.Render("\n  🔒 Hints are locked during the exam.")
 	case m.tab == tabSolution && m.examLocked(m.cur):

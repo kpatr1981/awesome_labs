@@ -103,11 +103,22 @@ func (m *model) examSources() []examSource {
 		}
 		return r
 	}
-	all := byProfile(m.cat.Exercises)
+	// One pool per track: several tracks share a lab VM, so a pool per profile
+	// would mix them.
+	all := map[string][]*exercise.Exercise{}
+	for _, e := range m.cat.Exercises {
+		all[e.Track] = append(all[e.Track], e)
+	}
 	src := []examSource{
-		{"Kubernetes — everything", all[exercise.ProfileK8s]},
-		{"Docker — everything", all[exercise.ProfileDocker]},
-		{"Offensive Security — everything", all[exercise.ProfileOffsec]},
+		{"Kubernetes — everything", all["kubernetes"]},
+		{"Docker — everything", all["docker"]},
+		{"Offensive Security — everything", all["offsec"]},
+		{"Linux — everything", all["linux"]},
+		{"Networking — everything", all["networking"]},
+		{"Cloud — everything", all["cloud"]},
+		{"Data — everything", all["data"]},
+		{"Security — everything", all["security"]},
+		{"Programming — everything", all["programming"]},
 	}
 	for _, p := range m.paths {
 		g := byProfile(p.Exercises)

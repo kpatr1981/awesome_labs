@@ -37,12 +37,13 @@ type tab int
 
 const (
 	tabScenario tab = iota
+	tabLearn
 	tabHints
 	tabSolution
 	tabOutput
 )
 
-var tabNames = []string{"Scenario", "Hints", "Solution", "Output"}
+var tabNames = []string{"Scenario", "Learn", "Hints", "Solution", "Output"}
 
 // ---- messages ----
 
@@ -152,7 +153,7 @@ func Run(d Deps) error {
 	sp.Style = lipgloss.NewStyle().Foreground(colAccent)
 	m := &model{
 		cat: cat, mgr: mgr, prog: prog,
-		tracks: []string{"", "docker", "kubernetes", "offsec"},
+		tracks: []string{"", "docker", "kubernetes", "offsec", "linux", "networking", "cloud", "data", "security", "programming"},
 		filter: ti, spin: sp, style: style,
 		output: map[string]*strings.Builder{}, result: map[string]string{},
 		mdCache: map[string]string{}, envStatus: map[exercise.Profile]string{},
@@ -639,14 +640,14 @@ func (m *model) updateDetail(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 		m.flash = ""
 		return m, nil
 	case "tab", "right", "l":
-		m.tab = (m.tab + 1) % 4
+		m.tab = (m.tab + 1) % 5
 		m.refreshViewport(false)
 		m.vp.GotoTop()
 	case "shift+tab":
-		m.tab = (m.tab + 3) % 4
+		m.tab = (m.tab + 4) % 5
 		m.refreshViewport(false)
 		m.vp.GotoTop()
-	case "1", "2", "3", "4":
+	case "1", "2", "3", "4", "5":
 		m.tab = tab(k[0] - '1')
 		if m.tab == tabSolution && !m.solShow {
 			return m, m.askSolution()

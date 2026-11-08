@@ -30,6 +30,7 @@ type Exercise struct {
 	Difficulty int      `yaml:"difficulty"` // 1 (intro) .. 5 (expert)
 	Kind       string   `yaml:"kind"`       // build | fix
 	Tags       []string `yaml:"tags"`
+	Tutorial   string   `yaml:"tutorial"` // concept and commands to read first (markdown)
 	Scenario   string   `yaml:"scenario"`
 	Hints      []string `yaml:"hints"`
 	Solution   string   `yaml:"solution"`

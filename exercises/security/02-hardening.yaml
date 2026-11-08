@@ -1,0 +1,547 @@
+track: security
+module: Hardening & investigation
+profile: offsec
+order: 2
+exercises:
+
+- id: sec-006
+  title: A secret in the history
+  difficulty: 1
+  kind: build
+  tags: [git, secrets, forensics]
+  tutorial: |
+    **Concept.** Git stores history, so deleting a file in a new commit does not remove it from earlier ones. Anyone with the repository can recover old content, which is why leaked secrets must be rotated.
+
+    **Read up on:**
+    - `git log -p` — show the diff of every commit
+    - `git log -S` — search history for added or removed strings
+    - `grep -o` with a regular expression — extract the matching text
+    - `git show COMMIT` — view one commit
+    - `git log --all` — include other branches
+  scenario: |
+    A developer committed an API key to the repository at **`/lab/app`**, then deleted it
+    in a later commit. It's no longer in the current files, but Git keeps history.
+
+    Find the key, which starts with **`sk_live_`**, and write it to **`/lab/answer.txt`**.
+  hints:
+    - "`git log -p` shows the changes made by every commit."
+    - "Pipe it through `grep -oE 'sk_live_[0-9a-f]+'`."
+  solution: |
+    ```bash
+    git -C /lab/app log -p --all | grep -oE 'sk_live_[0-9a-f]+' | head -1 > /lab/answer.txt
+    ```
+
+    Deleting a secret doesn't make it safe: it has to be **rotated**.
+  setup: |
+    key=sk_live_$(head -c12 /dev/urandom | od -An -tx1 | tr -d ' \n')
+    echo "$key" > "$KL_STATE/answer"
+    g() { git -C /lab/app -c user.name=Dev -c user.email=dev@example.test "$@"; }
+    git init -q -b main /lab/app
+    echo "# app" > /lab/app/README.md; g add .; g commit -qm "Initial commit"
+    echo "API_KEY=$key" > /lab/app/config.env; g add .; g commit -qm "Add config"
+    echo "print('hello')" > /lab/app/main.py; g add .; g commit -qm "Add main"
+    g rm -q config.env; g commit -qm "Remove config"
+    chown -R "$(lab_user):" /lab/app
+  check: |
+    check_eq "key in /lab/answer.txt" "$(tr -d '[:space:]' 2>/dev/null </lab/answer.txt)" "$(cat "$KL_STATE/answer")"
+  solve: |
+    git -C /lab/app log -p --all | grep -oE 'sk_live_[0-9a-f]+' | head -1 > /lab/answer.txt
+
+- id: sec-007
+  title: Secrets anyone can read
+  difficulty: 2
+  kind: fix
+  tags: [permissions, secrets, hardening]
+  tutorial: |
+    **Concept.** File permissions have three classes: owner, group, and others. Secret material should not be readable by others, and a bulk fix should touch only the files that match.
+
+    **Read up on:**
+    - `man find` — `-name` with `-o`, `-perm` modes, and `-exec`
+    - `-perm /mode` versus `-perm -mode` — any-bit versus all-bits matching
+    - `chmod` — setting an exact numeric mode
+    - Grouping with `\( ... \)` — quoting parentheses in the shell
+    - `ls -l` — review before and after
+  scenario: |
+    Under **`/srv/kl/app`**, some secret files are readable by every user on the system.
+
+    Find all files ending in **`.env`**, **`.key`** or **`.pem`** that others can read,
+    and set them to mode **`600`**. Don't change anything else, including public assets.
+  hints:
+    - "`find -perm /o+r` matches files that others can read."
+    - "Group the name tests: `\\( -name '*.env' -o -name '*.key' -o -name '*.pem' \\)`."
+  solution: |
+    ```bash
+    sudo find /srv/kl/app -type f \( -name '*.env' -o -name '*.key' -o -name '*.pem' \) -perm /o+r -exec chmod 600 {} +
+    ```
+  setup: |
+    mkdir -p /srv/kl/app/{conf,tls,public}
+    cd /srv/kl/app
+    touch .env conf/prod.env tls/server.key tls/ca.pem conf/backup.key public/index.html public/app.js conf/app.yaml
+    chmod 644 .env conf/prod.env tls/server.key tls/ca.pem public/index.html public/app.js conf/app.yaml
+    chmod 640 conf/backup.key
+    chmod 755 /srv/kl/app
+  check: |
+    cd /srv/kl/app
+    for f in .env conf/prod.env tls/server.key tls/ca.pem; do
+      check_eq "$f is 600" "$(stat -c %a "$f")" 600
+    done
+    check_eq "the non-world-readable key wasn't changed" "$(stat -c %a conf/backup.key)" 640
+    check_eq "public files were not changed" "$(stat -c %a public/index.html conf/app.yaml | sort -u)" 644
+  solve: |
+    sudo find /srv/kl/app -type f \( -name '*.env' -o -name '*.key' -o -name '*.pem' \) -perm /o+r -exec chmod 600 {} +
+
+- id: sec-008
+  title: Too much sudo
+  difficulty: 2
+  kind: fix
+  tags: [sudo, least-privilege, hardening]
+  tutorial: |
+    **Concept.** `sudo` rules in `/etc/sudoers.d` define who may run which commands as whom. The narrowest rule names exact commands, and a syntax error can break sudo for everyone.
+
+    **Read up on:**
+    - `man sudoers` — the user, host, runas and command specification
+    - `NOPASSWD:` tag — what it does
+    - `visudo -c -f FILE` — validate syntax without installing
+    - `sudo -l -U user` — list what a user may run
+    - Absolute paths in sudoers — why they are required
+  scenario: |
+    The account **`kl-ops`** only needs to restart nginx, but
+    **`/etc/sudoers.d/kl-ops`** gives it root for everything.
+
+    Change that file so that `kl-ops` can run **only** this command as root, without a
+    password:
+
+    ```bash
+    /usr/bin/systemctl restart nginx
+    ```
+
+    A syntax error in sudoers can lock you out, so validate your change.
+  hints:
+    - "The format is `user HOST=(RUNAS) NOPASSWD: /full/path args`."
+    - "`sudo visudo -cf FILE` validates a file. `sudo -l -U kl-ops` shows the result."
+  solution: |
+    ```bash
+    echo 'kl-ops ALL=(root) NOPASSWD: /usr/bin/systemctl restart nginx' | sudo tee /etc/sudoers.d/kl-ops
+    sudo visudo -cf /etc/sudoers.d/kl-ops
+    sudo -l -U kl-ops
+    ```
+  setup: |
+    useradd -m -s /bin/bash kl-ops
+    on_reset 'userdel -rf kl-ops 2>/dev/null'
+    echo 'kl-ops ALL=(ALL) NOPASSWD: ALL' > /etc/sudoers.d/kl-ops
+    chmod 440 /etc/sudoers.d/kl-ops
+  check: |
+    f=/etc/sudoers.d/kl-ops
+    check "the file is valid" 'visudo -cf $f'
+    l=$(sudo -l -U kl-ops 2>/dev/null)
+    check_match "nginx restart is allowed without a password" "$l" 'NOPASSWD: /usr/bin/systemctl restart nginx'
+    check_not "blanket access is gone" 'grep -qE "NOPASSWD: *ALL" <<<"$l"'
+    check_eq "file mode is intact" "$(stat -c %a $f)" 440
+  solve: |
+    echo 'kl-ops ALL=(root) NOPASSWD: /usr/bin/systemctl restart nginx' | sudo tee /etc/sudoers.d/kl-ops >/dev/null
+
+- id: sec-009
+  title: Harden an SSH config
+  difficulty: 2
+  kind: fix
+  tags: [ssh, hardening]
+  tutorial: |
+    **Concept.** sshd reads its configuration top to bottom, and for most keywords the first value found wins. The effective configuration is therefore what the daemon computes, not what you see on a single line.
+
+    **Read up on:**
+    - `man sshd_config` — the options and their defaults
+    - `sshd -T -f FILE` — print effective settings (needs a `-f` file)
+    - `sshd -t` — syntax check
+    - `grep -n` — find every place a keyword appears
+    - `Match` blocks — settings inside them apply conditionally
+  scenario: |
+    **`/lab/sshd_config`** is a proposed configuration for a new server. Don't apply it
+    to this VM; just fix the file. Its **effective** settings must be:
+
+    | Setting | Value |
+    |---|---|
+    | `PermitRootLogin` | `no` |
+    | `PasswordAuthentication` | `no` |
+    | `X11Forwarding` | `no` |
+    | `MaxAuthTries` | `3` |
+
+    Watch out: when a setting appears twice, `sshd` doesn't use the one you'd expect.
+  hints:
+    - "`sudo sshd -T -f /lab/sshd_config -C user=x,host=x,addr=127.0.0.1` prints the effective values."
+    - "For most settings, sshd uses the **first** value it finds."
+  solution: |
+    sshd uses the first value it sees, so remove the old lines before adding new ones:
+
+    ```bash
+    sed -i '/^PermitRootLogin/d; /^PasswordAuthentication/d; /^X11Forwarding/d; /^MaxAuthTries/d' /lab/sshd_config
+    cat >> /lab/sshd_config <<'EOF'
+    PermitRootLogin no
+    PasswordAuthentication no
+    X11Forwarding no
+    MaxAuthTries 3
+    EOF
+    sudo sshd -t -f /lab/sshd_config
+    ```
+  setup: |
+    lab_file /lab/sshd_config <<'EOF'
+    Port 22
+    PermitRootLogin yes
+    PasswordAuthentication yes
+    X11Forwarding yes
+    MaxAuthTries 6
+    UsePAM yes
+    # hardening
+    PermitRootLogin no
+    PasswordAuthentication no
+    EOF
+    mkdir -p /run/sshd
+  check: |
+    v=$(sshd -T -f /lab/sshd_config -C user=x,host=x,addr=127.0.0.1 2>/dev/null)
+    check_match "root login is off" "$v" $'(^|\n)permitrootlogin no'
+    check_match "password login is off" "$v" $'(^|\n)passwordauthentication no'
+    check_match "X11 forwarding is off" "$v" $'(^|\n)x11forwarding no'
+    check_match "MaxAuthTries is 3" "$v" $'(^|\n)maxauthtries 3'
+  solve: |
+    sed -i '/^PermitRootLogin/d; /^PasswordAuthentication/d; /^X11Forwarding/d; /^MaxAuthTries/d' /lab/sshd_config
+    cat >> /lab/sshd_config <<'EOF'
+    PermitRootLogin no
+    PasswordAuthentication no
+    X11Forwarding no
+    MaxAuthTries 3
+    EOF
+
+- id: sec-010
+  title: A port that wasn't there before
+  difficulty: 2
+  kind: fix
+  tags: [ports, forensics]
+  tutorial: |
+    **Concept.** Listening ports expose services. To find what changed, take the current list, compare it with a known baseline, then map the new port to its owning process.
+
+    **Read up on:**
+    - `ss -ltnp` — listening TCP sockets with owning processes
+    - `man ss` — the flags
+    - `comm` — differences between sorted lists
+    - `lsof -i :PORT` — another way to find the owner
+    - `kill` and `systemctl` — stopping a process, and why it might return
+  scenario: |
+    **`/lab/ports-baseline.txt`** lists the TCP ports this host was listening on when it
+    was last audited. Something new has opened a port since.
+
+    1. Write the new port number to **`/lab/answer.txt`**.
+    2. Find the process holding it, and stop it.
+  hints:
+    - "`ss -ltnH` lists listening sockets. Extract the ports and compare them with `comm`."
+    - "`sudo ss -ltnp` shows the process that owns each socket."
+  solution: |
+    ```bash
+    ss -ltnH | awk '{print $4}' | sed 's/.*://' | sort -u > /tmp/ports-now.txt
+    comm -13 /lab/ports-baseline.txt /tmp/ports-now.txt > /lab/answer.txt
+    sudo ss -ltnp "sport = :$(cat /lab/answer.txt)"
+    sudo kill PID
+    ```
+  setup: |
+    on_reset 'systemctl stop kl-svc-helper 2>/dev/null; systemctl reset-failed kl-svc-helper 2>/dev/null'
+    ss -ltnH | awk '{print $4}' | sed 's/.*://' | sort -u > /lab/ports-baseline.txt
+    chown "$(lab_user):" /lab/ports-baseline.txt
+    port=$((31000 + RANDOM % 20000))
+    echo "$port" > "$KL_STATE/answer"
+    systemd-run --quiet --unit=kl-svc-helper ncat -lk 0.0.0.0 "$port"
+    eventually 15 'ss -ltnH | grep -q ":$port "'
+  check: |
+    p=$(cat "$KL_STATE/answer")
+    check_eq "port in /lab/answer.txt" "$(tr -d '[:space:]' 2>/dev/null </lab/answer.txt)" "$p"
+    check_not "the port is closed" 'ss -ltnH | grep -q ":$p "'
+  solve: |
+    ss -ltnH | awk '{print $4}' | sed 's/.*://' | sort -u > /tmp/ports-now.txt
+    comm -13 /lab/ports-baseline.txt /tmp/ports-now.txt > /lab/answer.txt
+    p=$(cat /lab/answer.txt)
+    pid=$(sudo ss -ltnpH "sport = :$p" | grep -oP 'pid=\K[0-9]+' | head -1)
+    sudo kill "$pid"
+
+- id: sec-011
+  title: A locked-down container
+  difficulty: 2
+  kind: build
+  tags: [containers, hardening, docker]
+  tutorial: |
+    **Concept.** Containers can be restricted at start-up: filesystem access, Linux capabilities, user, privilege escalation and resources. Each restriction reduces what a compromised process can do.
+
+    **Read up on:**
+    - `docker run --help` — flags for read-only, capabilities, user, security options and memory
+    - `man capabilities` — what capabilities are
+    - `--security-opt no-new-privileges` — what it stops
+    - `docker inspect` — verify HostConfig settings
+    - `docker exec NAME id` — confirm the running user
+  scenario: |
+    Start a long-running container named **`kl-hard`** from `python:3.12-alpine`, running
+    `sleep 3600`, with these restrictions:
+
+    - a **read-only** root filesystem,
+    - **all Linux capabilities dropped**,
+    - running as UID **`1000`**,
+    - **no new privileges** allowed,
+    - a memory limit of **64MB**.
+  hints:
+    - "The `docker run` flags are `--read-only`, `--cap-drop`, `--user`, `--security-opt` and `--memory`."
+    - "The security option is `no-new-privileges`."
+  solution: |
+    ```bash
+    docker run -d --name kl-hard --read-only --cap-drop ALL --user 1000 \
+      --security-opt no-new-privileges --memory 64m python:3.12-alpine sleep 3600
+    ```
+  setup: |
+    true
+  check: |
+    n=kl-hard
+    check "the container is running" 'c_running $n'
+    check_eq "root filesystem is read-only" "$(c_get $n '{{.HostConfig.ReadonlyRootfs}}')" true
+    check_match "all capabilities are dropped" "$(c_get $n '{{.HostConfig.CapDrop}}')" '(ALL|all)'
+    check_eq "runs as UID 1000" "$(c_get $n '{{.Config.User}}')" 1000
+    check_match "no new privileges" "$(c_get $n '{{.HostConfig.SecurityOpt}}')" 'no-new-privileges'
+    check_eq "memory limit is 64MB" "$(c_get $n '{{.HostConfig.Memory}}')" 67108864
+  solve: |
+    docker run -d --name kl-hard --read-only --cap-drop ALL --user 1000 --security-opt no-new-privileges --memory 64m python:3.12-alpine sleep 3600
+
+- id: sec-012
+  title: Pin the base image
+  difficulty: 2
+  kind: fix
+  tags: [supply-chain, docker]
+  tutorial: |
+    **Concept.** A tag is a movable label, while a digest identifies exact image content. Pinning to a digest makes builds reproducible and resistant to tag tampering.
+
+    **Read up on:**
+    - `docker image inspect` — fields such as `RepoDigests`
+    - `docker images --digests` — list digests
+    - Dockerfile `FROM` syntax — name, tag, and `@sha256:` digest
+    - Go templates with `-f` — extract one field
+    - `sed` or an editor — edit the Dockerfile line in place
+  scenario: |
+    **`/lab/Dockerfile`** builds on the tag `python:3.12-alpine`. A tag can be moved to
+    point at different content at any time.
+
+    Pin the `FROM` line to the **exact digest** of the copy of that image on this host,
+    keeping the tag for readability:
+
+    ```
+    FROM python:3.12-alpine@sha256:...
+    ```
+  hints:
+    - "`docker image inspect python:3.12-alpine` has a `RepoDigests` field."
+    - "`-f '{{index .RepoDigests 0}}'` prints it. It looks like `python@sha256:...`."
+  solution: |
+    ```bash
+    d=$(docker image inspect -f '{{index .RepoDigests 0}}' python:3.12-alpine | cut -d@ -f2)
+    sed -i "s|^FROM python:3.12-alpine.*|FROM python:3.12-alpine@$d|" /lab/Dockerfile
+    ```
+  setup: |
+    lab_file /lab/Dockerfile <<'EOF'
+    FROM python:3.12-alpine
+    COPY app.py /app.py
+    CMD ["python", "/app.py"]
+    EOF
+    docker image inspect -f '{{index .RepoDigests 0}}' python:3.12-alpine | cut -d@ -f2 > "$KL_STATE/answer"
+  check: |
+    check_eq "FROM is pinned to the local digest" "$(head -1 /lab/Dockerfile)" "FROM python:3.12-alpine@$(cat "$KL_STATE/answer")"
+    check "the rest of the file was kept" 'grep -q "^COPY app.py /app.py" /lab/Dockerfile'
+  solve: |
+    d=$(docker image inspect -f '{{index .RepoDigests 0}}' python:3.12-alpine | cut -d@ -f2)
+    sed -i "s|^FROM python:3.12-alpine.*|FROM python:3.12-alpine@$d|" /lab/Dockerfile
+
+- id: sec-013
+  title: Audit the passwords
+  difficulty: 3
+  kind: build
+  tags: [passwords, john, audit]
+  tutorial: |
+    **Concept.** Password hashes are cracked by hashing guesses from a wordlist and comparing. Defenders do the same to find weak passwords before attackers do.
+
+    **Read up on:**
+    - `man john` — wordlist mode, `--wordlist` and `--show`
+    - Hash formats — how to recognise crypt-style hashes such as `$6$`
+    - The pot file — where John stores cracked results
+    - `cut` and `sort` — reshape output into a list of names
+    - Authorised use — only audit hashes you have permission to test
+  scenario: |
+    As part of an authorized audit, you've been given an export of password hashes at
+    **`/lab/hashes.txt`**, in `user:hash` format.
+
+    Find which accounts use a password from the common-password list at
+    **`/usr/share/kl/wordlists/top.txt`**. Write those **usernames**, one per line and
+    sorted, to **`/lab/weak.txt`**.
+  hints:
+    - "`john --wordlist=FILE /lab/hashes.txt` runs a dictionary attack."
+    - "`john --show /lab/hashes.txt` prints what has been cracked so far."
+  solution: |
+    ```bash
+    cd /lab
+    john --wordlist=/usr/share/kl/wordlists/top.txt hashes.txt
+    john --show hashes.txt | grep : | cut -d: -f1 | sort > weak.txt
+    ```
+
+    Those accounts need a forced password reset.
+  setup: |
+    mapfile -t common < <(grep -v '^$' /usr/share/kl/wordlists/top.txt | shuf -n 2)
+    : > /lab/hashes.txt
+    users=(alice bob carol dave erin frank)
+    weak=$(printf '%s\n' "${users[@]}" | shuf -n 2 | sort)
+    i=0
+    for u in "${users[@]}"; do
+      if grep -qx "$u" <<<"$weak"; then
+        p=${common[$i]}; i=$((i + 1))
+      else
+        p=$(head -c 18 /dev/urandom | od -An -tx1 | tr -d ' \n')
+      fi
+      echo "$u:$(openssl passwd -6 -salt "$(head -c6 /dev/urandom | od -An -tx1 | tr -d ' \n')" "$p")" >> /lab/hashes.txt
+    done
+    chown "$(lab_user):" /lab/hashes.txt
+    echo "$weak" > "$KL_STATE/answer"
+  check: |
+    check_eq "weak accounts in /lab/weak.txt" "$(cat /lab/weak.txt 2>/dev/null)" "$(cat "$KL_STATE/answer")"
+  solve: |
+    cd /lab
+    HOME=/lab john --wordlist=/usr/share/kl/wordlists/top.txt hashes.txt >/dev/null 2>&1
+    HOME=/lab john --show hashes.txt | grep : | cut -d: -f1 | sort > weak.txt
+
+- id: sec-014
+  title: The fake kernel thread
+  difficulty: 3
+  kind: fix
+  tags: [process, forensics, proc]
+  tutorial: |
+    **Concept.** Real kernel threads have no executable on disk, but userspace programs can rename themselves to look like them. The /proc filesystem exposes the truth for each process.
+
+    **Read up on:**
+    - `man proc` — `/proc/PID/exe`, `cmdline` and `comm`
+    - `ps -eo pid,ppid,comm,args` — compare names with arguments
+    - `readlink -f` — resolve a symlink
+    - Kernel threads — they are children of PID 2 (`kthreadd`)
+    - `kill` — sending a signal, and `-9` as a last resort
+  scenario: |
+    A process on this host is disguised with a name that looks like a kernel thread, in
+    square brackets.
+
+    Real kernel threads have no program on disk, and that's how to tell them apart.
+
+    1. Write the impostor's **PID** to **`/lab/pid.txt`**.
+    2. Write the **real path of the program** it's running to **`/lab/exe.txt`**.
+    3. Kill it.
+  hints:
+    - "For a process, `/proc/PID/exe` is a link to its program. Kernel threads don't have one."
+    - "Real kernel threads have an empty `/proc/PID/cmdline`."
+    - "Loop over `/proc/[0-9]*` looking for a command line that starts with `[`."
+  solution: |
+    ```bash
+    for p in /proc/[0-9]*; do
+      if tr '\0' ' ' < $p/cmdline 2>/dev/null | grep -q '^\['; then
+        echo "${p#/proc/}" > /lab/pid.txt
+        sudo readlink $p/exe > /lab/exe.txt
+      fi
+    done
+    sudo kill "$(cat /lab/pid.txt)"
+    ```
+  setup: |
+    on_reset 'systemctl stop kl-kw 2>/dev/null; systemctl reset-failed kl-kw 2>/dev/null'
+    systemd-run --quiet --unit=kl-kw bash -c 'exec -a "[kworker/u8:3-events]" sleep 86400'
+    eventually 10 '[ "$(systemctl show -p MainPID --value kl-kw)" != 0 ]'
+    pid=$(systemctl show -p MainPID --value kl-kw)
+    eventually 5 'tr "\0" " " </proc/'"$pid"'/cmdline | grep -q "^\[kworker"'
+    echo "$pid" > "$KL_STATE/answer"
+    readlink "/proc/$pid/exe" > "$KL_STATE/exe"
+  check: |
+    p=$(cat "$KL_STATE/answer")
+    check_eq "PID in /lab/pid.txt" "$(tr -d '[:space:]' 2>/dev/null </lab/pid.txt)" "$p"
+    check_eq "program in /lab/exe.txt" "$(tr -d '[:space:]' 2>/dev/null </lab/exe.txt)" "$(cat "$KL_STATE/exe")"
+    check_not "the process is dead" '[ -d /proc/$p ]'
+  solve: |
+    for p in /proc/[0-9]*; do
+      if tr '\0' ' ' 2>/dev/null < $p/cmdline | grep -q '^\['; then
+        echo "${p#/proc/}" > /lab/pid.txt
+        sudo readlink $p/exe > /lab/exe.txt
+      fi
+    done
+    sudo kill "$(cat /lab/pid.txt)"
+
+- id: sec-015
+  title: Isolate the compromised host
+  difficulty: 4
+  kind: build
+  tags: [containment, nftables, netns, incident]
+  tutorial: |
+    **Concept.** Containment means restricting a host's network access while preserving yours. A default-deny input policy plus narrow allows does this, but remember the replies and any outbound traffic you want to cut.
+
+    **Read up on:**
+    - `man nft` — base chains, `policy drop`, and matching `ip saddr` and `tcp dport`
+    - Connection tracking — `ct state established,related`
+    - Input versus output hooks — ingress and egress traffic
+    - `nft list ruleset` — verify
+    - `ip netns exec` — run commands inside the host namespace
+  scenario: |
+    Host **`h`** (10.60.0.5) is compromised, and you need to cut it off without losing
+    access for the investigation. It shares a segment with **`mgmt`** (10.60.0.10) and
+    **`other`** (10.60.0.20). `h` is running an SSH service on port 22.
+
+    Using **nftables on h**:
+
+    - allow TCP port **22 only from mgmt**, including the replies,
+    - **drop everything else**, inbound and outbound.
+  hints:
+    - "You need both an `input` and an `output` chain, each with `policy drop`."
+    - "`ct state established,related accept` in both chains lets the SSH replies out."
+    - "Don't forget loopback: `iif lo accept` and `oif lo accept`."
+  solution: |
+    ```bash
+    sudo ip netns exec h nft -f - <<'EOF'
+    table inet contain {
+      chain input {
+        type filter hook input priority filter; policy drop;
+        iif lo accept
+        ct state established,related accept
+        ip saddr 10.60.0.10 tcp dport 22 accept
+      }
+      chain output {
+        type filter hook output priority filter; policy drop;
+        oif lo accept
+        ct state established,related accept
+      }
+    }
+    EOF
+    ```
+  setup: |
+    netns_new h mgmt other sw
+    ip -n sw link add br0 type bridge
+    ip -n sw link set br0 up
+    i=0
+    for pair in h:5 mgmt:10 other:20; do
+      n=${pair%:*}; o=${pair#*:}; i=$((i + 1))
+      netns_link "$n" eth0 sw "p$i"
+      ip -n sw link set "p$i" master br0
+      ip -n "$n" addr add "10.60.0.$o/24" dev eth0
+    done
+    on_reset 'systemctl stop kl-sshd 2>/dev/null; systemctl reset-failed kl-sshd 2>/dev/null'
+    systemd-run --quiet --unit=kl-sshd ip netns exec h ncat -lk 10.60.0.5 22
+    eventually 15 'ip netns exec h ss -ltnH | grep -q ":22 "'
+  check: |
+    check "mgmt reaches port 22" 'ip netns exec mgmt ncat -z -w3 10.60.0.5 22'
+    check_not "other can't reach port 22" 'ip netns exec other ncat -z -w2 10.60.0.5 22'
+    check_not "other can't ping h" 'ip netns exec other ping -c1 -W1 10.60.0.5'
+    check_not "h can't reach other" 'ip netns exec h ping -c1 -W1 10.60.0.20'
+    check_not "h can't start connections to mgmt" 'ip netns exec h ping -c1 -W1 10.60.0.10'
+    check_eq "both default policies drop" "$(ip netns exec h nft list ruleset 2>/dev/null | grep -c 'policy drop')" 2
+  solve: |
+    sudo ip netns exec h nft -f - <<'EOF'
+    table inet contain {
+      chain input {
+        type filter hook input priority filter; policy drop;
+        iif lo accept
+        ct state established,related accept
+        ip saddr 10.60.0.10 tcp dport 22 accept
+      }
+      chain output {
+        type filter hook output priority filter; policy drop;
+        oif lo accept
+        ct state established,related accept
+      }
+    }
+    EOF

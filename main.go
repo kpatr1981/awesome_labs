@@ -143,6 +143,9 @@ func run(args []string) error {
 			return err
 		}
 		fmt.Printf("# %s — %s\n%s · %s · %s\n\n%s\n", ex.ID, ex.Title, ex.Module, exercise.DifficultyLabel(ex.Difficulty), ex.Kind, ex.Scenario)
+		if ex.Tutorial != "" {
+			fmt.Printf("\n## Before you start\n\n%s\n", ex.Tutorial)
+		}
 		if len(rest) > 1 && rest[1] == "--solution" {
 			fmt.Printf("\n## Solution\n\n%s\n", ex.Solution)
 		}

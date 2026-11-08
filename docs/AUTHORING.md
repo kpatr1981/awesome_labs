@@ -3,7 +3,7 @@
 Exercises live in `exercises/<track>/NN-<module>.yaml`. One file is one module:
 
 ```yaml
-track: kubernetes          # docker | kubernetes | offsec (display grouping)
+track: kubernetes          # docker | kubernetes | offsec | linux | networking | cloud | data | security | programming
 module: Services & DNS     # module title
 profile: k8s               # docker | k8s | offsec — which lab environment
 order: 3                   # module order within the track
@@ -13,6 +13,7 @@ exercises:
   difficulty: 1            # 1 beginner … 5 expert
   kind: build              # build | fix
   tags: [service]
+  tutorial: |              # markdown: the concept and commands to read first; no spoilers
   scenario: |              # markdown, shown in the UI and written to /lab/TASK.md
   hints: [...]             # revealed one at a time
   solution: |              # markdown
@@ -71,6 +72,10 @@ control plane, `KUBECONFIG` is `/etc/kubernetes/admin.conf`; the lab user has it
 | `lab_file PATH <<EOF` | write a file owned by the lab user |
 | `web_target NAME PORT <<PY` | run a stdlib-Python vulnerable target in container `kl-NAME` on 127.0.0.1:PORT (offsec) |
 | `rand_flag` | a fresh `KL{…}` flag token (offsec) |
+| `netns_new NS...`, `netns_link NS1 IF1 NS2 IF2` | network namespaces and veth links, removed on reset |
+| `moto_start` | run the AWS emulator and install an `aws` command that uses it (sees only `/lab`) |
+| `go_test <<'GO'` | run a hidden Go test file against the learner's `/lab/*.go` |
+| `pg_start`, `pg_sql 'SQL'` | PostgreSQL in container `kl-pg`, and run SQL from a script |
 
 ## Offensive-security exercises (`profile: offsec`)
 
