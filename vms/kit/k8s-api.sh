@@ -26,8 +26,22 @@ snapshot() {
   echo "api snapshot saved"
 }
 
+# heal_static_pods — after a manifest was replaced, the kubelet can occasionally
+# leave the old sandbox running next to the new one (port conflicts). Keep only the
+# newest sandbox of each control-plane component.
+heal_static_pods() {
+  local c ids
+  for c in kube-apiserver kube-controller-manager kube-scheduler etcd; do
+    ids=$(crictl pods --name "$c" --state ready -o json 2>/dev/null | jq -r '.items | sort_by(.createdAt) | .[:-1][] | .id')
+    for id in $ids; do echo "removing stale $c sandbox $id"; crictl stopp "$id" >/dev/null 2>&1; crictl rmp "$id" >/dev/null 2>&1; done
+  done
+}
+
 reset() {
-  wait_api 240 || { echo "API server not reachable" >&2; exit 1; }
+  if ! wait_api 90; then
+    heal_static_pods
+    wait_api 240 || { echo "API server not reachable" >&2; exit 1; }
+  fi
   local k o n
   # kube-system core objects
   for o in $SYS_OBJS; do
