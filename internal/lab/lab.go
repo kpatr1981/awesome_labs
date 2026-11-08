@@ -13,8 +13,10 @@ import (
 	"os/exec"
 	"os/user"
 	"path/filepath"
+	"strconv"
 	"strings"
 	"sync"
+	"syscall"
 	"time"
 
 	"kubelab/internal/exercise"
@@ -90,6 +92,9 @@ type Manager struct {
 	Verbose  bool // copy bootstrap output to the operation log
 	// AutoStop stops the other environment before an exercise starts.
 	AutoStop bool
+	// HoldEnvs marks every environment this process starts as busy, so that
+	// another kubelab's auto-stop leaves it alone (used by verify).
+	HoldEnvs bool
 	logFile  io.Writer
 	mu       sync.Mutex
 }
@@ -514,6 +519,10 @@ func (m *Manager) stopOthers(ctx context.Context, keep Env, log io.Writer) {
 		if env.Profile == keep.Profile {
 			continue
 		}
+		if m.busy(env) {
+			fmt.Fprintf(log, "==> leaving %s running: a kubelab verify run is using it\n", env.Title)
+			continue
+		}
 		for _, vm := range env.VMs {
 			if all[vm.Name].Status == "Running" {
 				fmt.Fprintf(log, "==> stopping %s (%s) to free memory — auto_stop in %s\n", vm.Name, env.Title, filepath.Join(m.StateDir, "config.yaml"))
@@ -523,9 +532,44 @@ func (m *Manager) stopOthers(ctx context.Context, keep Env, log io.Writer) {
 	}
 }
 
+func (m *Manager) lockPath(env Env) string {
+	return filepath.Join(m.StateDir, "busy-"+string(env.Profile)+".pid")
+}
+
+// hold marks env as in use by this process.
+func (m *Manager) hold(env Env) {
+	_ = os.WriteFile(m.lockPath(env), []byte(strconv.Itoa(os.Getpid())), 0o644)
+}
+
+// Release drops the busy marks this process holds.
+func (m *Manager) Release() {
+	for _, env := range []Env{DockerEnv, K8sEnv} {
+		if b, err := os.ReadFile(m.lockPath(env)); err == nil && strings.TrimSpace(string(b)) == strconv.Itoa(os.Getpid()) {
+			_ = os.Remove(m.lockPath(env))
+		}
+	}
+}
+
+// busy reports whether another live kubelab process holds env.
+func (m *Manager) busy(env Env) bool {
+	b, err := os.ReadFile(m.lockPath(env))
+	if err != nil {
+		return false
+	}
+	pid, err := strconv.Atoi(strings.TrimSpace(string(b)))
+	if err != nil || pid == os.Getpid() {
+		return false
+	}
+	return syscall.Kill(pid, 0) == nil
+}
+
 // StopAll stops every running lab VM.
 func (m *Manager) StopAll(ctx context.Context, log io.Writer) error {
 	for _, env := range []Env{DockerEnv, K8sEnv} {
+		if m.busy(env) {
+			fmt.Fprintf(log, "==> leaving %s running: a kubelab verify run is using it\n", env.Title)
+			continue
+		}
 		if err := m.Stop(ctx, env, log); err != nil {
 			return err
 		}
@@ -591,6 +635,9 @@ func (m *Manager) Start(ctx context.Context, ex *exercise.Exercise, log io.Write
 	m.mu.Lock()
 	defer m.mu.Unlock()
 	env := EnvFor(ex.Profile)
+	if m.HoldEnvs {
+		m.hold(env)
+	}
 	if m.AutoStop {
 		m.stopOthers(ctx, env, log)
 	}

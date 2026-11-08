@@ -270,6 +270,8 @@ func verify(ctx context.Context, cat *exercise.Catalog, mgr *lab.Manager, args [
 		return err
 	}
 	defer logf.Close()
+	mgr.HoldEnvs = true // a TUI's auto-stop must not pull VMs out from under us
+	defer mgr.Release()
 	started := *from == ""
 	var failed []string
 	n := 0
