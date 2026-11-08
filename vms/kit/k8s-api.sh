@@ -37,6 +37,14 @@ heal_static_pods() {
   done
 }
 
+# kubeadm's discovery ConfigMap + its RBAC are needed to join nodes
+ensure_cluster_info() {
+  if ! kubectl -n kube-public get configmap cluster-info >/dev/null 2>&1 ||
+     ! kubectl -n kube-public get role kubeadm:bootstrap-signer-clusterinfo >/dev/null 2>&1; then
+    kubeadm init phase bootstrap-token --kubeconfig /etc/kubernetes/admin.conf >/dev/null 2>&1 && echo "restored cluster-info"
+  fi
+}
+
 reset() {
   if ! wait_api 90; then
     heal_static_pods
@@ -51,6 +59,16 @@ reset() {
   done
   # exercise clean-up hooks (after core objects are back)
   /opt/kubelab/hooks.sh
+  # a node removed from the cluster (kubectl delete node, half-done rejoin) joins again
+  ensure_cluster_info
+  for n in $(jq -r '.[].name' "$P/nodes.json"); do
+    kubectl get node "$n" >/dev/null 2>&1 && continue
+    [ "$n" = node01 ] || continue
+    echo "node $n is missing — joining it again"
+    join=$(kubeadm token create --ttl 10m --print-join-command 2>/dev/null | tail -1)
+    on_node01 "kubeadm reset -f >/dev/null 2>&1; $join --node-name node01 >/dev/null 2>&1" || echo "warning: rejoin of $n failed"
+    kubectl wait --for=create node/"$n" --timeout=60s >/dev/null 2>&1
+  done
   # nodes: labels, taints, schedulability
   jq -c '.[]' "$P/nodes.json" | while read -r node; do
     n=$(jq -r .name <<<"$node")
@@ -75,11 +93,7 @@ reset() {
       grep -vE '/(kubernetes|cluster-info|kube-root-ca\.crt|default|kubeadm:.*|system:.*)$' |
       xargs -r kubectl -n "$n" delete --wait=false --ignore-not-found >/dev/null 2>&1
   done
-  # kubeadm's discovery ConfigMap + its RBAC are needed to join nodes
-  if ! kubectl -n kube-public get configmap cluster-info >/dev/null 2>&1 ||
-     ! kubectl -n kube-public get role kubeadm:bootstrap-signer-clusterinfo >/dev/null 2>&1; then
-    kubeadm init phase bootstrap-token --kubeconfig /etc/kubernetes/admin.conf >/dev/null 2>&1 && echo "restored cluster-info"
-  fi
+  ensure_cluster_info
   # cluster-scoped objects that were not there at snapshot time
   for k in $CLUSTER_KINDS; do
     kubectl get "$k" -o name 2>/dev/null | sort >/tmp/kl-now
