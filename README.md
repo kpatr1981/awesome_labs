@@ -92,6 +92,16 @@ shows the plan.
 - ~6 GiB of free RAM (one environment at a time; ~9 GiB with both), ~40 GiB of disk
 - Internet access (packages and images are downloaded on first start)
 
+## Download
+
+On Linux x86-64 you can skip building:
+
+```bash
+curl -fLo awesome_labs https://github.com/kpatr1981/awesome_labs/releases/latest/download/awesome_labs-linux-amd64
+chmod +x awesome_labs
+./awesome_labs install
+```
+
 ## Build & run
 
 ```bash
@@ -101,6 +111,9 @@ make build          # or: go build -o awesome_labs .
 ./awesome_labs install   # installs what's missing and puts awesome_labs on your PATH
 awesome_labs             # interactive browser
 ```
+
+`make build` produces a single static binary with the exercises built in. `make release`
+builds one for Linux and macOS on x86-64 and ARM into `dist/`, with checksums.
 
 ### In the browser
 
