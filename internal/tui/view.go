@@ -70,6 +70,8 @@ func trackLabel(t string) string {
 		return "Defensive Sec"
 	case "programming":
 		return "Programming"
+	case "datascience":
+		return "Data Science"
 	}
 	return t
 }
@@ -136,6 +138,38 @@ func (m *model) statusLine(help string) string {
 
 // ---- browse ----
 
+// fitTabs joins tabs, showing a window around the active one when they don't all
+// fit in width w. Hidden tabs on either side are marked with an arrow.
+func fitTabs(tabs []string, active, w int) string {
+	if lipgloss.Width(strings.Join(tabs, "")) <= w {
+		return strings.Join(tabs, "")
+	}
+	const arrows = 4 // room for "‹ " and " ›"
+	lo, hi := active, active
+	used := lipgloss.Width(tabs[active])
+	for grew := true; grew; {
+		grew = false
+		if hi+1 < len(tabs) && used+lipgloss.Width(tabs[hi+1]) <= w-arrows {
+			hi++
+			used += lipgloss.Width(tabs[hi])
+			grew = true
+		}
+		if lo > 0 && used+lipgloss.Width(tabs[lo-1]) <= w-arrows {
+			lo--
+			used += lipgloss.Width(tabs[lo])
+			grew = true
+		}
+	}
+	bar := strings.Join(tabs[lo:hi+1], "")
+	if lo > 0 {
+		bar = sMuted.Render("‹ ") + bar
+	}
+	if hi < len(tabs)-1 {
+		bar += sMuted.Render(" ›")
+	}
+	return bar
+}
+
 func (m *model) viewBrowse() string {
 	var tabs []string
 	for i, t := range m.tracks {
@@ -146,7 +180,7 @@ func (m *model) viewBrowse() string {
 			tabs = append(tabs, sTabOff.Render(label))
 		}
 	}
-	bar := strings.Join(tabs, "")
+	bar := fitTabs(tabs, m.trackIdx, m.w)
 	if m.path != nil {
 		ps, pt := m.pathProgress(m.path)
 		bar += sWarn.Render("  path: "+m.path.Title) + sMuted.Render(fmt.Sprintf(" %d/%d", ps, pt))

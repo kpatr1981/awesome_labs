@@ -18,6 +18,7 @@ import (
 	"awesome_labs/internal/config"
 	"awesome_labs/internal/exam"
 	"awesome_labs/internal/exercise"
+	"awesome_labs/internal/install"
 	"awesome_labs/internal/lab"
 	"awesome_labs/internal/progress"
 	"awesome_labs/internal/tui"
@@ -31,6 +32,8 @@ func usage() {
 
 usage:
   awesome_labs                         open the interactive exercise browser
+  awesome_labs install [--dry-run] [--yes] [--bin-dir DIR]
+                                  detect the OS, install Lima and QEMU, and put this binary on your PATH
   awesome_labs list [filter]           list exercises
   awesome_labs paths [path-id]         learning paths and your progress
   awesome_labs exam [status|history|abandon]  timed exams (start one from the UI with X)
@@ -64,6 +67,9 @@ func exercisesFS() (fs.FS, string) {
 }
 
 func run(args []string) error {
+	if len(args) > 0 && args[0] == "install" {
+		return install.Run(args[1:], os.Stdin, os.Stdout)
+	}
 	fsys, root := exercisesFS()
 	cat, err := exercise.Load(fsys, root)
 	if err != nil {

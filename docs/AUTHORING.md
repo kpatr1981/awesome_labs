@@ -3,7 +3,7 @@
 Exercises live in `exercises/<track>/NN-<module>.yaml`. One file is one module:
 
 ```yaml
-track: kubernetes          # docker | kubernetes | offsec | linux | networking | cloud | data | defensive | programming
+track: kubernetes          # docker | kubernetes | offsec | linux | networking | cloud | data | defensive | programming | datascience
 module: Services & DNS     # module title
 profile: k8s               # docker | k8s | offsec — which lab environment
 order: 3                   # module order within the track
@@ -74,6 +74,7 @@ control plane, `KUBECONFIG` is `/etc/kubernetes/admin.conf`; the lab user has it
 | `rand_flag` | a fresh `KL{…}` flag token (offsec) |
 | `netns_new NS...`, `netns_link NS1 IF1 NS2 IF2` | network namespaces and veth links, removed on reset |
 | `moto_start` | run the AWS emulator and install an `aws` command that uses it (sees only `/lab`) |
+| `ds_start` | install `dspy`, which runs Python with pandas and scikit-learn in `/lab` |
 | `go_test <<'GO'` | run a hidden Go test file against the learner's `/lab/*.go` |
 | `pg_start`, `pg_sql 'SQL'` | PostgreSQL in container `kl-pg`, and run SQL from a script |
 

@@ -126,6 +126,21 @@ WRAP
   eventually 30 'curl -fsS -m 2 http://127.0.0.1:5000/moto-api/ >/dev/null'
 }
 
+# ---------- data-science helper ----------
+# ds_start -> install `dspy`, which runs Python with pandas and scikit-learn in /lab.
+# The container can only see /lab and runs as the calling user.
+ds_start() {
+  cat >/usr/local/bin/dspy <<'WRAP'
+#!/bin/bash
+t=-i
+[ -t 0 ] && [ -t 1 ] && t=-it
+exec docker run --rm $t --user "$(id -u):$(id -g)" -e HOME=/tmp -e PYTHONDONTWRITEBYTECODE=1 \
+  -v /lab:/lab -w /lab kl-datascience:1 python "$@"
+WRAP
+  chmod 755 /usr/local/bin/dspy
+  on_reset 'rm -f /usr/local/bin/dspy'
+}
+
 # ---------- Go helper ----------
 # go_test <<'GO' ... GO -> run a hidden test file against the learner's /lab/*.go
 go_test() {

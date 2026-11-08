@@ -119,6 +119,7 @@ func (m *model) examSources() []examSource {
 		{"Data — everything", all["data"]},
 		{"Defensive Security — everything", all["defensive"]},
 		{"Programming — everything", all["programming"]},
+		{"Data Science — everything", all["datascience"]},
 	}
 	for _, p := range m.paths {
 		g := byProfile(p.Exercises)

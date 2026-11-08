@@ -29,7 +29,7 @@ type Instance struct {
 // Available reports whether limactl is on PATH.
 func Available() error {
 	if _, err := exec.LookPath(Binary); err != nil {
-		return fmt.Errorf("limactl not found on PATH (brew install lima): %w", err)
+		return fmt.Errorf("limactl not found on PATH (run: awesome_labs install): %w", err)
 	}
 	return nil
 }

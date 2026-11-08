@@ -1,7 +1,7 @@
 # awesome_labs
 
 **Hands-on labs on your own machine** for Docker, Kubernetes, Linux, networking, cloud,
-databases, security and programming — real VMs, real breakage, automatic grading.
+databases, security, programming and data science — real VMs, real breakage, automatic grading.
 
 awesome_labs creates [Lima](https://lima-vm.io) virtual machines, puts each exercise's
 scenario in place (a broken deployment, a crashed daemon, a half-finished compose
@@ -10,7 +10,7 @@ exercise has a scenario, progressive hints and a full solution you can reveal, a
 have a short tutorial on the concepts and commands to read first.
 
 ```text
- awesome_labs hands-on labs                                           ✔ 37/630 solved  ● 2 in progress
+ awesome_labs hands-on labs                                           ✔ 37/645 solved  ● 2 in progress
  All  Docker  Kubernetes  Offensive Sec  Linux  Networking  Cloud  Data  Defensive Sec  Programming
 ╭──────────────────────────────────────────────╮╭───────────────────────────────────────────────╮
 │▸ Kubernetes · Troubleshooting the cluster     ││k8s-245 — The API server is gone               │
@@ -35,8 +35,9 @@ have a short tutorial on the concepts and commands to read first.
 | **Data** | SQL, PostgreSQL operations and Redis *(growing)* | 15 |
 | **Defensive Security** | incident response and hardening *(growing)* | 15 |
 | **Programming** | Python and Go *(growing)* | 15 |
+| **Data Science** | pandas, statistics and machine learning *(growing)* | 15 |
 
-That's 630 exercises so far, growing toward 400 per topic; ideas for what comes next are
+That's 645 exercises so far, growing toward 400 per topic; ideas for what comes next are
 in [docs/PENDING.md](docs/PENDING.md).
 
 Difficulty rises through each module (1 = beginner … 5 = expert), mixing **build** tasks
@@ -74,6 +75,12 @@ reset can't undo; awesome_labs rebuilds the cluster before your next Kubernetes 
 
 Tested on Fedora 45 (x86_64) on a machine with 16 GB of RAM.
 
+`awesome_labs install` detects macOS or Linux and sets up what's missing: Lima (Homebrew
+on macOS when available, otherwise the official release, checksum-verified, into
+`~/.local`), QEMU with its firmware on Ubuntu, Debian, Fedora, Arch or openSUSE (through
+their package manager, which asks for sudo), and the binary itself in `~/.local/bin`. It shows the plan and asks first; `--dry-run` only
+shows the plan.
+
 - macOS (Apple Silicon or Intel) or Linux with [Lima](https://lima-vm.io) ≥ 2.0
   (`brew install lima`)
   - On Linux, awesome_labs runs QEMU through a small generated wrapper in `~/.awesome_labs/qemu`
@@ -89,7 +96,8 @@ Tested on Fedora 45 (x86_64) on a machine with 16 GB of RAM.
 git clone https://github.com/kpatr1981/awesome_labs.git
 cd awesome_labs
 make build          # or: go build -o awesome_labs .
-./awesome_labs           # interactive browser
+./awesome_labs install   # installs what's missing and puts awesome_labs on your PATH
+awesome_labs             # interactive browser
 ```
 
 ### In the browser

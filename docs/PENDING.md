@@ -3,7 +3,7 @@
 Ideas for future labs. Each topic has one home; where tracks touch, the row says which
 track it relies on.
 
-**Target: 400 exercises in each of the nine topics below, 3,600 in total.** The parts of
+**Target: 400 exercises in each of the ten topics below, 4,000 in total.** The parts of
 this list that the existing exercises don't cover are not started.
 
 | Topic | Exercises | Track | Module files |
@@ -17,6 +17,7 @@ this list that the existing exercises don't cover are not started.
 | Data | 15 / 400 | `data` | `exercises/data/` |
 | Defensive security | 15 / 400 | `defensive` | `exercises/defensive/` |
 | Programming | 15 / 400 | `programming` | `exercises/programming/` |
+| Data science | 15 / 400 | `datascience` | `exercises/datascience/` |
 
 - [Suggested order](#suggested-order)
 - [Shared lab foundations](#shared-lab-foundations)
