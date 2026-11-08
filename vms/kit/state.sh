@@ -9,7 +9,8 @@ ROLE=$2
 P=$KL_STATE/pristine
 USERHOME=$(lab_home)
 
-# group:path  — a group is the systemd unit to restart when its files change.
+# group:path  — a group is the systemd unit to restart when its files change
+# ("none" and "static" restart nothing; the kubelet picks up static pod manifests itself).
 case $ROLE in
 docker)
   ENTRIES=(
@@ -30,7 +31,8 @@ cp | worker)
     containerd:/etc/containerd
     containerd:/usr/lib/systemd/system/containerd.service
     containerd:/etc/systemd/system/containerd.service.d
-    kubelet:/etc/kubernetes
+    static:/etc/kubernetes
+    kubelet:/etc/kubernetes/kubelet.conf
     kubelet:/var/lib/kubelet/config.yaml
     kubelet:/var/lib/kubelet/kubeadm-flags.env
     kubelet:/usr/lib/systemd/system/kubelet.service
@@ -61,15 +63,18 @@ paths_of() { # paths_of GROUP
   done
 }
 
-fingerprint() { # fingerprint GROUP -> hash of contents + metadata
-  local p
+fingerprint() { # fingerprint GROUP [ROOT] -> hash of contents + metadata (paths relative to ROOT)
+  local p root=${2:-/}
   while read -r p; do
-    if [ -e "$p" ] || [ -L "$p" ]; then
-      find "$p" \( -type f -o -type l -o -type d \) -printf '%p %m %u %g %l\n' 2>/dev/null | sort
-      find "$p" -type f -print0 2>/dev/null | sort -z | xargs -0 -r sha256sum
-    else
-      echo "MISSING $p"
-    fi
+    (
+      cd "$root" || exit
+      if [ -e ".$p" ] || [ -L ".$p" ]; then
+        find ".$p" \( -type f -o -type l -o -type d \) -printf '%p %m %u %g %l\n' 2>/dev/null | sort
+        find ".$p" -type f -print0 2>/dev/null | sort -z | xargs -0 -r sha256sum
+      else
+        echo "MISSING $p"
+      fi
+    )
   done < <(paths_of "$1")
 }
 
@@ -87,6 +92,7 @@ snapshot() {
   tar --acls --xattrs -cpf "$P/files.tar" "${existing[@]}" 2>/dev/null
   local g
   for g in $(groups); do fingerprint "$g" | sha256sum | cut -d' ' -f1 >"$P/$g.sum"; done
+  touch "$P/sums.v2"
   echo "$ROLE" >"$KL_STATE/role"
   echo "snapshot saved (${#existing[@]} paths)"
 }
@@ -113,6 +119,11 @@ restore() {
   [ -f "$P/files.tar" ] || { echo "no pristine snapshot on this node" >&2; exit 1; }
   local changed=() g p
   T=$(mktemp -d)
+  if [ ! -f "$P/sums.v2" ]; then # fingerprints from an older kit: recompute from the snapshot itself
+    tar --acls --xattrs -xpf "$P/files.tar" -C "$T" 2>/dev/null
+    for g in $(groups); do fingerprint "$g" "$T" | sha256sum | cut -d' ' -f1 >"$P/$g.sum"; done
+    touch "$P/sums.v2"
+  fi
   for g in $(groups); do
     if [ "$(fingerprint "$g" | sha256sum | cut -d' ' -f1)" != "$(cat "$P/$g.sum")" ]; then
       changed+=("$g")

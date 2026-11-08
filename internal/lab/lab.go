@@ -452,6 +452,9 @@ grep -qF %q "$H/.ssh/authorized_keys" || echo %q >> "$H/.ssh/authorized_keys"`, 
 func (m *Manager) Reset(ctx context.Context, env Env, log io.Writer) error {
 	m.mu.Lock()
 	defer m.mu.Unlock()
+	if err := m.pushKit(ctx, env, log); err != nil {
+		return err
+	}
 	return m.reset(ctx, env, log)
 }
 
