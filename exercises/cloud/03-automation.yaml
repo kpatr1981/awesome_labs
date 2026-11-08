@@ -1,0 +1,692 @@
+track: cloud
+module: AWS automation & governance
+profile: docker
+order: 3
+exercises:
+
+- id: cloud-016
+  title: Nobody deletes the audit log
+  difficulty: 1
+  kind: build
+  tags: [aws, s3, bucket-policy]
+  tutorial: |
+    **Concept.** A bucket policy is a JSON document that allows or denies actions for principals on resources. An explicit Deny always beats any Allow, and object-level actions use a resource ARN that ends in a path.
+
+    **Read up on:**
+    - `aws s3api put-bucket-policy help` — how to pass a policy from a file
+    - `aws s3api get-bucket-policy` — read back what is attached
+    - Policy elements — `Effect`, `Principal`, `Action`, `Resource`
+    - S3 ARNs — the difference between the bucket ARN and the objects inside it
+  scenario: |
+    The `aws` command talks to a local emulator, and can only see files under `/lab`.
+
+    Bucket **`kl-audit`** holds audit logs. Auditors require that **nobody**, admins
+    included, can delete objects from it. Reading and uploading objects must keep working.
+
+    Write the policy to **`/lab/policy.json`** and attach it to the bucket.
+  hints:
+    - "A statement with `Effect: Deny` and `Principal: \"*\"` applies to everyone."
+    - "Object actions apply to the objects, so the resource ARN is `arn:aws:s3:::BUCKET/*`."
+    - "`aws s3api put-bucket-policy --bucket NAME --policy file:///lab/policy.json`"
+  solution: |
+    ```bash
+    cat > /lab/policy.json <<'EOF'
+    {
+      "Version": "2012-10-17",
+      "Statement": [{
+        "Sid": "NoDelete",
+        "Effect": "Deny",
+        "Principal": "*",
+        "Action": "s3:DeleteObject",
+        "Resource": "arn:aws:s3:::kl-audit/*"
+      }]
+    }
+    EOF
+    aws s3api put-bucket-policy --bucket kl-audit --policy file:///lab/policy.json
+    ```
+  setup: |
+    moto_start
+    aws s3 mb s3://kl-audit >/dev/null
+  check: |
+    p=$(aws s3api get-bucket-policy --bucket kl-audit --query Policy --output text 2>/dev/null)
+    denies() {
+      jq -e --arg a "$1" --arg r "$2" '
+        def arr: if type=="array" then . else [.] end;
+        [.Statement[]? | select(.Effect=="Deny")
+          | select((.Action|arr|index($a)) != null)
+          | select((.Resource|arr|index($r)) != null)] | length > 0' <<<"${p:-null}"
+    }
+    blocks_reads() {
+      jq -e '
+        def arr: if type=="array" then . else [.] end;
+        [.Statement[]? | select(.Effect=="Deny") | .Action | arr[]
+          | select(. == "s3:*" or . == "*" or . == "s3:GetObject" or . == "s3:PutObject")] | length > 0' <<<"${p:-null}"
+    }
+    check "a policy is attached" 'test -n "$p"'
+    check "deletes of objects are denied" 'denies s3:DeleteObject arn:aws:s3:::kl-audit/*'
+    check "the policy does not block reads or uploads" '[ -n "$p" ] && ! blocks_reads'
+  solve: |
+    cat > /lab/policy.json <<'EOF'
+    {
+      "Version": "2012-10-17",
+      "Statement": [{
+        "Sid": "NoDelete",
+        "Effect": "Deny",
+        "Principal": "*",
+        "Action": "s3:DeleteObject",
+        "Resource": "arn:aws:s3:::kl-audit/*"
+      }]
+    }
+    EOF
+    aws s3api put-bucket-policy --bucket kl-audit --policy file:///lab/policy.json
+
+- id: cloud-017
+  title: The payments key stopped working
+  difficulty: 2
+  kind: fix
+  tags: [aws, kms, encryption]
+  tutorial: |
+    **Concept.** A KMS key has a lifecycle state, and an alias is just a friendly name pointing at a key. Data encrypted under a key needs that same key, so replacing it is rarely the answer. Rotation is a separate per-key setting.
+
+    **Read up on:**
+    - `aws kms describe-key` — the key state and metadata, using an alias or key ID
+    - `aws kms list-aliases` — which key an alias points at
+    - `aws kms enable-key` and `disable-key`
+    - `aws kms get-key-rotation-status` and `enable-key-rotation`
+  scenario: |
+    The `aws` command talks to a local emulator.
+
+    The application encrypts with the alias **`alias/payments`**, and its calls are being
+    rejected. Security also wants **automatic key rotation** on this key.
+
+    Existing data is encrypted under the current key, so do **not** replace it or point
+    the alias somewhere else.
+  hints:
+    - "`aws kms describe-key --key-id alias/payments` shows the key's state."
+    - "A key that is not in the Enabled state cannot be used for encryption."
+    - "Rotation is switched on per key with `enable-key-rotation`."
+  solution: |
+    ```bash
+    KEY=$(aws kms describe-key --key-id alias/payments --query KeyMetadata.KeyId --output text)
+    aws kms enable-key --key-id "$KEY"
+    aws kms enable-key-rotation --key-id "$KEY"
+    aws kms get-key-rotation-status --key-id "$KEY"
+    ```
+  setup: |
+    moto_start
+    key=$(aws kms create-key --description "payments data key" --query KeyMetadata.KeyId --output text)
+    aws kms create-alias --alias-name alias/payments --target-key-id "$key"
+    aws kms disable-key --key-id "$key"
+    echo "$key" > "$KL_STATE/answer"
+  check: |
+    key=$(cat "$KL_STATE/answer")
+    check_eq "alias still points at the original key" "$(aws kms describe-key --key-id alias/payments --query KeyMetadata.KeyId --output text 2>/dev/null)" "$key"
+    check_eq "the key is enabled" "$(aws kms describe-key --key-id "$key" --query KeyMetadata.KeyState --output text 2>/dev/null)" Enabled
+    check_eq "rotation is on" "$(aws kms get-key-rotation-status --key-id "$key" --query KeyRotationEnabled --output text 2>/dev/null)" True
+  solve: |
+    KEY=$(aws kms describe-key --key-id alias/payments --query KeyMetadata.KeyId --output text)
+    aws kms enable-key --key-id "$KEY"
+    aws kms enable-key-rotation --key-id "$KEY"
+
+- id: cloud-018
+  title: Name the application
+  difficulty: 2
+  kind: build
+  tags: [aws, route53, dns]
+  tutorial: |
+    **Concept.** Route 53 stores DNS records in hosted zones, and records are changed in batches. A batch holds actions such as create, upsert or delete. Record names are fully qualified, and a CNAME points one name at another name rather than at an address.
+
+    **Read up on:**
+    - `aws route53 list-hosted-zones-by-name` — find a zone and its ID
+    - `aws route53 change-resource-record-sets help` — the change batch JSON
+    - `CREATE` versus `UPSERT` actions
+    - `aws route53 list-resource-record-sets` — read the records back
+  scenario: |
+    The `aws` command talks to a local emulator, and can only see files under `/lab`.
+
+    The hosted zone **`kl-lab.example`** exists and is empty. Add two records:
+
+    - **`app.kl-lab.example`** — an **A** record with TTL **60**, pointing at the address
+      written in **`/lab/app-ip.txt`**,
+    - **`www.kl-lab.example`** — a **CNAME** record with TTL **300**, pointing at
+      `app.kl-lab.example`.
+  hints:
+    - "Look up the zone ID with `aws route53 list-hosted-zones-by-name --dns-name kl-lab.example`."
+    - "A change batch looks like `{\"Changes\":[{\"Action\":\"UPSERT\",\"ResourceRecordSet\":{...}}]}`, passed with `--change-batch file:///lab/...`."
+    - "`ResourceRecords` is a list of `{\"Value\": \"...\"}` objects."
+  solution: |
+    ```bash
+    cd /lab
+    ZID=$(aws route53 list-hosted-zones-by-name --dns-name kl-lab.example --query 'HostedZones[0].Id' --output text)
+    IP=$(tr -d '[:space:]' < app-ip.txt)
+    cat > batch.json <<EOF
+    {"Changes": [
+      {"Action": "UPSERT", "ResourceRecordSet": {"Name": "app.kl-lab.example", "Type": "A", "TTL": 60,
+        "ResourceRecords": [{"Value": "$IP"}]}},
+      {"Action": "UPSERT", "ResourceRecordSet": {"Name": "www.kl-lab.example", "Type": "CNAME", "TTL": 300,
+        "ResourceRecords": [{"Value": "app.kl-lab.example"}]}}
+    ]}
+    EOF
+    aws route53 change-resource-record-sets --hosted-zone-id "$ZID" --change-batch file:///lab/batch.json
+    ```
+  setup: |
+    moto_start
+    aws route53 create-hosted-zone --name kl-lab.example --caller-reference "ref-$RANDOM" >/dev/null
+    ip="10.$((RANDOM % 200 + 1)).$((RANDOM % 250 + 1)).$((RANDOM % 250 + 1))"
+    echo "$ip" > "$KL_STATE/answer"
+    lab_file /lab/app-ip.txt <<EOF
+    $ip
+    EOF
+  check: |
+    ip=$(cat "$KL_STATE/answer")
+    zid=$(aws route53 list-hosted-zones-by-name --dns-name kl-lab.example --query 'HostedZones[0].Id' --output text 2>/dev/null)
+    zid=${zid##*/}
+    rr=$(aws route53 list-resource-record-sets --hosted-zone-id "$zid" --output json 2>/dev/null)
+    pick() { jq -r --arg n "$1" --arg t "$2" --arg f "$3" '[.ResourceRecordSets[]? | select((.Name|sub("\\.$";"")) == $n and .Type == $t)][0] | if . == null then "" elif $f == "ttl" then (.TTL|tostring) else (.ResourceRecords[0].Value | sub("\\.$";"")) end' <<<"${rr:-null}"; }
+    check_eq "app A record value" "$(pick app.kl-lab.example A value)" "$ip"
+    check_eq "app A record TTL" "$(pick app.kl-lab.example A ttl)" 60
+    check_eq "www CNAME target" "$(pick www.kl-lab.example CNAME value)" app.kl-lab.example
+    check_eq "www CNAME TTL" "$(pick www.kl-lab.example CNAME ttl)" 300
+  solve: |
+    cd /lab
+    ZID=$(aws route53 list-hosted-zones-by-name --dns-name kl-lab.example --query 'HostedZones[0].Id' --output text)
+    IP=$(tr -d '[:space:]' < app-ip.txt)
+    cat > batch.json <<EOF
+    {"Changes": [
+      {"Action": "UPSERT", "ResourceRecordSet": {"Name": "app.kl-lab.example", "Type": "A", "TTL": 60,
+        "ResourceRecords": [{"Value": "$IP"}]}},
+      {"Action": "UPSERT", "ResourceRecordSet": {"Name": "www.kl-lab.example", "Type": "CNAME", "TTL": 300,
+        "ResourceRecords": [{"Value": "app.kl-lab.example"}]}}
+    ]}
+    EOF
+    aws route53 change-resource-record-sets --hosted-zone-id "$ZID" --change-batch file:///lab/batch.json
+
+- id: cloud-019
+  title: An alarm that never rings
+  difficulty: 3
+  kind: fix
+  tags: [aws, cloudwatch, alarms, sns]
+  tutorial: |
+    **Concept.** A CloudWatch alarm watches one metric and compares a statistic over several periods to a threshold. It only helps if the comparison points the right way and an action, such as an SNS topic, is attached to the alarm state.
+
+    **Read up on:**
+    - `aws cloudwatch describe-alarms` — inspect an alarm's settings
+    - `aws cloudwatch put-metric-alarm help` — calling it again with the same name replaces the alarm
+    - Comparison operators, `Period` and `EvaluationPeriods`
+    - `--alarm-actions` — what runs when the state becomes ALARM
+  scenario: |
+    The `aws` command talks to a local emulator.
+
+    The alarm **`web-cpu-high`** is supposed to page the on-call team when web servers are
+    overloaded, but it never fires and nobody is notified. The runbook in
+    **`/lab/runbook.txt`** has the agreed threshold.
+
+    Reconfigure the same alarm so that it goes to ALARM when the **average** of
+    `CPUUtilization` (namespace `AWS/EC2`) stays **above the runbook threshold** for **3**
+    consecutive **5-minute** periods, and notifies the SNS topic **`ops-alerts`**.
+  hints:
+    - "`aws cloudwatch describe-alarms --alarm-names web-cpu-high` shows what is configured now."
+    - "`put-metric-alarm` with an existing alarm name overwrites it, so give it every setting again."
+    - "The topic's ARN comes from `aws sns list-topics`; pass it to `--alarm-actions`."
+  solution: |
+    ```bash
+    TOPIC=$(aws sns list-topics --query "Topics[?ends_with(TopicArn, ':ops-alerts')].TopicArn" --output text)
+    THR=$(grep -oE '[0-9]+' /lab/runbook.txt | head -1)
+    aws cloudwatch put-metric-alarm --alarm-name web-cpu-high \
+      --namespace AWS/EC2 --metric-name CPUUtilization --statistic Average \
+      --period 300 --evaluation-periods 3 --threshold "$THR" \
+      --comparison-operator GreaterThanThreshold --alarm-actions "$TOPIC"
+    ```
+  setup: |
+    moto_start
+    topic=$(aws sns create-topic --name ops-alerts --query TopicArn --output text)
+    thr=$((70 + 10 * (RANDOM % 3)))
+    printf '%s\n%s\n' "$thr" "$topic" > "$KL_STATE/answer"
+    lab_file /lab/runbook.txt <<EOF
+    Web tier runbook
+    CPU alarm threshold: $thr percent
+    Escalation: SNS topic ops-alerts
+    EOF
+    aws cloudwatch put-metric-alarm --alarm-name web-cpu-high \
+      --namespace AWS/EC2 --metric-name CPUUtilization --statistic Average \
+      --period 300 --evaluation-periods 1 --threshold 5 \
+      --comparison-operator LessThanThreshold
+  check: |
+    thr=$(sed -n 1p "$KL_STATE/answer")
+    topic=$(sed -n 2p "$KL_STATE/answer")
+    a=$(aws cloudwatch describe-alarms --alarm-names web-cpu-high --query 'MetricAlarms[0]' --output json 2>/dev/null)
+    f() { jq -r "$1" <<<"${a:-null}"; }
+    check_eq "alarm watches CPUUtilization" "$(f '.MetricName // ""')" CPUUtilization
+    check_eq "fires when CPU is above the threshold" "$(f '.ComparisonOperator // ""')" GreaterThanThreshold
+    check_eq "threshold matches the runbook" "$(f '(.Threshold // -1) | floor')" "$thr"
+    check_eq "three evaluation periods" "$(f '.EvaluationPeriods // 0')" 3
+    check_eq "five minute period" "$(f '.Period // 0')" 300
+    check_eq "average statistic" "$(f '.Statistic // ""')" Average
+    check_eq "alarm notifies ops-alerts" "$(f '[.AlarmActions[]? | select(. == "'"$topic"'")] | length')" 1
+  solve: |
+    TOPIC=$(aws sns list-topics --query "Topics[?ends_with(TopicArn, ':ops-alerts')].TopicArn" --output text)
+    THR=$(grep -oE '[0-9]+' /lab/runbook.txt | head -1)
+    aws cloudwatch put-metric-alarm --alarm-name web-cpu-high \
+      --namespace AWS/EC2 --metric-name CPUUtilization --statistic Average \
+      --period 300 --evaluation-periods 3 --threshold "$THR" \
+      --comparison-operator GreaterThanThreshold --alarm-actions "$TOPIC"
+
+- id: cloud-020
+  title: Orders vanish before the queue
+  difficulty: 3
+  kind: fix
+  tags: [aws, eventbridge, sqs]
+  tutorial: |
+    **Concept.** An EventBridge rule matches events with a JSON event pattern and sends matches to targets. A rule only works when it is enabled, its pattern matches the real events field by field, and at least one target is attached.
+
+    **Read up on:**
+    - `aws events describe-rule` — state and pattern of a rule
+    - `aws events put-rule help` — pattern syntax and `--state`
+    - `aws events list-targets-by-rule` and `put-targets`
+    - Event pattern fields — `source` and `detail-type`, which take lists
+  scenario: |
+    The `aws` command talks to a local emulator.
+
+    The shop's order service publishes events with source **`shop.orders`** and
+    detail-type **`OrderPlaced`**. They should land in the SQS queue **`order-events`**
+    through the EventBridge rule **`orders-placed`** on the default bus, but nothing ever
+    arrives.
+
+    Repair the existing rule. It must match **only** those events and deliver them to
+    the queue.
+  hints:
+    - "`aws events describe-rule --name orders-placed` shows the state and the pattern."
+    - "Compare the pattern to the source and detail-type in this description, character by character."
+    - "`put-targets` takes `Id=...,Arn=...`; the queue's ARN comes from `get-queue-attributes`."
+  solution: |
+    ```bash
+    aws events put-rule --name orders-placed --state ENABLED \
+      --event-pattern '{"source":["shop.orders"],"detail-type":["OrderPlaced"]}'
+    URL=$(aws sqs get-queue-url --queue-name order-events --query QueueUrl --output text)
+    QARN=$(aws sqs get-queue-attributes --queue-url "$URL" --attribute-names QueueArn --query Attributes.QueueArn --output text)
+    aws events put-targets --rule orders-placed --targets "Id=queue,Arn=$QARN"
+    ```
+  setup: |
+    moto_start
+    url=$(aws sqs create-queue --queue-name order-events --query QueueUrl --output text)
+    aws sqs get-queue-attributes --queue-url "$url" --attribute-names QueueArn --query Attributes.QueueArn --output text > "$KL_STATE/answer"
+    aws events put-rule --name orders-placed --state DISABLED \
+      --event-pattern '{"source":["shop.order"],"detail-type":["OrderPlaced"]}' >/dev/null
+  check: |
+    qarn=$(cat "$KL_STATE/answer")
+    r=$(aws events describe-rule --name orders-placed --output json 2>/dev/null)
+    pat=$(jq -c '(.EventPattern // "{}") | fromjson' <<<"${r:-null}" 2>/dev/null)
+    check_eq "the rule is enabled" "$(jq -r '.State // ""' <<<"${r:-null}")" ENABLED
+    check_eq "pattern matches source shop.orders only" "$(jq -c '.source // []' <<<"${pat:-null}" 2>/dev/null)" '["shop.orders"]'
+    check_eq "pattern matches OrderPlaced only" "$(jq -c '."detail-type" // []' <<<"${pat:-null}" 2>/dev/null)" '["OrderPlaced"]'
+    t=$(aws events list-targets-by-rule --rule orders-placed --output json 2>/dev/null)
+    check_eq "the queue is a target" "$(jq -r --arg a "$qarn" '[.Targets[]? | select(.Arn == $a)] | length' <<<"${t:-null}")" 1
+  solve: |
+    aws events put-rule --name orders-placed --state ENABLED \
+      --event-pattern '{"source":["shop.orders"],"detail-type":["OrderPlaced"]}'
+    URL=$(aws sqs get-queue-url --queue-name order-events --query QueueUrl --output text)
+    QARN=$(aws sqs get-queue-attributes --queue-url "$URL" --attribute-names QueueArn --query Attributes.QueueArn --output text)
+    aws events put-targets --rule orders-placed --targets "Id=queue,Arn=$QARN"
+
+- id: cloud-021
+  title: A password in plain sight
+  difficulty: 2
+  kind: fix
+  tags: [aws, ssm, parameter-store, secrets]
+  tutorial: |
+    **Concept.** SSM Parameter Store keeps configuration under hierarchical names. A parameter is a plain String, a StringList or an encrypted SecureString, and the type is chosen when it is written. Reading an encrypted value back requires asking for decryption.
+
+    **Read up on:**
+    - `aws ssm put-parameter help` — `--type`, `--overwrite` and `--value`
+    - `aws ssm get-parameter` and `--with-decryption`
+    - `aws ssm get-parameters-by-path` — list a whole hierarchy
+    - `aws ssm describe-parameters` — see types without values
+  scenario: |
+    The `aws` command talks to a local emulator.
+
+    Under the path **`/app/prod/`** there are two parameters: `db_host` and `db_password`.
+    The password is currently readable by anyone who can list parameters, because it
+    is stored unencrypted.
+
+    Store **`/app/prod/db_password`** as an encrypted parameter, keeping **exactly the same
+    value**, and leave `db_host` alone.
+  hints:
+    - "`aws ssm describe-parameters` shows the type of each parameter."
+    - "You can read the current value with `aws ssm get-parameter --name ... --with-decryption`."
+    - "Writing a parameter that already exists needs `--overwrite`."
+  solution: |
+    ```bash
+    PW=$(aws ssm get-parameter --name /app/prod/db_password --with-decryption --query Parameter.Value --output text)
+    aws ssm put-parameter --name /app/prod/db_password --type SecureString --value "$PW" --overwrite
+    ```
+  setup: |
+    moto_start
+    pw="pw-$RANDOM$RANDOM"
+    echo "$pw" > "$KL_STATE/answer"
+    aws ssm put-parameter --name /app/prod/db_host --type String --value db.internal >/dev/null
+    aws ssm put-parameter --name /app/prod/db_password --type String --value "$pw" >/dev/null
+  check: |
+    pw=$(cat "$KL_STATE/answer")
+    check_eq "db_password is a SecureString" "$(aws ssm get-parameter --name /app/prod/db_password --query Parameter.Type --output text 2>/dev/null)" SecureString
+    check_eq "the value is unchanged" "$(aws ssm get-parameter --name /app/prod/db_password --with-decryption --query Parameter.Value --output text 2>/dev/null)" "$pw"
+    check_eq "db_host is untouched" "$(aws ssm get-parameter --name /app/prod/db_host --query '[Parameter.Type,Parameter.Value]' --output text 2>/dev/null | tr '\t' ' ')" "String db.internal"
+  solve: |
+    PW=$(aws ssm get-parameter --name /app/prod/db_password --with-decryption --query Parameter.Value --output text)
+    aws ssm put-parameter --name /app/prod/db_password --type SecureString --value "$PW" --overwrite
+
+- id: cloud-022
+  title: Who owns these servers
+  difficulty: 3
+  kind: build
+  tags: [aws, ec2, tags, jmespath]
+  tutorial: |
+    **Concept.** Tags are key/value labels on resources, and keys are case-sensitive. JMESPath, used by `--query`, can filter nested lists and test for missing values. To find what is missing, report first, then change things, because afterwards the evidence is gone.
+
+    **Read up on:**
+    - `aws ec2 describe-instances help` — output structure, `Tags` list may be absent
+    - JMESPath filters — `[?Key=='x']`, `length()`, `not_null()` and negation
+    - `aws ec2 create-tags help` — apply a tag to many resources at once
+    - `--output text` — turn a list into plain values
+  scenario: |
+    The `aws` command talks to a local emulator.
+
+    Policy says that every EC2 instance must carry an **`Owner`** tag. Some do not.
+
+    1. Write the IDs of all instances **without an `Owner` tag**, sorted, one per line,
+       to **`/lab/missing.txt`**.
+    2. Tag each of those instances with **`Owner=unassigned`**.
+
+    Instances that already have an `Owner` tag must keep their value.
+  hints:
+    - "`--query 'Reservations[].Instances[]'` flattens the output into a list of instances."
+    - "In JMESPath, `Tags[?Key=='Owner']` returns a list that is empty when the tag is missing."
+    - "Tag keys are case-sensitive: look at every key that is present, not just the values."
+    - "Save the report before tagging, or you will no longer be able to tell which instances were missing it."
+  solution: |
+    ```bash
+    aws ec2 describe-instances --output json \
+      | jq -r '.Reservations[].Instances[] | select(([.Tags[]? | select(.Key=="Owner")] | length) == 0) | .InstanceId' \
+      | sort > /lab/missing.txt
+    aws ec2 create-tags --resources $(cat /lab/missing.txt) --tags Key=Owner,Value=unassigned
+    ```
+  setup: |
+    moto_start
+    ami=$(aws ec2 describe-images --query 'Images[0].ImageId' --output text)
+    ids=$(aws ec2 run-instances --image-id "$ami" --instance-type t3.micro --count 6 \
+      --query 'Instances[].InstanceId' --output text)
+    set -- $ids
+    aws ec2 create-tags --resources "$1" "$2" --tags Key=Owner,Value=alice
+    aws ec2 create-tags --resources "$3" --tags Key=Owner,Value=bob
+    aws ec2 create-tags --resources "$4" --tags Key=owner,Value=carol
+    aws ec2 create-tags --resources "$5" --tags Key=Env,Value=prod
+    printf '%s\n' "$4" "$5" "$6" | sort > "$KL_STATE/answer"
+    printf '%s alice\n%s alice\n%s bob\n' "$1" "$2" "$3" > "$KL_STATE/owners"
+  check: |
+    check_eq "/lab/missing.txt lists the untagged instances" "$(sort 2>/dev/null </lab/missing.txt | tr -s '[:space:]' ' ')" "$(tr -s '[:space:]' ' ' <"$KL_STATE/answer")"
+    all=$(aws ec2 describe-instances --output json 2>/dev/null)
+    tagval() { jq -r --arg i "$1" '[.Reservations[]?.Instances[]? | select(.InstanceId == $i) | .Tags[]? | select(.Key == "Owner") | .Value][0] // ""' <<<"${all:-null}"; }
+    bad=0
+    while read -r id; do
+      [ "$(tagval "$id")" = unassigned ] || bad=$((bad + 1))
+    done <"$KL_STATE/answer"
+    check_eq "untagged instances are now Owner=unassigned" "$bad" 0
+    keep=0
+    while read -r id v; do
+      [ "$(tagval "$id")" = "$v" ] || keep=$((keep + 1))
+    done <"$KL_STATE/owners"
+    check_eq "existing owners are preserved" "$keep" 0
+  solve: |
+    aws ec2 describe-instances --output json \
+      | jq -r '.Reservations[].Instances[] | select(([.Tags[]? | select(.Key=="Owner")] | length) == 0) | .InstanceId' \
+      | sort > /lab/missing.txt
+    aws ec2 create-tags --resources $(cat /lab/missing.txt) --tags Key=Owner,Value=unassigned
+
+- id: cloud-023
+  title: The public subnet has no way out
+  difficulty: 4
+  kind: fix
+  tags: [aws, ec2, vpc, route-table]
+  tutorial: |
+    **Concept.** Every subnet uses exactly one route table: its explicit association, or else the VPC's main table. A route only helps the subnets that actually use that table.
+
+    **Read up on:**
+    - `aws ec2 describe-route-tables` — routes and associations, including the `Main` flag
+    - `aws ec2 associate-route-table help` — tie a table to a subnet
+    - `aws ec2 create-route` — the `0.0.0.0/0` default route and its target
+    - `aws ec2 describe-subnets` — tags and CIDRs of the subnets
+    - Main versus custom route tables
+  scenario: |
+    The `aws` command talks to a local emulator.
+
+    VPC **10.20.0.0/16** has two subnets, tagged `Name=public` and `Name=private`. An
+    internet gateway is attached and a route table tagged `Name=public-rt` has a default
+    route through it, yet hosts in the **public** subnet cannot get out.
+
+    Fix the routing so the public subnet has a default route to the internet gateway.
+    The **private** subnet must still have **no** route to the gateway.
+  hints:
+    - "List `describe-route-tables` for the VPC and look at the `Associations` of each table."
+    - "A subnet without an explicit association falls back to the main route table."
+    - "Adding the internet route to the main table would also open up the private subnet."
+  solution: |
+    ```bash
+    SUBNET=$(aws ec2 describe-subnets --filters Name=tag:Name,Values=public --query 'Subnets[0].SubnetId' --output text)
+    RT=$(aws ec2 describe-route-tables --filters Name=tag:Name,Values=public-rt --query 'RouteTables[0].RouteTableId' --output text)
+    aws ec2 associate-route-table --route-table-id "$RT" --subnet-id "$SUBNET"
+    ```
+  setup: |
+    moto_start
+    vpc=$(aws ec2 create-vpc --cidr-block 10.20.0.0/16 --query Vpc.VpcId --output text)
+    echo "$vpc" > "$KL_STATE/answer"
+    for s in public:1 private:2; do
+      aws ec2 create-subnet --vpc-id "$vpc" --cidr-block "10.20.${s#*:}.0/24" \
+        --tag-specifications "ResourceType=subnet,Tags=[{Key=Name,Value=${s%:*}}]" >/dev/null
+    done
+    igw=$(aws ec2 create-internet-gateway --query InternetGateway.InternetGatewayId --output text)
+    aws ec2 attach-internet-gateway --internet-gateway-id "$igw" --vpc-id "$vpc"
+    rt=$(aws ec2 create-route-table --vpc-id "$vpc" \
+      --tag-specifications 'ResourceType=route-table,Tags=[{Key=Name,Value=public-rt}]' \
+      --query RouteTable.RouteTableId --output text)
+    aws ec2 create-route --route-table-id "$rt" --destination-cidr-block 0.0.0.0/0 --gateway-id "$igw" >/dev/null
+  check: |
+    vpc=$(cat "$KL_STATE/answer")
+    effroutes() {
+      local s rt
+      s=$(aws ec2 describe-subnets --filters "Name=tag:Name,Values=$1" "Name=vpc-id,Values=$vpc" --query 'Subnets[0].SubnetId' --output text)
+      rt=$(aws ec2 describe-route-tables --filters "Name=association.subnet-id,Values=$s" --output json)
+      if jq -e '.RouteTables | length > 0' <<<"${rt:-null}" >/dev/null 2>&1; then
+        echo "$rt"
+      else
+        aws ec2 describe-route-tables --filters "Name=vpc-id,Values=$vpc" "Name=association.main,Values=true" --output json
+      fi
+    }
+    hasdefault() {
+      jq -e '[.RouteTables[0].Routes[]? | select(.DestinationCidrBlock == "0.0.0.0/0" and ((.GatewayId // "") | startswith("igw-")))] | length > 0'
+    }
+    check "the public subnet routes 0.0.0.0/0 to the internet gateway" 'effroutes public | hasdefault'
+    check "the private subnet still has no internet route" 'effroutes private | grep -q RouteTables && ! effroutes private | hasdefault'
+  solve: |
+    SUBNET=$(aws ec2 describe-subnets --filters Name=tag:Name,Values=public --query 'Subnets[0].SubnetId' --output text)
+    RT=$(aws ec2 describe-route-tables --filters Name=tag:Name,Values=public-rt --query 'RouteTables[0].RouteTableId' --output text)
+    aws ec2 associate-route-table --route-table-id "$RT" --subnet-id "$SUBNET"
+
+- id: cloud-024
+  title: A web fleet that grows
+  difficulty: 4
+  kind: build
+  tags: [aws, autoscaling, launch-template]
+  tutorial: |
+    **Concept.** An Auto Scaling group keeps a number of instances running, between a minimum and a maximum, built from a launch template. Scaling policies change the desired capacity by a rule, such as adding a fixed number of instances.
+
+    **Read up on:**
+    - `aws autoscaling create-auto-scaling-group help` — sizes, zones and the template reference
+    - `aws ec2 describe-launch-templates` — names and versions
+    - `aws autoscaling put-scaling-policy help` — adjustment type and cooldown
+    - `aws autoscaling describe-auto-scaling-groups` and `describe-policies`
+  scenario: |
+    The `aws` command talks to a local emulator, and can only see files under `/lab`.
+
+    A launch template **`web-lt`** already exists. Create an Auto Scaling group named
+    **`web-asg`** that uses its latest version, spans the availability zones **`us-east-1a`**
+    and **`us-east-1b`**, and is sized as in **`/lab/sizing.txt`** (minimum, maximum and
+    desired capacity).
+
+    Then add a simple scaling policy named **`web-scale-out`** to the group that adds
+    **one** instance each time it runs, with a cooldown of **120** seconds.
+  hints:
+    - "`--launch-template LaunchTemplateName=web-lt,Version='$Latest'` selects the newest template version."
+    - "Sizes are `--min-size`, `--max-size` and `--desired-capacity`; zones are `--availability-zones`."
+    - "`put-scaling-policy` takes `--adjustment-type ChangeInCapacity` and `--scaling-adjustment`."
+  solution: |
+    ```bash
+    . /lab/sizing.txt
+    aws autoscaling create-auto-scaling-group --auto-scaling-group-name web-asg \
+      --launch-template 'LaunchTemplateName=web-lt,Version=$Latest' \
+      --min-size "$min" --max-size "$max" --desired-capacity "$desired" \
+      --availability-zones us-east-1a us-east-1b
+    aws autoscaling put-scaling-policy --auto-scaling-group-name web-asg \
+      --policy-name web-scale-out --adjustment-type ChangeInCapacity \
+      --scaling-adjustment 1 --cooldown 120
+    ```
+  setup: |
+    moto_start
+    ami=$(aws ec2 describe-images --query 'Images[0].ImageId' --output text)
+    aws ec2 create-launch-template --launch-template-name web-lt \
+      --launch-template-data "{\"ImageId\":\"$ami\",\"InstanceType\":\"t3.micro\"}" >/dev/null
+    mx=$((4 + RANDOM % 5))
+    printf 'min=2\nmax=%s\ndesired=3\n' "$mx" > "$KL_STATE/answer"
+    lab_file /lab/sizing.txt <<EOF
+    min=2
+    max=$mx
+    desired=3
+    EOF
+  check: |
+    . "$KL_STATE/answer"
+    g=$(aws autoscaling describe-auto-scaling-groups --auto-scaling-group-names web-asg --query 'AutoScalingGroups[0]' --output json 2>/dev/null)
+    f() { jq -r "$1" <<<"${g:-null}"; }
+    check_eq "group uses launch template web-lt" "$(f '.LaunchTemplate.LaunchTemplateName // ""')" web-lt
+    check_eq "minimum size" "$(f '.MinSize // -1')" "$min"
+    check_eq "maximum size" "$(f '.MaxSize // -1')" "$max"
+    check_eq "desired capacity" "$(f '.DesiredCapacity // -1')" "$desired"
+    check_eq "spans both zones" "$(f '[.AvailabilityZones[]?] | sort | join(",")')" us-east-1a,us-east-1b
+    p=$(aws autoscaling describe-policies --auto-scaling-group-name web-asg --policy-names web-scale-out --query 'ScalingPolicies[0]' --output json 2>/dev/null)
+    pf() { jq -r "$1" <<<"${p:-null}"; }
+    check_eq "policy adds capacity" "$(pf '.AdjustmentType // ""')" ChangeInCapacity
+    check_eq "policy adds one instance" "$(pf '.ScalingAdjustment // 0')" 1
+    check_eq "policy cooldown" "$(pf '.Cooldown // 0')" 120
+  solve: |
+    . /lab/sizing.txt
+    aws autoscaling create-auto-scaling-group --auto-scaling-group-name web-asg \
+      --launch-template 'LaunchTemplateName=web-lt,Version=$Latest' \
+      --min-size "$min" --max-size "$max" --desired-capacity "$desired" \
+      --availability-zones us-east-1a us-east-1b
+    aws autoscaling put-scaling-policy --auto-scaling-group-name web-asg \
+      --policy-name web-scale-out --adjustment-type ChangeInCapacity \
+      --scaling-adjustment 1 --cooldown 120
+
+- id: cloud-025
+  title: One template, many environments
+  difficulty: 5
+  kind: build
+  tags: [aws, cloudformation, parameters, outputs]
+  tutorial: |
+    **Concept.** A CloudFormation template can take parameters so that one file builds different environments, and publish outputs so that other tools can find what was created. Intrinsic functions build names from parameters and look up attributes of resources.
+
+    **Read up on:**
+    - Template sections — `Parameters`, `Resources` and `Outputs`
+    - Parameter properties — `Type`, `Default` and `AllowedValues`
+    - Intrinsic functions — `Ref`, `Fn::Join` and `Fn::GetAtt`
+    - `aws cloudformation create-stack help` — passing `--parameters`
+    - `aws cloudformation describe-stacks` — read parameters and outputs back
+  scenario: |
+    The `aws` command talks to a local emulator, and can only see files under `/lab`.
+
+    Write the template **`/lab/stack.yaml`** with:
+
+    - a parameter **`Env`** (a string, default **`dev`**, allowed values `dev`, `staging`,
+      `prod`),
+    - an S3 bucket named **`kl-app-<Env>`**,
+    - an SQS queue named **`kl-app-<Env>-jobs`**,
+    - outputs **`BucketName`** (the bucket's name) and **`QueueArn`** (the queue's ARN).
+
+    Deploy it as the stack **`app-stack`** for the environment named in **`/lab/env.txt`**.
+  hints:
+    - "Build names with `Fn::Join: [\"-\", [\"kl-app\", {Ref: Env}]]`; the long form of the functions is the safest in YAML."
+    - "`Ref` on a bucket returns its name, and `Fn::GetAtt: [Queue, Arn]` returns the queue's ARN."
+    - "`aws cloudformation create-stack ... --parameters ParameterKey=Env,ParameterValue=VALUE`"
+  solution: |
+    ```bash
+    cat > /lab/stack.yaml <<'EOF'
+    AWSTemplateFormatVersion: '2010-09-09'
+    Parameters:
+      Env:
+        Type: String
+        Default: dev
+        AllowedValues: [dev, staging, prod]
+    Resources:
+      Bucket:
+        Type: AWS::S3::Bucket
+        Properties:
+          BucketName:
+            Fn::Join: ["-", ["kl-app", {Ref: Env}]]
+      Queue:
+        Type: AWS::SQS::Queue
+        Properties:
+          QueueName:
+            Fn::Join: ["-", ["kl-app", {Ref: Env}, "jobs"]]
+    Outputs:
+      BucketName:
+        Value: {Ref: Bucket}
+      QueueArn:
+        Value:
+          Fn::GetAtt: [Queue, Arn]
+    EOF
+    aws cloudformation create-stack --stack-name app-stack --template-body file:///lab/stack.yaml \
+      --parameters ParameterKey=Env,ParameterValue="$(tr -d '[:space:]' < /lab/env.txt)"
+    ```
+  setup: |
+    moto_start
+    if [ $((RANDOM % 2)) -eq 0 ]; then env=prod; else env=staging; fi
+    echo "$env" > "$KL_STATE/answer"
+    lab_file /lab/env.txt <<EOF
+    $env
+    EOF
+  check: |
+    env=$(cat "$KL_STATE/answer")
+    s=$(aws cloudformation describe-stacks --stack-name app-stack --query 'Stacks[0]' --output json 2>/dev/null)
+    f() { jq -r "$1" <<<"${s:-null}"; }
+    check_eq "the stack deployed" "$(f '.StackStatus // ""')" CREATE_COMPLETE
+    check_eq "Env parameter is set for this environment" "$(f '[.Parameters[]? | select(.ParameterKey == "Env") | .ParameterValue][0] // ""')" "$env"
+    check_eq "output BucketName" "$(f '[.Outputs[]? | select(.OutputKey == "BucketName") | .OutputValue][0] // ""')" "kl-app-$env"
+    check_match "output QueueArn" "$(f '[.Outputs[]? | select(.OutputKey == "QueueArn") | .OutputValue][0] // ""')" ":kl-app-$env-jobs\$"
+    check "the bucket kl-app-$env exists" 'aws s3api head-bucket --bucket "kl-app-$env"'
+    check "the queue kl-app-$env-jobs exists" 'aws sqs get-queue-url --queue-name "kl-app-$env-jobs"'
+    check "the template declares dev as the default" 'grep -Eq "Default:.*dev" /lab/stack.yaml'
+  solve: |
+    cat > /lab/stack.yaml <<'EOF'
+    AWSTemplateFormatVersion: '2010-09-09'
+    Parameters:
+      Env:
+        Type: String
+        Default: dev
+        AllowedValues: [dev, staging, prod]
+    Resources:
+      Bucket:
+        Type: AWS::S3::Bucket
+        Properties:
+          BucketName:
+            Fn::Join: ["-", ["kl-app", {Ref: Env}]]
+      Queue:
+        Type: AWS::SQS::Queue
+        Properties:
+          QueueName:
+            Fn::Join: ["-", ["kl-app", {Ref: Env}, "jobs"]]
+    Outputs:
+      BucketName:
+        Value: {Ref: Bucket}
+      QueueArn:
+        Value:
+          Fn::GetAtt: [Queue, Arn]
+    EOF
+    aws cloudformation create-stack --stack-name app-stack --template-body file:///lab/stack.yaml \
+      --parameters ParameterKey=Env,ParameterValue="$(tr -d '[:space:]' < /lab/env.txt)"

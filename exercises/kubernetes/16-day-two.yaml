@@ -1,0 +1,594 @@
+track: kubernetes
+module: Day-two operations
+profile: k8s
+order: 16
+exercises:
+
+- id: k8s-301
+  title: An image inventory
+  difficulty: 1
+  kind: build
+  tags: [jsonpath, reporting]
+  tutorial: |
+    **Concept.** kubectl can print any field of any object using JSONPath templates, and repeated sections are walked with a range expression. Combined with ordinary shell tools you can turn cluster state into a plain-text report.
+
+    **Read up on:**
+    - `kubectl get pods -o jsonpath=...` — template syntax, `[*]` wildcards and `range ... end`
+    - `kubectl get pods -o json` — explore the real field names first
+    - `sort --help` and `tr --help` — ordering and de-duplicating lines
+    - Kubernetes docs: JSONPath Support
+  scenario: |
+    Security wants to know which container images run in namespace **`fleet`**.
+
+    Write every **distinct image** used by the pods there to **`/lab/images.txt`**:
+    one image per line, **sorted alphabetically**, no duplicates.
+  hints:
+    - "`kubectl get pods -n fleet -o jsonpath='{range .items[*]}{.spec.containers[*].image}{\"\\n\"}{end}'` prints the raw list."
+    - "The output of that template is space-separated per pod; `tr` and `sort -u` finish the job."
+  solution: |
+    ```bash
+    kubectl get pods -n fleet -o jsonpath='{range .items[*]}{.spec.containers[*].image}{"\n"}{end}' \
+      | tr ' ' '\n' | sort -u > /lab/images.txt
+    ```
+  setup: |
+    k_ns fleet
+    imgs=(nginx:1.27-alpine nginx:1.28-alpine busybox:1.37 redis:7.4-alpine alpine:3.22)
+    for i in 1 2 3 4 5 6; do
+      if [ "$i" -le 2 ]; then img=${imgs[$((i-1))]}; else img=${imgs[$((RANDOM % 5))]}; fi
+      kubectl -n fleet run "unit-$i" --image="$img" --restart=Never -- sleep 3600 >/dev/null
+    done
+    kubectl -n fleet get pods -o jsonpath='{range .items[*]}{.spec.containers[*].image}{"\n"}{end}' | tr ' ' '\n' | sort -u >"$KL_STATE/answer"
+  check: |
+    check "images.txt exists and is not empty" '[ -s /lab/images.txt ]'
+    check "exactly the distinct images, sorted" '[ -s /lab/images.txt ] && [ "$(cat /lab/images.txt)" = "$(cat $KL_STATE/answer)" ]'
+  solve: |
+    kubectl get pods -n fleet -o jsonpath='{range .items[*]}{.spec.containers[*].image}{"\n"}{end}' | tr ' ' '\n' | sort -u > /lab/images.txt
+
+- id: k8s-302
+  title: One directory, three kinds of data
+  difficulty: 2
+  kind: build
+  tags: [projected, volumes, downwardapi]
+  tutorial: |
+    **Concept.** A projected volume merges several sources into a single directory, so an application sees one config folder instead of three mounts. Each source can rename its files and set a file mode.
+
+    **Read up on:**
+    - `kubectl explain pod.spec.volumes.projected.sources` — which source types can be combined
+    - `kubectl explain pod.spec.volumes.projected.sources.secret.items` — key, path and mode
+    - `kubectl explain pod.spec.volumes.projected.sources.downwardAPI` — exposing pod fields as files
+    - Kubernetes docs: Projected Volumes
+  scenario: |
+    Namespace **`proj`** has a ConfigMap **`app-conf`** (key `settings.ini`) and a Secret
+    **`app-creds`** (key `token`).
+
+    Create pod **`portal`** (`busybox:1.37`, `sleep infinity`) with **a single volume**
+    mounted at **`/etc/portal`** that contains exactly three files:
+
+    - `settings.ini` — from the ConfigMap
+    - `token` — from the Secret, readable by its owner only (mode `0400`)
+    - `podname` — holding the pod's own name
+  hints:
+    - "The volume type is `projected`; give it three `sources`."
+    - "The pod name comes from `fieldRef: {fieldPath: metadata.name}` in a downwardAPI source."
+  solution: |
+    ```yaml
+    volumes:
+    - name: cfg
+      projected:
+        sources:
+        - configMap: {name: app-conf, items: [{key: settings.ini, path: settings.ini}]}
+        - secret: {name: app-creds, items: [{key: token, path: token, mode: 0400}]}
+        - downwardAPI: {items: [{path: podname, fieldRef: {fieldPath: metadata.name}}]}
+    ```
+  setup: |
+    k_ns proj
+    t="tok-$(head -c6 /dev/urandom | od -An -tx1 | tr -d ' \n')"
+    echo "$t" >"$KL_STATE/answer"
+    kubectl -n proj create configmap app-conf --from-literal=settings.ini='mode=production' >/dev/null
+    kubectl -n proj create secret generic app-creds --from-literal=token="$t" >/dev/null
+  check: |
+    wait_pod proj portal 60
+    check "one projected volume mounted at /etc/portal" '[ "$(kubectl -n proj get pod portal -o json | jq "[.spec.volumes[]? | select(.projected and (.name | startswith(\"kube-api-access\") | not))] | length")" = 1 ] && [ "$(kubectl -n proj get pod portal -o json | jq "[.spec.containers[0].volumeMounts[]? | select(.mountPath==\"/etc/portal\")] | length")" = 1 ]'
+    check "directory holds exactly the three files" '[ "$(kubectl -n proj exec portal -- ls /etc/portal | sort | tr "\n" " ")" = "podname settings.ini token " ]'
+    check "settings.ini comes from the ConfigMap" '[ "$(kubectl -n proj exec portal -- cat /etc/portal/settings.ini)" = "mode=production" ]'
+    check "token comes from the Secret" '[ "$(kubectl -n proj exec portal -- cat /etc/portal/token)" = "$(cat $KL_STATE/answer)" ]'
+    check "token is mode 0400" '[ "$(kubectl -n proj exec portal -- stat -L -c %a /etc/portal/token)" = 400 ]'
+    check "podname holds the pod name" '[ "$(kubectl -n proj exec portal -- cat /etc/portal/podname)" = portal ]'
+  solve: |
+    kubectl apply -f - <<'EOF'
+    apiVersion: v1
+    kind: Pod
+    metadata: {name: portal, namespace: proj}
+    spec:
+      containers:
+      - name: portal
+        image: busybox:1.37
+        command: ["sleep", "infinity"]
+        volumeMounts: [{name: cfg, mountPath: /etc/portal}]
+      volumes:
+      - name: cfg
+        projected:
+          sources:
+          - configMap: {name: app-conf, items: [{key: settings.ini, path: settings.ini}]}
+          - secret: {name: app-creds, items: [{key: token, path: token, mode: 0400}]}
+          - downwardAPI: {items: [{path: podname, fieldRef: {fieldPath: metadata.name}}]}
+    EOF
+
+- id: k8s-303
+  title: Greet on startup
+  difficulty: 2
+  kind: build
+  tags: [lifecycle, poststart]
+  tutorial: |
+    **Concept.** Lifecycle hooks run commands at fixed moments of a container's life. A postStart hook runs right after the container is created, and the container is not considered started until it has finished.
+
+    **Read up on:**
+    - `kubectl explain pod.spec.containers.lifecycle` — postStart and preStop handlers
+    - `kubectl explain pod.spec.containers.lifecycle.postStart.exec` — running a command in the container
+    - `kubectl describe pod` — events such as FailedPostStartHook
+    - Kubernetes docs: Container Lifecycle Hooks
+  scenario: |
+    Create pod **`greeter`** in namespace **`hooks`** (`nginx:1.28-alpine`). When the
+    container starts, a **lifecycle hook** must write the word stored in
+    **`/lab/word.txt`** (just the word) into **`/usr/share/nginx/html/hello.txt`**, so
+    that nginx serves it at `/hello.txt`.
+
+    Do it with the hook — don't bake the file into an image or a volume.
+  hints:
+    - "`lifecycle.postStart.exec.command: [\"sh\", \"-c\", \"echo WORD > /usr/share/nginx/html/hello.txt\"]`"
+  solution: |
+    ```yaml
+    lifecycle:
+      postStart:
+        exec:
+          command: ["sh", "-c", "echo WORD > /usr/share/nginx/html/hello.txt"]
+    ```
+    Replace `WORD` with the contents of `/lab/word.txt`.
+  setup: |
+    k_ns hooks
+    w="hello-$(head -c4 /dev/urandom | od -An -tx1 | tr -d ' \n')"
+    echo "$w" >"$KL_STATE/answer"
+    echo "$w" | lab_file /lab/word.txt
+  check: |
+    wait_pod hooks greeter 60
+    check "a postStart hook is defined" '[ -n "$(kubectl -n hooks get pod greeter -o jsonpath="{.spec.containers[0].lifecycle.postStart}")" ]'
+    pod_ready hooks greeter 2>/dev/null && eventually 20 '[ "$(kubectl -n hooks exec greeter -- wget -qO- http://127.0.0.1/hello.txt)" = "$(cat $KL_STATE/answer)" ]'
+    check "nginx serves the word at /hello.txt" '[ "$(kubectl -n hooks exec greeter -- wget -qO- http://127.0.0.1/hello.txt)" = "$(cat $KL_STATE/answer)" ]'
+    check "no volume hides the html directory" '[ -z "$(kubectl -n hooks get pod greeter -o jsonpath="{.spec.containers[0].volumeMounts[?(@.mountPath==\"/usr/share/nginx/html\")]}")" ]'
+  solve: |
+    W=$(cat /lab/word.txt)
+    kubectl apply -f - <<EOF
+    apiVersion: v1
+    kind: Pod
+    metadata: {name: greeter, namespace: hooks}
+    spec:
+      containers:
+      - name: nginx
+        image: nginx:1.28-alpine
+        lifecycle:
+          postStart:
+            exec:
+              command: ["sh", "-c", "echo $W > /usr/share/nginx/html/hello.txt"]
+    EOF
+
+- id: k8s-304
+  title: Which release was 1.28?
+  difficulty: 2
+  kind: build
+  tags: [rollout, history, reporting]
+  tutorial: |
+    **Concept.** A Deployment keeps old ReplicaSets as numbered revisions, which is what makes rollbacks possible. Each revision records the pod template that was live at that time, so you can inspect history without touching anything.
+
+    **Read up on:**
+    - `kubectl rollout history --help` — listing revisions and the `--revision` flag
+    - `kubectl get rs -o wide` — the ReplicaSets behind each revision
+    - `kubectl describe rs NAME` — the revision annotation and template
+    - `grep --help` — picking a line out of text output
+  scenario: |
+    The **`ledger-api`** deployment in namespace **`rel`** has been through several
+    releases with different nginx versions. An auditor asks: *which revision number ran
+    **`nginx:1.28-alpine`**?*
+
+    Write just that number to **`/lab/rev.txt`**. Don't change the deployment.
+  hints:
+    - "`kubectl rollout history deploy/ledger-api -n rel --revision=N` shows the pod template of revision N."
+  solution: |
+    ```bash
+    for r in 1 2 3; do
+      if kubectl rollout history deploy/ledger-api -n rel --revision=$r 2>/dev/null | grep -q 'nginx:1.28-alpine'; then
+        echo "$r" > /lab/rev.txt
+      fi
+    done
+    ```
+  setup: |
+    k_ns rel
+    imgs=(nginx:1.27-alpine nginx:1.28-alpine nginx:1.29-alpine)
+    # shuffle
+    for i in 2 1; do j=$((RANDOM % (i + 1))); t=${imgs[$i]}; imgs[$i]=${imgs[$j]}; imgs[$j]=$t; done
+    kubectl -n rel create deployment ledger-api --image="${imgs[0]}" >/dev/null
+    kubectl -n rel rollout status deploy/ledger-api --timeout=90s >/dev/null
+    for i in 1 2; do
+      kubectl -n rel set image deploy/ledger-api "nginx=${imgs[$i]}" >/dev/null
+      kubectl -n rel rollout status deploy/ledger-api --timeout=90s >/dev/null
+    done
+    for i in 0 1 2; do [ "${imgs[$i]}" = nginx:1.28-alpine ] && echo $((i + 1)) >"$KL_STATE/answer"; done
+    kj -n rel deploy ledger-api '{.metadata.generation}' >"$KL_STATE/generation"
+  check: |
+    check "rev.txt exists" '[ -s /lab/rev.txt ]'
+    check_eq "revision that ran nginx:1.28-alpine" "$(tr -d '[:space:]' 2>/dev/null </lab/rev.txt)" "$(cat $KL_STATE/answer)"
+    check_eq "deployment left untouched" "$(kj -n rel deploy ledger-api '{.metadata.generation}')" "$(cat $KL_STATE/generation)"
+  solve: |
+    for r in 1 2 3; do
+      if kubectl rollout history deploy/ledger-api -n rel --revision=$r 2>/dev/null | grep -q 'nginx:1.28-alpine'; then
+        echo "$r" > /lab/rev.txt
+      fi
+    done
+
+- id: k8s-305
+  title: Killed right after it started
+  difficulty: 3
+  kind: fix
+  tags: [lifecycle, poststart, troubleshooting]
+  tutorial: |
+    **Concept.** If a postStart hook fails, the kubelet kills the container and restarts it, so a broken hook looks like a crash loop even though the main process is fine. The pod's events record the failure.
+
+    **Read up on:**
+    - `kubectl describe pod` — events with the hook name and its error output
+    - `kubectl get deploy NAME -o yaml` — the lifecycle section of the container
+    - `kubectl patch --help` — JSON patch to replace a nested value
+    - `kubectl exec` — try a command by hand in a working container
+  scenario: |
+    The **`docs`** deployment in namespace **`web`** keeps restarting. It is supposed to
+    publish a marker through a lifecycle hook, so that `GET /ready.txt` on port 80 answers
+    **`ok`**.
+
+    Make the deployment healthy and serve that file. Keep the lifecycle hook — the marker
+    must still be created by it.
+  hints:
+    - "`kubectl describe pod -n web` → look for *FailedPostStartHook* in the events."
+    - "Run the hook command by hand in a working nginx container and read the error."
+  solution: |
+    ```bash
+    kubectl describe pod -n web | grep -A3 FailedPostStartHook
+    kubectl -n web patch deploy docs --type=json -p '[{"op":"replace","path":"/spec/template/spec/containers/0/lifecycle/postStart/exec/command","value":["sh","-c","echo ok > /usr/share/nginx/html/ready.txt"]}]'
+    ```
+    The hook wrote into a directory that does not exist in the image.
+  setup: |
+    k_ns web
+    kubectl apply -f - >/dev/null <<'EOF'
+    apiVersion: apps/v1
+    kind: Deployment
+    metadata: {name: docs, namespace: web}
+    spec:
+      selector: {matchLabels: {app: docs}}
+      template:
+        metadata: {labels: {app: docs}}
+        spec:
+          containers:
+          - name: nginx
+            image: nginx:1.28-alpine
+            lifecycle:
+              postStart:
+                exec:
+                  command: ["sh", "-c", "echo ok > /usr/share/nginx/htm/ready.txt"]
+    EOF
+  check: |
+    check "the postStart hook is still defined" '[ -n "$(kj -n web deploy docs "{.spec.template.spec.containers[0].lifecycle.postStart}")" ]'
+    wait_deploy web docs 60
+    pod=$(kubectl -n web get pods -l app=docs -o json | jq -r '[.items[] | select(.metadata.deletionTimestamp == null)][-1].metadata.name')
+    check "docs is ready" 'deploy_ready web docs'
+    check "/ready.txt answers ok" '[ "$(kubectl -n web exec $pod -- wget -qO- http://127.0.0.1/ready.txt)" = ok ]'
+    check "no restarts on the current pod" '[ "$(restarts web $pod)" = 0 ]'
+  solve: |
+    kubectl -n web patch deploy docs --type=json -p '[{"op":"replace","path":"/spec/template/spec/containers/0/lifecycle/postStart/exec/command","value":["sh","-c","echo ok > /usr/share/nginx/html/ready.txt"]}]'
+
+- id: k8s-306
+  title: Two replicas fit, the third does not
+  difficulty: 3
+  kind: fix
+  tags: [resourcequota, limitrange, troubleshooting]
+  tutorial: |
+    **Concept.** A LimitRange injects default requests into pods that omit them, and a ResourceQuota adds those requests up. Generous defaults can exhaust a quota early. Defaults are applied only when a pod is created.
+
+    **Read up on:**
+    - `kubectl describe quota -n NS` — Used versus Hard
+    - `kubectl describe rs -n NS` — FailedCreate events with the arithmetic
+    - `kubectl describe limitrange -n NS` — default and defaultRequest values
+    - `kubectl get pod -o yaml` — the resources a pod actually received
+  scenario: |
+    Deployment **`worker`** (namespace **`batch-team`**) wants **3 replicas**, but only 2
+    pods ever run. The team's manifest declares no resources of its own, and the
+    **ResourceQuota must stay exactly as it is**, as must the deployment's spec.
+
+    The workers are tiny and need only about **100m** CPU each. Get all 3 replicas
+    running by fixing the namespace's defaults.
+  hints:
+    - "`kubectl describe rs -n batch-team` — compare the requested amount with what is left in the quota."
+    - "The pods got their requests from the LimitRange. Lowering it only affects pods created afterwards."
+  solution: |
+    ```bash
+    kubectl describe quota -n batch-team
+    kubectl -n batch-team patch limitrange container-defaults --type=merge \
+      -p '{"spec":{"limits":[{"type":"Container","default":{"cpu":"200m"},"defaultRequest":{"cpu":"100m"}}]}}'
+    kubectl -n batch-team delete pod -l app=worker
+    ```
+  setup: |
+    k_ns batch-team
+    kubectl apply -f - >/dev/null <<'EOF'
+    apiVersion: v1
+    kind: ResourceQuota
+    metadata: {name: team-cpu, namespace: batch-team}
+    spec:
+      hard: {requests.cpu: 700m, pods: "10"}
+    ---
+    apiVersion: v1
+    kind: LimitRange
+    metadata: {name: container-defaults, namespace: batch-team}
+    spec:
+      limits:
+      - type: Container
+        default: {cpu: 300m}
+        defaultRequest: {cpu: 250m}
+    EOF
+    kubectl apply -f - >/dev/null <<'EOF'
+    apiVersion: apps/v1
+    kind: Deployment
+    metadata: {name: worker, namespace: batch-team}
+    spec:
+      replicas: 3
+      selector: {matchLabels: {app: worker}}
+      template:
+        metadata: {labels: {app: worker}}
+        spec:
+          terminationGracePeriodSeconds: 1
+          containers:
+          - name: worker
+            image: busybox:1.37
+            command: ["sleep", "infinity"]
+    EOF
+    kj -n batch-team quota team-cpu '{.spec.hard}' >"$KL_STATE/answer"
+  check: |
+    check_eq "quota unchanged" "$(kj -n batch-team quota team-cpu '{.spec.hard}')" "$(cat $KL_STATE/answer)"
+    check_eq "deployment still declares no resources" "$(kj -n batch-team deploy worker '{.spec.template.spec.containers[0].resources}')" "{}"
+    check_eq "still 3 replicas wanted" "$(kj -n batch-team deploy worker '{.spec.replicas}')" "3"
+    wait_deploy batch-team worker 90
+    check "all 3 workers are ready" 'deploy_ready batch-team worker'
+  solve: |
+    kubectl -n batch-team patch limitrange container-defaults --type=merge -p '{"spec":{"limits":[{"type":"Container","default":{"cpu":"200m"},"defaultRequest":{"cpu":"100m"}}]}}'
+    kubectl -n batch-team delete pod -l app=worker
+
+- id: k8s-307
+  title: A budget that protects nothing
+  difficulty: 3
+  kind: fix
+  tags: [pdb, selector, troubleshooting]
+  tutorial: |
+    **Concept.** A PodDisruptionBudget only counts the pods its label selector matches. If it matches nothing, or its numbers leave no slack, it either protects nothing or blocks every eviction. The status fields tell you what it actually sees.
+
+    **Read up on:**
+    - `kubectl get pdb -n NS` — ALLOWED DISRUPTIONS and the budget columns
+    - `kubectl get pdb NAME -o yaml` — status.expectedPods, currentHealthy, desiredHealthy
+    - `kubectl get pods --show-labels` — the labels the selector must match
+    - `kubectl create pdb --help` — building a budget from scratch
+  scenario: |
+    The PDB **`web-pdb`** in namespace **`ops`** is meant to protect the 3-replica **`web`**
+    deployment during maintenance, but its status shows it doesn't see any pods.
+
+    Fix it so it covers the web pods **and** permits **exactly one** pod to be disrupted
+    at a time. Keep the name `web-pdb`.
+  hints:
+    - "Compare `kubectl get pdb web-pdb -n ops -o yaml` with `kubectl get pods -n ops --show-labels`."
+    - "Allowed disruptions = healthy pods minus what the budget demands."
+  solution: |
+    ```bash
+    kubectl -n ops delete pdb web-pdb
+    kubectl -n ops create pdb web-pdb --selector=app=web --min-available=2
+    kubectl -n ops get pdb web-pdb   # ALLOWED DISRUPTIONS 1
+    ```
+  setup: |
+    k_ns ops
+    kubectl -n ops create deployment web --image=traefik/whoami:v1.10 --replicas=3 >/dev/null
+    kubectl -n ops create pdb web-pdb --selector=app=webb --min-available=3 >/dev/null
+  check: |
+    k_exists -n ops pdb web-pdb && wait_deploy ops web 60
+    check "web-pdb exists" 'k_exists -n ops pdb web-pdb'
+    k_exists -n ops pdb web-pdb && eventually 20 '[ "$(kj -n ops pdb web-pdb "{.status.expectedPods}")" = 3 ]'
+    check_eq "the PDB sees the 3 web pods" "$(kj -n ops pdb web-pdb '{.status.expectedPods}')" "3"
+    check_eq "exactly one disruption allowed" "$(kj -n ops pdb web-pdb '{.status.disruptionsAllowed}')" "1"
+  solve: |
+    kubectl -n ops delete pdb web-pdb
+    kubectl -n ops create pdb web-pdb --selector=app=web --min-available=2
+
+- id: k8s-308
+  title: Cut off in the middle of a flush
+  difficulty: 4
+  kind: fix
+  tags: [graceful-shutdown, sigterm, rollout]
+  tutorial: |
+    **Concept.** On deletion the kubelet sends SIGTERM, waits for the pod's grace period, then sends SIGKILL. An application that needs time to finish its work after SIGTERM must be given at least that much time, but a very large value slows every rollout and drain.
+
+    **Read up on:**
+    - `kubectl explain pod.spec.terminationGracePeriodSeconds` — default and meaning
+    - `kubectl get deploy NAME -o yaml` — read what the container does on shutdown
+    - `kubectl logs` — the application's own messages
+    - Kubernetes docs: Pod Lifecycle, Termination of Pods
+  scenario: |
+    The **`flusher`** deployment (namespace **`shutdown`**) buffers data in memory and, on
+    SIGTERM, takes about **25 seconds** to write it out before exiting cleanly. Operators
+    report lost data after every rollout.
+
+    Fix the deployment so the flush can finish, without making pod termination wait for
+    more than **2 minutes**. Don't change the container's command.
+  hints:
+    - "Read the shell trap in the container command to see how long shutdown takes."
+    - "`kubectl explain pod.spec.terminationGracePeriodSeconds`"
+  solution: |
+    ```bash
+    kubectl -n shutdown patch deploy flusher --type=merge \
+      -p '{"spec":{"template":{"spec":{"terminationGracePeriodSeconds":60}}}}'
+    ```
+  setup: |
+    k_ns shutdown
+    kubectl apply -f - >/dev/null <<'EOF'
+    apiVersion: apps/v1
+    kind: Deployment
+    metadata: {name: flusher, namespace: shutdown}
+    spec:
+      selector: {matchLabels: {app: flusher}}
+      template:
+        metadata: {labels: {app: flusher}}
+        spec:
+          terminationGracePeriodSeconds: 5
+          containers:
+          - name: flusher
+            image: busybox:1.37
+            command:
+            - sh
+            - -c
+            - "trap 'echo SIGTERM received, flushing; sleep 25; echo flush complete; exit 0' TERM; echo started; while true; do sleep 1; done"
+    EOF
+    kj -n shutdown deploy flusher '{.spec.template.spec.containers[0].command}' >"$KL_STATE/answer"
+  check: |
+    g=$(kj -n shutdown deploy flusher '{.spec.template.spec.terminationGracePeriodSeconds}')
+    check "grace period covers the 25s flush (got ${g:-unset})" '[ "${g:-30}" -ge 30 ] 2>/dev/null'
+    check "grace period at most 120s" '[ "${g:-30}" -le 120 ] 2>/dev/null'
+    check_eq "command unchanged" "$(kj -n shutdown deploy flusher '{.spec.template.spec.containers[0].command}')" "$(cat $KL_STATE/answer)"
+    wait_deploy shutdown flusher 60
+    check "flusher is running" 'deploy_ready shutdown flusher'
+  solve: |
+    kubectl -n shutdown patch deploy flusher --type=merge -p '{"spec":{"template":{"spec":{"terminationGracePeriodSeconds":60}}}}'
+
+- id: k8s-309
+  title: Who has no readiness probe?
+  difficulty: 3
+  kind: build
+  tags: [jsonpath, custom-columns, reporting, audit]
+  tutorial: |
+    **Concept.** Auditing a cluster often means asking which objects lack a field. JSONPath filters are good at finding things that exist but awkward for absence, so look at output formats that show missing values explicitly.
+
+    **Read up on:**
+    - `kubectl get deploy -o custom-columns=...` — your own columns, and what a missing field prints as
+    - `kubectl get deploy -o go-template=...` — conditionals over each item
+    - `awk` — test a column and print another
+    - `kubectl explain deploy.spec.template.spec.containers.readinessProbe` — the field to look for
+  scenario: |
+    Namespace **`audit`** holds six single-container deployments. Platform policy says each
+    one needs a **readiness probe**, and some don't have one.
+
+    Write the **names of the deployments without a readiness probe** to
+    **`/lab/no-probe.txt`**, one name per line, sorted.
+  hints:
+    - "`kubectl get deploy -n audit -o custom-columns=N:.metadata.name,P:.spec.template.spec.containers[0].readinessProbe` prints `<none>` where the field is absent."
+  solution: |
+    ```bash
+    kubectl get deploy -n audit --no-headers \
+      -o custom-columns=N:.metadata.name,P:.spec.template.spec.containers[0].readinessProbe \
+      | awk '$2=="<none>" {print $1}' | sort > /lab/no-probe.txt
+    ```
+  setup: |
+    k_ns audit
+    names=(alpha beta gamma delta epsilon zeta)
+    while :; do
+      none=(); with=()
+      for n in "${names[@]}"; do
+        if [ $((RANDOM % 2)) = 0 ]; then none+=("$n"); else with+=("$n"); fi
+      done
+      [ "${#none[@]}" -ge 2 ] && [ "${#with[@]}" -ge 2 ] && break
+    done
+    printf '%s\n' "${none[@]}" | sort >"$KL_STATE/answer"
+    for n in "${names[@]}"; do
+      probe=""
+      for w in "${with[@]}"; do [ "$w" = "$n" ] && probe='readinessProbe: {exec: {command: ["true"]}, periodSeconds: 10}'; done
+      kubectl apply -f - >/dev/null <<EOF
+    apiVersion: apps/v1
+    kind: Deployment
+    metadata: {name: $n, namespace: audit}
+    spec:
+      selector: {matchLabels: {app: $n}}
+      template:
+        metadata: {labels: {app: $n}}
+        spec:
+          containers:
+          - name: main
+            image: busybox:1.37
+            command: ["sleep", "infinity"]
+            $probe
+    EOF
+    done
+  check: |
+    check "no-probe.txt exists" '[ -s /lab/no-probe.txt ]'
+    got=$(sort -u 2>/dev/null </lab/no-probe.txt | tr '\n' ' ')
+    want=$(sort "$KL_STATE/answer" | tr '\n' ' ')
+    check_eq "deployments without a readiness probe" "$got" "$want"
+  solve: |
+    kubectl get deploy -n audit --no-headers -o custom-columns=N:.metadata.name,P:.spec.template.spec.containers[0].readinessProbe | awk '$2=="<none>" {print $1}' | sort > /lab/no-probe.txt
+
+- id: k8s-310
+  title: Spread across racks
+  difficulty: 5
+  kind: fix
+  tags: [topology-spread, scheduling, taints, troubleshooting]
+  tutorial: |
+    **Concept.** Topology spread constraints balance pods across domains defined by a node label. With a hard constraint, a node lacking that label cannot host the pods, and tainted nodes stay unusable until pods tolerate them. Each shows up as a separate scheduling failure reason.
+
+    **Read up on:**
+    - `kubectl describe pod` — the FailedScheduling message and its counts per reason
+    - `kubectl get nodes --show-labels` and `kubectl describe node` — labels and taints
+    - `kubectl explain pod.spec.topologySpreadConstraints` — topologyKey, maxSkew, whenUnsatisfiable
+    - Kubernetes docs: Pod Topology Spread Constraints
+  scenario: |
+    The **`edge`** deployment (namespace **`spread`**, 4 replicas) must be balanced across
+    "racks": its pods carry a hard topology spread constraint on the node label
+    **`lab.example/rack`** (max skew 1). All 4 pods are stuck Pending.
+
+    Get it running with **exactly 2 pods on each of the two nodes**. Keep the spread
+    constraint as it is; give each node its own rack value. Don't change any node's taints.
+  hints:
+    - "`kubectl describe pod -n spread` lists several reasons, each with a node count."
+    - "Pods that must run on the control-plane node need a toleration for its taint."
+    - "If pods end up uneven after you change the template, `kubectl rollout restart` reschedules them."
+  solution: |
+    ```bash
+    kubectl -n spread patch deploy edge --type=json -p '[{"op":"add","path":"/spec/template/spec/tolerations","value":[{"key":"node-role.kubernetes.io/control-plane","operator":"Exists","effect":"NoSchedule"}]}]'
+    kubectl label node controlplane lab.example/rack=r1
+    kubectl label node node01 lab.example/rack=r2
+    kubectl -n spread get pods -o wide
+    ```
+  setup: |
+    k_ns spread
+    kubectl apply -f - >/dev/null <<'EOF'
+    apiVersion: apps/v1
+    kind: Deployment
+    metadata: {name: edge, namespace: spread}
+    spec:
+      replicas: 4
+      selector: {matchLabels: {app: edge}}
+      template:
+        metadata: {labels: {app: edge}}
+        spec:
+          topologySpreadConstraints:
+          - maxSkew: 1
+            topologyKey: lab.example/rack
+            whenUnsatisfiable: DoNotSchedule
+            labelSelector: {matchLabels: {app: edge}}
+          containers:
+          - name: nginx
+            image: nginx:1.28-alpine
+    EOF
+  check: |
+    c=$(kj -n spread deploy edge '{.spec.template.spec.topologySpreadConstraints[0].maxSkew} {.spec.template.spec.topologySpreadConstraints[0].topologyKey} {.spec.template.spec.topologySpreadConstraints[0].whenUnsatisfiable}')
+    check_eq "constraint unchanged" "$c" "1 lab.example/rack DoNotSchedule"
+    wait_deploy spread edge 90
+    check "4 edge pods are ready" 'deploy_ready spread edge'
+    counts=$(kubectl -n spread get pods -l app=edge -o json | jq -r '[.items[] | select(.metadata.deletionTimestamp == null and .spec.nodeName != null) | .spec.nodeName] | group_by(.) | map(length) | sort | map(tostring) | join(" ")')
+    check_eq "2 pods on each node" "$counts" "2 2"
+    racks=$(kubectl get nodes -o json | jq -r '[.items[].metadata.labels["lab.example/rack"] // empty] | unique | length')
+    check_eq "both nodes have their own rack value" "$racks" "2"
+  solve: |
+    kubectl -n spread patch deploy edge --type=json -p '[{"op":"add","path":"/spec/template/spec/tolerations","value":[{"key":"node-role.kubernetes.io/control-plane","operator":"Exists","effect":"NoSchedule"}]}]'
+    i=1
+    for n in $(kubectl get nodes -o name); do
+      kubectl label "$n" lab.example/rack=r$i --overwrite
+      i=$((i + 1))
+    done
+    kubectl -n spread rollout status deploy/edge --timeout=120s

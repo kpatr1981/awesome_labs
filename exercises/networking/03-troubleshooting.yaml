@@ -1,0 +1,768 @@
+track: networking
+module: Traffic & troubleshooting
+profile: docker
+order: 3
+exercises:
+
+- id: net-016
+  title: Read the capture
+  difficulty: 1
+  kind: build
+  tags: [tcpdump, pcap, http]
+  tutorial: |
+    **Concept.** A packet capture records the frames that crossed an interface, so you can study a conversation after the fact: who connected, to which port, and what was said. `tcpdump` both writes and reads capture files, and BPF filters narrow the output.
+
+    **Read up on:**
+    - `tcpdump -nn -r FILE` — read a saved capture without resolving names or services
+    - `tcpdump -A` — print packet payloads as ASCII, handy for plain HTTP
+    - TCP flags `[S]`, `[S.]`, `[.]` — how to recognise the handshake and who is the server
+    - `man pcap-filter` — expressions such as `port N` or `host ADDR`
+  scenario: |
+    Someone captured the traffic between a client (`10.9.0.1`) and a web server
+    (`10.9.0.2`) into **`/lab/capture.pcap`**. The server listens on an unusual port,
+    and the client made two HTTP requests: one that worked and one for a page that
+    does not exist (the server answered it with a **404**).
+
+    Read the capture (no root needed) and write down:
+
+    - the **TCP port the server listens on**, in **`/lab/port.txt`**
+    - the **URL path of the request that got the 404**, in **`/lab/notfound.txt`**
+    (for example `/something`)
+  hints:
+    - "`tcpdump -nn -r /lab/capture.pcap` lists every packet. The server is the side that answers the first `[S]` with `[S.]`."
+    - "Add `-A` to see the text of the HTTP requests; look for lines beginning with `GET`."
+  solution: |
+    ```bash
+    tcpdump -nn -r /lab/capture.pcap 'tcp[tcpflags] & (tcp-syn|tcp-ack) = (tcp-syn|tcp-ack)'
+    tcpdump -nn -A -r /lab/capture.pcap | grep -a GET
+    ```
+    The SYN-ACK is sent *from* the server, so its source port is the listening port.
+    The second `GET` is the one the server answered with `404 File not found`.
+  setup: |
+    netns_new h1 h2
+    netns_link h1 eth0 h2 eth0
+    ip -n h1 addr add 10.9.0.1/24 dev eth0
+    ip -n h2 addr add 10.9.0.2/24 dev eth0
+    port=$((RANDOM % 20000 + 20000))
+    path=/report-$(head -c4 /dev/urandom | od -An -tx1 | tr -d ' \n')
+    printf '%s\n%s\n' "$port" "$path" > "$KL_STATE/answer"
+    d=$(mktemp -d); echo ok > "$d/index.html"; chmod -R a+rX "$d"
+    ip netns exec h2 timeout 30 python3 -m http.server "$port" --bind 10.9.0.2 --directory "$d" >/dev/null 2>&1 &
+    sp=$!
+    ip netns exec h1 timeout 30 tcpdump -Z root -nn -i eth0 -U -w /tmp/kl-cap.pcap >/dev/null 2>&1 &
+    tp=$!
+    eventually 10 "ip netns exec h2 ss -ltn | grep -q :$port"
+    sleep 2
+    ip netns exec h1 curl -s -m3 -o /dev/null "http://10.9.0.2:$port/"
+    ip netns exec h1 curl -s -m3 -o /dev/null "http://10.9.0.2:$port$path"
+    sleep 1
+    kill "$tp" "$sp" 2>/dev/null
+    wait "$tp" "$sp" 2>/dev/null
+    cp /tmp/kl-cap.pcap /lab/capture.pcap
+    rm -rf /tmp/kl-cap.pcap "$d"
+    chown "$(lab_user):" /lab/capture.pcap
+    chmod 644 /lab/capture.pcap
+  check: |
+    want_port=$(sed -n 1p "$KL_STATE/answer")
+    want_path=$(sed -n 2p "$KL_STATE/answer")
+    check_eq "server port is $want_port" "$(tr -d '[:space:]' 2>/dev/null </lab/port.txt)" "$want_port"
+    check_eq "the 404 path is $want_path" "$(tr -d '[:space:]' 2>/dev/null </lab/notfound.txt)" "$want_path"
+  solve: |
+    tcpdump -nn -r /lab/capture.pcap 'tcp[tcpflags] & (tcp-syn|tcp-ack) = (tcp-syn|tcp-ack)' 2>/dev/null \
+      | head -1 | awk '{print $3}' | sed 's/.*\.//' > /lab/port.txt
+    tcpdump -nn -A -r /lab/capture.pcap 2>/dev/null | grep -ao 'GET [^ ]*' | tail -1 | cut -d' ' -f2 > /lab/notfound.txt
+
+- id: net-017
+  title: Big downloads hang
+  difficulty: 4
+  kind: fix
+  tags: [mtu, pmtud, icmp, nftables, netns]
+  tutorial: |
+    **Concept.** Every link has a maximum frame size. Hosts discover the smallest size on a path when a router drops an oversized packet and sends back an ICMP error telling the sender to shrink. If that error never arrives, small packets still work while full-sized ones silently vanish.
+
+    **Read up on:**
+    - `ip link` and `ip route get ADDR` — MTU of each link and cached path MTU
+    - `ping -M do -s SIZE` — send packets that must not be fragmented, to probe the path
+    - ICMP "fragmentation needed" — and which firewall rules would swallow it
+    - `nft list ruleset` — look for rules on every router in the path
+    - MSS clamping — another way to keep TCP segments small
+  scenario: |
+    A client **`h1`** downloads files from a web server on **`h2`** through two routers:
+
+    ```
+    h1 (10.7.1.2) -- r1 -- (1400 MTU link) -- r2 -- h2 (10.7.3.2) :8080
+    ```
+
+    Small responses work, but `curl http://10.7.3.2:8080/big.bin` run on h1 hangs.
+    The middle link between r1 and r2 has an MTU of **1400** on purpose (it models a
+    tunnel); don't change it, and don't move the server.
+
+    Make the full download succeed.
+  hints:
+    - "`ping -M do -s 1472 10.7.3.2` from h1 versus `-s 1300` shows the size where things break."
+    - "Routers should tell senders when a packet is too big. Check what the routers' firewalls do to ICMP they generate."
+    - "`ip netns exec r2 nft list ruleset`"
+  solution: |
+    Router r2 has an nftables rule dropping the ICMP *destination unreachable* messages it
+    generates (including "fragmentation needed"), so h2 never learns that packets
+    must be smaller: a path MTU black hole. Remove the rule:
+
+    ```bash
+    sudo ip netns exec r2 nft flush ruleset
+    curl -s http://10.7.3.2:8080/big.bin | wc -c   # from h1: sudo ip netns exec h1 ...
+    ```
+    Clamping the MSS on a router would also work.
+  setup: |
+    netns_new h1 r1 r2 h2
+    netns_link h1 eth0 r1 eth0
+    netns_link r1 eth1 r2 eth0
+    netns_link r2 eth1 h2 eth0
+    ip -n h1 addr add 10.7.1.2/24 dev eth0
+    ip -n r1 addr add 10.7.1.1/24 dev eth0
+    ip -n r1 addr add 10.7.2.1/24 dev eth1
+    ip -n r2 addr add 10.7.2.2/24 dev eth0
+    ip -n r2 addr add 10.7.3.1/24 dev eth1
+    ip -n h2 addr add 10.7.3.2/24 dev eth0
+    ip -n r1 link set eth1 mtu 1400
+    ip -n r2 link set eth0 mtu 1400
+    ip -n h1 route add default via 10.7.1.1
+    ip -n h2 route add default via 10.7.3.1
+    ip -n r1 route add 10.7.3.0/24 via 10.7.2.2
+    ip -n r2 route add 10.7.1.0/24 via 10.7.2.1
+    ip netns exec r1 sysctl -qw net.ipv4.ip_forward=1
+    ip netns exec r2 sysctl -qw net.ipv4.ip_forward=1
+    ip netns exec r2 nft -f - <<'EOF'
+    table ip kl_filter {
+      chain output {
+        type filter hook output priority 0; policy accept;
+        icmp type destination-unreachable drop
+      }
+    }
+    EOF
+    on_reset 'systemctl stop kl-mtu 2>/dev/null; systemctl reset-failed kl-mtu 2>/dev/null; rm -rf /srv/kl-mtu'
+    mkdir -p /srv/kl-mtu
+    head -c300000 /dev/urandom > /srv/kl-mtu/big.bin
+    echo hi > /srv/kl-mtu/small.txt
+    chmod -R a+rX /srv/kl-mtu
+    sha256sum /srv/kl-mtu/big.bin | cut -d' ' -f1 > "$KL_STATE/answer"
+    systemd-run --quiet --unit=kl-mtu --working-directory=/srv/kl-mtu ip netns exec h2 python3 -m http.server 8080 --bind 10.7.3.2
+    eventually 15 'ip netns exec h1 curl -fsS -m2 http://10.7.3.2:8080/small.txt'
+  check: |
+    want=$(cat "$KL_STATE/answer")
+    check "r1-r2 link is still 1400 bytes" '[ "$(ip -n r1 -j link show eth1 | jq -r ".[0].mtu")" = 1400 ] && [ "$(ip -n r2 -j link show eth0 | jq -r ".[0].mtu")" = 1400 ]'
+    check "small files still work" 'ip netns exec h1 curl -fsS -m3 http://10.7.3.2:8080/small.txt'
+    got=$(ip netns exec h1 curl -fsS -m8 http://10.7.3.2:8080/big.bin 2>/dev/null | sha256sum | cut -d' ' -f1)
+    check_eq "big.bin downloads intact" "$got" "$want"
+  solve: |
+    sudo ip netns exec r2 nft flush ruleset
+
+- id: net-018
+  title: IPv6 and neighbor discovery
+  difficulty: 2
+  kind: build
+  tags: [ipv6, ndp, netns]
+  tutorial: |
+    **Concept.** IPv6 has no ARP. Hosts use Neighbor Discovery (ICMPv6) to map a neighbour's IPv6 address to its link-layer address, and keep the results in a neighbour table. Every interface also has an automatic link-local address.
+
+    **Read up on:**
+    - `ip -6 addr add ADDR/64 dev IF` — assigning IPv6 addresses
+    - `ip -6 neigh` — the neighbour table and its states (REACHABLE, STALE)
+    - `ping -6` or `ping6` — generating traffic that triggers discovery
+    - Duplicate address detection — why a new address is briefly "tentative"
+    - `ip link` — where a NIC's own MAC is shown
+  scenario: |
+    Namespaces **`h1`** and **`h2`** are joined by a cable (`eth0` on both) and have no
+    global IPv6 addresses. The /64 prefix to use is in **`/lab/prefix.txt`**.
+
+    1. Give **h1** the address `<prefix>::1/64` and **h2** `<prefix>::2/64`
+       (use the prefix without the trailing `::/64`), so they can ping each other over IPv6.
+    2. Using what **h2** learned about **h1** through neighbor discovery, write h1's
+       **MAC address** (lowercase, colon-separated) into **`/lab/mac.txt`**.
+  hints:
+    - "For `fd00:abcd:1234::/64` the addresses are `fd00:abcd:1234::1/64` and `fd00:abcd:1234::2/64`."
+    - "Ping first, then look at `ip -6 neigh show dev eth0` inside h2."
+  solution: |
+    ```bash
+    p=$(cut -d: -f1-3 /lab/prefix.txt)
+    sudo ip netns exec h1 ip addr add $p::1/64 dev eth0
+    sudo ip netns exec h2 ip addr add $p::2/64 dev eth0
+    sleep 2; sudo ip netns exec h1 ping -6 -c2 $p::2
+    sudo ip netns exec h2 ip -6 neigh show dev eth0
+    ```
+    The `lladdr` shown for `$p::1` is h1's MAC; write it to `/lab/mac.txt`.
+  setup: |
+    netns_new h1 h2
+    netns_link h1 eth0 h2 eth0
+    p=$(printf 'fd00:%x:%x' $((RANDOM % 57344 + 4096)) $((RANDOM % 57344 + 4096)))
+    echo "$p" > "$KL_STATE/answer"
+    echo "$p::/64" | lab_file /lab/prefix.txt
+  check: |
+    p=$(cat "$KL_STATE/answer")
+    check "h1 has $p::1/64" 'ip -n h1 -6 addr show dev eth0 | grep -q "inet6 $p::1/64"'
+    check "h2 has $p::2/64" 'ip -n h2 -6 addr show dev eth0 | grep -q "inet6 $p::2/64"'
+    check "h1 can ping h2 over IPv6" 'eventually 8 "ip netns exec h1 ping -6 -c1 -W1 $p::2"'
+    want=$(ip -n h1 -j link show eth0 | jq -r '.[0].address')
+    check_eq "mac.txt holds h1's MAC" "$(tr -d '[:space:]' 2>/dev/null </lab/mac.txt | tr A-F a-f)" "$want"
+    check "h2 learned that MAC by neighbor discovery" 'ip -n h2 -6 neigh show dev eth0 | grep -qi "$want"'
+  solve: |
+    p=$(cut -d: -f1-3 /lab/prefix.txt)
+    sudo ip netns exec h1 ip addr add $p::1/64 dev eth0
+    sudo ip netns exec h2 ip addr add $p::2/64 dev eth0
+    sleep 3
+    sudo ip netns exec h1 ping -6 -c2 -W2 $p::2 >/dev/null
+    sudo ip netns exec h2 ip -6 neigh show dev eth0 | awk -v a="$p::1" '$1==a {print $3}' > /lab/mac.txt
+
+- id: net-019
+  title: Hide the clients behind the router
+  difficulty: 3
+  kind: build
+  tags: [nat, masquerade, nftables, netns]
+  tutorial: |
+    **Concept.** Source NAT rewrites the source address of packets leaving a network, so a server that has no route to the private clients sees only the router's address. Replies come back to the router, which translates them for the right client using connection tracking.
+
+    **Read up on:**
+    - `man nft` — the `nat` table type, the `postrouting` hook and the `masquerade` statement
+    - `oifname` / `oif` matches — restricting a rule to the outgoing interface
+    - `nft list ruleset` — confirm what is loaded
+    - Why a server's log shows the NAT address instead of the real client
+  scenario: |
+    Client **`h1`** must reach a web server on **`h2`**, with router **`r1`** between them:
+
+    ```
+    h1 (10.1.0.2) --- (10.1.0.1) r1 (10.2.0.1) --- (10.2.0.2) h2 :8080
+    ```
+
+    h1 sends its traffic to r1, which forwards it. But **h2 has no route to the
+    10.1.0.0/24 network** and must not get one, so `curl http://10.2.0.2:8080/` from h1
+    gets no answer.
+
+    Fix this on **r1** using **nftables**. The server prints the client address it sees,
+    and must report it as **10.2.0.1**.
+  hints:
+    - "Rewrite the source on the way out of r1 towards h2, not on the way in."
+    - "A `nat` table, chain `type nat hook postrouting priority srcnat`, and a rule with `masquerade`."
+  solution: |
+    ```bash
+    sudo ip netns exec r1 nft -f - <<'EOF'
+    table ip nat {
+      chain postrouting {
+        type nat hook postrouting priority srcnat;
+        oifname "eth1" masquerade
+      }
+    }
+    EOF
+    sudo ip netns exec h1 curl -s http://10.2.0.2:8080/
+    ```
+  setup: |
+    netns_new h1 r1 h2
+    netns_link h1 eth0 r1 eth0
+    netns_link r1 eth1 h2 eth0
+    ip -n h1 addr add 10.1.0.2/24 dev eth0
+    ip -n r1 addr add 10.1.0.1/24 dev eth0
+    ip -n r1 addr add 10.2.0.1/24 dev eth1
+    ip -n h2 addr add 10.2.0.2/24 dev eth0
+    ip -n h1 route add default via 10.1.0.1
+    ip netns exec r1 sysctl -qw net.ipv4.ip_forward=1
+    on_reset 'systemctl stop kl-nat 2>/dev/null; systemctl reset-failed kl-nat 2>/dev/null; rm -rf /srv/kl-nat'
+    mkdir -p /srv/kl-nat
+    head -c6 /dev/urandom | od -An -tx1 | tr -d ' \n' > /srv/kl-nat/token
+    cp /srv/kl-nat/token "$KL_STATE/answer"
+    cat >/srv/kl-nat/app.py <<'PY'
+    from http.server import BaseHTTPRequestHandler, HTTPServer
+    T = open('/srv/kl-nat/token').read().strip()
+    class H(BaseHTTPRequestHandler):
+        def do_GET(self):
+            b = ("%s from %s\n" % (T, self.client_address[0])).encode()
+            self.send_response(200)
+            self.send_header('Content-Length', str(len(b)))
+            self.end_headers()
+            self.wfile.write(b)
+        def log_message(self, *a):
+            pass
+    HTTPServer(('10.2.0.2', 8080), H).serve_forever()
+    PY
+    systemd-run --quiet --unit=kl-nat ip netns exec h2 python3 /srv/kl-nat/app.py
+    eventually 15 'ip netns exec h2 ss -ltn | grep -q :8080'
+  check: |
+    want=$(cat "$KL_STATE/answer")
+    check_eq "h2 sees the router's address as the client" "$(ip netns exec h1 curl -fsS -m4 http://10.2.0.2:8080/ 2>/dev/null)" "$want from 10.2.0.1"
+    check_eq "h2 still has no route to 10.1.0.0/24" "$(ip -n h2 route | grep -c '^10\.1\.0\.')" 0
+    check "h2 still has no default route" '[ -z "$(ip -n h2 route show default)" ]'
+  solve: |
+    sudo ip netns exec r1 nft -f - <<'EOF'
+    table ip nat {
+      chain postrouting {
+        type nat hook postrouting priority srcnat;
+        oifname "eth1" masquerade
+      }
+    }
+    EOF
+
+- id: net-020
+  title: Where does the path die?
+  difficulty: 3
+  kind: fix
+  tags: [traceroute, routing, netns]
+  tutorial: |
+    **Concept.** `traceroute` sends probes with growing TTL; each router that drops one answers with an ICMP error from its own address. A line of stars means no reply came back, which can be caused by the router, or by the way back from that router.
+
+    **Read up on:**
+    - `traceroute -n ADDR` and `mtr -n -r -c 3 ADDR` — print the path hop by hop
+    - Where the stars begin — which router is the last one that answers
+    - `ip route get ADDR` — what route a router would use for a destination
+    - Asymmetric paths — replies travel the reverse route
+  scenario: |
+    Five networks in a line, with routers in between. All addresses are set:
+
+    ```
+    h1 -(10.0.0.x)- r1 -(10.0.1.x)- r2 -(10.0.2.x)- r3 -(10.0.3.x)- r4 -(10.0.4.x)- h2
+    ```
+
+    In each network `.1` is the left device and `.2` the right one (h1 is 10.0.0.1,
+    h2 is 10.0.4.2). From h1, `ping 10.0.4.2` gets no reply, and
+    `traceroute -n 10.0.4.2` prints stars after a few hops.
+
+    Find the faulty router and repair the path so h1 can reach h2. The fault is on a
+    single router; don't touch h1 or h2.
+  hints:
+    - "`sudo ip netns exec h1 traceroute -n -w1 -q1 10.0.4.2` — note the last hop that answers."
+    - "A router can forward a probe fine but fail to route the reply back. Inspect `ip route` on the routers near where the answers stop."
+  solution: |
+    One router is missing the route back towards h1's network (10.0.0.0/24), so it
+    cannot send its replies; traceroute shows stars from that router onwards. Find
+    it with `ip route` on each router, then add the route via its left neighbour:
+
+    ```bash
+    sudo ip netns exec r3 ip route add 10.0.0.0/24 via 10.0.2.1   # if r3 is the broken one
+    ```
+  setup: |
+    N=(h1 r1 r2 r3 r4 h2)
+    netns_new "${N[@]}"
+    for j in 0 1 2 3 4; do
+      netns_link "${N[j]}" eth1 "${N[j+1]}" eth0
+      ip -n "${N[j]}" addr add 10.0.$j.1/24 dev eth1
+      ip -n "${N[j+1]}" addr add 10.0.$j.2/24 dev eth0
+    done
+    ip -n h1 route add default via 10.0.0.2
+    ip -n h2 route add default via 10.0.4.1
+    K=$((RANDOM % 3 + 2))
+    echo "$K" > "$KL_STATE/answer"
+    for i in 1 2 3 4; do
+      ip netns exec r$i sysctl -qw net.ipv4.ip_forward=1
+      for ((j = i + 1; j <= 4; j++)); do
+        ip -n r$i route add 10.0.$j.0/24 via 10.0.$i.2
+      done
+      [ "$i" = "$K" ] && continue
+      for ((j = 0; j <= i - 2; j++)); do
+        ip -n r$i route add 10.0.$j.0/24 via 10.0.$((i - 1)).1
+      done
+    done
+  check: |
+    check "h1 can ping h2" 'ip netns exec h1 ping -c1 -W2 10.0.4.2'
+    check "h2 can ping h1" 'ip netns exec h2 ping -c1 -W2 10.0.0.1'
+    check "traceroute reaches h2" 'ip netns exec h1 traceroute -n -w1 -q1 -m 8 10.0.4.2 | tail -1 | grep -q "10.0.4.2"'
+  solve: |
+    for i in 2 3 4; do
+      sudo ip netns exec r$i ip route replace 10.0.0.0/24 via 10.0.$((i - 1)).1
+    done
+
+- id: net-021
+  title: Which port does the server see?
+  difficulty: 3
+  kind: build
+  tags: [nat, snat, masquerade, netns]
+  tutorial: |
+    **Concept.** Source NAT rewrites a connection's source address, and masquerade can also remap the source port into a chosen range. The far end never sees the client's real port — only the translated one. You can read the translated port from either the router or the server's own socket.
+
+    **Read up on:**
+    - `ss -tn` — established connections and the peer address:port, from either end
+    - Source NAT and masquerade — how and why the source port is rewritten
+    - `ip netns exec NS cmd` — run a tool inside one namespace
+    - Ephemeral ports — the range a client picks from before translation
+  scenario: |
+    Router **`r1`** source-NATs traffic from the client network and remaps the source
+    port into a fixed range. The client **`h1`** (10.1.0.2) holds a long-lived TCP
+    connection to a server on **`h2`** (10.2.0.2), port **9000**.
+
+    Find the **source port the server sees** for that connection, and write that number
+    into **`/lab/port.txt`**. It is not the port h1 itself used.
+  hints:
+    - "The server's own sockets show the peer it is talking to: `sudo ip netns exec h2 ss -tn`."
+    - "Look at the established connection whose local port is 9000; the peer's port is the translated one."
+  solution: |
+    The server sees the post-NAT source address and port, so ask the server:
+
+    ```bash
+    sudo ip netns exec h2 ss -tnH state established 'sport = :9000'
+    # 0  0  10.2.0.2:9000  10.2.0.1:NNNNN   <- NNNNN is the translated source port
+    sudo ip netns exec h2 ss -tnH state established 'sport = :9000' \
+      | grep -oE '10\.2\.0\.1:[0-9]+' | cut -d: -f2 > /lab/port.txt
+    ```
+  setup: |
+    netns_new h1 r1 h2
+    netns_link h1 eth0 r1 eth0
+    netns_link r1 eth1 h2 eth0
+    ip -n h1 addr add 10.1.0.2/24 dev eth0
+    ip -n r1 addr add 10.1.0.1/24 dev eth0
+    ip -n r1 addr add 10.2.0.1/24 dev eth1
+    ip -n h2 addr add 10.2.0.2/24 dev eth0
+    ip -n h1 route add default via 10.1.0.1
+    ip netns exec r1 sysctl -qw net.ipv4.ip_forward=1
+    base=$((RANDOM % 20000 + 30000))
+    ip netns exec r1 nft -f - <<EOF
+    table ip nat {
+      chain postrouting {
+        type nat hook postrouting priority srcnat;
+        oifname "eth1" meta l4proto tcp masquerade to :$base-$((base + 99))
+      }
+    }
+    EOF
+    on_reset 'systemctl stop kl-ct-srv kl-ct-cli 2>/dev/null; systemctl reset-failed kl-ct-srv kl-ct-cli 2>/dev/null; rm -rf /srv/kl-ct'
+    mkdir -p /srv/kl-ct
+    systemd-run --quiet --unit=kl-ct-srv --working-directory=/srv/kl-ct ip netns exec h2 python3 -m http.server 9000 --bind 10.2.0.2
+    eventually 15 'ip netns exec h2 ss -ltn | grep -q :9000'
+    systemd-run --quiet --unit=kl-ct-cli ip netns exec h1 python3 -c 'import socket,time; s=socket.create_connection(("10.2.0.2",9000)); time.sleep(7200)'
+    eventually 15 "ip netns exec h2 ss -tnH state established 'sport = :9000' | grep -q 10.2.0.1"
+  check: |
+    live=$(ip netns exec h2 ss -tnH state established 'sport = :9000' | grep -oE '10\.2\.0\.1:[0-9]+' | head -1 | cut -d: -f2)
+    check "the server has the connection" '[ -n "$live" ]'
+    check_eq "port.txt holds the translated source port" "$(tr -d '[:space:]' 2>/dev/null </lab/port.txt)" "$live"
+  solve: |
+    sudo ip netns exec h2 ss -tnH state established 'sport = :9000' \
+      | grep -oE '10\.2\.0\.1:[0-9]+' | head -1 | cut -d: -f2 > /lab/port.txt
+- id: net-022
+  title: Balance across the backends
+  difficulty: 4
+  kind: fix
+  tags: [haproxy, load-balancing, health-checks, docker]
+  tutorial: |
+    **Concept.** A load balancer such as HAProxy spreads requests across several backend servers using a balancing algorithm, and uses health checks to keep traffic away from servers that don't answer. A server can also be configured so that it is used only as a spare.
+
+    **Read up on:**
+    - The HAProxy `backend` section: `balance`, `server` lines and their options
+    - Server flags such as `check`, `weight` and `backup` — what each changes
+    - `docker kill -s HUP NAME` or `docker restart` — loading a new configuration
+    - `docker logs NAME` — startup warnings and health-check state changes
+    - Health checks — a wrong address or port marks a server down
+  scenario: |
+    HAProxy runs in the container **`kl-lb`** (host networking) and listens on
+    **`127.0.0.1:8088`**. Three identical web backends listen on `127.0.0.1:9101`,
+    `9102` and `9103`; each answers with its own name (`be1`, `be2`, `be3`).
+
+    Requests should rotate across **all three** backends, but they don't.
+    The configuration is in **`/lab/haproxy/haproxy.cfg`** (the directory is mounted
+    read-only into the container). Fix it and make HAProxy load the change.
+
+    Keep all three `server` lines.
+  hints:
+    - "`for i in $(seq 6); do curl -s http://127.0.0.1:8088/; done` shows which backends answer."
+    - "Compare the options on each `server` line, and check each backend's port with `ss -ltn`."
+    - "A config change only takes effect after HAProxy reloads: `docker kill -s HUP kl-lb`."
+  solution: |
+    Two lines are wrong: `s2` is flagged `backup` (only used when the others fail), and
+    `s3` points at port 9130 instead of 9103, so its health check keeps it down.
+
+    ```bash
+    sed -i 's/ backup//; s/9130/9103/' /lab/haproxy/haproxy.cfg
+    docker kill -s HUP kl-lb
+    for i in $(seq 6); do curl -s http://127.0.0.1:8088/; done
+    ```
+  setup: |
+    on_reset 'docker rm -f kl-lb >/dev/null 2>&1; for n in 1 2 3; do systemctl stop kl-be$n 2>/dev/null; systemctl reset-failed kl-be$n 2>/dev/null; done; rm -rf /srv/kl-lb'
+    for n in 1 2 3; do
+      mkdir -p /srv/kl-lb/be$n
+      echo "be$n" > /srv/kl-lb/be$n/index.html
+      chmod -R a+rX /srv/kl-lb
+      systemd-run --quiet --unit=kl-be$n --working-directory=/srv/kl-lb/be$n python3 -m http.server 910$n --bind 127.0.0.1
+    done
+    lab_file /lab/haproxy/haproxy.cfg <<'EOF'
+    global
+        maxconn 256
+
+    defaults
+        mode http
+        timeout connect 2s
+        timeout client 10s
+        timeout server 10s
+
+    frontend web
+        bind 127.0.0.1:8088
+        default_backend app
+
+    backend app
+        balance roundrobin
+        option httpchk GET /
+        server s1 127.0.0.1:9101 check inter 1s rise 1 fall 2
+        server s2 127.0.0.1:9102 check inter 1s rise 1 fall 2 backup
+        server s3 127.0.0.1:9130 check inter 1s rise 1 fall 2
+    EOF
+    chmod 755 /lab/haproxy
+    docker rm -f kl-lb >/dev/null 2>&1
+    docker run -d --name kl-lb --network host -v /lab/haproxy:/usr/local/etc/haproxy:ro haproxy:3.0-alpine >/dev/null
+    eventually 20 'curl -fsS -m2 http://127.0.0.1:8088/'
+  check: |
+    dist() { for i in $(seq 12); do curl -fsS -m2 http://127.0.0.1:8088/ 2>/dev/null; done | sort -u | wc -l; }
+    check "HAProxy container is running" 'c_running kl-lb'
+    check_eq "config still lists three servers" "$(grep -c '^ *server ' /lab/haproxy/haproxy.cfg)" 3
+    check "ports 9101-9103 are still the backends" 'grep -q ":9101" /lab/haproxy/haproxy.cfg && grep -q ":9102" /lab/haproxy/haproxy.cfg && grep -q ":9103" /lab/haproxy/haproxy.cfg'
+    eventually 12 '[ "$(dist)" = 3 ]' || true
+    check_eq "responses come from all three backends" "$(dist)" 3
+  solve: |
+    sed -i 's/ backup//; s/9130/9103/' /lab/haproxy/haproxy.cfg
+    docker kill -s HUP kl-lb
+
+- id: net-023
+  title: 504 on the slow report
+  difficulty: 3
+  kind: fix
+  tags: [nginx, proxy, timeouts, docker]
+  tutorial: |
+    **Concept.** A reverse proxy waits only so long for its upstream: separate timeouts cover connecting, sending the request and reading the response. When the upstream is slower than the limit, the proxy gives up and returns an error of its own, even though the upstream is healthy.
+
+    **Read up on:**
+    - `ngx_http_proxy_module` — the `proxy_connect_timeout`, `proxy_send_timeout` and `proxy_read_timeout` directives
+    - HTTP 502 versus 504 — what each says about the upstream
+    - `docker exec NAME nginx -t` and `nginx -s reload` — validate and apply a config
+    - `curl -sS -o /dev/null -w '%{http_code} %{time_total}\n'` — measure a request
+  scenario: |
+    nginx (container **`kl-nginx`**, host networking) proxies **`127.0.0.1:8089`** to an
+    upstream application. The `/fast` page works but `/report` always fails with a
+    gateway error, though the application itself is healthy and simply takes a few
+    seconds to build the report.
+
+    The nginx config is in **`/lab/nginx/default.conf`** (the directory is mounted
+    read-only into the container). Make `curl http://127.0.0.1:8089/report` succeed
+    through the proxy, and apply the change.
+  hints:
+    - "`curl -si http://127.0.0.1:8089/report` — look at the status and how long it took."
+    - "The upstream takes a few seconds; nginx's default and configured read limits are what matter."
+    - "Reload with `docker exec kl-nginx nginx -s reload`."
+  solution: |
+    The proxy gives up after `proxy_read_timeout 2s`, but the report takes about four
+    seconds. Raise the timeout and reload:
+
+    ```bash
+    sed -i 's/proxy_read_timeout 2s/proxy_read_timeout 15s/' /lab/nginx/default.conf
+    docker exec kl-nginx nginx -s reload
+    ```
+  setup: |
+    on_reset 'docker rm -f kl-nginx >/dev/null 2>&1; systemctl stop kl-slow 2>/dev/null; systemctl reset-failed kl-slow 2>/dev/null; rm -rf /srv/kl-slow'
+    mkdir -p /srv/kl-slow
+    head -c6 /dev/urandom | od -An -tx1 | tr -d ' \n' > /srv/kl-slow/token
+    cp /srv/kl-slow/token "$KL_STATE/answer"
+    cat >/srv/kl-slow/app.py <<'PY'
+    import time
+    from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
+    T = open('/srv/kl-slow/token').read().strip()
+    class H(BaseHTTPRequestHandler):
+        def do_GET(self):
+            if self.path.startswith('/report'):
+                time.sleep(4)
+                b = (T + "\n").encode()
+            else:
+                b = b"fast\n"
+            self.send_response(200)
+            self.send_header('Content-Length', str(len(b)))
+            self.end_headers()
+            self.wfile.write(b)
+        def log_message(self, *a):
+            pass
+    ThreadingHTTPServer(('127.0.0.1', 9201), H).serve_forever()
+    PY
+    systemd-run --quiet --unit=kl-slow python3 /srv/kl-slow/app.py
+    lab_file /lab/nginx/default.conf <<'EOF'
+    server {
+        listen 127.0.0.1:8089;
+        add_header X-Proxy kl always;
+        location / {
+            proxy_pass http://127.0.0.1:9201;
+            proxy_read_timeout 2s;
+        }
+    }
+    EOF
+    chmod 755 /lab/nginx
+    docker rm -f kl-nginx >/dev/null 2>&1
+    docker run -d --name kl-nginx --network host -v /lab/nginx:/etc/nginx/conf.d:ro nginx:1.27-alpine >/dev/null
+    eventually 20 'curl -fsS -m3 http://127.0.0.1:8089/fast'
+  check: |
+    want=$(cat "$KL_STATE/answer")
+    check "nginx container is running" 'c_running kl-nginx'
+    check "/fast goes through the proxy" 'curl -si -m4 http://127.0.0.1:8089/fast | grep -qi "^x-proxy: kl"'
+    eventually 10 'curl -fsS -m8 -o /dev/null http://127.0.0.1:8089/report' || true
+    check_eq "/report returns the report through the proxy" "$(curl -fsS -m10 http://127.0.0.1:8089/report 2>/dev/null)" "$want"
+  solve: |
+    sed -i 's/proxy_read_timeout 2s/proxy_read_timeout 15s/' /lab/nginx/default.conf
+    docker exec kl-nginx nginx -s reload
+
+- id: net-024
+  title: Mutual TLS
+  difficulty: 4
+  kind: build
+  tags: [tls, mtls, openssl, nginx]
+  tutorial: |
+    **Concept.** In mutual TLS the server also demands a certificate from the client, and accepts it only if it chains to a CA the server trusts. The client certificate's subject then identifies who is calling.
+
+    **Read up on:**
+    - `man openssl-req` and `man openssl-x509` — create a key and request, then sign with a CA
+    - Extended key usage — the `clientAuth` purpose that marks a certificate for clients
+    - `-extfile` — attach extensions while signing
+    - `curl --cert --key --cacert` — present a client certificate and trust a private CA
+    - `openssl x509 -noout -subject -dates -ext extendedKeyUsage` — inspect the result
+  scenario: |
+    An nginx server (container `kl-mtls`) listens on **`https://127.0.0.1:9444`** and
+    rejects any client that has no valid certificate. Your private CA is in
+    **`/lab/pki`** (`ca.crt` and `ca.key`).
+
+    Issue yourself a client certificate and use it. Create **`/lab/pki/client.key`** and
+    **`/lab/pki/client.crt`**, where the certificate:
+
+    - is signed by the CA,
+    - has the common name found in **`/lab/pki/identity.txt`**,
+    - is marked for **client authentication**,
+    - is valid for **no more than 90 days**.
+
+    Then `curl` must succeed, trusting `ca.crt` and presenting your certificate.
+  hints:
+    - "Make a key and CSR with `openssl req -newkey rsa:2048 -nodes -keyout client.key -out client.csr -subj /CN=...`."
+    - "Sign it with `openssl x509 -req -CA ca.crt -CAkey ca.key -CAcreateserial -days N`, adding `-extfile` with an `extendedKeyUsage` line."
+  solution: |
+    ```bash
+    cd /lab/pki
+    cn=$(cat identity.txt)
+    openssl req -newkey rsa:2048 -nodes -keyout client.key -out client.csr -subj "/CN=$cn"
+    openssl x509 -req -in client.csr -CA ca.crt -CAkey ca.key -CAcreateserial \
+      -out client.crt -days 30 -extfile <(echo extendedKeyUsage=clientAuth)
+    curl --cacert ca.crt --cert client.crt --key client.key https://127.0.0.1:9444/
+    ```
+  setup: |
+    cn=svc-$(head -c3 /dev/urandom | od -An -tx1 | tr -d ' \n')
+    echo "$cn" > "$KL_STATE/answer"
+    d=/lab/pki; s=/srv/kl-mtls
+    on_reset 'docker rm -f kl-mtls >/dev/null 2>&1; rm -rf /srv/kl-mtls'
+    mkdir -p "$d" "$s/conf" "$s/certs"
+    openssl req -x509 -newkey rsa:2048 -nodes -keyout "$d/ca.key" -out "$d/ca.crt" -days 365 -subj "/CN=Lab Internal CA" 2>/dev/null
+    openssl req -newkey rsa:2048 -nodes -keyout "$s/certs/server.key" -out "$s/server.csr" -subj "/CN=mtls.test" 2>/dev/null
+    openssl x509 -req -in "$s/server.csr" -CA "$d/ca.crt" -CAkey "$d/ca.key" -CAcreateserial -CAserial "$s/ca.srl" \
+      -out "$s/certs/server.crt" -days 90 -extfile <(echo "subjectAltName=IP:127.0.0.1,DNS:localhost") 2>/dev/null
+    cp "$d/ca.crt" "$s/certs/ca.crt"
+    chmod -R a+rX "$s"
+    echo "$cn" > "$d/identity.txt"
+    cat >"$s/conf/default.conf" <<'EOF'
+    server {
+        listen 127.0.0.1:9444 ssl;
+        ssl_certificate /certs/server.crt;
+        ssl_certificate_key /certs/server.key;
+        ssl_client_certificate /certs/ca.crt;
+        ssl_verify_client on;
+        location / { return 200 "hello $ssl_client_s_dn\n"; }
+    }
+    EOF
+    chown -R "$(lab_user):" "$d"
+    docker rm -f kl-mtls >/dev/null 2>&1
+    docker run -d --name kl-mtls --network host -v "$s/conf:/etc/nginx/conf.d:ro" -v "$s/certs:/certs:ro" nginx:1.27-alpine >/dev/null
+    eventually 20 "curl -sS -m3 --cacert $d/ca.crt -o /dev/null https://127.0.0.1:9444/"
+  check: |
+    d=/lab/pki; cn=$(cat "$KL_STATE/answer")
+    check "server is up and rejects clients with no certificate" 'c_running kl-mtls && ! curl -fsS -m5 --cacert $d/ca.crt https://127.0.0.1:9444/'
+    if [ -f $d/client.crt ] && [ -f $d/client.key ]; then
+      check "client.crt is signed by the CA" 'openssl verify -CAfile $d/ca.crt $d/client.crt'
+      check "subject common name is $cn" 'openssl x509 -in $d/client.crt -noout -subject | grep -q "CN *= *$cn"'
+      check "marked for client authentication" 'openssl x509 -in $d/client.crt -noout -ext extendedKeyUsage | grep -q "TLS Web Client Authentication"'
+      check "valid now, but for at most 90 days" 'openssl x509 -in $d/client.crt -noout -checkend 0 && ! openssl x509 -in $d/client.crt -noout -checkend 7862400'
+      got=$(curl -sS -m5 --cacert $d/ca.crt --cert $d/client.crt --key $d/client.key https://127.0.0.1:9444/ 2>/dev/null)
+      check_match "the server accepts the certificate and sees its identity" "$got" "CN=$cn"
+    else
+      fail "client.crt and client.key exist in /lab/pki"
+    fi
+  solve: |
+    cd /lab/pki
+    cn=$(cat identity.txt)
+    openssl req -newkey rsa:2048 -nodes -keyout client.key -out client.csr -subj "/CN=$cn" 2>/dev/null
+    openssl x509 -req -in client.csr -CA ca.crt -CAkey ca.key -CAcreateserial -out client.crt -days 30 \
+      -extfile <(echo extendedKeyUsage=clientAuth) 2>/dev/null
+
+- id: net-025
+  title: Find the lossy link
+  difficulty: 5
+  kind: fix
+  tags: [netem, packet-loss, mtr, tc, netns]
+  tutorial: |
+    **Concept.** Packet loss at one hop shows up in every measurement that crosses it, so you find the culprit by testing progressively further targets and seeing where loss first appears. Not every anomaly is the cause, because other links may have unrelated, harmless quirks.
+
+    **Read up on:**
+    - `ping -c N -i 0.2 ADDR` — measure loss to each hop in turn
+    - `mtr -n -r -c 20 ADDR` — per-hop loss and latency in one report
+    - `tc qdisc show` and `man tc-netem` — how loss and delay emulation appear on an interface
+    - `tc -n NS` — inspect a namespace from outside
+    - Directionality — a rule only affects packets leaving that interface
+  scenario: |
+    Users on **`h1`** complain that connections to **`h2`** stutter:
+
+    ```
+    h1 (10.5.1.2) -- r1 -- r2 -- h2 (10.5.3.2)
+    ```
+
+    `ping 10.5.3.2` from h1 loses a good share of its packets. The network was
+    deliberately degraded for a test and never cleaned up, and more than one thing
+    on the path was left misconfigured.
+
+    Find what causes the **packet loss** and remove it. Don't disturb anything else:
+    other settings on the path (such as extra latency) are expected by another team
+    and must stay.
+  hints:
+    - "Ping r1 (10.5.1.1), then r2 (10.5.2.2 from r1's side, or 10.5.3.1), then h2, and see where the loss starts."
+    - "`sudo tc -n r1 qdisc show` on each namespace; read which line has `loss`, and on which interface."
+    - "Remove only that qdisc with `tc qdisc del dev IF root`."
+  solution: |
+    One interface carries a `netem loss ...` qdisc; another carries a `netem delay 40ms`
+    qdisc that is a red herring. Locate the loss, then delete only that qdisc:
+
+    ```bash
+    for ns in h1 r1 r2 h2; do echo "== $ns"; sudo tc -n $ns qdisc show; done
+    sudo tc -n NS qdisc del dev IF root     # the one with "loss"
+    ```
+  setup: |
+    netns_new h1 r1 r2 h2
+    netns_link h1 eth0 r1 eth0
+    netns_link r1 eth1 r2 eth0
+    netns_link r2 eth1 h2 eth0
+    ip -n h1 addr add 10.5.1.2/24 dev eth0
+    ip -n r1 addr add 10.5.1.1/24 dev eth0
+    ip -n r1 addr add 10.5.2.1/24 dev eth1
+    ip -n r2 addr add 10.5.2.2/24 dev eth0
+    ip -n r2 addr add 10.5.3.1/24 dev eth1
+    ip -n h2 addr add 10.5.3.2/24 dev eth0
+    ip -n h1 route add default via 10.5.1.1
+    ip -n h2 route add default via 10.5.3.1
+    ip -n r1 route add 10.5.3.0/24 via 10.5.2.2
+    ip -n r2 route add 10.5.1.0/24 via 10.5.2.1
+    ip netns exec r1 sysctl -qw net.ipv4.ip_forward=1
+    ip netns exec r2 sysctl -qw net.ipv4.ip_forward=1
+    link_dev() {
+      case "$1:$2" in
+        1:0) echo "h1 eth0" ;; 1:1) echo "r1 eth0" ;;
+        2:0) echo "r1 eth1" ;; 2:1) echo "r2 eth0" ;;
+        3:0) echo "r2 eth1" ;; 3:1) echo "h2 eth0" ;;
+      esac
+    }
+    L=$((RANDOM % 3 + 1)); D=$((L % 3 + 1))
+    read -r lns ldev <<<"$(link_dev "$L" $((RANDOM % 2)))"
+    read -r dns ddev <<<"$(link_dev "$D" 0)"
+    tc -n "$lns" qdisc add dev "$ldev" root netem loss 30%
+    tc -n "$dns" qdisc add dev "$ddev" root netem delay 40ms
+    echo "$dns $ddev" > "$KL_STATE/answer"
+  check: |
+    read -r dns ddev < "$KL_STATE/answer"
+    for ns in h1 r1 r2 h2; do
+      check_not "no loss qdisc left in $ns" 'tc -n $ns qdisc show | grep -Eq "loss [1-9]"'
+    done
+    check "the 40ms delay on $dns/$ddev is untouched" 'tc -n $dns qdisc show dev $ddev | grep -q "delay 40"'
+    out=$(ip netns exec h1 ping -q -c 20 -i 0.1 -W 2 10.5.3.2 2>&1)
+    check_match "20 pings to h2 all arrive" "$out" ' 0% packet loss'
+  solve: |
+    for ns in h1 r1 r2 h2; do
+      for dev in $(sudo tc -n $ns qdisc show | awk '/netem/ && /loss [1-9]/ {for (i = 1; i < NF; i++) if ($i == "dev") print $(i + 1)}'); do
+        sudo tc -n $ns qdisc del dev "$dev" root
+      done
+    done
+    true

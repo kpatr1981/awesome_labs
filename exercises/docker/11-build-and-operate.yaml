@@ -1,0 +1,627 @@
+track: docker
+module: Advanced builds & operations
+profile: docker
+order: 11
+exercises:
+
+- id: docker-201
+  title: Cap one container's log file
+  difficulty: 1
+  kind: build
+  tags: [logging, log-rotation]
+  tutorial: |
+    **Concept.** The default json-file log driver appends to one file per container forever. Each container can be given its own rotation settings, independent of the daemon-wide defaults, so a chatty service cannot fill the disk.
+
+    **Read up on:**
+    - `docker run --help` — find `--log-driver` and `--log-opt`
+    - Docker docs 'JSON File logging driver' — the options it accepts
+    - `docker inspect` — `.HostConfig.LogConfig` shows what was applied
+  scenario: |
+    The **`chatter`** service prints a line every second and nobody ever rotates its log.
+
+    Run **`chatter`** (`busybox:1.37`, command `sh -c 'while true; do echo tick; sleep 1; done'`)
+    so that its log is rotated using the limits written in **`/lab/limits.txt`**.
+  hints:
+    - "Log options are passed per container with `--log-opt key=value`, repeatable."
+    - "The size limit and the number of files kept are two separate options."
+  solution: |
+    ```bash
+    docker run -d --name chatter --log-opt max-size=4m --log-opt max-file=3 \
+      busybox:1.37 sh -c 'while true; do echo tick; sleep 1; done'
+    docker inspect -f '{{.HostConfig.LogConfig}}' chatter
+    ```
+    Use the values from `/lab/limits.txt`.
+  setup: |
+    sz=$((RANDOM % 4 + 2)); nf=$((RANDOM % 3 + 2))
+    echo "${sz}m $nf" > "$KL_STATE/answer"
+    lab_file limits.txt <<EOF
+    max size of one log file: ${sz}m
+    number of log files kept: ${nf}
+    EOF
+  check: |
+    read -r want_sz want_nf < "$KL_STATE/answer"
+    t=$(c_get chatter '{{.HostConfig.LogConfig.Type}}')
+    check "chatter is running" 'c_running chatter'
+    check "a rotating log driver is used" '[ "$t" = json-file ] || [ "$t" = local ]'
+    check_eq "max-size" "$(c_get chatter '{{index .HostConfig.LogConfig.Config "max-size"}}')" "$want_sz"
+    check_eq "max-file" "$(c_get chatter '{{index .HostConfig.LogConfig.Config "max-file"}}')" "$want_nf"
+  solve: |
+    sz=$(awk -F': ' '/max size/{print $2}' /lab/limits.txt)
+    nf=$(awk -F': ' '/files kept/{print $2}' /lab/limits.txt)
+    docker run -d --name chatter --log-opt max-size="$sz" --log-opt max-file="$nf" \
+      busybox:1.37 sh -c 'while true; do echo tick; sleep 1; done'
+
+- id: docker-202
+  title: Retry a few times, then give up
+  difficulty: 2
+  kind: build
+  tags: [restart-policy, on-failure]
+  tutorial: |
+    **Concept.** A restart policy tells the daemon what to do when a container's main process ends. Policies differ in whether they care about the exit code and whether they ever stop trying, which matters for jobs that can fail for good.
+
+    **Read up on:**
+    - `docker run --help` — the restart option and its accepted values
+    - Docker docs 'Start containers automatically' — compare each policy
+    - `docker inspect` — `.HostConfig.RestartPolicy` and `.RestartCount`
+  scenario: |
+    The **`flaky`** worker sometimes dies with a non-zero exit code, and a restart usually
+    fixes it. But when it is truly broken it must not be restarted forever.
+
+    Run **`flaky`** (`busybox:1.37`, command `sh -c 'echo starting; sleep 3; exit 3'`) so that
+    Docker restarts it after failures, with the retry budget given in **`/lab/retries.txt`**.
+  hints:
+    - "One of the policies accepts a maximum retry count after a colon."
+    - "A clean exit (code 0) should not trigger a restart under that policy."
+  solution: |
+    ```bash
+    docker run -d --name flaky --restart on-failure:4 busybox:1.37 sh -c 'echo starting; sleep 3; exit 3'
+    docker inspect -f '{{.HostConfig.RestartPolicy}} {{.RestartCount}}' flaky
+    ```
+    Use the number from `/lab/retries.txt`.
+  setup: |
+    n=$((RANDOM % 3 + 3))
+    echo "$n" > "$KL_STATE/answer"
+    lab_file retries.txt <<EOF
+    allowed restart attempts: $n
+    EOF
+  check: |
+    n=$(cat "$KL_STATE/answer")
+    check "flaky exists" 'c_exists flaky'
+    check "flaky uses the busybox:1.37 image" '[ "$(c_get flaky "{{.Config.Image}}")" = busybox:1.37 ]'
+    check_eq "restart policy" "$(c_get flaky '{{.HostConfig.RestartPolicy.Name}}')" "on-failure"
+    check_eq "maximum retries" "$(c_get flaky '{{.HostConfig.RestartPolicy.MaximumRetryCount}}')" "$n"
+  solve: |
+    n=$(awk -F': ' '{print $2}' /lab/retries.txt)
+    docker run -d --name flaky --restart "on-failure:$n" busybox:1.37 sh -c 'echo starting; sleep 3; exit 3'
+
+- id: docker-203
+  title: Ship only the public folder
+  difficulty: 2
+  kind: build
+  tags: [dockerignore, build-context]
+  tutorial: |
+    **Concept.** Everything in the build context is sent to the daemon and is available to COPY. A .dockerignore file filters the context, and its patterns can exclude broadly and then re-include specific paths with an exception rule.
+
+    **Read up on:**
+    - Docker docs 'Build context' — the `.dockerignore` section and its syntax
+    - `docker build --help` — how the context is chosen
+    - `docker run --rm --entrypoint find IMAGE / -type f` — list what an image contains
+  scenario: |
+    **`/lab/site`** is a documentation site. Only the **`public/`** folder may end up in the
+    image; the folder also holds notes, drafts, a backup archive and a `.env` that must never ship.
+
+    Build **`docsite:1`** from `/lab/site`. Do not change the Dockerfile (its `COPY . /srv/` is
+    policy) — make sure `/srv` in the image contains files from `public/` only.
+  hints:
+    - "You cannot edit the Dockerfile, so control what the context contains."
+    - "Think in terms of an allow-list: exclude everything, then add back one path."
+    - "Order matters in `.dockerignore`: a later rule overrides an earlier one."
+  solution: |
+    ```bash
+    cd /lab/site
+    printf '*\n!public\n' > .dockerignore
+    docker build -t docsite:1 .
+    docker run --rm --entrypoint find docsite:1 /srv -type f
+    ```
+  setup: |
+    tok=$(rand_flag)
+    echo "$tok" > "$KL_STATE/answer"
+    lab_file site/Dockerfile <<'EOF'
+    FROM busybox:1.37
+    COPY . /srv/
+    CMD ["httpd", "-f", "-p", "8080", "-h", "/srv/public"]
+    EOF
+    lab_file site/public/index.html <<EOF
+    <h1>Docs</h1><p>$tok</p>
+    EOF
+    lab_file site/public/about.html <<'EOF'
+    <h1>About</h1>
+    EOF
+    lab_file site/notes/todo.txt <<'EOF'
+    rewrite the introduction
+    EOF
+    lab_file site/drafts/q4-plan.md <<'EOF'
+    # Q4 plan (internal)
+    EOF
+    lab_file site/.env <<EOF
+    API_KEY=$(rand_flag)
+    EOF
+    head -c 3000000 /dev/urandom > /lab/site/backup-2024.tar.gz
+    chown -R "$(lab_user):" /lab
+    (cd /lab/site && md5sum Dockerfile) > "$KL_STATE/df.md5"
+  check: |
+    tok=$(cat "$KL_STATE/answer")
+    files=$(docker run --rm --entrypoint find docsite:1 /srv -type f 2>/dev/null)
+    check "Dockerfile was not changed" '(cd /lab/site && md5sum -c --status "$KL_STATE/df.md5")'
+    check "docsite:1 exists" 'img_exists docsite:1'
+    check "both public pages are in the image" 'grep -q "^/srv/public/index.html$" <<<"$files" && grep -q "^/srv/public/about.html$" <<<"$files"'
+    check "nothing but public/ is under /srv" '[ -n "$files" ] && ! grep -qv "^/srv/public/" <<<"$files"'
+    check "index.html is the current one" 'docker run --rm --entrypoint cat docsite:1 /srv/public/index.html | grep -qF "$tok"'
+  solve: |
+    cd /lab/site
+    printf '*\n!public\n' > .dockerignore
+    docker build -t docsite:1 .
+
+- id: docker-204
+  title: A new build id reruns the slow step
+  difficulty: 4
+  kind: fix
+  tags: [build-cache, build-args, layers]
+  tutorial: |
+    **Concept.** Docker reuses a cached layer only if its instruction and everything before it are unchanged. A build argument that changes on every run invalidates the cache from the point it takes effect, so its position matters.
+
+    **Read up on:**
+    - Docker docs 'Build cache' — what invalidates a layer
+    - Docker docs on `ARG` — 'Impact on build caching'
+    - `docker build --progress=plain` — see which steps say CACHED
+    - `docker history IMAGE` — layers and the instructions that made them
+  scenario: |
+    CI builds **`/lab/pipeline`** with `--build-arg BUILD_ID=<run number>` on every run, and every
+    run now repeats the slow dependency step (6 seconds here, ten minutes in production).
+
+    Fix **`/lab/pipeline/Dockerfile`** so that building again with a different `BUILD_ID` reuses the
+    cached slow step. The image must still carry the id in its **`build.id`** label.
+  hints:
+    - "Run two builds with different `--build-arg BUILD_ID=...` values using `--progress=plain` and see which steps rerun."
+    - "Once a layer is rebuilt, every layer after it is rebuilt too."
+    - "An ARG is only visible to instructions that come after it."
+  solution: |
+    Declare the argument and use it only after the slow step:
+
+    ```dockerfile
+    FROM busybox:1.37
+    RUN sleep 6 && echo "deps installed" > /deps.txt
+    COPY app.sh /app.sh
+    ARG BUILD_ID=dev
+    LABEL build.id=$BUILD_ID
+    CMD ["sh", "/app.sh"]
+    ```
+    ```bash
+    docker build --build-arg BUILD_ID=1 -t pipe:1 /lab/pipeline
+    docker build --build-arg BUILD_ID=2 -t pipe:2 /lab/pipeline   # instant
+    ```
+  setup: |
+    lab_file pipeline/Dockerfile <<'EOF'
+    FROM busybox:1.37
+    ARG BUILD_ID=dev
+    LABEL build.id=$BUILD_ID
+    RUN sleep 6 && echo "deps installed" > /deps.txt
+    COPY app.sh /app.sh
+    CMD ["sh", "/app.sh"]
+    EOF
+    lab_file pipeline/app.sh <<'EOF'
+    echo "pipeline app"
+    EOF
+  check: |
+    a="a$RANDOM"; b="b$RANDOM"
+    pbuild() { docker build -q --build-arg BUILD_ID="$1" -t "kl-chk-pipe:$1" /lab/pipeline >/dev/null 2>&1; }
+    built=0; ms=99999
+    if pbuild "$a"; then
+      t0=$(date +%s%N)
+      if pbuild "$b"; then built=1; ms=$(( ($(date +%s%N) - t0) / 1000000 )); fi
+    fi
+    lbl=$(docker image inspect -f '{{index .Config.Labels "build.id"}}' "kl-chk-pipe:$b" 2>/dev/null)
+    docker rmi -f "kl-chk-pipe:$a" "kl-chk-pipe:$b" >/dev/null 2>&1
+    check "the Dockerfile builds" '[ "$built" = 1 ]'
+    check "a new BUILD_ID reuses the cached slow step (second build took ${ms} ms)" '[ "$ms" -lt 4000 ]'
+    check_eq "build.id label carries the build argument" "$lbl" "$b"
+  solve: |
+    cd /lab/pipeline
+    cat > Dockerfile <<'EOF'
+    FROM busybox:1.37
+    RUN sleep 6 && echo "deps installed" > /deps.txt
+    COPY app.sh /app.sh
+    ARG BUILD_ID=dev
+    LABEL build.id=$BUILD_ID
+    CMD ["sh", "/app.sh"]
+    EOF
+
+- id: docker-205
+  title: Unhealthy while warming up
+  difficulty: 4
+  kind: fix
+  tags: [healthcheck, start-period]
+  tutorial: |
+    **Concept.** A health check runs on a schedule and flips the container to unhealthy after enough consecutive failures. Slow-starting software fails the first probes through no fault of its own, and Docker has a setting to tolerate that.
+
+    **Read up on:**
+    - `docker run --help` — all the `--health-*` options
+    - `docker inspect` — `.Config.Healthcheck` and `.State.Health`
+    - Docker docs on `HEALTHCHECK` — what each timing option means
+    - Health settings are fixed at creation time; see what `docker update --help` can and cannot change
+  scenario: |
+    The **`reports`** container needs about 15 seconds to warm up. The deploy tooling treats a
+    container that reports **unhealthy** as a failed rollout, and `reports` flips to unhealthy
+    during every start.
+
+    Recreate **`reports`** with the same name, image, command and health command, so that it
+    never reports unhealthy while it warms up and ends up **healthy**. Inspect the running
+    container to see how it was started.
+  hints:
+    - "`docker inspect reports` shows the exact health settings in use."
+    - "Loosening the retries only delays the problem; look for the option that makes early failures not count."
+  solution: |
+    ```bash
+    docker rm -f reports
+    docker run -d --name reports \
+      --health-cmd 'test -f /tmp/ready' --health-interval 3s --health-timeout 2s \
+      --health-retries 2 --health-start-period 20s \
+      busybox:1.37 sh -c 'sleep 15; touch /tmp/ready; sleep infinity'
+    ```
+  setup: |
+    docker run -d --name reports \
+      --health-cmd 'test -f /tmp/ready' --health-interval 3s --health-timeout 2s --health-retries 2 \
+      busybox:1.37 sh -c 'sleep 15; touch /tmp/ready; sleep infinity' >/dev/null
+  check: |
+    reports_healthy() { [ "$(c_get reports '{{.State.Health.Status}}')" = healthy ]; }
+    sp=$(c_get reports '{{.Config.Healthcheck.StartPeriod}}')
+    secs=$(printf '%s' "$sp" | awk '/[0-9]s$/{sub(/s$/,"");print int($0);next} /^[0-9]+$/{print int($0/1000000000);next} {print 0}')
+    ok=0; [ "${secs:-0}" -ge 15 ] && ok=1
+    check "reports is running" 'c_running reports'
+    check "same image" '[ "$(c_get reports "{{.Config.Image}}")" = busybox:1.37 ]'
+    check "same health command" 'c_get reports "{{.Config.Healthcheck.Test}}" | grep -q /tmp/ready'
+    check "early probe failures are tolerated while warming up" '[ "$ok" = 1 ]'
+    if [ "$ok" = 1 ]; then
+      check "reports becomes healthy" 'eventually 40 reports_healthy'
+    else
+      fail "reports becomes healthy"
+    fi
+  solve: |
+    docker rm -f reports
+    docker run -d --name reports \
+      --health-cmd 'test -f /tmp/ready' --health-interval 3s --health-timeout 2s \
+      --health-retries 2 --health-start-period 20s \
+      busybox:1.37 sh -c 'sleep 15; touch /tmp/ready; sleep infinity'
+
+- id: docker-206
+  title: Which file did the uploader write?
+  difficulty: 2
+  kind: build
+  tags: [debugging, diff, cp]
+  tutorial: |
+    **Concept.** A container's writable layer records every change made to the image's filesystem. Docker can list those changes and copy files in and out of a container, which is often enough to investigate a running service without extra tools.
+
+    **Read up on:**
+    - `docker diff --help` — the A, C and D markers in the output
+    - `docker cp --help` — copying out of a container
+    - `docker exec` — run commands inside, and why it is not always needed
+  scenario: |
+    The **`uploader`** container produced a job file that support needs. All you know is that it
+    ends in **`.dat`** and was not written under `/tmp`. Nobody remembers where it lives.
+
+    Copy that file out of the container to **`/lab/job.dat`**.
+  hints:
+    - "Which Docker command shows only what changed compared to the image?"
+    - "Added paths are marked with `A`; ignore changed (`C`) directories."
+  solution: |
+    ```bash
+    docker diff uploader | grep '\.dat$'
+    docker cp uploader:/var/spool/q-xxxx/job-xxxx.dat /lab/job.dat
+    ```
+  setup: |
+    d=$(head -c4 /dev/urandom | od -An -tx1 | tr -d ' \n')
+    tok=$(rand_flag)
+    echo "$tok" > "$KL_STATE/answer"
+    docker run -d --name uploader busybox:1.37 sh -c "
+      mkdir -p /var/spool/q-$d
+      echo '$tok' > /var/spool/q-$d/job-$d.dat
+      echo scratch > /tmp/upload-$d.tmp
+      echo 'worker=1' >> /etc/uploader.conf
+      exec sleep 3600" >/dev/null
+    eventually 15 'docker diff uploader | grep -q "\.dat$"'
+  check: |
+    got=$(tr -d '[:space:]' 2>/dev/null </lab/job.dat)
+    check_eq "/lab/job.dat holds the job file's content" "$got" "$(cat "$KL_STATE/answer")"
+  solve: |
+    f=$(docker diff uploader | awk '$1=="A" && $2 ~ /\.dat$/ {print $2}')
+    docker cp "uploader:$f" /lab/job.dat
+
+- id: docker-207
+  title: Tag every log line with its owner
+  difficulty: 3
+  kind: build
+  tags: [logging, json-file, labels]
+  tutorial: |
+    **Concept.** Log drivers can attach container metadata to each record they write. With the json-file driver you choose which labels or environment variables are copied into every line, so a shipper can tell sources apart without parsing messages.
+
+    **Read up on:**
+    - `docker run --help` — `--label` and `--log-opt`
+    - Docker docs 'JSON File logging driver' — the options that add attributes
+    - `docker inspect` — `.LogPath` is the file the driver writes
+    - `head -n1` on that file — each line is JSON; look at its keys
+  scenario: |
+    The central log shipper reads Docker's own log files and groups lines by the key **`team`**.
+    **`/lab/owner.txt`** says which team owns the new **`checkout`** service.
+
+    Run **`checkout`** (`busybox:1.37`, command `sh -c 'while true; do echo tick; sleep 1; done'`)
+    so that every line in its log file carries `team` with the owning team's name.
+  hints:
+    - "The metadata has to come from somewhere: the container needs it set first."
+    - "Setting it is not enough; the log driver must be told to copy it into each record."
+    - "Look at a line of the log file with `sudo head -n1 $(docker inspect -f '{{.LogPath}}' checkout)`."
+  solution: |
+    ```bash
+    docker run -d --name checkout --label team=billing --log-opt labels=team \
+      busybox:1.37 sh -c 'while true; do echo tick; sleep 1; done'
+    sudo head -n2 "$(docker inspect -f '{{.LogPath}}' checkout)"
+    ```
+    Each line then contains `"attrs":{"team":"billing"}`. Use the team from `/lab/owner.txt`.
+  setup: |
+    teams=(payments search billing growth platform)
+    team=${teams[RANDOM % 5]}
+    echo "$team" > "$KL_STATE/answer"
+    lab_file owner.txt <<EOF
+    checkout is owned by team: $team
+    EOF
+  check: |
+    team=$(cat "$KL_STATE/answer")
+    logged() { local f; f=$(c_get checkout '{{.LogPath}}'); [ -n "$f" ] && grep -q "\"team\":\"$team\"" "$f"; }
+    check "checkout is running" 'c_running checkout'
+    check "log lines carry team=$team" 'c_running checkout && eventually 10 logged'
+  solve: |
+    team=$(awk '{print $NF}' /lab/owner.txt)
+    docker run -d --name checkout --label "team=$team" --log-opt labels=team \
+      busybox:1.37 sh -c 'while true; do echo tick; sleep 1; done'
+
+- id: docker-208
+  title: Containers with no memory limit
+  difficulty: 3
+  kind: build
+  tags: [inspect, resources, memory]
+  tutorial: |
+    **Concept.** A container's resource settings live in its configuration, not in the processes inside it. `docker inspect` exposes them as JSON and accepts a Go template, so you can audit many containers at once without parsing by hand.
+
+    **Read up on:**
+    - `docker inspect --format` — Go templates and the `.HostConfig` fields
+    - `docker ps --format` — listing names for a loop
+    - Docker docs 'Resource constraints' — hard limits versus soft reservations
+    - What a value of 0 means for a limit field
+  scenario: |
+    A capacity review is under way. Several **`svc-*`** containers are running on this host.
+
+    Write the names of every running container that has **no hard memory limit** to
+    **`/lab/unlimited.txt`**, one per line, sorted alphabetically. Be careful with containers that
+    only have a soft setting.
+  hints:
+    - "A hard limit and a soft reservation are different fields of `.HostConfig`."
+    - "For an unlimited container the limit field is `0`."
+    - "A shell loop over `docker ps --format '{{.Names}}'` with an inspect inside is enough."
+  solution: |
+    ```bash
+    for c in $(docker ps --format '{{.Names}}'); do
+      [ "$(docker inspect -f '{{.HostConfig.Memory}}' "$c")" = 0 ] && echo "$c"
+    done | sort > /lab/unlimited.txt
+    ```
+  setup: |
+    while :; do
+      bits=""; lim=0
+      for i in 1 2 3 4 5 6; do b=$((RANDOM % 2)); bits="$bits$b"; lim=$((lim + b)); done
+      [ "$lim" -ge 2 ] && [ "$lim" -le 4 ] && break
+    done
+    unl=""
+    for i in 1 2 3 4 5 6; do
+      b=${bits:$((i - 1)):1}
+      if [ "$b" = 1 ]; then
+        flags="--memory 64m"
+      else
+        unl="$unl svc-$i"
+        flags=""
+        [ $((RANDOM % 2)) = 0 ] && flags="--memory-reservation 32m"
+      fi
+      [ $((RANDOM % 2)) = 0 ] && flags="$flags --cpus 0.5"
+      docker run -d --name "svc-$i" $flags busybox:1.37 sleep 3600 >/dev/null
+    done
+    printf '%s\n' $unl | sort > "$KL_STATE/answer"
+  check: |
+    got=$(grep -v '^[[:space:]]*$' /lab/unlimited.txt 2>/dev/null | tr -d '[:blank:]' | sort)
+    check_eq "the unlimited containers are listed" "$got" "$(cat "$KL_STATE/answer")"
+  solve: |
+    for c in $(docker ps --format '{{.Names}}'); do
+      [ "$(docker inspect -f '{{.HostConfig.Memory}}' "$c")" = 0 ] && echo "$c"
+    done | sort > /lab/unlimited.txt
+
+- id: docker-209
+  title: Deleted in a later layer, still in the image
+  difficulty: 3
+  kind: fix
+  tags: [layers, image-size, dockerfile]
+  tutorial: |
+    **Concept.** An image is a stack of read-only layers, one per filesystem-changing instruction. Deleting a file in a later layer only hides it; the earlier layer still carries its bytes, and the image keeps that weight.
+
+    **Read up on:**
+    - `docker history IMAGE` — size contributed by each layer
+    - `docker image ls` — the SIZE column
+    - Docker docs 'Best practices' — the sections on layers and multi-stage builds
+    - How `&&` chains commands inside one `RUN`
+  scenario: |
+    **`report:1`** is built from **`/lab/report`**. It only prints a number, yet the image is far
+    larger than its content suggests, and it is pushed hundreds of times a day.
+
+    Change the Dockerfile and rebuild **`report:1`** so the image is **under 10 MB** while
+    `docker run --rm report:1` prints exactly the same output as now.
+  hints:
+    - "`docker history report:1` shows which layer holds the weight."
+    - "The working file is only needed while the report is generated."
+    - "There is more than one valid approach: a single `RUN`, or a second build stage."
+  solution: |
+    Do the work and the clean-up in the same layer:
+
+    ```dockerfile
+    FROM busybox:1.37
+    RUN head -c 30000000 /dev/zero > /tmp/work.bin \
+     && wc -c < /tmp/work.bin > /report.txt \
+     && rm /tmp/work.bin
+    CMD ["cat", "/report.txt"]
+    ```
+    ```bash
+    docker build -t report:1 /lab/report
+    docker image ls report:1
+    ```
+  setup: |
+    n=$((RANDOM % 20 + 20))000000
+    echo "$n" > "$KL_STATE/answer"
+    lab_file report/Dockerfile <<EOF
+    FROM busybox:1.37
+    RUN head -c $n /dev/zero > /tmp/work.bin
+    RUN wc -c < /tmp/work.bin > /report.txt
+    RUN rm /tmp/work.bin
+    CMD ["cat", "/report.txt"]
+    EOF
+    docker build -q -t report:1 /lab/report >/dev/null
+  check: |
+    n=$(cat "$KL_STATE/answer")
+    size=$(docker image inspect -f '{{.Size}}' report:1 2>/dev/null)
+    case "$size" in ''|*[!0-9]*) size=999999999 ;; esac
+    out=$(docker run --rm report:1 2>/dev/null | tr -d '[:space:]')
+    check "report:1 exists" 'img_exists report:1'
+    check "report:1 is under 10 MB (now $((size / 1000000)) MB)" '[ "$size" -lt 10000000 ]'
+    check_eq "report:1 prints the same output" "$out" "$n"
+  solve: |
+    cd /lab/report
+    n=$(grep -o 'head -c [0-9]*' Dockerfile | awk '{print $3}')
+    cat > Dockerfile <<EOF
+    FROM busybox:1.37
+    RUN head -c $n /dev/zero > /tmp/work.bin \\
+     && wc -c < /tmp/work.bin > /report.txt \\
+     && rm /tmp/work.bin
+    CMD ["cat", "/report.txt"]
+    EOF
+    docker build -t report:1 .
+
+- id: docker-210
+  title: "Incident: the API image misbehaves everywhere"
+  difficulty: 5
+  kind: fix
+  tags: [incident, build-args, healthcheck, dockerignore, env]
+  tutorial: |
+    **Concept.** Build-time and run-time settings are separate worlds: an ARG exists only while building, and a HEALTHCHECK runs inside the container with only what the image ships.
+
+    **Read up on:**
+    - Docker docs on `ARG` and `ENV` — carrying a build value to run time
+    - `docker inspect` — `.State.Health.Log` holds failed probe output
+    - `docker run --rm --entrypoint sh IMAGE -c 'which curl wget'` — tools present
+    - `.dockerignore`, `docker history` — what got copied
+  scenario: |
+    The release pipeline builds **`/lab/api`** once per environment with
+    `docker build --build-arg APP_PORT=<port> /lab/api`, then runs the image with no other options.
+    Three complaints came in:
+
+    1. The container always listens on 8000, whatever `APP_PORT` was.
+    2. The container never becomes **healthy**.
+    3. The image carries the 12 MB `vendor/` wheel cache that is only for local development.
+
+    Fix the build in `/lab/api` so that, for any port given as `APP_PORT`, the container serves on
+    that port, becomes healthy, and has no `vendor/` in `/app`. Do **not** edit `server.py`.
+  hints:
+    - "Read `server.py` to see where it gets its port from, then connect that to the build argument."
+    - "After starting the container, `docker inspect -f '{{json .State.Health}}'` tells why probes fail."
+    - "The health command must reach the port the server really uses and only use tools present in the image."
+    - "Inside the container `127.0.0.1` is reliable; shell-form `HEALTHCHECK CMD` expands environment variables when it runs."
+  solution: |
+    ```bash
+    cd /lab/api
+    printf 'vendor\n' > .dockerignore
+    cat > Dockerfile <<'EOF'
+    FROM python:3.12-alpine
+    ARG APP_PORT=8000
+    ENV PORT=$APP_PORT
+    WORKDIR /app
+    COPY . .
+    EXPOSE $APP_PORT
+    HEALTHCHECK --interval=30s --timeout=3s CMD wget -qO- http://127.0.0.1:$PORT/health || exit 1
+    CMD ["python", "server.py"]
+    EOF
+    docker build --build-arg APP_PORT=8123 -t api:2 .
+    ```
+    The ARG is promoted to an ENV so the server sees it, the health check uses `wget` (the
+    Alpine image has no `curl`) against the real port, and `.dockerignore` keeps `vendor/` out.
+  setup: |
+    lab_file api/Dockerfile <<'EOF'
+    FROM python:3.12-alpine
+    ARG APP_PORT=8000
+    WORKDIR /app
+    COPY . .
+    EXPOSE 8000
+    HEALTHCHECK --interval=30s --timeout=3s CMD curl -fsS http://localhost:8000/health || exit 1
+    CMD ["python", "server.py"]
+    EOF
+    lab_file api/server.py <<'EOF'
+    import os
+    from http.server import BaseHTTPRequestHandler, HTTPServer
+
+    port = int(os.environ.get("PORT", "8000"))
+
+    class Handler(BaseHTTPRequestHandler):
+        def do_GET(self):
+            self.send_response(200)
+            self.end_headers()
+            self.wfile.write(b"ok\n")
+
+        def log_message(self, *args):
+            pass
+
+    HTTPServer(("0.0.0.0", port), Handler).serve_forever()
+    EOF
+    lab_file api/README.txt <<'EOF'
+    internal api service
+    EOF
+    mkdir -p /lab/api/vendor
+    head -c 12000000 /dev/zero > /lab/api/vendor/wheels.bin
+    chown -R "$(lab_user):" /lab
+    (cd /lab/api && md5sum server.py) > "$KL_STATE/srv.md5"
+  check: |
+    p=$((RANDOM % 800 + 8100)); img=kl-chk-api; ctr=kl-chk-api; ip=""
+    serving() { curl -fsS -m 2 "http://$ip:$p/" >/dev/null; }
+    healthy() { [ "$(c_get $ctr '{{.State.Health.Status}}')" = healthy ]; }
+    docker rm -f $ctr >/dev/null 2>&1; docker rmi -f $img >/dev/null 2>&1
+    check "server.py was not edited" '(cd /lab/api && md5sum -c --status "$KL_STATE/srv.md5")'
+    built=0; docker build -q --build-arg APP_PORT=$p -t $img /lab/api >/dev/null 2>&1 && built=1
+    check "the image builds with APP_PORT=$p" '[ "$built" = 1 ]'
+    srv=0; hl=0
+    if [ "$built" = 1 ]; then
+      check "vendor/ is not in the image" 'docker run --rm --entrypoint test $img ! -e /app/vendor'
+      docker run -d --name $ctr --health-interval 2s --health-timeout 2s $img >/dev/null 2>&1
+      ip=$(docker inspect -f '{{range .NetworkSettings.Networks}}{{.IPAddress}}{{end}}' $ctr 2>/dev/null)
+      eventually 8 serving && srv=1
+      check "the container serves on port $p" '[ "$srv" = 1 ]'
+      if [ "$srv" = 1 ]; then eventually 20 healthy && hl=1; fi
+      check "the container becomes healthy" '[ "$hl" = 1 ]'
+    else
+      fail "vendor/ is not in the image"
+      fail "the container serves on port $p"
+      fail "the container becomes healthy"
+    fi
+    docker rm -f $ctr >/dev/null 2>&1; docker rmi -f $img >/dev/null 2>&1
+  solve: |
+    cd /lab/api
+    printf 'vendor\n' > .dockerignore
+    cat > Dockerfile <<'EOF'
+    FROM python:3.12-alpine
+    ARG APP_PORT=8000
+    ENV PORT=$APP_PORT
+    WORKDIR /app
+    COPY . .
+    EXPOSE $APP_PORT
+    HEALTHCHECK --interval=30s --timeout=3s CMD wget -qO- http://127.0.0.1:$PORT/health || exit 1
+    CMD ["python", "server.py"]
+    EOF
