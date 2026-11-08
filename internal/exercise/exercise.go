@@ -20,6 +20,7 @@ type Profile string
 const (
 	ProfileDocker Profile = "docker"
 	ProfileK8s    Profile = "k8s"
+	ProfileOffsec Profile = "offsec"
 )
 
 // Exercise is one lab task.
@@ -148,8 +149,8 @@ func (m *Module) validate(file string) error {
 	if m.Track == "" || m.Module == "" {
 		return fmt.Errorf("%s: track and module are required", file)
 	}
-	if m.Profile != ProfileDocker && m.Profile != ProfileK8s {
-		return fmt.Errorf("%s: profile must be docker or k8s, got %q", file, m.Profile)
+	if m.Profile != ProfileDocker && m.Profile != ProfileK8s && m.Profile != ProfileOffsec {
+		return fmt.Errorf("%s: profile must be docker, k8s or offsec, got %q", file, m.Profile)
 	}
 	for _, e := range m.Exercises {
 		where := fmt.Sprintf("%s: exercise %q", file, e.ID)
@@ -171,7 +172,7 @@ func (m *Module) validate(file string) error {
 		case strings.TrimSpace(e.Solve) == "":
 			return fmt.Errorf("%s: missing solve", where)
 		}
-		if m.Profile == ProfileDocker && (e.SetupWorker != "" || e.CheckWorker != "") {
+		if m.Profile != ProfileK8s && (e.SetupWorker != "" || e.CheckWorker != "") {
 			return fmt.Errorf("%s: worker scripts only valid for k8s profile", where)
 		}
 	}

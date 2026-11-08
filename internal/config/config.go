@@ -24,6 +24,7 @@ type Config struct {
 	Docker       VMSize `yaml:"docker"`
 	ControlPlane VMSize `yaml:"controlplane"`
 	Worker       VMSize `yaml:"worker"`
+	Offsec       VMSize `yaml:"offsec"`
 }
 
 // AutoStopEnabled returns the effective auto_stop setting.
@@ -41,6 +42,7 @@ auto_stop: true
 # docker:       {cpus: 2, memory: 3GiB}
 # controlplane: {cpus: 2, memory: 3GiB}
 # worker:       {cpus: 2, memory: 2560MiB}
+# offsec:       {cpus: 2, memory: 3GiB}
 `
 
 // Path returns the config file location inside dir.

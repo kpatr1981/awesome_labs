@@ -26,6 +26,27 @@ docker)
   )
   UNITS=(containerd docker.socket docker)
   ;;
+offsec)
+  ENTRIES=(
+    containerd:/etc/containerd/config.toml
+    docker:/etc/docker
+    docker:/usr/lib/systemd/system/docker.service
+    docker:/usr/lib/systemd/system/docker.socket
+    none:/etc/passwd
+    none:/etc/group
+    none:/etc/shadow
+    none:/etc/gshadow
+    none:/etc/sudoers
+    none:/etc/sudoers.d
+    none:/etc/crontab
+    none:/etc/cron.d
+    none:/etc/ssh/sshd_config
+    none:/etc/hosts
+    none:/etc/sysctl.d
+    none:/usr/share/kl
+  )
+  UNITS=(containerd docker.socket docker)
+  ;;
 cp | worker)
   ENTRIES=(
     containerd:/etc/containerd

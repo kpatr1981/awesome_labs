@@ -3,9 +3,9 @@
 Exercises live in `exercises/<track>/NN-<module>.yaml`. One file is one module:
 
 ```yaml
-track: kubernetes          # docker | kubernetes (display grouping)
+track: kubernetes          # docker | kubernetes | offsec (display grouping)
 module: Services & DNS     # module title
-profile: k8s               # docker | k8s — which lab environment
+profile: k8s               # docker | k8s | offsec — which lab environment
 order: 3                   # module order within the track
 exercises:
 - id: k8s-041              # unique
@@ -69,3 +69,27 @@ control plane, `KUBECONFIG` is `/etc/kubernetes/admin.conf`; the lab user has it
 | `ing_get HOST PATH`, `ing_code`, `ing_tls` | through the Traefik ingress |
 | `on_node01 'cmd'` | run as root on node01 (from the control plane) |
 | `lab_file PATH <<EOF` | write a file owned by the lab user |
+| `web_target NAME PORT <<PY` | run a stdlib-Python vulnerable target in container `kl-NAME` on 127.0.0.1:PORT (offsec) |
+| `rand_flag` | a fresh `KL{…}` flag token (offsec) |
+
+## Offensive-security exercises (`profile: offsec`)
+
+The `offsec` VM is a single Ubuntu host that is both the attacker box (nmap, ncat,
+hydra, john, curl, python3) and the home for the targets. Keep everything
+**self-contained** — targets run on this VM, nothing reaches the outside network —
+and **deterministic**.
+
+The standard pattern for a web task:
+
+1. `setup` mints a flag with `FLAG=$(rand_flag); export FLAG`, stores the expected
+   answer in `$KL_STATE/answer`, and starts the vulnerable app with
+   `web_target NAME PORT <<'PY' … PY`. `web_target` forwards `FLAG`/`SECRET`/
+   `DBUSER`/`DBPASS` into the container and registers its own teardown, so no
+   `on_reset` is needed for the target.
+2. The task asks the learner to capture the flag into a file under `/lab`.
+3. `check` compares that file to `$KL_STATE/answer` (fails before the attack, passes
+   after). `solve` is the reference exploit, run as the lab user in `/lab`.
+
+For a **fix** exercise, ship the vulnerable source with `lab_file /lab/app.py`; the
+`check` starts the learner's version in a throwaway container (register its removal
+with `on_reset`) and probes that the bug is gone *and* the app still works.

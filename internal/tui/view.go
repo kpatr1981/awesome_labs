@@ -56,6 +56,8 @@ func trackLabel(t string) string {
 		return "Docker"
 	case "kubernetes":
 		return "Kubernetes"
+	case "offsec":
+		return "Offensive Sec"
 	}
 	return t
 }
@@ -346,7 +348,7 @@ func (m *model) viewEnv() string {
 	var b strings.Builder
 	b.WriteString(m.header() + "\n\n")
 	b.WriteString(sTitle.Render(" Lab environments") + "\n\n")
-	for i, env := range []lab.Env{lab.DockerEnv, lab.K8sEnv} {
+	for i, env := range lab.AllEnvs() {
 		st, ok := m.envStatus[env.Profile]
 		if !ok {
 			st = "checking…"

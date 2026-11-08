@@ -107,6 +107,7 @@ func (m *model) examSources() []examSource {
 	src := []examSource{
 		{"Kubernetes — everything", all[exercise.ProfileK8s]},
 		{"Docker — everything", all[exercise.ProfileDocker]},
+		{"Offensive Security — everything", all[exercise.ProfileOffsec]},
 	}
 	for _, p := range m.paths {
 		g := byProfile(p.Exercises)
@@ -116,7 +117,7 @@ func (m *model) examSources() []examSource {
 			}
 			continue
 		}
-		for _, prof := range []exercise.Profile{exercise.ProfileK8s, exercise.ProfileDocker} {
+		for _, prof := range []exercise.Profile{exercise.ProfileK8s, exercise.ProfileDocker, exercise.ProfileOffsec} {
 			if len(g[prof]) > 0 {
 				src = append(src, examSource{fmt.Sprintf("%s (%s)", p.Title, lab.EnvFor(prof).Title), g[prof]})
 			}

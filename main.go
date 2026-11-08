@@ -37,8 +37,8 @@ usage:
   kubelab show <id>               print scenario (add --solution for the solution)
   kubelab start <id>              prepare the lab for an exercise
   kubelab check <id>              check your work
-  kubelab shell [docker|k8s|node01]  open a shell in a lab VM
-  kubelab env status|up|stop|destroy|rebuild|reset [docker|k8s]
+  kubelab shell [docker|k8s|node01|offsec]  open a shell in a lab VM
+  kubelab env status|up|stop|destroy|rebuild|reset [docker|k8s|offsec]
   kubelab verify [-from id] [ids or prefixes...]
                                   author tool: setup -> check fails -> solve -> check passes
   kubelab lint                    validate all exercise files
@@ -82,7 +82,8 @@ func run(args []string) error {
 	}
 	lab.ApplySizes([2]string{itoa(cfg.Docker.CPUs), cfg.Docker.Memory},
 		[2]string{itoa(cfg.ControlPlane.CPUs), cfg.ControlPlane.Memory},
-		[2]string{itoa(cfg.Worker.CPUs), cfg.Worker.Memory})
+		[2]string{itoa(cfg.Worker.CPUs), cfg.Worker.Memory},
+		[2]string{itoa(cfg.Offsec.CPUs), cfg.Offsec.Memory})
 	pfs, pfile := fs.FS(assets), "learning-paths.yaml"
 	if f := os.Getenv("KUBELAB_PATHS"); f != "" {
 		pfs, pfile = os.DirFS(filepath.Dir(f)), filepath.Base(f)
@@ -186,6 +187,8 @@ func run(args []string) error {
 			env = lab.K8sEnv
 		case "node01", "worker":
 			env, worker = lab.K8sEnv, true
+		case "offsec":
+			env = lab.OffsecEnv
 		}
 		c := mgr.ShellCommand(env, worker)
 		return c.Run()
@@ -210,15 +213,17 @@ func envCmd(ctx context.Context, mgr *lab.Manager, args []string) error {
 	if len(args) == 0 {
 		args = []string{"status"}
 	}
-	envs := []lab.Env{lab.DockerEnv, lab.K8sEnv}
+	envs := lab.AllEnvs()
 	if len(args) > 1 {
 		switch args[1] {
 		case "docker":
 			envs = []lab.Env{lab.DockerEnv}
 		case "k8s", "kubernetes":
 			envs = []lab.Env{lab.K8sEnv}
+		case "offsec":
+			envs = []lab.Env{lab.OffsecEnv}
 		default:
-			return fmt.Errorf("unknown environment %q (docker|k8s)", args[1])
+			return fmt.Errorf("unknown environment %q (docker|k8s|offsec)", args[1])
 		}
 	}
 	mgr.Verbose = os.Getenv("KUBELAB_VERBOSE") != ""

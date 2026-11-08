@@ -152,7 +152,7 @@ func Run(d Deps) error {
 	sp.Style = lipgloss.NewStyle().Foreground(colAccent)
 	m := &model{
 		cat: cat, mgr: mgr, prog: prog,
-		tracks: []string{"", "docker", "kubernetes"},
+		tracks: []string{"", "docker", "kubernetes", "offsec"},
 		filter: ti, spin: sp, style: style,
 		output: map[string]*strings.Builder{}, result: map[string]string{},
 		mdCache: map[string]string{}, envStatus: map[exercise.Profile]string{},
@@ -346,18 +346,20 @@ func (m *model) cmdShell(worker bool) tea.Cmd {
 func (m *model) cmdEnvStatus() tea.Cmd {
 	return func() tea.Msg {
 		ctx := context.Background()
-		return envStatusMsg{
-			exercise.ProfileDocker: m.mgr.EnvStatus(ctx, lab.DockerEnv),
-			exercise.ProfileK8s:    m.mgr.EnvStatus(ctx, lab.K8sEnv),
+		st := envStatusMsg{}
+		for _, env := range lab.AllEnvs() {
+			st[env.Profile] = m.mgr.EnvStatus(ctx, env)
 		}
+		return st
 	}
 }
 
 func (m *model) envAction(action string) tea.Cmd {
-	env := lab.DockerEnv
-	if m.envCursor == 1 {
-		env = lab.K8sEnv
+	envs := lab.AllEnvs()
+	if m.envCursor < 0 || m.envCursor >= len(envs) {
+		m.envCursor = 0
 	}
+	env := envs[m.envCursor]
 	run := func(f func(ctx context.Context, w io.Writer) error) tea.Cmd {
 		return m.startOp("env", fmt.Sprintf("%s: %s", env.Title, action), "env", func(ctx context.Context, w io.Writer) (bool, error) {
 			return false, f(ctx, w)
@@ -768,9 +770,13 @@ func (m *model) updateEnv(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 	case "esc", "q", "e":
 		m.screen = scrBrowse
 	case "up", "k":
-		m.envCursor = 0
+		if m.envCursor > 0 {
+			m.envCursor--
+		}
 	case "down", "j":
-		m.envCursor = 1
+		if m.envCursor < len(lab.AllEnvs())-1 {
+			m.envCursor++
+		}
 	case "r":
 		return m, m.cmdEnvStatus()
 	case "u":

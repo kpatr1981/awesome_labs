@@ -1,7 +1,7 @@
 # kubelab
 
-**500 hands-on Docker & Kubernetes exercises on your own machine** — real VMs, real
-breakage, automatic grading.
+**Hands-on Docker, Kubernetes & offensive-security exercises on your own machine** —
+real VMs, real breakage, automatic grading.
 
 kubelab creates [Lima](https://lima-vm.io) virtual machines, puts each exercise's
 scenario in place (a broken deployment, a crashed daemon, a half-finished compose
@@ -27,10 +27,13 @@ exercise has a scenario, progressive hints and a full solution you can reveal.
 |-------|---------|-----------|
 | **Docker** | containers · images & Dockerfiles · volumes · networking · Compose · registries · security & limits · the daemon & host · production patterns · real-world troubleshooting | 200 |
 | **Kubernetes** | pods · deployments · services & DNS · ConfigMaps & Secrets · scheduling · storage · Jobs/CronJobs/DaemonSets · probes, resources & autoscaling · Ingress & Gateway API · NetworkPolicies · RBAC & pod security · app troubleshooting · cluster troubleshooting · cluster administration · Helm, Kustomize & CRDs | 300 |
+| **Offensive Security** | web exploitation (recon · SQL injection · path traversal · command injection · IDOR · SSRF · XXE · JWT · remediation) · *(more modules in progress)* | 20 |
 
 Each module has 20 exercises of increasing difficulty (1 = beginner … 5 = expert),
-mixing **build** tasks ("create X") and **fix** tasks ("X is broken, find out why").
-Each module ends with a multi-problem *incident*.
+mixing **build** tasks ("create X" / "capture the flag") and **fix** tasks ("X is
+broken — find out why" / "patch the vulnerability"). Each module ends with a
+multi-problem *incident*. Offensive-security exercises are self-contained: every
+target runs on the lab's own VM and nothing reaches the outside network.
 
 ## The lab environments
 
@@ -38,6 +41,7 @@ Each module ends with a multi-problem *incident*.
 |-------------|-----|---------------|
 | **Docker host** | `kl-docker` (2 CPU, 3 GiB) | Ubuntu 24.04, Docker Engine + Compose + Buildx, common images pre-pulled |
 | **Kubernetes cluster** | `kl-cp` → `controlplane` (2 CPU, 3 GiB)<br>`kl-worker` → `node01` (2 CPU, 2.5 GiB) | kubeadm **v1.36**, containerd 2, Calico (enforces NetworkPolicies), metrics-server, local-path storage (default StorageClass), Traefik ingress + Gateway API (NodePorts 30080/30443), Helm |
+| **Offensive security lab** | `kl-offsec` (2 CPU, 3 GiB) | Ubuntu 24.04, Docker (hosts the vulnerable targets), attacker tooling (nmap, ncat, hydra, john, …) and wordlists under `/usr/share/kl`. Attacker and targets are the same isolated box |
 
 The cluster deliberately runs one minor release behind the newest Kubernetes, so the
 upgrade exercise has something to upgrade to.

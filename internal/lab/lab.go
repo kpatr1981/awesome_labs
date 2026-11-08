@@ -74,14 +74,24 @@ var (
 		{Name: "kl-cp", Role: "cp", Hostname: "controlplane", CPUs: 2, Memory: "3GiB"},
 		{Name: "kl-worker", Role: "worker", Hostname: "node01", CPUs: 2, Memory: "2560MiB"},
 	}}
+	OffsecEnv = Env{Profile: exercise.ProfileOffsec, Title: "Offensive security lab", VMs: []VM{
+		{Name: "kl-offsec", Role: "offsec", Hostname: "offsec", CPUs: 2, Memory: "3GiB"},
+	}}
 )
+
+// AllEnvs is every environment, in display order.
+func AllEnvs() []Env { return []Env{DockerEnv, K8sEnv, OffsecEnv} }
 
 // EnvFor returns the environment for a profile.
 func EnvFor(p exercise.Profile) Env {
-	if p == exercise.ProfileK8s {
+	switch p {
+	case exercise.ProfileK8s:
 		return K8sEnv
+	case exercise.ProfileOffsec:
+		return OffsecEnv
+	default:
+		return DockerEnv
 	}
-	return DockerEnv
 }
 
 // Manager runs lab operations. It is safe for one operation at a time.
@@ -243,9 +253,12 @@ func (m *Manager) ensure(ctx context.Context, env Env, log io.Writer) error {
 		return nil
 	}
 	fmt.Fprintf(log, "==> bootstrapping %s\n", env.Title)
-	if env.Profile == exercise.ProfileDocker {
+	switch env.Profile {
+	case exercise.ProfileDocker:
 		err = m.bootstrapDocker(ctx, env, log)
-	} else {
+	case exercise.ProfileOffsec:
+		err = m.bootstrapOffsec(ctx, env, log)
+	default:
 		err = m.bootstrapK8s(ctx, env, log)
 	}
 	if err != nil {
@@ -264,8 +277,11 @@ func (m *Manager) ensure(ctx context.Context, env Env, log io.Writer) error {
 
 func (m *Manager) template(env Env, vm VM) (string, error) {
 	name := "vms/docker.yaml"
-	if env.Profile == exercise.ProfileK8s {
+	switch env.Profile {
+	case exercise.ProfileK8s:
 		name = "vms/k8s-node.yaml"
+	case exercise.ProfileOffsec:
+		name = "vms/offsec.yaml"
 	}
 	b, err := fs.ReadFile(m.Assets, name)
 	if err != nil {
@@ -364,6 +380,18 @@ func (m *Manager) bootstrapDocker(ctx context.Context, env Env, log io.Writer) e
 		}
 	}
 	return nil
+}
+
+func (m *Manager) bootstrapOffsec(ctx context.Context, env Env, log io.Writer) error {
+	vm := env.Primary()
+	for _, s := range []string{"common.sh", "offsec.sh"} {
+		if err := m.runBootstrap(ctx, vm, s, nil, log); err != nil {
+			return err
+		}
+	}
+	fmt.Fprintf(log, "==> taking pristine snapshot\n")
+	_, err := m.root(ctx, vm, "/opt/kubelab/state.sh snapshot offsec", nil, m.detail(log))
+	return err
 }
 
 func (m *Manager) ip(ctx context.Context, vm VM) (string, error) {
@@ -470,8 +498,12 @@ func (m *Manager) Reset(ctx context.Context, env Env, log io.Writer) error {
 
 func (m *Manager) reset(ctx context.Context, env Env, log io.Writer) error {
 	fmt.Fprintf(log, "==> resetting %s\n", env.Title)
-	if env.Profile == exercise.ProfileDocker {
+	switch env.Profile {
+	case exercise.ProfileDocker:
 		_, err := m.root(ctx, env.Primary(), "/opt/kubelab/reset-docker.sh", nil, log)
+		return err
+	case exercise.ProfileOffsec:
+		_, err := m.root(ctx, env.Primary(), "/opt/kubelab/reset-offsec.sh", nil, log)
 		return err
 	}
 	var wg sync.WaitGroup
@@ -518,7 +550,7 @@ func (m *Manager) stopOthers(ctx context.Context, keep Env, log io.Writer) {
 	if err != nil {
 		return
 	}
-	for _, env := range []Env{DockerEnv, K8sEnv} {
+	for _, env := range AllEnvs() {
 		if env.Profile == keep.Profile {
 			continue
 		}
@@ -546,7 +578,7 @@ func (m *Manager) hold(env Env) {
 
 // Release drops the busy marks this process holds.
 func (m *Manager) Release() {
-	for _, env := range []Env{DockerEnv, K8sEnv} {
+	for _, env := range AllEnvs() {
 		if b, err := os.ReadFile(m.lockPath(env)); err == nil && strings.TrimSpace(string(b)) == strconv.Itoa(os.Getpid()) {
 			_ = os.Remove(m.lockPath(env))
 		}
@@ -568,7 +600,7 @@ func (m *Manager) busy(env Env) bool {
 
 // StopAll stops every running lab VM.
 func (m *Manager) StopAll(ctx context.Context, log io.Writer) error {
-	for _, env := range []Env{DockerEnv, K8sEnv} {
+	for _, env := range AllEnvs() {
 		if m.busy(env) {
 			fmt.Fprintf(log, "==> leaving %s running: a kubelab verify run is using it\n", env.Title)
 			continue
@@ -581,7 +613,7 @@ func (m *Manager) StopAll(ctx context.Context, log io.Writer) error {
 }
 
 // ApplySizes overrides VM sizes (from the config file).
-func ApplySizes(docker, cp, worker [2]string) {
+func ApplySizes(docker, cp, worker, offsec [2]string) {
 	set := func(vm *VM, s [2]string) {
 		if s[0] != "" {
 			fmt.Sscan(s[0], &vm.CPUs)
@@ -593,6 +625,7 @@ func ApplySizes(docker, cp, worker [2]string) {
 	set(&DockerEnv.VMs[0], docker)
 	set(&K8sEnv.VMs[0], cp)
 	set(&K8sEnv.VMs[1], worker)
+	set(&OffsecEnv.VMs[0], offsec)
 }
 
 // Destroy deletes the environment's VMs.

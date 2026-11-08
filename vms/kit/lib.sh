@@ -96,6 +96,35 @@ img_exists() { docker image inspect "$1" >/dev/null 2>&1; }
 http_get() { curl -fsS -m 5 "$@"; }
 http_code() { curl -s -o /dev/null -m 5 -w '%{http_code}' "$1"; }
 
+# ---------- offensive-security helpers ----------
+# web_target NAME PORT   (python source on stdin)
+# Run a stdlib-only Python web app (the deliberately vulnerable target) in a
+# container named kl-NAME, served on 127.0.0.1:PORT. The app source is read from
+# stdin; $PORT is exported into it. Registers its own teardown for the next reset
+# and waits until it answers.
+web_target() {
+  local name=$1 port=$2 dir=/srv/kl/$1
+  mkdir -p "$dir"
+  cat >"$dir/app.py"
+  docker rm -f "kl-$name" >/dev/null 2>&1 || true
+  # PORT is set per call; FLAG/SECRET/DBUSER/DBPASS are forwarded from the
+  # setup environment when present, so the app source need not embed them.
+  local fwd=(-e "PORT=$port")
+  local v
+  for v in FLAG SECRET DBUSER DBPASS; do
+    [ -n "${!v:-}" ] && fwd+=(-e "$v=${!v}")
+  done
+  docker run -d --name "kl-$name" --restart unless-stopped \
+    -p "127.0.0.1:$port:$port" "${fwd[@]}" \
+    -v "$dir/app.py:/app/app.py:ro" python:3.12-alpine \
+    python /app/app.py >/dev/null
+  on_reset "docker rm -f kl-$name >/dev/null 2>&1; rm -rf $dir"
+  eventually 20 "curl -fsS -o /dev/null http://127.0.0.1:$port/"
+}
+
+# rand_flag — a fresh unguessable flag token, e.g. KL{deadbeef...}
+rand_flag() { echo "KL{$(head -c16 /dev/urandom | od -An -tx1 | tr -d ' \n')}"; }
+
 # ---------- kubernetes helpers ----------
 k() { kubectl "$@"; }
 # kj RESOURCE... JSONPATH — e.g. kj -n web deploy api '{.spec.replicas}'
