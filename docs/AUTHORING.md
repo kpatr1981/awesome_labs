@@ -3,7 +3,7 @@
 Exercises live in `exercises/<track>/NN-<module>.yaml`. One file is one module:
 
 ```yaml
-track: kubernetes          # docker | kubernetes | offsec | linux | networking | cloud | data | security | programming
+track: kubernetes          # docker | kubernetes | offsec | linux | networking | cloud | data | defensive | programming
 module: Services & DNS     # module title
 profile: k8s               # docker | k8s | offsec — which lab environment
 order: 3                   # module order within the track

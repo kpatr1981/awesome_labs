@@ -32,7 +32,7 @@ exercise has a scenario, progressive hints and a full solution you can reveal.
 | **Networking** | routing, NAT, firewalls, DNS, TLS, proxies, WireGuard, netem *(growing)* | 15 |
 | **Cloud** | AWS CLI and CloudFormation against a local emulator *(growing)* | 15 |
 | **Data** | SQL, PostgreSQL operations and Redis *(growing)* | 15 |
-| **Security** | incident response and hardening *(growing)* | 15 |
+| **Defensive Security** | incident response and hardening *(growing)* | 15 |
 | **Programming** | Python and Go *(growing)* | 15 |
 
 Each module has 20 exercises of increasing difficulty (1 = beginner … 5 = expert),

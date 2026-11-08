@@ -117,7 +117,7 @@ func (m *model) examSources() []examSource {
 		{"Networking — everything", all["networking"]},
 		{"Cloud — everything", all["cloud"]},
 		{"Data — everything", all["data"]},
-		{"Security — everything", all["security"]},
+		{"Defensive Security — everything", all["defensive"]},
 		{"Programming — everything", all["programming"]},
 	}
 	for _, p := range m.paths {

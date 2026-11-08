@@ -3,16 +3,19 @@
 Ideas for future labs. Each topic has one home; where tracks touch, the row says which
 track it relies on.
 
-**Target: 400 exercises in each of the six areas below.** Each area has 15 so far; the
-parts of this list they don't cover are not started.
+**Target: 400 exercises in each of the nine topics below, 3,600 in total.** The parts of
+this list that the existing exercises don't cover are not started.
 
-| Area | Exercises | Track | Module files |
+| Topic | Exercises | Track | Module files |
 |---|---|---|---|
+| Docker | 200 / 400 | `docker` | `exercises/docker/` |
+| Kubernetes | 300 / 400 | `kubernetes` | `exercises/kubernetes/` |
+| Offensive security | 40 / 400 | `offsec` | `exercises/offsec/` |
 | Linux & systems | 15 / 400 | `linux` | `exercises/linux/` |
 | Networking | 15 / 400 | `networking` | `exercises/networking/` |
 | Cloud & platform | 15 / 400 | `cloud` | `exercises/cloud/` |
 | Data | 15 / 400 | `data` | `exercises/data/` |
-| Security | 15 / 400 | `security` | `exercises/security/` |
+| Defensive security | 15 / 400 | `defensive` | `exercises/defensive/` |
 | Programming | 15 / 400 | `programming` | `exercises/programming/` |
 
 - [Suggested order](#suggested-order)

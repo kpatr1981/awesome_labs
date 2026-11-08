@@ -66,8 +66,8 @@ func trackLabel(t string) string {
 		return "Cloud"
 	case "data":
 		return "Data"
-	case "security":
-		return "Security"
+	case "defensive":
+		return "Defensive Sec"
 	case "programming":
 		return "Programming"
 	}
