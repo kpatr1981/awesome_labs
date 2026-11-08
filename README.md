@@ -56,7 +56,7 @@ reset can't undo; kubelab rebuilds the cluster before your next Kubernetes exerc
 - macOS (Apple Silicon or Intel) or Linux with [Lima](https://lima-vm.io) ≥ 2.0
   (`brew install lima`)
 - Go ≥ 1.24 to build
-- ~9 GiB of free RAM when both environments run, ~40 GiB of disk
+- ~6 GiB of free RAM (one environment at a time; ~9 GiB with both), ~40 GiB of disk
 - Internet access (packages and images are downloaded on first start)
 
 ## Build & run
@@ -75,7 +75,10 @@ make build          # or: go build -o kubelab .
 | `tab` | All / Docker / Kubernetes |
 | `u` | show only unsolved |
 | `enter` | open an exercise |
+| `L` | **learning paths** — focus the list on a curated path, with progress |
+| `X` | **exam mode** — start a timed exam, or return to the running one |
 | `e` | environments screen (create, stop, reset, rebuild, delete VMs) |
+| `Q` | quit **and stop all lab VMs** |
 
 ### In an exercise
 
@@ -94,10 +97,53 @@ Inside the VMs the scenario is also in **`/lab/TASK.md`**; `/lab` is your workin
 directory. On the control plane `kubectl` (alias `k`, with completion) is configured
 for you, and `ssh node01` gets you onto the worker.
 
+### Learning paths
+
+| Path | What's in it |
+|------|--------------|
+| Docker fundamentals | containers, images, volumes, networks, Compose (difficulty ≤ 3) |
+| Docker in production | registries, hardening, the daemon, production patterns, outages |
+| Kubernetes for developers (CKAD-style) | workloads, config, services, probes, ingress, policies, Helm/Kustomize |
+| Kubernetes administration (CKA-style) | scheduling, storage, networking, RBAC, cluster troubleshooting, upgrades, etcd |
+| Kubernetes security | RBAC, pod security, network policies, secrets, audit, encryption |
+| Troubleshooting only | every *fix* exercise |
+| Incident drills | the multi-problem incidents at the end of each module |
+
+Paths are defined in `learning-paths.yaml` (filters by track, module, kind, tag,
+difficulty or id).
+
+### Exam mode
+
+Press `X`, pick a pool (a whole track or any path), the number of questions, a time
+limit and whether hints are allowed. kubelab draws a balanced random set: about a
+third easy, a third medium, a third hard. A countdown runs in the header, hints and
+solutions are locked, and **the last check of each question counts**. When you finish
+(`F`) or time runs out you get your score against a **66 % pass mark**, and solutions
+unlock. Exams are kept in `~/.kubelab/exam-history.json`.
+
+```bash
+kubelab exam status     # the running exam
+kubelab exam history    # past results
+```
+
+### Saving memory
+
+Only one environment needs to run at a time. With `auto_stop: true` (the default),
+starting a Docker exercise stops the Kubernetes VMs and vice versa; `Q` in the browser
+quits and stops everything. Settings live in `~/.kubelab/config.yaml`:
+
+```yaml
+auto_stop: true
+docker:       {cpus: 2, memory: 3GiB}       # applied when a VM is (re)created:
+controlplane: {cpus: 2, memory: 3GiB}       #   kubelab env rebuild docker|k8s
+worker:       {cpus: 2, memory: 2560MiB}
+```
+
 ### Command line
 
 ```bash
 kubelab list [filter]              # list exercises (✔ solved, ● started)
+kubelab paths [path-id]            # learning paths and progress
 kubelab show k8s-101 [--solution]
 kubelab start docker-042           # prepare the lab
 kubelab shell docker|k8s|node01    # open a shell
@@ -130,6 +176,9 @@ internal/lab               environments: create/bootstrap/reset VMs, run setup/c
 internal/lima              thin limactl wrapper
 internal/tui               Bubble Tea interface
 internal/progress          ~/.kubelab/progress.json
+internal/exam              timed exams
+internal/config            ~/.kubelab/config.yaml
+learning-paths.yaml        curated paths
 vms/*.yaml                 Lima templates
 vms/bootstrap/             one-time provisioning (kubeadm init, add-ons, image pre-pulls)
 vms/kit/                   copied to /opt/kubelab in every VM: lib.sh helpers, reset & snapshot scripts

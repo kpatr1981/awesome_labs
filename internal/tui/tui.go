@@ -7,6 +7,7 @@ import (
 	"io"
 	"strings"
 	"sync"
+	"time"
 
 	"github.com/charmbracelet/bubbles/spinner"
 	"github.com/charmbracelet/bubbles/textinput"
@@ -14,6 +15,7 @@ import (
 	tea "github.com/charmbracelet/bubbletea"
 	"github.com/charmbracelet/lipgloss"
 
+	"kubelab/internal/exam"
 	"kubelab/internal/exercise"
 	"kubelab/internal/lab"
 	"kubelab/internal/progress"
@@ -25,6 +27,10 @@ const (
 	scrBrowse screen = iota
 	scrDetail
 	scrEnv
+	scrPaths
+	scrExamSetup
+	scrExam
+	scrExamResult
 )
 
 type tab int
@@ -49,6 +55,8 @@ type opDoneMsg struct {
 }
 type envStatusMsg map[exercise.Profile]string
 type shellDoneMsg struct{ err error }
+type tickMsg time.Time
+type stoppedMsg struct{ err error }
 
 // ---- model ----
 
@@ -95,10 +103,43 @@ type model struct {
 	style   string
 	mdMu    sync.Mutex
 	mdCache map[string]string
+
+	// learning paths
+	paths      []*exercise.Path
+	path       *exercise.Path // active path filter, nil = none
+	pathCursor int
+
+	// exams
+	exams       *exam.Store
+	exam        *exam.Exam // running exam, nil = none
+	finished    *exam.Exam // last finished exam (result screen)
+	examCursor  int
+	setupField  int
+	setupSource int
+	setupCount  int
+	setupMins   int
+	setupHints  bool
+	quitting    bool
+	fromExam    bool // detail opened from the exam screen
+}
+
+// examLocked reports whether hints/solution of ex are hidden by a running exam.
+func (m *model) examLocked(ex *exercise.Exercise) bool {
+	return ex != nil && m.exam != nil && !m.exam.Over() && m.exam.Has(ex.ID) && !m.exam.AllowHints
+}
+
+// Deps are the services the TUI works with.
+type Deps struct {
+	Catalog  *exercise.Catalog
+	Manager  *lab.Manager
+	Progress *progress.Store
+	Paths    []*exercise.Path
+	Exams    *exam.Store
 }
 
 // Run starts the TUI.
-func Run(cat *exercise.Catalog, mgr *lab.Manager, prog *progress.Store) error {
+func Run(d Deps) error {
+	cat, mgr, prog := d.Catalog, d.Manager, d.Progress
 	style := "dark"
 	if !lipgloss.HasDarkBackground() {
 		style = "light"
@@ -115,13 +156,22 @@ func Run(cat *exercise.Catalog, mgr *lab.Manager, prog *progress.Store) error {
 		filter: ti, spin: sp, style: style,
 		output: map[string]*strings.Builder{}, result: map[string]string{},
 		mdCache: map[string]string{}, envStatus: map[exercise.Profile]string{},
+		paths: d.Paths, exams: d.Exams, setupCount: 1, setupMins: 1,
+	}
+	m.exam = d.Exams.Current()
+	if m.exam != nil && m.exam.Over() {
+		m.finishExam()
 	}
 	m.refilter()
 	_, err := tea.NewProgram(m, tea.WithAltScreen(), tea.WithMouseCellMotion()).Run()
 	return err
 }
 
-func (m *model) Init() tea.Cmd { return m.spin.Tick }
+func (m *model) Init() tea.Cmd { return tea.Batch(m.spin.Tick, tick()) }
+
+func tick() tea.Cmd {
+	return tea.Tick(time.Second, func(t time.Time) tea.Msg { return tickMsg(t) })
+}
 
 // ---- filtering ----
 
@@ -129,7 +179,11 @@ func (m *model) refilter() {
 	q := strings.ToLower(strings.TrimSpace(m.filter.Value()))
 	track := m.tracks[m.trackIdx]
 	m.visible = m.visible[:0]
-	for _, e := range m.cat.Exercises {
+	pool := m.cat.Exercises
+	if m.path != nil {
+		pool = m.path.Exercises
+	}
+	for _, e := range pool {
 		if track != "" && e.Track != track {
 			continue
 		}
@@ -364,6 +418,9 @@ func (m *model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 			m.flash = "lab ready — press t to open a terminal"
 		case msg.kind == "check":
 			m.prog.RecordCheck(msg.id, msg.passed)
+			if m.exam != nil && m.exam.Record(msg.id, msg.passed) {
+				_ = m.exams.Save(m.exam)
+			}
 			if msg.passed {
 				m.result[msg.id] = "passed"
 				m.flash = "✔ solved! great work"
@@ -381,6 +438,16 @@ func (m *model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 	case envStatusMsg:
 		m.envStatus = msg
 		return m, nil
+
+	case tickMsg:
+		if m.exam != nil && m.exam.Over() && m.op == "" {
+			m.finishExam()
+			m.screen = scrExamResult
+		}
+		return m, tick()
+
+	case stoppedMsg:
+		return m, tea.Quit
 
 	case shellDoneMsg:
 		if msg.err != nil {
@@ -422,6 +489,14 @@ func (m *model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 			return m.updateDetail(msg)
 		case scrEnv:
 			return m.updateEnv(msg)
+		case scrPaths:
+			return m.updatePaths(msg)
+		case scrExamSetup:
+			return m.updateExamSetup(msg)
+		case scrExam:
+			return m.updateExam(msg)
+		case scrExamResult:
+			return m.updateExamResult(msg)
 		}
 	}
 	return m, nil
@@ -511,6 +586,22 @@ func (m *model) updateBrowse(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 	case "e":
 		m.screen = scrEnv
 		return m, m.cmdEnvStatus()
+	case "L":
+		m.screen = scrPaths
+	case "X":
+		if m.exam != nil {
+			m.screen = scrExam
+		} else {
+			m.screen = scrExamSetup
+		}
+	case "Q":
+		if m.op != "" {
+			m.flash = "busy: " + m.op
+			return m, nil
+		}
+		m.quitting = true
+		m.flash = "stopping all lab VMs…"
+		return m, func() tea.Msg { return stoppedMsg{m.mgr.StopAll(context.Background(), io.Discard)} }
 	case "enter", "right", "l":
 		if len(m.visible) > 0 {
 			m.openDetail(m.visible[m.cursor])
@@ -521,10 +612,14 @@ func (m *model) updateBrowse(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 
 func (m *model) openDetail(ex *exercise.Exercise) {
 	m.cur = ex
+	m.fromExam = false
 	m.screen = scrDetail
 	m.tab = tabScenario
 	m.solShow = m.prog.Get(ex.ID).SawSolution
 	m.hintsShow = m.prog.Get(ex.ID).HintsUsed
+	if m.examLocked(ex) {
+		m.solShow, m.hintsShow = false, 0
+	}
 	m.flash = ""
 	m.refreshViewport(false)
 	m.vp.GotoTop()
@@ -536,6 +631,9 @@ func (m *model) updateDetail(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 	switch k {
 	case "esc", "q", "backspace", "left":
 		m.screen = scrBrowse
+		if m.fromExam {
+			m.screen = scrExam
+		}
 		m.flash = ""
 		return m, nil
 	case "tab", "right", "l":
@@ -583,6 +681,24 @@ func (m *model) updateDetail(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 	case "v":
 		return m, m.askSolution()
 	case "n", "N":
+		if m.fromExam && m.exam != nil {
+			d := 1
+			if k == "N" {
+				d = -1
+			}
+			for i, q := range m.exam.Questions {
+				if q.ID == ex.ID {
+					j := i + d
+					if j >= 0 && j < len(m.exam.Questions) {
+						m.examCursor = j
+						m.openDetail(m.cat.Get(m.exam.Questions[j].ID))
+						m.fromExam = true
+					}
+					break
+				}
+			}
+			return m, nil
+		}
 		// next / previous exercise
 		for i, e := range m.cat.Exercises {
 			if e == ex {
@@ -606,6 +722,10 @@ func (m *model) updateDetail(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 
 func (m *model) revealHint() tea.Cmd {
 	ex := m.cur
+	if m.examLocked(ex) {
+		m.flash = "hints are locked during this exam"
+		return nil
+	}
 	if len(ex.Hints) == 0 {
 		m.flash = "this exercise has no hints — try the solution"
 		return nil
@@ -621,6 +741,10 @@ func (m *model) revealHint() tea.Cmd {
 }
 
 func (m *model) askSolution() tea.Cmd {
+	if m.examLocked(m.cur) {
+		m.flash = "the solution is locked during this exam"
+		return nil
+	}
 	if m.solShow {
 		m.tab = tabSolution
 		m.refreshViewport(false)

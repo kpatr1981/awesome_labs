@@ -10,17 +10,20 @@ import (
 	"io/fs"
 	"os"
 	"os/signal"
+	"path/filepath"
 	"sort"
 	"strings"
 	"time"
 
+	"kubelab/internal/config"
+	"kubelab/internal/exam"
 	"kubelab/internal/exercise"
 	"kubelab/internal/lab"
 	"kubelab/internal/progress"
 	"kubelab/internal/tui"
 )
 
-//go:embed all:vms all:exercises
+//go:embed all:vms all:exercises learning-paths.yaml
 var assets embed.FS
 
 func usage() {
@@ -29,6 +32,8 @@ func usage() {
 usage:
   kubelab                         open the interactive exercise browser
   kubelab list [filter]           list exercises
+  kubelab paths [path-id]         learning paths and your progress
+  kubelab exam [status|history|abandon]  timed exams (start one from the UI with X)
   kubelab show <id>               print scenario (add --solution for the solution)
   kubelab start <id>              prepare the lab for an exercise
   kubelab check <id>              check your work
@@ -71,11 +76,28 @@ func run(args []string) error {
 	if err != nil {
 		return err
 	}
+	cfg, err := config.Load(mgr.StateDir)
+	if err != nil {
+		return err
+	}
+	lab.ApplySizes([2]string{itoa(cfg.Docker.CPUs), cfg.Docker.Memory},
+		[2]string{itoa(cfg.ControlPlane.CPUs), cfg.ControlPlane.Memory},
+		[2]string{itoa(cfg.Worker.CPUs), cfg.Worker.Memory})
+	pfs, pfile := fs.FS(assets), "learning-paths.yaml"
+	if f := os.Getenv("KUBELAB_PATHS"); f != "" {
+		pfs, pfile = os.DirFS(filepath.Dir(f)), filepath.Base(f)
+	}
+	paths, err := exercise.LoadPaths(pfs, pfile, cat)
+	if err != nil {
+		return err
+	}
+	exams := exam.NewStore(mgr.StateDir)
 	ctx, cancel := signal.NotifyContext(context.Background(), os.Interrupt)
 	defer cancel()
 
 	if len(args) == 0 {
-		return tui.Run(cat, mgr, prog)
+		mgr.AutoStop = cfg.AutoStopEnabled()
+		return tui.Run(tui.Deps{Catalog: cat, Manager: mgr, Progress: prog, Paths: paths, Exams: exams})
 	}
 	cmd, rest := args[0], args[1:]
 	get := func() (*exercise.Exercise, error) {
@@ -127,6 +149,7 @@ func run(args []string) error {
 		if err != nil {
 			return err
 		}
+		mgr.AutoStop = cfg.AutoStopEnabled()
 		if err := mgr.Start(ctx, ex, os.Stdout); err != nil {
 			return err
 		}
@@ -166,6 +189,10 @@ func run(args []string) error {
 		}
 		c := mgr.ShellCommand(env, worker)
 		return c.Run()
+	case "paths":
+		return pathsCmd(paths, prog, rest)
+	case "exam":
+		return examCmd(exams, cat, rest)
 	case "env":
 		return envCmd(ctx, mgr, rest)
 	case "verify":
@@ -308,4 +335,77 @@ func trunc(s string, n int) string {
 		return s
 	}
 	return string([]rune(s)[:n-1]) + "…"
+}
+
+func itoa(n int) string {
+	if n <= 0 {
+		return ""
+	}
+	return fmt.Sprint(n)
+}
+
+func pathsCmd(paths []*exercise.Path, prog *progress.Store, args []string) error {
+	for _, p := range paths {
+		if len(args) > 0 && args[0] != p.ID {
+			continue
+		}
+		ids := make([]string, len(p.Exercises))
+		for i, e := range p.Exercises {
+			ids[i] = e.ID
+		}
+		solved, _ := prog.Counts(ids)
+		fmt.Printf("%-22s %3d/%-3d %s\n%22s %s\n", p.ID, solved, len(ids), p.Title, "", p.Description)
+		if len(args) > 0 {
+			for _, e := range p.Exercises {
+				fmt.Printf("  %s %-10s %s %s\n", prog.Get(e.ID).Mark(), e.ID, stars(e.Difficulty), e.Title)
+			}
+		}
+	}
+	return nil
+}
+
+func examCmd(store *exam.Store, cat *exercise.Catalog, args []string) error {
+	action := "status"
+	if len(args) > 0 {
+		action = args[0]
+	}
+	switch action {
+	case "status":
+		e := store.Current()
+		if e == nil {
+			fmt.Println("no exam running — start one from the UI (press X)")
+			return nil
+		}
+		p, n, _ := e.Score()
+		fmt.Printf("%s — %s left, %d/%d passed so far\n", e.Title, exam.FormatDuration(e.Remaining()), p, n)
+		for i, q := range e.Questions {
+			mark := "·"
+			if q.Passed {
+				mark = "✔"
+			} else if q.Checks > 0 {
+				mark = "✘"
+			}
+			t := ""
+			if ex := cat.Get(q.ID); ex != nil {
+				t = ex.Title
+			}
+			fmt.Printf("  %2d. %s %-10s %s\n", i+1, mark, q.ID, t)
+		}
+	case "history":
+		for _, e := range store.History() {
+			p, n, sc := e.Score()
+			res := "FAIL"
+			if e.Pass() {
+				res = "PASS"
+			}
+			fmt.Printf("%s  %-40s %2d/%-2d %3.0f%%  %s  %s\n", e.Started.Format("2006-01-02 15:04"), e.Title, p, n, sc*100, res, exam.FormatDuration(e.TimeUsed()))
+		}
+	case "abandon":
+		if e := store.Current(); e != nil {
+			return store.Finish(e)
+		}
+	default:
+		return fmt.Errorf("unknown exam action %q", action)
+	}
+	return nil
 }

@@ -3,10 +3,12 @@ package tui
 import (
 	"fmt"
 	"strings"
+	"time"
 
 	"github.com/charmbracelet/glamour"
 	"github.com/charmbracelet/lipgloss"
 
+	"kubelab/internal/exam"
 	"kubelab/internal/exercise"
 	"kubelab/internal/lab"
 )
@@ -70,6 +72,14 @@ func (m *model) View() string {
 		body = m.viewDetail()
 	case scrEnv:
 		body = m.viewEnv()
+	case scrPaths:
+		body = m.viewPaths()
+	case scrExamSetup:
+		body = m.viewExamSetup()
+	case scrExam:
+		body = m.viewExam()
+	case scrExamResult:
+		body = m.viewExamResult()
 	}
 	return body
 }
@@ -81,6 +91,9 @@ func (m *model) header() string {
 	}
 	solved, started := m.prog.Counts(ids)
 	left := sTitle.Render(" kubelab ") + sMuted.Render("Docker & Kubernetes labs")
+	if m.exam != nil {
+		left += "   " + sBigOKInline(m.exam)
+	}
 	right := sOK.Render(fmt.Sprintf("✔ %d", solved)) + sMuted.Render(fmt.Sprintf("/%d solved  ", len(ids))) +
 		sWarn.Render(fmt.Sprintf("● %d", started)) + sMuted.Render(" in progress ")
 	gap := max(1, m.w-lipgloss.Width(left)-lipgloss.Width(right))
@@ -120,6 +133,10 @@ func (m *model) viewBrowse() string {
 		}
 	}
 	bar := strings.Join(tabs, "")
+	if m.path != nil {
+		ps, pt := m.pathProgress(m.path)
+		bar += sWarn.Render("  path: "+m.path.Title) + sMuted.Render(fmt.Sprintf(" %d/%d", ps, pt))
+	}
 	if m.unsolved {
 		bar += sWarn.Render("  [unsolved only]")
 	}
@@ -175,7 +192,7 @@ func (m *model) viewBrowse() string {
 	}
 	prevBox := sBorder.Width(prevW - 2).Height(lh).Render(prev)
 
-	help := "↑↓ move · enter open · / filter · tab track · n/p module · u unsolved · e environments · q quit"
+	help := "↑↓ move · enter open · / filter · tab track · n/p module · u unsolved · L paths · X exam · e envs · q quit · Q quit+stop VMs"
 	return lipgloss.JoinVertical(lipgloss.Left,
 		m.header(), bar,
 		lipgloss.JoinHorizontal(lipgloss.Top, list, prevBox),
@@ -246,7 +263,11 @@ func (m *model) viewDetail() string {
 	if e.Profile == exercise.ProfileK8s {
 		help += " · w node01"
 	}
-	help += " · c check · h hint · v solution · tab switch · n/N next/prev · esc back"
+	if m.examLocked(e) {
+		help += " · c check · tab switch · n/N next/prev question · esc exam"
+	} else {
+		help += " · c check · h hint · v solution · tab switch · n/N next/prev · esc back"
+	}
 	return lipgloss.JoinVertical(lipgloss.Left, title, strings.Join(tabs, ""), box, m.statusLine(help))
 }
 
@@ -264,6 +285,10 @@ func (m *model) refreshViewport(follow bool) {
 	case m.tab == tabScenario:
 		intro := sMuted.Render("Press s to prepare the lab, then t to open a terminal. The task is also in /lab/TASK.md.")
 		content = intro + "\n" + m.markdown("sc:"+m.cur.ID, m.cur.Scenario, w)
+	case m.tab == tabHints && m.examLocked(m.cur):
+		content = sMuted.Render("\n  🔒 Hints are locked during the exam.")
+	case m.tab == tabSolution && m.examLocked(m.cur):
+		content = sMuted.Render("\n  🔒 The solution is locked during the exam. It unlocks on the result screen.")
 	case m.tab == tabHints:
 		if len(m.cur.Hints) == 0 {
 			content = sMuted.Render("\n  No hints for this one.")
@@ -383,4 +408,17 @@ func padRight(s string, w int) string {
 		return s + strings.Repeat(" ", d)
 	}
 	return s
+}
+
+// sBigOKInline renders the exam countdown for the header.
+func sBigOKInline(e *exam.Exam) string {
+	left := e.Remaining()
+	st := sOK
+	if left < 10*time.Minute {
+		st = sBad
+	} else if left < 30*time.Minute {
+		st = sWarn
+	}
+	p, n, _ := e.Score()
+	return st.Bold(true).Render("EXAM "+exam.FormatDuration(left)) + sMuted.Render(fmt.Sprintf(" %d/%d · X", p, n))
 }

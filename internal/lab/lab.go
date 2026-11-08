@@ -88,6 +88,8 @@ type Manager struct {
 	StateDir string
 	User     string
 	Verbose  bool // copy bootstrap output to the operation log
+	// AutoStop stops the other environment before an exercise starts.
+	AutoStop bool
 	logFile  io.Writer
 	mu       sync.Mutex
 }
@@ -502,6 +504,50 @@ func (m *Manager) Stop(ctx context.Context, env Env, log io.Writer) error {
 	return nil
 }
 
+// stopOthers stops every running VM that belongs to another environment.
+func (m *Manager) stopOthers(ctx context.Context, keep Env, log io.Writer) {
+	all, err := lima.List(ctx)
+	if err != nil {
+		return
+	}
+	for _, env := range []Env{DockerEnv, K8sEnv} {
+		if env.Profile == keep.Profile {
+			continue
+		}
+		for _, vm := range env.VMs {
+			if all[vm.Name].Status == "Running" {
+				fmt.Fprintf(log, "==> stopping %s (%s) to free memory — auto_stop in %s\n", vm.Name, env.Title, filepath.Join(m.StateDir, "config.yaml"))
+				_ = lima.Stop(ctx, vm.Name, m.detail(log))
+			}
+		}
+	}
+}
+
+// StopAll stops every running lab VM.
+func (m *Manager) StopAll(ctx context.Context, log io.Writer) error {
+	for _, env := range []Env{DockerEnv, K8sEnv} {
+		if err := m.Stop(ctx, env, log); err != nil {
+			return err
+		}
+	}
+	return nil
+}
+
+// ApplySizes overrides VM sizes (from the config file).
+func ApplySizes(docker, cp, worker [2]string) {
+	set := func(vm *VM, s [2]string) {
+		if s[0] != "" {
+			fmt.Sscan(s[0], &vm.CPUs)
+		}
+		if s[1] != "" {
+			vm.Memory = s[1]
+		}
+	}
+	set(&DockerEnv.VMs[0], docker)
+	set(&K8sEnv.VMs[0], cp)
+	set(&K8sEnv.VMs[1], worker)
+}
+
 // Destroy deletes the environment's VMs.
 func (m *Manager) Destroy(ctx context.Context, env Env, log io.Writer) error {
 	m.mu.Lock()
@@ -545,6 +591,9 @@ func (m *Manager) Start(ctx context.Context, ex *exercise.Exercise, log io.Write
 	m.mu.Lock()
 	defer m.mu.Unlock()
 	env := EnvFor(ex.Profile)
+	if m.AutoStop {
+		m.stopOthers(ctx, env, log)
+	}
 	if m.Tainted(env) {
 		fmt.Fprintf(log, "==> the previous exercise changed the cluster beyond repair — rebuilding %s\n", env.Title)
 		for _, vm := range env.VMs {
