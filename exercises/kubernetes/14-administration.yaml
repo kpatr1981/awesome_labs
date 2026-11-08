@@ -53,20 +53,27 @@ exercises:
     1. restore the snapshot into a **new data directory** `/var/lib/etcd/restored`
        (inside etcd's existing hostPath volume)
     2. point the etcd static pod at it (`--data-dir`)
-    3. wait for the API server to come back
+    3. restart the API server, controller-manager and scheduler — their caches still
+       hold the *newer* state and would hide what you restored
+    4. wait for the API server to come back
 
-    The `billing` namespace and its ConfigMap must exist again.
+    The `billing` namespace and its ConfigMap must exist again — visible to a plain
+    `kubectl get cm -n billing`.
   hints:
     - "`etcdutl snapshot restore SNAPSHOT --data-dir DIR` — you can run it via `kubectl exec` in the etcd pod *before* switching (copy the snapshot into `/var/lib/etcd/` first)."
     - "Then edit `/etc/kubernetes/manifests/etcd.yaml`: `--data-dir=/var/lib/etcd/restored`. The kubelet restarts etcd; the API server reconnects within a minute or two."
+    - "etcd went *back* in time but the API server's watch cache didn't: `kubectl get ns billing` works while `kubectl get ns` doesn't list it. Stop the control-plane containers (`crictl stop`) — the kubelet starts them fresh."
   solution: |
     ```bash
     sudo cp /lab/etcd-snapshot.db /var/lib/etcd/snapshot.db
     kubectl -n kube-system exec etcd-controlplane -- etcdutl snapshot restore /var/lib/etcd/snapshot.db \
       --data-dir /var/lib/etcd/restored
     sudo sed -i 's|--data-dir=/var/lib/etcd$|--data-dir=/var/lib/etcd/restored|' /etc/kubernetes/manifests/etcd.yaml
+    sleep 30   # etcd restarts on the restored data
+    # the API server / controllers still cache the newer state — restart them
+    sudo crictl ps -q --name "kube-(apiserver|controller-manager|scheduler)" | xargs sudo crictl stop
     # wait 1-2 minutes
-    kubectl get cm invoice-settings -n billing
+    kubectl get cm -n billing
     ```
     In production you'd stop the API servers first and restore every etcd member; here a
     single-member etcd makes it straightforward.
@@ -77,18 +84,23 @@ exercises:
     kubectl -n kube-system exec etcd-controlplane -- etcdctl --endpoints=https://127.0.0.1:2379 --cacert=/etc/kubernetes/pki/etcd/ca.crt --cert=/etc/kubernetes/pki/etcd/server.crt --key=/etc/kubernetes/pki/etcd/server.key snapshot save /var/lib/etcd/kl-snap.db >/dev/null 2>&1
     mv /var/lib/etcd/kl-snap.db /lab/etcd-snapshot.db; chown $(lab_user): /lab/etcd-snapshot.db
     on_reset 'rm -rf /var/lib/etcd/restored /var/lib/etcd/snapshot.db'
-    on_reset 'crictl stop $(crictl ps --name kube-apiserver -q) >/dev/null 2>&1; sleep 15; wait_api 180'
+    on_reset 'crictl stop $(crictl ps -q --name "kube-(apiserver|controller-manager|scheduler)") >/dev/null 2>&1; sleep 15; wait_api 180'
     kubectl delete ns billing --wait=true >/dev/null
   check: |
     grep -q -- "--data-dir=/var/lib/etcd/restored" /etc/kubernetes/manifests/etcd.yaml && eventually 180 'api_up && k_exists -n billing cm invoice-settings'
     check "etcd uses the restored data dir" 'grep -q -- "--data-dir=/var/lib/etcd/restored" /etc/kubernetes/manifests/etcd.yaml'
     check "API server is up" 'api_up'
     check_eq "billing/invoice-settings is back" "$(kj -n billing cm invoice-settings '{.data.vat}')" "24"
+    eventually 60 'kubectl -n billing get cm -o name | grep -q invoice-settings'
+    check "kubectl get cm -n billing lists it (no stale cache)" 'kubectl -n billing get cm -o name | grep -q invoice-settings'
   solve: |
     sudo cp /lab/etcd-snapshot.db /var/lib/etcd/snapshot.db
     kubectl -n kube-system exec etcd-controlplane -- etcdutl snapshot restore /var/lib/etcd/snapshot.db --data-dir /var/lib/etcd/restored
     sudo sed -i 's|--data-dir=/var/lib/etcd$|--data-dir=/var/lib/etcd/restored|' /etc/kubernetes/manifests/etcd.yaml
-    sleep 20
+    sleep 30
+    for i in $(seq 1 60); do kubectl get --raw=/readyz >/dev/null 2>&1 && break; sleep 3; done
+    sudo crictl ps -q --name "kube-(apiserver|controller-manager|scheduler)" | xargs sudo crictl stop
+    sleep 10
     for i in $(seq 1 60); do kubectl get --raw=/readyz >/dev/null 2>&1 && break; sleep 3; done
 
 - id: k8s-263
@@ -803,13 +815,17 @@ exercises:
     running again. The rest of the cluster must stay healthy.
   hints:
     - "Restore the snapshot to a **new** data directory (inside `/var/lib/etcd/`), point the etcd static pod at it, and wait for the API server."
+    - "Once the API is back, `kubectl get ns` may still not show them: the API server and controller-manager cache the *newer* state. Restart the control-plane containers (`crictl stop` them; the kubelet starts them again)."
     - "Workloads come back automatically once their objects exist again — but give the controllers a minute."
   solution: |
     ```bash
     sudo cp /var/backups/etcd/nightly.db /var/lib/etcd/nightly.db
     kubectl -n kube-system exec etcd-controlplane -- etcdutl snapshot restore /var/lib/etcd/nightly.db --data-dir /var/lib/etcd/recovered
     sudo sed -i 's|--data-dir=/var/lib/etcd$|--data-dir=/var/lib/etcd/recovered|' /etc/kubernetes/manifests/etcd.yaml
-    # wait for etcd + apiserver
+    sleep 30   # etcd restarts on the restored data
+    # caches in the API server and controllers predate the restore — restart them
+    sudo crictl ps -q --name "kube-(apiserver|controller-manager|scheduler)" | xargs sudo crictl stop
+    # wait for the apiserver
     kubectl get deploy -n orders; kubectl get deploy -n customers
     ```
   setup: |
@@ -824,7 +840,7 @@ exercises:
     kubectl -n kube-system exec etcd-controlplane -- etcdctl --endpoints=https://127.0.0.1:2379 --cacert=/etc/kubernetes/pki/etcd/ca.crt --cert=/etc/kubernetes/pki/etcd/server.crt --key=/etc/kubernetes/pki/etcd/server.key snapshot save /var/lib/etcd/kl-nightly.db >/dev/null 2>&1
     mv /var/lib/etcd/kl-nightly.db /var/backups/etcd/nightly.db
     on_reset 'rm -rf /var/lib/etcd/recovered /var/lib/etcd/nightly.db /var/backups/etcd'
-    on_reset 'crictl stop $(crictl ps --name kube-apiserver -q) >/dev/null 2>&1; sleep 15; wait_api 180'
+    on_reset 'crictl stop $(crictl ps -q --name "kube-(apiserver|controller-manager|scheduler)") >/dev/null 2>&1; sleep 15; wait_api 180'
     kubectl delete ns orders customers --wait=true >/dev/null
   check: |
     grep -q -- "--data-dir=/var/lib/etcd/recovered" /etc/kubernetes/manifests/etcd.yaml && eventually 180 'api_up && k_exists ns orders'
@@ -840,4 +856,7 @@ exercises:
     kubectl -n kube-system exec etcd-controlplane -- etcdutl snapshot restore /var/lib/etcd/nightly.db --data-dir /var/lib/etcd/recovered
     sudo sed -i 's|--data-dir=/var/lib/etcd$|--data-dir=/var/lib/etcd/recovered|' /etc/kubernetes/manifests/etcd.yaml
     sleep 30
+    for i in $(seq 1 60); do kubectl get --raw=/readyz >/dev/null 2>&1 && break; sleep 3; done
+    sudo crictl ps -q --name "kube-(apiserver|controller-manager|scheduler)" | xargs sudo crictl stop
+    sleep 10
     for i in $(seq 1 60); do kubectl get --raw=/readyz >/dev/null 2>&1 && break; sleep 3; done
