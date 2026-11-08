@@ -91,18 +91,36 @@ snapshot() {
   echo "snapshot saved (${#existing[@]} paths)"
 }
 
+# restore_path PATH — make PATH identical to the snapshot, touching only what differs
+# (static pod manifests that didn't change must keep their inode, or the kubelet
+# restarts every control-plane pod).
+restore_path() {
+  local p=$1 src=$T$1
+  if [ ! -e "$src" ] && [ ! -L "$src" ]; then
+    rm -rf "$p"
+  elif [ -d "$src" ] && [ ! -L "$src" ]; then
+    [ -d "$p" ] && [ ! -L "$p" ] || { rm -rf "$p"; mkdir -p "$p"; }
+    rsync -a --delete --checksum "$src/" "$p/"
+  elif [ -L "$src" ] || [ ! -f "$p" ] || ! cmp -s "$src" "$p" ||
+       [ "$(stat -c '%a %u %g' "$src")" != "$(stat -c '%a %u %g' "$p")" ]; then
+    rm -rf "$p"
+    mkdir -p "$(dirname "$p")"
+    cp -a "$src" "$p"
+  fi
+}
+
 restore() {
   [ -f "$P/files.tar" ] || { echo "no pristine snapshot on this node" >&2; exit 1; }
   local changed=() g p
+  T=$(mktemp -d)
   for g in $(groups); do
     if [ "$(fingerprint "$g" | sha256sum | cut -d' ' -f1)" != "$(cat "$P/$g.sum")" ]; then
       changed+=("$g")
-      while read -r p; do
-        rm -rf "$p"
-        tar --acls --xattrs -xpf "$P/files.tar" -C / "${p#/}" 2>/dev/null || true
-      done < <(paths_of "$g")
+      [ -n "$(ls -A "$T")" ] || tar --acls --xattrs -xpf "$P/files.tar" -C "$T" 2>/dev/null
+      while read -r p; do restore_path "$p"; done < <(paths_of "$g")
     fi
   done
+  rm -rf "$T"
   if [ ${#changed[@]} -gt 0 ]; then
     echo "restored: ${changed[*]}"
     systemctl daemon-reload
