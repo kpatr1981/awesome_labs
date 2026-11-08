@@ -72,7 +72,7 @@ reset can't undo; awesome_labs rebuilds the cluster before your next Kubernetes 
 
 ## Requirements
 
-Tested on Fedora 45 (x86_64).
+Tested on Fedora 45 (x86_64) on a machine with 16 GB of RAM.
 
 - macOS (Apple Silicon or Intel) or Linux with [Lima](https://lima-vm.io) ≥ 2.0
   (`brew install lima`)
