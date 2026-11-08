@@ -7,7 +7,9 @@ export DEBIAN_FRONTEND=noninteractive
 # Attacker CLI tooling. All of it is standard, authorized-pentest / CTF tooling
 # that operates only against the targets this same VM hosts.
 # Core tools the exercises rely on; must install. Optional tools are nice-to-have.
-CORE=(nmap ncat hydra john hashid python3-pip)
+# gcc/libc6-dev: compile vulnerable SUID binaries for the privesc/binary modules.
+# libcap2-bin: setcap, for the Linux capabilities exercises. cron: scheduled-task privesc.
+CORE=(nmap ncat hydra john hashid python3-pip gcc libc6-dev libcap2-bin cron)
 OPT=(whatweb nikto)
 need() { local p; for p in "$@"; do dpkg -s "$p" >/dev/null 2>&1 || echo "$p"; done; }
 missing_core=$(need "${CORE[@]}")
@@ -76,6 +78,9 @@ EOF
 for img in python:3.12-alpine nginx:1.27-alpine httpd:2.4-alpine; do
   docker image inspect "$img" >/dev/null 2>&1 || docker pull -q "$img" >/dev/null
 done
+
+# cron drives the scheduled-task privesc exercises; make sure it's running.
+systemctl enable --now cron >/dev/null 2>&1 || true
 
 # Make the wordlists and a scratch dir readable to the lab user.
 U=${LAB_USER:?}

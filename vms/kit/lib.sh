@@ -125,6 +125,27 @@ web_target() {
 # rand_flag — a fresh unguessable flag token, e.g. KL{deadbeef...}
 rand_flag() { echo "KL{$(head -c16 /dev/urandom | od -An -tx1 | tr -d ' \n')}"; }
 
+# root_flag — plant a fresh flag in /root/flag.txt (root-only), store it as the
+# expected answer, schedule its removal on the next reset, and echo it. For
+# privilege-escalation tasks: the learner must become root to read it.
+root_flag() {
+  local f; f=$(rand_flag)
+  echo "$f" > /root/flag.txt; chmod 600 /root/flag.txt; chown root:root /root/flag.txt
+  echo "$f" > "$KL_STATE/answer"
+  on_reset 'rm -f /root/flag.txt'
+  echo "$f"
+}
+
+# check_flag [FILE] — pass when FILE (default /lab/flag.txt) holds the stored
+# answer (a KL{...} token if present, otherwise the file's trimmed contents).
+check_flag() {
+  local file=${1:-/lab/flag.txt} want got
+  want=$(cat "$KL_STATE/answer" 2>/dev/null)
+  got=$(grep -oE 'KL\{[0-9a-f]+\}' "$file" 2>/dev/null | head -1)
+  [ -z "$got" ] && got=$(tr -d ' \t\r\n' < "$file" 2>/dev/null)
+  check_eq "flag captured in $file" "$got" "$want"
+}
+
 # ---------- kubernetes helpers ----------
 k() { kubectl "$@"; }
 # kj RESOURCE... JSONPATH — e.g. kj -n web deploy api '{.spec.replicas}'

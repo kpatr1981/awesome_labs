@@ -12,6 +12,12 @@ docker ps -aq 2>/dev/null | xargs -r docker rm -f >/dev/null 2>&1
 docker network ls --format '{{.Name}}' | grep -vxE 'bridge|host|none' | xargs -r docker network rm >/dev/null 2>&1
 docker volume ls -q | xargs -r docker volume rm -f >/dev/null 2>&1
 
+# Remove any exercise-planted cron jobs up front and kill whatever they spawned,
+# so a scheduled-task exercise can't keep firing between resets (state.sh also
+# restores /etc/cron.d, but do it defensively before anything else runs).
+rm -f /etc/cron.d/kl-* 2>/dev/null
+pkill -f '/srv/kl/' >/dev/null 2>&1 || true
+
 # Cleanup hooks (e.g. remove a planted SUID binary, kill a background listener).
 /opt/kubelab/hooks.sh
 
