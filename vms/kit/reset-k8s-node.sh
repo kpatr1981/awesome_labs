@@ -13,4 +13,10 @@ ctr -n default containers ls -q 2>/dev/null | xargs -r ctr -n default containers
 missing=$(for i in $(grep -v '^#' /opt/kubelab/images.txt | awk '$2 ~ /k/ {print $1}'); do crictl inspecti "$i" >/dev/null 2>&1 || echo "$i"; done)
 [ -n "$missing" ] && (for i in $missing; do crictl pull "$i" >/dev/null 2>&1; done) &
 rm -rf /lab && mkdir -p /lab && chown "$(lab_user)": /lab
+# lab VMs get new host keys when re-created/re-joined: never let a stale known_hosts block `ssh node01`
+h=$(getent passwd "$(lab_user)" | cut -d: -f6)
+if [ -n "$h" ] && [ -d "$h/.ssh" ]; then
+  printf 'Host node01 controlplane\n  StrictHostKeyChecking no\n  UserKnownHostsFile /dev/null\n  LogLevel ERROR\n' >"$h/.ssh/config"
+  chown "$(lab_user)": "$h/.ssh/config"
+fi
 echo "node $(hostname) reset"
