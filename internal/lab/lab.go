@@ -413,7 +413,7 @@ func (m *Manager) bootstrapK8s(ctx context.Context, env Env, log io.Writer) erro
 	// ssh from controlplane to node01 as the lab user
 	pub, err := m.root(ctx, cp, fmt.Sprintf(`H=$(getent passwd %[1]s | cut -d: -f6)
 sudo -u %[1]s bash -c 'test -f ~/.ssh/id_ed25519 || ssh-keygen -q -t ed25519 -N "" -f ~/.ssh/id_ed25519'
-printf 'Host node01 controlplane\n  StrictHostKeyChecking accept-new\n' > "$H/.ssh/config"; chown %[1]s: "$H/.ssh/config"
+printf 'Host node01 controlplane\n  StrictHostKeyChecking no\n  UserKnownHostsFile /dev/null\n  LogLevel ERROR\n' > "$H/.ssh/config"; chown %[1]s: "$H/.ssh/config"
 cat "$H/.ssh/id_ed25519.pub"`, m.User), nil, m.detail(log))
 	if err != nil {
 		return err
