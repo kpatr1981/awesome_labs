@@ -1,4 +1,4 @@
-module kubelab
+module awesome_labs
 
 go 1.27.2
 

@@ -34,7 +34,7 @@ control plane, `KUBECONFIG` is `/etc/kubernetes/admin.conf`; the lab user has it
 1. `setup` runs on a **freshly reset** environment. Make it deterministic; if you
    randomise answers, store the expected value in `$KL_STATE/answer`.
 2. `check` must **fail** right after setup and **pass** after `solve`. Run
-   `kubelab verify <id>` to prove it.
+   `awesome_labs verify <id>` to prove it.
 3. Checks must be **quick to fail**: use `wait_pod`, `wait_pods`, `wait_deploy`
    (they give up early when pods are clearly stuck), and guard long `eventually`
    loops with a precondition.

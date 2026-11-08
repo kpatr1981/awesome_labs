@@ -8,9 +8,9 @@ import (
 	"github.com/charmbracelet/glamour"
 	"github.com/charmbracelet/lipgloss"
 
-	"kubelab/internal/exam"
-	"kubelab/internal/exercise"
-	"kubelab/internal/lab"
+	"awesome_labs/internal/exam"
+	"awesome_labs/internal/exercise"
+	"awesome_labs/internal/lab"
 )
 
 var (
@@ -104,7 +104,7 @@ func (m *model) header() string {
 		ids = append(ids, e.ID)
 	}
 	solved, started := m.prog.Counts(ids)
-	left := sTitle.Render(" kubelab ") + sMuted.Render("Docker & Kubernetes labs")
+	left := sTitle.Render(" awesome_labs ") + sMuted.Render("Docker & Kubernetes labs")
 	if m.exam != nil {
 		left += "   " + sBigOKInline(m.exam)
 	}

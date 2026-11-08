@@ -1,15 +1,15 @@
-# kubelab
+# awesome_labs
 
 **Hands-on Docker, Kubernetes & offensive-security exercises on your own machine** —
 real VMs, real breakage, automatic grading.
 
-kubelab creates [Lima](https://lima-vm.io) virtual machines, puts each exercise's
+awesome_labs creates [Lima](https://lima-vm.io) virtual machines, puts each exercise's
 scenario in place (a broken deployment, a crashed daemon, a half-finished compose
 project…), drops you into a shell, and checks your work when you're done. Every
 exercise has a scenario, progressive hints and a full solution you can reveal.
 
 ```text
- kubelab Docker & Kubernetes labs                                ✔ 37/500 solved  ● 2 in progress
+ awesome_labs Docker & Kubernetes labs                                ✔ 37/500 solved  ● 2 in progress
  All  Docker  Kubernetes
 ╭──────────────────────────────────────────────╮╭───────────────────────────────────────────────╮
 │▸ Kubernetes · Troubleshooting the cluster     ││k8s-245 — The API server is gone               │
@@ -53,19 +53,19 @@ The cluster deliberately runs one minor release behind the newest Kubernetes, so
 upgrade exercise has something to upgrade to.
 
 VMs are created **on first use** (5–15 minutes, mostly package installs and image
-pulls) and reused afterwards. Before every exercise kubelab **resets** the environment
+pulls) and reused afterwards. Before every exercise awesome_labs **resets** the environment
 to a pristine snapshot: it removes leftover containers, namespaces and cluster-scoped
 objects, restores changed config files (daemon.json, kubelet config, static pod
 manifests, …) and restarts what needs restarting — usually in a few seconds.
 
 Two exercises (the cluster upgrade and encryption-at-rest) change the cluster in ways a
-reset can't undo; kubelab rebuilds the cluster before your next Kubernetes exercise.
+reset can't undo; awesome_labs rebuilds the cluster before your next Kubernetes exercise.
 
 ## Requirements
 
 - macOS (Apple Silicon or Intel) or Linux with [Lima](https://lima-vm.io) ≥ 2.0
   (`brew install lima`)
-  - On Linux, kubelab runs QEMU through a small generated wrapper in `~/.kubelab/qemu`
+  - On Linux, awesome_labs runs QEMU through a small generated wrapper in `~/.awesome_labs/qemu`
     to avoid a [QEMU crash on Lima's `user-v2` network](https://github.com/lima-vm/lima/issues/5722).
     Starting the `kl-cp` or `kl-worker` VMs with `limactl` directly skips it.
 - Go ≥ 1.24 to build
@@ -75,8 +75,8 @@ reset can't undo; kubelab rebuilds the cluster before your next Kubernetes exerc
 ## Build & run
 
 ```bash
-make build          # or: go build -o kubelab .
-./kubelab           # interactive browser
+make build          # or: go build -o awesome_labs .
+./awesome_labs           # interactive browser
 ```
 
 ### In the browser
@@ -129,44 +129,44 @@ difficulty or id).
 ### Exam mode
 
 Press `X`, pick a pool (a whole track or any path), the number of questions, a time
-limit and whether hints are allowed. kubelab draws a balanced random set: about a
+limit and whether hints are allowed. awesome_labs draws a balanced random set: about a
 third easy, a third medium, a third hard. A countdown runs in the header, hints and
 solutions are locked, and **the last check of each question counts**. When you finish
 (`F`) or time runs out you get your score against a **66 % pass mark**, and solutions
-unlock. Exams are kept in `~/.kubelab/exam-history.json`.
+unlock. Exams are kept in `~/.awesome_labs/exam-history.json`.
 
 ```bash
-kubelab exam status     # the running exam
-kubelab exam history    # past results
+awesome_labs exam status     # the running exam
+awesome_labs exam history    # past results
 ```
 
 ### Saving memory
 
 Only one environment needs to run at a time. With `auto_stop: true` (the default),
 starting a Docker exercise stops the Kubernetes VMs and vice versa; `Q` in the browser
-quits and stops everything. Settings live in `~/.kubelab/config.yaml`:
+quits and stops everything. Settings live in `~/.awesome_labs/config.yaml`:
 
 ```yaml
 auto_stop: true
 docker:       {cpus: 2, memory: 3GiB}       # applied when a VM is (re)created:
-controlplane: {cpus: 2, memory: 3GiB}       #   kubelab env rebuild docker|k8s
+controlplane: {cpus: 2, memory: 3GiB}       #   awesome_labs env rebuild docker|k8s
 worker:       {cpus: 2, memory: 2560MiB}
 ```
 
 ### Command line
 
 ```bash
-kubelab list [filter]              # list exercises (✔ solved, ● started)
-kubelab paths [path-id]            # learning paths and progress
-kubelab show k8s-101 [--solution]
-kubelab start docker-042           # prepare the lab
-kubelab shell docker|k8s|node01    # open a shell
-kubelab check docker-042           # grade (exit code 0 = solved)
-kubelab forget docker-042          # erase progress on one exercise
-kubelab env status|up|stop|reset|rebuild|destroy [docker|k8s]
+awesome_labs list [filter]              # list exercises (✔ solved, ● started)
+awesome_labs paths [path-id]            # learning paths and progress
+awesome_labs show k8s-101 [--solution]
+awesome_labs start docker-042           # prepare the lab
+awesome_labs shell docker|k8s|node01    # open a shell
+awesome_labs check docker-042           # grade (exit code 0 = solved)
+awesome_labs forget docker-042          # erase progress on one exercise
+awesome_labs env status|up|stop|reset|rebuild|destroy [docker|k8s]
 ```
 
-Progress is stored in `~/.kubelab/progress.json`, logs in `~/.kubelab/logs/`.
+Progress is stored in `~/.awesome_labs/progress.json`, logs in `~/.awesome_labs/logs/`.
 
 ## Writing exercises
 
@@ -175,13 +175,13 @@ binary at build time. See **[docs/AUTHORING.md](docs/AUTHORING.md)**. Every exer
 ships with a `solve` script, and
 
 ```bash
-kubelab verify [id-prefix ...]
+awesome_labs verify [id-prefix ...]
 ```
 
 runs each one end to end — *reset → setup → check must fail → solve → check must
 pass* — which is how the whole catalogue is tested. Each exercise gets 25 minutes (50 for the
 destructive ones), and while a verify run is going its environment is marked busy, so
-auto-stop or `Q` in another kubelab leaves it alone. Set `KUBELAB_EXERCISES=./exercises`
+auto-stop or `Q` in another awesome_labs leaves it alone. Set `AWESOME_LABS_EXERCISES=./exercises`
 to work on exercise files without rebuilding.
 
 ## Project layout
@@ -192,9 +192,9 @@ internal/exercise          exercise model + loader/validator
 internal/lab               environments: create/bootstrap/reset VMs, run setup/check/solve
 internal/lima              thin limactl wrapper
 internal/tui               Bubble Tea interface
-internal/progress          ~/.kubelab/progress.json
+internal/progress          ~/.awesome_labs/progress.json
 internal/exam              timed exams
-internal/config            ~/.kubelab/config.yaml
+internal/config            ~/.awesome_labs/config.yaml
 learning-paths.yaml        curated paths
 vms/*.yaml                 Lima templates
 vms/bootstrap/             one-time provisioning (kubeadm init, add-ons, image pre-pulls)

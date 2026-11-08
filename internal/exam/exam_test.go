@@ -6,7 +6,7 @@ import (
 	"testing"
 	"time"
 
-	"kubelab/internal/exercise"
+	"awesome_labs/internal/exercise"
 )
 
 func pool(n int, prof exercise.Profile) []*exercise.Exercise {

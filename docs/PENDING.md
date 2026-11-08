@@ -27,7 +27,7 @@ this list that the existing exercises don't cover are not started.
 - [Security](#security)
 - [Programming](#programming)
 - [Practice modes](#practice-modes)
-- [kubelab features](#kubelab-features)
+- [awesome_labs features](#awesome_labs-features)
 - [Left out for now](#left-out-for-now)
 
 ## Suggested order
@@ -67,7 +67,7 @@ For Networking, Degraded networks, VPN creation and DNS & email.
 - **Docker resolver:** containers use Docker's built-in resolver by default, so point each
   one at the lab's own resolver.
 - **Lockout risk:** a bad route, a full tunnel or netem on a VM's main interface can cut
-  the SSH connection kubelab depends on. Keep labs inside containers or namespaces. Netem
+  the SSH connection awesome_labs depends on. Keep labs inside containers or namespaces. Netem
   rules on k8s nodes should target only cluster traffic, or remove themselves after a
   timeout.
 - **Permissions:** containers changing their own networking need `NET_ADMIN`, and OpenVPN
@@ -116,7 +116,7 @@ Rescue is the most valuable module: it breaks a throwaway guest and not the lab 
 - **Memory:** lab VMs have 3GiB, so use tiny guests (CirrOS or Alpine, 128–256MB). Two or
   three fit comfortably.
 - **Checks:** script them with `qemu-img info`, QMP, `virsh` or SSH into the guest. Guest
-  boot time will make `kubelab verify` slower.
+  boot time will make `awesome_labs verify` slower.
 - **macOS:** expect no KVM inside the VMs, so guests fall back to much slower software
   emulation. Timing-sensitive exercises may not work there.
 
@@ -245,7 +245,7 @@ Moto only emulates the API, so these limits apply:
 - EC2 instances are only records: no SSH, and security groups don't block anything.
   Networking labs won't work.
 - IAM isn't enforced by default.
-- Service coverage varies, so prove each exercise with `kubelab verify`.
+- Service coverage varies, so prove each exercise with `awesome_labs verify`.
 
 ## Data
 
@@ -320,12 +320,12 @@ New ways to use exercises, most of them reusing existing content.
 - **Command golf:** records the shell session and compares the number of commands with the
   reference solution.
 
-## kubelab features
+## awesome_labs features
 
 - **Weak spots:** shows which modules cost the most hints, checks and solution views. The
   data is already recorded.
 - **Exercise packs:** install extra exercises from a Git repo, building on the existing
-  `KUBELAB_EXERCISES` setting.
+  `AWESOME_LABS_EXERCISES` setting.
 
 ## Left out for now
 

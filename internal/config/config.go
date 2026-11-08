@@ -1,4 +1,4 @@
-// Package config loads ~/.kubelab/config.yaml.
+// Package config loads ~/.awesome_labs/config.yaml.
 package config
 
 import (
@@ -30,14 +30,14 @@ type Config struct {
 // AutoStopEnabled returns the effective auto_stop setting.
 func (c Config) AutoStopEnabled() bool { return c.AutoStop == nil || *c.AutoStop }
 
-const template = `# kubelab configuration
+const template = `# awesome_labs configuration
 #
 # Stop the other lab environment when you start an exercise, so that only one
 # of them (Docker host or Kubernetes cluster) uses memory at a time.
 auto_stop: true
 
 # VM sizes. Changes apply when a VM is created: run
-#   kubelab env rebuild docker|k8s
+#   awesome_labs env rebuild docker|k8s
 # afterwards. Defaults shown; the Kubernetes nodes need at least 2 CPUs / 2GiB.
 # docker:       {cpus: 2, memory: 3GiB}
 # controlplane: {cpus: 2, memory: 3GiB}

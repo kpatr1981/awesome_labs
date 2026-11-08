@@ -19,8 +19,8 @@ import (
 	"syscall"
 	"time"
 
-	"kubelab/internal/exercise"
-	"kubelab/internal/lima"
+	"awesome_labs/internal/exercise"
+	"awesome_labs/internal/lima"
 )
 
 // Pinned versions. The cluster runs one minor behind the latest stable
@@ -103,22 +103,31 @@ type Manager struct {
 	// AutoStop stops the other environment before an exercise starts.
 	AutoStop bool
 	// HoldEnvs marks every environment this process starts as busy, so that
-	// another kubelab's auto-stop leaves it alone (used by verify).
+	// another awesome_labs's auto-stop leaves it alone (used by verify).
 	HoldEnvs bool
 	logFile  io.Writer
 	mu       sync.Mutex
 }
 
 // LogPath is where verbose output of every operation is appended.
-func (m *Manager) LogPath() string { return filepath.Join(m.StateDir, "logs", "kubelab.log") }
+func (m *Manager) LogPath() string { return filepath.Join(m.StateDir, "logs", "awesome_labs.log") }
 
-// NewManager prepares ~/.kubelab.
+// NewManager prepares ~/.awesome_labs.
 func NewManager(assets fs.FS) (*Manager, error) {
 	home, err := os.UserHomeDir()
 	if err != nil {
 		return nil, err
 	}
-	dir := filepath.Join(home, ".kubelab")
+	dir := filepath.Join(home, ".awesome_labs")
+	// The project used to be called kubelab: keep existing progress and settings.
+	old := filepath.Join(home, ".kubelab")
+	if _, err := os.Stat(dir); os.IsNotExist(err) {
+		if _, err := os.Stat(old); err == nil {
+			if err := os.Rename(old, dir); err != nil {
+				return nil, err
+			}
+		}
+	}
 	if err := os.MkdirAll(filepath.Join(dir, "logs"), 0o755); err != nil {
 		return nil, err
 	}
@@ -555,7 +564,7 @@ func (m *Manager) stopOthers(ctx context.Context, keep Env, log io.Writer) {
 			continue
 		}
 		if m.busy(env) {
-			fmt.Fprintf(log, "==> leaving %s running: a kubelab verify run is using it\n", env.Title)
+			fmt.Fprintf(log, "==> leaving %s running: a awesome_labs verify run is using it\n", env.Title)
 			continue
 		}
 		for _, vm := range env.VMs {
@@ -585,7 +594,7 @@ func (m *Manager) Release() {
 	}
 }
 
-// busy reports whether another live kubelab process holds env.
+// busy reports whether another live awesome_labs process holds env.
 func (m *Manager) busy(env Env) bool {
 	b, err := os.ReadFile(m.lockPath(env))
 	if err != nil {
@@ -602,7 +611,7 @@ func (m *Manager) busy(env Env) bool {
 func (m *Manager) StopAll(ctx context.Context, log io.Writer) error {
 	for _, env := range AllEnvs() {
 		if m.busy(env) {
-			fmt.Fprintf(log, "==> leaving %s running: a kubelab verify run is using it\n", env.Title)
+			fmt.Fprintf(log, "==> leaving %s running: a awesome_labs verify run is using it\n", env.Title)
 			continue
 		}
 		if err := m.Stop(ctx, env, log); err != nil {
@@ -707,7 +716,7 @@ func (m *Manager) Start(ctx context.Context, ex *exercise.Exercise, log io.Write
 		m.SetTainted(env, true)
 	}
 	task := fmt.Sprintf("# %s — %s\n\n%s\n", ex.ID, ex.Title, strings.TrimSpace(ex.Scenario))
-	_, _ = m.root(ctx, env.Primary(), fmt.Sprintf("echo %s > /var/lib/kubelab/current\nsource /opt/kubelab/lib.sh\nlab_file /lab/TASK.md <<'KUBELAB_TASK_EOF'\n%s\nKUBELAB_TASK_EOF", ex.ID, task), nil, io.Discard)
+	_, _ = m.root(ctx, env.Primary(), fmt.Sprintf("echo %s > /var/lib/kubelab/current\nsource /opt/kubelab/lib.sh\nlab_file /lab/TASK.md <<'AWESOME_LABS_TASK_EOF'\n%s\nAWESOME_LABS_TASK_EOF", ex.ID, task), nil, io.Discard)
 	fmt.Fprintf(log, "==> ready: open a terminal and solve the task\n")
 	return nil
 }
@@ -741,7 +750,7 @@ func (m *Manager) Check(ctx context.Context, ex *exercise.Exercise, log io.Write
 	return ok, nil
 }
 
-// Solve applies the reference solution (used by `kubelab verify`).
+// Solve applies the reference solution (used by `awesome_labs verify`).
 func (m *Manager) Solve(ctx context.Context, ex *exercise.Exercise, log io.Writer) error {
 	m.mu.Lock()
 	defer m.mu.Unlock()

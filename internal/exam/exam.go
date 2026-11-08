@@ -12,7 +12,7 @@ import (
 	"sort"
 	"time"
 
-	"kubelab/internal/exercise"
+	"awesome_labs/internal/exercise"
 )
 
 // PassMark is the share of questions needed to pass (like the CKA's 66%).
@@ -186,10 +186,10 @@ func (e *Exam) TimeUsed() time.Duration {
 
 // ---- persistence ----
 
-// Store keeps the current exam and the history under ~/.kubelab.
+// Store keeps the current exam and the history under ~/.awesome_labs.
 type Store struct{ dir string }
 
-// NewStore uses dir (usually ~/.kubelab).
+// NewStore uses dir (usually ~/.awesome_labs).
 func NewStore(dir string) *Store { return &Store{dir: dir} }
 
 func (s *Store) current() string { return filepath.Join(s.dir, "exam.json") }

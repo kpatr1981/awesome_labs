@@ -1,4 +1,4 @@
-// kubelab — hands-on Docker & Kubernetes exercises on local Lima VMs.
+// awesome_labs — hands-on Docker & Kubernetes exercises on local Lima VMs.
 package main
 
 import (
@@ -15,37 +15,37 @@ import (
 	"strings"
 	"time"
 
-	"kubelab/internal/config"
-	"kubelab/internal/exam"
-	"kubelab/internal/exercise"
-	"kubelab/internal/lab"
-	"kubelab/internal/progress"
-	"kubelab/internal/tui"
+	"awesome_labs/internal/config"
+	"awesome_labs/internal/exam"
+	"awesome_labs/internal/exercise"
+	"awesome_labs/internal/lab"
+	"awesome_labs/internal/progress"
+	"awesome_labs/internal/tui"
 )
 
 //go:embed all:vms all:exercises learning-paths.yaml
 var assets embed.FS
 
 func usage() {
-	fmt.Fprint(os.Stderr, `kubelab — Docker & Kubernetes exercises on Lima VMs
+	fmt.Fprint(os.Stderr, `awesome_labs — Docker & Kubernetes exercises on Lima VMs
 
 usage:
-  kubelab                         open the interactive exercise browser
-  kubelab list [filter]           list exercises
-  kubelab paths [path-id]         learning paths and your progress
-  kubelab exam [status|history|abandon]  timed exams (start one from the UI with X)
-  kubelab show <id>               print scenario (add --solution for the solution)
-  kubelab start <id>              prepare the lab for an exercise
-  kubelab check <id>              check your work
-  kubelab forget <id>             erase your progress on an exercise
-  kubelab shell [docker|k8s|node01|offsec]  open a shell in a lab VM
-  kubelab env status|up|stop|destroy|rebuild|reset [docker|k8s|offsec]
-  kubelab verify [-from id] [ids or prefixes...]
+  awesome_labs                         open the interactive exercise browser
+  awesome_labs list [filter]           list exercises
+  awesome_labs paths [path-id]         learning paths and your progress
+  awesome_labs exam [status|history|abandon]  timed exams (start one from the UI with X)
+  awesome_labs show <id>               print scenario (add --solution for the solution)
+  awesome_labs start <id>              prepare the lab for an exercise
+  awesome_labs check <id>              check your work
+  awesome_labs forget <id>             erase your progress on an exercise
+  awesome_labs shell [docker|k8s|node01|offsec]  open a shell in a lab VM
+  awesome_labs env status|up|stop|destroy|rebuild|reset [docker|k8s|offsec]
+  awesome_labs verify [-from id] [ids or prefixes...]
                                   author tool: setup -> check fails -> solve -> check passes
-  kubelab lint                    validate all exercise files
+  awesome_labs lint                    validate all exercise files
 
 environment:
-  KUBELAB_EXERCISES=dir           load exercises from disk instead of the built-in set
+  AWESOME_LABS_EXERCISES=dir           load exercises from disk instead of the built-in set
 `)
 }
 
@@ -57,7 +57,7 @@ func main() {
 }
 
 func exercisesFS() (fs.FS, string) {
-	if dir := os.Getenv("KUBELAB_EXERCISES"); dir != "" {
+	if dir := os.Getenv("AWESOME_LABS_EXERCISES"); dir != "" {
 		return os.DirFS(dir), "."
 	}
 	return assets, "exercises"
@@ -86,7 +86,7 @@ func run(args []string) error {
 		[2]string{itoa(cfg.Worker.CPUs), cfg.Worker.Memory},
 		[2]string{itoa(cfg.Offsec.CPUs), cfg.Offsec.Memory})
 	pfs, pfile := fs.FS(assets), "learning-paths.yaml"
-	if f := os.Getenv("KUBELAB_PATHS"); f != "" {
+	if f := os.Getenv("AWESOME_LABS_PATHS"); f != "" {
 		pfs, pfile = os.DirFS(filepath.Dir(f)), filepath.Base(f)
 	}
 	paths, err := exercise.LoadPaths(pfs, pfile, cat)
@@ -159,7 +159,7 @@ func run(args []string) error {
 			return err
 		}
 		prog.MarkStarted(ex.ID)
-		fmt.Printf("\n%s\n\nOpen a shell with: kubelab shell %s\n", ex.Scenario, ex.Profile)
+		fmt.Printf("\n%s\n\nOpen a shell with: awesome_labs shell %s\n", ex.Scenario, ex.Profile)
 	case "check":
 		ex, err := get()
 		if err != nil {
@@ -241,7 +241,7 @@ func envCmd(ctx context.Context, mgr *lab.Manager, args []string) error {
 			return fmt.Errorf("unknown environment %q (docker|k8s|offsec)", args[1])
 		}
 	}
-	mgr.Verbose = os.Getenv("KUBELAB_VERBOSE") != ""
+	mgr.Verbose = os.Getenv("AWESOME_LABS_VERBOSE") != ""
 	for _, env := range envs {
 		var err error
 		switch args[0] {

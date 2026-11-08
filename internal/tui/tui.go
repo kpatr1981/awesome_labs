@@ -15,10 +15,10 @@ import (
 	tea "github.com/charmbracelet/bubbletea"
 	"github.com/charmbracelet/lipgloss"
 
-	"kubelab/internal/exam"
-	"kubelab/internal/exercise"
-	"kubelab/internal/lab"
-	"kubelab/internal/progress"
+	"awesome_labs/internal/exam"
+	"awesome_labs/internal/exercise"
+	"awesome_labs/internal/lab"
+	"awesome_labs/internal/progress"
 )
 
 type screen int

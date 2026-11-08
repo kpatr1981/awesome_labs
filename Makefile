@@ -1,4 +1,4 @@
-BIN := kubelab
+BIN := awesome_labs
 
 .PHONY: build lint install clean
 build:
