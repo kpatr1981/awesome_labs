@@ -11,7 +11,7 @@ have a short tutorial on the concepts and commands to read first.
 
 ```text
  awesome_labs hands-on labs                                           ✔ 37/645 solved  ● 2 in progress
- All  Docker  Kubernetes  Offensive Sec  Linux  Networking  Cloud  Data  Defensive Sec  Programming
+ All  Docker  Kubernetes  Offensive Sec  Linux  Networking  Cloud  Data  Defensive Sec  Programming  Data Science
 ╭──────────────────────────────────────────────╮╭───────────────────────────────────────────────╮
 │▸ Kubernetes · Troubleshooting the cluster     ││k8s-245 — The API server is gone               │
 │ ✔ k8s-241   ●●○○○ fix   node01 is NotReady    ││●●●○○ Medium · Fix something · Kubernetes      │
@@ -55,7 +55,7 @@ techniques on systems you own or are explicitly authorized to test.
 
 | Environment | VMs | What's inside |
 |-------------|-----|---------------|
-| **Docker host** | `kl-docker` (2 CPU, 3 GiB) | Ubuntu 24.04, Docker Engine + Compose + Buildx, common images pre-pulled |
+| **Docker host** | `kl-docker` (2 CPU, 3 GiB) | Ubuntu 24.04, Docker Engine + Compose + Buildx, common images pre-pulled, networking and diagnostic tools, a Python data-science image |
 | **Kubernetes cluster** | `kl-cp` → `controlplane` (2 CPU, 3 GiB)<br>`kl-worker` → `node01` (2 CPU, 2.5 GiB) | kubeadm **v1.36**, containerd 2, Calico (enforces NetworkPolicies), metrics-server, local-path storage (default StorageClass), Traefik ingress + Gateway API (NodePorts 30080/30443), Helm |
 | **Offensive security lab** | `kl-offsec` (2 CPU, 3 GiB) | Ubuntu 24.04, Docker (hosts the vulnerable targets), attacker tooling (nmap, ncat, hydra, john, …) and wordlists under `/usr/share/kl`. Attacker and targets are the same isolated box |
 
@@ -73,7 +73,9 @@ reset can't undo; awesome_labs rebuilds the cluster before your next Kubernetes 
 
 ## Requirements
 
-Tested on Fedora 45 (x86_64) on a machine with 16 GB of RAM.
+The labs are tested on Fedora 45 (x86_64) on a machine with 16 GB of RAM. The installer is
+tested on Ubuntu 24.04, Fedora 45 and Arch Linux. macOS is supported but hasn't been tested
+yet.
 
 `awesome_labs install` detects macOS or Linux and sets up what's missing: Lima (Homebrew
 on macOS when available, otherwise the official release, checksum-verified, into
@@ -82,11 +84,11 @@ their package manager, which asks for sudo), and the binary itself in `~/.local/
 shows the plan.
 
 - macOS (Apple Silicon or Intel) or Linux with [Lima](https://lima-vm.io) ≥ 2.0
-  (`brew install lima`)
+  (`awesome_labs install` sets this up)
   - On Linux, awesome_labs runs QEMU through a small generated wrapper in `~/.awesome_labs/qemu`
     to avoid a [QEMU crash on Lima's `user-v2` network](https://github.com/lima-vm/lima/issues/5722).
     Starting the `kl-cp` or `kl-worker` VMs with `limactl` directly skips it.
-- Go ≥ 1.24 to build
+- Go ≥ 1.27 to build
 - ~6 GiB of free RAM (one environment at a time; ~9 GiB with both), ~40 GiB of disk
 - Internet access (packages and images are downloaded on first start)
 
@@ -177,6 +179,7 @@ worker:       {cpus: 2, memory: 2560MiB}
 ### Command line
 
 ```bash
+awesome_labs install [--dry-run] [--yes] [--bin-dir DIR]   # set up Lima, QEMU and the binary
 awesome_labs list [filter]              # list exercises (✔ solved, ● started)
 awesome_labs paths [path-id]            # learning paths and progress
 awesome_labs show k8s-101 [--solution]
@@ -212,6 +215,7 @@ main.go                    CLI entry point, verify runner
 internal/exercise          exercise model + loader/validator
 internal/lab               environments: create/bootstrap/reset VMs, run setup/check/solve
 internal/lima              thin limactl wrapper
+internal/install           OS detection and the install command
 internal/tui               Bubble Tea interface
 internal/progress          ~/.awesome_labs/progress.json
 internal/exam              timed exams
