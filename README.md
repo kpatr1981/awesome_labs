@@ -97,6 +97,7 @@ make build          # or: go build -o kubelab .
 | `c` | **check** your work |
 | `h` | reveal the next **hint** |
 | `v` | reveal the **solution** (asks first) |
+| `R` | **reset progress** on this exercise (asks first) |
 | `1`–`4` / `tab` | Scenario · Hints · Solution · Output |
 | `n` / `N` | next / previous exercise |
 
@@ -155,6 +156,7 @@ kubelab show k8s-101 [--solution]
 kubelab start docker-042           # prepare the lab
 kubelab shell docker|k8s|node01    # open a shell
 kubelab check docker-042           # grade (exit code 0 = solved)
+kubelab forget docker-042          # erase progress on one exercise
 kubelab env status|up|stop|reset|rebuild|destroy [docker|k8s]
 ```
 

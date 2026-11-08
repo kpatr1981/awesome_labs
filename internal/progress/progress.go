@@ -29,6 +29,11 @@ func (e Entry) Mark() string {
 	return " "
 }
 
+// IsZero reports whether nothing is recorded in e.
+func (e Entry) IsZero() bool {
+	return e.Started.IsZero() && e.Solved.IsZero() && e.Checks == 0 && e.HintsUsed == 0 && !e.SawSolution
+}
+
 // Store is a JSON file of entries keyed by exercise id.
 type Store struct {
 	path string
@@ -63,6 +68,11 @@ func (s *Store) update(id string, f func(*Entry)) {
 	e := s.data[id]
 	f(&e)
 	s.data[id] = e
+	s.save()
+}
+
+// save writes the store to disk; the caller holds s.mu.
+func (s *Store) save() {
 	b, _ := json.MarshalIndent(s.data, "", "  ")
 	tmp := s.path + ".tmp"
 	if os.WriteFile(tmp, b, 0o644) == nil {
@@ -99,9 +109,12 @@ func (s *Store) SawSolution(id string) {
 	s.update(id, func(e *Entry) { e.SawSolution = true })
 }
 
-// Reset forgets id.
+// Reset forgets id: started, solved, checks, hints and solution views.
 func (s *Store) Reset(id string) {
-	s.update(id, func(e *Entry) { *e = Entry{} })
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	delete(s.data, id)
+	s.save()
 }
 
 // Counts returns (solved, started) totals over ids.

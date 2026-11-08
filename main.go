@@ -37,6 +37,7 @@ usage:
   kubelab show <id>               print scenario (add --solution for the solution)
   kubelab start <id>              prepare the lab for an exercise
   kubelab check <id>              check your work
+  kubelab forget <id>             erase your progress on an exercise
   kubelab shell [docker|k8s|node01|offsec]  open a shell in a lab VM
   kubelab env status|up|stop|destroy|rebuild|reset [docker|k8s|offsec]
   kubelab verify [-from id] [ids or prefixes...]
@@ -169,6 +170,17 @@ func run(args []string) error {
 		if !ok {
 			os.Exit(1)
 		}
+	case "forget":
+		ex, err := get()
+		if err != nil {
+			return err
+		}
+		if prog.Get(ex.ID).IsZero() {
+			fmt.Printf("no progress recorded for %s\n", ex.ID)
+			return nil
+		}
+		prog.Reset(ex.ID)
+		fmt.Printf("forgot progress on %s\n", ex.ID)
 	case "solve":
 		ex, err := get()
 		if err != nil {

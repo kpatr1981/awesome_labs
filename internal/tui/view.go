@@ -268,7 +268,7 @@ func (m *model) viewDetail() string {
 	if m.examLocked(e) {
 		help += " · c check · tab switch · n/N next/prev question · esc exam"
 	} else {
-		help += " · c check · h hint · v solution · tab switch · n/N next/prev · esc back"
+		help += " · c check · h hint · v solution · R reset progress · tab switch · n/N next/prev · esc back"
 	}
 	return lipgloss.JoinVertical(lipgloss.Left, title, strings.Join(tabs, ""), box, m.statusLine(help))
 }

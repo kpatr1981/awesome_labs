@@ -682,6 +682,9 @@ func (m *model) updateDetail(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 		return m, m.revealHint()
 	case "v":
 		return m, m.askSolution()
+	case "R":
+		m.askForget()
+		return m, nil
 	case "n", "N":
 		if m.fromExam && m.exam != nil {
 			d := 1
@@ -763,6 +766,34 @@ func (m *model) askSolution() tea.Cmd {
 		return nil
 	}
 	return nil
+}
+
+// askForget offers to erase the recorded progress of the open exercise.
+func (m *model) askForget() {
+	ex := m.cur
+	if m.op != "" {
+		m.flash = "busy: " + m.op
+		return
+	}
+	if m.exam != nil && !m.exam.Over() && m.exam.Has(ex.ID) {
+		m.flash = "progress can't be reset during an exam on this question"
+		return
+	}
+	if m.prog.Get(ex.ID).IsZero() && m.result[ex.ID] == "" {
+		m.flash = "no progress recorded for this exercise"
+		return
+	}
+	m.confirm = "Forget all progress on this exercise, including solved status? (y/n)"
+	m.onYes = func() tea.Cmd {
+		m.prog.Reset(ex.ID)
+		delete(m.result, ex.ID)
+		m.solShow, m.hintsShow = false, 0
+		m.tab = tabScenario
+		m.flash = "progress reset"
+		m.refreshViewport(false)
+		m.vp.GotoTop()
+		return nil
+	}
 }
 
 func (m *model) updateEnv(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
