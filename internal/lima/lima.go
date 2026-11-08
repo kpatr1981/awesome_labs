@@ -12,6 +12,7 @@ import (
 	"os"
 	"os/exec"
 	"strings"
+	"time"
 )
 
 // Binary is the limactl executable.
@@ -147,6 +148,7 @@ func Run(ctx context.Context, name string, s Script, out io.Writer) (int, error)
 		stdin = strings.NewReader(body)
 	}
 	cmd := exec.CommandContext(ctx, Binary, args...)
+	cmd.WaitDelay = 10 * time.Second // don't hang on inherited pipes after a cancel
 	cmd.Stdin = stdin
 	if out == nil {
 		out = io.Discard

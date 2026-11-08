@@ -284,9 +284,21 @@ func verify(ctx context.Context, cat *exercise.Catalog, mgr *lab.Manager, args [
 		t0 := time.Now()
 		fmt.Printf("%-10s %-50s ", ex.ID, trunc(ex.Title, 50))
 		fmt.Fprintf(logf, "\n\n######## %s %s\n", ex.ID, ex.Title)
-		res := verifyOne(ctx, mgr, ex, logf)
+		// a hung step (a wait without a timeout in some script) must not stall the whole run
+		limit := 25 * time.Minute
+		if ex.Destructive {
+			limit = 50 * time.Minute
+		}
+		exCtx, cancel := context.WithTimeout(ctx, limit)
+		res := verifyOne(exCtx, mgr, ex, logf)
+		timedOut := exCtx.Err() != nil
+		cancel()
 		if ctx.Err() != nil {
 			return ctx.Err()
+		}
+		if timedOut {
+			res = "timed out"
+			fmt.Fprintf(logf, "TIMED OUT after %s\n", limit)
 		}
 		fmt.Printf("%-28s %4.0fs\n", res, time.Since(t0).Seconds())
 		if res != "ok" {
