@@ -327,9 +327,17 @@ func (m *model) cmdStart() tea.Cmd {
 
 func (m *model) cmdCheck() tea.Cmd {
 	ex := m.cur
+	inExam := m.exam != nil
 	return m.startOp("check", "Checking "+ex.ID, ex.ID, func(ctx context.Context, w io.Writer) (bool, error) {
 		fmt.Fprintf(w, "Checking %s — %s\n\n", ex.ID, ex.Title)
-		return m.mgr.Check(ctx, ex, w)
+		passed, err := m.mgr.Check(ctx, ex, w)
+		// an exam moves on to its next task on the same VM, so only stop outside one
+		if err == nil && passed && !inExam {
+			if serr := m.mgr.StopAfterPass(ctx, ex, w); serr != nil {
+				fmt.Fprintf(w, "(could not stop the lab VM: %v)\n", serr)
+			}
+		}
+		return passed, err
 	})
 }
 

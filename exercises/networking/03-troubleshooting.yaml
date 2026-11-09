@@ -295,10 +295,13 @@ exercises:
   tutorial: |
     **Concept.** Source NAT rewrites the source of packets leaving a network, so a server that has no route to the private clients sees only the router's address. Replies come back to the router, which translates them for the right client using connection tracking.
 
+    NAT doesn't have to apply to everything. A rule can match on the source network, so that some clients are translated and others keep their real address, for example a monitoring host that the far side must be able to identify. Translating everyone is the easy mistake, and it still looks like it works.
+
     Masquerade can also remap the **source port** into a chosen range. The far end then never sees the client's real address or port, only the translated pair. This is why a server's log shows the NAT address rather than the real client, and why you must look at the right end of a connection when you want the truth about it: each side's sockets report what that side sees.
 
     **Read up on:**
     - `man nft` — the `nat` table type, the `postrouting` hook and the `masquerade` statement
+    - `ip saddr` matches in nftables — restricting a rule to a source network
     - `oifname` / `oif` matches — restricting a rule to the outgoing interface
     - `nft list ruleset` — confirm what is loaded
     - Why a server's log shows the NAT address instead of the real client
@@ -309,20 +312,22 @@ exercises:
   scenario: |
     Two routers doing source NAT: one you configure, and one you inspect.
 
-    ## Part 1: Hide the clients behind the router
+    ## Part 1: Hide one network, not the other
 
-    Client **`h1`** must reach a web server on **`h2`**, with router **`r1`** between them:
+    Router **`r1`** connects two client networks to a web server on **`h2`**:
 
     ```
     h1 (10.1.0.2) --- (10.1.0.1) r1 (10.2.0.1) --- (10.2.0.2) h2 :8080
+    h3 (10.3.0.2) --- (10.3.0.1) r1
     ```
 
-    h1 sends its traffic to r1, which forwards it. But **h2 has no route to the
-    10.1.0.0/24 network** and must not get one (no default route either), so
-    `curl http://10.2.0.2:8080/` from h1 gets no answer.
+    **h2 has no route to 10.1.0.0/24** and must not get one (no default route either), so
+    `curl http://10.2.0.2:8080/` from h1 gets no answer. h2 does have a route to
+    10.3.0.0/24, because `h3` is a monitoring host that the server must identify by its
+    real address.
 
-    Fix this on **r1** using **nftables**. The server prints the client address it sees,
-    and must report it as **10.2.0.1**.
+    Fix this on **r1** using **nftables**. The server prints the client address it sees.
+    From h1 it must report **10.2.0.1**, and from h3 it must still report **10.3.0.2**.
 
     ## Part 2: Which port does the server see?
 
@@ -338,22 +343,23 @@ exercises:
     into **`/lab/port.txt`**. It is not the port the laptop itself used.
   hints:
     - "Part 1: rewrite the source on the way out of r1 towards h2, not on the way in."
-    - "Part 1: a `nat` table, chain `type nat hook postrouting priority srcnat`, and a rule with `masquerade`."
+    - "Part 1: a `nat` table, chain `type nat hook postrouting priority srcnat`, and a `masquerade` rule that matches only one source network."
     - "Part 2: the server's own sockets show the peer it is talking to: `sudo ip netns exec backend ss -tn`."
     - "Part 2: look at the established connection whose local port is 9000; the peer's port is the translated one."
   solution: |
-    **Part 1.** Masquerade traffic as it leaves r1's outside interface:
+    **Part 1.** Masquerade only the network that needs it, as it leaves r1's outside interface:
 
     ```bash
     sudo ip netns exec r1 nft -f - <<'EOF'
     table ip nat {
       chain postrouting {
         type nat hook postrouting priority srcnat;
-        oifname "eth1" masquerade
+        oifname "eth1" ip saddr 10.1.0.0/24 masquerade
       }
     }
     EOF
     sudo ip netns exec h1 curl -s http://10.2.0.2:8080/
+    sudo ip netns exec h3 curl -s http://10.2.0.2:8080/
     ```
 
     **Part 2.** The server sees the post-NAT source address and port, so ask the server:
@@ -365,15 +371,20 @@ exercises:
       | grep -oE '10\.22\.0\.1:[0-9]+' | head -1 | cut -d: -f2 > /lab/port.txt
     ```
   setup: |
-    # --- part 1: Hide the clients behind the router ---
-    netns_new h1 r1 h2
+    # --- part 1: Hide one network, not the other ---
+    netns_new h1 r1 h2 h3
     netns_link h1 eth0 r1 eth0
     netns_link r1 eth1 h2 eth0
+    netns_link h3 eth0 r1 eth2
+    ip -n r1 addr add 10.3.0.1/24 dev eth2
+    ip -n h3 addr add 10.3.0.2/24 dev eth0
+    ip -n h3 route add default via 10.3.0.1
     ip -n h1 addr add 10.1.0.2/24 dev eth0
     ip -n r1 addr add 10.1.0.1/24 dev eth0
     ip -n r1 addr add 10.2.0.1/24 dev eth1
     ip -n h2 addr add 10.2.0.2/24 dev eth0
     ip -n h1 route add default via 10.1.0.1
+    ip -n h2 route add 10.3.0.0/24 via 10.2.0.1
     ip netns exec r1 sysctl -qw net.ipv4.ip_forward=1
     on_reset 'systemctl stop kl-nat 2>/dev/null; systemctl reset-failed kl-nat 2>/dev/null; rm -rf /srv/kl-nat'
     mkdir -p /srv/kl-nat
@@ -422,9 +433,10 @@ exercises:
     systemd-run --quiet --unit=kl-ct-cli ip netns exec laptop python3 -c 'import socket,time; s=socket.create_connection(("10.22.0.2",9000)); time.sleep(7200)'
     eventually 15 "ip netns exec backend ss -tnH state established 'sport = :9000' | grep -q 10.22.0.1"
   check: |
-    info "Part 1: Hide the clients behind the router"
+    info "Part 1: Hide one network, not the other"
     want=$(cat "$KL_STATE/answer.nat")
-    check_eq "h2 sees the router's address as the client" "$(ip netns exec h1 curl -fsS -m4 http://10.2.0.2:8080/ 2>/dev/null)" "$want from 10.2.0.1"
+    check_eq "h1 reaches h2 as the router's address" "$(ip netns exec h1 curl -fsS -m4 http://10.2.0.2:8080/ 2>/dev/null)" "$want from 10.2.0.1"
+    check_eq "h3 keeps its real address" "$(ip netns exec h3 curl -fsS -m4 http://10.2.0.2:8080/ 2>/dev/null)" "$want from 10.3.0.2"
     check_eq "h2 still has no route to 10.1.0.0/24" "$(ip -n h2 route | grep -c '^10\.1\.0\.')" 0
     check "h2 still has no default route" '[ -z "$(ip -n h2 route show default)" ]'
 
@@ -433,12 +445,12 @@ exercises:
     check "the server has the connection" '[ -n "$live" ]'
     check_eq "port.txt holds the translated source port" "$(tr -d '[:space:]' 2>/dev/null </lab/port.txt)" "$live"
   solve: |
-    # --- part 1: Hide the clients behind the router ---
+    # --- part 1: Hide one network, not the other ---
     sudo ip netns exec r1 nft -f - <<'EOF'
     table ip nat {
       chain postrouting {
         type nat hook postrouting priority srcnat;
-        oifname "eth1" masquerade
+        oifname "eth1" ip saddr 10.1.0.0/24 masquerade
       }
     }
     EOF

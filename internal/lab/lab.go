@@ -553,6 +553,21 @@ func (m *Manager) Stop(ctx context.Context, env Env, log io.Writer) error {
 	return nil
 }
 
+// StopAfterPass stops an exercise's environment once the exercise is solved, so a
+// finished lab doesn't keep using memory. It honours auto_stop and leaves alone an
+// environment that a verify run is using.
+func (m *Manager) StopAfterPass(ctx context.Context, ex *exercise.Exercise, log io.Writer) error {
+	if !m.AutoStop {
+		return nil
+	}
+	env := EnvFor(ex.Profile)
+	if m.busy(env) {
+		fmt.Fprintf(log, "==> leaving %s running: a awesome_labs verify run is using it\n", env.Title)
+		return nil
+	}
+	return m.Stop(ctx, env, log)
+}
+
 // stopOthers stops every running VM that belongs to another environment.
 func (m *Manager) stopOthers(ctx context.Context, keep Env, log io.Writer) {
 	all, err := lima.List(ctx)

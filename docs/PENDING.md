@@ -8,7 +8,7 @@ multi-step scenario and teach a concept, and a smaller catalog after merging thi
 is a good outcome. The parts of this list that the existing exercises don't cover are not
 started.
 
-Exercise counts as of v0.8.0:
+Exercise counts as of v0.9.0:
 
 | Topic | Exercises | Track | Module files |
 |---|---|---|---|
@@ -53,7 +53,7 @@ These apply to several tracks, so they're listed once here.
 
 | Check | Needed by | Status |
 |---|---|---|
-| `/dev/kvm` inside the lab VMs | QEMU | Works in `kl-docker`: a CirrOS guest boots under KVM in a container with 256MiB. A login prompt wasn't reached in 150s, because CirrOS was still retrying its metadata requests, so labs need an image that doesn't wait on those |
+| `/dev/kvm` inside the lab VMs | QEMU | Works in `kl-docker`: the 64MB Alpine virt 3.22 ISO reaches a login prompt on the serial console in 5s, under KVM in a container with 256MiB. Avoid CirrOS, which stalls on metadata requests |
 | containerlab on the 3GiB Docker VM | Networking and tracks built on it | Works: six FRR 9.1 routers in a ring deployed and linked with containerlab 0.59, using about 150MiB in total |
 | `sch_netem` kernel module | Degraded networks | Works in `kl-docker`, and `net-005` uses it |
 | WireGuard kernel support | VPN creation | Works in `kl-docker`, and `net-015` uses it |

@@ -179,6 +179,10 @@ func run(args []string) error {
 		if !ok {
 			os.Exit(1)
 		}
+		mgr.AutoStop = cfg.AutoStopEnabled()
+		if err := mgr.StopAfterPass(ctx, ex, os.Stdout); err != nil {
+			return err
+		}
 	case "forget":
 		ex, err := get()
 		if err != nil {
