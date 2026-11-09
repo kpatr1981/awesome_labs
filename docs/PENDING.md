@@ -53,11 +53,11 @@ These apply to several tracks, so they're listed once here.
 
 | Check | Needed by | Status |
 |---|---|---|
-| `/dev/kvm` inside the lab VMs | QEMU | Present in `kl-docker`; running a guest is still untested |
-| containerlab on the 3GiB Docker VM | Networking and tracks built on it | Not tried; FRR routers are small, so 6–8 should fit |
+| `/dev/kvm` inside the lab VMs | QEMU | Works in `kl-docker`: a CirrOS guest boots under KVM in a container with 256MiB. A login prompt wasn't reached in 150s, because CirrOS was still retrying its metadata requests, so labs need an image that doesn't wait on those |
+| containerlab on the 3GiB Docker VM | Networking and tracks built on it | Works: six FRR 9.1 routers in a ring deployed and linked with containerlab 0.59, using about 150MiB in total |
 | `sch_netem` kernel module | Degraded networks | Works in `kl-docker`, and `net-005` uses it |
 | WireGuard kernel support | VPN creation | Works in `kl-docker`, and `net-015` uses it |
-| Moto's optional IAM enforcement | AWS CLI | Not tested; needed before any permission-debugging exercises |
+| Moto's optional IAM enforcement | AWS CLI | Works in Moto 5.1.0 with `INITIAL_NO_AUTH_ACTION_COUNT`: a user's policy allowed one S3 call and the next was `AccessDenied`. Re-check on the Moto version the labs pin |
 
 ### Multi-network labs
 
