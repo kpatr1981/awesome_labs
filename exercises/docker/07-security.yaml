@@ -5,154 +5,118 @@ order: 7
 exercises:
 
 - id: docker-121
-  title: No privilege escalation
-  difficulty: 2
-  kind: build
-  tags: [security, no-new-privileges]
+  title: Lock down a container's privileges and resources
+  difficulty: 3
+  kind: fix
+  tags: [security, resources, no-new-privileges, pids-limit, ulimits, cpuset, update, oom]
   tutorial: |
-    **Concept.** Linux has a 'no_new_privs' flag that stops a process and its children from gaining privileges via setuid/setgid binaries. Docker exposes it as a security option at container start.
+    **Concept.** A container is a process under a set of kernel controls, and hardening it means setting those controls deliberately. Some are **cgroup limits** (memory, process count, CPU placement and weight); they can usually be changed on a running container with `docker update`. Others are **process attributes** fixed at creation (`no_new_privs`, per-process `ulimit`s such as the open-file limit); to change those you must recreate the container. Knowing which kind you are dealing with decides whether you update in place or recreate.
+
+    - `no_new_privs` stops a process and its children from gaining privileges through setuid/setgid binaries.
+    - The cgroup **pids** limit caps how many processes a container may create, which stops fork bombs from exhausting the host.
+    - The **nofile** ulimit caps open file descriptors per process; busy gateways run out with the default.
+    - **cpuset** restricts which cores a container may use, **cpu-shares** sets its relative weight when cores are contended.
+    - Memory and swap are separate settings that interact: with `--memory-swap` equal to `--memory` there is no swap.
 
     **Read up on:**
-    - `docker run --help` — find the `--security-opt` option
-    - Docker docs 'Security' and the kernel doc 'no_new_privs'
-    - `docker inspect` — `.HostConfig.SecurityOpt`
-    - `grep NoNewPrivs /proc/1/status` inside the container — verify the flag
+    - `docker run --help` and `docker update --help` — compare which flags exist in both and which only in `run`
+    - Docker docs 'Runtime options with Memory, CPUs, and GPUs' and 'Security'
+    - `docker inspect` — `.HostConfig.Memory`, `.PidsLimit`, `.CpusetCpus`, `.CPUShares`, `.Ulimits`, `.SecurityOpt`
+    - Inside a container: `cat /sys/fs/cgroup/pids.max`, `cat /sys/fs/cgroup/cpuset.cpus.effective`, `ulimit -n`, `grep NoNewPrivs /proc/1/status`
   scenario: |
-    Policy: no process inside a container may gain more privileges than it started with
-    (e.g. through setuid binaries).
+    Two containers need hardening.
 
-    Run **`portal`** (`nginx:1.28-alpine`, port **8130** → 80) with that protection.
+    **1. `search-index`** (already running, `--restart always`) keeps getting OOM-killed and
+    restarted: it needs about 150 MB but is limited to 100 MiB. Fix it **without recreating
+    the container** (it must keep its identity), and while you are at it limit it to:
+
+    - memory **256 MiB**, with the swap limit the same
+    - at most **100 processes**
+    - **CPU 0 only** (CPU 1 belongs to the latency-critical services), cpu-shares **256**
+
+    It must be up and have loaded its index afterwards.
+
+    **2. `ws-gateway`** does not exist yet. Run it from `nginx:1.28-alpine`, publishing
+    port **8130** → 80, so that:
+
+    - no process inside may gain privileges (e.g. through setuid binaries)
+    - the **nofile** limit is **65536** (soft and hard) - it serves tens of thousands of websockets
   hints:
-    - "`--security-opt no-new-privileges`"
+    - "`docker update` can change memory, memory-swap, pids-limit, cpuset-cpus and cpu-shares of a running container in one command. If `search-index` is in a restart back-off afterwards, `docker restart` it."
+    - "`no-new-privileges` and ulimits cannot be changed with `docker update` - `ws-gateway` is created fresh, so set them at `docker run` time."
+    - "`--security-opt no-new-privileges` and `--ulimit nofile=SOFT:HARD`. Verify with `docker exec ws-gateway sh -c 'ulimit -n'` and `grep NoNewPrivs /proc/1/status`."
   solution: |
     ```bash
-    docker run -d --name portal --security-opt no-new-privileges -p 8130:80 nginx:1.28-alpine
-    docker exec portal grep NoNewPrivs /proc/1/status   # NoNewPrivs: 1
+    docker inspect search-index -f '{{.State.OOMKilled}} {{.RestartCount}}'
+    docker update --memory 256m --memory-swap 256m --pids-limit 100 \
+      --cpuset-cpus 0 --cpu-shares 256 search-index
+    docker restart search-index
+    docker exec search-index cat /sys/fs/cgroup/pids.max             # 100
+    docker exec search-index cat /sys/fs/cgroup/cpuset.cpus.effective # 0
+
+    docker run -d --name ws-gateway --security-opt no-new-privileges \
+      --ulimit nofile=65536:65536 -p 8130:80 nginx:1.28-alpine
+    docker exec ws-gateway sh -c 'ulimit -n'                         # 65536
+    docker exec ws-gateway grep NoNewPrivs /proc/1/status            # 1
     ```
+  setup: |
+    docker run -d --name search-index --restart always --memory 100m --memory-swap 100m python:3.12-alpine python -c "import time; x = bytearray(150*1024*1024); print('index loaded', flush=True); time.sleep(36000)" >/dev/null
+    docker inspect -f '{{.Id}}' search-index > $KL_STATE/answer
+    sleep 3
   check: |
-    check "portal is running" 'c_running portal'
-    check "no-new-privileges is set" 'c_get portal "{{.HostConfig.SecurityOpt}}" | grep -q no-new-privileges'
-    check "NoNewPrivs is active in the process" 'docker exec portal grep -q "NoNewPrivs:.*1" /proc/1/status'
-    check "portal serves on 8130" 'http_get localhost:8130 | grep -q nginx'
-  solve: |
-    docker run -d --name portal --security-opt no-new-privileges -p 8130:80 nginx:1.28-alpine
-
-- id: docker-122
-  title: Fork bomb insurance
-  difficulty: 2
-  kind: build
-  tags: [resources, pids-limit]
-  tutorial: |
-    **Concept.** A cgroup can limit how many processes a container may create, which stops fork bombs from exhausting the host's process table.
-
-    **Read up on:**
-    - `docker run --help` — resource constraint flags, the one about process counts
-    - `docker inspect` — `.HostConfig.PidsLimit`
-    - `cat /sys/fs/cgroup/pids.max` inside the container — cgroup v2 value
-    - `man cgroups` — the pids controller
-  scenario: |
-    The **`sandbox`** container runs user-submitted scripts. A runaway script once
-    forked until the host fell over.
-
-    Run **`sandbox`** (`busybox:1.37`, `sleep infinity`) so that it can have at most
-    **100 processes**.
-  hints:
-    - "`--pids-limit`"
-  solution: |
-    ```bash
-    docker run -d --name sandbox --pids-limit 100 busybox:1.37 sleep infinity
-    ```
-  check: |
-    check "sandbox is running" 'c_running sandbox'
-    check_eq "PidsLimit" "$(c_get sandbox '{{.HostConfig.PidsLimit}}')" "100"
-    check_eq "pids.max inside the container" "$(docker exec sandbox cat /sys/fs/cgroup/pids.max 2>/dev/null)" "100"
-  solve: |
-    docker run -d --name sandbox --pids-limit 100 busybox:1.37 sleep infinity
-
-- id: docker-123
-  title: Too many open files
-  difficulty: 2
-  kind: build
-  tags: [ulimits]
-  tutorial: |
-    **Concept.** Every process has resource limits, including how many file descriptors it may open. Docker lets you set these per container, with soft and hard values.
-
-    **Read up on:**
-    - `docker run --help` — the `--ulimit` option and its `name=soft:hard` format
-    - `man getrlimit` / `man bash` (`ulimit`) — what nofile means
-    - `docker exec <c> sh -c 'ulimit -n'` — check the effective limit
-    - `cat /proc/1/limits` — all limits of PID 1
-  scenario: |
-    The **`ws-gateway`** handles tens of thousands of websocket connections and runs out
-    of file descriptors with the default limit.
-
-    Run **`ws-gateway`** (`traefik/whoami:v1.10`) with a **nofile** limit of
-    **65536** (soft and hard).
-  hints:
-    - "`--ulimit nofile=SOFT:HARD`"
-  solution: |
-    ```bash
-    docker run -d --name ws-gateway --ulimit nofile=65536:65536 traefik/whoami:v1.10
-    ```
-  check: |
+    check_eq "search-index is still the same container" "$(c_get search-index '{{.Id}}')" "$(cat $KL_STATE/answer)"
+    check_eq "memory limit 256 MiB" "$(c_get search-index '{{.HostConfig.Memory}}')" "268435456"
+    check_eq "swap limit 256 MiB" "$(c_get search-index '{{.HostConfig.MemorySwap}}')" "268435456"
+    check_eq "pids limit" "$(c_get search-index '{{.HostConfig.PidsLimit}}')" "100"
+    check_eq "cpuset" "$(c_get search-index '{{.HostConfig.CpusetCpus}}')" "0"
+    check_eq "cpu shares" "$(c_get search-index '{{.HostConfig.CPUShares}}')" "256"
+    check "search-index is up and loaded its index" 'c_running search-index && eventually 20 "docker logs search-index 2>&1 | grep -q \"index loaded\""'
+    check_eq "pids.max inside search-index" "$(docker exec search-index cat /sys/fs/cgroup/pids.max 2>/dev/null)" "100"
+    check_eq "effective CPUs inside search-index" "$(docker exec search-index cat /sys/fs/cgroup/cpuset.cpus.effective 2>/dev/null)" "0"
     check "ws-gateway is running" 'c_running ws-gateway'
+    check "no-new-privileges is set" 'c_get ws-gateway "{{.HostConfig.SecurityOpt}}" | grep -q no-new-privileges'
+    check "NoNewPrivs is active in the process" 'docker exec ws-gateway grep -q "NoNewPrivs:.*1" /proc/1/status'
     check_eq "nofile ulimit" "$(c_get ws-gateway '{{range .HostConfig.Ulimits}}{{.Name}}={{.Soft}}:{{.Hard}}{{end}}')" "nofile=65536:65536"
+    check_eq "effective nofile inside" "$(docker exec ws-gateway sh -c 'ulimit -n' 2>/dev/null)" "65536"
+    check "ws-gateway serves on 8130" 'http_get localhost:8130 | grep -q nginx'
   solve: |
-    docker run -d --name ws-gateway --ulimit nofile=65536:65536 traefik/whoami:v1.10
-
-- id: docker-124
-  title: Pin the batch job to one CPU
-  difficulty: 2
-  kind: build
-  tags: [resources, cpuset]
-  tutorial: |
-    **Concept.** CPU placement and CPU weight are separate controls: one restricts which cores a container may run on, the other sets its relative share when cores are contended.
-
-    **Read up on:**
-    - `docker run --help` — CPU related options (cpuset, shares)
-    - `docker update --help` — changing them later
-    - `/sys/fs/cgroup/cpuset.cpus.effective` inside the container — verify placement
-    - `man cgroups` — cpu and cpuset controllers
-  scenario: |
-    The nightly **`encoder`** job must never disturb the latency-critical services,
-    which own CPU 1. Run **`encoder`** (`busybox:1.37`, `sleep infinity`) restricted to
-    **CPU 0 only**, with a relative CPU weight (**cpu-shares**) of **256**.
-  hints:
-    - "`--cpuset-cpus` and `--cpu-shares`"
-  solution: |
-    ```bash
-    docker run -d --name encoder --cpuset-cpus 0 --cpu-shares 256 busybox:1.37 sleep infinity
-    docker exec encoder cat /sys/fs/cgroup/cpuset.cpus.effective
-    ```
-  check: |
-    check "encoder is running" 'c_running encoder'
-    check_eq "cpuset" "$(c_get encoder '{{.HostConfig.CpusetCpus}}')" "0"
-    check_eq "cpu shares" "$(c_get encoder '{{.HostConfig.CPUShares}}')" "256"
-    check_eq "effective CPUs inside" "$(docker exec encoder cat /sys/fs/cgroup/cpuset.cpus.effective 2>/dev/null)" "0"
-  solve: |
-    docker run -d --name encoder --cpuset-cpus 0 --cpu-shares 256 busybox:1.37 sleep infinity
+    docker update --memory 256m --memory-swap 256m --pids-limit 100 --cpuset-cpus 0 --cpu-shares 256 search-index
+    docker restart search-index
+    docker run -d --name ws-gateway --security-opt no-new-privileges --ulimit nofile=65536:65536 -p 8130:80 nginx:1.28-alpine
 
 - id: docker-125
-  title: Who is hogging the memory?
-  difficulty: 2
+  title: Find and throttle the resource hog
+  difficulty: 3
   kind: build
-  tags: [stats, monitoring]
+  tags: [stats, monitoring, resources, blkio]
   tutorial: |
-    **Concept.** Docker can report live resource usage per container, read from cgroup counters. For one-off reporting you can ask for a single snapshot and format the columns.
+    **Concept.** Troubleshooting a loaded docker host has two halves: *finding* the container that consumes a resource, then *constraining* the next one before it hurts. Docker reports live usage per container from cgroup counters (`docker stats`), and cgroups can throttle block I/O throughput - but only per block device, so you must name the right disk.
 
     **Read up on:**
-    - `docker stats --help` — `--no-stream` and `--format`
-    - Format placeholders such as `.Name`, `.MemUsage`
-    - `sort -h` and `sort -k` — ordering human-readable sizes
-    - Careful: `MemUsage` includes a unit and a limit column
+    - `docker stats --help` — `--no-stream` and `--format`, placeholders such as `.Name`, `.MemUsage`, `.MemPerc`
+    - `sort -h` and `sort -n` — ordering human-readable sizes or plain numbers (`MemUsage` contains a unit and a limit column, `MemPerc` is easier)
+    - `lsblk` and `findmnt -no SOURCE /` — identify the root disk (the whole disk, not the partition)
+    - `docker run --help` — the `--device-write-bps` option and its units; `docker inspect` — `.HostConfig.BlkioDeviceWriteBps`
   scenario: |
-    The docker host is swapping. Find the container that **uses the most memory right
-    now** and write its name to **`/lab/memory-hog.txt`**.
+    The docker host is swapping and slow.
+
+    1. Several containers are running. Find the one that **uses the most memory right now**
+       and write its name to **`/lab/memory-hog.txt`**.
+    2. While you are on the box: nightly backups saturate the disk and slow down the
+       databases. Write the **root disk device** (the whole disk, e.g. `/dev/vda`) to
+       **`/lab/root-disk.txt`**, then run **`backup`** (`busybox:1.37`, `sleep infinity`)
+       so that its **write bandwidth to that disk is limited to 10 MB/s**.
   hints:
-    - "`docker stats --no-stream`"
+    - "`docker stats --no-stream --format '{{.MemPerc}} {{.Name}}'` gives one snapshot you can sort."
+    - "`lsblk -no PKNAME \"$(findmnt -no SOURCE /)\"` gives the disk name of the root partition."
+    - "`--device-write-bps DEVICE:RATE`, e.g. `/dev/vda:10mb`, works on the whole disk device."
   solution: |
     ```bash
-    docker stats --no-stream --format '{{.MemUsage}}\t{{.Name}}' | sort -h | tail -1
+    docker stats --no-stream --format '{{.MemPerc}} {{.Name}}' | tr -d '%' | sort -n | tail -1 | awk '{print $2}' > /lab/memory-hog.txt
+
+    dev=/dev/$(lsblk -no PKNAME "$(findmnt -no SOURCE /)" | head -1)
+    echo "$dev" > /lab/root-disk.txt
+    docker run -d --name backup --device-write-bps $dev:10mb busybox:1.37 sleep infinity
     ```
   setup: |
     names=(thumbnailer indexer mailer scheduler)
@@ -163,9 +127,16 @@ exercises:
     done
     sleep 3
   check: |
+    dev=/dev/$(lsblk -no PKNAME "$(findmnt -no SOURCE /)" | head -1)
     check_eq "memory hog" "$(tr -d '[:space:]' < /lab/memory-hog.txt 2>/dev/null)" "$(cat $KL_STATE/answer)"
+    check_eq "root disk recorded" "$(tr -d '[:space:]' < /lab/root-disk.txt 2>/dev/null)" "$dev"
+    check "backup is running" 'c_running backup'
+    check_eq "write limit" "$(c_get backup '{{range .HostConfig.BlkioDeviceWriteBps}}{{.Path}}={{.Rate}}{{end}}')" "$dev=10485760"
   solve: |
     docker stats --no-stream --format '{{.MemPerc}} {{.Name}}' | tr -d '%' | sort -n | tail -1 | awk '{print $2}' > /lab/memory-hog.txt
+    dev=/dev/$(lsblk -no PKNAME "$(findmnt -no SOURCE /)" | head -1)
+    echo "$dev" > /lab/root-disk.txt
+    docker run -d --name backup --device-write-bps $dev:10mb busybox:1.37 sleep infinity
 
 - id: docker-126
   title: Retry flaky jobs, but not forever
@@ -245,121 +216,60 @@ exercises:
     if [ "$(docker inspect importer --format '{{.State.OOMKilled}}')" = true ]; then echo OOMKilled; else echo SIGKILL; fi > /lab/importer-cause.txt
     echo $(( $(docker inspect importer --format '{{.HostConfig.Memory}}') / 1024 / 1024 )) > /lab/importer-limit.txt
 
-- id: docker-128
-  title: More memory, same container
-  difficulty: 2
-  kind: fix
-  tags: [resources, update, oom]
-  tutorial: |
-    **Concept.** Many resource limits of a running container can be changed in place, and swap is configured separately from memory, so the two values interact.
-
-    **Read up on:**
-    - `docker update --help` — which limits can change live
-    - `docker run --help` — how `--memory` and `--memory-swap` relate
-    - `docker inspect` — `.HostConfig.Memory` and `.MemorySwap`
-    - `docker stats --no-stream` — compare usage against the limit
-  scenario: |
-    **`search-index`** keeps getting OOM-killed and restarted: it needs about 150 MB but
-    is limited to 100 MiB.
-
-    Raise its memory limit to **256 MiB** (swap limit the same) **without recreating
-    the container**. It must stay up afterwards.
-  hints:
-    - "`docker update --memory ... --memory-swap ...`"
-    - "If the container is in a restart back-off, `docker start` / `docker restart` it after updating."
-  solution: |
-    ```bash
-    docker inspect search-index -f '{{.State.OOMKilled}} {{.RestartCount}}'
-    docker update --memory 256m --memory-swap 256m search-index
-    docker restart search-index
-    ```
-  setup: |
-    docker run -d --name search-index --restart always --memory 100m --memory-swap 100m python:3.12-alpine python -c "import time; x = bytearray(150*1024*1024); print('index loaded', flush=True); time.sleep(36000)" >/dev/null
-    docker inspect -f '{{.Id}}' search-index > $KL_STATE/answer
-    sleep 3
-  check: |
-    check_eq "same container" "$(c_get search-index '{{.Id}}')" "$(cat $KL_STATE/answer)"
-    check_eq "memory limit" "$(c_get search-index '{{.HostConfig.Memory}}')" "268435456"
-    sleep 3
-    check "search-index is up and loaded its index" 'c_running search-index && docker logs search-index 2>&1 | grep -q "index loaded"'
-  solve: |
-    docker update --memory 256m --memory-swap 256m search-index
-    docker restart search-index
-
 - id: docker-129
-  title: Seccomp was switched off
-  difficulty: 2
+  title: Restore the security profiles
+  difficulty: 3
   kind: fix
-  tags: [security, seccomp]
+  tags: [security, seccomp, apparmor]
   tutorial: |
-    **Concept.** Docker applies a default seccomp profile that blocks dangerous system calls. Disabling it widens what a compromised container can do. Security options are stored in the container's configuration.
+    **Concept.** Docker confines every container with two default kernel security layers. **seccomp** filters which system calls a process may make; the default profile blocks dozens of dangerous ones. **AppArmor** confines file access and capabilities with the `docker-default` profile. Both can be switched off per container with `--security-opt ...=unconfined`, which is handy while debugging and dangerous when forgotten. These settings are part of the container's creation config and cannot be changed afterwards - you recreate the container, keeping everything else (image, command, ports) identical.
 
     **Read up on:**
-    - `docker inspect` — `.HostConfig.SecurityOpt`, `.Config.Image`, `.Config.Cmd`
-    - `docker run --help` — `--security-opt`
-    - Docker docs 'Seccomp security profiles for Docker'
-    - `grep Seccomp /proc/1/status` — check from inside
+    - `docker inspect` — `.HostConfig.SecurityOpt`, `.AppArmorProfile`, `.Config.Image`, `.Config.Cmd`
+    - `docker run --help` — `--security-opt` and its seccomp / apparmor values
+    - Docker docs 'Seccomp security profiles for Docker' and 'AppArmor security profiles for Docker'
+    - `grep Seccomp /proc/1/status` inside a container (0 = off, 2 = filter), `aa-status` on the host
   scenario: |
-    While debugging, someone started **`payments-worker`** with the seccomp filter
-    disabled (`seccomp=unconfined`) and never turned it back on.
+    A post-debugging audit found two containers left with their protections off:
 
-    Recreate **`payments-worker`** (same image and command) with docker's **default
-    seccomp profile**.
+    - **`payments-worker`** was started with the seccomp filter disabled
+      (`seccomp=unconfined`).
+    - **`reverse-proxy`** (`nginx:1.28-alpine`, port **8131** → 80) was started with
+      **AppArmor disabled**.
+
+    Recreate both with the same image, command and port, so that docker's **default
+    seccomp profile** and **default AppArmor profile** (`docker-default`) apply again.
   hints:
-    - "`docker inspect payments-worker -f '{{.HostConfig.SecurityOpt}}'`"
-    - "Simply don't pass any seccomp option — the default profile applies automatically."
+    - "`docker inspect payments-worker -f '{{.HostConfig.SecurityOpt}} {{.Config.Image}} {{json .Config.Cmd}}'` and `docker inspect reverse-proxy -f '{{.AppArmorProfile}}'` show what is wrong and what to keep."
+    - "Both fixes mean recreating the container: `docker rm -f NAME` then `docker run` again."
+    - "Simply don't pass any seccomp or apparmor option - the default profiles apply automatically."
   solution: |
     ```bash
     docker inspect payments-worker -f '{{.HostConfig.SecurityOpt}} {{.Config.Image}} {{json .Config.Cmd}}'
     docker rm -f payments-worker
     docker run -d --name payments-worker busybox:1.37 sh -c 'while true; do echo processing; sleep 5; done'
     docker exec payments-worker grep Seccomp /proc/1/status   # Seccomp: 2 (filtering)
-    ```
-  setup: |
-    docker run -d --name payments-worker --security-opt seccomp=unconfined busybox:1.37 sh -c 'while true; do echo processing; sleep 5; done' >/dev/null
-  check: |
-    check "payments-worker is running" 'c_running payments-worker'
-    check_not "no seccomp=unconfined" 'c_get payments-worker "{{.HostConfig.SecurityOpt}}" | grep -q unconfined'
-    check "seccomp filter active (mode 2)" 'docker exec payments-worker grep -q "Seccomp:.*2" /proc/1/status'
-    check_eq "same command" "$(c_get payments-worker '{{json .Config.Cmd}}')" '["sh","-c","while true; do echo processing; sleep 5; done"]'
-  solve: |
-    docker rm -f payments-worker
-    docker run -d --name payments-worker busybox:1.37 sh -c 'while true; do echo processing; sleep 5; done'
 
-- id: docker-130
-  title: AppArmor was switched off
-  difficulty: 2
-  kind: fix
-  tags: [security, apparmor]
-  tutorial: |
-    **Concept.** AppArmor confines what a process can do with files and capabilities. Docker loads a default profile; a container can be started with that profile turned off. Container settings cannot be changed after creation, only recreated.
-
-    **Read up on:**
-    - `docker inspect` — `.AppArmorProfile`
-    - `docker run --help` — `--security-opt` and AppArmor values
-    - Docker docs 'AppArmor security profiles for Docker'
-    - `aa-status` — which profiles are loaded on the host
-  scenario: |
-    The **`reverse-proxy`** container (`nginx:1.28-alpine`, port **8131**) was started with
-    **AppArmor disabled**. Recreate it so docker's default AppArmor profile
-    (`docker-default`) applies again.
-  hints:
-    - "`docker inspect reverse-proxy -f '{{.AppArmorProfile}}'`"
-  solution: |
-    ```bash
     docker inspect reverse-proxy -f '{{.AppArmorProfile}}'    # unconfined
     docker rm -f reverse-proxy
     docker run -d --name reverse-proxy -p 8131:80 nginx:1.28-alpine
     docker inspect reverse-proxy -f '{{.AppArmorProfile}}'    # docker-default
     ```
   setup: |
+    docker run -d --name payments-worker --security-opt seccomp=unconfined busybox:1.37 sh -c 'while true; do echo processing; sleep 5; done' >/dev/null
     docker run -d --name reverse-proxy -p 8131:80 --security-opt apparmor=unconfined nginx:1.28-alpine >/dev/null
   check: |
+    check "payments-worker is running" 'c_running payments-worker'
+    check_not "no seccomp=unconfined" 'c_get payments-worker "{{.HostConfig.SecurityOpt}}" | grep -q unconfined'
+    check "seccomp filter active (mode 2)" 'docker exec payments-worker grep -q "Seccomp:.*2" /proc/1/status'
+    check_eq "same command" "$(c_get payments-worker '{{json .Config.Cmd}}')" '["sh","-c","while true; do echo processing; sleep 5; done"]'
     check "reverse-proxy is running" 'c_running reverse-proxy'
     check_eq "AppArmor profile" "$(c_get reverse-proxy '{{.AppArmorProfile}}')" "docker-default"
-    check "serves on 8131" 'http_get localhost:8131 | grep -q nginx'
+    check_not "no unconfined option on reverse-proxy" 'c_get reverse-proxy "{{.HostConfig.SecurityOpt}}" | grep -q unconfined'
+    check "reverse-proxy serves on 8131" 'http_get localhost:8131 | grep -q nginx'
   solve: |
-    docker rm -f reverse-proxy
+    docker rm -f payments-worker reverse-proxy
+    docker run -d --name payments-worker busybox:1.37 sh -c 'while true; do echo processing; sleep 5; done'
     docker run -d --name reverse-proxy -p 8131:80 nginx:1.28-alpine
 
 - id: docker-131
@@ -662,40 +572,6 @@ exercises:
     check "journalctl -t audit shows its lines" 'journalctl -t audit --since "-1min" --no-pager | grep -q "audit event"'
   solve: |
     docker run -d --name audit-trail --log-driver journald --log-opt tag=audit busybox:1.37 sh -c 'while true; do echo "audit event $(date +%s)"; sleep 2; done'
-
-- id: docker-138
-  title: Don't let backups saturate the disk
-  difficulty: 3
-  kind: build
-  tags: [resources, blkio]
-  tutorial: |
-    **Concept.** Block I/O limits in cgroups throttle read or write throughput to a specific block device, so you must name the device. Which device is the root disk is something you look up on the VM.
-
-    **Read up on:**
-    - `lsblk` and `findmnt /` — identify the root disk device
-    - `docker run --help` — the `--device-*-bps` options and their units
-    - `docker inspect` — `.HostConfig.BlkioDeviceWriteBps`
-    - Docker docs on block IO bandwidth limits
-  scenario: |
-    The **`backup`** container's writes saturate the disk and slow down the databases.
-
-    Run **`backup`** (`busybox:1.37`, `sleep infinity`) so that its **write bandwidth to
-    the VM's root disk is limited to 10 MB/s**.
-  hints:
-    - "`findmnt -no SOURCE /` tells you the device (e.g. `/dev/vda1` → disk `/dev/vda`)."
-    - "`--device-write-bps DEVICE:RATE` works on the whole disk device."
-  solution: |
-    ```bash
-    lsblk
-    docker run -d --name backup --device-write-bps /dev/vda:10mb busybox:1.37 sleep infinity
-    ```
-  check: |
-    dev=/dev/$(lsblk -no PKNAME "$(findmnt -no SOURCE /)" | head -1)
-    check "backup is running" 'c_running backup'
-    check_eq "write limit" "$(c_get backup '{{range .HostConfig.BlkioDeviceWriteBps}}{{.Path}}={{.Rate}}{{end}}')" "$dev=10485760"
-  solve: |
-    dev=/dev/$(lsblk -no PKNAME "$(findmnt -no SOURCE /)" | head -1)
-    docker run -d --name backup --device-write-bps $dev:10mb busybox:1.37 sleep infinity
 
 - id: docker-139
   title: Containers that survive daemon restarts

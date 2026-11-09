@@ -49,142 +49,197 @@ exercises:
     } > /lab/engine.txt
 
 - id: docker-142
-  title: The container's process on the host
+  title: Observe the daemon and containers from the host
   difficulty: 2
   kind: build
-  tags: [pid, processes]
+  tags: [pid, disk, events, observability]
   tutorial: |
-    **Concept.** A container is an ordinary process on the host, isolated by namespaces and cgroups. The daemon records the PID, as seen from the host, in the container's state.
+    **Concept.** A container is an ordinary process on the host, isolated by namespaces and cgroups, and the daemon keeps a record of everything that happens to it. Three questions come up constantly when you run a docker host: *which host process is this container?*, *which container is eating disk?* and *what happened while nobody was watching?* Each has a built-in answer.
+
+    - The daemon stores the container's PID **as seen from the host** in its state; inside the container the same process is PID 1.
+    - Anything a container writes outside a volume or bind mount lands in its **writable layer** on top of the image. Docker can report that layer's size per container.
+    - The daemon emits an **event stream** (create, start, die, destroy ...). Instead of watching live you can replay the past with `--since`/`--until` and filter on event type; a `die` event carries the `exitCode`.
 
     **Read up on:**
-    - `docker inspect --format` — fields under `.State`
-    - `ps -fp <pid>` — see the process from the host
-    - `docker top <container>` — processes with host PIDs
-    - `man pid_namespaces` — why PIDs differ inside the container
+    - `docker inspect --format` — fields under `.State`, and `docker top <container>`
+    - `ps -fp <pid>` and `man pid_namespaces` — the host view vs the container view
+    - `docker ps --help` (the size option), `docker system df -v`, `docker diff <container>`
+    - `docker events --help` — `--since`, `--until`, `--filter`, `--format`; `{{json .}}` to discover fields
   scenario: |
-    Containers are just processes. Find the **host PID** of the main process of the
-    container **`db`** and write it to **`/lab/db-pid.txt`**.
+    You've inherited a busy docker host and need three facts about it. Write each one to
+    its own file in **`/lab`**:
+
+    1. **`/lab/db-pid.txt`** — the **host PID** of the main process of the container **`db`**.
+    2. **`/lab/fat-container.txt`** — the name of the container among **`api`**, **`worker`**,
+       **`cron`** and **`reporter`** with the **largest writable layer** (one of them writes
+       huge temporary files inside the container, not to a volume).
+    3. **`/lab/exit3.txt`** — the name of the short-lived container that **died with exit
+       code 3** a few minutes ago. It has already been removed, so `docker ps -a` won't
+       help.
   hints:
-    - "`docker inspect -f '{{.State.Pid}}' db`, or `docker top db`."
+    - "PID: `docker inspect -f '{{.State.Pid}}' db`, or `docker top db`. Disk: `docker ps -s` shows each container's writable-layer SIZE."
+    - "Events can be replayed: `docker events --since 30m --until 0s --filter event=die`."
+    - "Each die event carries `name` and `exitCode` attributes: `--format '{{.Actor.Attributes.name}} {{.Actor.Attributes.exitCode}}'`."
   solution: |
     ```bash
     docker inspect -f '{{.State.Pid}}' db > /lab/db-pid.txt
-    ps -fp $(cat /lab/db-pid.txt)
+    ps -fp $(cat /lab/db-pid.txt)               # the same process, seen from the host
+
+    docker ps -s                                 # SIZE column: one container is far bigger
+    echo <that name> > /lab/fat-container.txt
+
+    docker events --since 30m --until 0s --filter event=die \
+      --format '{{.Actor.Attributes.name}} {{.Actor.Attributes.exitCode}}'
+    echo <the name with exit code 3> > /lab/exit3.txt
     ```
   setup: |
-    docker run -d --name db -e POSTGRES_PASSWORD=pw postgres:16-alpine >/dev/null
-  check: |
-    check_eq "host PID" "$(tr -d '[:space:]' < /lab/db-pid.txt 2>/dev/null)" "$(c_get db '{{.State.Pid}}')"
-  solve: |
-    docker inspect -f '{{.State.Pid}}' db > /lab/db-pid.txt
-
-- id: docker-143
-  title: Which container's layer grew?
-  difficulty: 2
-  kind: build
-  tags: [disk, writable-layer]
-  tutorial: |
-    **Concept.** Writing inside a container (not to a volume) grows the writable layer on top of the image. Docker can report that layer's size per container.
-
-    **Read up on:**
-    - `docker ps --help` — an option for showing sizes
-    - `docker system df -v` — verbose per-container usage
-    - `docker diff <container>` — which files changed
-    - Docker docs on storage drivers and the container writable layer
-  scenario: |
-    One of the running containers writes huge temporary files **inside the container**
-    (not to a volume), growing its writable layer.
-
-    Write the name of the container with the **largest writable layer** to
-    **`/lab/fat-container.txt`**.
-  hints:
-    - "`docker ps -s` shows the SIZE of each container's writable layer."
-  solution: |
-    ```bash
-    docker ps -s
-    ```
-  setup: |
+    docker run -d --name db redis:7.4-alpine >/dev/null
     names=(api worker cron reporter)
-    fat=${names[$((RANDOM % 4))]}; echo "$fat" > $KL_STATE/answer
+    fat=${names[$((RANDOM % 4))]}; echo "$fat" > $KL_STATE/fat
     for n in "${names[@]}"; do
       mb=1; [ "$n" = "$fat" ] && mb=120
       docker run -d --name "$n" busybox:1.37 sh -c "dd if=/dev/zero of=/tmp/scratch bs=1M count=$mb 2>/dev/null; sleep infinity" >/dev/null
     done
-    sleep 3
+    jobs=(nightly-backup cert-renew log-shipper report-mailer cache-warmer)
+    bad=${jobs[$((RANDOM % 5))]}; echo "$bad" > $KL_STATE/exit3
+    for n in "${jobs[@]}"; do
+      code=0; [ "$n" = "$bad" ] && code=3
+      docker run --rm --name "$n" busybox:1.37 sh -c "exit $code" >/dev/null 2>&1 || true
+    done
+    sleep 3   # let dd finish; `docker events --until` has 1s resolution
   check: |
-    check_eq "fattest container" "$(tr -d '[:space:]' < /lab/fat-container.txt 2>/dev/null)" "$(cat $KL_STATE/answer)"
+    check "db is running" 'c_running db'
+    check_eq "host PID of db" "$(tr -d '[:space:]' < /lab/db-pid.txt 2>/dev/null)" "$(c_get db '{{.State.Pid}}')"
+    check_eq "container with the largest writable layer" "$(tr -d '[:space:]' < /lab/fat-container.txt 2>/dev/null)" "$(cat $KL_STATE/fat)"
+    check_eq "container that exited with 3" "$(tr -d '[:space:]' < /lab/exit3.txt 2>/dev/null)" "$(cat $KL_STATE/exit3)"
   solve: |
-    for c in $(docker ps --format '{{.Names}}'); do echo "$(docker exec $c du -sk /tmp 2>/dev/null | cut -f1) $c"; done | sort -n | tail -1 | awk '{print $2}' > /lab/fat-container.txt
+    docker inspect -f '{{.State.Pid}}' db > /lab/db-pid.txt
+    for c in api worker cron reporter; do echo "$(docker exec $c du -sk /tmp 2>/dev/null | cut -f1) $c"; done | sort -n | tail -1 | awk '{print $2}' > /lab/fat-container.txt
+    docker events --since 30m --until 0s --filter event=die --format '{{.Actor.Attributes.name}} {{.Actor.Attributes.exitCode}}' | awk '$2 == 3 {print $1}' | tail -1 > /lab/exit3.txt
 
 - id: docker-144
-  title: Contexts for different engines
-  difficulty: 2
+  title: Contexts and the bridge subnet
+  difficulty: 3
   kind: build
-  tags: [context, cli]
+  tags: [context, cli, bip, networking]
   tutorial: |
-    **Concept.** A docker context stores the connection details of an engine, so one CLI can manage several hosts by name. Contexts have an endpoint and optional description.
+    **Concept.** Two independent ideas meet here. A docker **context** stores the connection details of an engine (endpoint, description), so one CLI can manage several hosts by name; the current context is remembered per user. The **default bridge** `docker0`, on the other hand, is a property of the *daemon*: its address comes from daemon settings and changes only when the daemon restarts. Containers started on the default bridge draw their addresses from that subnet.
 
     **Read up on:**
-    - `docker context create --help` — the `--docker` endpoint syntax
-    - `docker context ls` and `docker context use`
-    - `docker context inspect` — view stored endpoint
-    - `DOCKER_CONTEXT` / `--context` — temporary override
+    - `docker context create --help` — the `--docker host=...` endpoint syntax and `--description`
+    - `docker context ls`, `docker context use`, `docker context inspect`, `docker context show`
+    - Docker docs 'Customize the default bridge network' — the `bip` key in `daemon.json`
+    - `ip -4 addr show docker0`, `docker network inspect bridge`, `docker run --rm busybox ip addr`
   scenario: |
-    You'll soon manage several docker engines from this machine. Create a docker
-    **context** named **`lab`** that points at this host's engine through the socket
-    **`unix:///var/run/docker.sock`**, with the description **`kubelab docker host`**,
-    and make it the **current** context.
+    You'll soon manage several docker engines from this machine, and this one's default
+    bridge **`docker0`** (`172.17.0.1/16`) overlaps with the office printer network.
+
+    1. Create a docker **context** named **`lab`** pointing at this host's engine through
+       **`unix:///var/run/docker.sock`**, with the description **`kubelab docker host`**,
+       and make it the **current** context for your user.
+    2. Move **`docker0`** to **`10.123.0.1/24`** and apply it.
+    3. Prove it: start a container **`edge`** (`busybox:1.37`, `sleep infinity`) on the
+       default bridge; it must get an address in `10.123.0.0/24`.
   hints:
-    - "`docker context create NAME --docker host=... --description ...`"
-    - "`docker context use NAME`"
+    - "`docker context create NAME --docker host=... --description ...`, then `docker context use NAME`."
+    - "daemon.json key `bip` (bridge IP) takes the gateway address with prefix length; the daemon must be restarted."
+    - "Containers created before the restart keep running only if configured to; just create `edge` after the restart."
   solution: |
     ```bash
     docker context create lab --description "kubelab docker host" --docker host=unix:///var/run/docker.sock
     docker context use lab
     docker context ls
+
+    echo '{"bip": "10.123.0.1/24"}' | sudo tee /etc/docker/daemon.json
+    sudo systemctl restart docker
+    ip -4 addr show docker0
+
+    docker run -d --name edge busybox:1.37 sleep infinity
+    docker inspect edge -f '{{.NetworkSettings.Networks.bridge.IPAddress}}'
     ```
+  setup: |
+    # daemon.json / docker0 are restored by the reset; restart so docker0 gets its old address back
+    on_reset 'systemctl restart docker >/dev/null 2>&1 || true'
   check: |
     ctx=$(as_user "docker context inspect lab" 2>/dev/null)
     check "context lab exists" '[ -n "$ctx" ]'
     check_eq "endpoint" "$(jq -r '.[0].Endpoints.docker.Host' <<<"$ctx" 2>/dev/null)" "unix:///var/run/docker.sock"
     check_eq "description" "$(jq -r '.[0].Metadata.Description' <<<"$ctx" 2>/dev/null)" "kubelab docker host"
     check_eq "current context" "$(as_user 'docker context show' 2>/dev/null)" "lab"
+    check "docker0 has 10.123.0.1/24" 'ip -4 addr show docker0 | grep -q "inet 10.123.0.1/24"'
+    check_match "default bridge subnet" "$(docker network inspect bridge -f '{{range .IPAM.Config}}{{.Subnet}}{{end}}' 2>/dev/null)" '^10\.123\.0\.0/24$'
+    check "edge is running" 'c_running edge'
+    check_match "edge address" "$(c_get edge '{{.NetworkSettings.Networks.bridge.IPAddress}}')" '^10\.123\.0\.[0-9]+$'
   solve: |
     docker context create lab --description "kubelab docker host" --docker host=unix:///var/run/docker.sock
     docker context use lab
+    echo '{"bip": "10.123.0.1/24"}' | sudo tee /etc/docker/daemon.json
+    sudo systemctl restart docker
+    sleep 4
+    docker run -d --name edge busybox:1.37 sleep infinity
 
 - id: docker-145
-  title: Turn on debug logging for the daemon
-  difficulty: 2
-  kind: build
-  tags: [daemon, daemon.json, logging]
+  title: Configure the daemon safely
+  difficulty: 3
+  kind: fix
+  tags: [daemon, daemon.json, systemd, troubleshooting]
   tutorial: |
-    **Concept.** The daemon reads its configuration from a JSON file. Some settings can be applied with a reload signal; others need a full restart. Invalid JSON prevents the daemon from starting.
+    **Concept.** The daemon reads its configuration from `/etc/docker/daemon.json`, and the daemon itself is a systemd service. Both layers can fail you. Invalid JSON (a trailing comma is the classic) stops the daemon from starting at all, and the reason is only in the service log. Separately, systemd can hold the service back: *stopped* (not running now), *disabled* (won't start at boot) or *masked* (can't be started by anyone). Docker also has a socket unit that can activate it. Finally, some settings such as `debug` can be applied with a reload signal, others need a restart.
 
     **Read up on:**
-    - Docker docs 'Daemon configuration file' — the `debug` key
-    - `man dockerd` — config reference
-    - `systemctl reload docker` vs `restart` — the difference
-    - `docker info` — verify the debug line, `journalctl -u docker` for logs
+    - `systemctl status docker` and `journalctl -u docker -n 30 --no-pager` — the real error
+    - `jq . /etc/docker/daemon.json` or `dockerd --validate` — check the config without starting
+    - `systemctl is-enabled docker`, `systemctl list-unit-files 'docker*'`, `man systemctl` — enable, unmask, `--now`, `reset-failed`
+    - Docker docs 'Daemon configuration file' — the `debug` key; `docker info` shows the Debug line
   scenario: |
-    Docker support asks for **debug logs** from the daemon. Enable debug mode in the
-    daemon's configuration file and apply it.
+    Docker support asked for **debug logs**, so a colleague edited
+    **`/etc/docker/daemon.json`** to add a registry mirror, and "tested something with
+    systemd" while at it. The docker host is now **down** and nothing works.
+
+    Get docker back, keeping the colleague's intended settings (the **registry mirror**
+    `http://localhost:5050` and `log-level` **info**), and:
+
+    - turn on **debug** mode in the daemon configuration and make the daemon report it;
+    - make sure docker is running now **and** starts automatically on boot.
   hints:
-    - "`/etc/docker/daemon.json` → `{\"debug\": true}`"
-    - "`debug` can be reloaded without restarting containers: `sudo systemctl reload docker`."
+    - "`sudo systemctl status docker` and `sudo journalctl -u docker -n 20`. Is the service failing, masked, or disabled?"
+    - "`jq . /etc/docker/daemon.json` validates the JSON. Add `\"debug\": true` once it parses."
+    - "`sudo systemctl unmask docker`, then `sudo systemctl enable --now docker.socket docker.service`."
   solution: |
     ```bash
-    echo '{"debug": true}' | sudo tee /etc/docker/daemon.json
-    sudo systemctl reload docker
-    docker info --format '{{.Debug}}'      # true
-    sudo journalctl -u docker -n 5
+    systemctl status docker                       # masked
+    sudo journalctl -u docker -n 20 --no-pager    # invalid character '}' in daemon.json
+    jq . /etc/docker/daemon.json                  # parse error: trailing comma
+    cat <<'JSON' | sudo tee /etc/docker/daemon.json
+    {"registry-mirrors": ["http://localhost:5050"], "log-level": "info", "debug": true}
+    JSON
+    sudo systemctl unmask docker.service docker.socket
+    sudo systemctl reset-failed docker docker.socket
+    sudo systemctl enable --now docker.socket docker.service
+    docker info --format '{{.Debug}}'             # true
     ```
+  setup: |
+    on_reset 'systemctl unmask docker docker.socket >/dev/null 2>&1; systemctl enable docker docker.socket >/dev/null 2>&1; systemctl start docker.socket docker >/dev/null 2>&1 || true'
+    echo '{"registry-mirrors": ["http://localhost:5050"], "log-level": "info",}' > /etc/docker/daemon.json
+    systemctl stop docker docker.socket >/dev/null 2>&1
+    systemctl disable docker.socket >/dev/null 2>&1
+    systemctl disable docker >/dev/null 2>&1
+    systemctl mask docker >/dev/null 2>&1
+    true
   check: |
+    check "daemon.json is valid JSON" 'jq . /etc/docker/daemon.json'
+    check "registry mirror kept" 'jq -e ".\"registry-mirrors\" | index(\"http://localhost:5050\")" /etc/docker/daemon.json'
+    check_eq "log-level kept" "$(jq -r '."log-level"' /etc/docker/daemon.json 2>/dev/null)" "info"
     check "daemon.json sets debug" 'jq -e ".debug == true" /etc/docker/daemon.json'
-    check_eq "daemon reports debug" "$(docker info --format '{{.Debug}}')" "true"
+    check "docker is active" 'systemctl is-active -q docker'
+    check_eq "docker.service enabled at boot" "$(systemctl is-enabled docker 2>/dev/null)" "enabled"
+    check_eq "daemon reports debug" "$(timeout -s KILL 15 docker info --format '{{.Debug}}' 2>/dev/null)" "true"
   solve: |
-    echo '{"debug": true}' | sudo tee /etc/docker/daemon.json
-    sudo systemctl reload docker
+    echo '{"registry-mirrors": ["http://localhost:5050"], "log-level": "info", "debug": true}' | sudo tee /etc/docker/daemon.json
+    sudo systemctl unmask docker.service docker.socket
+    sudo systemctl reset-failed docker docker.socket || true
+    sudo systemctl enable --now docker.socket docker.service
+    sleep 3
 
 - id: docker-146
   title: Log rotation for every container
@@ -229,89 +284,6 @@ exercises:
     sleep 3
     docker run -d --name probe busybox:1.37 sleep infinity
 
-- id: docker-147
-  title: Docker won't start after a config change
-  difficulty: 2
-  kind: fix
-  tags: [daemon, daemon.json, troubleshooting]
-  tutorial: |
-    **Concept.** When the daemon refuses to start, the answer is almost always in the service log. Configuration errors are reported with the offending file or key.
-
-    **Read up on:**
-    - `systemctl status docker` — state and last lines
-    - `journalctl -u docker -n 30 --no-pager` — the real error
-    - `python3 -m json.tool /etc/docker/daemon.json` or `jq .` — validate JSON syntax
-    - `dockerd --validate` — check the config without starting
-  scenario: |
-    A colleague edited **`/etc/docker/daemon.json`** to add a registry mirror and
-    restarted docker. Now the daemon **won't start** and nothing works.
-
-    Fix the configuration — keep the colleague's intended settings — and get docker
-    running again.
-  hints:
-    - "`sudo systemctl status docker` / `sudo journalctl -u docker -n 20`"
-    - "`jq . /etc/docker/daemon.json` validates JSON."
-  solution: |
-    ```bash
-    sudo journalctl -u docker -n 20 --no-pager   # unable to configure the Docker daemon with file ...: invalid character '}'
-    jq . /etc/docker/daemon.json                 # parse error near line 4
-    sudo vim /etc/docker/daemon.json             # remove the trailing comma
-    sudo systemctl reset-failed docker
-    sudo systemctl start docker
-    ```
-  setup: |
-    printf '{\n  "registry-mirrors": ["http://localhost:5050"],\n  "log-level": "info",\n}\n' > /etc/docker/daemon.json
-    systemctl restart docker >/dev/null 2>&1 || true
-    sleep 2
-  check: |
-    check "daemon.json is valid JSON" 'jq . /etc/docker/daemon.json'
-    check "registry mirror kept" 'jq -e ".\"registry-mirrors\" | index(\"http://localhost:5050\")" /etc/docker/daemon.json'
-    check "docker is running" 'systemctl is-active -q docker && docker info'
-  solve: |
-    printf '{\n  "registry-mirrors": ["http://localhost:5050"],\n  "log-level": "info"\n}\n' | sudo tee /etc/docker/daemon.json
-    sudo systemctl reset-failed docker docker.socket || true
-    sudo systemctl start docker
-
-- id: docker-148
-  title: Docker should start at boot
-  difficulty: 2
-  kind: fix
-  tags: [systemd, daemon]
-  tutorial: |
-    **Concept.** systemd services can be started, enabled to start at boot, or masked, which blocks them entirely. Docker also has a socket unit that can activate it.
-
-    **Read up on:**
-    - `systemctl status docker` — look at the loaded and enabled lines
-    - `systemctl is-enabled docker` — distinguishing disabled from masked
-    - `man systemctl` — enable, unmask, `--now`
-    - `systemctl list-unit-files 'docker*'`
-  scenario: |
-    After the last reboot, the docker host came up **without docker**. Someone had been
-    "testing something" with systemd.
-
-    Make sure docker is running now **and** starts automatically on boot.
-  hints:
-    - "`systemctl status docker` — is it *masked*? *disabled*?"
-    - "`systemctl unmask`, `systemctl enable --now`"
-  solution: |
-    ```bash
-    systemctl status docker
-    sudo systemctl unmask docker.service docker.socket
-    sudo systemctl enable --now docker.socket docker.service
-    ```
-  setup: |
-    systemctl stop docker docker.socket
-    systemctl disable docker.socket >/dev/null 2>&1
-    systemctl disable docker >/dev/null 2>&1
-    systemctl mask docker >/dev/null 2>&1
-  check: |
-    check "docker is active" 'systemctl is-active -q docker'
-    check_eq "docker.service enabled" "$(systemctl is-enabled docker 2>/dev/null)" "enabled"
-    check "docker answers" 'docker info'
-  solve: |
-    sudo systemctl unmask docker.service docker.socket
-    sudo systemctl enable --now docker.socket docker.service
-
 - id: docker-149
   title: Permission denied on docker.sock
   difficulty: 2
@@ -355,46 +327,76 @@ exercises:
     sudo chmod 660 /var/run/docker.sock
 
 - id: docker-150
-  title: DNS works on the host, not in containers
-  difficulty: 2
+  title: Fix container networking from the host
+  difficulty: 3
   kind: fix
-  tags: [dns, daemon, troubleshooting]
+  tags: [dns, sysctl, iptables, networking, troubleshooting]
   tutorial: |
-    **Concept.** Containers on the default bridge get DNS servers from the daemon's configuration or, if none, from the host's resolver. A wrong override breaks every new container while the host works.
+    **Concept.** A container reaches the outside world through the host, and three separate pieces must all be healthy. (1) **Name resolution:** containers on the default bridge get DNS servers from the daemon's `dns` setting or, if none, from the host's resolver, so a dead override breaks every new container while the host looks fine. (2) **Routing:** the host must forward packets between the bridge and the outside, which is the kernel setting `net.ipv4.ip_forward`; it is persisted under `/etc/sysctl.d/`. (3) **NAT:** docker writes its own iptables chains (`DOCKER`, MASQUERADE for outbound traffic, DNAT for published ports) when the daemon starts. If something flushes them, the daemon is what rebuilds them.
 
     **Read up on:**
-    - `cat /etc/docker/daemon.json` — any `dns` settings
-    - `docker run --rm busybox cat /etc/resolv.conf` — what containers use
-    - `resolvectl status` or `/etc/resolv.conf` — host resolver
-    - `man dockerd` — DNS options
+    - `cat /etc/docker/daemon.json` and `docker run --rm busybox:1.37 cat /etc/resolv.conf` — what containers use
+    - `sysctl net.ipv4.ip_forward`, `/etc/sysctl.d/` and `sysctl --system` — read and persist a kernel setting
+    - `iptables -t nat -S` and `iptables -S DOCKER` — are docker's chains and MASQUERADE present?
+    - `systemctl restart docker` — what it re-creates, and what happens to running containers
   scenario: |
-    On the docker host `getent hosts deb.debian.org` works, but inside new containers
-    every lookup fails:
+    The docker host is fine, but containers are cut off. A hardening script and an admin
+    "cleaning up" the firewall ran last night. Symptoms:
 
     ```bash
-    docker run --rm busybox:1.37 nslookup deb.debian.org     # ;; connection timed out
+    docker run --rm busybox:1.37 nslookup deb.debian.org                # ;; connection timed out
+    docker run --rm busybox:1.37 ping -c1 -W2 1.1.1.1                   # fails
     ```
 
-    Fix the docker daemon configuration so containers resolve names again.
+    and the published port of container **`web`** (**8135**) no longer answers.
+
+    Fix all of it **without recreating `web`**, and make the kernel fix **survive a reboot**.
   hints:
-    - "Look at `/etc/docker/daemon.json` — is there a `dns` setting?"
-    - "Without a `dns` key, docker uses the host's resolver configuration."
+    - "Look at `/etc/docker/daemon.json` for a `dns` entry; without one, docker uses the host's resolver."
+    - "`sysctl net.ipv4.ip_forward`; find the file that sets it with `grep -r ip_forward /etc/sysctl.d/`."
+    - "`sudo iptables -t nat -S` — docker's rules are gone; the daemon writes them on start. Containers without a restart policy need `docker start` afterwards."
   solution: |
     ```bash
-    cat /etc/docker/daemon.json        # {"dns": ["10.255.255.1"]}  (decommissioned resolver)
+    cat /etc/docker/daemon.json                     # {"dns": ["10.255.255.1"]}  (decommissioned resolver)
     echo '{}' | sudo tee /etc/docker/daemon.json
-    sudo systemctl restart docker
-    docker run --rm busybox:1.37 nslookup deb.debian.org
+
+    sysctl net.ipv4.ip_forward                      # 0
+    grep -r ip_forward /etc/sysctl.d/               # 99-hardening.conf: net.ipv4.ip_forward = 0
+    sudo sed -i 's/ip_forward = 0/ip_forward = 1/' /etc/sysctl.d/99-hardening.conf
+    sudo sysctl --system
+
+    sudo iptables -t nat -S | head                  # no DOCKER chain, no MASQUERADE
+    sudo systemctl restart docker                   # recreates the chains and rules
+    docker start web 2>/dev/null; curl localhost:8135
     ```
   setup: |
+    on_reset 'sysctl -w net.ipv4.ip_forward=1 >/dev/null 2>&1; rm -f /etc/sysctl.d/99-hardening.conf; systemctl restart docker >/dev/null 2>&1 || true'
+    docker run -d --name web --restart unless-stopped -p 8135:80 nginx:1.28-alpine >/dev/null
+    docker inspect -f '{{.Id}}' web > $KL_STATE/answer
     echo '{"dns": ["10.255.255.1"]}' > /etc/docker/daemon.json
     systemctl restart docker
+    eventually 40 'docker info >/dev/null 2>&1 && [ "$(docker inspect -f "{{.State.Running}}" web)" = true ]'
+    echo "net.ipv4.ip_forward = 0" > /etc/sysctl.d/99-hardening.conf
+    sysctl -w net.ipv4.ip_forward=0 >/dev/null
+    iptables -t nat -F
+    if command -v iptables-nft >/dev/null 2>&1; then iptables-nft -t nat -F 2>/dev/null || true; fi
   check: |
     check_not "no dead resolver configured" 'grep -q 10.255.255.1 /etc/docker/daemon.json'
-    check "containers resolve deb.debian.org" 'docker run --rm busybox:1.37 nslookup -type=a deb.debian.org. 2>&1 | grep -q "^Address: .*[0-9]$" '
+    check "ip_forward persisted (sysctl --system keeps it on)" 'sysctl --system >/dev/null 2>&1; [ "$(sysctl -n net.ipv4.ip_forward)" = 1 ]'
+    check "docker is running" 'systemctl is-active -q docker'
+    check_eq "web was not recreated" "$(c_get web '{{.Id}}')" "$(cat $KL_STATE/answer 2>/dev/null)"
+    check "MASQUERADE rule is back" 'iptables -t nat -S POSTROUTING | grep -q MASQUERADE'
+    ip=$(hostname -I | awk '{print $1}')
+    check "web answers on $ip:8135" "curl -fs -m 3 http://$ip:8135 | grep -q nginx"
+    check "containers resolve deb.debian.org" 'timeout -s KILL 25 docker run --rm busybox:1.37 nslookup -type=a deb.debian.org. 2>&1 | grep -q "^Address: .*[0-9]$"'
+    check "containers reach 1.1.1.1" 'timeout -s KILL 25 docker run --rm busybox:1.37 ping -c1 -W3 1.1.1.1'
   solve: |
     echo '{}' | sudo tee /etc/docker/daemon.json
+    sudo sed -i 's/ip_forward = 0/ip_forward = 1/' /etc/sysctl.d/99-hardening.conf
+    sudo sysctl --system
     sudo systemctl restart docker
+    sleep 4
+    docker start web || true
 
 - id: docker-151
   title: Docker networks collide with the corporate LAN
@@ -434,39 +436,6 @@ exercises:
     sudo systemctl restart docker
     sleep 2
     docker network create after-change
-
-- id: docker-152
-  title: Move docker0 to another subnet
-  difficulty: 3
-  kind: build
-  tags: [daemon, bip, networking]
-  tutorial: |
-    **Concept.** The default bridge `docker0` gets its address from daemon settings. Changing the bridge address affects the subnet containers draw from, but only after the daemon restarts.
-
-    **Read up on:**
-    - Docker docs 'Customize the default bridge network'
-    - `ip -4 addr show docker0` — check the address
-    - `docker network inspect bridge` — subnet and gateway
-    - `docker run --rm busybox ip addr` — a new container's address
-  scenario: |
-    The default bridge **`docker0`** uses `172.17.0.1/16`, which overlaps with the
-    office printer network. Move it to **`10.123.0.1/24`** and make sure a new container
-    on the default bridge gets an address in that range.
-  hints:
-    - "daemon.json key `bip` (bridge IP) takes the gateway address with prefix length."
-  solution: |
-    ```bash
-    echo '{"bip": "10.123.0.1/24"}' | sudo tee /etc/docker/daemon.json
-    sudo systemctl restart docker
-    ip -4 addr show docker0
-    docker run --rm busybox:1.37 ip -4 addr show eth0
-    ```
-  check: |
-    check "docker0 has 10.123.0.1/24" 'ip -4 addr show docker0 | grep -q "inet 10.123.0.1/24"'
-    check "new containers get 10.123.0.x" 'docker run --rm busybox:1.37 ip -4 addr show eth0 | grep -q "inet 10.123.0."'
-  solve: |
-    echo '{"bip": "10.123.0.1/24"}' | sudo tee /etc/docker/daemon.json
-    sudo systemctl restart docker
 
 - id: docker-153
   title: The remote API on localhost
@@ -647,137 +616,6 @@ exercises:
   solve: |
     PID=$(docker inspect -f '{{.State.Pid}}' mystery)
     sudo nsenter -t $PID -n ss -ltnH | awk '{print $4}' | awk -F: '{print $NF}' | head -1 > /lab/mystery-port.txt
-
-- id: docker-157
-  title: What happened while I was away?
-  difficulty: 3
-  kind: build
-  tags: [events, troubleshooting]
-  tutorial: |
-    **Concept.** The daemon emits an event stream for container lifecycle changes. You can query the past with time bounds and filters instead of watching live.
-
-    **Read up on:**
-    - `docker events --help` — `--since`, `--until`, `--filter`, `--format`
-    - Event type `die` and its `exitCode` attribute
-    - `docker ps -a` — exited containers and codes, as a cross-check
-    - Go template `{{json .}}` — discover available fields
-  scenario: |
-    Over the last few minutes, several short-lived containers ran on this host. One of
-    them **died with exit code 3**.
-
-    Find its **name** using docker's event stream and write it to
-    **`/lab/exit3.txt`**. (The container has already been removed, so `docker ps -a`
-    won't help.)
-  hints:
-    - "`docker events --since 30m --until 0s --filter event=die`"
-    - "Each die event carries `exitCode` and `name` attributes; `--format '{{json .}}'` makes them easy to parse."
-  solution: |
-    ```bash
-    docker events --since 30m --until 0s --filter event=die \
-      --format '{{.Actor.Attributes.name}} {{.Actor.Attributes.exitCode}}'
-    ```
-  setup: |
-    names=(nightly-backup cert-renew log-shipper report-mailer cache-warmer)
-    bad=${names[$((RANDOM % 5))]}; echo "$bad" > $KL_STATE/answer
-    for n in "${names[@]}"; do
-      code=0; [ "$n" = "$bad" ] && code=3
-      docker run --rm --name "$n" busybox:1.37 sh -c "exit $code" >/dev/null 2>&1 || true
-    done
-    sleep 2   # `docker events --until` has 1s resolution
-  check: |
-    check_eq "container that exited with 3" "$(tr -d '[:space:]' < /lab/exit3.txt 2>/dev/null)" "$(cat $KL_STATE/answer)"
-  solve: |
-    docker events --since 30m --until 0s --filter event=die --format '{{.Actor.Attributes.name}} {{.Actor.Attributes.exitCode}}' | awk '$2 == 3 {print $1}' | tail -1 > /lab/exit3.txt
-
-- id: docker-158
-  title: Containers lost the internet
-  difficulty: 3
-  kind: fix
-  tags: [networking, sysctl, troubleshooting]
-  tutorial: |
-    **Concept.** Containers reach the outside world through the host acting as a router, which requires the kernel to forward packets and NAT rules to be present. Kernel networking settings are managed with sysctl.
-
-    **Read up on:**
-    - `sysctl net.ipv4.ip_forward` — read a kernel setting
-    - `/etc/sysctl.d/` and `sysctl --system` — persistent settings
-    - `man sysctl`
-    - `iptables -S` — FORWARD chain policy and docker's rules
-  scenario: |
-    Containers on the default bridge can't reach anything outside the host anymore
-    (`docker run --rm busybox:1.37 ping -c1 -W2 1.1.1.1` fails), while the host itself is
-    fine. A hardening script ran on the host last night.
-
-    Fix it, and make the fix **survive a reboot**.
-  hints:
-    - "For containers to reach the outside, the host must *route* their packets."
-    - "`sysctl net.ipv4.ip_forward`"
-    - "Persist sysctls in a file under `/etc/sysctl.d/`."
-  solution: |
-    ```bash
-    sysctl net.ipv4.ip_forward          # 0
-    grep -r ip_forward /etc/sysctl.d/   # 99-hardening.conf: net.ipv4.ip_forward = 0
-    sudo sed -i 's/ip_forward = 0/ip_forward = 1/' /etc/sysctl.d/99-hardening.conf
-    sudo sysctl --system
-    ```
-  setup: |
-    echo "net.ipv4.ip_forward = 0" > /etc/sysctl.d/99-hardening.conf
-    sysctl -w net.ipv4.ip_forward=0 >/dev/null
-    on_reset 'sysctl -w net.ipv4.ip_forward=1'
-  check: |
-    check_eq "ip_forward is on" "$(sysctl -n net.ipv4.ip_forward)" "1"
-    check "persisted (sysctl --system keeps it on)" 'cp /proc/sys/net/ipv4/ip_forward /tmp/kl-ipf; sysctl --system >/dev/null 2>&1; [ "$(sysctl -n net.ipv4.ip_forward)" = 1 ]'
-    check "containers reach 1.1.1.1" 'docker run --rm busybox:1.37 ping -c1 -W3 1.1.1.1'
-  solve: |
-    sudo sed -i 's/ip_forward = 0/ip_forward = 1/' /etc/sysctl.d/99-hardening.conf
-    sudo sysctl --system
-
-- id: docker-159
-  title: Someone flushed the firewall
-  difficulty: 3
-  kind: fix
-  tags: [iptables, networking, troubleshooting]
-  tutorial: |
-    **Concept.** Docker maintains its own iptables chains and NAT rules for port publishing and outbound masquerade. If they are removed, the daemon is the thing that rebuilds them.
-
-    **Read up on:**
-    - `iptables -t nat -S` — inspect NAT chains (`man iptables`)
-    - `iptables -S DOCKER` — see whether docker's chains exist
-    - `systemctl restart docker` — what it re-creates
-    - `docker ps` — check published ports are mapped again
-  scenario: |
-    A well-meaning admin ran `iptables -t nat -F` to "clean up". Since then:
-
-    - published ports (`web` on **8135**) don't answer from outside the container
-    - containers can't reach the internet
-
-    Restore docker's networking rules **without recreating any container**.
-  hints:
-    - "`sudo iptables -t nat -S` — docker's `DOCKER` chain and MASQUERADE rules are gone."
-    - "Docker writes its rules when the daemon starts."
-  solution: |
-    ```bash
-    sudo iptables -t nat -S | head
-    sudo systemctl restart docker      # recreates the chains and rules
-    docker start web 2>/dev/null; curl localhost:8135
-    ```
-    Containers without a restart policy are stopped by the daemon restart — start them
-    again (or use `live-restore`).
-  setup: |
-    docker run -d --name web --restart unless-stopped -p 8135:80 nginx:1.28-alpine >/dev/null
-    sleep 1
-    iptables -t nat -F
-    if command -v iptables-nft >/dev/null 2>&1; then iptables-nft -t nat -F 2>/dev/null || true; fi
-    docker inspect -f '{{.Id}}' web > $KL_STATE/answer
-  check: |
-    check_eq "web was not recreated" "$(c_get web '{{.Id}}')" "$(cat $KL_STATE/answer)"
-    check "MASQUERADE rule is back" 'iptables -t nat -S POSTROUTING | grep -q MASQUERADE'
-    ip=$(hostname -I | awk '{print $1}')
-    check "web answers on $ip:8135" "curl -fs -m 3 http://$ip:8135 | grep -q nginx"
-    check "containers reach 1.1.1.1" 'docker run --rm busybox:1.37 ping -c1 -W3 1.1.1.1'
-  solve: |
-    sudo systemctl restart docker
-    sleep 3
-    docker start web || true
 
 - id: docker-160
   title: "Incident: the docker host after the upgrade"

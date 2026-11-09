@@ -5,50 +5,89 @@ order: 5
 exercises:
 
 - id: docker-081
-  title: Your first compose file
-  difficulty: 1
+  title: Give a service real storage
+  difficulty: 2
   kind: build
-  tags: [compose]
+  tags: [volume, bind-mount, tmpfs, postgres]
   tutorial: |
-    **Concept.** Compose describes containers declaratively in a YAML file, so `docker compose up` replaces long `docker run` commands.
+    **Concept.** A container's own filesystem is disposable: remove the container and it is gone. Docker offers three ways to attach storage with very different lifetimes.
+
+    - A **named volume** is managed by docker and outlives any container that uses it. Use it for data you must keep (a database).
+    - A **bind mount** shows a host path inside the container. Use it for files you edit on the host (configuration, SQL, content). It can be mounted read-only so the container cannot change it.
+    - A **tmpfs mount** lives in memory, can be size-capped, and vanishes when the container stops. Use it for scratch data that must never touch the disk.
+
+    One container can use all three at once. The official postgres image also runs every `*.sql` file in `/docker-entrypoint-initdb.d` the first time it starts on an *empty* data directory, and skips them afterwards.
 
     **Read up on:**
-    - `docker compose up --help` — options such as detaching
-    - Compose file reference: `services`, `image`, `ports`
-    - `docker compose ps` — see project status
-    - `docker compose config` — validate the file
+    - `docker volume --help` — create, ls, inspect
+    - `docker run --help` — the `-v`, `--mount` and `--tmpfs` options, and the read-only mode
+    - Postgres image page — the data directory and the initialisation directory
+    - `docker inspect` — the Mounts section; `docker exec CONTAINER df -h` to see a tmpfs and its size
+    - `docker rm` then `docker run` — the way to prove persistence
   scenario: |
-    Stop typing long `docker run` commands.
+    The notes service needs a PostgreSQL database with three kinds of storage. The
+    schema file **`/lab/db/10-schema.sql`** is maintained by ops on the host.
 
-    In **`/lab/hello-compose`**, write a **`compose.yaml`** with one service **`web`**
-    using **`nginx:1.28-alpine`**, published on host port **8110** → 80, and start it in
-    the background.
+    Run **`db`** (`postgres:16-alpine`, password `devpass`) with:
+
+    1. a **named volume `pgdata`** at **`/var/lib/postgresql/data`** (create it first);
+    2. the schema file **bind-mounted read-only** as
+       `/docker-entrypoint-initdb.d/10-schema.sql`, so the `notes` table is created
+       on first start;
+    3. a **tmpfs at `/scratch`, limited to 64 MiB**, for the export tool's temporary files.
+
+    Then prove the data is safe: insert a row with the body **`kept`** into `notes`,
+    remove the container, start it again with the **same** options, and make sure the
+    row is still there.
   hints:
-    - "Top-level key `services:`; under the service: `image:` and `ports:`."
-    - "`docker compose up -d` in the project directory."
+    - "`docker volume create NAME`, then `-v NAME:/path`; a single host file is mounted with `-v /host/file:/container/file:ro`; memory storage is `--tmpfs /path:size=64m`."
+    - "The database accepts connections on TCP only once initialisation has finished: `docker exec db psql -h 127.0.0.1 -U postgres -c 'select 1'` — retry until it works before inserting."
+    - "Insert with `docker exec db psql -U postgres -c \"insert into notes(body) values ('kept')\"`, then `docker rm -f db`, and run the very same `docker run` command again. The init script is skipped because the volume is no longer empty."
   solution: |
-    ```yaml
-    services:
-      web:
-        image: nginx:1.28-alpine
-        ports:
-          - "8110:80"
-    ```
     ```bash
-    cd /lab/hello-compose && docker compose up -d && docker compose ps
+    docker volume create pgdata
+    docker run -d --name db -e POSTGRES_PASSWORD=devpass \
+      -v pgdata:/var/lib/postgresql/data \
+      -v /lab/db/10-schema.sql:/docker-entrypoint-initdb.d/10-schema.sql:ro \
+      --tmpfs /scratch:size=64m postgres:16-alpine
+    # wait until it answers on TCP, then write a row
+    docker exec db psql -h 127.0.0.1 -U postgres -c "insert into notes(body) values ('kept')"
+    # recreate with the same options: the data lives in the volume, not the container
+    docker rm -f db
+    docker run -d --name db -e POSTGRES_PASSWORD=devpass \
+      -v pgdata:/var/lib/postgresql/data \
+      -v /lab/db/10-schema.sql:/docker-entrypoint-initdb.d/10-schema.sql:ro \
+      --tmpfs /scratch:size=64m postgres:16-alpine
+    docker exec db psql -U postgres -c 'select * from notes'
+    docker exec db df -h /scratch
     ```
-    The project name defaults to the directory name (`hello-compose`).
+    The volume keeps the database across containers, the read-only bind mount keeps the
+    schema under ops' control, and the tmpfs is gone for good whenever the container is.
   setup: |
-    mkdir -p /lab/hello-compose && chown $(lab_user): /lab/hello-compose
+    lab_file /lab/db/10-schema.sql <<'SQL'
+    create table notes(id serial primary key, body text not null);
+    SQL
   check: |
-    check "compose.yaml exists" 'test -f /lab/hello-compose/compose.yaml -o -f /lab/hello-compose/docker-compose.yml -o -f /lab/hello-compose/docker-compose.yaml'
-    check "service web of project hello-compose is running" 'cc_running hello-compose web'
-    check "http://localhost:8110 answers" 'http_get localhost:8110 | grep -q nginx'
+    check "volume pgdata exists" 'docker volume inspect pgdata'
+    check "db is running" 'c_running db'
+    check_eq "pgdata is mounted at the data dir" "$(c_get db '{{range .Mounts}}{{if eq .Name "pgdata"}}{{.Destination}}{{end}}{{end}}')" "/var/lib/postgresql/data"
+    check_eq "the schema is a read-only bind mount" "$(c_get db '{{range .Mounts}}{{if eq .Destination "/docker-entrypoint-initdb.d/10-schema.sql"}}{{.Type}}:{{.RW}}{{end}}{{end}}')" "bind:false"
+    check "/scratch is a tmpfs" 'docker exec db grep -q " /scratch tmpfs " /proc/mounts'
+    sz=$(docker exec db df -k /scratch 2>/dev/null | awk 'NR==2{print $2}')
+    check_eq "tmpfs size is 64 MiB" "${sz:-0}" "65536"
+    check "postgres initialised its files in the volume" 'test -f "$(docker volume inspect -f "{{.Mountpoint}}" pgdata)/PG_VERSION"'
+    c_running db && eventually 40 'docker exec db psql -h 127.0.0.1 -U postgres -c "select 1"'
+    check_eq "the schema was applied and the row survived" "$(docker exec db psql -h 127.0.0.1 -U postgres -tAc "select count(*) from notes where body='kept'" 2>/dev/null)" "1"
   solve: |
-    cd /lab/hello-compose
-    printf 'services:\n  web:\n    image: nginx:1.28-alpine\n    ports:\n      - "8110:80"\n' > compose.yaml
-    docker compose up -d
-
+    docker volume create pgdata
+    run_db() {
+      docker run -d --name db -e POSTGRES_PASSWORD=devpass -v pgdata:/var/lib/postgresql/data -v /lab/db/10-schema.sql:/docker-entrypoint-initdb.d/10-schema.sql:ro --tmpfs /scratch:size=64m postgres:16-alpine
+      for i in $(seq 40); do docker exec db psql -h 127.0.0.1 -U postgres -c 'select 1' >/dev/null 2>&1 && break; sleep 2; done
+    }
+    run_db
+    docker exec db psql -h 127.0.0.1 -U postgres -c "insert into notes(body) values ('kept')"
+    docker rm -f db
+    run_db
 - id: docker-082
   title: Web app plus cache
   difficulty: 1
@@ -209,48 +248,6 @@ exercises:
     echo PORTAL_PORT=8114 > .env
     docker compose up -d
 
-- id: docker-085
-  title: Service settings from an env_file
-  difficulty: 2
-  kind: build
-  tags: [compose, env_file]
-  tutorial: |
-    **Concept.** Compose can load a service's environment from a file instead of listing variables inline.
-
-    **Read up on:**
-    - Compose reference: `env_file`
-    - How paths resolve relative to the compose file
-    - `docker compose config` — view the merged result
-    - `docker compose exec SERVICE env`
-  scenario: |
-    The project **`/lab/crm`** runs PostgreSQL. Its settings are in **`/lab/crm/db.env`**.
-
-    Make the **`db`** service load its environment **from that file** (not inline
-    `environment:` entries) and start the project.
-  hints:
-    - "`env_file: db.env` — different from `.env`, which is only used for substitution in the compose file."
-  solution: |
-    ```yaml
-    services:
-      db:
-        image: postgres:16-alpine
-        env_file: db.env
-    ```
-  setup: |
-    mkdir -p /lab/crm
-    printf 'POSTGRES_USER=crm\nPOSTGRES_PASSWORD=crm-secret\nPOSTGRES_DB=crm\n' > /lab/crm/db.env
-    printf 'services:\n  db:\n    image: postgres:16-alpine\n' > /lab/crm/compose.yaml
-    chown -R $(lab_user): /lab/crm
-  check: |
-    check "db uses env_file" 'cd /lab/crm && grep -q "env_file" compose.yaml && ! grep -q "POSTGRES_PASSWORD" compose.yaml'
-    check "db is running" 'cc_running crm db'
-    cc_running crm db && eventually 30 'cc_exec crm db pg_isready -U crm'
-    check "database crm owned by user crm exists" 'cc_exec crm db psql -U crm -d crm -c "select 1"'
-  solve: |
-    cd /lab/crm
-    printf 'services:\n  db:\n    image: postgres:16-alpine\n    env_file: db.env\n' > compose.yaml
-    docker compose up -d
-
 - id: docker-086
   title: Named volumes in compose
   difficulty: 2
@@ -359,57 +356,6 @@ exercises:
     cd /lab/webstack
     WEB_PORT=8116 docker compose -p staging up -d
 
-- id: docker-088
-  title: Build images with compose
-  difficulty: 2
-  kind: build
-  tags: [compose, build]
-  tutorial: |
-    **Concept.** Compose can build a service from source and give the resulting image a chosen name.
-
-    **Read up on:**
-    - Compose reference: `build` and `image`
-    - `docker compose build --help`
-    - `docker images` — check the tag
-    - `docker compose up --help`
-  scenario: |
-    **`/lab/quotes-api`** contains a Dockerfile and app. Add a **`compose.yaml`** whose
-    **`api`** service **builds** from the project directory, tags the result as
-    **`acme/quotes-api:dev`**, and publishes **8117** → 8000. Start it.
-  hints:
-    - "`build: .` together with `image:` names the built image."
-  solution: |
-    ```yaml
-    services:
-      api:
-        build: .
-        image: acme/quotes-api:dev
-        ports: ["8117:8000"]
-    ```
-    ```bash
-    cd /lab/quotes-api && docker compose up -d --build
-    ```
-  setup: |
-    D=/lab/quotes-api; mkdir -p $D
-    printf 'FROM python:3.12-alpine\nWORKDIR /app\nCOPY app.py .\nCMD ["python","app.py"]\n' > $D/Dockerfile
-    cat > $D/app.py <<'EOF'
-    from http.server import BaseHTTPRequestHandler, HTTPServer
-    class H(BaseHTTPRequestHandler):
-        def do_GET(self):
-            self.send_response(200); self.end_headers(); self.wfile.write(b"Simplicity is prerequisite for reliability.\n")
-    HTTPServer(("0.0.0.0", 8000), H).serve_forever()
-    EOF
-    chown -R $(lab_user): $D
-  check: |
-    check "image acme/quotes-api:dev was built" 'img_exists acme/quotes-api:dev'
-    check_eq "api runs that image" "$(cc_get quotes-api api '{{.Config.Image}}')" "acme/quotes-api:dev"
-    cc_running quotes-api api && eventually 10 'http_get localhost:8117'
-    check "api answers on 8117" 'http_get localhost:8117 | grep -q reliability'
-  solve: |
-    cd /lab/quotes-api
-    printf 'services:\n  api:\n    build: .\n    image: acme/quotes-api:dev\n    ports: ["8117:8000"]\n' > compose.yaml
-    docker compose up -d --build
-
 - id: docker-089
   title: Scale the workers
   difficulty: 2
@@ -472,152 +418,81 @@ exercises:
     docker compose up -d --remove-orphans
 
 - id: docker-090
-  title: What is the importer complaining about?
-  difficulty: 2
+  title: Volume housekeeping
+  difficulty: 3
   kind: build
-  tags: [compose, logs]
+  tags: [system-df, volume, filter, prune, disk]
   tutorial: |
-    **Concept.** Compose aggregates the logs of all services and prefixes each line with the service name.
+    **Concept.** Cleaning up a docker host safely is three questions in a row: *which volume is eating the disk*, *who is using it*, and *what can go*. Docker answers each one, but only if you ask the right command.
+
+    - `docker system df -v` reports disk usage per object type, including the size of every volume. The volume directories can also be measured on the host with `du`.
+    - Docker tracks which containers reference a volume, **running or stopped**, and refuses to delete a volume that is in use. The `volume` filter of `docker ps` shows the holders.
+    - A volume is *unused* only when no container at all references it. Anonymous volumes (created by an image's `VOLUME` line or `-v /path`) pile up quietly, and since Docker 23 `volume prune` removes only anonymous ones unless told otherwise.
 
     **Read up on:**
-    - `docker compose logs --help` — options
-    - `grep` — filter for a keyword
-    - Log line prefix format
-    - `docker compose ps`
+    - `docker system df --help` — the verbose option
+    - `docker ps --help` — filter options, `-a` to include stopped containers, `--format` for names only
+    - `docker volume prune --help` — what is covered by default and what the all option adds
+    - `du -sh` — measuring a directory on the host (volumes live under the volume's Mountpoint)
   scenario: |
-    The **`etl`** project (`/lab/etl`) has three services. One of them logged a line
-    containing **`FATAL`** with a file name in it.
+    Disk usage on the docker host is climbing. Four named volumes
+    (`audit-logs`, `media-cache`, `build-cache`, `tmp-exports`) are in use by
+    containers, one running and one stopped each, and months of experiments left
+    other volumes behind, named and anonymous.
 
-    Write the **name of the service** that logged it to **`/lab/fatal-service.txt`** and
-    the **file name** it mentions to **`/lab/fatal-file.txt`**.
+    1. Find the **largest volume** and write its name to **`/lab/biggest-volume.txt`**.
+    2. Find every container (running or stopped) that holds that volume and write
+       their names, one per line, to **`/lab/biggest-users.txt`**.
+    3. Delete **every volume that is not used by any container**. Volumes in use
+       must survive, and **no container may be removed**.
   hints:
-    - "`docker compose logs` prefixes each line with the service name."
-    - "`docker compose logs --no-log-prefix SERVICE` for one service only."
+    - "`docker system df -v` lists volumes with their sizes; `docker ps -a --filter volume=NAME --format '{{.Names}}'` lists the containers that reference one."
+    - "Stopped containers count as users, so use `-a`. Do the measuring and the filtering first, then clean up."
+    - "Since Docker 23, `docker volume prune` only removes *anonymous* volumes by default. Add `--all` (and `-f`) to include unused named ones; volumes in use are never touched."
   solution: |
     ```bash
-    cd /lab/etl && docker compose logs | grep FATAL
-    # importer-1  | FATAL cannot open /data/feeds/....csv
+    docker system df -v | sed -n '/VOLUME NAME/,/^$/p'      # find the largest
+    echo media-cache > /lab/biggest-volume.txt              # whichever it is
+    docker ps -a --filter volume=media-cache --format '{{.Names}}' > /lab/biggest-users.txt
+    docker volume prune --all -f
+    docker volume ls
     ```
+    Pruning last is deliberate: the report is about the full picture, and `prune` is
+    safe on volumes in use but not undoable on the rest. Stopped containers hold
+    volumes just as running ones do, which is why `docker volume rm` fails even when
+    nothing seems to be using a volume.
   setup: |
-    D=/lab/etl; mkdir -p $D
-    f="feed-$(date +%Y%m%d)-$RANDOM.csv"; echo "$f" > $KL_STATE/answer
-    svcs=(extractor importer loader); bad=${svcs[$((RANDOM % 3))]}; echo "$bad" >> $KL_STATE/answer
-    {
-      echo "services:"
-      for s in "${svcs[@]}"; do
-        if [ "$s" = "$bad" ]; then msg="for i in \$\$(seq 1 30); do echo INFO $s tick \$\$i; done; echo FATAL cannot open /data/feeds/$f; sleep infinity"
-        else msg="for i in \$\$(seq 1 30); do echo INFO $s tick \$\$i; done; sleep infinity"; fi
-        printf '  %s:\n    image: busybox:1.37\n    command: ["sh", "-c", "%s"]\n' "$s" "$msg"
-      done
-    } > $D/compose.yaml
-    chown -R $(lab_user): $D
-    as_user "cd $D && docker compose up -d" >/dev/null 2>&1; sleep 2
+    names=(audit-logs media-cache build-cache tmp-exports)
+    big=${names[$((RANDOM % 4))]}; echo "$big" > $KL_STATE/answer
+    for v in "${names[@]}"; do
+      docker volume create "$v" >/dev/null
+      mb=5; [ "$v" = "$big" ] && mb=60
+      docker run --rm -v "$v":/v busybox:1.37 sh -c "dd if=/dev/zero of=/v/data bs=1M count=$mb 2>/dev/null"
+      docker run -d --name "app-$v" -v "$v":/data busybox:1.37 sleep infinity >/dev/null
+      docker create --name "old-$v" -v "$v":/import busybox:1.37 true >/dev/null
+    done
+    # leftovers: unused named volumes and anonymous ones
+    for v in exp-1 exp-2 old-cache scratch-2024; do docker volume create $v >/dev/null; done
+    for i in 1 2 3; do docker run --rm -v /data busybox:1.37 true >/dev/null; done
+    docker run -v /data busybox:1.37 true >/dev/null
+    docker container prune -f >/dev/null
+    # container prune removed the anonymous run above and the created/exited ones;
+    # recreate the four stopped holders it took
+    for v in "${names[@]}"; do
+      docker container inspect "old-$v" >/dev/null 2>&1 || docker create --name "old-$v" -v "$v":/import busybox:1.37 true >/dev/null
+    done
+    docker volume create stray-anon-seed >/dev/null
   check: |
-    check_eq "service" "$(tr -d '[:space:]' < /lab/fatal-service.txt 2>/dev/null)" "$(sed -n 2p $KL_STATE/answer)"
-    check_eq "file name" "$(tr -d '[:space:]' < /lab/fatal-file.txt 2>/dev/null | sed 's|.*/||')" "$(sed -n 1p $KL_STATE/answer)"
+    big=$(cat $KL_STATE/answer)
+    check_eq "/lab/biggest-volume.txt" "$(tr -d '[:space:]' < /lab/biggest-volume.txt 2>/dev/null)" "$big"
+    check_eq "/lab/biggest-users.txt lists running and stopped holders" "$(sort /lab/biggest-users.txt 2>/dev/null | tr -s '[:space:]' ' ' | sed 's/ $//')" "app-$big old-$big"
+    check_eq "only volumes in use remain" "$(docker volume ls -q | sort | tr '\n' ' ' | sed 's/ $//')" "audit-logs build-cache media-cache tmp-exports"
+    check_eq "no container was removed" "$(docker ps -aq | wc -l | tr -d ' ')" "8"
   solve: |
-    cd /lab/etl
-    docker compose logs | grep FATAL | head -1 | awk '{print $1}' | sed 's/-[0-9]*$//' > /lab/fatal-service.txt
-    docker compose logs --no-log-prefix | grep FATAL | grep -o '[^/ ]*\.csv' > /lab/fatal-file.txt
-
-- id: docker-091
-  title: Both services want port 8080
-  difficulty: 2
-  kind: fix
-  tags: [compose, ports, troubleshooting]
-  tutorial: |
-    **Concept.** Two services cannot publish the same host port. Only the host side of the mapping needs to differ.
-
-    **Read up on:**
-    - Compose reference: `ports` syntax
-    - `docker compose up` error text
-    - `ss -ltn` — ports already in use
-    - `docker compose ps`
-  scenario: |
-    `docker compose up -d` in **`/lab/dashboards`** starts `grafana-ish` but fails for
-    `metrics-ish` with *port is already allocated*.
-
-    Fix the compose file: **`grafana-ish`** keeps **8080**, **`metrics-ish`** moves to
-    **8081**. Both must run.
-  hints:
-    - "Only the host side (left of the colon) must be unique."
-  solution: |
-    ```yaml
-      metrics-ish:
-        ports:
-          - "8081:80"
-    ```
-    ```bash
-    docker compose up -d
-    ```
-  setup: |
-    D=/lab/dashboards; mkdir -p $D
-    printf 'services:\n  grafana-ish:\n    image: nginx:1.28-alpine\n    ports: ["8080:80"]\n  metrics-ish:\n    image: traefik/whoami:v1.10\n    ports: ["8080:80"]\n' > $D/compose.yaml
-    chown -R $(lab_user): $D
-    as_user "cd $D && docker compose up -d grafana-ish && docker compose up -d" >/dev/null 2>&1 || true
-  check: |
-    eventually 10 'http_get localhost:8080 && http_get localhost:8081'
-    check "grafana-ish on 8080" 'http_get localhost:8080 | grep -q nginx'
-    check "metrics-ish on 8081" 'http_get localhost:8081 | grep -q Hostname'
-  solve: |
-    cd /lab/dashboards
-    printf 'services:\n  grafana-ish:\n    image: nginx:1.28-alpine\n    ports: ["8080:80"]\n  metrics-ish:\n    image: traefik/whoami:v1.10\n    ports: ["8081:80"]\n' > compose.yaml
-    docker compose up -d
-
-- id: docker-092
-  title: "Connection refused: localhost:6379"
-  difficulty: 2
-  kind: fix
-  tags: [compose, networking, troubleshooting]
-  tutorial: |
-    **Concept.** Inside a container, localhost means that container itself, not the host or sibling services. Other services are reached by service name.
-
-    **Read up on:**
-    - `docker compose logs SERVICE` — the connection error
-    - Compose networking docs — service names as DNS
-    - `docker compose config` — resolved environment
-    - `docker compose exec`
-  scenario: |
-    The **`counter`** service in **`/lab/counter`** can't reach Redis:
-    `docker compose logs counter` shows *connection refused* to `localhost:6379`. It worked
-    on the developer's laptop where Redis ran natively…
-
-    Fix the configuration so `counter` reaches the **`redis`** service.
-  hints:
-    - "Inside a container, `localhost` is the container itself."
-    - "In compose, services reach each other by **service name**."
-  solution: |
-    ```yaml
-      counter:
-        environment:
-          REDIS_HOST: redis      # was: localhost
-    ```
-    ```bash
-    docker compose up -d && docker compose logs -f counter
-    ```
-  setup: |
-    D=/lab/counter; mkdir -p $D
-    cat > $D/compose.yaml <<'EOF'
-    services:
-      redis:
-        image: redis:7.4-alpine
-      counter:
-        image: redis:7.4-alpine
-        environment:
-          REDIS_HOST: localhost
-        command: ["sh", "-c", "while true; do redis-cli -h $$REDIS_HOST incr visits || echo connection refused to $$REDIS_HOST:6379; sleep 2; done"]
-    EOF
-    chown -R $(lab_user): $D
-    as_user "cd $D && docker compose up -d" >/dev/null 2>&1
-  check: |
-    check_eq "REDIS_HOST" "$(cc_exec counter counter printenv REDIS_HOST 2>/dev/null)" "redis"
-    sleep 3
-    check "visits counter is increasing in redis" '[ "$(cc_exec counter redis redis-cli get visits 2>/dev/null)" -gt 0 ] 2>/dev/null'
-  solve: |
-    cd /lab/counter
-    sed -i 's/REDIS_HOST: localhost/REDIS_HOST: redis/' compose.yaml
-    docker compose up -d
-
+    big=$(for v in $(docker volume ls -q); do echo "$(sudo du -s $(docker volume inspect -f '{{.Mountpoint}}' $v) | cut -f1) $v"; done | sort -n | tail -1 | awk '{print $2}')
+    echo "$big" > /lab/biggest-volume.txt
+    docker ps -a --filter volume="$big" --format '{{.Names}}' > /lab/biggest-users.txt
+    docker volume prune --all -f
 - id: docker-093
   title: Front and back networks
   difficulty: 3
@@ -905,46 +780,6 @@ exercises:
     printf 'services:\n  api:\n    image: traefik/whoami:v1.10\n  toolbox:\n    image: busybox:1.37\n    command: sleep infinity\n    profiles: [debug]\n' > compose.yaml
     docker compose up -d
     docker compose --profile debug up -d
-
-- id: docker-097
-  title: Tear it all down
-  difficulty: 2
-  kind: build
-  tags: [compose, down, cleanup]
-  tutorial: |
-    **Concept.** `docker compose down` removes a project's containers and networks, and extra flags control volumes and images.
-
-    **Read up on:**
-    - `docker compose down --help` — each removal option
-    - `docker compose ls` — projects on the host
-    - `docker volume ls` and `docker network ls` — leftovers
-    - `docker images`
-  scenario: |
-    The **`legacy-crm`** project (`/lab/legacy-crm`) is retired. Remove its **containers,
-    networks and volumes** — but keep its images (another team still uses them) and keep
-    the other project, **`newcrm`**, untouched.
-  hints:
-    - "`docker compose down` removes containers and networks; `-v` adds the volumes."
-  solution: |
-    ```bash
-    cd /lab/legacy-crm && docker compose down -v
-    ```
-    `--rmi all` would also delete the images — not wanted here.
-  setup: |
-    for p in legacy-crm newcrm; do
-      mkdir -p /lab/$p
-      printf 'services:\n  db:\n    image: redis:7.4-alpine\n    volumes: [data:/data]\n  web:\n    image: nginx:1.28-alpine\nvolumes:\n  data:\n' > /lab/$p/compose.yaml
-    done
-    chown -R $(lab_user): /lab
-    as_user "cd /lab/legacy-crm && docker compose up -d && cd /lab/newcrm && docker compose up -d" >/dev/null 2>&1
-  check: |
-    check "no legacy-crm containers" '[ -z "$(docker ps -aq --filter label=com.docker.compose.project=legacy-crm)" ]'
-    check "legacy-crm network gone" '! docker network inspect legacy-crm_default'
-    check "legacy-crm volume gone" '! docker volume inspect legacy-crm_data'
-    check "images kept" 'img_exists redis:7.4-alpine && img_exists nginx:1.28-alpine'
-    check "newcrm untouched" 'cc_running newcrm db && cc_running newcrm web && docker volume inspect newcrm_data'
-  solve: |
-    cd /lab/legacy-crm && docker compose down -v
 
 - id: docker-098
   title: External network not found

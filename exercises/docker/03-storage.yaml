@@ -5,115 +5,89 @@ order: 3
 exercises:
 
 - id: docker-041
-  title: Give the database a real volume
-  difficulty: 1
+  title: Give a service real storage
+  difficulty: 2
   kind: build
-  tags: [volume, postgres]
+  tags: [volume, bind-mount, tmpfs, postgres]
   tutorial: |
-    **Concept.** Named volumes are managed by docker and outlive containers, so data survives removing and recreating the container.
+    **Concept.** A container's own filesystem is disposable: remove the container and it is gone. Docker offers three ways to attach storage with very different lifetimes.
+
+    - A **named volume** is managed by docker and outlives any container that uses it. Use it for data you must keep (a database).
+    - A **bind mount** shows a host path inside the container. Use it for files you edit on the host (configuration, SQL, content). It can be mounted read-only so the container cannot change it.
+    - A **tmpfs mount** lives in memory, can be size-capped, and vanishes when the container stops. Use it for scratch data that must never touch the disk.
+
+    One container can use all three at once. The official postgres image also runs every `*.sql` file in `/docker-entrypoint-initdb.d` the first time it starts on an *empty* data directory, and skips them afterwards.
 
     **Read up on:**
     - `docker volume --help` — create, ls, inspect
-    - `docker run --help` — the volume option
-    - Postgres image page — where it stores data
-    - `docker rm` then `docker run` — prove persistence
+    - `docker run --help` — the `-v`, `--mount` and `--tmpfs` options, and the read-only mode
+    - Postgres image page — the data directory and the initialisation directory
+    - `docker inspect` — the Mounts section; `docker exec CONTAINER df -h` to see a tmpfs and its size
+    - `docker rm` then `docker run` — the way to prove persistence
   scenario: |
-    Containers are disposable, data is not.
+    The notes service needs a PostgreSQL database with three kinds of storage. The
+    schema file **`/lab/db/10-schema.sql`** is maintained by ops on the host.
 
-    1. Create a named volume **`pgdata`**.
-    2. Run PostgreSQL as container **`db`** (`postgres:16-alpine`, password `devpass`)
-       with that volume mounted at **`/var/lib/postgresql/data`**.
+    Run **`db`** (`postgres:16-alpine`, password `devpass`) with:
+
+    1. a **named volume `pgdata`** at **`/var/lib/postgresql/data`** (create it first);
+    2. the schema file **bind-mounted read-only** as
+       `/docker-entrypoint-initdb.d/10-schema.sql`, so the `notes` table is created
+       on first start;
+    3. a **tmpfs at `/scratch`, limited to 64 MiB**, for the export tool's temporary files.
+
+    Then prove the data is safe: insert a row with the body **`kept`** into `notes`,
+    remove the container, start it again with the **same** options, and make sure the
+    row is still there.
   hints:
-    - "`docker volume create NAME`, then `-v NAME:/path` on `docker run`."
+    - "`docker volume create NAME`, then `-v NAME:/path`; a single host file is mounted with `-v /host/file:/container/file:ro`; memory storage is `--tmpfs /path:size=64m`."
+    - "The database accepts connections on TCP only once initialisation has finished: `docker exec db psql -h 127.0.0.1 -U postgres -c 'select 1'` — retry until it works before inserting."
+    - "Insert with `docker exec db psql -U postgres -c \"insert into notes(body) values ('kept')\"`, then `docker rm -f db`, and run the very same `docker run` command again. The init script is skipped because the volume is no longer empty."
   solution: |
     ```bash
     docker volume create pgdata
     docker run -d --name db -e POSTGRES_PASSWORD=devpass \
-      -v pgdata:/var/lib/postgresql/data postgres:16-alpine
-    docker volume inspect pgdata
+      -v pgdata:/var/lib/postgresql/data \
+      -v /lab/db/10-schema.sql:/docker-entrypoint-initdb.d/10-schema.sql:ro \
+      --tmpfs /scratch:size=64m postgres:16-alpine
+    # wait until it answers on TCP, then write a row
+    docker exec db psql -h 127.0.0.1 -U postgres -c "insert into notes(body) values ('kept')"
+    # recreate with the same options: the data lives in the volume, not the container
+    docker rm -f db
+    docker run -d --name db -e POSTGRES_PASSWORD=devpass \
+      -v pgdata:/var/lib/postgresql/data \
+      -v /lab/db/10-schema.sql:/docker-entrypoint-initdb.d/10-schema.sql:ro \
+      --tmpfs /scratch:size=64m postgres:16-alpine
+    docker exec db psql -U postgres -c 'select * from notes'
+    docker exec db df -h /scratch
     ```
+    The volume keeps the database across containers, the read-only bind mount keeps the
+    schema under ops' control, and the tmpfs is gone for good whenever the container is.
+  setup: |
+    lab_file /lab/db/10-schema.sql <<'SQL'
+    create table notes(id serial primary key, body text not null);
+    SQL
   check: |
     check "volume pgdata exists" 'docker volume inspect pgdata'
     check "db is running" 'c_running db'
     check_eq "pgdata is mounted at the data dir" "$(c_get db '{{range .Mounts}}{{if eq .Name "pgdata"}}{{.Destination}}{{end}}{{end}}')" "/var/lib/postgresql/data"
-    c_running db && eventually 30 'docker exec db pg_isready'
+    check_eq "the schema is a read-only bind mount" "$(c_get db '{{range .Mounts}}{{if eq .Destination "/docker-entrypoint-initdb.d/10-schema.sql"}}{{.Type}}:{{.RW}}{{end}}{{end}}')" "bind:false"
+    check "/scratch is a tmpfs" 'docker exec db grep -q " /scratch tmpfs " /proc/mounts'
+    sz=$(docker exec db df -k /scratch 2>/dev/null | awk 'NR==2{print $2}')
+    check_eq "tmpfs size is 64 MiB" "${sz:-0}" "65536"
     check "postgres initialised its files in the volume" 'test -f "$(docker volume inspect -f "{{.Mountpoint}}" pgdata)/PG_VERSION"'
+    c_running db && eventually 40 'docker exec db psql -h 127.0.0.1 -U postgres -c "select 1"'
+    check_eq "the schema was applied and the row survived" "$(docker exec db psql -h 127.0.0.1 -U postgres -tAc "select count(*) from notes where body='kept'" 2>/dev/null)" "1"
   solve: |
     docker volume create pgdata
-    docker run -d --name db -e POSTGRES_PASSWORD=devpass -v pgdata:/var/lib/postgresql/data postgres:16-alpine
-
-- id: docker-042
-  title: Configuration from a bind mount
-  difficulty: 1
-  kind: build
-  tags: [bind-mount, nginx]
-  tutorial: |
-    **Concept.** A bind mount shows a host path inside a container, and it can be mounted read-only so the container cannot change it.
-
-    **Read up on:**
-    - `docker run --help` — `-v` and `--mount` formats
-    - The read-only mode flag for mounts
-    - `docker exec CONTAINER nginx -t` — validate the loaded config
-  scenario: |
-    Ops maintains nginx configuration on the host in **`/lab/edge/default.conf`**.
-
-    Run **`edge`** from **`nginx:1.28-alpine`** on port **8090** → 80 with that file
-    **bind-mounted read-only** as `/etc/nginx/conf.d/default.conf`.
-    `curl localhost:8090/ping` must answer `pong`.
-  hints:
-    - "`-v /host/file:/container/file:ro` mounts a single file."
-  solution: |
-    ```bash
-    docker run -d --name edge -p 8090:80 \
-      -v /lab/edge/default.conf:/etc/nginx/conf.d/default.conf:ro nginx:1.28-alpine
-    curl localhost:8090/ping
-    ```
-  setup: |
-    lab_file /lab/edge/default.conf <<'EOF'
-    server {
-        listen 80;
-        location /ping { default_type text/plain; return 200 "pong\n"; }
-        location / { root /usr/share/nginx/html; }
+    run_db() {
+      docker run -d --name db -e POSTGRES_PASSWORD=devpass -v pgdata:/var/lib/postgresql/data -v /lab/db/10-schema.sql:/docker-entrypoint-initdb.d/10-schema.sql:ro --tmpfs /scratch:size=64m postgres:16-alpine
+      for i in $(seq 40); do docker exec db psql -h 127.0.0.1 -U postgres -c 'select 1' >/dev/null 2>&1 && break; sleep 2; done
     }
-    EOF
-  check: |
-    check "edge is running" 'c_running edge'
-    check_eq "the config is a read-only bind mount" "$(c_get edge '{{range .Mounts}}{{if eq .Destination "/etc/nginx/conf.d/default.conf"}}{{.Type}}:{{.RW}}{{end}}{{end}}')" "bind:false"
-    check "/ping answers pong" 'http_get localhost:8090/ping | grep -qx pong'
-  solve: |
-    docker run -d --name edge -p 8090:80 -v /lab/edge/default.conf:/etc/nginx/conf.d/default.conf:ro nginx:1.28-alpine
-
-- id: docker-043
-  title: Scratch space in memory
-  difficulty: 1
-  kind: build
-  tags: [tmpfs]
-  tutorial: |
-    **Concept.** A tmpfs mount lives in memory and disappears when the container stops. Its size can be capped.
-
-    **Read up on:**
-    - `docker run --help` — the tmpfs option and its size setting
-    - `docker exec CONTAINER df -h` — see the mount and size
-    - Docker docs: 'tmpfs mounts'
-  scenario: |
-    The image converter writes large temporary files that must never touch the disk.
-
-    Run **`cruncher`** from **`busybox:1.37`** with the command `sleep infinity` and a
-    **tmpfs** mounted at **`/scratch`**, limited to **64 MiB**.
-  hints:
-    - "`--tmpfs /path:size=64m` or `--mount type=tmpfs,destination=/path,tmpfs-size=...`"
-  solution: |
-    ```bash
-    docker run -d --name cruncher --tmpfs /scratch:size=64m busybox:1.37 sleep infinity
-    docker exec cruncher df -h /scratch
-    ```
-  check: |
-    check "cruncher is running" 'c_running cruncher'
-    check "/scratch is a tmpfs" 'docker exec cruncher grep -q " /scratch tmpfs " /proc/mounts'
-    sz=$(docker exec cruncher df -k /scratch 2>/dev/null | awk 'NR==2{print $2}')
-    check_eq "tmpfs size is 64 MiB" "${sz:-0}" "65536"
-  solve: |
-    docker run -d --name cruncher --tmpfs /scratch:size=64m busybox:1.37 sleep infinity
+    run_db
+    docker exec db psql -h 127.0.0.1 -U postgres -c "insert into notes(body) values ('kept')"
+    docker rm -f db
+    run_db
 
 - id: docker-044
   title: Sessions vanish on every deploy
@@ -156,77 +130,75 @@ exercises:
     docker run -d --name sessions -p 6379:6379 -v sessions-data:/data redis:7.4-alpine redis-server --appendonly yes
 
 - id: docker-045
-  title: Which volume is eating the disk?
-  difficulty: 2
+  title: Volume housekeeping
+  difficulty: 3
   kind: build
-  tags: [system-df, disk]
+  tags: [system-df, volume, filter, prune, disk]
   tutorial: |
-    **Concept.** Docker reports disk usage per object type, including each volume's size.
+    **Concept.** Cleaning up a docker host safely is three questions in a row: *which volume is eating the disk*, *who is using it*, and *what can go*. Docker answers each one, but only if you ask the right command.
+
+    - `docker system df -v` reports disk usage per object type, including the size of every volume. The volume directories can also be measured on the host with `du`.
+    - Docker tracks which containers reference a volume, **running or stopped**, and refuses to delete a volume that is in use. The `volume` filter of `docker ps` shows the holders.
+    - A volume is *unused* only when no container at all references it. Anonymous volumes (created by an image's `VOLUME` line or `-v /path`) pile up quietly, and since Docker 23 `volume prune` removes only anonymous ones unless told otherwise.
 
     **Read up on:**
     - `docker system df --help` — the verbose option
-    - `docker volume ls` — names only
-    - `du -sh` — measuring a directory on the host
+    - `docker ps --help` — filter options, `-a` to include stopped containers, `--format` for names only
+    - `docker volume prune --help` — what is covered by default and what the all option adds
+    - `du -sh` — measuring a directory on the host (volumes live under the volume's Mountpoint)
   scenario: |
-    Disk usage on the docker host is climbing. There are several volumes.
+    Disk usage on the docker host is climbing. Four named volumes
+    (`audit-logs`, `media-cache`, `build-cache`, `tmp-exports`) are in use by
+    containers, one running and one stopped each, and months of experiments left
+    other volumes behind, named and anonymous.
 
-    Find the **largest volume** and write its name to **`/lab/biggest-volume.txt`**.
+    1. Find the **largest volume** and write its name to **`/lab/biggest-volume.txt`**.
+    2. Find every container (running or stopped) that holds that volume and write
+       their names, one per line, to **`/lab/biggest-users.txt`**.
+    3. Delete **every volume that is not used by any container**. Volumes in use
+       must survive, and **no container may be removed**.
   hints:
-    - "`docker system df -v` lists volumes with their sizes."
+    - "`docker system df -v` lists volumes with their sizes; `docker ps -a --filter volume=NAME --format '{{.Names}}'` lists the containers that reference one."
+    - "Stopped containers count as users, so use `-a`. Do the measuring and the filtering first, then clean up."
+    - "Since Docker 23, `docker volume prune` only removes *anonymous* volumes by default. Add `--all` (and `-f`) to include unused named ones; volumes in use are never touched."
   solution: |
     ```bash
-    docker system df -v | sed -n '/VOLUME NAME/,/^$/p'
-    echo media-cache > /lab/biggest-volume.txt
+    docker system df -v | sed -n '/VOLUME NAME/,/^$/p'      # find the largest
+    echo media-cache > /lab/biggest-volume.txt              # whichever it is
+    docker ps -a --filter volume=media-cache --format '{{.Names}}' > /lab/biggest-users.txt
+    docker volume prune --all -f
+    docker volume ls
     ```
+    Pruning last is deliberate: the report is about the full picture, and `prune` is
+    safe on volumes in use but not undoable on the rest. Stopped containers hold
+    volumes just as running ones do, which is why `docker volume rm` fails even when
+    nothing seems to be using a volume.
   setup: |
+    # leftovers first: unused named volumes and anonymous ones
+    for v in exp-1 exp-2 old-cache scratch-2024; do docker volume create $v >/dev/null; done
+    for i in 1 2 3; do docker run -v /data busybox:1.37 true >/dev/null; done
+    docker container prune -f >/dev/null
+    # the four volumes in use: one running and one stopped holder each
     names=(audit-logs media-cache build-cache tmp-exports)
     big=${names[$((RANDOM % 4))]}; echo "$big" > $KL_STATE/answer
     for v in "${names[@]}"; do
       docker volume create "$v" >/dev/null
       mb=5; [ "$v" = "$big" ] && mb=60
       docker run --rm -v "$v":/v busybox:1.37 sh -c "dd if=/dev/zero of=/v/data bs=1M count=$mb 2>/dev/null"
+      docker run -d --name "app-$v" -v "$v":/data busybox:1.37 sleep infinity >/dev/null
+      docker create --name "old-$v" -v "$v":/import busybox:1.37 true >/dev/null
     done
-    docker run -d --name media -v media-cache:/cache busybox:1.37 sleep infinity >/dev/null
   check: |
-    check_eq "/lab/biggest-volume.txt" "$(tr -d '[:space:]' < /lab/biggest-volume.txt 2>/dev/null)" "$(cat $KL_STATE/answer)"
+    big=$(cat $KL_STATE/answer)
+    check_eq "/lab/biggest-volume.txt" "$(tr -d '[:space:]' < /lab/biggest-volume.txt 2>/dev/null)" "$big"
+    check_eq "/lab/biggest-users.txt lists running and stopped holders" "$(sort /lab/biggest-users.txt 2>/dev/null | tr -s '[:space:]' ' ' | sed 's/ $//')" "app-$big old-$big"
+    check_eq "only volumes in use remain" "$(docker volume ls -q | sort | tr '\n' ' ' | sed 's/ $//')" "audit-logs build-cache media-cache tmp-exports"
+    check_eq "no container was removed" "$(docker ps -aq | wc -l | tr -d ' ')" "8"
   solve: |
-    for v in $(docker volume ls -q); do echo "$(sudo du -s $(docker volume inspect -f '{{.Mountpoint}}' $v) | cut -f1) $v"; done | sort -n | tail -1 | awk '{print $2}' > /lab/biggest-volume.txt
-
-- id: docker-046
-  title: Who is holding this volume?
-  difficulty: 2
-  kind: build
-  tags: [volume, filter]
-  tutorial: |
-    **Concept.** Docker tracks which containers reference a volume, whether they are running or stopped.
-
-    **Read up on:**
-    - `docker ps --help` — the filter options
-    - `docker ps -a` — include stopped containers
-    - `--format` with Go templates — print only names
-  scenario: |
-    You want to delete the volume **`ledger`**, but docker says *volume is in use*.
-
-    Find the container(s) using it and write their names, one per line, to
-    **`/lab/ledger-users.txt`**. Don't remove anything yet.
-  hints:
-    - "`docker ps -a --filter volume=ledger`"
-  solution: |
-    ```bash
-    docker ps -a --filter volume=ledger --format '{{.Names}}' > /lab/ledger-users.txt
-    ```
-    Stopped containers count too — that's why `docker volume rm` fails even if nothing
-    is running.
-  setup: |
-    docker volume create ledger >/dev/null
-    for n in api worker cron; do docker run -d --name $n busybox:1.37 sleep infinity >/dev/null; done
-    docker run -d --name accounting -v ledger:/data busybox:1.37 sleep infinity >/dev/null
-    docker create --name old-import -v ledger:/import busybox:1.37 true >/dev/null
-  check: |
-    check_eq "the right containers" "$(sort /lab/ledger-users.txt 2>/dev/null | tr -s '[:space:]' ' ' | sed 's/ $//')" "accounting old-import"
-    check "volume ledger still exists" 'docker volume inspect ledger'
-  solve: |
-    docker ps -a --filter volume=ledger --format '{{.Names}}' > /lab/ledger-users.txt
+    big=$(for v in $(docker volume ls -q); do echo "$(sudo du -s $(docker volume inspect -f '{{.Mountpoint}}' $v) | cut -f1) $v"; done | sort -n | tail -1 | awk '{print $2}')
+    echo "$big" > /lab/biggest-volume.txt
+    docker ps -a --filter volume="$big" --format '{{.Names}}' > /lab/biggest-users.txt
+    docker volume prune --all -f
 
 - id: docker-047
   title: One writer, one reader
@@ -493,43 +465,6 @@ exercises:
     docker rm -f cms
     docker run -d --name cms -v uploads:/srv/uploads busybox:1.37 sleep infinity
     docker volume rm old-uploads
-
-- id: docker-053
-  title: Prune volumes nobody uses
-  difficulty: 2
-  kind: fix
-  tags: [prune, cleanup, disk]
-  tutorial: |
-    **Concept.** A volume is unused if no container, running or stopped, references it. Named and anonymous volumes are treated differently by prune.
-
-    **Read up on:**
-    - `docker volume prune --help` — options and what they cover
-    - `docker volume ls --filter` — list unreferenced volumes
-    - `docker ps -a` — stopped containers may still hold volumes
-  scenario: |
-    Months of experiments left lots of volumes behind — named and anonymous.
-
-    Delete **every volume that is not used by any container** (running or stopped).
-    Volumes in use must survive.
-  hints:
-    - "Since Docker 23, `docker volume prune` only removes *anonymous* volumes by default."
-    - "`docker volume prune --all`"
-  solution: |
-    ```bash
-    docker volume prune --all -f
-    docker volume ls
-    ```
-  setup: |
-    for v in exp-1 exp-2 old-cache scratch-2024; do docker volume create $v >/dev/null; done
-    for i in 1 2 3; do docker run -v /data busybox:1.37 true >/dev/null; done
-    docker container prune -f >/dev/null
-    docker volume create live-db >/dev/null; docker volume create paused-jobs >/dev/null
-    docker run -d --name db -v live-db:/data busybox:1.37 sleep infinity >/dev/null
-    docker create --name jobs -v paused-jobs:/data busybox:1.37 true >/dev/null
-  check: |
-    check_eq "only volumes in use remain" "$(docker volume ls -q | sort | tr '\n' ' ' | sed 's/ $//')" "live-db paused-jobs"
-  solve: |
-    docker volume prune --all -f
 
 - id: docker-054
   title: A RAM-backed named volume
