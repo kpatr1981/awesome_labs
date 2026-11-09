@@ -8,7 +8,7 @@ multi-step scenario and teach a concept, and a smaller catalog after merging thi
 is a good outcome. The parts of this list that the existing exercises don't cover are not
 started.
 
-Exercise counts as of v0.7.0:
+Exercise counts as of v0.8.0:
 
 | Topic | Exercises | Track | Module files |
 |---|---|---|---|
@@ -16,7 +16,7 @@ Exercise counts as of v0.7.0:
 | Kubernetes | 231 | `kubernetes` | `exercises/kubernetes/` |
 | Offensive security | 45 | `offsec` | `exercises/offsec/` |
 | Linux & systems | 30 | `linux` | `exercises/linux/` |
-| Networking | 39 | `networking` | `exercises/networking/` |
+| Networking | 42 | `networking` | `exercises/networking/` |
 | Cloud & platform | 42 | `cloud` | `exercises/cloud/` |
 | Data | 27 | `data` | `exercises/data/` |
 | Defensive security | 30 | `defensive` | `exercises/defensive/` |
@@ -57,7 +57,7 @@ These apply to several tracks, so they're listed once here.
 | containerlab on the 3GiB Docker VM | Networking and tracks built on it | Works: six FRR 9.1 routers in a ring deployed and linked with containerlab 0.59, using about 150MiB in total |
 | `sch_netem` kernel module | Degraded networks | Works in `kl-docker`, and `net-005` uses it |
 | WireGuard kernel support | VPN creation | Works in `kl-docker`, and `net-015` uses it |
-| Moto's optional IAM enforcement | AWS CLI | Works in Moto 5.1.0 with `INITIAL_NO_AUTH_ACTION_COUNT`: a user's policy allowed one S3 call and the next was `AccessDenied`. Re-check on the Moto version the labs pin |
+| Moto's optional IAM enforcement | AWS CLI | Works on 5.2.4, the version the labs pin, with `INITIAL_NO_AUTH_ACTION_COUNT`: a user's policy allowed one S3 call and the next was `AccessDenied` |
 
 ### Multi-network labs
 
@@ -145,7 +145,7 @@ Rescue is the most valuable module: it breaks a throwaway guest and not the lab 
 | **Static routing** | Multi-hop paths, forwarding, return-path failures, longest-prefix match, asymmetric routes |
 | **Policy routing** | Multiple routing tables, `ip rule`, two uplinks, source-based routing, `rp_filter` drops |
 | **NAT & firewalls** | nftables, SNAT and DNAT, port forwards, conntrack, hairpin NAT |
-| **IPv6** | SLAAC, link-local addresses, neighbor discovery, dual-stack bugs |
+| **IPv6** | OSPFv3, dual-stack repair and BGP over IPv6 done in `07-ipv6-routing.yaml`; neighbor discovery in `net-018`. SLAAC not yet covered |
 | **OSPF** | Done in `06-dynamic-routing.yaml`: FRR neighbors, areas, costs, timer mismatches, failover |
 | **BGP** | Done in `06-dynamic-routing.yaml`: peering, route filters, communities, path selection, route leaks |
 | **High availability** | VRRP (FRR's `vrrpd`) and ECMP done in `06-dynamic-routing.yaml`; anycast in `net-035` |

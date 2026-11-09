@@ -75,6 +75,7 @@ control plane, `KUBECONFIG` is `/etc/kubernetes/admin.conf`; the lab user has it
 | `netns_new NS...`, `netns_link NS1 IF1 NS2 IF2` | network namespaces and veth links, removed on reset |
 | `frr_up NAME...`, `frr_link A IFA ADDR B IFB ADDR`, `frr_gw HOST GW` | FRR routers and hosts in containers, joined by veth links (docker host) |
 | `frr_conf R <<EOF`, `frr_json R 'show ...'`, `frr_route R PREFIX`, `frr_ping NODE ADDR` | configure a router, read its state, test reachability |
+| `frr_gw6 HOST GW`, `frr_route6 R PREFIX`, `frr_ping6 NODE ADDR` | the IPv6 versions |
 | `moto_start` | run the AWS emulator and install an `aws` command that uses it (sees only `/lab`) |
 | `ds_start` | install `dspy`, which runs Python with pandas and scikit-learn in `/lab` |
 | `go_test <<'GO'` | run a hidden Go test file against the learner's `/lab/*.go` |

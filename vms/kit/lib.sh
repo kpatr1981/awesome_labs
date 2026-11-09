@@ -128,14 +128,14 @@ frr_image() {
 frr_start() {
   docker run -d --name "$1" --hostname "$1" --network none --privileged \
     --restart no --entrypoint sh "$FRR_IMAGE" -c \
-    "sed -i 's/^ospfd=no/ospfd=yes/;s/^bgpd=no/bgpd=yes/;s/^vrrpd=no/vrrpd=yes/' /etc/frr/daemons; touch /etc/frr/vtysh.conf; exec /sbin/tini -- /usr/lib/frr/docker-start" >/dev/null
+    "sed -i 's/^ospfd=no/ospfd=yes/;s/^bgpd=no/bgpd=yes/;s/^vrrpd=no/vrrpd=yes/;s/^ospf6d=no/ospf6d=yes/' /etc/frr/daemons; touch /etc/frr/vtysh.conf; exec /sbin/tini -- /usr/lib/frr/docker-start" >/dev/null
 }
 # frr_healthy NAME -> startup finished and every daemon is running
 frr_healthy() {
   docker logs "$1" 2>&1 | awk '/all daemons up/{u=NR} /state -> down|Forked background/{d=NR} END{exit !(u>d)}' || return 1
-  docker exec "$1" sh -c 'ps -o args | grep -q "[w]atchfrr\.sh" && exit 1; for d in zebra mgmtd bgpd ospfd staticd vrrpd; do pidof $d >/dev/null || exit 1; done'
+  docker exec "$1" sh -c 'ps -o args | grep -q "[w]atchfrr\.sh" && exit 1; for d in zebra mgmtd bgpd ospfd ospf6d staticd vrrpd; do pidof $d >/dev/null || exit 1; done'
 }
-# frr_up NAME... -> start routers with ospfd, bgpd and vrrpd enabled and forwarding on.
+# frr_up NAME... -> start routers with ospfd, ospf6d, bgpd and vrrpd enabled and forwarding on.
 # At boot watchfrr can restart the daemons and lose zebra for good, which leaves a router
 # that accepts configuration and can't route. No links exist yet, so such a router is
 # simply recreated.
@@ -153,7 +153,7 @@ frr_up() {
     for n in $bad; do docker rm -f "$n" >/dev/null; frr_start "$n"; done
   done
   [ -z "$bad" ] || { echo "routers did not start:$bad" >&2; return 1; }
-  for n in "$@"; do docker exec "$n" sysctl -qw net.ipv4.ip_forward=1; done
+  for n in "$@"; do docker exec "$n" sysctl -qw net.ipv4.ip_forward=1 net.ipv6.conf.all.forwarding=1; done
 }
 # frr_link A IFA ADDR/LEN B IFB ADDR/LEN -> veth between two containers, addresses optional ("-")
 frr_link() {
@@ -190,6 +190,13 @@ frr_route() {
 }
 # frr_ping NODE ADDRESS -> one reply within a second
 frr_ping() { docker exec "$1" ping -c1 -W1 "$2" >/dev/null 2>&1; }
+# frr_gw6, frr_route6, frr_ping6 -> the IPv6 versions of the above
+frr_gw6() { docker exec "$1" ip -6 route replace default via "$2"; }
+frr_route6() {
+  frr_json "$1" "show ipv6 route $2 json" | jq -r --arg p "$2" \
+    '.[$p][]? | select(.selected==true) | "\(.protocol) \(.nexthops[0].interfaceName // "-") \(.nexthops[0].ip // "-")"' 2>/dev/null
+}
+frr_ping6() { docker exec "$1" ping -6 -c1 -W1 "$2" >/dev/null 2>&1; }
 
 # ---------- AWS emulator helper ----------
 # moto_start -> run the emulator on 127.0.0.1:5000 and install an `aws` command
