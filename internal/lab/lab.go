@@ -40,6 +40,7 @@ const (
 	BuildxVersion     = "0.38.1-1~ubuntu.24.04~noble"
 	ComposeVersion    = "5.7.0-1~ubuntu.24.04~noble"
 	CriToolsVersion   = "1.36.0-1.1"
+	TsharkVersion     = "4.2.2-1.1build3"
 	// KitVersion is bumped whenever bootstrap output changes incompatibly.
 	KitVersion = "1"
 )
@@ -312,6 +313,7 @@ func (m *Manager) template(env Env, vm VM) (string, error) {
 		"__BUILDX_VERSION__", BuildxVersion,
 		"__COMPOSE_VERSION__", ComposeVersion,
 		"__CRI_TOOLS_VERSION__", CriToolsVersion,
+		"__TSHARK_VERSION__", TsharkVersion,
 		"__CPUS__", fmt.Sprint(vm.CPUs),
 		"__MEMORY__", vm.Memory,
 	)

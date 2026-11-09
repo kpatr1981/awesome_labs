@@ -109,6 +109,60 @@ netns_link() {
   ip -n "$3" link set "$4" up
 }
 
+# ---------- packet capture helpers ----------
+# Keep in step with TsharkVersion in internal/lab/lab.go.
+TSHARK_VERSION=4.2.2-1.1build3
+# tshark_ready -> make sure tshark exists, also on VMs built before it joined provisioning.
+# The VM's reset never touches /usr, so the install lasts.
+tshark_ready() {
+  command -v tshark >/dev/null && return 0
+  export DEBIAN_FRONTEND=noninteractive
+  apt-get update -qq && apt-get install -y -qq "tshark=$TSHARK_VERSION" >/dev/null
+}
+# lan_up NS=ADDR/LEN... -> namespaces on one bridge (hub namespace kl-lan); any address is reachable
+lan_up() {
+  local h ns addr a b
+  _kl_lan_ns=kl-lan
+  ip netns add kl-lan && ip -n kl-lan link set lo up
+  ip -n kl-lan link add br0 type bridge && ip -n kl-lan link set br0 up
+  on_reset 'ip netns pids kl-lan | xargs -r kill 2>/dev/null; ip netns del kl-lan 2>/dev/null'
+  for h in "$@"; do
+    ns=${h%%=*}; addr=${h#*=}; a="klv$RANDOM"; b="klv$RANDOM"
+    _kl_lan_ns="$_kl_lan_ns $ns"
+    netns_new "$ns"
+    ip netns exec "$ns" sysctl -qw net.ipv6.conf.all.disable_ipv6=1
+    ip link add "$a" type veth peer name "$b"
+    ip link set "$a" netns "$ns" name eth0
+    ip link set "$b" netns kl-lan
+    ip -n kl-lan link set "$b" master br0 up
+    ip -n "$ns" addr add "$addr" dev eth0
+    ip -n "$ns" link set eth0 up
+    ip -n "$ns" route add default dev eth0
+    on_reset "ip netns pids $ns | xargs -r kill 2>/dev/null"
+  done
+}
+# cap_start FILE / cap_stop -> capture everything crossing the bridge; the file ends up owned by the lab user
+cap_start() {
+  ip netns exec kl-lan tcpdump -nn -U -s0 -i br0 -w "$1" >/dev/null 2>&1 </dev/null &
+  _kl_cap_pid=$! _kl_cap_file=$1
+  eventually 10 "[ -s '$1' ]"
+}
+cap_stop() {
+  kill -INT "$_kl_cap_pid" 2>/dev/null
+  wait "$_kl_cap_pid" 2>/dev/null
+  chown "$(lab_user)": "$_kl_cap_file"
+}
+# lan_down -> stop everything running on the bridge and remove it; call after cap_stop
+lan_down() {
+  local n
+  {
+    for n in $(ip netns list | awk '{print $1}'); do
+      case " $_kl_lan_ns " in *" $n "*) ip netns pids "$n" | xargs -r kill -9; ip netns del "$n" ;; esac
+    done
+    wait
+  } 2>/dev/null
+}
+
 # ---------- FRR router helpers ----------
 # Routers and hosts are FRR containers with no docker network; veth links join them.
 # A restarted container loses its links, so labs must not restart routers.

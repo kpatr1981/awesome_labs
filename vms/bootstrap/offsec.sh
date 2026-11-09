@@ -75,7 +75,7 @@ EOF
 
 # Pre-pull the base images the target services run from (stdlib-only apps, no pip
 # at exercise time). Keep versions pinned; never :latest.
-for img in python:3.12-alpine nginx:1.27-alpine httpd:2.4-alpine; do
+for img in python:3.12-alpine nginx:1.27-alpine httpd:2.4-alpine owasp/modsecurity-crs:4.25.2-nginx-alpine-202610180210-lts; do
   docker image inspect "$img" >/dev/null 2>&1 || docker pull -q "$img" >/dev/null
 done
 

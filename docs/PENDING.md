@@ -8,7 +8,7 @@ what to consolidate. The target doesn't lower the bar: a lab should carry a real
 scenario and teach a concept. The parts of this list that the existing exercises don't cover
 are not started.
 
-Exercise counts as of v0.11.0:
+Exercise counts as of v0.12.0:
 
 | Topic | Exercises | Target | Track | Module files |
 |---|---|---|---|---|
@@ -19,7 +19,7 @@ Exercise counts as of v0.11.0:
 | Networking | 42 | 250 | `networking` | `exercises/networking/` |
 | Cloud & platform | 47 | 250 | `cloud` | `exercises/cloud/` |
 | Data | 27 | 250 | `data` | `exercises/data/` |
-| Defensive security | 30 | 250 | `defensive` | `exercises/defensive/` |
+| Defensive security | 40 | 250 | `defensive` | `exercises/defensive/` |
 | Programming | 45 | 250 | `programming` | `exercises/programming/` |
 | Data science | 43 | 250 | `datascience` | `exercises/datascience/` |
 
@@ -377,13 +377,13 @@ Problems that are rare until they ruin your day. The first three are the suggest
 
 ### Packet capture labs
 
-Only `offsec-for-001` and `net-016` use captures today, both at low difficulty, and the defensive
-track has none. Build the defensive set first. `tshark` isn't on the VMs yet, only `tcpdump`:
-add it to provisioning, pinned like the other packages, and fetch it on first use on existing VMs.
+The defensive set is done in `exercises/defensive/06-network-forensics-and-hardening.yaml`, with
+`tshark` pinned on the offsec VM and fetched on first use by `tshark_ready`. The offsec and
+networking rows are still to do, and the Docker VM doesn't have `tshark` yet.
 
 | Track | Ideas |
 |---|---|
-| **Defensive** | Reconstruct an intrusion from a capture (timeline, attacker's host, what was taken); find DNS tunnelling and recover the data; find C2 beaconing among normal traffic; carve a dropped payload from an HTTP stream; read TLS metadata (SNI, certificates, handshake) without decrypting |
+| **Defensive** | Done: `sec-045` to `sec-049` |
 | **Offsec** | Sniff plaintext credentials on an isolated lab network; ARP spoofing between namespaces, then the defender's view of it; reverse a custom binary protocol from captures |
 | **Networking** | Diagnose faults from captures: retransmissions, zero windows, RST storms and MTU problems |
 

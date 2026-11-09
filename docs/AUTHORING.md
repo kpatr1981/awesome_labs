@@ -73,6 +73,7 @@ control plane, `KUBECONFIG` is `/etc/kubernetes/admin.conf`; the lab user has it
 | `web_target NAME PORT <<PY` | run a stdlib-Python vulnerable target in container `kl-NAME` on 127.0.0.1:PORT (offsec) |
 | `rand_flag` | a fresh `KL{…}` flag token (offsec) |
 | `netns_new NS...`, `netns_link NS1 IF1 NS2 IF2` | network namespaces and veth links, removed on reset |
+| `tshark_ready`, `lan_up NS=ADDR/LEN...`, `cap_start FILE`, `cap_stop`, `lan_down` | install the pinned tshark on older VMs; hosts on one bridge; capture all their traffic; remove the bridge and everything on it (offsec) |
 | `frr_up NAME...`, `frr_link A IFA ADDR B IFB ADDR`, `frr_gw HOST GW` | FRR routers and hosts in containers, joined by veth links (docker host) |
 | `frr_conf R <<EOF`, `frr_json R 'show ...'`, `frr_route R PREFIX`, `frr_ping NODE ADDR` | configure a router, read its state, test reachability |
 | `frr_gw6 HOST GW`, `frr_route6 R PREFIX`, `frr_ping6 NODE ADDR` | the IPv6 versions |
