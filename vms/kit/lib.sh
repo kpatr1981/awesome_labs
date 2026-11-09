@@ -128,14 +128,14 @@ frr_image() {
 frr_start() {
   docker run -d --name "$1" --hostname "$1" --network none --privileged \
     --restart no --entrypoint sh "$FRR_IMAGE" -c \
-    "sed -i 's/^ospfd=no/ospfd=yes/;s/^bgpd=no/bgpd=yes/' /etc/frr/daemons; touch /etc/frr/vtysh.conf; exec /sbin/tini -- /usr/lib/frr/docker-start" >/dev/null
+    "sed -i 's/^ospfd=no/ospfd=yes/;s/^bgpd=no/bgpd=yes/;s/^vrrpd=no/vrrpd=yes/' /etc/frr/daemons; touch /etc/frr/vtysh.conf; exec /sbin/tini -- /usr/lib/frr/docker-start" >/dev/null
 }
 # frr_healthy NAME -> startup finished and every daemon is running
 frr_healthy() {
   docker logs "$1" 2>&1 | awk '/all daemons up/{u=NR} /state -> down|Forked background/{d=NR} END{exit !(u>d)}' || return 1
-  docker exec "$1" sh -c 'ps -o args | grep -q "[w]atchfrr\.sh" && exit 1; for d in zebra mgmtd bgpd ospfd staticd; do pidof $d >/dev/null || exit 1; done'
+  docker exec "$1" sh -c 'ps -o args | grep -q "[w]atchfrr\.sh" && exit 1; for d in zebra mgmtd bgpd ospfd staticd vrrpd; do pidof $d >/dev/null || exit 1; done'
 }
-# frr_up NAME... -> start routers with ospfd and bgpd enabled and forwarding on.
+# frr_up NAME... -> start routers with ospfd, bgpd and vrrpd enabled and forwarding on.
 # At boot watchfrr can restart the daemons and lose zebra for good, which leaves a router
 # that accepts configuration and can't route. No links exist yet, so such a router is
 # simply recreated.

@@ -8,7 +8,7 @@ multi-step scenario and teach a concept, and a smaller catalog after merging thi
 is a good outcome. The parts of this list that the existing exercises don't cover are not
 started.
 
-Exercise counts as of v0.6.0:
+Exercise counts as of v0.7.0:
 
 | Topic | Exercises | Track | Module files |
 |---|---|---|---|
@@ -16,7 +16,7 @@ Exercise counts as of v0.6.0:
 | Kubernetes | 231 | `kubernetes` | `exercises/kubernetes/` |
 | Offensive security | 45 | `offsec` | `exercises/offsec/` |
 | Linux & systems | 30 | `linux` | `exercises/linux/` |
-| Networking | 36 | `networking` | `exercises/networking/` |
+| Networking | 39 | `networking` | `exercises/networking/` |
 | Cloud & platform | 42 | `cloud` | `exercises/cloud/` |
 | Data | 27 | `data` | `exercises/data/` |
 | Defensive security | 30 | `defensive` | `exercises/defensive/` |
@@ -147,8 +147,8 @@ Rescue is the most valuable module: it breaks a throwaway guest and not the lab 
 | **NAT & firewalls** | nftables, SNAT and DNAT, port forwards, conntrack, hairpin NAT |
 | **IPv6** | SLAAC, link-local addresses, neighbor discovery, dual-stack bugs |
 | **OSPF** | Done in `06-dynamic-routing.yaml`: FRR neighbors, areas, costs, timer mismatches, failover |
-| **BGP** | Done in `06-dynamic-routing.yaml`: peering, route filters, path selection, route leaks. Communities not yet covered |
-| **High availability** | VRRP with keepalived, ECMP, anycast services |
+| **BGP** | Done in `06-dynamic-routing.yaml`: peering, route filters, communities, path selection, route leaks |
+| **High availability** | VRRP (FRR's `vrrpd`) and ECMP done in `06-dynamic-routing.yaml`; anycast in `net-035` |
 | **Packet analysis** | `tcpdump` and `tshark`, the TCP handshake, MTU problems, finding faults from captures |
 | **Kubernetes** | Peer Calico with an FRR router over BGP, MetalLB in BGP mode, trace a packet from pod to outside |
 

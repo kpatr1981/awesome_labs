@@ -488,6 +488,9 @@ exercises:
     Peer `r1` with `r2`, and `r2` with `r3`, over the addresses shown, with the AS numbers
     shown. Use router IDs **1.1.1.1**, **2.2.2.2** and **3.3.3.3**.
 
+    A correct session can sit in `Active` for up to two minutes, because BGP waits between
+    connection attempts. `clear bgp *` makes it try again at once.
+
     ## Part 2: Announce the LANs
 
     Each company announces only its own LAN. Every router must hold all three LANs, learned
@@ -499,6 +502,7 @@ exercises:
     `10.3.0.0/24` to **`/lab/as-path.txt`**.
   hints:
   - 'Part 1: `router bgp <your-as>`, then `neighbor <ip> remote-as <their-as>` on each end. `show bgp summary` tells you if it worked.'
+  - 'Part 1: `Active` means it''s still trying. If both ends look right, `clear bgp *` retries now instead of after the connect timer.'
   - 'Part 2: if the session is Established but counts stay at 0 and show (Policy), that''s RFC 8212 at work.'
   - 'Part 2: `network` matches an exact route already in the table, so the mask matters.'
   solution: |
@@ -532,7 +536,7 @@ exercises:
     check_eq "r2 router id" "$(rid r2)" 2.2.2.2
     check_eq "r3 router id" "$(rid r3)" 3.3.3.3
     if [ -n "$(peer r1 172.16.12.2)" ] && [ -n "$(peer r3 172.16.23.1)" ]; then
-      eventually 25 '[ "$(peer r1 172.16.12.2)" = Established ] && [ "$(peer r3 172.16.23.1)" = Established ]' || true
+      eventually 45 '[ "$(peer r1 172.16.12.2)" = Established ] && [ "$(peer r3 172.16.23.1)" = Established ]' || true
     fi
     check_eq "r1 to r2 is Established" "$(peer r1 172.16.12.2)" Established
     check_eq "r2 to r3 is Established" "$(peer r2 172.16.23.2)" Established
@@ -1125,4 +1129,527 @@ exercises:
     e1 passed the ISP next hop unchanged, so a1 could not resolve it
     p1 runs no BGP and had no route to the internet, so e1 now originates a default into OSPF
     e1 did not announce 10.3.0.0/24, so the ISP had no route back
+    EOF
+
+- id: net-053
+  title: Ask the provider nicely
+  difficulty: 4
+  kind: build
+  tags: [bgp, frr, communities, no-export, route-map]
+  tutorial: |
+    **Concept.** A BGP **community** is a label attached to a route. It means nothing by
+    itself: it's a way for one network to tell another what it would like done, and the
+    receiving network's policy decides what happens. A number written as `ASN:value` is
+    conventionally defined by the AS named in it, and providers publish the values they
+    honour.
+
+    *Asking instead of guessing.* Prepending is a blunt request that everyone sees. A
+    community lets you ask one provider for one specific behaviour, such as "treat this as a
+    backup path inside your network".
+
+    *Well-known values.* A few communities mean the same thing everywhere. **no-export**
+    tells a network to keep a route within its own AS and not pass it to its external
+    neighbours.
+
+    *Tags can be overwritten.* A route-map's `set community` replaces what was there unless
+    told to add. A route-map with no matching entry denies the route, so a policy that
+    handles only one prefix silently withdraws the others.
+
+    **Read up on:**
+    - `show bgp ipv4 unicast <prefix>` — communities, local preference and the best path
+    - FRR docs — `set community`, `bgp community-list`, `match ip address prefix-list`
+    - `show bgp ipv4 unicast neighbors <ip> advertised-routes`
+    - `clear bgp ipv4 unicast * soft out` — re-send routes after a policy change
+  scenario: |
+    Your site `s1` (AS 65010) connects to the same provider (AS 65100) at two of its routers.
+    The provider's `x1` peering (AS 65300) leads to the rest of the internet.
+
+    ```
+    10.10.0.0/24, 10.11.0.0/24
+            s1 eth1 172.16.1.2 -- 172.16.1.1 eth1 p1 eth3 172.16.3.1 -- 172.16.3.2 x1
+               eth2 172.16.2.2 -- 172.16.2.1 eth1 p2     (p1 and p2 share an iBGP session)
+    ```
+
+    The provider publishes one policy: routes tagged **`65100:80`** get local preference
+    **80** at the router that receives them. You may change only **`s1`**, and its sessions
+    already work.
+
+    ## Part 1: Make p2 the backup way in
+
+    Your production prefix is `10.10.0.0/24`. When the link to `p1` is up, the provider
+    should carry traffic for it to you through `p1`. Tag the announcement **to `p2` only**,
+    so that `p2`'s best path to it goes over its iBGP session to `p1`.
+
+    ## Part 2: Keep the private prefix inside the provider
+
+    `10.11.0.0/24` is for a service only the provider's own customers may reach. Tag it so
+    that both provider routers keep it and `x1` never receives it.
+
+    ## Part 3: Failover
+
+    If the session to `p1` drops, `p2` must take over for `10.10.0.0/24` by itself, and
+    `10.11.0.0/24` must still stay away from `x1`. The check takes the session down and
+    restores it.
+  hints:
+  - 'Part 1: one route-map, applied outbound on the session to p2, setting `community 65100:80` for the production prefix.'
+  - 'Part 1: a route-map with no matching entry drops the route. Make sure each prefix is matched somewhere in each outbound policy.'
+  - 'Part 2: `no-export` goes on the private prefix in the policies for both sessions.'
+  - 'Run `clear bgp ipv4 unicast * soft out` after changing outbound policy.'
+  solution: |
+    On `s1`:
+
+    ```
+    ip prefix-list PROD seq 5 permit 10.10.0.0/24
+    ip prefix-list PRIVATE seq 5 permit 10.11.0.0/24
+    route-map TO-P2 permit 10
+     match ip address prefix-list PROD
+     set community 65100:80
+    route-map TO-P2 permit 20
+     match ip address prefix-list PRIVATE
+     set community no-export
+    route-map TO-P1 permit 10
+     match ip address prefix-list PRIVATE
+     set community no-export
+    route-map TO-P1 permit 20
+    router bgp 65010
+     address-family ipv4 unicast
+      neighbor 172.16.1.1 route-map TO-P1 out
+      neighbor 172.16.2.1 route-map TO-P2 out
+    ```
+
+    Then `clear bgp ipv4 unicast * soft out`.
+  setup: |
+    frr_up s1 p1 p2 x1
+    frr_link s1 eth1 172.16.1.2/30 p1 eth1 172.16.1.1/30
+    frr_link s1 eth2 172.16.2.2/30 p2 eth1 172.16.2.1/30
+    frr_link p1 eth2 10.0.0.1/30 p2 eth2 10.0.0.2/30
+    frr_link p1 eth3 172.16.3.1/30 x1 eth1 172.16.3.2/30
+    docker exec s1 sh -c 'ip link add lan0 type dummy; ip addr add 10.10.0.1/24 dev lan0; ip link set lan0 up; ip link add lan1 type dummy; ip addr add 10.11.0.1/24 dev lan1; ip link set lan1 up'
+    docker exec x1 sh -c 'ip link add lan0 type dummy; ip addr add 10.30.0.1/24 dev lan0; ip link set lan0 up'
+    frr_conf s1 <<'EOF'
+    router bgp 65010
+     bgp router-id 10.10.10.10
+     no bgp ebgp-requires-policy
+     neighbor 172.16.1.1 remote-as 65100
+     neighbor 172.16.1.1 timers connect 5
+     neighbor 172.16.2.1 remote-as 65100
+     neighbor 172.16.2.1 timers connect 5
+     network 10.10.0.0/24
+     network 10.11.0.0/24
+    EOF
+    for spec in p1:1.1.1.1:172.16.1.2:10.0.0.2 p2:2.2.2.2:172.16.2.2:10.0.0.1; do
+      IFS=: read -r r id cust ibgp <<<"$spec"
+      frr_conf $r <<EOF
+    bgp community-list standard BACKUP permit 65100:80
+    route-map FROM-CUSTOMER permit 10
+     match community BACKUP
+     set local-preference 80
+    route-map FROM-CUSTOMER permit 20
+    router bgp 65100
+     bgp router-id $id
+     no bgp ebgp-requires-policy
+     neighbor $cust remote-as 65010
+     neighbor $cust timers connect 5
+     neighbor $ibgp remote-as 65100
+     neighbor $ibgp timers connect 5
+     address-family ipv4 unicast
+      neighbor $cust route-map FROM-CUSTOMER in
+      neighbor $ibgp next-hop-self
+    EOF
+    done
+    frr_conf p1 <<'EOF'
+    router bgp 65100
+     neighbor 172.16.3.2 remote-as 65300
+     neighbor 172.16.3.2 timers connect 5
+    EOF
+    frr_conf x1 <<'EOF'
+    router bgp 65300
+     bgp router-id 30.30.30.30
+     no bgp ebgp-requires-policy
+     neighbor 172.16.3.1 remote-as 65100
+     neighbor 172.16.3.1 timers connect 5
+     network 10.30.0.0/24
+    EOF
+    all_up() { frr_json "$1" 'show bgp summary json' | jq -e '[.ipv4Unicast.peers[].state] | all(. == "Established")' >/dev/null; }
+    eventually 60 'all_up s1 && all_up p1 && all_up p2 && all_up x1'
+    eventually 30 '[ -n "$(frr_route x1 10.10.0.0/24)" ]'
+    for r in p1 p2 x1; do docker exec $r vtysh -c 'show running-config' | grep -v '^!' | sha256sum >"$KL_STATE/$r.cfg"; done
+  check: |
+    best() { frr_json "$1" "show bgp ipv4 unicast $2 json" | jq -r "[.paths[]? | select(.bestpath.overall==true) | $3][0] // empty"; }
+    p2_via() { best p2 10.10.0.0/24 .peer.peerId; }
+    cfg=$(frr_json s1 'show running-config')
+    info "Part 1: Make p2 the backup way in"
+    if grep -q 'route-map' <<<"$cfg"; then eventually 25 '[ "$(p2_via)" = 10.0.0.1 ] && [ -z "$(frr_route x1 10.11.0.0/24)" ]' || true; fi
+    check_eq "p2 reaches the site through p1" "$(p2_via)" 10.0.0.1
+    check "p2 received the backup tag from s1" 'frr_json p2 "show bgp ipv4 unicast 10.10.0.0/24 json" | jq -e "[.paths[] | select(.peer.peerId==\"172.16.2.2\") | .community.string] | any(contains(\"65100:80\"))"'
+    check_eq "p1 uses the direct path at normal preference" "$(best p1 10.10.0.0/24 .peer.peerId):$(best p1 10.10.0.0/24 '(.locPrf // 100)')" 172.16.1.2:100
+    check_match "x1 still reaches the production prefix" "$(frr_route x1 10.10.0.0/24)" '^bgp'
+
+    info "Part 2: Keep the private prefix inside the provider"
+    check_match "p1 holds the private prefix" "$(frr_route p1 10.11.0.0/24)" '^bgp'
+    check_match "p2 holds the private prefix" "$(frr_route p2 10.11.0.0/24)" '^bgp'
+    check_eq "x1 did not receive the private prefix" "$(frr_route x1 10.11.0.0/24)" ""
+    check "the private prefix carries no-export" 'frr_json p1 "show bgp ipv4 unicast 10.11.0.0/24 json" | jq -e "[.paths[].community.string] | any(test(\"no-?export\"; \"i\"))"'
+
+    info "Part 3: Failover"
+    if [ "$(p2_via)" = 10.0.0.1 ] && [ -z "$(frr_route x1 10.11.0.0/24)" ] && [ -n "$(frr_route p1 10.11.0.0/24)" ]; then
+      printf 'router bgp 65010\n neighbor 172.16.1.1 shutdown\n' | frr_conf s1
+      check "p2 takes over the production prefix" "eventually 20 '[ \"\$(p2_via)\" = 172.16.2.2 ]'"
+      check "x1 still reaches the production prefix" "eventually 20 'frr_route x1 10.10.0.0/24 | grep -q ^bgp'"
+      check_eq "x1 still lacks the private prefix" "$(frr_route x1 10.11.0.0/24)" ""
+      printf 'router bgp 65010\n no neighbor 172.16.1.1 shutdown\n' | frr_conf s1
+      check "traffic returns through p1" "eventually 30 '[ \"\$(p2_via)\" = 10.0.0.1 ]'"
+    else
+      fail "failover test skipped until parts 1 and 2 are right"
+    fi
+    for r in p1 p2 x1; do
+      check "$r was not changed" "[ \"\$(docker exec $r vtysh -c 'show running-config' | grep -v '^!' | sha256sum)\" = \"\$(cat \$KL_STATE/$r.cfg)\" ]"
+    done
+  solve: |
+    frr_conf s1 <<'EOF'
+    ip prefix-list PROD seq 5 permit 10.10.0.0/24
+    ip prefix-list PRIVATE seq 5 permit 10.11.0.0/24
+    route-map TO-P2 permit 10
+     match ip address prefix-list PROD
+     set community 65100:80
+    route-map TO-P2 permit 20
+     match ip address prefix-list PRIVATE
+     set community no-export
+    route-map TO-P1 permit 10
+     match ip address prefix-list PRIVATE
+     set community no-export
+    route-map TO-P1 permit 20
+    router bgp 65010
+     address-family ipv4 unicast
+      neighbor 172.16.1.1 route-map TO-P1 out
+      neighbor 172.16.2.1 route-map TO-P2 out
+    EOF
+    docker exec s1 vtysh -c 'clear bgp ipv4 unicast * soft out' >/dev/null
+
+- id: net-054
+  title: Two paths, both busy
+  difficulty: 4
+  kind: build
+  tags: [bgp, frr, ecmp, multipath, load-balancing]
+  tutorial: |
+    **Concept.** **ECMP** (equal-cost multipath) installs several next hops for one
+    destination so that traffic can use them all. It needs agreement at two layers, and the
+    second is easy to miss.
+
+    *The routing protocol must offer the paths.* BGP normally picks one best path and
+    stops. It will install several only when told how many, and by default only if the AS
+    paths are identical. Paths through two different providers have different AS paths, so
+    they need an explicit relaxation of that rule.
+
+    *The kernel chooses per flow, not per packet.* Splitting one connection across two paths
+    would reorder its packets, so Linux hashes each packet to a next hop. By default it
+    hashes only source and destination addresses, so all traffic between two hosts follows
+    one path, however many paths exist. Including ports in the hash spreads different
+    connections between the same two hosts.
+
+    *Proving it.* The routing table showing two next hops proves only the first layer. To
+    see the second, you have to look at where packets go.
+
+    **Read up on:**
+    - `show ip route 10.4.0.0/24` and `ip route show 10.4.0.0/24` in the container
+    - FRR docs — `maximum-paths`, `bgp bestpath as-path multipath-relax`
+    - `net.ipv4.fib_multipath_hash_policy` in the kernel docs
+    - `traceroute -p` — vary the destination port between runs
+  scenario: |
+    Your router `r1` (AS 65001) has two transit providers, `r2` and `r3`, and both reach
+    the destination network behind `r4`. BGP is running, but all the traffic uses one link
+    while the other sits idle.
+
+    ```
+                   eth1 172.16.12.1 -- r2 (AS 65002) --.
+    h1 10.1.0.10 -- r1                                   r4 (AS 65004) -- h4 10.4.0.10
+                   eth2 172.16.13.1 -- r3 (AS 65003) --'
+    ```
+
+    Change only **`r1`**.
+
+    ## Part 1: Install both paths
+
+    `r1` must install both next hops, `172.16.12.2` and `172.16.13.2`, for `10.4.0.0/24`.
+
+    ## Part 2: Spread the flows
+
+    Different connections between `h1` and `h4` must use different paths. Make `r1`'s kernel
+    include layer-4 ports in its multipath hash.
+
+    ## Part 3: Survive a lost link
+
+    If one uplink fails, traffic must continue over the other, and both must be used again
+    once it recovers. The check takes `eth1` down and brings it back.
+  hints:
+  - 'Part 1: `maximum-paths` belongs under `address-family ipv4 unicast`, and paths through different ASes need a `bgp bestpath` option.'
+  - 'Part 2: this is a sysctl, set inside the r1 container, not a vtysh command.'
+  - 'Part 2: `docker exec h1 traceroute -n -q 1 -m 2 -p 40000 10.4.0.10`, repeated with other ports, shows which way each flow goes.'
+  - 'Part 3: if parts 1 and 2 are right, this needs nothing more.'
+  solution: |
+    On `r1`:
+
+    ```
+    router bgp 65001
+     bgp bestpath as-path multipath-relax
+     address-family ipv4 unicast
+      maximum-paths 2
+    ```
+
+    Then, in the container:
+
+    ```
+    docker exec r1 sysctl -w net.ipv4.fib_multipath_hash_policy=1
+    ```
+  setup: |
+    frr_up r1 r2 r3 r4 h1 h4
+    frr_link r1 eth1 172.16.12.1/30 r2 eth1 172.16.12.2/30
+    frr_link r1 eth2 172.16.13.1/30 r3 eth1 172.16.13.2/30
+    frr_link r2 eth2 172.16.24.1/30 r4 eth1 172.16.24.2/30
+    frr_link r3 eth2 172.16.34.1/30 r4 eth2 172.16.34.2/30
+    frr_link r1 eth0 10.1.0.1/24 h1 eth0 10.1.0.10/24
+    frr_link r4 eth0 10.4.0.1/24 h4 eth0 10.4.0.10/24
+    frr_gw h1 10.1.0.1; frr_gw h4 10.4.0.1
+    frr_conf r1 <<'EOF'
+    router bgp 65001
+     bgp router-id 1.1.1.1
+     no bgp ebgp-requires-policy
+     neighbor 172.16.12.2 remote-as 65002
+     neighbor 172.16.12.2 timers connect 5
+     neighbor 172.16.13.2 remote-as 65003
+     neighbor 172.16.13.2 timers connect 5
+     network 10.1.0.0/24
+    EOF
+    frr_conf r2 <<'EOF'
+    router bgp 65002
+     bgp router-id 2.2.2.2
+     no bgp ebgp-requires-policy
+     neighbor 172.16.12.1 remote-as 65001
+     neighbor 172.16.12.1 timers connect 5
+     neighbor 172.16.24.2 remote-as 65004
+     neighbor 172.16.24.2 timers connect 5
+    EOF
+    frr_conf r3 <<'EOF'
+    router bgp 65003
+     bgp router-id 3.3.3.3
+     no bgp ebgp-requires-policy
+     neighbor 172.16.13.1 remote-as 65001
+     neighbor 172.16.13.1 timers connect 5
+     neighbor 172.16.34.2 remote-as 65004
+     neighbor 172.16.34.2 timers connect 5
+    EOF
+    frr_conf r4 <<'EOF'
+    router bgp 65004
+     bgp router-id 4.4.4.4
+     no bgp ebgp-requires-policy
+     neighbor 172.16.24.1 remote-as 65002
+     neighbor 172.16.24.1 timers connect 5
+     neighbor 172.16.34.1 remote-as 65003
+     neighbor 172.16.34.1 timers connect 5
+     network 10.4.0.0/24
+    EOF
+    all_up() { frr_json "$1" 'show bgp summary json' | jq -e '[.ipv4Unicast.peers[].state] | all(. == "Established")' >/dev/null; }
+    eventually 60 'all_up r1 && all_up r2 && all_up r3 && all_up r4'
+    eventually 30 '[ "$(frr_json r1 "show bgp ipv4 unicast 10.4.0.0/24 json" | jq ".paths | length")" = 2 ]'
+  check: |
+    hops() { frr_json r1 'show ip route 10.4.0.0/24 json' | jq -r '[."10.4.0.0/24"[]? | select(.selected==true) | .nexthops[] | select(.active==true) | .ip] | sort | join(" ")'; }
+    seen() { for p in $(seq 40000 40039); do docker exec h1 traceroute -n -q 1 -w 1 -m 2 -p "$p" 10.4.0.10 2>/dev/null | awk '$1=="2"{print $2}'; done | sort -u | tr '\n' ' '; }
+    both="172.16.12.2 172.16.13.2"
+    cfg=$(frr_json r1 'show running-config')
+    info "Part 1: Install both paths"
+    if grep -q 'maximum-paths' <<<"$cfg"; then eventually 25 '[ "$(hops)" = "$both" ]' || true; fi
+    check_eq "r1 installed both next hops" "$(hops)" "$both"
+    check_match "the route comes from BGP" "$(frr_route r1 10.4.0.0/24)" '^bgp'
+    check "the kernel has both next hops" "[ \"\$(docker exec r1 ip route show 10.4.0.0/24 | grep -c 'nexthop via')\" = 2 ]"
+
+    info "Part 2: Spread the flows"
+    check_eq "the hash includes layer-4 ports" "$(docker exec r1 sysctl -n net.ipv4.fib_multipath_hash_policy)" 1
+    if [ "$(hops)" = "$both" ] && [ "$(docker exec r1 sysctl -n net.ipv4.fib_multipath_hash_policy)" = 1 ]; then
+      s=$(seen)
+      check_match "flows use the path through r2" "$s" '172\.16\.12\.2'
+      check_match "flows use the path through r3" "$s" '172\.16\.13\.2'
+
+      info "Part 3: Survive a lost link"
+      docker exec r1 ip link set eth1 down
+      check "r1 falls back to the other next hop" "eventually 15 '[ \"\$(hops)\" = 172.16.13.2 ]'"
+      check "h1 still reaches h4" "eventually 10 'frr_ping h1 10.4.0.10'"
+      docker exec r1 ip link set eth1 up
+      check "both next hops return" "eventually 30 '[ \"\$(hops)\" = \"\$both\" ]'"
+    else
+      fail "flow and failover tests skipped until parts 1 and 2 are right"
+    fi
+    for r in r2 r3 r4; do
+      check_not "$r was not changed" "docker exec $r vtysh -c 'show running-config' | grep -q 'maximum-paths'"
+    done
+  solve: |
+    frr_conf r1 <<'EOF'
+    router bgp 65001
+     bgp bestpath as-path multipath-relax
+     address-family ipv4 unicast
+      maximum-paths 2
+    EOF
+    docker exec r1 sysctl -qw net.ipv4.fib_multipath_hash_policy=1
+
+- id: net-055
+  title: A gateway that survives its router
+  difficulty: 3
+  kind: build
+  tags: [vrrp, frr, high-availability, failover, arp]
+  tutorial: |
+    **Concept.** Hosts usually have one default gateway address and no idea how to use
+    another. If that router dies, routing protocols can't help the hosts, because they don't
+    speak them. **VRRP** lets two routers share one virtual gateway address, so the address
+    survives when a router doesn't.
+
+    *Roles.* The routers in a group elect a **master** by priority. The master answers for
+    the virtual address and sends regular advertisements. A **backup** stays silent and
+    takes over when the advertisements stop. A recovered router with a higher priority takes
+    the role back, which is called **preemption**.
+
+    *A virtual MAC.* The group has a fixed virtual MAC address derived from its VRID, so a
+    host's ARP entry stays valid when the role moves. In FRR that address lives on a
+    **macvlan** interface, and the backup's copy is held down until it's needed. This lab
+    has created those interfaces for you.
+
+    *Looks working, isn't.* If a backup answers ARP for the virtual address from its real
+    interface, traffic reaches the wrong router and pings still succeed. Check which MAC the
+    host learned.
+
+    **Read up on:**
+    - `show vrrp` — role, priority and timers
+    - FRR docs, VRRP — `vrrp`, `vrrp ... ip`, `vrrp ... priority`, `vrrp ... advertisement-interval`
+    - `docker exec h1 ip neigh` — the MAC behind the gateway address
+    - `docker exec r1 ip -br link` — macvlan state on each router
+  scenario: |
+    `h1` uses `10.1.0.1` as its default gateway, and that address doesn't exist yet. Two routers
+    sit on the LAN, each with its own uplink, and OSPF is already running upstream.
+
+    ```
+                 r1 eth0 10.1.0.2   eth1 10.0.1.1 -- x1 -- h9 10.9.0.10
+    h1 10.1.0.10 --(LAN)--
+                 r2 eth0 10.1.0.3   eth1 10.0.2.1 -- x1
+    ```
+
+    Don't restart the containers. Open a router with `docker exec -it r1 vtysh`.
+
+    ## Part 1: Create the virtual gateway
+
+    Configure **VRRP group 5** on `eth0` of `r1` and `r2` with the virtual address
+    **`10.1.0.1`**. `r1` must be master with priority **200**, `r2` backup at the default
+    priority, and both must advertise every **1000 ms**.
+
+    `h1` must reach `h9`, and its ARP entry for `10.1.0.1` must be the group's virtual MAC,
+    **`00:00:5e:00:01:05`**.
+
+    ## Part 2: Lose the master
+
+    The check takes `r1`'s LAN interface down. `r2` must become master within about **10
+    seconds** and `h1` must keep reaching `h9`. When `r1` returns it must take the role back
+    on its own.
+  hints:
+  - 'Part 1: the commands go under `interface eth0`, and all begin with `vrrp 5`.'
+  - 'Part 1: `show vrrp` should show Master on r1 and Backup on r2. Initialize means the group has no usable interface or address.'
+  - 'Part 2: VRRP preempts by default, so this needs nothing further if part 1 is correct.'
+  solution: |
+    On `r1`:
+
+    ```
+    interface eth0
+     vrrp 5
+     vrrp 5 ip 10.1.0.1
+     vrrp 5 priority 200
+     vrrp 5 advertisement-interval 1000
+    ```
+
+    On `r2` the same, without the priority line.
+  setup: |
+    frr_up r1 r2 x1 sw h1 h9
+    docker exec sw sh -c 'ip link add br0 type bridge; ip link set br0 up'
+    frr_link sw p1 - r1 eth0 10.1.0.2/24
+    frr_link sw p2 - r2 eth0 10.1.0.3/24
+    frr_link sw p3 - h1 eth0 10.1.0.10/24
+    for p in p1 p2 p3; do docker exec sw ip link set $p master br0; done
+    frr_link r1 eth1 10.0.1.1/30 x1 eth1 10.0.1.2/30
+    frr_link r2 eth1 10.0.2.1/30 x1 eth2 10.0.2.2/30
+    frr_link x1 eth0 10.9.0.1/24 h9 eth0 10.9.0.10/24
+    frr_gw h1 10.1.0.1; frr_gw h9 10.9.0.1
+    for r in r1 r2; do
+      pid=$(docker inspect -f '{{.State.Pid}}' $r)
+      nsenter -t "$pid" -n ip link add vrrp4-2-5 link eth0 type macvlan mode bridge
+      nsenter -t "$pid" -n ip link set dev vrrp4-2-5 addrgenmode random
+      nsenter -t "$pid" -n ip link set dev vrrp4-2-5 address 00:00:5e:00:01:05
+      nsenter -t "$pid" -n ip addr add 10.1.0.1/24 dev vrrp4-2-5
+      nsenter -t "$pid" -n ip link set dev vrrp4-2-5 up
+      docker exec $r sysctl -qw net.ipv4.conf.eth0.arp_ignore=1 net.ipv4.conf.eth0.arp_announce=2
+    done
+    i=1
+    for r in r1 r2; do
+      frr_conf $r <<EOF
+    router ospf
+     ospf router-id $i.$i.$i.$i
+    interface eth0
+     ip ospf area 0
+     ip ospf passive
+    interface eth1
+     ip ospf area 0
+     ip ospf network point-to-point
+    EOF
+      i=$((i+1))
+    done
+    frr_conf x1 <<'EOF'
+    router ospf
+     ospf router-id 9.9.9.9
+    interface eth0
+     ip ospf area 0
+     ip ospf passive
+    interface eth1
+     ip ospf area 0
+     ip ospf network point-to-point
+    interface eth2
+     ip ospf area 0
+     ip ospf network point-to-point
+    EOF
+    eventually 45 'frr_route x1 10.1.0.0/24 | grep -q "^ospf" && frr_route r1 10.9.0.0/24 | grep -q "^ospf" && frr_route r2 10.9.0.0/24 | grep -q "^ospf"'
+  check: |
+    vr() { frr_json "$1" 'show vrrp json' | jq -r ".[]? | select(.vrid==5) | $2"; }
+    cfg1=$(frr_json r1 'show running-config')
+    info "Part 1: Create the virtual gateway"
+    if grep -q 'vrrp 5' <<<"$cfg1"; then eventually 15 '[ "$(vr r1 .v4.status)" = Master ] && [ "$(vr r2 .v4.status)" = Backup ]' || true; fi
+    check_eq "r1 is master" "$(vr r1 .v4.status)" Master
+    check_eq "r2 is backup" "$(vr r2 .v4.status)" Backup
+    check_eq "r1 priority is 200" "$(vr r1 .priority)" 200
+    check_eq "r2 keeps the default priority" "$(vr r2 .priority)" 100
+    check_eq "r1 advertises every second" "$(vr r1 .advertisementInterval)" 1000
+    check_eq "r2 advertises every second" "$(vr r2 .advertisementInterval)" 1000
+    check_eq "the group's address is the gateway" "$(vr r1 '.v4.addresses | join(" ")')" 10.1.0.1
+    docker exec h1 ip neigh flush to 10.1.0.1 >/dev/null 2>&1
+    check "h1 reaches h9 through the gateway" "eventually 10 'frr_ping h1 10.9.0.10'"
+    check_match "h1 learned the virtual MAC" "$(docker exec h1 ip neigh show 10.1.0.1 | tr A-F a-f)" '00:00:5e:00:01:05'
+
+    info "Part 2: Lose the master"
+    if [ "$(vr r1 .v4.status)" = Master ] && [ "$(vr r2 .v4.status)" = Backup ] && [ "$(vr r1 .priority)" = 200 ]; then
+      docker exec r1 ip link set eth0 down
+      check "r2 becomes master" "eventually 10 '[ \"\$(vr r2 .v4.status)\" = Master ]'"
+      check "h1 keeps reaching h9" "eventually 15 'frr_ping h1 10.9.0.10'"
+      check_match "the virtual MAC moved with the role" "$(docker exec h1 ip neigh show 10.1.0.1 | tr A-F a-f)" '00:00:5e:00:01:05'
+      docker exec r1 ip link set eth0 up
+      check "r1 takes the role back" "eventually 15 '[ \"\$(vr r1 .v4.status)\" = Master ] && [ \"\$(vr r2 .v4.status)\" = Backup ]'"
+      check "h1 still reaches h9 afterwards" "eventually 15 'frr_ping h1 10.9.0.10'"
+    else
+      fail "failover test skipped until r1 is master at priority 200"
+    fi
+    check_not "h1's gateway was not changed" "docker exec h1 ip route show default | grep -qv 'via 10.1.0.1'"
+  solve: |
+    frr_conf r1 <<'EOF'
+    interface eth0
+     vrrp 5
+     vrrp 5 ip 10.1.0.1
+     vrrp 5 priority 200
+     vrrp 5 advertisement-interval 1000
+    EOF
+    frr_conf r2 <<'EOF'
+    interface eth0
+     vrrp 5
+     vrrp 5 ip 10.1.0.1
+     vrrp 5 advertisement-interval 1000
     EOF
