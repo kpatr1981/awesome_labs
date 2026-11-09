@@ -68,118 +68,175 @@ exercises:
     mv /lab/transfer.new /lab/transfer.sql
 
 - id: data-037
-  title: No more negative balances
-  difficulty: 2
+  title: Teach the database to say no
+  difficulty: 4
   kind: build
-  tags: [postgres, constraint, check, integrity]
+  tags: [postgres, constraint, check, unique, exclusion, integrity]
   tutorial: |
-    **Concept.** Constraints let the database itself refuse invalid data, whichever application writes to it. A CHECK constraint rejects any row for which a boolean expression is not true.
+    **Concept.** Application checks only protect against the code paths that remember to run them, and two concurrent requests can both pass a "does this exist yet?" test. Constraints live with the data: whichever client writes, the database refuses what breaks the rule, and it does so correctly under concurrency.
+
+    PostgreSQL has a ladder of them, each able to express more than the last:
+
+    - A **CHECK** constraint rejects any row for which a boolean expression over that row is false. Existing rows are validated when you add it.
+    - A **UNIQUE** constraint compares values exactly, so `Bob@x.com` and `bob@x.com` count as different. A **unique index on an expression** enforces uniqueness on a normalised form of the value, but existing duplicates have to go first.
+    - An **exclusion constraint** generalises uniqueness: it rejects a row that conflicts with an existing row under operators you choose, such as "same room **and** overlapping time". It is backed by a GiST index. Plain equality on integers or text inside GiST needs the `btree_gist` extension.
+
+    Range types are half-open by default, which is why a booking ending at 10:00 doesn't clash with one starting at 10:00.
 
     **Read up on:**
-    - `ALTER TABLE ... ADD CONSTRAINT ... CHECK` — adding a rule to an existing table
-    - Constraint validation — existing rows are checked when the constraint is added
+    - `ALTER TABLE ... ADD CONSTRAINT ... CHECK`, and constraint names
     - `\d table` in psql — listing a table's constraints
-    - Constraint names — why naming them helps with error messages
+    - `CREATE UNIQUE INDEX` and expression indexes such as `lower(column)`
+    - Unique violations, and `DELETE ... USING` for removing duplicates
+    - Range types such as `tstzrange` and the `&&` (overlaps) operator
+    - `EXCLUDE USING gist` — the syntax of exclusion constraints
+    - The `btree_gist` extension
   scenario: |
     PostgreSQL runs in **`kl-pg`** (`docker exec -it kl-pg psql -U lab -d lab`).
 
-    A bug in the payments service let the **`accounts`** table go overdrawn. The
-    application will be fixed later, but the database must refuse it in the meantime.
+    Three separate bugs have let bad data into three tables. The application will be fixed
+    later, but until then the database itself has to refuse it.
+
+    ## Part 1: No more negative balances
+
+    A bug in the payments service let the **`accounts`** table go overdrawn.
 
     Make PostgreSQL reject any insert or update that leaves `accounts.balance` below zero.
     Keep all existing rows and keep normal updates working.
-  hints:
-    - "`\\d accounts` shows the table and any constraints it already has."
-    - "A CHECK constraint is a table-level rule that takes a boolean expression over the columns."
-    - "Try an update that would go negative inside `BEGIN; ... ROLLBACK;` to prove it is rejected."
-  solution: |
-    ```sql
-    ALTER TABLE accounts ADD CONSTRAINT balance_non_negative CHECK (balance >= 0);
-    ```
-  setup: |
-    pg_start
-    pg_sql <<'SQL'
-    CREATE TABLE accounts (id int PRIMARY KEY, owner text NOT NULL, balance int NOT NULL);
-    INSERT INTO accounts VALUES (1, 'alice', 120), (2, 'bob', 0), (3, 'carol', 3400), (4, 'dave', 75), (5, 'erin', 910);
-    SQL
-    pg_sql 'SELECT sum(balance) FROM accounts' > "$KL_STATE/answer"
-  check: |
-    neg="BEGIN; UPDATE accounts SET balance = -1 WHERE id = 1; ROLLBACK"
-    ins="BEGIN; INSERT INTO accounts VALUES (99, 'zed', -5); ROLLBACK"
-    ok="BEGIN; UPDATE accounts SET balance = balance + 1 WHERE id = 1; ROLLBACK"
-    check_not "an update to a negative balance is rejected" 'pg_sql "$neg"'
-    check_not "an insert with a negative balance is rejected" 'pg_sql "$ins"'
-    check "a normal update still works" 'pg_sql "$ok"'
-    check_eq "no rows were changed" "$(pg_sql "SELECT count(*) || '-' || sum(balance) FROM accounts")" "5-$(cat "$KL_STATE/answer")"
-  solve: |
-    docker exec -i kl-pg psql -h 127.0.0.1 -U lab -d lab -qAt -c "ALTER TABLE accounts ADD CONSTRAINT balance_non_negative CHECK (balance >= 0)"
 
-- id: data-038
-  title: One account per email, however it is typed
-  difficulty: 3
-  kind: build
-  tags: [postgres, unique, index, integrity]
-  tutorial: |
-    **Concept.** A UNIQUE constraint compares values exactly, so `Bob@x.com` and `bob@x.com` count as different. A unique index on an expression can enforce uniqueness on a normalised form of the value.
-
-    **Read up on:**
-    - `CREATE UNIQUE INDEX` — uniqueness without a table constraint
-    - Expression indexes — indexing `lower(column)`
-    - Unique violations — the error you get when the index finds duplicates
-    - `DELETE ... USING` or `row_number()` — removing duplicate rows
-  scenario: |
-    PostgreSQL runs in **`kl-pg`** (`docker exec -it kl-pg psql -U lab -d lab`).
+    ## Part 2: One account per email, however it is typed
 
     The **`users`** table has accounts that were registered twice, once with different
     capitalisation (`user3@example.com` and `USER3@Example.com`).
 
     1. Remove the duplicate registrations, keeping the **oldest** (lowest `id`) of each.
     2. Make PostgreSQL refuse any new email that differs from an existing one only by case.
+
+    ## Part 3: Double-booked meeting rooms
+
+    The **`bookings`** table (`room`, `during`) keeps meeting-room reservations as time
+    ranges. The application checks for clashes before inserting, but two people booking
+    at once still double-book a room.
+
+    Make the database refuse a booking whose time range overlaps another booking of the
+    **same room**. Back-to-back bookings and bookings in different rooms must still work.
+    Keep the existing rows.
   hints:
-    - "`SELECT lower(email), count(*) FROM users GROUP BY 1 HAVING count(*) > 1` lists the clashes."
+    - "A CHECK constraint is a table-level rule that takes a boolean expression over the columns. Try an update that would go negative inside `BEGIN; ... ROLLBACK;` to prove it is rejected."
+    - "`SELECT lower(email), count(*) FROM users GROUP BY 1 HAVING count(*) > 1` lists the clashes. Delete the rows whose id is not the minimum id for their lowercased email."
     - "A unique index can be built on an expression such as `lower(email)`, but only once the duplicates are gone."
-    - "Delete the rows whose id is not the minimum id for their lowercased email."
+    - "A plain UNIQUE index cannot compare ranges for overlap. Look at exclusion constraints: combine an equality test on `room` with the overlap operator on `during`."
+    - "Equality on an integer inside a GiST index needs an extension. `CREATE EXTENSION` can add it."
   solution: |
     ```sql
+    -- Part 1
+    ALTER TABLE accounts ADD CONSTRAINT balance_non_negative CHECK (balance >= 0);
+
+    -- Part 2
     DELETE FROM users u USING users o
      WHERE lower(u.email) = lower(o.email) AND u.id > o.id;
     CREATE UNIQUE INDEX users_email_ci ON users (lower(email));
+
+    -- Part 3
+    CREATE EXTENSION IF NOT EXISTS btree_gist;
+    ALTER TABLE bookings ADD CONSTRAINT no_double_booking
+      EXCLUDE USING gist (room WITH =, during WITH &&);
     ```
   setup: |
     pg_start
+
+    # --- part 1: No more negative balances ---
+    pg_sql <<'SQL'
+    CREATE TABLE accounts (id int PRIMARY KEY, owner text NOT NULL, balance int NOT NULL);
+    INSERT INTO accounts VALUES (1, 'alice', 120), (2, 'bob', 0), (3, 'carol', 3400), (4, 'dave', 75), (5, 'erin', 910);
+    SQL
+    pg_sql 'SELECT sum(balance) FROM accounts' > "$KL_STATE/balance-sum"
+
+    # --- part 2: One account per email, however it is typed ---
     pg_sql <<'SQL'
     CREATE TABLE users (id serial PRIMARY KEY, email text NOT NULL);
     INSERT INTO users (email) SELECT 'user' || g || '@example.com' FROM generate_series(1, 30) g;
     INSERT INTO users (email) SELECT 'USER' || g || '@Example.com' FROM generate_series(1, 6) g;
     SQL
+
+    # --- part 3: Double-booked meeting rooms ---
+    pg_sql <<'SQL'
+    CREATE TABLE bookings (id serial PRIMARY KEY, room int NOT NULL, during tstzrange NOT NULL);
+    INSERT INTO bookings (room, during) VALUES
+      (1, tstzrange('2030-01-01 09:00+00', '2030-01-01 10:00+00')),
+      (1, tstzrange('2030-01-01 10:00+00', '2030-01-01 11:00+00')),
+      (2, tstzrange('2030-01-01 09:00+00', '2030-01-01 11:00+00'));
+    SQL
   check: |
+    info "Part 1: No more negative balances"
+    neg="BEGIN; UPDATE accounts SET balance = -1 WHERE id = 1; ROLLBACK"
+    ins="BEGIN; INSERT INTO accounts VALUES (99, 'zed', -5); ROLLBACK"
+    ok="BEGIN; UPDATE accounts SET balance = balance + 1 WHERE id = 1; ROLLBACK"
+    check_not "an update to a negative balance is rejected" 'pg_sql "$neg"'
+    check_not "an insert with a negative balance is rejected" 'pg_sql "$ins"'
+    check "a normal update still works" 'pg_sql "$ok"'
+    check_eq "no rows were changed" "$(pg_sql "SELECT count(*) || '-' || sum(balance) FROM accounts")" "5-$(cat "$KL_STATE/balance-sum")"
+
+    info "Part 2: One account per email, however it is typed"
     dup="BEGIN; INSERT INTO users (email) VALUES ('USER7@EXAMPLE.COM'); ROLLBACK"
     new="BEGIN; INSERT INTO users (email) VALUES ('brand-new@example.com'); ROLLBACK"
     check_eq "30 distinct users remain" "$(pg_sql 'SELECT count(*) FROM users')" 30
     check_eq "the oldest registrations were kept" "$(pg_sql 'SELECT max(id) FROM users')" 30
     check_not "a case-variant duplicate is rejected" 'pg_sql "$dup"'
     check "a genuinely new email is accepted" 'pg_sql "$new"'
+
+    info "Part 3: Double-booked meeting rooms"
+    clash="BEGIN; INSERT INTO bookings (room, during) VALUES (1, tstzrange('2030-01-01 09:30+00', '2030-01-01 09:45+00')); ROLLBACK"
+    inside="BEGIN; INSERT INTO bookings (room, during) VALUES (2, tstzrange('2030-01-01 08:00+00', '2030-01-01 12:00+00')); ROLLBACK"
+    next="BEGIN; INSERT INTO bookings (room, during) VALUES (1, tstzrange('2030-01-01 11:00+00', '2030-01-01 12:00+00')); ROLLBACK"
+    other="BEGIN; INSERT INTO bookings (room, during) VALUES (3, tstzrange('2030-01-01 09:00+00', '2030-01-01 10:00+00')); ROLLBACK"
+    check_not "an overlapping booking in the same room is rejected" 'pg_sql "$clash"'
+    check_not "a booking that wraps an existing one is rejected" 'pg_sql "$inside"'
+    check "a back-to-back booking is accepted" 'pg_sql "$next"'
+    check "the same hours in another room are accepted" 'pg_sql "$other"'
+    check_eq "the existing bookings were kept" "$(pg_sql 'SELECT count(*) FROM bookings')" 3
   solve: |
+    # --- part 1: No more negative balances ---
+    docker exec -i kl-pg psql -h 127.0.0.1 -U lab -d lab -qAt -c "ALTER TABLE accounts ADD CONSTRAINT balance_non_negative CHECK (balance >= 0)"
+
+    # --- part 2: One account per email, however it is typed ---
     docker exec -i kl-pg psql -h 127.0.0.1 -U lab -d lab -qAt <<'SQL'
     DELETE FROM users u USING users o WHERE lower(u.email) = lower(o.email) AND u.id > o.id;
     CREATE UNIQUE INDEX users_email_ci ON users (lower(email));
     SQL
 
+    # --- part 3: Double-booked meeting rooms ---
+    docker exec -i kl-pg psql -h 127.0.0.1 -U lab -d lab -qAt <<'SQL'
+    CREATE EXTENSION IF NOT EXISTS btree_gist;
+    ALTER TABLE bookings ADD CONSTRAINT no_double_booking EXCLUDE USING gist (room WITH =, during WITH &&);
+    SQL
+
 - id: data-039
-  title: Ten buyers, one lost update
+  title: Ten workers at the same moment
   difficulty: 3
   kind: fix
-  tags: [postgres, concurrency, lost-update, atomic]
+  tags: [postgres, concurrency, lost-update, atomic, queue, skip-locked]
   tutorial: |
-    **Concept.** Reading a value, changing it in the application and writing it back lets concurrent sessions overwrite each other's work. Doing the arithmetic inside the UPDATE makes the database apply every change in turn.
+    **Concept.** Code that is correct for one client can be wrong for ten. The dangerous pattern is any gap between *looking at* a row and *changing* it: another session can act in that gap. Both fixes here close the gap by making the database do the look and the change in one statement.
+
+    **Lost updates.** Reading a value, changing it in the application and writing it back lets concurrent sessions overwrite each other's work. Doing the arithmetic inside the `UPDATE` makes the database apply every change in turn, because the row lock taken by `UPDATE` queues them up and each one sees the previous result.
+
+    **Claiming work.** Several workers can share one table as a queue if each claims a different row. `UPDATE ... RETURNING` claims a row and reports it in one statement. A subquery chooses the row, and that is where the race moves to. `SELECT ... FOR UPDATE` locks the chosen row, and `SKIP LOCKED` lets other workers pass over rows that are already taken instead of waiting.
 
     **Read up on:**
     - Lost updates — how read-modify-write races lose data
     - `UPDATE ... SET col = col - 1` — expressions evaluated by the database
-    - Row locks taken by UPDATE — how concurrent updates queue up
-    - Read Committed isolation — what a statement sees when a row changed under it
+    - Row locks taken by UPDATE, and what Read Committed sees when a row changed under it
+    - `SELECT ... FOR UPDATE SKIP LOCKED` — the queue-consumer locking clause
+    - `UPDATE ... RETURNING` — changing a row and reading it back in one statement
+    - Subqueries in `UPDATE ... WHERE id = (SELECT ...)` — selecting the row to claim
   scenario: |
     PostgreSQL runs in **`kl-pg`** (`docker exec -it kl-pg psql -U lab -d lab`).
+
+    The warehouse service runs fine in testing and misbehaves under real load. Both of the
+    scripts below get fired **ten at a time**.
+
+    ## Part 1: Ten buyers, one lost update
 
     **`/lab/reserve.sh`** reserves one widget: it should lower `stock.qty` by exactly one.
     Under load, buyers keep getting the same stock number and widgets are sold that were
@@ -187,21 +244,45 @@ exercises:
     end up ten lower.
 
     Fix the script so that concurrent reservations never overwrite each other.
+
+    ## Part 2: A job queue without double work
+
+    The table **`jobs`** has 20 rows with `status = 'pending'`. Write
+    **`/lab/claim.sh`**, the script each worker runs. One call must:
+
+    - claim the lowest-numbered pending job, set its status to `running`,
+    - print its `id` (and nothing else), or print nothing when the queue is empty.
+
+    Ten workers will call it at the same moment, and they must each end up with a
+    **different** job.
   hints:
-    - "The script reads `qty` into a shell variable, waits, then writes back a value it computed itself. Anything that changed in between is lost."
-    - "Let PostgreSQL do the subtraction inside the UPDATE statement."
-    - "You can test it yourself by starting several copies with `&` and then `wait`."
+    - "`reserve.sh` reads `qty` into a shell variable, waits, then writes back a value it computed itself. Anything that changed in between is lost, so let PostgreSQL do the subtraction inside the UPDATE statement."
+    - "You can test either script yourself by starting several copies with `&` and then `wait`."
+    - "One `UPDATE jobs SET status = 'running' WHERE id = (...) RETURNING id` can claim and report in one go. The subquery picks the next pending row, ordered by id, `LIMIT 1`."
+    - "Workers that hit the same row will wait on it or grab it twice. Look for a locking clause that skips rows other sessions hold."
   solution: |
-    Replace the read-then-write with a single atomic statement:
+    Replace the read-then-write with a single atomic statement, and claim jobs in one
+    statement that skips locked rows:
 
     ```bash
     cat > /lab/reserve.sh <<'EOF'
     #!/bin/bash
     docker exec kl-pg psql -h 127.0.0.1 -U lab -d lab -qAt -c "UPDATE stock SET qty = qty - 1 WHERE sku = 'widget'"
     EOF
+
+    cat > /lab/claim.sh <<'EOF'
+    #!/bin/bash
+    docker exec kl-pg psql -h 127.0.0.1 -U lab -d lab -qAt -c "
+      UPDATE jobs SET status = 'running'
+       WHERE id = (SELECT id FROM jobs WHERE status = 'pending'
+                    ORDER BY id LIMIT 1 FOR UPDATE SKIP LOCKED)
+      RETURNING id"
+    EOF
     ```
   setup: |
     pg_start
+
+    # --- part 1: Ten buyers, one lost update ---
     pg_sql <<'SQL'
     CREATE TABLE stock (sku text PRIMARY KEY, qty int NOT NULL);
     INSERT INTO stock VALUES ('widget', 100);
@@ -213,65 +294,22 @@ exercises:
     sleep 0.3
     docker exec kl-pg psql -h 127.0.0.1 -U lab -d lab -qAt -c "UPDATE stock SET qty = $((qty - 1)) WHERE sku = 'widget'"
     EOF
+
+    # --- part 2: A job queue without double work ---
+    pg_sql <<'SQL'
+    CREATE TABLE jobs (id serial PRIMARY KEY, status text NOT NULL DEFAULT 'pending');
+    INSERT INTO jobs (status) SELECT 'pending' FROM generate_series(1, 20);
+    SQL
   check: |
+    info "Part 1: Ten buyers, one lost update"
     check "the script still exists" '[ -f /lab/reserve.sh ]'
     check "the script lets the database do the arithmetic" 'grep -Eqi "qty *= *qty *- *1" /lab/reserve.sh'
     pg_sql "UPDATE stock SET qty = 100 WHERE sku = 'widget'" >/dev/null
     for i in $(seq 1 10); do bash /lab/reserve.sh >/dev/null 2>&1 & done
     wait
     check_eq "ten reservations lowered the stock by ten" "$(pg_sql "SELECT qty FROM stock WHERE sku = 'widget'")" 90
-  solve: |
-    cat > /lab/reserve.sh <<'EOF'
-    #!/bin/bash
-    docker exec kl-pg psql -h 127.0.0.1 -U lab -d lab -qAt -c "UPDATE stock SET qty = qty - 1 WHERE sku = 'widget'"
-    EOF
 
-- id: data-040
-  title: A job queue without double work
-  difficulty: 3
-  kind: build
-  tags: [postgres, queue, skip-locked, concurrency]
-  tutorial: |
-    **Concept.** Several workers can share one table as a queue if each claims a different row. `SELECT ... FOR UPDATE` locks the chosen row, and `SKIP LOCKED` lets other workers pass over rows that are already taken instead of waiting.
-
-    **Read up on:**
-    - `SELECT ... FOR UPDATE SKIP LOCKED` — the queue-consumer locking clause
-    - `UPDATE ... RETURNING` — changing a row and reading it back in one statement
-    - Subqueries in `UPDATE ... WHERE id = (SELECT ...)` — selecting the row to claim
-    - Race conditions in "find the next row" queries
-  scenario: |
-    PostgreSQL runs in **`kl-pg`** (`docker exec -it kl-pg psql -U lab -d lab`).
-
-    The table **`jobs`** has 20 rows with `status = 'pending'`. Write
-    **`/lab/claim.sh`**, the script each worker runs. One call must:
-
-    - claim the lowest-numbered pending job, set its status to `running`,
-    - print its `id` (and nothing else), or print nothing when the queue is empty.
-
-    Ten workers will call it at the same moment, and they must each end up with a
-    **different** job.
-  hints:
-    - "One `UPDATE jobs SET status = 'running' WHERE id = (...) RETURNING id` can claim and report in one go."
-    - "The subquery picks the next pending row, ordered by id, `LIMIT 1`."
-    - "Workers that hit the same row will wait on it or grab it twice. Look for a locking clause that skips rows other sessions hold."
-  solution: |
-    ```bash
-    cat > /lab/claim.sh <<'EOF'
-    #!/bin/bash
-    docker exec kl-pg psql -h 127.0.0.1 -U lab -d lab -qAt -c "
-      UPDATE jobs SET status = 'running'
-       WHERE id = (SELECT id FROM jobs WHERE status = 'pending'
-                    ORDER BY id LIMIT 1 FOR UPDATE SKIP LOCKED)
-      RETURNING id"
-    EOF
-    ```
-  setup: |
-    pg_start
-    pg_sql <<'SQL'
-    CREATE TABLE jobs (id serial PRIMARY KEY, status text NOT NULL DEFAULT 'pending');
-    INSERT INTO jobs (status) SELECT 'pending' FROM generate_series(1, 20);
-    SQL
-  check: |
+    info "Part 2: A job queue without double work"
     check "claim.sh exists" '[ -f /lab/claim.sh ]'
     pg_sql "UPDATE jobs SET status = 'pending'" >/dev/null
     rm -f "$KL_STATE"/claim.*
@@ -282,6 +320,13 @@ exercises:
     check_eq "ten jobs are now running" "$(pg_sql "SELECT count(*) FROM jobs WHERE status = 'running'")" 10
     check_eq "ten jobs are still pending" "$(pg_sql "SELECT count(*) FROM jobs WHERE status = 'pending'")" 10
   solve: |
+    # --- part 1: Ten buyers, one lost update ---
+    cat > /lab/reserve.sh <<'EOF'
+    #!/bin/bash
+    docker exec kl-pg psql -h 127.0.0.1 -U lab -d lab -qAt -c "UPDATE stock SET qty = qty - 1 WHERE sku = 'widget'"
+    EOF
+
+    # --- part 2: A job queue without double work ---
     cat > /lab/claim.sh <<'EOF'
     #!/bin/bash
     docker exec kl-pg psql -h 127.0.0.1 -U lab -d lab -qAt -c "
@@ -292,34 +337,65 @@ exercises:
     EOF
 
 - id: data-041
-  title: Two transfers, one deadlock
+  title: Locks that wait forever, locks that deadlock
   difficulty: 4
   kind: fix
-  tags: [postgres, deadlock, locking, ordering]
+  tags: [postgres, locks, deadlock, ordering, pg_stat_activity, operations]
   tutorial: |
-    **Concept.** A deadlock happens when two transactions each hold a lock the other needs. PostgreSQL detects it and aborts one transaction. The standard cure is to make every transaction take its locks in the same order.
+    **Concept.** Row locks are held until the transaction ends, and that one rule produces two different kinds of trouble.
+
+    **Waiting behind someone.** A transaction that stays open keeps its locks, and every other session that wants the same row queues behind it, forever if nothing changes. The database can't call that a problem, because the holder might commit any moment. Operators find the culprit in the activity views and end it with a backend-termination function. Ending a session rolls its open transaction back.
+
+    **Waiting in a circle.** A deadlock happens when two transactions each hold a lock the other needs. This one PostgreSQL does detect: after `deadlock_timeout` it aborts one of them. Killing a session doesn't cure it, because the same code deadlocks again next time. The standard cure is to make every transaction take its locks in the same order, so a cycle becomes impossible.
 
     **Read up on:**
+    - `pg_stat_activity` — one row per backend, with its state and current query
+    - `pg_locks` and `pg_blocking_pids()` — who is waiting for whom
+    - `pg_cancel_backend()` versus `pg_terminate_backend()`
+    - `lock_timeout` — making a statement give up instead of waiting forever
     - Deadlocks in the PostgreSQL docs, section "Explicit Locking"
     - `deadlock_timeout` — how long the server waits before checking
-    - Row-level locks taken by `UPDATE`
     - Lock ordering — a global rule that makes cycles impossible
   scenario: |
     PostgreSQL runs in **`kl-pg`** (`docker exec -it kl-pg psql -U lab -d lab`).
 
+    Two lock problems have landed on the on-call rota this week, one in each of two
+    tables.
+
+    ## Part 1: The forgotten transaction
+
+    Every update to account 1 in the **`savings`** table hangs. Someone ran a maintenance
+    session that touched that row and never finished.
+
+    Find that session and end it so updates to the row go through again. Do not restart
+    the container, and do not change any data: the abandoned session's work must be
+    rolled back, not committed.
+
+    ## Part 2: Two transfers, one deadlock
+
     Two batch jobs, **`/lab/t1.sql`** and **`/lab/t2.sql`**, each add 10 to both account 1
-    and account 2 inside a transaction. When they run at the same time one of them dies
-    with `deadlock detected`.
+    and account 2 of the **`accounts`** table inside a transaction. When they run at the
+    same time one of them dies with `deadlock detected`.
 
     Change the scripts so they can run together and both finish. Each must still apply
     both updates in a single transaction.
   hints:
-    - "Run both at once with `docker exec -i kl-pg psql -U lab -d lab < /lab/t1.sql &` and the same for t2, then `wait`."
-    - "Compare the order in which each script touches the rows."
-    - "Whichever order you choose, both scripts must use the same one."
+    - "Try `SET lock_timeout = '2s'; UPDATE savings SET balance = balance WHERE id = 1;` to see the hang without blocking your terminal."
+    - "`SELECT pid, state, query FROM pg_stat_activity WHERE datname = 'lab';` lists the sessions. `pg_terminate_backend(pid)` ends one. Do not terminate your own."
+    - "Run both batch jobs at once with `docker exec -i kl-pg psql -U lab -d lab < /lab/t1.sql &` and the same for t2, then `wait`."
+    - "Compare the order in which each script touches the rows. Whichever order you choose, both scripts must use the same one."
   solution: |
-    `t1.sql` locks account 1 then 2, `t2.sql` locks 2 then 1, so each can end up waiting
-    for the other. Make `t2.sql` lock account 1 first too:
+    Part 1: find the session and end it. Ending it rolls its open transaction back, which
+    releases the lock.
+
+    ```sql
+    SELECT pid, state, query FROM pg_stat_activity WHERE datname = 'lab' AND pid <> pg_backend_pid();
+    SELECT pg_terminate_backend(pid) FROM pg_stat_activity
+     WHERE datname = 'lab' AND pid <> pg_backend_pid() AND query LIKE '%pg_sleep(3600)%';
+    ```
+
+    Part 2: `t1.sql` locks account 1 then 2, `t2.sql` locks 2 then 1, so each can end up
+    waiting for the other. Make `t2.sql` lock account 1 first too:
 
     ```bash
     cat > /lab/t2.sql <<'EOF'
@@ -332,6 +408,19 @@ exercises:
     ```
   setup: |
     pg_start
+
+    # --- part 1: The forgotten transaction ---
+    pg_sql <<'SQL'
+    CREATE TABLE savings (id int PRIMARY KEY, balance int NOT NULL);
+    INSERT INTO savings VALUES (1, 500), (2, 500), (3, 500);
+    SQL
+    docker exec -d kl-pg psql -h 127.0.0.1 -U lab -d lab -c "BEGIN; UPDATE savings SET balance = balance + 1 WHERE id = 1; SELECT pg_sleep(3600)"
+    held() { [ "$(pg_sql "SELECT count(*) FROM pg_stat_activity WHERE query LIKE '%pg_sleep(3600)%' AND pid <> pg_backend_pid()")" -ge 1 ]; }
+    eventually 30 held
+    sleep 1
+    docker inspect -f '{{.State.StartedAt}}' kl-pg > "$KL_STATE/started-at"
+
+    # --- part 2: Two transfers, one deadlock ---
     pg_sql <<'SQL'
     CREATE TABLE accounts (id int PRIMARY KEY, balance int NOT NULL);
     INSERT INTO accounts VALUES (1, 1000), (2, 1000);
@@ -351,6 +440,14 @@ exercises:
     COMMIT;
     EOF
   check: |
+    info "Part 1: The forgotten transaction"
+    sql="SET lock_timeout = '2s'; UPDATE savings SET balance = balance WHERE id = 1"
+    check_eq "the container was not restarted" "$(docker inspect -f '{{.State.StartedAt}}' kl-pg)" "$(cat "$KL_STATE/started-at")"
+    check "updating account 1 no longer blocks" 'pg_sql "$sql"'
+    check_eq "the abandoned change was rolled back" "$(pg_sql 'SELECT balance FROM savings WHERE id = 1')" 500
+    check_eq "the other accounts are untouched" "$(pg_sql 'SELECT sum(balance) FROM savings')" 1500
+
+    info "Part 2: Two transfers, one deadlock"
     check "both scripts exist" '[ -f /lab/t1.sql ] && [ -f /lab/t2.sql ]'
     pg_sql 'UPDATE accounts SET balance = 1000' >/dev/null
     pg_sql < /lab/t1.sql >"$KL_STATE/t1.out" 2>&1 & p1=$!
@@ -362,6 +459,10 @@ exercises:
     check_not "no deadlock was reported" 'cat "$KL_STATE/t1.out" "$KL_STATE/t2.out" | grep -qi deadlock'
     check_eq "both updates of both scripts were applied" "$(pg_sql "SELECT string_agg(balance::text, ',' ORDER BY id) FROM accounts")" "1020,1020"
   solve: |
+    # --- part 1: The forgotten transaction ---
+    docker exec -i kl-pg psql -h 127.0.0.1 -U lab -d lab -qAt -c "SELECT pg_terminate_backend(pid) FROM pg_stat_activity WHERE datname = 'lab' AND pid <> pg_backend_pid() AND query LIKE '%pg_sleep(3600)%'"
+
+    # --- part 2: Two transfers, one deadlock ---
     cat > /lab/t2.sql <<'EOF'
     BEGIN;
     UPDATE accounts SET balance = balance + 10 WHERE id = 1;
@@ -369,117 +470,6 @@ exercises:
     UPDATE accounts SET balance = balance + 10 WHERE id = 2;
     COMMIT;
     EOF
-
-- id: data-042
-  title: The forgotten transaction
-  difficulty: 3
-  kind: fix
-  tags: [postgres, locks, pg_stat_activity, operations]
-  tutorial: |
-    **Concept.** A transaction that stays open keeps its row locks until it ends. Every other session that wants the same row waits behind it. Operators find the culprit in the activity views and end it with a backend-termination function.
-
-    **Read up on:**
-    - `pg_stat_activity` — one row per backend, with its state and current query
-    - `pg_locks` and `pg_blocking_pids()` — who is waiting for whom
-    - `pg_cancel_backend()` versus `pg_terminate_backend()`
-    - `lock_timeout` — making a statement give up instead of waiting forever
-  scenario: |
-    PostgreSQL runs in **`kl-pg`** (`docker exec -it kl-pg psql -U lab -d lab`).
-
-    Every update to account 1 in the **`accounts`** table hangs. Someone ran a maintenance
-    session that touched that row and never finished.
-
-    Find that session and end it so updates to the row go through again. Do not restart
-    the container, and do not change any data: the abandoned session's work must be
-    rolled back, not committed.
-  hints:
-    - "Try `SET lock_timeout = '2s'; UPDATE accounts SET balance = balance WHERE id = 1;` to see the hang without blocking your terminal."
-    - "`SELECT pid, state, query FROM pg_stat_activity WHERE datname = 'lab';` lists the sessions."
-    - "`pg_terminate_backend(pid)` ends a session. Do not terminate your own."
-  solution: |
-    ```sql
-    SELECT pid, state, query FROM pg_stat_activity WHERE datname = 'lab' AND pid <> pg_backend_pid();
-    SELECT pg_terminate_backend(pid) FROM pg_stat_activity
-     WHERE datname = 'lab' AND pid <> pg_backend_pid() AND query LIKE '%pg_sleep(3600)%';
-    ```
-    Ending the session rolls its open transaction back, which releases the lock.
-  setup: |
-    pg_start
-    pg_sql <<'SQL'
-    CREATE TABLE accounts (id int PRIMARY KEY, balance int NOT NULL);
-    INSERT INTO accounts VALUES (1, 500), (2, 500), (3, 500);
-    SQL
-    docker exec -d kl-pg psql -h 127.0.0.1 -U lab -d lab -c "BEGIN; UPDATE accounts SET balance = balance + 1 WHERE id = 1; SELECT pg_sleep(3600)"
-    held() { [ "$(pg_sql "SELECT count(*) FROM pg_stat_activity WHERE query LIKE '%pg_sleep(3600)%' AND pid <> pg_backend_pid()")" -ge 1 ]; }
-    eventually 30 held
-    sleep 1
-    docker inspect -f '{{.State.StartedAt}}' kl-pg > "$KL_STATE/answer"
-  check: |
-    sql="SET lock_timeout = '2s'; UPDATE accounts SET balance = balance WHERE id = 1"
-    check_eq "the container was not restarted" "$(docker inspect -f '{{.State.StartedAt}}' kl-pg)" "$(cat "$KL_STATE/answer")"
-    check "updating account 1 no longer blocks" 'pg_sql "$sql"'
-    check_eq "the abandoned change was rolled back" "$(pg_sql 'SELECT balance FROM accounts WHERE id = 1')" 500
-    check_eq "the other accounts are untouched" "$(pg_sql 'SELECT sum(balance) FROM accounts')" 1500
-  solve: |
-    docker exec -i kl-pg psql -h 127.0.0.1 -U lab -d lab -qAt -c "SELECT pg_terminate_backend(pid) FROM pg_stat_activity WHERE datname = 'lab' AND pid <> pg_backend_pid() AND query LIKE '%pg_sleep(3600)%'"
-
-- id: data-043
-  title: Double-booked meeting rooms
-  difficulty: 4
-  kind: build
-  tags: [postgres, exclusion, constraint, ranges]
-  tutorial: |
-    **Concept.** A UNIQUE constraint can only forbid equal values. To forbid overlapping time ranges you need an exclusion constraint, which rejects a row when it conflicts with an existing row under operators you choose. It is backed by a GiST index.
-
-    **Read up on:**
-    - Range types such as `tstzrange` and the `&&` (overlaps) operator
-    - `EXCLUDE USING gist` — the syntax of exclusion constraints
-    - The `btree_gist` extension — GiST support for plain equality on integers and text
-    - Half-open ranges — why a booking ending at 10:00 does not clash with one starting at 10:00
-  scenario: |
-    PostgreSQL runs in **`kl-pg`** (`docker exec -it kl-pg psql -U lab -d lab`).
-
-    The **`bookings`** table (`room`, `during`) keeps meeting-room reservations as time
-    ranges. The application checks for clashes before inserting, but two people booking
-    at once still double-book a room.
-
-    Make the database refuse a booking whose time range overlaps another booking of the
-    **same room**. Back-to-back bookings and bookings in different rooms must still work.
-    Keep the existing rows.
-  hints:
-    - "A plain UNIQUE index cannot compare ranges for overlap. Look at exclusion constraints."
-    - "The constraint combines an equality test on `room` with the overlap operator on `during`."
-    - "Equality on an integer inside a GiST index needs an extension. `CREATE EXTENSION` can add it."
-  solution: |
-    ```sql
-    CREATE EXTENSION IF NOT EXISTS btree_gist;
-    ALTER TABLE bookings ADD CONSTRAINT no_double_booking
-      EXCLUDE USING gist (room WITH =, during WITH &&);
-    ```
-  setup: |
-    pg_start
-    pg_sql <<'SQL'
-    CREATE TABLE bookings (id serial PRIMARY KEY, room int NOT NULL, during tstzrange NOT NULL);
-    INSERT INTO bookings (room, during) VALUES
-      (1, tstzrange('2030-01-01 09:00+00', '2030-01-01 10:00+00')),
-      (1, tstzrange('2030-01-01 10:00+00', '2030-01-01 11:00+00')),
-      (2, tstzrange('2030-01-01 09:00+00', '2030-01-01 11:00+00'));
-    SQL
-  check: |
-    clash="BEGIN; INSERT INTO bookings (room, during) VALUES (1, tstzrange('2030-01-01 09:30+00', '2030-01-01 09:45+00')); ROLLBACK"
-    inside="BEGIN; INSERT INTO bookings (room, during) VALUES (2, tstzrange('2030-01-01 08:00+00', '2030-01-01 12:00+00')); ROLLBACK"
-    next="BEGIN; INSERT INTO bookings (room, during) VALUES (1, tstzrange('2030-01-01 11:00+00', '2030-01-01 12:00+00')); ROLLBACK"
-    other="BEGIN; INSERT INTO bookings (room, during) VALUES (3, tstzrange('2030-01-01 09:00+00', '2030-01-01 10:00+00')); ROLLBACK"
-    check_not "an overlapping booking in the same room is rejected" 'pg_sql "$clash"'
-    check_not "a booking that wraps an existing one is rejected" 'pg_sql "$inside"'
-    check "a back-to-back booking is accepted" 'pg_sql "$next"'
-    check "the same hours in another room are accepted" 'pg_sql "$other"'
-    check_eq "the existing bookings were kept" "$(pg_sql 'SELECT count(*) FROM bookings')" 3
-  solve: |
-    docker exec -i kl-pg psql -h 127.0.0.1 -U lab -d lab -qAt <<'SQL'
-    CREATE EXTENSION IF NOT EXISTS btree_gist;
-    ALTER TABLE bookings ADD CONSTRAINT no_double_booking EXCLUDE USING gist (room WITH =, during WITH &&);
-    SQL
 
 - id: data-044
   title: Nobody left on call

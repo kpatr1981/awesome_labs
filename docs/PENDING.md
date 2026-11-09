@@ -14,14 +14,14 @@ Exercise counts as of v0.5.0:
 |---|---|---|---|
 | Docker | 149 | `docker` | `exercises/docker/` |
 | Kubernetes | 231 | `kubernetes` | `exercises/kubernetes/` |
-| Offensive security | 70 | `offsec` | `exercises/offsec/` |
-| Linux & systems | 45 | `linux` | `exercises/linux/` |
-| Networking | 45 | `networking` | `exercises/networking/` |
-| Cloud & platform | 45 | `cloud` | `exercises/cloud/` |
-| Data | 45 | `data` | `exercises/data/` |
-| Defensive security | 45 | `defensive` | `exercises/defensive/` |
+| Offensive security | 45 | `offsec` | `exercises/offsec/` |
+| Linux & systems | 30 | `linux` | `exercises/linux/` |
+| Networking | 29 | `networking` | `exercises/networking/` |
+| Cloud & platform | 42 | `cloud` | `exercises/cloud/` |
+| Data | 27 | `data` | `exercises/data/` |
+| Defensive security | 30 | `defensive` | `exercises/defensive/` |
 | Programming | 45 | `programming` | `exercises/programming/` |
-| Data science | 45 | `datascience` | `exercises/datascience/` |
+| Data science | 43 | `datascience` | `exercises/datascience/` |
 
 - [Suggested order](#suggested-order)
 - [Shared lab foundations](#shared-lab-foundations)
@@ -280,7 +280,7 @@ Moto only emulates the API, so these limits apply:
 
 ### Offensive security modules
 
-The track has 70 exercises so far.
+The track has 45 exercises so far.
 
 - **Network and credentials:** enumeration, service misconfigurations, hash cracking,
   pivoting between containers.

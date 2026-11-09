@@ -81,52 +81,102 @@ exercises:
     aws s3api put-bucket-policy --bucket kl-audit --policy file:///lab/policy.json
 
 - id: cloud-017
-  title: The payments key stopped working
+  title: The payments key and the plain password
   difficulty: 2
   kind: fix
-  tags: [aws, kms, encryption]
+  tags: [aws, kms, ssm, parameter-store, secrets, encryption]
   tutorial: |
-    **Concept.** A KMS key has a lifecycle state, and an alias is just a friendly name pointing at a key. Data encrypted under a key needs that same key, so replacing it is rarely the answer. Rotation is a separate per-key setting.
+    **Concept.** Encryption in AWS is mostly a question of which key, and whether that key is usable. A KMS key has a lifecycle state, and an alias is just a friendly name pointing at a key. Data encrypted under a key needs that same key, so replacing it is rarely the answer, and rotation is a separate per-key setting. SSM Parameter Store builds on this: a parameter is a plain String, a StringList or an encrypted SecureString, the type is chosen when it is written, and a SecureString is encrypted under a KMS key, the default one unless you name another. Reading an encrypted value back requires asking for decryption.
 
     **Read up on:**
     - `aws kms describe-key` — the key state and metadata, using an alias or key ID
     - `aws kms list-aliases` — which key an alias points at
     - `aws kms enable-key` and `disable-key`
     - `aws kms get-key-rotation-status` and `enable-key-rotation`
+    - `aws ssm put-parameter help` — `--type`, `--key-id`, `--overwrite` and `--value`
+    - `aws ssm get-parameter` and `--with-decryption`
+    - `aws ssm get-parameters-by-path` — list a whole hierarchy
+    - `aws ssm describe-parameters` — see types and keys without values
   scenario: |
-    The `aws` command talks to a local emulator.
+    The `aws` command talks to a local emulator. A security review of the payments service
+    found two problems.
+
+    ## Part 1: Revive the key
 
     The application encrypts with the alias **`alias/payments`**, and its calls are being
     rejected. Security also wants **automatic key rotation** on this key.
 
     Existing data is encrypted under the current key, so do **not** replace it or point
     the alias somewhere else.
+
+    ## Part 2: Encrypt the password
+
+    Under the path **`/app/prod/`** there are two parameters: `db_host` and `db_password`.
+    The password is currently readable by anyone who can list parameters, because it
+    is stored unencrypted.
+
+    Store **`/app/prod/db_password`** as an encrypted parameter, encrypted under
+    **`alias/payments`** and keeping **exactly the same value**. Leave `db_host` alone.
   hints:
-    - "`aws kms describe-key --key-id alias/payments` shows the key's state."
-    - "A key that is not in the Enabled state cannot be used for encryption."
-    - "Rotation is switched on per key with `enable-key-rotation`."
+    - "Part 1: `aws kms describe-key --key-id alias/payments` shows the key's state."
+    - "Part 1: a key that is not in the Enabled state cannot be used for encryption."
+    - "Part 1: rotation is switched on per key with `enable-key-rotation`."
+    - "Part 2: `aws ssm describe-parameters` shows the type of each parameter."
+    - "Part 2: you can read the current value with `aws ssm get-parameter --name ... --with-decryption`."
+    - "Part 2: writing a parameter that already exists needs `--overwrite`, and `--key-id` chooses the key."
   solution: |
+    The key is disabled. Enable it and switch on rotation, keeping the same key and alias:
+
     ```bash
     KEY=$(aws kms describe-key --key-id alias/payments --query KeyMetadata.KeyId --output text)
     aws kms enable-key --key-id "$KEY"
     aws kms enable-key-rotation --key-id "$KEY"
     aws kms get-key-rotation-status --key-id "$KEY"
     ```
+
+    Then rewrite the password as a SecureString under that key:
+
+    ```bash
+    PW=$(aws ssm get-parameter --name /app/prod/db_password --with-decryption --query Parameter.Value --output text)
+    aws ssm put-parameter --name /app/prod/db_password --type SecureString --key-id alias/payments --value "$PW" --overwrite
+    ```
   setup: |
     moto_start
+
+    # --- part 1: Revive the key ---
     key=$(aws kms create-key --description "payments data key" --query KeyMetadata.KeyId --output text)
     aws kms create-alias --alias-name alias/payments --target-key-id "$key"
     aws kms disable-key --key-id "$key"
-    echo "$key" > "$KL_STATE/answer"
+    echo "$key" > "$KL_STATE/payments_key"
+
+    # --- part 2: Encrypt the password ---
+    pw="pw-$RANDOM$RANDOM"
+    echo "$pw" > "$KL_STATE/db_password"
+    aws ssm put-parameter --name /app/prod/db_host --type String --value db.internal >/dev/null
+    aws ssm put-parameter --name /app/prod/db_password --type String --value "$pw" >/dev/null
   check: |
-    key=$(cat "$KL_STATE/answer")
+    key=$(cat "$KL_STATE/payments_key")
+    pw=$(cat "$KL_STATE/db_password")
+
+    info "Part 1: Revive the key"
     check_eq "alias still points at the original key" "$(aws kms describe-key --key-id alias/payments --query KeyMetadata.KeyId --output text 2>/dev/null)" "$key"
     check_eq "the key is enabled" "$(aws kms describe-key --key-id "$key" --query KeyMetadata.KeyState --output text 2>/dev/null)" Enabled
     check_eq "rotation is on" "$(aws kms get-key-rotation-status --key-id "$key" --query KeyRotationEnabled --output text 2>/dev/null)" True
+
+    info "Part 2: Encrypt the password"
+    check_eq "db_password is a SecureString" "$(aws ssm get-parameter --name /app/prod/db_password --query Parameter.Type --output text 2>/dev/null)" SecureString
+    check_match "db_password is encrypted under the payments key" "$(aws ssm describe-parameters --query "Parameters[?Name=='/app/prod/db_password'].KeyId | [0]" --output text 2>/dev/null)" "(alias/payments|$key)\$"
+    check_eq "the value is unchanged" "$(aws ssm get-parameter --name /app/prod/db_password --with-decryption --query Parameter.Value --output text 2>/dev/null)" "$pw"
+    check_eq "db_host is untouched" "$(aws ssm get-parameter --name /app/prod/db_host --query '[Parameter.Type,Parameter.Value]' --output text 2>/dev/null | tr '\t' ' ')" "String db.internal"
   solve: |
+    # --- part 1: Revive the key ---
     KEY=$(aws kms describe-key --key-id alias/payments --query KeyMetadata.KeyId --output text)
     aws kms enable-key --key-id "$KEY"
     aws kms enable-key-rotation --key-id "$KEY"
+
+    # --- part 2: Encrypt the password ---
+    PW=$(aws ssm get-parameter --name /app/prod/db_password --with-decryption --query Parameter.Value --output text)
+    aws ssm put-parameter --name /app/prod/db_password --type SecureString --key-id alias/payments --value "$PW" --overwrite
 
 - id: cloud-018
   title: Name the application
@@ -327,52 +377,6 @@ exercises:
     URL=$(aws sqs get-queue-url --queue-name order-events --query QueueUrl --output text)
     QARN=$(aws sqs get-queue-attributes --queue-url "$URL" --attribute-names QueueArn --query Attributes.QueueArn --output text)
     aws events put-targets --rule orders-placed --targets "Id=queue,Arn=$QARN"
-
-- id: cloud-021
-  title: A password in plain sight
-  difficulty: 2
-  kind: fix
-  tags: [aws, ssm, parameter-store, secrets]
-  tutorial: |
-    **Concept.** SSM Parameter Store keeps configuration under hierarchical names. A parameter is a plain String, a StringList or an encrypted SecureString, and the type is chosen when it is written. Reading an encrypted value back requires asking for decryption.
-
-    **Read up on:**
-    - `aws ssm put-parameter help` — `--type`, `--overwrite` and `--value`
-    - `aws ssm get-parameter` and `--with-decryption`
-    - `aws ssm get-parameters-by-path` — list a whole hierarchy
-    - `aws ssm describe-parameters` — see types without values
-  scenario: |
-    The `aws` command talks to a local emulator.
-
-    Under the path **`/app/prod/`** there are two parameters: `db_host` and `db_password`.
-    The password is currently readable by anyone who can list parameters, because it
-    is stored unencrypted.
-
-    Store **`/app/prod/db_password`** as an encrypted parameter, keeping **exactly the same
-    value**, and leave `db_host` alone.
-  hints:
-    - "`aws ssm describe-parameters` shows the type of each parameter."
-    - "You can read the current value with `aws ssm get-parameter --name ... --with-decryption`."
-    - "Writing a parameter that already exists needs `--overwrite`."
-  solution: |
-    ```bash
-    PW=$(aws ssm get-parameter --name /app/prod/db_password --with-decryption --query Parameter.Value --output text)
-    aws ssm put-parameter --name /app/prod/db_password --type SecureString --value "$PW" --overwrite
-    ```
-  setup: |
-    moto_start
-    pw="pw-$RANDOM$RANDOM"
-    echo "$pw" > "$KL_STATE/answer"
-    aws ssm put-parameter --name /app/prod/db_host --type String --value db.internal >/dev/null
-    aws ssm put-parameter --name /app/prod/db_password --type String --value "$pw" >/dev/null
-  check: |
-    pw=$(cat "$KL_STATE/answer")
-    check_eq "db_password is a SecureString" "$(aws ssm get-parameter --name /app/prod/db_password --query Parameter.Type --output text 2>/dev/null)" SecureString
-    check_eq "the value is unchanged" "$(aws ssm get-parameter --name /app/prod/db_password --with-decryption --query Parameter.Value --output text 2>/dev/null)" "$pw"
-    check_eq "db_host is untouched" "$(aws ssm get-parameter --name /app/prod/db_host --query '[Parameter.Type,Parameter.Value]' --output text 2>/dev/null | tr '\t' ' ')" "String db.internal"
-  solve: |
-    PW=$(aws ssm get-parameter --name /app/prod/db_password --with-decryption --query Parameter.Value --output text)
-    aws ssm put-parameter --name /app/prod/db_password --type SecureString --value "$PW" --overwrite
 
 - id: cloud-022
   title: Who owns these servers

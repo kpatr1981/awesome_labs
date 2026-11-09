@@ -73,65 +73,128 @@ exercises:
     tcpdump -nn -A -r /lab/capture.pcap 2>/dev/null | grep -ao 'GET [^ ]*' | tail -1 | cut -d' ' -f2 > /lab/notfound.txt
 
 - id: net-017
-  title: Big downloads hang
+  title: The errors that never come back
   difficulty: 4
   kind: fix
-  tags: [mtu, pmtud, icmp, nftables, netns]
+  tags: [traceroute, routing, mtu, pmtud, icmp, nftables, netns]
   tutorial: |
-    **Concept.** Every link has a maximum frame size. Hosts discover the smallest size on a path when a router drops an oversized packet and sends back an ICMP error telling the sender to shrink. If that error never arrives, small packets still work while full-sized ones silently vanish.
+    **Concept.** Much of what we know about a network path, we learn from ICMP errors that routers send back to the source. Two everyday tools and mechanisms depend on those errors arriving:
+
+    - **`traceroute`** sends probes with growing TTL. Each router that drops one answers with an ICMP error from its own address. A line of stars means no reply came back, which can be caused by the router, or by the way back from that router.
+    - **Path MTU discovery.** Every link has a maximum frame size. A router that must drop an oversized packet sends back an ICMP "fragmentation needed" message telling the sender to shrink. If that error never arrives, small packets still work while full-sized ones silently vanish: a *black hole*.
+
+    The lesson in both cases is that forward and return paths are separate things. A packet can get where it is going while the message about it cannot get back, because of a missing return route or a firewall rule that swallows ICMP.
 
     **Read up on:**
-    - `ip link` and `ip route get ADDR` — MTU of each link and cached path MTU
+    - `traceroute -n ADDR` and `mtr -n -r -c 3 ADDR` — print the path hop by hop
+    - Where the stars begin — which router is the last one that answers
+    - `ip route get ADDR` — what route a router would use for a destination
+    - Asymmetric paths — replies travel the reverse route
+    - `ip link` — the MTU of each link, and cached path MTU in `ip route get`
     - `ping -M do -s SIZE` — send packets that must not be fragmented, to probe the path
     - ICMP "fragmentation needed" — and which firewall rules would swallow it
     - `nft list ruleset` — look for rules on every router in the path
     - MSS clamping — another way to keep TCP segments small
   scenario: |
-    A client **`h1`** downloads files from a web server on **`h2`** through two routers:
+    Two tickets from the network team, both on multi-hop paths. Run commands inside a
+    namespace with `sudo ip netns exec <namespace> <command>`.
+
+    ## Part 1: Where does the path die?
+
+    Five networks in a line, with routers in between. All addresses are set:
 
     ```
-    h1 (10.7.1.2) -- r1 -- (1400 MTU link) -- r2 -- h2 (10.7.3.2) :8080
+    h1 -(10.0.0.x)- r1 -(10.0.1.x)- r2 -(10.0.2.x)- r3 -(10.0.3.x)- r4 -(10.0.4.x)- h2
     ```
 
-    Small responses work, but `curl http://10.7.3.2:8080/big.bin` run on h1 hangs.
-    The middle link between r1 and r2 has an MTU of **1400** on purpose (it models a
-    tunnel); don't change it, and don't move the server.
+    In each network `.1` is the left device and `.2` the right one (h1 is 10.0.0.1,
+    h2 is 10.0.4.2). From h1, `ping 10.0.4.2` gets no reply, and
+    `traceroute -n 10.0.4.2` prints stars after a few hops.
+
+    Find the faulty router and repair the path so h1 can reach h2 and h2 can reach h1. The
+    fault is on a single router; don't touch h1 or h2.
+
+    ## Part 2: Big downloads hang
+
+    A client downloads files from a web server through two routers:
+
+    ```
+    client (10.7.1.2) -- edge -- (1400 MTU link) -- core -- server (10.7.3.2) :8080
+    ```
+
+    Small responses work (`/small.txt`), but
+    `curl http://10.7.3.2:8080/big.bin` run on `client` hangs. The middle link between
+    `edge` and `core` has an MTU of **1400** on purpose (it models a tunnel); don't change
+    it, and don't move the server.
 
     Make the full download succeed.
   hints:
-    - "`ping -M do -s 1472 10.7.3.2` from h1 versus `-s 1300` shows the size where things break."
-    - "Routers should tell senders when a packet is too big. Check what the routers' firewalls do to ICMP they generate."
-    - "`ip netns exec r2 nft list ruleset`"
+    - "Part 1: `sudo ip netns exec h1 traceroute -n -w1 -q1 10.0.4.2` — note the last hop that answers."
+    - "Part 1: a router can forward a probe fine but fail to route the reply back. Inspect `ip route` on the routers near where the answers stop."
+    - "Part 2: `ping -M do -s 1472 10.7.3.2` from client versus `-s 1300` shows the size where things break."
+    - "Part 2: routers should tell senders when a packet is too big. Check what the routers' firewalls do to ICMP they generate: `ip netns exec core nft list ruleset`."
   solution: |
-    Router r2 has an nftables rule dropping the ICMP *destination unreachable* messages it
-    generates (including "fragmentation needed"), so h2 never learns that packets
-    must be smaller: a path MTU black hole. Remove the rule:
+    **Part 1.** One router is missing the route back towards h1's network (10.0.0.0/24), so
+    it cannot send its replies; traceroute shows stars from that router onwards. Find it
+    with `ip route` on each router, then add the route via its left neighbour:
 
     ```bash
-    sudo ip netns exec r2 nft flush ruleset
-    curl -s http://10.7.3.2:8080/big.bin | wc -c   # from h1: sudo ip netns exec h1 ...
+    sudo ip netns exec r3 ip route add 10.0.0.0/24 via 10.0.2.1   # if r3 is the broken one
+    ```
+
+    **Part 2.** Router `core` has an nftables rule dropping the ICMP *destination
+    unreachable* messages it generates (including "fragmentation needed"), so the server
+    never learns that packets must be smaller: a path MTU black hole. Remove the rule:
+
+    ```bash
+    sudo ip netns exec core nft flush ruleset
+    sudo ip netns exec client curl -s http://10.7.3.2:8080/big.bin | wc -c
     ```
     Clamping the MSS on a router would also work.
   setup: |
-    netns_new h1 r1 r2 h2
-    netns_link h1 eth0 r1 eth0
-    netns_link r1 eth1 r2 eth0
-    netns_link r2 eth1 h2 eth0
-    ip -n h1 addr add 10.7.1.2/24 dev eth0
-    ip -n r1 addr add 10.7.1.1/24 dev eth0
-    ip -n r1 addr add 10.7.2.1/24 dev eth1
-    ip -n r2 addr add 10.7.2.2/24 dev eth0
-    ip -n r2 addr add 10.7.3.1/24 dev eth1
-    ip -n h2 addr add 10.7.3.2/24 dev eth0
-    ip -n r1 link set eth1 mtu 1400
-    ip -n r2 link set eth0 mtu 1400
-    ip -n h1 route add default via 10.7.1.1
-    ip -n h2 route add default via 10.7.3.1
-    ip -n r1 route add 10.7.3.0/24 via 10.7.2.2
-    ip -n r2 route add 10.7.1.0/24 via 10.7.2.1
-    ip netns exec r1 sysctl -qw net.ipv4.ip_forward=1
-    ip netns exec r2 sysctl -qw net.ipv4.ip_forward=1
-    ip netns exec r2 nft -f - <<'EOF'
+    # --- part 1: Where does the path die? ---
+    N=(h1 r1 r2 r3 r4 h2)
+    netns_new "${N[@]}"
+    for j in 0 1 2 3 4; do
+      netns_link "${N[j]}" eth1 "${N[j+1]}" eth0
+      ip -n "${N[j]}" addr add 10.0.$j.1/24 dev eth1
+      ip -n "${N[j+1]}" addr add 10.0.$j.2/24 dev eth0
+    done
+    ip -n h1 route add default via 10.0.0.2
+    ip -n h2 route add default via 10.0.4.1
+    K=$((RANDOM % 3 + 2))
+    echo "$K" > "$KL_STATE/answer.path"
+    for i in 1 2 3 4; do
+      ip netns exec r$i sysctl -qw net.ipv4.ip_forward=1
+      for ((j = i + 1; j <= 4; j++)); do
+        ip -n r$i route add 10.0.$j.0/24 via 10.0.$i.2
+      done
+      [ "$i" = "$K" ] && continue
+      for ((j = 0; j <= i - 2; j++)); do
+        ip -n r$i route add 10.0.$j.0/24 via 10.0.$((i - 1)).1
+      done
+    done
+
+    # --- part 2: Big downloads hang ---
+    netns_new client edge core server
+    netns_link client eth0 edge eth0
+    netns_link edge eth1 core eth0
+    netns_link core eth1 server eth0
+    ip -n client addr add 10.7.1.2/24 dev eth0
+    ip -n edge addr add 10.7.1.1/24 dev eth0
+    ip -n edge addr add 10.7.2.1/24 dev eth1
+    ip -n core addr add 10.7.2.2/24 dev eth0
+    ip -n core addr add 10.7.3.1/24 dev eth1
+    ip -n server addr add 10.7.3.2/24 dev eth0
+    ip -n edge link set eth1 mtu 1400
+    ip -n core link set eth0 mtu 1400
+    ip -n client route add default via 10.7.1.1
+    ip -n server route add default via 10.7.3.1
+    ip -n edge route add 10.7.3.0/24 via 10.7.2.2
+    ip -n core route add 10.7.1.0/24 via 10.7.2.1
+    ip netns exec edge sysctl -qw net.ipv4.ip_forward=1
+    ip netns exec core sysctl -qw net.ipv4.ip_forward=1
+    ip netns exec core nft -f - <<'EOF'
     table ip kl_filter {
       chain output {
         type filter hook output priority 0; policy accept;
@@ -144,17 +207,29 @@ exercises:
     head -c300000 /dev/urandom > /srv/kl-mtu/big.bin
     echo hi > /srv/kl-mtu/small.txt
     chmod -R a+rX /srv/kl-mtu
-    sha256sum /srv/kl-mtu/big.bin | cut -d' ' -f1 > "$KL_STATE/answer"
-    systemd-run --quiet --unit=kl-mtu --working-directory=/srv/kl-mtu ip netns exec h2 python3 -m http.server 8080 --bind 10.7.3.2
-    eventually 15 'ip netns exec h1 curl -fsS -m2 http://10.7.3.2:8080/small.txt'
+    sha256sum /srv/kl-mtu/big.bin | cut -d' ' -f1 > "$KL_STATE/answer.mtu"
+    systemd-run --quiet --unit=kl-mtu --working-directory=/srv/kl-mtu ip netns exec server python3 -m http.server 8080 --bind 10.7.3.2
+    eventually 15 'ip netns exec client curl -fsS -m2 http://10.7.3.2:8080/small.txt'
   check: |
-    want=$(cat "$KL_STATE/answer")
-    check "r1-r2 link is still 1400 bytes" '[ "$(ip -n r1 -j link show eth1 | jq -r ".[0].mtu")" = 1400 ] && [ "$(ip -n r2 -j link show eth0 | jq -r ".[0].mtu")" = 1400 ]'
-    check "small files still work" 'ip netns exec h1 curl -fsS -m3 http://10.7.3.2:8080/small.txt'
-    got=$(ip netns exec h1 curl -fsS -m8 http://10.7.3.2:8080/big.bin 2>/dev/null | sha256sum | cut -d' ' -f1)
+    info "Part 1: Where does the path die?"
+    check "h1 can ping h2" 'ip netns exec h1 ping -c1 -W2 10.0.4.2'
+    check "h2 can ping h1" 'ip netns exec h2 ping -c1 -W2 10.0.0.1'
+    check "traceroute reaches h2" 'ip netns exec h1 traceroute -n -w1 -q1 -m 8 10.0.4.2 | tail -1 | grep -q "10.0.4.2"'
+
+    info "Part 2: Big downloads hang"
+    want=$(cat "$KL_STATE/answer.mtu")
+    check "edge-core link is still 1400 bytes" '[ "$(ip -n edge -j link show eth1 | jq -r ".[0].mtu")" = 1400 ] && [ "$(ip -n core -j link show eth0 | jq -r ".[0].mtu")" = 1400 ]'
+    check "small files still work" 'ip netns exec client curl -fsS -m3 http://10.7.3.2:8080/small.txt'
+    got=$(ip netns exec client curl -fsS -m8 http://10.7.3.2:8080/big.bin 2>/dev/null | sha256sum | cut -d' ' -f1)
     check_eq "big.bin downloads intact" "$got" "$want"
   solve: |
-    sudo ip netns exec r2 nft flush ruleset
+    # --- part 1: Where does the path die? ---
+    for i in 2 3 4; do
+      sudo ip netns exec r$i ip route replace 10.0.0.0/24 via 10.0.$((i - 1)).1
+    done
+
+    # --- part 2: Big downloads hang ---
+    sudo ip netns exec core nft flush ruleset
 
 - id: net-018
   title: IPv6 and neighbor discovery
@@ -213,19 +288,29 @@ exercises:
     sudo ip netns exec h2 ip -6 neigh show dev eth0 | awk -v a="$p::1" '$1==a {print $3}' > /lab/mac.txt
 
 - id: net-019
-  title: Hide the clients behind the router
+  title: Hide the clients, then see what the server sees
   difficulty: 3
   kind: build
-  tags: [nat, masquerade, nftables, netns]
+  tags: [nat, snat, masquerade, nftables, ss, netns]
   tutorial: |
-    **Concept.** Source NAT rewrites the source address of packets leaving a network, so a server that has no route to the private clients sees only the router's address. Replies come back to the router, which translates them for the right client using connection tracking.
+    **Concept.** Source NAT rewrites the source of packets leaving a network, so a server that has no route to the private clients sees only the router's address. Replies come back to the router, which translates them for the right client using connection tracking.
+
+    Masquerade can also remap the **source port** into a chosen range. The far end then never sees the client's real address or port, only the translated pair. This is why a server's log shows the NAT address rather than the real client, and why you must look at the right end of a connection when you want the truth about it: each side's sockets report what that side sees.
 
     **Read up on:**
     - `man nft` — the `nat` table type, the `postrouting` hook and the `masquerade` statement
     - `oifname` / `oif` matches — restricting a rule to the outgoing interface
     - `nft list ruleset` — confirm what is loaded
     - Why a server's log shows the NAT address instead of the real client
+    - `ss -tn` — established connections and the peer address:port, from either end
+    - Source NAT and masquerade — how and why the source port is rewritten
+    - `ip netns exec NS cmd` — run a tool inside one namespace
+    - Ephemeral ports — the range a client picks from before translation
   scenario: |
+    Two routers doing source NAT: one you configure, and one you inspect.
+
+    ## Part 1: Hide the clients behind the router
+
     Client **`h1`** must reach a web server on **`h2`**, with router **`r1`** between them:
 
     ```
@@ -233,15 +318,32 @@ exercises:
     ```
 
     h1 sends its traffic to r1, which forwards it. But **h2 has no route to the
-    10.1.0.0/24 network** and must not get one, so `curl http://10.2.0.2:8080/` from h1
-    gets no answer.
+    10.1.0.0/24 network** and must not get one (no default route either), so
+    `curl http://10.2.0.2:8080/` from h1 gets no answer.
 
     Fix this on **r1** using **nftables**. The server prints the client address it sees,
     and must report it as **10.2.0.1**.
+
+    ## Part 2: Which port does the server see?
+
+    A second router, **`gw`**, already source-NATs traffic from its client network and
+    remaps the source port into a fixed range. The client **`laptop`** (10.21.0.2) holds a
+    long-lived TCP connection to a server on **`backend`** (10.22.0.2), port **9000**:
+
+    ```
+    laptop (10.21.0.2) --- (10.21.0.1) gw (10.22.0.1) --- (10.22.0.2) backend :9000
+    ```
+
+    Find the **source port the server sees** for that connection, and write that number
+    into **`/lab/port.txt`**. It is not the port the laptop itself used.
   hints:
-    - "Rewrite the source on the way out of r1 towards h2, not on the way in."
-    - "A `nat` table, chain `type nat hook postrouting priority srcnat`, and a rule with `masquerade`."
+    - "Part 1: rewrite the source on the way out of r1 towards h2, not on the way in."
+    - "Part 1: a `nat` table, chain `type nat hook postrouting priority srcnat`, and a rule with `masquerade`."
+    - "Part 2: the server's own sockets show the peer it is talking to: `sudo ip netns exec backend ss -tn`."
+    - "Part 2: look at the established connection whose local port is 9000; the peer's port is the translated one."
   solution: |
+    **Part 1.** Masquerade traffic as it leaves r1's outside interface:
+
     ```bash
     sudo ip netns exec r1 nft -f - <<'EOF'
     table ip nat {
@@ -253,7 +355,17 @@ exercises:
     EOF
     sudo ip netns exec h1 curl -s http://10.2.0.2:8080/
     ```
+
+    **Part 2.** The server sees the post-NAT source address and port, so ask the server:
+
+    ```bash
+    sudo ip netns exec backend ss -tnH state established 'sport = :9000'
+    # 0  0  10.22.0.2:9000  10.22.0.1:NNNNN   <- NNNNN is the translated source port
+    sudo ip netns exec backend ss -tnH state established 'sport = :9000' \
+      | grep -oE '10\.22\.0\.1:[0-9]+' | head -1 | cut -d: -f2 > /lab/port.txt
+    ```
   setup: |
+    # --- part 1: Hide the clients behind the router ---
     netns_new h1 r1 h2
     netns_link h1 eth0 r1 eth0
     netns_link r1 eth1 h2 eth0
@@ -266,7 +378,7 @@ exercises:
     on_reset 'systemctl stop kl-nat 2>/dev/null; systemctl reset-failed kl-nat 2>/dev/null; rm -rf /srv/kl-nat'
     mkdir -p /srv/kl-nat
     head -c6 /dev/urandom | od -An -tx1 | tr -d ' \n' > /srv/kl-nat/token
-    cp /srv/kl-nat/token "$KL_STATE/answer"
+    cp /srv/kl-nat/token "$KL_STATE/answer.nat"
     cat >/srv/kl-nat/app.py <<'PY'
     from http.server import BaseHTTPRequestHandler, HTTPServer
     T = open('/srv/kl-nat/token').read().strip()
@@ -283,133 +395,19 @@ exercises:
     PY
     systemd-run --quiet --unit=kl-nat ip netns exec h2 python3 /srv/kl-nat/app.py
     eventually 15 'ip netns exec h2 ss -ltn | grep -q :8080'
-  check: |
-    want=$(cat "$KL_STATE/answer")
-    check_eq "h2 sees the router's address as the client" "$(ip netns exec h1 curl -fsS -m4 http://10.2.0.2:8080/ 2>/dev/null)" "$want from 10.2.0.1"
-    check_eq "h2 still has no route to 10.1.0.0/24" "$(ip -n h2 route | grep -c '^10\.1\.0\.')" 0
-    check "h2 still has no default route" '[ -z "$(ip -n h2 route show default)" ]'
-  solve: |
-    sudo ip netns exec r1 nft -f - <<'EOF'
-    table ip nat {
-      chain postrouting {
-        type nat hook postrouting priority srcnat;
-        oifname "eth1" masquerade
-      }
-    }
-    EOF
 
-- id: net-020
-  title: Where does the path die?
-  difficulty: 3
-  kind: fix
-  tags: [traceroute, routing, netns]
-  tutorial: |
-    **Concept.** `traceroute` sends probes with growing TTL; each router that drops one answers with an ICMP error from its own address. A line of stars means no reply came back, which can be caused by the router, or by the way back from that router.
-
-    **Read up on:**
-    - `traceroute -n ADDR` and `mtr -n -r -c 3 ADDR` — print the path hop by hop
-    - Where the stars begin — which router is the last one that answers
-    - `ip route get ADDR` — what route a router would use for a destination
-    - Asymmetric paths — replies travel the reverse route
-  scenario: |
-    Five networks in a line, with routers in between. All addresses are set:
-
-    ```
-    h1 -(10.0.0.x)- r1 -(10.0.1.x)- r2 -(10.0.2.x)- r3 -(10.0.3.x)- r4 -(10.0.4.x)- h2
-    ```
-
-    In each network `.1` is the left device and `.2` the right one (h1 is 10.0.0.1,
-    h2 is 10.0.4.2). From h1, `ping 10.0.4.2` gets no reply, and
-    `traceroute -n 10.0.4.2` prints stars after a few hops.
-
-    Find the faulty router and repair the path so h1 can reach h2. The fault is on a
-    single router; don't touch h1 or h2.
-  hints:
-    - "`sudo ip netns exec h1 traceroute -n -w1 -q1 10.0.4.2` — note the last hop that answers."
-    - "A router can forward a probe fine but fail to route the reply back. Inspect `ip route` on the routers near where the answers stop."
-  solution: |
-    One router is missing the route back towards h1's network (10.0.0.0/24), so it
-    cannot send its replies; traceroute shows stars from that router onwards. Find
-    it with `ip route` on each router, then add the route via its left neighbour:
-
-    ```bash
-    sudo ip netns exec r3 ip route add 10.0.0.0/24 via 10.0.2.1   # if r3 is the broken one
-    ```
-  setup: |
-    N=(h1 r1 r2 r3 r4 h2)
-    netns_new "${N[@]}"
-    for j in 0 1 2 3 4; do
-      netns_link "${N[j]}" eth1 "${N[j+1]}" eth0
-      ip -n "${N[j]}" addr add 10.0.$j.1/24 dev eth1
-      ip -n "${N[j+1]}" addr add 10.0.$j.2/24 dev eth0
-    done
-    ip -n h1 route add default via 10.0.0.2
-    ip -n h2 route add default via 10.0.4.1
-    K=$((RANDOM % 3 + 2))
-    echo "$K" > "$KL_STATE/answer"
-    for i in 1 2 3 4; do
-      ip netns exec r$i sysctl -qw net.ipv4.ip_forward=1
-      for ((j = i + 1; j <= 4; j++)); do
-        ip -n r$i route add 10.0.$j.0/24 via 10.0.$i.2
-      done
-      [ "$i" = "$K" ] && continue
-      for ((j = 0; j <= i - 2; j++)); do
-        ip -n r$i route add 10.0.$j.0/24 via 10.0.$((i - 1)).1
-      done
-    done
-  check: |
-    check "h1 can ping h2" 'ip netns exec h1 ping -c1 -W2 10.0.4.2'
-    check "h2 can ping h1" 'ip netns exec h2 ping -c1 -W2 10.0.0.1'
-    check "traceroute reaches h2" 'ip netns exec h1 traceroute -n -w1 -q1 -m 8 10.0.4.2 | tail -1 | grep -q "10.0.4.2"'
-  solve: |
-    for i in 2 3 4; do
-      sudo ip netns exec r$i ip route replace 10.0.0.0/24 via 10.0.$((i - 1)).1
-    done
-
-- id: net-021
-  title: Which port does the server see?
-  difficulty: 3
-  kind: build
-  tags: [nat, snat, masquerade, netns]
-  tutorial: |
-    **Concept.** Source NAT rewrites a connection's source address, and masquerade can also remap the source port into a chosen range. The far end never sees the client's real port — only the translated one. You can read the translated port from either the router or the server's own socket.
-
-    **Read up on:**
-    - `ss -tn` — established connections and the peer address:port, from either end
-    - Source NAT and masquerade — how and why the source port is rewritten
-    - `ip netns exec NS cmd` — run a tool inside one namespace
-    - Ephemeral ports — the range a client picks from before translation
-  scenario: |
-    Router **`r1`** source-NATs traffic from the client network and remaps the source
-    port into a fixed range. The client **`h1`** (10.1.0.2) holds a long-lived TCP
-    connection to a server on **`h2`** (10.2.0.2), port **9000**.
-
-    Find the **source port the server sees** for that connection, and write that number
-    into **`/lab/port.txt`**. It is not the port h1 itself used.
-  hints:
-    - "The server's own sockets show the peer it is talking to: `sudo ip netns exec h2 ss -tn`."
-    - "Look at the established connection whose local port is 9000; the peer's port is the translated one."
-  solution: |
-    The server sees the post-NAT source address and port, so ask the server:
-
-    ```bash
-    sudo ip netns exec h2 ss -tnH state established 'sport = :9000'
-    # 0  0  10.2.0.2:9000  10.2.0.1:NNNNN   <- NNNNN is the translated source port
-    sudo ip netns exec h2 ss -tnH state established 'sport = :9000' \
-      | grep -oE '10\.2\.0\.1:[0-9]+' | cut -d: -f2 > /lab/port.txt
-    ```
-  setup: |
-    netns_new h1 r1 h2
-    netns_link h1 eth0 r1 eth0
-    netns_link r1 eth1 h2 eth0
-    ip -n h1 addr add 10.1.0.2/24 dev eth0
-    ip -n r1 addr add 10.1.0.1/24 dev eth0
-    ip -n r1 addr add 10.2.0.1/24 dev eth1
-    ip -n h2 addr add 10.2.0.2/24 dev eth0
-    ip -n h1 route add default via 10.1.0.1
-    ip netns exec r1 sysctl -qw net.ipv4.ip_forward=1
+    # --- part 2: Which port does the server see? ---
+    netns_new laptop gw backend
+    netns_link laptop eth0 gw eth0
+    netns_link gw eth1 backend eth0
+    ip -n laptop addr add 10.21.0.2/24 dev eth0
+    ip -n gw addr add 10.21.0.1/24 dev eth0
+    ip -n gw addr add 10.22.0.1/24 dev eth1
+    ip -n backend addr add 10.22.0.2/24 dev eth0
+    ip -n laptop route add default via 10.21.0.1
+    ip netns exec gw sysctl -qw net.ipv4.ip_forward=1
     base=$((RANDOM % 20000 + 30000))
-    ip netns exec r1 nft -f - <<EOF
+    ip netns exec gw nft -f - <<EOF
     table ip nat {
       chain postrouting {
         type nat hook postrouting priority srcnat;
@@ -419,55 +417,107 @@ exercises:
     EOF
     on_reset 'systemctl stop kl-ct-srv kl-ct-cli 2>/dev/null; systemctl reset-failed kl-ct-srv kl-ct-cli 2>/dev/null; rm -rf /srv/kl-ct'
     mkdir -p /srv/kl-ct
-    systemd-run --quiet --unit=kl-ct-srv --working-directory=/srv/kl-ct ip netns exec h2 python3 -m http.server 9000 --bind 10.2.0.2
-    eventually 15 'ip netns exec h2 ss -ltn | grep -q :9000'
-    systemd-run --quiet --unit=kl-ct-cli ip netns exec h1 python3 -c 'import socket,time; s=socket.create_connection(("10.2.0.2",9000)); time.sleep(7200)'
-    eventually 15 "ip netns exec h2 ss -tnH state established 'sport = :9000' | grep -q 10.2.0.1"
+    systemd-run --quiet --unit=kl-ct-srv --working-directory=/srv/kl-ct ip netns exec backend python3 -m http.server 9000 --bind 10.22.0.2
+    eventually 15 'ip netns exec backend ss -ltn | grep -q :9000'
+    systemd-run --quiet --unit=kl-ct-cli ip netns exec laptop python3 -c 'import socket,time; s=socket.create_connection(("10.22.0.2",9000)); time.sleep(7200)'
+    eventually 15 "ip netns exec backend ss -tnH state established 'sport = :9000' | grep -q 10.22.0.1"
   check: |
-    live=$(ip netns exec h2 ss -tnH state established 'sport = :9000' | grep -oE '10\.2\.0\.1:[0-9]+' | head -1 | cut -d: -f2)
+    info "Part 1: Hide the clients behind the router"
+    want=$(cat "$KL_STATE/answer.nat")
+    check_eq "h2 sees the router's address as the client" "$(ip netns exec h1 curl -fsS -m4 http://10.2.0.2:8080/ 2>/dev/null)" "$want from 10.2.0.1"
+    check_eq "h2 still has no route to 10.1.0.0/24" "$(ip -n h2 route | grep -c '^10\.1\.0\.')" 0
+    check "h2 still has no default route" '[ -z "$(ip -n h2 route show default)" ]'
+
+    info "Part 2: Which port does the server see?"
+    live=$(ip netns exec backend ss -tnH state established 'sport = :9000' | grep -oE '10\.22\.0\.1:[0-9]+' | head -1 | cut -d: -f2)
     check "the server has the connection" '[ -n "$live" ]'
     check_eq "port.txt holds the translated source port" "$(tr -d '[:space:]' 2>/dev/null </lab/port.txt)" "$live"
   solve: |
-    sudo ip netns exec h2 ss -tnH state established 'sport = :9000' \
-      | grep -oE '10\.2\.0\.1:[0-9]+' | head -1 | cut -d: -f2 > /lab/port.txt
+    # --- part 1: Hide the clients behind the router ---
+    sudo ip netns exec r1 nft -f - <<'EOF'
+    table ip nat {
+      chain postrouting {
+        type nat hook postrouting priority srcnat;
+        oifname "eth1" masquerade
+      }
+    }
+    EOF
+
+    # --- part 2: Which port does the server see? ---
+    sudo ip netns exec backend ss -tnH state established 'sport = :9000' \
+      | grep -oE '10\.22\.0\.1:[0-9]+' | head -1 | cut -d: -f2 > /lab/port.txt
+
 - id: net-022
-  title: Balance across the backends
+  title: Two proxies, two quiet failures
   difficulty: 4
   kind: fix
-  tags: [haproxy, load-balancing, health-checks, docker]
+  tags: [haproxy, nginx, load-balancing, health-checks, proxy, timeouts, docker]
   tutorial: |
-    **Concept.** A load balancer such as HAProxy spreads requests across several backend servers using a balancing algorithm, and uses health checks to keep traffic away from servers that don't answer. A server can also be configured so that it is used only as a spare.
+    **Concept.** A proxy stands between clients and backends, and its configuration decides what clients experience. Two kinds of mistake look like backend problems when they are not.
+
+    - **Distribution.** A load balancer such as HAProxy spreads requests across several servers using a balancing algorithm, and uses health checks to keep traffic away from servers that don't answer. A server can also be configured so that it is used only as a spare. A server flagged the wrong way, or checked at the wrong address, quietly drops out of the rotation.
+    - **Patience.** A reverse proxy waits only so long for its upstream: separate timeouts cover connecting, sending the request and reading the response. When the upstream is slower than the limit, the proxy gives up and returns an error of its own, even though the upstream is healthy.
+
+    In both cases a proxy keeps its old config until told otherwise, so an edit is only half of the fix.
 
     **Read up on:**
     - The HAProxy `backend` section: `balance`, `server` lines and their options
     - Server flags such as `check`, `weight` and `backup` — what each changes
-    - `docker kill -s HUP NAME` or `docker restart` — loading a new configuration
+    - `docker kill -s HUP NAME` or `docker restart` — loading a new HAProxy configuration
     - `docker logs NAME` — startup warnings and health-check state changes
-    - Health checks — a wrong address or port marks a server down
+    - `ngx_http_proxy_module` — the `proxy_connect_timeout`, `proxy_send_timeout` and `proxy_read_timeout` directives
+    - HTTP 502 versus 504 — what each says about the upstream
+    - `docker exec NAME nginx -t` and `nginx -s reload` — validate and apply a config
+    - `curl -sS -o /dev/null -w '%{http_code} %{time_total}\n'` — measure a request
   scenario: |
+    Two front-ends in the same stack are misbehaving. Both configurations are mounted
+    read-only into their containers, so edit them on the host and make each proxy load the
+    change.
+
+    ## Part 1: Balance across the backends
+
     HAProxy runs in the container **`kl-lb`** (host networking) and listens on
     **`127.0.0.1:8088`**. Three identical web backends listen on `127.0.0.1:9101`,
     `9102` and `9103`; each answers with its own name (`be1`, `be2`, `be3`).
 
     Requests should rotate across **all three** backends, but they don't.
-    The configuration is in **`/lab/haproxy/haproxy.cfg`** (the directory is mounted
-    read-only into the container). Fix it and make HAProxy load the change.
+    The configuration is in **`/lab/haproxy/haproxy.cfg`**. Fix it and make HAProxy load
+    the change. Keep all three `server` lines, on ports 9101, 9102 and 9103.
 
-    Keep all three `server` lines.
+    ## Part 2: 504 on the slow report
+
+    nginx (container **`kl-nginx`**, host networking) proxies **`127.0.0.1:8089`** to an
+    upstream application. The `/fast` page works but `/report` always fails with a
+    gateway error, though the application itself is healthy and simply takes a few
+    seconds to build the report.
+
+    The nginx config is in **`/lab/nginx/default.conf`**. Make
+    `curl http://127.0.0.1:8089/report` succeed through the proxy, and apply the change.
   hints:
-    - "`for i in $(seq 6); do curl -s http://127.0.0.1:8088/; done` shows which backends answer."
-    - "Compare the options on each `server` line, and check each backend's port with `ss -ltn`."
-    - "A config change only takes effect after HAProxy reloads: `docker kill -s HUP kl-lb`."
+    - "Part 1: `for i in $(seq 6); do curl -s http://127.0.0.1:8088/; done` shows which backends answer."
+    - "Part 1: compare the options on each `server` line, and check each backend's port with `ss -ltn`."
+    - "Part 1: a config change only takes effect after HAProxy reloads: `docker kill -s HUP kl-lb`."
+    - "Part 2: `curl -si http://127.0.0.1:8089/report` — look at the status and how long it took."
+    - "Part 2: the upstream takes a few seconds; nginx's default and configured read limits are what matter. Reload with `docker exec kl-nginx nginx -s reload`."
   solution: |
-    Two lines are wrong: `s2` is flagged `backup` (only used when the others fail), and
-    `s3` points at port 9130 instead of 9103, so its health check keeps it down.
+    **Part 1.** Two lines are wrong: `s2` is flagged `backup` (only used when the others
+    fail), and `s3` points at port 9130 instead of 9103, so its health check keeps it down.
 
     ```bash
     sed -i 's/ backup//; s/9130/9103/' /lab/haproxy/haproxy.cfg
     docker kill -s HUP kl-lb
     for i in $(seq 6); do curl -s http://127.0.0.1:8088/; done
     ```
+
+    **Part 2.** The proxy gives up after `proxy_read_timeout 2s`, but the report takes about
+    four seconds. Raise the timeout and reload:
+
+    ```bash
+    sed -i 's/proxy_read_timeout 2s/proxy_read_timeout 15s/' /lab/nginx/default.conf
+    docker exec kl-nginx nginx -s reload
+    ```
   setup: |
+    # --- part 1: Balance across the backends ---
     on_reset 'docker rm -f kl-lb >/dev/null 2>&1; for n in 1 2 3; do systemctl stop kl-be$n 2>/dev/null; systemctl reset-failed kl-be$n 2>/dev/null; done; rm -rf /srv/kl-lb'
     for n in 1 2 3; do
       mkdir -p /srv/kl-lb/be$n
@@ -500,56 +550,12 @@ exercises:
     docker rm -f kl-lb >/dev/null 2>&1
     docker run -d --name kl-lb --network host -v /lab/haproxy:/usr/local/etc/haproxy:ro haproxy:3.0-alpine >/dev/null
     eventually 20 'curl -fsS -m2 http://127.0.0.1:8088/'
-  check: |
-    dist() { for i in $(seq 12); do curl -fsS -m2 http://127.0.0.1:8088/ 2>/dev/null; done | sort -u | wc -l; }
-    check "HAProxy container is running" 'c_running kl-lb'
-    check_eq "config still lists three servers" "$(grep -c '^ *server ' /lab/haproxy/haproxy.cfg)" 3
-    check "ports 9101-9103 are still the backends" 'grep -q ":9101" /lab/haproxy/haproxy.cfg && grep -q ":9102" /lab/haproxy/haproxy.cfg && grep -q ":9103" /lab/haproxy/haproxy.cfg'
-    eventually 12 '[ "$(dist)" = 3 ]' || true
-    check_eq "responses come from all three backends" "$(dist)" 3
-  solve: |
-    sed -i 's/ backup//; s/9130/9103/' /lab/haproxy/haproxy.cfg
-    docker kill -s HUP kl-lb
 
-- id: net-023
-  title: 504 on the slow report
-  difficulty: 3
-  kind: fix
-  tags: [nginx, proxy, timeouts, docker]
-  tutorial: |
-    **Concept.** A reverse proxy waits only so long for its upstream: separate timeouts cover connecting, sending the request and reading the response. When the upstream is slower than the limit, the proxy gives up and returns an error of its own, even though the upstream is healthy.
-
-    **Read up on:**
-    - `ngx_http_proxy_module` — the `proxy_connect_timeout`, `proxy_send_timeout` and `proxy_read_timeout` directives
-    - HTTP 502 versus 504 — what each says about the upstream
-    - `docker exec NAME nginx -t` and `nginx -s reload` — validate and apply a config
-    - `curl -sS -o /dev/null -w '%{http_code} %{time_total}\n'` — measure a request
-  scenario: |
-    nginx (container **`kl-nginx`**, host networking) proxies **`127.0.0.1:8089`** to an
-    upstream application. The `/fast` page works but `/report` always fails with a
-    gateway error, though the application itself is healthy and simply takes a few
-    seconds to build the report.
-
-    The nginx config is in **`/lab/nginx/default.conf`** (the directory is mounted
-    read-only into the container). Make `curl http://127.0.0.1:8089/report` succeed
-    through the proxy, and apply the change.
-  hints:
-    - "`curl -si http://127.0.0.1:8089/report` — look at the status and how long it took."
-    - "The upstream takes a few seconds; nginx's default and configured read limits are what matter."
-    - "Reload with `docker exec kl-nginx nginx -s reload`."
-  solution: |
-    The proxy gives up after `proxy_read_timeout 2s`, but the report takes about four
-    seconds. Raise the timeout and reload:
-
-    ```bash
-    sed -i 's/proxy_read_timeout 2s/proxy_read_timeout 15s/' /lab/nginx/default.conf
-    docker exec kl-nginx nginx -s reload
-    ```
-  setup: |
+    # --- part 2: 504 on the slow report ---
     on_reset 'docker rm -f kl-nginx >/dev/null 2>&1; systemctl stop kl-slow 2>/dev/null; systemctl reset-failed kl-slow 2>/dev/null; rm -rf /srv/kl-slow'
     mkdir -p /srv/kl-slow
     head -c6 /dev/urandom | od -An -tx1 | tr -d ' \n' > /srv/kl-slow/token
-    cp /srv/kl-slow/token "$KL_STATE/answer"
+    cp /srv/kl-slow/token "$KL_STATE/answer.report"
     cat >/srv/kl-slow/app.py <<'PY'
     import time
     from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
@@ -585,12 +591,26 @@ exercises:
     docker run -d --name kl-nginx --network host -v /lab/nginx:/etc/nginx/conf.d:ro nginx:1.27-alpine >/dev/null
     eventually 20 'curl -fsS -m3 http://127.0.0.1:8089/fast'
   check: |
-    want=$(cat "$KL_STATE/answer")
+    info "Part 1: Balance across the backends"
+    dist() { for i in $(seq 12); do curl -fsS -m2 http://127.0.0.1:8088/ 2>/dev/null; done | sort -u | wc -l; }
+    check "HAProxy container is running" 'c_running kl-lb'
+    check_eq "config still lists three servers" "$(grep -c '^ *server ' /lab/haproxy/haproxy.cfg)" 3
+    check "ports 9101-9103 are still the backends" 'grep -q ":9101" /lab/haproxy/haproxy.cfg && grep -q ":9102" /lab/haproxy/haproxy.cfg && grep -q ":9103" /lab/haproxy/haproxy.cfg'
+    eventually 12 '[ "$(dist)" = 3 ]' || true
+    check_eq "responses come from all three backends" "$(dist)" 3
+
+    info "Part 2: 504 on the slow report"
+    want=$(cat "$KL_STATE/answer.report")
     check "nginx container is running" 'c_running kl-nginx'
     check "/fast goes through the proxy" 'curl -si -m4 http://127.0.0.1:8089/fast | grep -qi "^x-proxy: kl"'
     eventually 10 'curl -fsS -m8 -o /dev/null http://127.0.0.1:8089/report' || true
     check_eq "/report returns the report through the proxy" "$(curl -fsS -m10 http://127.0.0.1:8089/report 2>/dev/null)" "$want"
   solve: |
+    # --- part 1: Balance across the backends ---
+    sed -i 's/ backup//; s/9130/9103/' /lab/haproxy/haproxy.cfg
+    docker kill -s HUP kl-lb
+
+    # --- part 2: 504 on the slow report ---
     sed -i 's/proxy_read_timeout 2s/proxy_read_timeout 15s/' /lab/nginx/default.conf
     docker exec kl-nginx nginx -s reload
 

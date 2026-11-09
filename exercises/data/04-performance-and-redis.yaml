@@ -5,18 +5,28 @@ order: 4
 exercises:
 
 - id: data-026
-  title: Latest events without a sort
+  title: A tuning session, from plan to bloat
   difficulty: 3
   kind: fix
-  tags: [postgres, index, explain, composite]
+  tags: [postgres, explain, index, partial, vacuum]
   tutorial: |
-    **Concept.** A B-tree index stores rows ordered by its key columns. A multicolumn index can answer an equality filter and hand rows back already ordered, so the planner can skip a separate sort step.
+    **Concept.** Performance work starts with reading what the database really did, and only then changing something. `EXPLAIN` shows the plan the planner chose; `EXPLAIN ANALYZE` also runs the query and reports what each node actually did, including how many rows a filter threw away. A scan that discards almost everything it reads is the classic sign of a missing index.
+
+    **Indexes are shaped by the query.** A B-tree index stores rows ordered by its key columns. A multicolumn index can answer an equality filter and hand rows back already ordered, so the planner skips the sort step entirely. Column order decides whether that works.
+
+    **Indexes have a cost.** Every index takes space and slows writes. When a query always targets a small subset of a big table, a *partial* index (`WHERE` in the index definition) contains only those rows, so it is far smaller. The planner uses it only when it can prove the query's condition matches the index's.
+
+    **Dead rows.** PostgreSQL never overwrites a row on `UPDATE`: it writes a new version and leaves the old one as a dead tuple until `VACUUM` marks the space reusable. Autovacuum normally does this, but it can be switched off per table, and heavy batch updates pile up bloat quickly.
 
     **Read up on:**
-    - `EXPLAIN` — how to read the node names of a plan
-    - `CREATE INDEX` with several columns — why column order matters
-    - `ASC` / `DESC` in index definitions and backward index scans
+    - `EXPLAIN (ANALYZE)` — actual time, `rows`, `loops`, and the lines under a filtered scan
+    - `CREATE INDEX` with several columns — why column order matters, `ASC` / `DESC`
     - `Sort` versus `Limit` nodes — what a top-N sort costs
+    - `CREATE INDEX ... WHERE` — the partial index syntax and predicate matching
+    - `pg_relation_size` and `pg_size_pretty` — measure an index
+    - `VACUUM` — what it reclaims and whether it locks the table
+    - `pg_stat_user_tables` — `n_dead_tup`, `last_vacuum`
+    - Storage parameters (`reloptions`) and `ALTER TABLE ... RESET`
   scenario: |
     PostgreSQL runs in the container **`kl-pg`** (database, user and password: `lab`):
 
@@ -24,56 +34,10 @@ exercises:
     docker exec -it kl-pg psql -U lab -d lab
     ```
 
-    The table **`events`** holds 200,000 rows. The app runs this query constantly and it is slow:
+    You've been given an afternoon to go through the database's performance complaints,
+    one table at a time. Don't change the data or the application's queries.
 
-    ```sql
-    SELECT * FROM events WHERE user_id = 42 ORDER BY ts DESC LIMIT 20;
-    ```
-
-    Make the plan for that query use an index and contain **no `Sort` node**.
-    Do not change the query or the table's data.
-  hints:
-    - "`EXPLAIN SELECT ...` shows the plan. Right now it scans the whole table and sorts."
-    - "One index must serve both the filter and the ordering. Think about which column comes first."
-  solution: |
-    ```sql
-    CREATE INDEX events_user_ts ON events (user_id, ts DESC);
-    ```
-    The equality column goes first and the ordering column second, so the rows for one
-    user come out already sorted.
-  setup: |
-    pg_start
-    pg_sql <<'SQL'
-    create table events(id serial primary key, user_id int not null, kind text, ts timestamptz not null);
-    insert into events(user_id, kind, ts)
-      select (random()*500)::int, 'click', now() - ((random()*100000)::int || ' seconds')::interval
-      from generate_series(1,200000);
-    analyze events;
-    SQL
-  check: |
-    plan=$(pg_sql "explain select * from events where user_id = 42 order by ts desc limit 20" 2>&1)
-    n=$(pg_sql "select count(*) from pg_indexes where tablename='events' and indexdef like '%(user_id, %'" 2>/dev/null)
-    check "the plan uses an index" 'grep -q "Index" <<<"$plan"'
-    check_not "the plan has no Sort step" 'grep -q "Sort" <<<"$plan"'
-    check "an index starts with user_id" '[ "${n:-0}" -ge 1 ]'
-  solve: |
-    docker exec -i kl-pg psql -h 127.0.0.1 -U lab -d lab -qAt -c "CREATE INDEX events_user_ts ON events (user_id, ts DESC)"
-
-- id: data-027
-  title: What the filter threw away
-  difficulty: 2
-  kind: build
-  tags: [postgres, explain, analyze]
-  tutorial: |
-    **Concept.** `EXPLAIN ANALYZE` runs the query and reports what each plan node really did, not just what the planner guessed. Comparing actual and estimated work is the first step of any tuning session.
-
-    **Read up on:**
-    - `EXPLAIN (ANALYZE)` — difference between plain EXPLAIN and ANALYZE
-    - `Seq Scan` node details — the extra lines printed under a filtered scan
-    - `actual time`, `rows` and `loops` — how to read the figures
-    - `psql -c` — running a single statement from the shell
-  scenario: |
-    PostgreSQL runs in the container **`kl-pg`** (`docker exec -it kl-pg psql -U lab -d lab`).
+    ## Part 1: What the filter threw away
 
     The table **`readings`** has a `status` column. Run
 
@@ -82,62 +46,91 @@ exercises:
     ```
 
     under `EXPLAIN ANALYZE`. The plan reports how many rows the filter **discarded**
-    while scanning. Write that number, and nothing else, to **`/lab/answer.txt`**.
-  hints:
-    - "Use `EXPLAIN (ANALYZE) SELECT ...`. The scan node prints extra lines below it."
-    - "Look for the line that starts with `Rows Removed by Filter`."
-  solution: |
-    ```bash
-    docker exec kl-pg psql -U lab -d lab -c "EXPLAIN ANALYZE SELECT * FROM readings WHERE status = 'hot'"
+    while scanning. Write that number, and nothing else, to
+    **`/lab/filter-removed.txt`**.
+
+    ## Part 2: Latest events without a sort
+
+    The table **`events`** holds 200,000 rows. The app runs this query constantly and it
+    is slow:
+
+    ```sql
+    SELECT * FROM events WHERE user_id = 42 ORDER BY ts DESC LIMIT 20;
     ```
-    Copy the number after `Rows Removed by Filter:` into `/lab/answer.txt`.
-  setup: |
-    pg_start
-    k=$(shuf -i 300-900 -n 1)
-    pg_sql "create table readings(id serial primary key, status text not null, val int);
-            insert into readings(status, val) select case when g <= $k then 'hot' else 'cold' end, g from generate_series(1,20000) g;
-            analyze readings;"
-    echo $((20000 - k)) > "$KL_STATE/answer"
-  check: |
-    check_eq "rows removed by the filter" "$(tr -d '[:space:]' 2>/dev/null </lab/answer.txt)" "$(cat "$KL_STATE/answer")"
-  solve: |
-    docker exec kl-pg psql -U lab -d lab -qAt -c "EXPLAIN ANALYZE SELECT * FROM readings WHERE status = 'hot'" \
-      | sed -n 's/.*Rows Removed by Filter: *\([0-9]*\).*/\1/p' > /lab/answer.txt
 
-- id: data-028
-  title: Index only the open tickets
-  difficulty: 3
-  kind: build
-  tags: [postgres, index, partial]
-  tutorial: |
-    **Concept.** A partial index only contains the rows that satisfy a `WHERE` condition. When a query always targets a small subset of a big table, it is far smaller and cheaper to maintain than a full index.
+    Make the plan for that query use an index and contain **no `Sort` node**.
 
-    **Read up on:**
-    - `CREATE INDEX ... WHERE` — the partial index syntax
-    - `pg_relation_size` and `pg_size_pretty` — measure an index
-    - Predicate matching — when the planner may use a partial index
-    - `EXPLAIN` — which scan type replaces a sequential scan
-  scenario: |
-    PostgreSQL runs in the container **`kl-pg`** (`docker exec -it kl-pg psql -U lab -d lab`).
+    ## Part 3: Index only the open tickets
 
-    The table **`tickets`** has 100,000 rows, and only a tiny fraction have `status = 'open'`.
-    The support dashboard runs this query all day:
+    The table **`tickets`** has 100,000 rows, and only a tiny fraction have
+    `status = 'open'`. The support dashboard runs this query all day:
 
     ```sql
     SELECT id FROM tickets WHERE status = 'open' ORDER BY created_at;
     ```
 
     It scans the whole table. Add an index that makes it use an index instead, but keep
-    the **total size of all indexes (apart from the primary key) under 64 kB**.
+    the **total size of all indexes on `tickets` (apart from the primary key) under
+    64 kB**.
+
+    ## Part 4: Clean up after the updates
+
+    The table **`jobs_log`** (50,000 rows) was bulk-updated several times and has piled
+    up dead tuples. Someone also disabled autovacuum on it to "speed up" the batch job.
+
+    Fix both problems:
+
+    - the table must have been vacuumed, and `n_dead_tup` for it must be below 500;
+    - autovacuum must be allowed to run on the table again (no storage parameter turning
+      it off).
+
+    All 50,000 rows must still be there.
   hints:
-    - "A normal index over 100,000 rows is a couple of megabytes. Only a few rows matter to this query."
-    - "Give the index a `WHERE` clause that matches the one in the query."
+    - "Use `EXPLAIN (ANALYZE) SELECT ...`. The scan node prints extra lines below it: look for the one that starts with `Rows Removed by Filter`."
+    - "For `events`, one index must serve both the filter and the ordering. Think about which column comes first."
+    - "A normal index over 100,000 rows is a couple of megabytes, and only a few rows matter to the `tickets` query. Give the index a `WHERE` clause that matches the one in the query."
+    - "`SELECT n_dead_tup, last_vacuum FROM pg_stat_user_tables WHERE relname = 'jobs_log';` and `SELECT reloptions FROM pg_class WHERE relname = 'jobs_log';` show the state of `jobs_log`."
   solution: |
+    Part 1: read the plan and copy the number after `Rows Removed by Filter:` into
+    `/lab/filter-removed.txt`:
+
+    ```bash
+    docker exec kl-pg psql -U lab -d lab -c "EXPLAIN ANALYZE SELECT * FROM readings WHERE status = 'hot'"
+    ```
+
+    Parts 2 to 4:
+
     ```sql
+    -- Part 2: equality column first, ordering column second, so one user's rows come out sorted
+    CREATE INDEX events_user_ts ON events (user_id, ts DESC);
+
+    -- Part 3: only the open tickets go into the index
     CREATE INDEX tickets_open ON tickets (created_at) WHERE status = 'open';
+
+    -- Part 4
+    VACUUM jobs_log;
+    ALTER TABLE jobs_log RESET (autovacuum_enabled);
     ```
   setup: |
     pg_start
+
+    # --- part 1: What the filter threw away ---
+    k=$(shuf -i 300-900 -n 1)
+    pg_sql "create table readings(id serial primary key, status text not null, val int);
+            insert into readings(status, val) select case when g <= $k then 'hot' else 'cold' end, g from generate_series(1,20000) g;
+            analyze readings;"
+    echo $((20000 - k)) > "$KL_STATE/removed"
+
+    # --- part 2: Latest events without a sort ---
+    pg_sql <<'SQL'
+    create table events(id serial primary key, user_id int not null, kind text, ts timestamptz not null);
+    insert into events(user_id, kind, ts)
+      select (random()*500)::int, 'click', now() - ((random()*100000)::int || ' seconds')::interval
+      from generate_series(1,200000);
+    analyze events;
+    SQL
+
+    # --- part 3: Index only the open tickets ---
     pg_sql <<'SQL'
     create table tickets(id serial primary key, status text not null, created_at timestamptz not null, body text);
     insert into tickets(status, created_at, body)
@@ -145,51 +138,8 @@ exercises:
       from generate_series(1,100000) g;
     analyze tickets;
     SQL
-  check: |
-    plan=$(pg_sql "explain select id from tickets where status = 'open' order by created_at" 2>&1)
-    size=$(pg_sql "select coalesce(sum(pg_relation_size(indexrelid)),0) from pg_index where indrelid='tickets'::regclass and not indisprimary" 2>/dev/null)
-    np=$(pg_sql "select count(*) from pg_indexes where tablename='tickets' and indexdef like '%WHERE%'" 2>/dev/null)
-    check "the query no longer scans the whole table" '! grep -q "Seq Scan" <<<"$plan" && grep -q "Index" <<<"$plan"'
-    check "a partial index exists" '[ "${np:-0}" -ge 1 ]'
-    check "extra indexes stay under 64 kB" '[ "${size:-999999}" -gt 0 ] && [ "${size:-999999}" -lt 65536 ]'
-  solve: |
-    docker exec -i kl-pg psql -h 127.0.0.1 -U lab -d lab -qAt -c "CREATE INDEX tickets_open ON tickets (created_at) WHERE status = 'open'"
 
-- id: data-029
-  title: Clean up after the updates
-  difficulty: 3
-  kind: fix
-  tags: [postgres, vacuum, bloat]
-  tutorial: |
-    **Concept.** PostgreSQL never overwrites a row on UPDATE. It writes a new version and leaves the old one as a dead tuple until VACUUM marks the space reusable. Autovacuum normally does this, but it can be switched off per table.
-
-    **Read up on:**
-    - `VACUUM` — what it reclaims and whether it locks the table
-    - `pg_stat_user_tables` — `n_dead_tup`, `last_vacuum`
-    - Storage parameters (`reloptions`) — `autovacuum_enabled`
-    - `ALTER TABLE ... RESET` — removing a storage parameter
-  scenario: |
-    PostgreSQL runs in the container **`kl-pg`** (`docker exec -it kl-pg psql -U lab -d lab`).
-
-    The table **`jobs_log`** (50,000 rows) was bulk-updated several times and has piled up
-    dead tuples. Someone also disabled autovacuum on it to "speed up" the batch job.
-
-    Fix both problems:
-
-    - the table must have been vacuumed, and `n_dead_tup` for it must be below 500;
-    - autovacuum must be allowed to run on the table again (no storage parameter turning it off).
-
-    All 50,000 rows must still be there.
-  hints:
-    - "`SELECT n_dead_tup, last_vacuum FROM pg_stat_user_tables WHERE relname = 'jobs_log';`"
-    - "`SELECT reloptions FROM pg_class WHERE relname = 'jobs_log';` shows the stored option."
-  solution: |
-    ```sql
-    VACUUM jobs_log;
-    ALTER TABLE jobs_log RESET (autovacuum_enabled);
-    ```
-  setup: |
-    pg_start
+    # --- part 4: Clean up after the updates ---
     pg_sql <<'SQL'
     create table jobs_log(id int primary key, n int not null, note text);
     alter table jobs_log set (autovacuum_enabled = false);
@@ -199,6 +149,25 @@ exercises:
     update jobs_log set n = n + 1;
     SQL
   check: |
+    info "Part 1: What the filter threw away"
+    check_eq "rows removed by the filter" "$(tr -d '[:space:]' 2>/dev/null </lab/filter-removed.txt)" "$(cat "$KL_STATE/removed")"
+
+    info "Part 2: Latest events without a sort"
+    plan=$(pg_sql "explain select * from events where user_id = 42 order by ts desc limit 20" 2>&1)
+    n=$(pg_sql "select count(*) from pg_indexes where tablename='events' and indexdef like '%(user_id, %'" 2>/dev/null)
+    check "the plan uses an index" 'grep -q "Index" <<<"$plan"'
+    check_not "the plan has no Sort step" 'grep -q "Sort" <<<"$plan"'
+    check "an index starts with user_id" '[ "${n:-0}" -ge 1 ]'
+
+    info "Part 3: Index only the open tickets"
+    plan=$(pg_sql "explain select id from tickets where status = 'open' order by created_at" 2>&1)
+    size=$(pg_sql "select coalesce(sum(pg_relation_size(indexrelid)),0) from pg_index where indrelid='tickets'::regclass and not indisprimary" 2>/dev/null)
+    np=$(pg_sql "select count(*) from pg_indexes where tablename='tickets' and indexdef like '%WHERE%'" 2>/dev/null)
+    check "the query no longer scans the whole table" '! grep -q "Seq Scan" <<<"$plan" && grep -q "Index" <<<"$plan"'
+    check "a partial index exists" '[ "${np:-0}" -ge 1 ]'
+    check "extra indexes stay under 64 kB" '[ "${size:-999999}" -gt 0 ] && [ "${size:-999999}" -lt 65536 ]'
+
+    info "Part 4: Clean up after the updates"
     lv=$(pg_sql "select count(*) from pg_stat_user_tables where relname='jobs_log' and last_vacuum is not null" 2>/dev/null)
     dead=$(pg_sql "select n_dead_tup from pg_stat_user_tables where relname='jobs_log'" 2>/dev/null)
     opts=$(pg_sql "select coalesce(reloptions::text,'') from pg_class where relname='jobs_log'" 2>/dev/null)
@@ -208,24 +177,49 @@ exercises:
     check_not "autovacuum is not disabled on the table" 'grep -q "autovacuum_enabled=false" <<<"$opts"'
     check_eq "all rows kept" "$rows" 50000
   solve: |
+    # --- part 1: What the filter threw away ---
+    docker exec kl-pg psql -U lab -d lab -qAt -c "EXPLAIN ANALYZE SELECT * FROM readings WHERE status = 'hot'" \
+      | sed -n 's/.*Rows Removed by Filter: *\([0-9]*\).*/\1/p' > /lab/filter-removed.txt
+
+    # --- part 2: Latest events without a sort ---
+    docker exec -i kl-pg psql -h 127.0.0.1 -U lab -d lab -qAt -c "CREATE INDEX events_user_ts ON events (user_id, ts DESC)"
+
+    # --- part 3: Index only the open tickets ---
+    docker exec -i kl-pg psql -h 127.0.0.1 -U lab -d lab -qAt -c "CREATE INDEX tickets_open ON tickets (created_at) WHERE status = 'open'"
+
+    # --- part 4: Clean up after the updates ---
     docker exec -i kl-pg psql -h 127.0.0.1 -U lab -d lab -qAt -c "VACUUM jobs_log"
     docker exec -i kl-pg psql -h 127.0.0.1 -U lab -d lab -qAt -c "ALTER TABLE jobs_log RESET (autovacuum_enabled)"
 
 - id: data-030
-  title: A price with VAT that maintains itself
-  difficulty: 2
+  title: Let the database do the work
+  difficulty: 4
   kind: build
-  tags: [postgres, generated-column]
+  tags: [postgres, generated-column, upsert, on-conflict, listen-notify, trigger]
   tutorial: |
-    **Concept.** A generated column is computed from other columns of the same row by the database itself, so it can never drift out of sync. A stored one is calculated on write and kept on disk.
+    **Concept.** A lot of application code exists to keep data consistent: recalculating a derived value, checking whether a row exists before writing it, polling a table for changes. Each of those is racy or easy to forget, and PostgreSQL can do all three itself, for every client.
+
+    **Derived values.** A generated column is computed from other columns of the same row by the database, so it can never drift out of sync. A stored one is calculated on write and kept on disk. Its expression may only use the row's own columns and immutable functions.
+
+    **Insert or update.** An upsert inserts a row, or, when it collides with an existing key, updates the existing row instead. It is atomic, so concurrent writers can't create duplicates or lose updates. The conflict needs a primary key or unique constraint, and `EXCLUDED` is the pseudo-table holding the row you tried to insert.
+
+    **Telling others.** PostgreSQL has a lightweight message channel built in. A session subscribes to a named channel, and any session can send a message with an optional text payload. Messages are delivered when the sender's transaction commits. Combined with a trigger, every insert announces itself, whoever does it.
 
     **Read up on:**
-    - `GENERATED ALWAYS AS (...) STORED` — the column definition syntax
-    - `ALTER TABLE ... ADD COLUMN` — adding one to a table with data
+    - `GENERATED ALWAYS AS (...) STORED` and `ALTER TABLE ... ADD COLUMN`
     - Integer division in PostgreSQL — how results are truncated
-    - `\d table` in psql — how a generated column is displayed
+    - `INSERT ... ON CONFLICT (col) DO UPDATE` — the conflict target and action
+    - `EXCLUDED`, and referring to the existing row by table name in `SET`
+    - `LISTEN`, `NOTIFY` and `pg_notify()` — subscribing and sending, payload limits
+    - `CREATE TRIGGER` and trigger functions in PL/pgSQL — `NEW`
+    - `AFTER INSERT ... FOR EACH ROW` — when a trigger fires
   scenario: |
     PostgreSQL runs in the container **`kl-pg`** (`docker exec -it kl-pg psql -U lab -d lab`).
+
+    The shop's backend has grown a pile of code that keeps the data straight. Move three of
+    those jobs into the database, so they happen for every client.
+
+    ## Part 1: A price with VAT that maintains itself
 
     The table **`items`** stores prices in whole cents in `unit_cents` (always a multiple of
     100). The shop's VAT rate, in percent, is stored in the table **`settings`** under the key
@@ -234,60 +228,8 @@ exercises:
     Add a **stored generated column** named **`price_with_vat`** to `items` that always equals
     `unit_cents` plus VAT, as an integer. Existing rows and rows inserted later must have
     the right value without any application code.
-  hints:
-    - "Read the rate first: `SELECT value FROM settings WHERE key = 'vat_percent';`"
-    - "A generated column expression may only use the row's own columns and immutable functions, so the rate has to appear as a number in the expression."
-  solution: |
-    With a rate of, for example, 20:
 
-    ```sql
-    ALTER TABLE items ADD COLUMN price_with_vat int
-      GENERATED ALWAYS AS (unit_cents * (100 + 20) / 100) STORED;
-    ```
-  setup: |
-    pg_start
-    v=$(shuf -e 10 20 25 30 -n 1)
-    echo "$v" > "$KL_STATE/answer"
-    pg_sql <<SQL
-    create table settings(key text primary key, value text not null);
-    insert into settings values ('vat_percent', '$v');
-    create table items(id serial primary key, name text not null, unit_cents int not null, qty int not null default 1);
-    insert into items(name, unit_cents, qty)
-      select 'item-' || g, (1 + (random()*50)::int) * 100, 1 + (random()*5)::int from generate_series(1,40) g;
-    SQL
-  check: |
-    v=$(cat "$KL_STATE/answer")
-    kind=$(pg_sql "select attgenerated from pg_attribute where attrelid='items'::regclass and attname='price_with_vat'" 2>/dev/null)
-    bad=$(pg_sql "select count(*) from items where price_with_vat is distinct from unit_cents * (100 + $v) / 100" 2>/dev/null)
-    new=$(pg_sql 2>/dev/null <<SQL
-    begin;
-    insert into items(name, unit_cents, qty) values ('probe', 2000, 1);
-    select price_with_vat from items where name = 'probe';
-    rollback;
-    SQL
-    )
-    check_eq "price_with_vat is a stored generated column" "$kind" s
-    check_eq "existing rows are correct" "$bad" 0
-    check_eq "a new row gets its value automatically" "$new" "$((2000 * (100 + v) / 100))"
-  solve: |
-    v=$(docker exec kl-pg psql -h 127.0.0.1 -U lab -d lab -qAt -c "select value from settings where key='vat_percent'")
-    docker exec kl-pg psql -h 127.0.0.1 -U lab -d lab -qAt -c "ALTER TABLE items ADD COLUMN price_with_vat int GENERATED ALWAYS AS (unit_cents * (100 + $v) / 100) STORED"
-
-- id: data-031
-  title: Merge today's page hits
-  difficulty: 3
-  kind: build
-  tags: [postgres, upsert, on-conflict]
-  tutorial: |
-    **Concept.** An upsert inserts a row, or, when it collides with an existing key, updates the existing row instead. It is atomic, so concurrent writers cannot create duplicates or lose updates.
-
-    **Read up on:**
-    - `INSERT ... ON CONFLICT (col) DO UPDATE` — the conflict target and action
-    - `EXCLUDED` — the pseudo-table holding the proposed row
-    - Referring to the existing row by table name in the `SET` clause
-    - `PRIMARY KEY` / unique constraints — what a conflict needs
-  scenario: |
-    PostgreSQL runs in the container **`kl-pg`** (`docker exec -it kl-pg psql -U lab -d lab`).
+    ## Part 2: Merge today's page hits
 
     The table **`page_hits`** (`path` primary key, `hits`) counts visits per page. The file
     **`/lab/new_hits.csv`** has lines of `path,count` from today's logs. Some paths are
@@ -295,17 +237,62 @@ exercises:
 
     Apply every line once: for known paths **add** the count to the stored total, for
     new paths create the row. No path may end up twice.
+
+    ## Part 3: Tell the workers about new orders
+
+    Worker processes need to learn about new rows in the table **`orders`** without polling.
+    Make the database announce every newly inserted order on the channel
+    **`new_order`**, with the new order's **`id`** (as text) as the payload.
+
+    A session that ran `LISTEN new_order;` must receive a notification for each insert, whoever
+    does the insert.
   hints:
-    - "The file is short. You can write the statement by hand, or load it with `\\copy ... FROM STDIN` into a staging table first."
+    - "Read the rate first: `SELECT value FROM settings WHERE key = 'vat_percent';`. A generated column expression may only use the row's own columns and immutable functions, so the rate has to appear as a number in the expression."
+    - "The hits file is short. You can write the statement by hand, or load it with `\\copy ... FROM STDIN` into a staging table first."
     - "In the `DO UPDATE SET hits = ...` expression, `page_hits.hits` is the old value and `EXCLUDED.hits` is the new one."
+    - "Part 3 needs a trigger function and a trigger on `orders`. `pg_notify(channel, payload)` can be called from PL/pgSQL with `PERFORM`, and in an AFTER INSERT row trigger the new row is `NEW`."
   solution: |
+    Part 1, with a rate of, for example, 20:
+
+    ```sql
+    ALTER TABLE items ADD COLUMN price_with_vat int
+      GENERATED ALWAYS AS (unit_cents * (100 + 20) / 100) STORED;
+    ```
+
+    Part 2: build the `VALUES` list from the CSV (or load it into a staging table and
+    `INSERT ... SELECT`):
+
     ```sql
     INSERT INTO page_hits(path, hits) VALUES ('home', 12), ('docs', 5), ...
     ON CONFLICT (path) DO UPDATE SET hits = page_hits.hits + EXCLUDED.hits;
     ```
-    Build the `VALUES` list from the CSV (or load it into a staging table and `INSERT ... SELECT`).
+
+    Part 3:
+
+    ```sql
+    CREATE FUNCTION notify_order() RETURNS trigger LANGUAGE plpgsql AS $$
+    BEGIN
+      PERFORM pg_notify('new_order', NEW.id::text);
+      RETURN NEW;
+    END $$;
+    CREATE TRIGGER orders_notify AFTER INSERT ON orders
+      FOR EACH ROW EXECUTE FUNCTION notify_order();
+    ```
   setup: |
     pg_start
+
+    # --- part 1: A price with VAT that maintains itself ---
+    v=$(shuf -e 10 20 25 30 -n 1)
+    echo "$v" > "$KL_STATE/vat"
+    pg_sql <<SQL
+    create table settings(key text primary key, value text not null);
+    insert into settings values ('vat_percent', '$v');
+    create table items(id serial primary key, name text not null, unit_cents int not null, qty int not null default 1);
+    insert into items(name, unit_cents, qty)
+      select 'item-' || g, (1 + (random()*50)::int) * 100, 1 + (random()*5)::int from generate_series(1,40) g;
+    SQL
+
+    # --- part 2: Merge today's page hits ---
     pg_sql "create table page_hits(path text primary key, hits int not null)"
     declare -A cur add
     paths=(home pricing docs blog about login cart api status jobs)
@@ -323,13 +310,60 @@ exercises:
     done
     shuf /lab/new_hits.csv -o /lab/new_hits.csv
     chown "$(lab_user)": /lab/new_hits.csv
-    for p in "${paths[@]}"; do echo "$p=$((cur[$p] + add[$p]))"; done | LC_ALL=C sort | paste -sd, > "$KL_STATE/answer"
+    for p in "${paths[@]}"; do echo "$p=$((cur[$p] + add[$p]))"; done | LC_ALL=C sort | paste -sd, > "$KL_STATE/hits"
+
+    # --- part 3: Tell the workers about new orders ---
+    pg_sql "create table orders(id serial primary key, item text not null, qty int not null default 1);
+            insert into orders(item) values ('widget'), ('gadget');"
   check: |
+    info "Part 1: A price with VAT that maintains itself"
+    v=$(cat "$KL_STATE/vat")
+    kind=$(pg_sql "select attgenerated from pg_attribute where attrelid='items'::regclass and attname='price_with_vat'" 2>/dev/null)
+    bad=$(pg_sql "select count(*) from items where price_with_vat is distinct from unit_cents * (100 + $v) / 100" 2>/dev/null)
+    new=$(pg_sql 2>/dev/null <<SQL
+    begin;
+    insert into items(name, unit_cents, qty) values ('probe', 2000, 1);
+    select price_with_vat from items where name = 'probe';
+    rollback;
+    SQL
+    )
+    check_eq "price_with_vat is a stored generated column" "$kind" s
+    check_eq "existing rows are correct" "$bad" 0
+    check_eq "a new row gets its value automatically" "$new" "$((2000 * (100 + v) / 100))"
+
+    info "Part 2: Merge today's page hits"
     got=$(pg_sql "select string_agg(path || '=' || hits, ',' order by path collate \"C\") from page_hits" 2>/dev/null)
-    check_eq "page_hits holds the merged totals" "$got" "$(cat "$KL_STATE/answer")"
+    check_eq "page_hits holds the merged totals" "$got" "$(cat "$KL_STATE/hits")"
+
+    info "Part 3: Tell the workers about new orders"
+    out=$(pg_sql 2>&1 <<'SQL'
+    listen new_order;
+    insert into orders(id, item) values (999999, 'probe');
+    select 1;
+    delete from orders where id = 999999;
+    select 2;
+    SQL
+    )
+    check "a listener receives the new order id" 'grep -q "\"new_order\" with payload \"999999\"" <<<"$out"'
   solve: |
+    # --- part 1: A price with VAT that maintains itself ---
+    v=$(docker exec kl-pg psql -h 127.0.0.1 -U lab -d lab -qAt -c "select value from settings where key='vat_percent'")
+    docker exec kl-pg psql -h 127.0.0.1 -U lab -d lab -qAt -c "ALTER TABLE items ADD COLUMN price_with_vat int GENERATED ALWAYS AS (unit_cents * (100 + $v) / 100) STORED"
+
+    # --- part 2: Merge today's page hits ---
     vals=$(awk -F, '{printf "%s(\x27%s\x27,%s)", (NR>1?",":""), $1, $2}' /lab/new_hits.csv)
     docker exec -i kl-pg psql -h 127.0.0.1 -U lab -d lab -qAt -c "INSERT INTO page_hits(path,hits) VALUES $vals ON CONFLICT (path) DO UPDATE SET hits = page_hits.hits + EXCLUDED.hits"
+
+    # --- part 3: Tell the workers about new orders ---
+    docker exec -i kl-pg psql -h 127.0.0.1 -U lab -d lab -qAt <<'SQL'
+    CREATE FUNCTION notify_order() RETURNS trigger LANGUAGE plpgsql AS $$
+    BEGIN
+      PERFORM pg_notify('new_order', NEW.id::text);
+      RETURN NEW;
+    END $$;
+    CREATE TRIGGER orders_notify AFTER INSERT ON orders
+      FOR EACH ROW EXECUTE FUNCTION notify_order();
+    SQL
 
 - id: data-032
   title: The best trailing week
@@ -381,128 +415,42 @@ exercises:
   solve: |
     docker exec kl-pg psql -h 127.0.0.1 -U lab -d lab -qAt -c "SELECT day FROM (SELECT day, row_number() OVER w AS rn, avg(amount) OVER w AS a FROM daily_sales WINDOW w AS (ORDER BY day ROWS BETWEEN 6 PRECEDING AND CURRENT ROW)) s WHERE rn >= 7 ORDER BY a DESC LIMIT 1" > /lab/answer.txt
 
-- id: data-033
-  title: Tell the workers about new orders
-  difficulty: 4
-  kind: build
-  tags: [postgres, listen-notify, trigger]
-  tutorial: |
-    **Concept.** PostgreSQL has a lightweight message channel built in. A session can subscribe to a named channel, and any session can send a message with an optional text payload. Messages are delivered when the sender's transaction commits.
-
-    **Read up on:**
-    - `LISTEN`, `NOTIFY` and `pg_notify()` — subscribing and sending
-    - `CREATE TRIGGER` and trigger functions in PL/pgSQL — `NEW`
-    - `AFTER INSERT ... FOR EACH ROW` — when a trigger fires
-    - Payload limits — what fits in a notification
-  scenario: |
-    PostgreSQL runs in the container **`kl-pg`** (`docker exec -it kl-pg psql -U lab -d lab`).
-
-    Worker processes need to learn about new rows in the table **`orders`** without polling.
-    Make the database announce every newly inserted order on the channel
-    **`new_order`**, with the new order's **`id`** (as text) as the payload.
-
-    A session that ran `LISTEN new_order;` must receive a notification for each insert, whoever
-    does the insert.
-  hints:
-    - "You need a trigger function and a trigger on `orders`."
-    - "`pg_notify(channel, payload)` can be called from PL/pgSQL with `PERFORM`. In an AFTER INSERT row trigger the new row is `NEW`."
-  solution: |
-    ```sql
-    CREATE FUNCTION notify_order() RETURNS trigger LANGUAGE plpgsql AS $$
-    BEGIN
-      PERFORM pg_notify('new_order', NEW.id::text);
-      RETURN NEW;
-    END $$;
-    CREATE TRIGGER orders_notify AFTER INSERT ON orders
-      FOR EACH ROW EXECUTE FUNCTION notify_order();
-    ```
-  setup: |
-    pg_start
-    pg_sql "create table orders(id serial primary key, item text not null, qty int not null default 1);
-            insert into orders(item) values ('widget'), ('gadget');"
-  check: |
-    out=$(pg_sql 2>&1 <<'SQL'
-    listen new_order;
-    insert into orders(id, item) values (999999, 'probe');
-    select 1;
-    delete from orders where id = 999999;
-    select 2;
-    SQL
-    )
-    check "a listener receives the new order id" 'grep -q "\"new_order\" with payload \"999999\"" <<<"$out"'
-  solve: |
-    docker exec -i kl-pg psql -h 127.0.0.1 -U lab -d lab -qAt <<'SQL'
-    CREATE FUNCTION notify_order() RETURNS trigger LANGUAGE plpgsql AS $$
-    BEGIN
-      PERFORM pg_notify('new_order', NEW.id::text);
-      RETURN NEW;
-    END $$;
-    CREATE TRIGGER orders_notify AFTER INSERT ON orders
-      FOR EACH ROW EXECUTE FUNCTION notify_order();
-    SQL
-
 - id: data-034
-  title: Unique visitors for the week
+  title: End of day on the shop's Redis
   difficulty: 3
   kind: build
-  tags: [redis, hyperloglog]
+  tags: [redis, hyperloglog, hash, hincrby]
   tutorial: |
-    **Concept.** A HyperLogLog is a Redis structure that estimates the number of distinct elements in a tiny, fixed amount of memory. Several of them can be combined to count distinct elements across all of them, without double-counting.
+    **Concept.** Picking the right Redis structure turns a job that would need a lot of client-side bookkeeping into a couple of commands. Two end-of-day jobs show the range.
+
+    A **HyperLogLog** estimates the number of distinct elements in a tiny, fixed amount of memory. It stores no elements, so you can't list them, but several can be merged to count distinct elements across all of them. That matters because daily unique counts can't simply be added: a visitor who came on two days would be counted twice. The estimate has a small standard error, which is the price of the tiny size.
+
+    A **hash** stores many field/value pairs under one key. Single fields can be read, changed or removed atomically, without rewriting the whole object, so `HINCRBY` is safe even with several writers. It also returns the new value, which is useful when a result triggers a further step.
 
     **Read up on:**
     - `PFADD` and `PFCOUNT` — adding elements and reading the estimate
     - `PFMERGE destkey sourcekey...` — union of several HyperLogLogs
     - Why a plain sum of daily counts overcounts returning visitors
-    - `TYPE` — what kind of key a HyperLogLog is stored as
-  scenario: |
-    Redis is running in **`kl-redis`** (`docker exec -it kl-redis redis-cli`).
-
-    The HyperLogLogs **`kl:visitors:mon`**, **`kl:visitors:tue`** and **`kl:visitors:wed`**
-    hold the visitor IDs seen on each day. Some visitors came on several days.
-
-    1. Create the key **`kl:visitors:week`** holding the union of the three days.
-    2. Write the number of **distinct** visitors it reports (and only that number) to
-       **`/lab/answer.txt`**.
-  hints:
-    - "`PFMERGE kl:visitors:week kl:visitors:mon kl:visitors:tue kl:visitors:wed`."
-    - "Then `PFCOUNT kl:visitors:week` prints the estimate."
-  solution: |
-    ```bash
-    docker exec kl-redis redis-cli PFMERGE kl:visitors:week kl:visitors:mon kl:visitors:tue kl:visitors:wed
-    docker exec kl-redis redis-cli PFCOUNT kl:visitors:week > /lab/answer.txt
-    ```
-  setup: |
-    docker run -d --name kl-redis redis:7.4-alpine >/dev/null
-    eventually 20 '[ "$(docker exec kl-redis redis-cli ping)" = PONG ]'
-    add() { local key=$1 lo=$2 hi=$3 n=$4 args=() i; for i in $(shuf -i "$lo-$hi" -n "$n"); do args+=("v$i"); done
-            docker exec kl-redis redis-cli PFADD "$key" "${args[@]}" >/dev/null; }
-    add kl:visitors:mon 1 400 150
-    add kl:visitors:tue 100 500 150
-    add kl:visitors:wed 300 600 100
-    docker exec kl-redis redis-cli PFCOUNT kl:visitors:mon kl:visitors:tue kl:visitors:wed | tr -d '[:space:]' > "$KL_STATE/answer"
-  check: |
-    want=$(cat "$KL_STATE/answer")
-    check_eq "answer.txt holds the distinct count" "$(tr -d '[:space:]' 2>/dev/null </lab/answer.txt)" "$want"
-    check_eq "kl:visitors:week reports the same union" "$(docker exec kl-redis redis-cli PFCOUNT kl:visitors:week | tr -d '[:space:]')" "$want"
-  solve: |
-    docker exec kl-redis redis-cli PFMERGE kl:visitors:week kl:visitors:mon kl:visitors:tue kl:visitors:wed
-    docker exec kl-redis redis-cli PFCOUNT kl:visitors:week > /lab/answer.txt
-
-- id: data-035
-  title: Apply the day's orders to the stock hash
-  difficulty: 3
-  kind: build
-  tags: [redis, hash, hincrby]
-  tutorial: |
-    **Concept.** A Redis hash stores many field/value pairs under one key. Single fields can be read, changed or removed atomically, without rewriting the whole object.
-
-    **Read up on:**
     - `HGET`, `HGETALL` and `HLEN` — inspecting a hash
     - `HINCRBY key field increment` — atomic arithmetic, negative values too
     - `HDEL` — remove a single field
     - Shell loops over `redis-cli` — applying many commands from a file
   scenario: |
     Redis is running in **`kl-redis`** (`docker exec -it kl-redis redis-cli`).
+
+    The shop's end-of-day job has been down since the weekend, and today's two steps have
+    to be run by hand.
+
+    ## Part 1: Unique visitors for the week
+
+    The HyperLogLogs **`kl:visitors:mon`**, **`kl:visitors:tue`** and **`kl:visitors:wed`**
+    hold the visitor IDs seen on each day. Some visitors came on several days.
+
+    1. Create the key **`kl:visitors:week`** holding the union of the three days.
+    2. Write the number of **distinct** visitors it reports (and only that number) to
+       **`/lab/visitors.txt`**.
+
+    ## Part 2: Apply the day's orders to the stock hash
 
     The hash **`kl:stock`** maps a SKU to the number of units in the warehouse. The file
     **`/lab/orders.txt`** lists the day's sales, one `sku quantity` per line. A SKU can
@@ -511,10 +459,16 @@ exercises:
     Subtract every sale from the stock. A SKU whose stock drops to **exactly zero** must be
     removed from the hash completely, not left with a `0`. Apply each line once.
   hints:
+    - "`PFMERGE kl:visitors:week kl:visitors:mon kl:visitors:tue kl:visitors:wed`, then `PFCOUNT kl:visitors:week` prints the estimate."
     - "`HINCRBY kl:stock sku -3` subtracts three and returns the new value."
     - "`HINCRBY` returns the new value, so you can test for zero and `HDEL` the field. Or apply all lines first and clean up afterwards."
   solution: |
     ```bash
+    # Part 1
+    docker exec kl-redis redis-cli PFMERGE kl:visitors:week kl:visitors:mon kl:visitors:tue kl:visitors:wed
+    docker exec kl-redis redis-cli PFCOUNT kl:visitors:week > /lab/visitors.txt
+
+    # Part 2
     while read -r sku qty; do
       docker exec kl-redis redis-cli HINCRBY kl:stock "$sku" "-$qty"
     done < /lab/orders.txt
@@ -524,6 +478,16 @@ exercises:
   setup: |
     docker run -d --name kl-redis redis:7.4-alpine >/dev/null
     eventually 20 '[ "$(docker exec kl-redis redis-cli ping)" = PONG ]'
+
+    # --- part 1: Unique visitors for the week ---
+    add() { local key=$1 lo=$2 hi=$3 n=$4 args=() i; for i in $(shuf -i "$lo-$hi" -n "$n"); do args+=("v$i"); done
+            docker exec kl-redis redis-cli PFADD "$key" "${args[@]}" >/dev/null; }
+    add kl:visitors:mon 1 400 150
+    add kl:visitors:tue 100 500 150
+    add kl:visitors:wed 300 600 100
+    docker exec kl-redis redis-cli PFCOUNT kl:visitors:mon kl:visitors:tue kl:visitors:wed | tr -d '[:space:]' > "$KL_STATE/visitors"
+
+    # --- part 2: Apply the day's orders to the stock hash ---
     : > "$KL_STATE/expected"
     : > /lab/orders.txt
     out=0
@@ -544,6 +508,12 @@ exercises:
     shuf /lab/orders.txt -o /lab/orders.txt
     chown "$(lab_user)": /lab/orders.txt
   check: |
+    info "Part 1: Unique visitors for the week"
+    want=$(cat "$KL_STATE/visitors")
+    check_eq "visitors.txt holds the distinct count" "$(tr -d '[:space:]' 2>/dev/null </lab/visitors.txt)" "$want"
+    check_eq "kl:visitors:week reports the same union" "$(docker exec kl-redis redis-cli PFCOUNT kl:visitors:week | tr -d '[:space:]')" "$want"
+
+    info "Part 2: Apply the day's orders to the stock hash"
     n=$(wc -l < "$KL_STATE/expected")
     check_eq "only the remaining SKUs are left" "$(docker exec kl-redis redis-cli HLEN kl:stock | tr -d '[:space:]')" "$n"
     bad=0
@@ -552,6 +522,11 @@ exercises:
     done < "$KL_STATE/expected"
     check_eq "stock levels are right" "$bad" 0
   solve: |
+    # --- part 1: Unique visitors for the week ---
+    docker exec kl-redis redis-cli PFMERGE kl:visitors:week kl:visitors:mon kl:visitors:tue kl:visitors:wed
+    docker exec kl-redis redis-cli PFCOUNT kl:visitors:week > /lab/visitors.txt
+
+    # --- part 2: Apply the day's orders to the stock hash ---
     while read -r sku qty; do
       docker exec kl-redis redis-cli HINCRBY kl:stock "$sku" "-$qty" >/dev/null
     done < /lab/orders.txt
