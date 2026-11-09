@@ -8,7 +8,7 @@ multi-step scenario and teach a concept, and a smaller catalog after merging thi
 is a good outcome. The parts of this list that the existing exercises don't cover are not
 started.
 
-Exercise counts as of v0.9.0:
+Exercise counts as of v0.10.0:
 
 | Topic | Exercises | Track | Module files |
 |---|---|---|---|

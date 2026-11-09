@@ -33,6 +33,13 @@ const (
 	MetricsVersion    = "v0.9.1"
 	LocalPathVersion  = "v0.0.37"
 	GatewayAPIVersion = "v1.7.0"
+	// Exact apt versions, so a VM built later matches the one the labs were
+	// verified on. Bump these on purpose and re-run verify.
+	DockerVersion     = "5:29.9.3-1~ubuntu.24.04~noble"
+	ContainerdVersion = "2.4.2-3~ubuntu.24.04~noble"
+	BuildxVersion     = "0.38.1-1~ubuntu.24.04~noble"
+	ComposeVersion    = "5.7.0-1~ubuntu.24.04~noble"
+	CriToolsVersion   = "1.36.0-1.1"
 	// KitVersion is bumped whenever bootstrap output changes incompatibly.
 	KitVersion = "1"
 )
@@ -300,6 +307,11 @@ func (m *Manager) template(env Env, vm VM) (string, error) {
 		"__HOSTNAME__", vm.Hostname,
 		"__K8S_MINOR__", K8sMinor,
 		"__K8S_VERSION__", K8sVersion,
+		"__DOCKER_VERSION__", DockerVersion,
+		"__CONTAINERD_VERSION__", ContainerdVersion,
+		"__BUILDX_VERSION__", BuildxVersion,
+		"__COMPOSE_VERSION__", ComposeVersion,
+		"__CRI_TOOLS_VERSION__", CriToolsVersion,
 		"__CPUS__", fmt.Sprint(vm.CPUs),
 		"__MEMORY__", vm.Memory,
 	)
