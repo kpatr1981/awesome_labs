@@ -1,0 +1,575 @@
+track: cloud
+module: Data & messaging
+profile: docker
+order: 4
+exercises:
+
+- id: cloud-026
+  title: A link that expires
+  difficulty: 2
+  kind: build
+  tags: [aws, s3, presign]
+  tutorial: |
+    **Concept.** A presigned URL carries a signature and an expiry in its query string, so anyone holding it can fetch one object without credentials until it lapses. It is computed locally from your keys.
+
+    **Read up on:**
+    - `aws s3 presign help` — what the command prints and its options
+    - Signature version 4 query parameters — which one holds the lifetime
+    - `curl -fsS URL` — testing a link without any AWS tooling
+    - The default lifetime — and how to change it
+  scenario: |
+    The `aws` command talks to a local emulator. The bucket **`kl-share`** holds an object
+    **`handbook.txt`**, and a contractor with no AWS account needs to download it.
+
+    Create a download link that stays valid for exactly **10 minutes** and save the bare URL
+    to **`/lab/link.txt`**.
+  hints:
+    - "`aws s3 presign` prints a URL; the lifetime is given in seconds."
+    - "The default lifetime is one hour, so you have to set it explicitly."
+  solution: |
+    ```bash
+    cd /lab
+    aws s3 presign s3://kl-share/handbook.txt --expires-in 600 > link.txt
+    curl -s "$(cat link.txt)"
+    ```
+  setup: |
+    moto_start
+    tok=link-$RANDOM$RANDOM
+    echo "$tok" > "$KL_STATE/answer"
+    aws s3 mb s3://kl-share >/dev/null
+    echo "$tok" | aws s3 cp - s3://kl-share/handbook.txt >/dev/null
+  check: |
+    u=$(tr -d '[:space:]' 2>/dev/null </lab/link.txt)
+    check_match "link points at handbook.txt" "$u" 'kl-share.*handbook\.txt\?'
+    check_match "link lives for 600 seconds" "$u" 'X-Amz-Expires=600(&|$)'
+    check_eq "link downloads the object" "$(curl -fsS -m 5 "${u:-http://127.0.0.1:1/}" 2>/dev/null)" "$(cat "$KL_STATE/answer")"
+  solve: |
+    cd /lab
+    aws s3 presign s3://kl-share/handbook.txt --expires-in 600 > link.txt
+
+- id: cloud-027
+  title: Label and lock an invoice
+  difficulty: 2
+  kind: build
+  tags: [aws, s3, metadata, encryption]
+  tutorial: |
+    **Concept.** An S3 object carries user metadata, tags and an encryption setting, and all three can be given when it is written. Metadata is fixed at upload, while tags can be changed later.
+
+    **Read up on:**
+    - `aws s3api put-object help` — metadata, tagging and encryption options
+    - `aws s3api head-object` — reading back metadata and encryption
+    - `aws s3api get-object-tagging` — the TagSet shape
+    - Server-side encryption with S3-managed keys — the algorithm name
+  scenario: |
+    The `aws` command talks to a local emulator. The bucket **`kl-books`** exists and
+    **`/lab/invoice.txt`** needs filing.
+
+    Store it as **`invoices/2026/inv.txt`** with all of the following:
+
+    - user metadata **`ticket`** set to the value in **`/lab/ticket.txt`**
+    - the tag **`retention`** with the value **`7y`**
+    - server-side encryption with S3-managed keys
+  hints:
+    - "`aws s3api put-object` can set all three in one call."
+    - "`--metadata ticket=VALUE`, `--tagging 'k=v'` and `--server-side-encryption`."
+    - "Local files for `--body` must live under /lab."
+  solution: |
+    ```bash
+    cd /lab
+    aws s3api put-object --bucket kl-books --key invoices/2026/inv.txt --body /lab/invoice.txt \
+      --metadata ticket="$(cat ticket.txt)" --tagging 'retention=7y' --server-side-encryption AES256
+    aws s3api head-object --bucket kl-books --key invoices/2026/inv.txt
+    ```
+  setup: |
+    moto_start
+    t=TCK-$RANDOM
+    echo "$t" > "$KL_STATE/answer"
+    aws s3 mb s3://kl-books >/dev/null
+    lab_file /lab/ticket.txt <<EOF
+    $t
+    EOF
+    lab_file /lab/invoice.txt <<EOF
+    invoice,$RANDOM
+    total,$RANDOM
+    EOF
+  check: |
+    h=$(aws s3api head-object --bucket kl-books --key invoices/2026/inv.txt 2>/dev/null)
+    g=$(aws s3api get-object-tagging --bucket kl-books --key invoices/2026/inv.txt 2>/dev/null)
+    check_eq "metadata ticket is set" "$(jq -r '.Metadata.ticket' <<<"${h:-null}" 2>/dev/null)" "$(cat "$KL_STATE/answer")"
+    check_eq "encrypted with AES256" "$(jq -r '.ServerSideEncryption' <<<"${h:-null}" 2>/dev/null)" "AES256"
+    check_eq "retention tag is 7y" "$(jq -r '[.TagSet[]? | select(.Key=="retention") | .Value][0]' <<<"${g:-null}" 2>/dev/null)" "7y"
+    check_eq "content is the invoice" "$(aws s3 cp s3://kl-books/invoices/2026/inv.txt - 2>/dev/null | sha256sum)" "$(sha256sum </lab/invoice.txt)"
+  solve: |
+    cd /lab
+    aws s3api put-object --bucket kl-books --key invoices/2026/inv.txt --body /lab/invoice.txt \
+      --metadata ticket="$(cat ticket.txt)" --tagging 'retention=7y' --server-side-encryption AES256
+
+- id: cloud-028
+  title: Let the database say no
+  difficulty: 3
+  kind: build
+  tags: [aws, dynamodb, conditional-write]
+  tutorial: |
+    **Concept.** A conditional write succeeds only if an expression about the item's current state is true, so two clients cannot both win a race. A failed condition comes back as a specific error.
+
+    **Read up on:**
+    - `aws dynamodb update-item help` — update and condition expressions
+    - `--expression-attribute-names` and `--expression-attribute-values` — placeholders
+    - DynamoDB reserved words — which common attribute names need a placeholder
+    - `ConditionalCheckFailedException` — what it means
+  scenario: |
+    The `aws` command talks to a local emulator. The table **`seats`** (key **`seat`**) lists
+    each seat with a **`status`** of `free` or `taken`, plus a **`holder`** once taken.
+    Seats **A1** and **A2** exist.
+
+    Book **A1** for the guest named in **`/lab/guest.txt`**, setting `status` to `taken` and
+    `holder` to the guest. Then attempt the same booking for **A2**: the *database* must refuse
+    it because the seat is not free, not your own judgement. Save that attempt's error output
+    to **`/lab/refused.txt`**. A2 must keep its original holder.
+  hints:
+    - "Use `--condition-expression` so the update only applies while the status is `free`."
+    - "`status` is a reserved word, so refer to it through `--expression-attribute-names`."
+    - "Redirect stderr of the second call: `2> /lab/refused.txt`."
+  solution: |
+    The same conditional update is run for both seats. A1 succeeds; A2 fails the condition.
+
+    ```bash
+    cd /lab
+    g=$(cat guest.txt)
+    vals=$(jq -nc --arg g "$g" '{":t":{S:"taken"},":f":{S:"free"},":h":{S:$g}}')
+    book() {
+      aws dynamodb update-item --table-name seats --key "{\"seat\":{\"S\":\"$1\"}}" \
+        --update-expression 'SET #s = :t, holder = :h' --condition-expression '#s = :f' \
+        --expression-attribute-names '{"#s":"status"}' --expression-attribute-values "$vals"
+    }
+    book A1
+    book A2 2> refused.txt
+    ```
+  setup: |
+    moto_start
+    g=guest$RANDOM
+    echo "$g" > "$KL_STATE/answer"
+    lab_file /lab/guest.txt <<EOF
+    $g
+    EOF
+    aws dynamodb create-table --table-name seats --attribute-definitions AttributeName=seat,AttributeType=S \
+      --key-schema AttributeName=seat,KeyType=HASH --billing-mode PAY_PER_REQUEST >/dev/null
+    aws dynamodb put-item --table-name seats --item '{"seat":{"S":"A1"},"status":{"S":"free"}}'
+    aws dynamodb put-item --table-name seats --item '{"seat":{"S":"A2"},"status":{"S":"taken"},"holder":{"S":"mallory"}}'
+  check: |
+    a1=$(aws dynamodb get-item --table-name seats --key '{"seat":{"S":"A1"}}' --consistent-read 2>/dev/null)
+    a2=$(aws dynamodb get-item --table-name seats --key '{"seat":{"S":"A2"}}' --consistent-read 2>/dev/null)
+    check_eq "A1 is taken" "$(jq -r '.Item.status.S' <<<"${a1:-null}" 2>/dev/null)" "taken"
+    check_eq "A1 is held by the guest" "$(jq -r '.Item.holder.S' <<<"${a1:-null}" 2>/dev/null)" "$(cat "$KL_STATE/answer")"
+    check_eq "A2 still belongs to mallory" "$(jq -r '.Item.holder.S' <<<"${a2:-null}" 2>/dev/null)" "mallory"
+    check "the refusal was saved" 'grep -q ConditionalCheckFailedException /lab/refused.txt'
+  solve: |
+    cd /lab
+    g=$(cat guest.txt)
+    vals=$(jq -nc --arg g "$g" '{":t":{S:"taken"},":f":{S:"free"},":h":{S:$g}}')
+    book() {
+      aws dynamodb update-item --table-name seats --key "{\"seat\":{\"S\":\"$1\"}}" \
+        --update-expression 'SET #s = :t, holder = :h' --condition-expression '#s = :f' \
+        --expression-attribute-names '{"#s":"status"}' --expression-attribute-values "$vals"
+    }
+    book A1
+    book A2 2> refused.txt || true
+
+- id: cloud-029
+  title: Sessions that clean themselves up
+  difficulty: 2
+  kind: build
+  tags: [aws, dynamodb, ttl]
+  tutorial: |
+    **Concept.** DynamoDB can delete items for you once a timestamp attribute has passed. You name the attribute at the table level, and each item stores its own expiry as a number.
+
+    **Read up on:**
+    - `aws dynamodb update-time-to-live help` — the specification argument
+    - `aws dynamodb describe-time-to-live` — checking the status
+    - The expected format of a TTL value — which unit and which type
+    - `date +%s` and shell arithmetic — computing a future time
+  scenario: |
+    The `aws` command talks to a local emulator. The table **`sessions`** (key **`id`**) holds
+    login sessions, and nothing ever removes the old ones.
+
+    Turn on time to live using the attribute named in **`/lab/ttl-attr.txt`**. Then make the
+    existing session **`s-42`** expire about **one hour** from now, keeping its other data.
+  hints:
+    - "TTL is enabled per table with a specification naming the attribute."
+    - "The value is a number: seconds since the epoch."
+    - "`update-item` with `SET` adds an attribute without touching the rest."
+  solution: |
+    ```bash
+    cd /lab
+    a=$(cat ttl-attr.txt)
+    aws dynamodb update-time-to-live --table-name sessions \
+      --time-to-live-specification "Enabled=true,AttributeName=$a"
+    aws dynamodb update-item --table-name sessions --key '{"id":{"S":"s-42"}}' \
+      --update-expression 'SET #a = :v' --expression-attribute-names "{\"#a\":\"$a\"}" \
+      --expression-attribute-values "{\":v\":{\"N\":\"$(( $(date +%s) + 3600 ))\"}}"
+    ```
+  setup: |
+    moto_start
+    attrs=(expires_at expiry ttl_epoch purge_after)
+    a=${attrs[RANDOM % 4]}
+    echo "$a" > "$KL_STATE/answer"
+    lab_file /lab/ttl-attr.txt <<EOF
+    $a
+    EOF
+    aws dynamodb create-table --table-name sessions --attribute-definitions AttributeName=id,AttributeType=S \
+      --key-schema AttributeName=id,KeyType=HASH --billing-mode PAY_PER_REQUEST >/dev/null
+    aws dynamodb put-item --table-name sessions --item '{"id":{"S":"s-42"},"user":{"S":"ann"}}'
+  check: |
+    a=$(cat "$KL_STATE/answer")
+    t=$(aws dynamodb describe-time-to-live --table-name sessions 2>/dev/null)
+    i=$(aws dynamodb get-item --table-name sessions --key '{"id":{"S":"s-42"}}' --consistent-read 2>/dev/null)
+    check_match "TTL is on" "$(jq -r '.TimeToLiveDescription.TimeToLiveStatus' <<<"${t:-null}" 2>/dev/null)" '^(ENABLED|ENABLING)$'
+    check_eq "TTL uses the right attribute" "$(jq -r '.TimeToLiveDescription.AttributeName' <<<"${t:-null}" 2>/dev/null)" "$a"
+    v=$(jq -r --arg a "$a" '.Item[$a].N' <<<"${i:-null}" 2>/dev/null)
+    now=$(date +%s)
+    check "s-42 expires in about an hour" '[[ "$v" =~ ^[0-9]+$ ]] && [ "$v" -ge $((now+3000)) ] && [ "$v" -le $((now+4200)) ]'
+    check_eq "s-42 keeps its user" "$(jq -r '.Item.user.S' <<<"${i:-null}" 2>/dev/null)" "ann"
+  solve: |
+    cd /lab
+    a=$(cat ttl-attr.txt)
+    aws dynamodb update-time-to-live --table-name sessions \
+      --time-to-live-specification "Enabled=true,AttributeName=$a"
+    aws dynamodb update-item --table-name sessions --key '{"id":{"S":"s-42"}}' \
+      --update-expression 'SET #a = :v' --expression-attribute-names "{\"#a\":\"$a\"}" \
+      --expression-attribute-values "{\":v\":{\"N\":\"$(( $(date +%s) + 3600 ))\"}}"
+
+- id: cloud-030
+  title: Priority jobs and a patient queue
+  difficulty: 3
+  kind: build
+  tags: [aws, sqs, attributes, visibility]
+  tutorial: |
+    **Concept.** SQS messages carry a body plus typed message attributes, and a received message is hidden from other consumers for a visibility timeout. A queue-level default applies unless a receive overrides it.
+
+    **Read up on:**
+    - `aws sqs send-message help` — the `--message-attributes` structure
+    - Message attribute data types — String, Number and Binary
+    - `aws sqs set-queue-attributes help` — queue-wide defaults
+    - `--message-attribute-names` — why a receive returns no attributes by default
+  scenario: |
+    The `aws` command talks to a local emulator. The queue **`jobs`** exists and is empty.
+
+    Send the text in **`/lab/job.txt`** as the body of a message that has a **Number**
+    attribute **`priority`** with the value **9**. Then make consumers get a **two-minute**
+    window (120 seconds) to finish a job before it reappears, as a default for the whole queue.
+
+    Leave the message waiting in the queue: do not consume it.
+  hints:
+    - "Message attributes are a JSON map of name to `DataType` and `StringValue`."
+    - "A Number is still sent as a string value, with the type set to Number."
+    - "The default window is the queue attribute `VisibilityTimeout`."
+  solution: |
+    ```bash
+    cd /lab
+    URL=$(aws sqs get-queue-url --queue-name jobs --query QueueUrl --output text)
+    aws sqs send-message --queue-url "$URL" --message-body "$(cat job.txt)" \
+      --message-attributes '{"priority":{"DataType":"Number","StringValue":"9"}}'
+    aws sqs set-queue-attributes --queue-url "$URL" --attributes VisibilityTimeout=120
+    ```
+  setup: |
+    moto_start
+    t=job-$RANDOM$RANDOM
+    echo "$t" > "$KL_STATE/answer"
+    lab_file /lab/job.txt <<EOF
+    $t
+    EOF
+    aws sqs create-queue --queue-name jobs >/dev/null
+  check: |
+    url=$(aws sqs get-queue-url --queue-name jobs --query QueueUrl --output text 2>/dev/null)
+    vt=$(aws sqs get-queue-attributes --queue-url "$url" --attribute-names VisibilityTimeout --query Attributes.VisibilityTimeout --output text 2>/dev/null)
+    check_eq "queue default window is 120 seconds" "$vt" "120"
+    m=$(aws sqs receive-message --queue-url "$url" --max-number-of-messages 10 --visibility-timeout 0 --message-attribute-names All 2>/dev/null)
+    want=$(cat "$KL_STATE/answer")
+    msg=$(jq -c --arg w "$want" '[.Messages[]? | select(.Body==$w)][0]' <<<"${m:-null}" 2>/dev/null)
+    check_eq "message is waiting with the right body" "$(jq -r '.Body' <<<"${msg:-null}" 2>/dev/null)" "$want"
+    check_eq "priority is a Number" "$(jq -r '.MessageAttributes.priority.DataType' <<<"${msg:-null}" 2>/dev/null)" "Number"
+    check_eq "priority is 9" "$(jq -r '.MessageAttributes.priority.StringValue' <<<"${msg:-null}" 2>/dev/null)" "9"
+  solve: |
+    cd /lab
+    URL=$(aws sqs get-queue-url --queue-name jobs --query QueueUrl --output text)
+    aws sqs send-message --queue-url "$URL" --message-body "$(cat job.txt)" \
+      --message-attributes '{"priority":{"DataType":"Number","StringValue":"9"}}'
+    aws sqs set-queue-attributes --queue-url "$URL" --attributes VisibilityTimeout=120
+
+- id: cloud-031
+  title: Only my region, please
+  difficulty: 3
+  kind: build
+  tags: [aws, sns, sqs, filter-policy]
+  tutorial: |
+    **Concept.** An SNS subscription can carry a filter policy, so it receives only messages whose attributes match. Without one, a subscriber gets everything published to the topic.
+
+    **Read up on:**
+    - `aws sns set-subscription-attributes help` — which attribute name holds the policy
+    - Subscription filter policy syntax — a JSON object of attribute to array of values
+    - `aws sns list-subscriptions-by-topic` — finding a subscription ARN
+    - `aws sns get-subscription-attributes` — reading a policy back
+  scenario: |
+    The `aws` command talks to a local emulator. The topic **`orders`** has two SQS
+    subscribers: **`regional-q`** and **`all-q`**.
+
+    Order messages carry a message attribute named **`region`**. Make **`regional-q`** receive
+    only the orders whose region is the one written in **`/lab/region.txt`**, and leave
+    **`all-q`** receiving everything.
+  hints:
+    - "The filter belongs to the subscription, not to the topic or the queue."
+    - "The policy shape is `{\"region\": [\"value\"]}`."
+    - "Use `list-subscriptions-by-topic` to find the subscription whose endpoint is the queue's ARN."
+  solution: |
+    ```bash
+    cd /lab
+    TOPIC=$(aws sns list-topics --query "Topics[?ends_with(TopicArn, ':orders')].TopicArn" --output text)
+    SUB=$(aws sns list-subscriptions-by-topic --topic-arn "$TOPIC" \
+      --query "Subscriptions[?ends_with(Endpoint, ':regional-q')].SubscriptionArn" --output text)
+    aws sns set-subscription-attributes --subscription-arn "$SUB" --attribute-name FilterPolicy \
+      --attribute-value "$(jq -nc --arg r "$(cat region.txt)" '{region: [$r]}')"
+    ```
+  setup: |
+    moto_start
+    regs=(eu us ap)
+    r=${regs[RANDOM % 3]}
+    echo "$r" > "$KL_STATE/answer"
+    lab_file /lab/region.txt <<EOF
+    $r
+    EOF
+    topic=$(aws sns create-topic --name orders --query TopicArn --output text)
+    for q in regional-q all-q; do
+      aws sqs create-queue --queue-name "$q" >/dev/null
+      url=$(aws sqs get-queue-url --queue-name "$q" --query QueueUrl --output text)
+      arn=$(aws sqs get-queue-attributes --queue-url "$url" --attribute-names QueueArn --query Attributes.QueueArn --output text)
+      aws sns subscribe --topic-arn "$topic" --protocol sqs --notification-endpoint "$arn" >/dev/null
+    done
+  check: |
+    topic=$(aws sns list-topics --query "Topics[?ends_with(TopicArn, ':orders')].TopicArn" --output text 2>/dev/null)
+    sub() { aws sns list-subscriptions-by-topic --topic-arn "$topic" --query "Subscriptions[?ends_with(Endpoint, ':$1')].SubscriptionArn | [0]" --output text 2>/dev/null; }
+    pol() { aws sns get-subscription-attributes --subscription-arn "$1" --query 'Attributes.FilterPolicy' --output text 2>/dev/null; }
+    fp=$(pol "$(sub regional-q)")
+    all=$(pol "$(sub all-q)")
+    check_eq "regional-q filters on region" "$(jq -c '.region | if type=="array" then . else [.] end' <<<"${fp:-null}" 2>/dev/null)" "[\"$(cat "$KL_STATE/answer")\"]"
+    check "all-q has no filter" '[ -z "$all" ] || [ "$all" = None ] || [ "$all" = null ] || [ "$all" = "{}" ]'
+  solve: |
+    cd /lab
+    TOPIC=$(aws sns list-topics --query "Topics[?ends_with(TopicArn, ':orders')].TopicArn" --output text)
+    SUB=$(aws sns list-subscriptions-by-topic --topic-arn "$TOPIC" \
+      --query "Subscriptions[?ends_with(Endpoint, ':regional-q')].SubscriptionArn" --output text)
+    aws sns set-subscription-attributes --subscription-arn "$SUB" --attribute-name FilterPolicy \
+      --attribute-value "$(jq -nc --arg r "$(cat region.txt)" '{region: [$r]}')"
+
+- id: cloud-032
+  title: Click events on a stream
+  difficulty: 3
+  kind: build
+  tags: [aws, kinesis, streams]
+  tutorial: |
+    **Concept.** A Kinesis stream splits records across shards by partition key. You write with a producer call and read with a shard iterator that points at a position in a shard.
+
+    **Read up on:**
+    - `aws kinesis create-stream help` — shard count
+    - `aws kinesis put-record help` — and how the CLI expects the data blob to be encoded
+    - `aws kinesis get-shard-iterator` — iterator types such as TRIM_HORIZON
+    - `aws kinesis get-records` — what comes back, and in which encoding
+  scenario: |
+    The `aws` command talks to a local emulator.
+
+    Create a Kinesis stream **`clicks`** with a single shard. Then publish the exact contents of
+    **`/lab/event.json`** to it as one record, using the partition key **`user-7`**.
+  hints:
+    - "Create the stream first and make sure it has one shard."
+    - "Since CLI v2, `--data` is expected to be base64 unless you say otherwise, via `--cli-binary-format` or by passing the file as `fileb://`."
+  solution: |
+    ```bash
+    cd /lab
+    aws kinesis create-stream --stream-name clicks --shard-count 1
+    aws kinesis put-record --stream-name clicks --partition-key user-7 --data fileb:///lab/event.json
+    ```
+    Read it back with `get-shard-iterator --shard-iterator-type TRIM_HORIZON` and `get-records`;
+    the data comes back base64-encoded.
+  setup: |
+    moto_start
+    lab_file /lab/event.json <<EOF
+    {"user":"u$RANDOM","page":"/pricing","ts":$RANDOM$RANDOM}
+    EOF
+  check: |
+    n=$(aws kinesis describe-stream-summary --stream-name clicks --query StreamDescriptionSummary.OpenShardCount --output text 2>/dev/null)
+    check_eq "stream has one shard" "$n" "1"
+    sid=$(aws kinesis describe-stream --stream-name clicks --query 'StreamDescription.Shards[0].ShardId' --output text 2>/dev/null)
+    it=$(aws kinesis get-shard-iterator --stream-name clicks --shard-id "${sid:-none}" --shard-iterator-type TRIM_HORIZON --query ShardIterator --output text 2>/dev/null)
+    recs=$(aws kinesis get-records --shard-iterator "${it:-none}" 2>/dev/null)
+    want=$(tr -d '[:space:]' 2>/dev/null </lab/event.json)
+    got=$(jq -r '.Records[]? | select(.PartitionKey=="user-7") | .Data' <<<"${recs:-null}" 2>/dev/null | while read -r d; do echo "$d" | base64 -d 2>/dev/null | tr -d '[:space:]'; echo; done)
+    check "a record on user-7 holds event.json" '[ -n "$want" ] && grep -qxF -- "$want" <<<"$got"'
+  solve: |
+    cd /lab
+    aws kinesis create-stream --stream-name clicks --shard-count 1
+    aws kinesis put-record --stream-name clicks --partition-key user-7 --data fileb:///lab/event.json
+
+- id: cloud-033
+  title: A workflow that points nowhere
+  difficulty: 4
+  kind: fix
+  tags: [aws, stepfunctions, asl]
+  tutorial: |
+    **Concept.** A Step Functions state machine is defined in Amazon States Language: a start state and a map of named states, each pointing at its successor or ending the flow. Every pointer must name a state that exists.
+
+    **Read up on:**
+    - `aws stepfunctions describe-state-machine` — reading the stored definition
+    - `aws stepfunctions update-state-machine help` — replacing a definition
+    - ASL fields `StartAt`, `Next` and `Type` — how states link together
+    - `jq` — inspecting or editing the definition JSON
+  scenario: |
+    The `aws` command talks to a local emulator. The state machine **`order-flow`** was created
+    from **`/lab/flow.json`** with the states `Validate`, `Charge` and `Done`. It was accepted,
+    but every execution of it would fail.
+
+    Find out why, and correct the stored definition of `order-flow`. Keep the three states and
+    the intended order: validate, then charge, then done.
+  hints:
+    - "Compare each state's `Next` against the names of the states that exist."
+    - "Fix the JSON file, then push it with `update-state-machine`."
+    - "`--definition file:///lab/flow.json` reads the definition from a file."
+  solution: |
+    One `Next` has a typo. Fix it in the file and update the state machine.
+
+    ```bash
+    cd /lab
+    sed -i 's/Chrage/Charge/' flow.json
+    ARN=$(aws stepfunctions list-state-machines --query "stateMachines[?name=='order-flow'].stateMachineArn | [0]" --output text)
+    aws stepfunctions update-state-machine --state-machine-arn "$ARN" --definition file:///lab/flow.json
+    ```
+  setup: |
+    moto_start
+    lab_file /lab/flow.json <<'EOF'
+    {
+      "Comment": "Order flow",
+      "StartAt": "Validate",
+      "States": {
+        "Validate": {"Type": "Pass", "Next": "Chrage"},
+        "Charge": {"Type": "Pass", "Next": "Done"},
+        "Done": {"Type": "Succeed"}
+      }
+    }
+    EOF
+    aws stepfunctions create-state-machine --name order-flow --definition file:///lab/flow.json \
+      --role-arn arn:aws:iam::123456789012:role/sfn-role >/dev/null
+  check: |
+    sm=$(aws stepfunctions list-state-machines --query "stateMachines[?name=='order-flow'].stateMachineArn | [0]" --output text 2>/dev/null)
+    def=$(aws stepfunctions describe-state-machine --state-machine-arn "${sm:-none}" --query definition --output text 2>/dev/null)
+    check "every Next names an existing state" 'jq -e ".States as \$S | [\$S[] | (.Next // empty) | select(\$S[.] == null)] | length == 0" <<<"${def:-null}" >/dev/null 2>&1'
+    check "start state exists and a Succeed state remains" 'jq -e ".States as \$S | (\$S[.StartAt] != null) and ([\$S[] | select(.Type==\"Succeed\")] | length >= 1)" <<<"${def:-null}" >/dev/null 2>&1'
+    check_eq "the three states are kept" "$(jq -c '.States | keys' <<<"${def:-null}" 2>/dev/null)" '["Charge","Done","Validate"]'
+    check_eq "Validate leads to Charge" "$(jq -r '.States.Validate.Next' <<<"${def:-null}" 2>/dev/null)" "Charge"
+  solve: |
+    cd /lab
+    sed -i 's/Chrage/Charge/' flow.json
+    ARN=$(aws stepfunctions list-state-machines --query "stateMachines[?name=='order-flow'].stateMachineArn | [0]" --output text)
+    aws stepfunctions update-state-machine --state-machine-arn "$ARN" --definition file:///lab/flow.json
+
+- id: cloud-034
+  title: Tidy the container registry
+  difficulty: 3
+  kind: build
+  tags: [aws, ecr, lifecycle]
+  tutorial: |
+    **Concept.** An ECR repository stores container images, and a lifecycle policy deletes images automatically by rules. Each rule has a priority, a selection of which images it covers, and an action.
+
+    **Read up on:**
+    - `aws ecr put-lifecycle-policy help` — the policy text argument
+    - ECR lifecycle policy rule format — `rulePriority`, `selection` and `action`
+    - `aws ecr put-image-scanning-configuration` — scan on push
+    - `aws ecr get-lifecycle-policy` — reading the policy back
+  scenario: |
+    The `aws` command talks to a local emulator. The ECR repository **`app/api`** exists.
+
+    Make it scan every image as it is pushed. Then add a lifecycle policy with one rule that
+    **expires untagged images** a number of days after they were pushed, where the number of
+    days is in **`/lab/days.txt`**. Write the policy as **`/lab/policy.json`** first.
+  hints:
+    - "Scanning on push is a separate setting from the lifecycle policy."
+    - "A rule selects with `tagStatus`, `countType`, `countUnit` and `countNumber`."
+    - "The policy text is passed with `--lifecycle-policy-text file:///lab/policy.json`."
+  solution: |
+    ```bash
+    cd /lab
+    aws ecr put-image-scanning-configuration --repository-name app/api --image-scanning-configuration scanOnPush=true
+    jq -n --argjson d "$(cat days.txt)" '{rules:[{rulePriority:1,description:"expire untagged",
+      selection:{tagStatus:"untagged",countType:"sinceImagePushed",countUnit:"days",countNumber:$d},
+      action:{type:"expire"}}]}' > policy.json
+    aws ecr put-lifecycle-policy --repository-name app/api --lifecycle-policy-text file:///lab/policy.json
+    ```
+  setup: |
+    moto_start
+    ds=(7 14 30)
+    d=${ds[RANDOM % 3]}
+    echo "$d" > "$KL_STATE/answer"
+    lab_file /lab/days.txt <<EOF
+    $d
+    EOF
+    aws ecr create-repository --repository-name app/api >/dev/null
+  check: |
+    r=$(aws ecr describe-repositories --repository-names app/api 2>/dev/null)
+    check_eq "scan on push is enabled" "$(jq -r '.repositories[0].imageScanningConfiguration.scanOnPush' <<<"${r:-null}" 2>/dev/null)" "true"
+    p=$(aws ecr get-lifecycle-policy --repository-name app/api --query lifecyclePolicyText --output text 2>/dev/null)
+    d=$(cat "$KL_STATE/answer")
+    check "a rule expires untagged images after the right number of days" 'jq -e --argjson d "$d" ".rules | any(.selection.tagStatus==\"untagged\" and .selection.countType==\"sinceImagePushed\" and .selection.countUnit==\"days\" and .selection.countNumber==\$d and .action.type==\"expire\")" <<<"${p:-null}" >/dev/null 2>&1'
+  solve: |
+    cd /lab
+    aws ecr put-image-scanning-configuration --repository-name app/api --image-scanning-configuration scanOnPush=true
+    jq -n --argjson d "$(cat days.txt)" '{rules:[{rulePriority:1,description:"expire untagged",
+      selection:{tagStatus:"untagged",countType:"sinceImagePushed",countUnit:"days",countNumber:$d},
+      action:{type:"expire"}}]}' > policy.json
+    aws ecr put-lifecycle-policy --repository-name app/api --lifecycle-policy-text file:///lab/policy.json
+
+- id: cloud-035
+  title: Export one environment's settings
+  difficulty: 3
+  kind: build
+  tags: [aws, ssm, parameter-store]
+  tutorial: |
+    **Concept.** Parameter Store names look like file paths, so settings can be grouped by environment and service and fetched together by path. Secret values are stored encrypted and need an explicit flag to read.
+
+    **Read up on:**
+    - `aws ssm get-parameters-by-path help` — path, recursion and decryption options
+    - Parameter types — String versus SecureString
+    - `--query` and `--output text` — shaping the result
+    - `jq` string functions such as `ltrimstr` and `gsub`
+  scenario: |
+    The `aws` command talks to a local emulator. Parameter Store holds settings for a shop
+    under paths like **`/shop/prod/...`** and **`/shop/dev/...`**, nested several levels deep.
+
+    Write **`/lab/prod.env`** with one line per **production** parameter, in the form
+    `NAME=value`. NAME is the path below `/shop/prod/` with each `/` turned into `_`, in
+    upper case, for example `/shop/prod/a/b` becomes `A_B`. Use the real, decrypted values and
+    include nothing from dev.
+  hints:
+    - "One call can list everything below a path if you ask for recursion."
+    - "Secret values stay unreadable unless you ask for decryption."
+    - "`jq -r` with `ltrimstr`, `gsub` and `ascii_upcase` can build each line."
+  solution: |
+    ```bash
+    cd /lab
+    aws ssm get-parameters-by-path --path /shop/prod --recursive --with-decryption \
+      | jq -r '.Parameters[] | ((.Name | ltrimstr("/shop/prod/") | gsub("/"; "_") | ascii_upcase) + "=" + .Value)' > prod.env
+    ```
+  setup: |
+    moto_start
+    h=db$RANDOM.internal
+    p=$((RANDOM % 1000 + 4000))
+    k=key$RANDOM$RANDOM
+    aws ssm put-parameter --name /shop/prod/db/host --type String --value "$h" >/dev/null
+    aws ssm put-parameter --name /shop/prod/db/port --type String --value "$p" >/dev/null
+    aws ssm put-parameter --name /shop/prod/api/key --type SecureString --value "$k" >/dev/null
+    aws ssm put-parameter --name /shop/dev/db/host --type String --value "dev$RANDOM.internal" >/dev/null
+    aws ssm put-parameter --name /shop/dev/api/key --type SecureString --value "devkey$RANDOM" >/dev/null
+    printf 'API_KEY=%s\nDB_HOST=%s\nDB_PORT=%s\n' "$k" "$h" "$p" > "$KL_STATE/answer"
+  check: |
+    got=$(sort 2>/dev/null </lab/prod.env | grep -v '^$')
+    check_eq "prod.env holds the decrypted prod settings" "$got" "$(sort "$KL_STATE/answer")"
+  solve: |
+    cd /lab
+    aws ssm get-parameters-by-path --path /shop/prod --recursive --with-decryption \
+      | jq -r '.Parameters[] | ((.Name | ltrimstr("/shop/prod/") | gsub("/"; "_") | ascii_upcase) + "=" + .Value)' > prod.env

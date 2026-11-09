@@ -1,0 +1,785 @@
+track: kubernetes
+module: Config & scheduling II
+profile: k8s
+order: 17
+exercises:
+
+- id: k8s-311
+  title: The init container that waits for itself
+  difficulty: 1
+  kind: fix
+  tags: [initcontainers, ordering]
+  tutorial: |
+    **Concept.** Init containers run one at a time, strictly in the order they are listed, and each must finish successfully before the next one starts. The application containers only start after the last one completes, so a wrong order can block a pod forever.
+
+    **Read up on:**
+    - `kubectl get pod NAME` — what `Init:0/2` means
+    - `kubectl describe pod NAME` — the state of each init container
+    - `kubectl logs NAME -c INIT_CONTAINER` — logs of an init container
+    - Kubernetes docs: Init Containers
+  scenario: |
+    Deployment **`shop`** in namespace **`boot`** never leaves `Init`. It has two init
+    containers, **`seed`** (writes a file into a shared volume) and **`wait-seed`** (waits
+    until that file exists), and the app container reads the file.
+
+    Make the **`shop`** deployment become Ready. Keep both init containers and don't edit
+    their commands.
+  hints:
+    - "`kubectl -n boot describe pod` shows which init container is the one currently running."
+    - "One of them is waiting for something the other one has not produced yet."
+    - "The order of the `initContainers` list in the pod template is the order of execution."
+  solution: |
+    Swap the order of the two init containers so `seed` comes first:
+
+    ```bash
+    kubectl -n boot patch deploy shop --type=json \
+      -p '[{"op":"move","from":"/spec/template/spec/initContainers/1","path":"/spec/template/spec/initContainers/0"}]'
+    ```
+  setup: |
+    k_ns boot
+    t="seed-$(head -c6 /dev/urandom | od -An -tx1 | tr -d ' \n')"
+    echo "$t" >"$KL_STATE/answer"
+    kubectl apply -f - >/dev/null <<EOF
+    apiVersion: apps/v1
+    kind: Deployment
+    metadata: {name: shop, namespace: boot}
+    spec:
+      replicas: 1
+      selector: {matchLabels: {app: shop}}
+      template:
+        metadata: {labels: {app: shop}}
+        spec:
+          initContainers:
+          - name: wait-seed
+            image: busybox:1.37
+            command: ["sh", "-c", "until [ -f /shared/seed ]; do sleep 1; done"]
+            volumeMounts: [{name: shared, mountPath: /shared}]
+          - name: seed
+            image: busybox:1.37
+            command: ["sh", "-c", "echo $t > /shared/seed"]
+            volumeMounts: [{name: shared, mountPath: /shared}]
+          containers:
+          - name: app
+            image: busybox:1.37
+            command: ["sleep", "infinity"]
+            volumeMounts: [{name: shared, mountPath: /shared}]
+          volumes:
+          - name: shared
+            emptyDir: {}
+    EOF
+  check: |
+    names() { kubectl -n boot get deploy shop -o jsonpath='{.spec.template.spec.initContainers[*].name}' 2>/dev/null; }
+    check "both init containers are kept, seed runs first" '[ "$(names)" = "seed wait-seed" ]'
+    check "shop becomes ready" '[ "$(names)" = "seed wait-seed" ] && wait_deploy boot shop 90'
+    check "the app sees the seed file" '[ "$(names)" = "seed wait-seed" ] && [ "$(kubectl -n boot exec deploy/shop -c app -- cat /shared/seed)" = "$(cat $KL_STATE/answer)" ]'
+  solve: |
+    kubectl -n boot patch deploy shop --type=json \
+      -p '[{"op":"move","from":"/spec/template/spec/initContainers/1","path":"/spec/template/spec/initContainers/0"}]'
+    kubectl -n boot rollout status deploy shop --timeout=120s
+
+- id: k8s-312
+  title: Prefixed settings, optional overrides
+  difficulty: 2
+  kind: build
+  tags: [env, envfrom, configmap, secret, optional]
+  tutorial: |
+    **Concept.** Environment variables can come from a whole ConfigMap or Secret (`envFrom`, optionally with a prefix) or from a single key (`valueFrom`). A missing source normally stops the container from being created, unless the reference is marked optional.
+
+    **Read up on:**
+    - `kubectl explain pod.spec.containers.envFrom` — prefix and the two source kinds
+    - `kubectl explain pod.spec.containers.env.valueFrom` — picking one key
+    - `kubectl get pod NAME -o yaml` — the resulting spec
+    - Kubernetes docs: Define Environment Variables for a Container
+  scenario: |
+    Namespace **`envs`** has a ConfigMap **`site`** and a Secret **`site-creds`** (key `token`).
+
+    Create pod **`reporter`** (`busybox:1.37`, `sleep infinity`) so that its environment has:
+
+    - every key of ConfigMap `site` as a variable, with its name **prefixed by `SITE_`**
+    - **`API_TOKEN`** from the `token` key of the Secret
+    - every key of a Secret named **`site-overrides`** (it does not exist today and may be
+      created later by another team) - the pod must start fine without it
+  hints:
+    - "`envFrom` takes a list; each item can have `prefix` and either `configMapRef` or `secretRef`."
+    - "Look at the key names in the ConfigMap first: `kubectl -n envs get cm site -o yaml`."
+    - "`kubectl explain pod.spec.containers.envFrom.secretRef` lists the field that makes a missing Secret acceptable."
+  solution: |
+    ```yaml
+    envFrom:
+    - prefix: SITE_
+      configMapRef: {name: site}
+    - secretRef: {name: site-overrides, optional: true}
+    env:
+    - name: API_TOKEN
+      valueFrom: {secretKeyRef: {name: site-creds, key: token}}
+    ```
+  setup: |
+    k_ns envs
+    r="eu-$((RANDOM % 900 + 100))"
+    t="tok-$(head -c6 /dev/urandom | od -An -tx1 | tr -d ' \n')"
+    printf '%s\n%s\n' "$r" "$t" >"$KL_STATE/answer"
+    kubectl -n envs create configmap site --from-literal=REGION="$r" --from-literal=TIER=gold >/dev/null
+    kubectl -n envs create secret generic site-creds --from-literal=token="$t" >/dev/null
+  check: |
+    wait_pod envs reporter 60
+    reg=$(sed -n 1p "$KL_STATE/answer" 2>/dev/null); tok=$(sed -n 2p "$KL_STATE/answer" 2>/dev/null)
+    check "SITE_REGION comes from the ConfigMap" '[ "$(kubectl -n envs exec reporter -- printenv SITE_REGION)" = "$reg" ]'
+    check "SITE_TIER comes from the ConfigMap" '[ "$(kubectl -n envs exec reporter -- printenv SITE_TIER)" = gold ]'
+    check "no unprefixed REGION variable" '! kubectl -n envs exec reporter -- printenv REGION'
+    check "API_TOKEN comes from the Secret" '[ "$(kubectl -n envs exec reporter -- printenv API_TOKEN)" = "$tok" ]'
+    check "site-overrides is referenced as optional" '[ "$(kubectl -n envs get pod reporter -o json | jq -r "[.spec.containers[0].envFrom[]? | select(.secretRef.name==\"site-overrides\") | .secretRef.optional] | first")" = true ]'
+  solve: |
+    kubectl apply -f - <<'EOF'
+    apiVersion: v1
+    kind: Pod
+    metadata: {name: reporter, namespace: envs}
+    spec:
+      containers:
+      - name: reporter
+        image: busybox:1.37
+        command: ["sleep", "infinity"]
+        envFrom:
+        - prefix: SITE_
+          configMapRef: {name: site}
+        - secretRef: {name: site-overrides, optional: true}
+        env:
+        - name: API_TOKEN
+          valueFrom: {secretKeyRef: {name: site-creds, key: token}}
+    EOF
+
+- id: k8s-313
+  title: Blue or green, never reserved
+  difficulty: 2
+  kind: build
+  tags: [affinity, nodeaffinity, labels]
+  tutorial: |
+    **Concept.** Node affinity selects nodes by their labels with richer operators than a plain node selector: several allowed values, existence tests and negation. Required rules are hard filters; the scheduler never places the pod on a node that fails them.
+
+    **Read up on:**
+    - `kubectl get nodes --show-labels` — what labels the nodes carry
+    - `kubectl explain pod.spec.affinity.nodeAffinity` — required versus preferred rules
+    - `kubectl explain pod.spec.affinity.nodeAffinity.requiredDuringSchedulingIgnoredDuringExecution.nodeSelectorTerms.matchExpressions` — the operators
+    - Kubernetes docs: Assigning Pods to Nodes
+  scenario: |
+    Create pod **`placer`** (`nginx:1.27-alpine`) in namespace **`aff`** that may only be
+    scheduled on a node that:
+
+    - has a label **`pool`** whose value is **`blue`** or **`green`**, and
+    - does **not** have a label **`dedicated`** at all.
+
+    Express it as one **required node-affinity** rule (not `nodeSelector`, not `nodeName`).
+    The pod must end up Running.
+  hints:
+    - "Both conditions go into the matchExpressions of the same term, so they must both hold."
+    - "Operators you need are `In` and `DoesNotExist`."
+  solution: |
+    ```yaml
+    affinity:
+      nodeAffinity:
+        requiredDuringSchedulingIgnoredDuringExecution:
+          nodeSelectorTerms:
+          - matchExpressions:
+            - {key: pool, operator: In, values: [blue, green]}
+            - {key: dedicated, operator: DoesNotExist}
+    ```
+  setup: |
+    k_ns aff
+    if [ $((RANDOM % 2)) -eq 0 ]; then p=blue; else p=green; fi
+    echo "$p" >"$KL_STATE/answer"
+    kubectl label node node01 pool="$p" --overwrite >/dev/null
+  check: |
+    aff_ok() {
+      kubectl -n aff get pod placer -o json | jq -e '
+        (.spec.affinity.nodeAffinity.requiredDuringSchedulingIgnoredDuringExecution.nodeSelectorTerms // []) as $t
+        | ($t | length) == 1
+        and ([$t[0].matchExpressions[]? | select(.key=="pool" and .operator=="In") | .values | sort] | first) == ["blue","green"]
+        and any($t[0].matchExpressions[]?; .key=="dedicated" and .operator=="DoesNotExist")
+        and ((.spec.nodeSelector // {}) | length) == 0' >/dev/null 2>&1
+    }
+    check "pod placer has the required node-affinity rule" aff_ok
+    check "placer is running on node01" 'aff_ok && wait_pod aff placer 60 && [ "$(kj -n aff pod placer "{.spec.nodeName}")" = node01 ]'
+  solve: |
+    kubectl apply -f - <<'EOF'
+    apiVersion: v1
+    kind: Pod
+    metadata: {name: placer, namespace: aff}
+    spec:
+      affinity:
+        nodeAffinity:
+          requiredDuringSchedulingIgnoredDuringExecution:
+            nodeSelectorTerms:
+            - matchExpressions:
+              - {key: pool, operator: In, values: [blue, green]}
+              - {key: dedicated, operator: DoesNotExist}
+      containers:
+      - name: placer
+        image: nginx:1.27-alpine
+    EOF
+
+- id: k8s-314
+  title: A native sidecar for the logs
+  difficulty: 3
+  kind: build
+  tags: [sidecar, initcontainers, logs]
+  tutorial: |
+    **Concept.** A native sidecar is an init container with its own restart policy: it starts before the main containers, keeps running next to them, and is stopped after them. This ordering guarantee is the difference from just adding a second regular container.
+
+    **Read up on:**
+    - `kubectl explain pod.spec.initContainers.restartPolicy` — the field that turns an init container into a sidecar
+    - `kubectl get pod NAME -o yaml` — where sidecar status is reported
+    - `kubectl logs NAME -c CONTAINER` — reading one container's logs
+    - Kubernetes docs: Sidecar Containers
+  scenario: |
+    In namespace **`side`**, create pod **`edge`**:
+
+    - regular container **`web`** (`nginx:1.27-alpine`) writing its logs to files in `/var/log/nginx`
+      through a shared `emptyDir`
+    - a **native sidecar** named **`shipper`** (`busybox:1.37`) that follows
+      `access.log` of that volume and prints each new line, started **before** `web`
+      and kept running for the life of the pod
+
+    `shipper` must show web's requests in its own log.
+  hints:
+    - "Mount the same emptyDir in both containers; busybox has `tail -F` for a file that may not exist yet."
+    - "A sidecar lives in `initContainers`, not in `containers`."
+  solution: |
+    ```yaml
+    initContainers:
+    - name: shipper
+      image: busybox:1.37
+      restartPolicy: Always
+      command: ["sh", "-c", "tail -F /logs/access.log"]
+      volumeMounts: [{name: logs, mountPath: /logs}]
+    containers:
+    - name: web
+      image: nginx:1.27-alpine
+      volumeMounts: [{name: logs, mountPath: /var/log/nginx}]
+    volumes:
+    - name: logs
+      emptyDir: {}
+    ```
+  setup: |
+    k_ns side
+    echo "kl-$(head -c5 /dev/urandom | od -An -tx1 | tr -d ' \n')" >"$KL_STATE/answer"
+  check: |
+    wait_pod side edge 90
+    pj() { kubectl -n side get pod edge -o json 2>/dev/null; }
+    check "shipper is a native sidecar (init container, restartPolicy Always)" 'pj | jq -e ".spec.initContainers[]? | select(.name==\"shipper\" and .restartPolicy==\"Always\")"'
+    check "web is a regular container and shipper is not" '[ "$(pj | jq -r "[.spec.containers[].name] | join(\",\")")" = web ]'
+    check "shipper is running next to web" 'pj | jq -e ".status.initContainerStatuses[]? | select(.name==\"shipper\" and .state.running != null)"'
+    check "web requests show up in shipper logs" 'p=$(cat $KL_STATE/answer); pod_ready side edge && { kubectl -n side exec edge -c web -- wget -q -O /dev/null "http://127.0.0.1/$p" || true; } && eventually 25 "kubectl -n side logs edge -c shipper | grep -q /$p"'
+  solve: |
+    kubectl apply -f - <<'EOF'
+    apiVersion: v1
+    kind: Pod
+    metadata: {name: edge, namespace: side}
+    spec:
+      initContainers:
+      - name: shipper
+        image: busybox:1.37
+        restartPolicy: Always
+        command: ["sh", "-c", "tail -F /logs/access.log"]
+        volumeMounts: [{name: logs, mountPath: /logs}]
+      containers:
+      - name: web
+        image: nginx:1.27-alpine
+        volumeMounts: [{name: logs, mountPath: /var/log/nginx}]
+      volumes:
+      - name: logs
+        emptyDir: {}
+    EOF
+    kubectl -n side wait --for=condition=Ready pod/edge --timeout=90s
+
+- id: k8s-315
+  title: The limit that cannot be edited
+  difficulty: 3
+  kind: fix
+  tags: [configmap, immutable, rollout]
+  tutorial: |
+    **Concept.** A ConfigMap marked immutable rejects every change to its data. The way to change the value is to create a new ConfigMap and point the workload at it, which also rolls the pods. Editing or deleting-and-recreating the same name is unreliable, because the kubelet caches a referenced ConfigMap by name.
+
+    **Read up on:**
+    - `kubectl explain configmap.immutable` — what the field guarantees
+    - `kubectl set env deploy/NAME --from=configmap/NAME` or patching `configMapKeyRef.name`
+    - `kubectl rollout status` — waiting for the new pods
+    - Versioned ConfigMaps — why a new name is the usual update path
+  scenario: |
+    Deployment **`gate`** in namespace **`immut`** reads its `MAX` from the immutable
+    ConfigMap **`ratelimit-v1`**. The rate limit must change to the value in
+    **`/lab/limit.txt`**, but the ConfigMap can't be edited.
+
+    Roll the new value out the way immutable ConfigMaps are meant to be updated — the new
+    ConfigMap must itself be immutable — so that the running pod ends up with `MAX` set to
+    the new value.
+  hints:
+    - "An immutable ConfigMap can't be edited or patched; create a different one (a new name) with the new value."
+    - "Point the Deployment's `configMapKeyRef` at the new ConfigMap — `kubectl set env deploy/gate --from=configmap/NEW` or a JSON patch — which rolls the pods."
+  solution: |
+    Create a new immutable ConfigMap and repoint the Deployment at it:
+
+    ```bash
+    n=$(cat /lab/limit.txt)
+    kubectl -n immut create configmap ratelimit-v2 --from-literal=max="$n"
+    kubectl -n immut patch configmap ratelimit-v2 -p '{"immutable":true}'
+    kubectl -n immut patch deploy gate --type=json \
+      -p '[{"op":"replace","path":"/spec/template/spec/containers/0/env/0/valueFrom/configMapKeyRef/name","value":"ratelimit-v2"}]'
+    kubectl -n immut rollout status deploy gate --timeout=90s
+    ```
+  setup: |
+    k_ns immut
+    n=$((RANDOM % 80 + 20))
+    echo "$n" >"$KL_STATE/answer"
+    lab_file /lab/limit.txt <<EOF
+    $n
+    EOF
+    kubectl apply -f - >/dev/null <<'EOF'
+    apiVersion: v1
+    kind: ConfigMap
+    metadata: {name: ratelimit-v1, namespace: immut}
+    immutable: true
+    data: {max: "10"}
+    ---
+    apiVersion: apps/v1
+    kind: Deployment
+    metadata: {name: gate, namespace: immut}
+    spec:
+      replicas: 1
+      selector: {matchLabels: {app: gate}}
+      template:
+        metadata: {labels: {app: gate}}
+        spec:
+          terminationGracePeriodSeconds: 3
+          containers:
+          - name: gate
+            image: busybox:1.37
+            command: ["sleep", "infinity"]
+            env:
+            - name: MAX
+              valueFrom: {configMapKeyRef: {name: ratelimit-v1, key: max}}
+    EOF
+    wait_deploy immut gate 90
+  check: |
+    want=$(cat "$KL_STATE/answer" 2>/dev/null)
+    ref=$(kj -n immut deploy gate '{.spec.template.spec.containers[0].env[0].valueFrom.configMapKeyRef.name}')
+    ref_ok() { [ -n "$ref" ] && [ "$(kj -n immut cm "$ref" '{.data.max}')" = "$want" ]; }
+    check "the Deployment now reads MAX from a ConfigMap holding the new limit" ref_ok
+    check "that ConfigMap is immutable" '[ "$(kj -n immut cm "$ref" "{.immutable}")" = true ]'
+    check "ratelimit-v1 was left unchanged" '[ "$(kj -n immut cm ratelimit-v1 "{.data.max}")" = 10 ]'
+    check "the running pod sees the new MAX" 'ref_ok && wait_deploy immut gate 90 && eventually 30 "[ \"\$(kubectl -n immut exec deploy/gate -- printenv MAX)\" = \"$want\" ]"'
+  solve: |
+    n=$(tr -d '[:space:]' 2>/dev/null </lab/limit.txt)
+    kubectl -n immut create configmap ratelimit-v2 --from-literal=max="$n"
+    kubectl -n immut patch configmap ratelimit-v2 -p '{"immutable":true}'
+    kubectl -n immut patch deploy gate --type=json -p '[{"op":"replace","path":"/spec/template/spec/containers/0/env/0/valueFrom/configMapKeyRef/name","value":"ratelimit-v2"}]'
+    kubectl -n immut rollout status deploy gate --timeout=90s
+- id: k8s-316
+  title: Look inside without a shell
+  difficulty: 3
+  kind: build
+  tags: [debug, ephemeral-containers]
+  tutorial: |
+    **Concept.** An ephemeral container is added to an already running pod, which cannot be changed otherwise. When it targets a container it shares that container's process namespace, so you can inspect its processes and files from a toolbox image.
+
+    **Read up on:**
+    - `kubectl debug --help` — the `--target` and `--image` options
+    - `kubectl get pod NAME -o yaml` — where ephemeral containers are recorded
+    - `man 5 proc` — the per-process `root` link
+    - Kubernetes docs: Ephemeral Containers
+  scenario: |
+    Pod **`vault`** in namespace **`dbg`** (container **`web`**) serves a page and has a
+    token mounted from a Secret at **`/run/vault/token`**. Nobody remembers the value.
+
+    Without recreating the pod, attach an **ephemeral container** (`busybox:1.37`) that
+    targets **`web`**, and use it to read the token into **`/lab/token.txt`**.
+  hints:
+    - "`kubectl debug POD --image=... --target=CONTAINER -- COMMAND`"
+    - "From a container that shares the process namespace, `/proc/<pid>/root` is the other container's filesystem."
+    - "Ephemeral container output is read with `kubectl logs POD -c NAME` once it has run."
+  solution: |
+    ```bash
+    kubectl -n dbg debug vault --image=busybox:1.37 --target=web -c probe -- \
+      sh -c 'for f in /proc/[0-9]*/root/run/vault/token; do cat "$f" 2>/dev/null && echo; done | grep . | sort -u | head -1'
+    kubectl -n dbg logs vault -c probe > /lab/token.txt
+    ```
+  setup: |
+    k_ns dbg
+    t="vlt-$(head -c8 /dev/urandom | od -An -tx1 | tr -d ' \n')"
+    echo "$t" >"$KL_STATE/answer"
+    kubectl -n dbg create secret generic vault-token --from-literal=token="$t" >/dev/null
+    kubectl apply -f - >/dev/null <<'EOF'
+    apiVersion: v1
+    kind: Pod
+    metadata: {name: vault, namespace: dbg}
+    spec:
+      containers:
+      - name: web
+        image: nginx:1.27-alpine
+        volumeMounts: [{name: tok, mountPath: /run/vault, readOnly: true}]
+      volumes:
+      - name: tok
+        secret: {secretName: vault-token}
+    EOF
+    wait_pod dbg vault 60
+  check: |
+    check "the token file exists" '[ -s /lab/token.txt ]'
+    check "an ephemeral busybox container targets web" 'kubectl -n dbg get pod vault -o json | jq -e ".spec.ephemeralContainers[]? | select(.image==\"busybox:1.37\" and .targetContainerName==\"web\")"'
+    check "the token is correct" '[ "$(tr -d "[:space:]" 2>/dev/null </lab/token.txt)" = "$(cat $KL_STATE/answer)" ]'
+    check "the pod was not recreated (web has no restarts)" '[ "$(restarts dbg vault)" = 0 ]'
+  solve: |
+    kubectl -n dbg debug vault --image=busybox:1.37 --target=web -c probe -- \
+      sh -c 'for f in /proc/[0-9]*/root/run/vault/token; do cat "$f" 2>/dev/null && echo; done | grep . | sort -u | head -1'
+    for i in $(seq 1 30); do
+      if kubectl -n dbg logs vault -c probe 2>/dev/null | grep -q .; then break; fi
+      sleep 2
+    done
+    kubectl -n dbg logs vault -c probe > /lab/token.txt
+
+- id: k8s-317
+  title: Half the room is promised elsewhere
+  difficulty: 4
+  kind: fix
+  tags: [scheduling, requests, capacity]
+  tutorial: |
+    **Concept.** The scheduler places a pod on a node only if the sum of the CPU and memory requests of the pods already there, plus the new pod's requests, fits in the node's allocatable amount. Real usage does not matter, only requests.
+
+    **Read up on:**
+    - `kubectl describe node node01` — the Allocated resources section
+    - `kubectl describe pod NAME` — the scheduler's events (Insufficient cpu)
+    - `kubectl set resources --help` — changing requests of a workload
+    - Kubernetes docs: Resource Management for Pods and Containers
+  scenario: |
+    Namespace **`fit`** runs a pod **`filler`** that has reserved most of the CPU left on
+    **node01** (it must stay). Deployment **`worker`** wants **2 replicas**, both pinned to
+    node01, but one of them is stuck Pending. The workload itself is tiny.
+
+    Make both replicas run, keeping `filler`, 2 replicas and the node pinning. Each worker
+    must still **request between `100m` and `200m` CPU** (a request of zero is not an option).
+  hints:
+    - "`kubectl -n fit describe pod` of the Pending replica names the reason."
+    - "Compare what `kubectl describe node node01` says is already allocated with what each worker asks for."
+  solution: |
+    The two workers request 250m each and only 400m is free. Lower the request to 200m or less:
+
+    ```bash
+    kubectl -n fit set resources deploy worker --requests=cpu=150m
+    ```
+  setup: |
+    k_ns fit
+    alloc=$(kubectl get node node01 -o jsonpath='{.status.allocatable.cpu}')
+    case "$alloc" in *m) alloc=${alloc%m} ;; *) alloc=$((alloc * 1000)) ;; esac
+    used=$(kubectl get pods -A --field-selector spec.nodeName=node01 -o json | jq '
+      def m: if endswith("m") then rtrimstr("m") | tonumber else (tonumber * 1000) end;
+      [.items[] | select(.status.phase != "Succeeded" and .status.phase != "Failed")
+       | .spec.containers[] | (.resources.requests.cpu // "0") | m] | add // 0')
+    fill=$((alloc - used - 400))
+    [ "$fill" -lt 50 ] && fill=50
+    echo "$fill" >"$KL_STATE/answer"
+    kubectl apply -f - >/dev/null <<EOF
+    apiVersion: v1
+    kind: Pod
+    metadata: {name: filler, namespace: fit}
+    spec:
+      nodeName: node01
+      containers:
+      - name: filler
+        image: busybox:1.37
+        command: ["sleep", "infinity"]
+        resources:
+          requests: {cpu: "${fill}m", memory: 16Mi}
+    EOF
+    wait_pod fit filler 60
+    kubectl apply -f - >/dev/null <<'EOF'
+    apiVersion: apps/v1
+    kind: Deployment
+    metadata: {name: worker, namespace: fit}
+    spec:
+      replicas: 2
+      strategy: {type: Recreate}
+      selector: {matchLabels: {app: worker}}
+      template:
+        metadata: {labels: {app: worker}}
+        spec:
+          nodeSelector: {kubernetes.io/hostname: node01}
+          containers:
+          - name: worker
+            image: busybox:1.37
+            command: ["sleep", "infinity"]
+            resources:
+              requests: {cpu: 250m, memory: 16Mi}
+    EOF
+  check: |
+    reqm() {
+      kubectl -n fit get deploy worker -o json 2>/dev/null | jq -r '
+        .spec.template.spec.containers[0].resources.requests.cpu // "0"
+        | if endswith("m") then rtrimstr("m") | tonumber else (tonumber * 1000) end'
+    }
+    sized() { r=$(reqm); [ "$r" -ge 100 ] && [ "$r" -le 200 ]; }
+    check "filler is still there" 'k_exists -n fit pod filler'
+    check "worker keeps 2 replicas, pinned to node01" '[ "$(kj -n fit deploy worker "{.spec.replicas}")" = 2 ] && [ "$(kj -n fit deploy worker "{.spec.template.spec.nodeSelector.kubernetes\.io/hostname}")" = node01 ]'
+    check "each worker requests between 100m and 200m CPU" sized
+    check "both workers are running" 'sized && wait_deploy fit worker 90'
+  solve: |
+    kubectl -n fit set resources deploy worker --requests=cpu=150m
+    kubectl -n fit rollout status deploy worker --timeout=120s
+
+- id: k8s-318
+  title: Evict everyone but the analytics team
+  difficulty: 4
+  kind: build
+  tags: [taints, tolerations, noexecute, eviction]
+  tutorial: |
+    **Concept.** A taint with the NoExecute effect not only blocks new pods, it also evicts running pods that do not tolerate it. A toleration lets a pod stay, and matches a taint by key, value and effect.
+
+    **Read up on:**
+    - `kubectl taint --help` — adding and removing taints, effects
+    - `kubectl explain pod.spec.tolerations` — operator, key, value, effect
+    - `kubectl describe node node01` — the Taints line
+    - Kubernetes docs: Taints and Tolerations
+  scenario: |
+    Namespace **`team`** has deployments **`analytics`** and **`intruder`**, all pods pinned to
+    **node01**. From now on node01 belongs to one team, whose name is in **`/lab/team.txt`**.
+
+    Mark **node01** with a taint whose key is **`team`**, whose value is that team name,
+    and that **evicts** pods already running there. Afterwards **`analytics`** must be
+    Running on node01 and the **`intruder`** pods must not run. Don't delete either deployment.
+  hints:
+    - "Two of the three taint effects keep new pods away; only one also removes the running ones."
+    - "A pod you want to keep needs a toleration; pods that are evicted keep their deployment and just stay Pending."
+    - "Apply the toleration before the taint to avoid downtime."
+  solution: |
+    ```bash
+    T=$(cat /lab/team.txt)
+    kubectl -n team patch deploy analytics --type=json -p \
+      '[{"op":"add","path":"/spec/template/spec/tolerations","value":[{"key":"team","operator":"Equal","value":"'$T'","effect":"NoExecute"}]}]'
+    kubectl taint node node01 team=$T:NoExecute
+    ```
+  setup: |
+    k_ns team
+    t="team-$(head -c3 /dev/urandom | od -An -tx1 | tr -d ' \n')"
+    echo "$t" >"$KL_STATE/answer"
+    lab_file /lab/team.txt <<EOF
+    $t
+    EOF
+    kubectl apply -f - >/dev/null <<'EOF'
+    apiVersion: apps/v1
+    kind: Deployment
+    metadata: {name: analytics, namespace: team}
+    spec:
+      replicas: 1
+      selector: {matchLabels: {app: analytics}}
+      template:
+        metadata: {labels: {app: analytics}}
+        spec:
+          nodeSelector: {kubernetes.io/hostname: node01}
+          containers:
+          - name: analytics
+            image: busybox:1.37
+            command: ["sleep", "infinity"]
+            resources: {requests: {cpu: 10m, memory: 8Mi}}
+    ---
+    apiVersion: apps/v1
+    kind: Deployment
+    metadata: {name: intruder, namespace: team}
+    spec:
+      replicas: 2
+      selector: {matchLabels: {app: intruder}}
+      template:
+        metadata: {labels: {app: intruder}}
+        spec:
+          nodeSelector: {kubernetes.io/hostname: node01}
+          containers:
+          - name: intruder
+            image: busybox:1.37
+            command: ["sleep", "infinity"]
+            resources: {requests: {cpu: 10m, memory: 8Mi}}
+    EOF
+    wait_deploy team analytics 90
+    wait_deploy team intruder 90
+  check: |
+    team=$(cat "$KL_STATE/answer" 2>/dev/null)
+    tainted() { kubectl get node node01 -o json | jq -e --arg v "$team" '.spec.taints[]? | select(.key=="team" and .value==$v and .effect=="NoExecute")' >/dev/null; }
+    check "node01 carries the team taint with the NoExecute effect" tainted
+    check "analytics is running on node01" 'tainted && wait_deploy team analytics 90 && [ "$(kubectl -n team get pods -l app=analytics -o jsonpath="{.items[0].spec.nodeName}")" = node01 ]'
+    check "no intruder pod is running" 'tainted && k_exists -n team deploy intruder && eventually 40 "[ \"\$(kubectl -n team get pods -l app=intruder --no-headers 2>/dev/null | grep -c Running)\" = 0 ]"'
+  solve: |
+    t=$(tr -d '[:space:]' 2>/dev/null </lab/team.txt)
+    kubectl -n team patch deploy analytics --type=json -p \
+      '[{"op":"add","path":"/spec/template/spec/tolerations","value":[{"key":"team","operator":"Equal","value":"'"$t"'","effect":"NoExecute"}]}]'
+    kubectl -n team rollout status deploy analytics --timeout=90s
+    kubectl taint node node01 "team=$t:NoExecute"
+
+- id: k8s-319
+  title: A startup budget for a slow boot
+  difficulty: 4
+  kind: fix
+  tags: [probes, startupprobe, liveness]
+  tutorial: |
+    **Concept.** A startup probe runs first and holds back the liveness and readiness probes until it succeeds once. Its period and failure threshold together define how long the application may take to boot, without making the later liveness checks lenient.
+
+    **Read up on:**
+    - `kubectl explain pod.spec.containers.startupProbe` — fields shared with other probes
+    - `kubectl describe pod NAME` — probe failures and kill events
+    - `kubectl get pod NAME -w` — the restart counter
+    - Kubernetes docs: Configure Liveness, Readiness and Startup Probes
+  scenario: |
+    Deployment **`slowboot`** in namespace **`slow`** needs between 30 and 50 seconds before
+    it is able to serve, but the liveness probe kills it long before that and the pod
+    restarts forever.
+
+    Fix it without loosening the **liveness** probe (it must keep detecting a hang within
+    15 seconds). The pod should become Ready soon after the app is up: whatever you add must
+    check at least every **3 seconds**, and must allow a boot of up to **60 seconds**.
+    The final pod must show **zero restarts**.
+  hints:
+    - "Total patience of a probe is roughly `periodSeconds * failureThreshold`."
+    - "`kubectl explain pod.spec.containers.startupProbe` - it takes the same handler types as liveness."
+  solution: |
+    Add a startup probe with the same command as the liveness probe:
+
+    ```bash
+    kubectl -n slow patch deploy slowboot --type=json -p '[{"op":"add","path":"/spec/template/spec/containers/0/startupProbe","value":{"exec":{"command":["test","-f","/tmp/up"]},"periodSeconds":2,"failureThreshold":35}}]'
+    ```
+  setup: |
+    k_ns slow
+    d=$((RANDOM % 16 + 30))
+    echo "$d" >"$KL_STATE/answer"
+    kubectl apply -f - >/dev/null <<EOF
+    apiVersion: apps/v1
+    kind: Deployment
+    metadata: {name: slowboot, namespace: slow}
+    spec:
+      replicas: 1
+      selector: {matchLabels: {app: slowboot}}
+      template:
+        metadata: {labels: {app: slowboot}}
+        spec:
+          containers:
+          - name: app
+            image: busybox:1.37
+            command: ["sh", "-c", "sleep $d; touch /tmp/up; sleep infinity"]
+            livenessProbe:
+              exec: {command: ["test", "-f", "/tmp/up"]}
+              periodSeconds: 5
+              failureThreshold: 2
+    EOF
+  check: |
+    probes_ok() {
+      kubectl -n slow get deploy slowboot -o json 2>/dev/null | jq -e '
+        .spec.template.spec.containers[0] as $c
+        | ($c.startupProbe // null) != null
+        and ($c.startupProbe.periodSeconds // 10) <= 3
+        and ($c.startupProbe.periodSeconds // 10) * ($c.startupProbe.failureThreshold // 3) >= 60
+        and ($c.livenessProbe // null) != null
+        and ($c.livenessProbe.periodSeconds // 10) * ($c.livenessProbe.failureThreshold // 3) <= 15' >/dev/null
+    }
+    check "a startup probe (period <= 3s, budget >= 60s) is configured" probes_ok
+    check "liveness probe is still strict" '[ "$(kubectl -n slow get deploy slowboot -o json | jq "(.spec.template.spec.containers[0].livenessProbe.periodSeconds // 10) * (.spec.template.spec.containers[0].livenessProbe.failureThreshold // 3) <= 15")" = true ]'
+    check "slowboot becomes ready" 'probes_ok && eventually 150 "deploy_ready slow slowboot"'
+    check "no restarts" 'probes_ok && [ "$(kubectl -n slow get pods -l app=slowboot -o json | jq "[.items[] | select(.metadata.deletionTimestamp == null) | .status.containerStatuses[]?.restartCount] | add // 0")" = 0 ]'
+  solve: |
+    kubectl -n slow patch deploy slowboot --type=json -p '[{"op":"add","path":"/spec/template/spec/containers/0/startupProbe","value":{"exec":{"command":["test","-f","/tmp/up"]},"periodSeconds":2,"failureThreshold":35}}]'
+    kubectl -n slow rollout status deploy slowboot --timeout=150s
+
+- id: k8s-320
+  title: An autoscaler with manners
+  difficulty: 5
+  kind: build
+  tags: [hpa, autoscaling, behavior]
+  tutorial: |
+    **Concept.** The autoscaling/v2 HorizontalPodAutoscaler can combine several metrics (the largest desired size wins) and has a behavior section that limits how quickly it scales up and down. The object is valid and stored even when no metrics are available yet.
+
+    **Read up on:**
+    - `kubectl explain hpa.spec.metrics.resource.target` — Utilization versus AverageValue
+    - `kubectl explain hpa.spec.behavior.scaleDown` — stabilization window and policies
+    - `kubectl api-resources | grep autoscal` — the API group and versions
+    - Kubernetes docs: Horizontal Pod Autoscaling
+  scenario: |
+    Namespace **`scale`** has deployment **`catalog`**. Create an **autoscaling/v2**
+    HorizontalPodAutoscaler named **`catalog`** that targets it with:
+
+    - between **2** and **6** replicas
+    - a CPU metric: average **utilization** equal to the percentage written in **`/lab/target-cpu.txt`**
+    - a memory metric: **average value** of **`100Mi`**
+    - scale **down**: stabilization window **180 seconds**, and at most **1 pod per 60 seconds**
+    - scale **up**: at most **100 percent** of the current pods per **30 seconds**
+
+    No metrics server is needed; only the object matters.
+  hints:
+    - "`kubectl autoscale` cannot express all of this; write the manifest."
+    - "Under `behavior`, `scaleDown` and `scaleUp` each take `policies` with `type`, `value` and `periodSeconds`."
+    - "Policy types are `Pods` and `Percent`; the stabilization window is a sibling of `policies`."
+  solution: |
+    ```yaml
+    apiVersion: autoscaling/v2
+    kind: HorizontalPodAutoscaler
+    metadata: {name: catalog, namespace: scale}
+    spec:
+      scaleTargetRef: {apiVersion: apps/v1, kind: Deployment, name: catalog}
+      minReplicas: 2
+      maxReplicas: 6
+      metrics:
+      - type: Resource
+        resource: {name: cpu, target: {type: Utilization, averageUtilization: 65}}
+      - type: Resource
+        resource: {name: memory, target: {type: AverageValue, averageValue: 100Mi}}
+      behavior:
+        scaleDown:
+          stabilizationWindowSeconds: 180
+          policies: [{type: Pods, value: 1, periodSeconds: 60}]
+        scaleUp:
+          policies: [{type: Percent, value: 100, periodSeconds: 30}]
+    ```
+  setup: |
+    k_ns scale
+    c=$((RANDOM % 26 + 55))
+    echo "$c" >"$KL_STATE/answer"
+    lab_file /lab/target-cpu.txt <<EOF
+    $c
+    EOF
+    kubectl apply -f - >/dev/null <<'EOF'
+    apiVersion: apps/v1
+    kind: Deployment
+    metadata: {name: catalog, namespace: scale}
+    spec:
+      replicas: 2
+      selector: {matchLabels: {app: catalog}}
+      template:
+        metadata: {labels: {app: catalog}}
+        spec:
+          containers:
+          - name: catalog
+            image: nginx:1.27-alpine
+            resources:
+              requests: {cpu: 20m, memory: 32Mi}
+    EOF
+  check: |
+    want=$(cat "$KL_STATE/answer" 2>/dev/null)
+    hpa() { kubectl -n scale get horizontalpodautoscalers.v2.autoscaling catalog -o json 2>/dev/null; }
+    check "HPA catalog exists and targets deployment catalog" 'hpa | jq -e ".spec.scaleTargetRef.kind==\"Deployment\" and .spec.scaleTargetRef.name==\"catalog\""'
+    check "replicas between 2 and 6" 'hpa | jq -e ".spec.minReplicas==2 and .spec.maxReplicas==6"'
+    check "CPU utilization target matches /lab/target-cpu.txt" 'hpa | jq -e --argjson c "$want" "any(.spec.metrics[]?; .type==\"Resource\" and .resource.name==\"cpu\" and .resource.target.type==\"Utilization\" and .resource.target.averageUtilization==\$c)"'
+    check "memory average value is 100Mi" 'hpa | jq -e "any(.spec.metrics[]?; .type==\"Resource\" and .resource.name==\"memory\" and .resource.target.type==\"AverageValue\" and (.resource.target.averageValue | IN(\"100Mi\",\"102400Ki\",\"104857600\")))"'
+    check "scale down: 180s window, 1 pod per 60s" 'hpa | jq -e ".spec.behavior.scaleDown.stabilizationWindowSeconds==180 and any(.spec.behavior.scaleDown.policies[]?; .type==\"Pods\" and .value==1 and .periodSeconds==60)"'
+    check "scale up: 100 percent per 30s" 'hpa | jq -e "any(.spec.behavior.scaleUp.policies[]?; .type==\"Percent\" and .value==100 and .periodSeconds==30)"'
+  solve: |
+    c=$(tr -d '[:space:]' 2>/dev/null </lab/target-cpu.txt)
+    kubectl apply -f - <<EOF
+    apiVersion: autoscaling/v2
+    kind: HorizontalPodAutoscaler
+    metadata: {name: catalog, namespace: scale}
+    spec:
+      scaleTargetRef: {apiVersion: apps/v1, kind: Deployment, name: catalog}
+      minReplicas: 2
+      maxReplicas: 6
+      metrics:
+      - type: Resource
+        resource: {name: cpu, target: {type: Utilization, averageUtilization: $c}}
+      - type: Resource
+        resource: {name: memory, target: {type: AverageValue, averageValue: 100Mi}}
+      behavior:
+        scaleDown:
+          stabilizationWindowSeconds: 180
+          policies: [{type: Pods, value: 1, periodSeconds: 60}]
+        scaleUp:
+          policies: [{type: Percent, value: 100, periodSeconds: 30}]
+    EOF

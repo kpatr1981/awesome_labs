@@ -1,0 +1,880 @@
+track: networking
+module: Services & scale
+profile: docker
+order: 4
+exercises:
+
+- id: net-026
+  title: One name, three addresses
+  difficulty: 2
+  kind: fix
+  tags: [dns, dnsmasq, round-robin, netns]
+  tutorial: |
+    **Concept.** DNS can spread clients over several servers by answering one name with several A records. Resolvers return the records in a rotating order, so successive clients start with different addresses.
+
+    **Read up on:**
+    - `dig +short @SERVER name` — see every record in an answer
+    - `man dnsmasq` — `addn-hosts` and how several lines for one name are answered
+    - `man hosts` — the file format dnsmasq reads
+    - `systemctl restart` — dnsmasq reads its data files at startup
+  scenario: |
+    A DNS server runs in the namespace **`dns`** at **10.90.0.1** (systemd unit
+    **`kl-rr`**), and the namespace **`cl`** is a client at 10.90.0.2:
+
+    ```
+    cl (10.90.0.2) --- (10.90.0.1) dns
+    ```
+
+    **`web.lab.test`** should be served by the three web servers listed in
+    **`/lab/backends.txt`**, but clients are only told about one of them.
+    The server's files are in **`/lab/dns/`**.
+
+    Make `dig @10.90.0.1 web.lab.test` (run in `cl`) return all three addresses, and
+    keep `db.lab.test` working.
+  hints:
+    - "`sudo ip netns exec cl dig +short @10.90.0.1 web.lab.test` shows what clients get now."
+    - "Look at `/lab/dns/dnsmasq.conf` to find where the records come from."
+    - "The same name may appear on several lines. Restart `kl-rr` afterwards."
+  solution: |
+    The name has a single entry in the hosts file. Add one line per backend address,
+    then restart the server so it rereads the file.
+
+    ```bash
+    while read -r ip; do
+      grep -q "^$ip " /lab/dns/hosts || echo "$ip web.lab.test" >> /lab/dns/hosts
+    done </lab/backends.txt
+    sudo systemctl restart kl-rr
+    sudo ip netns exec cl dig +short @10.90.0.1 web.lab.test
+    ```
+  setup: |
+    on_reset 'systemctl stop kl-rr 2>/dev/null; systemctl reset-failed kl-rr 2>/dev/null'
+    netns_new dns cl
+    netns_link dns eth0 cl eth0
+    ip -n dns addr add 10.90.0.1/24 dev eth0
+    ip -n cl addr add 10.90.0.2/24 dev eth0
+    n=$((10 + RANDOM % 80))
+    printf '10.90.1.%s\n10.90.1.%s\n10.90.1.%s\n' "$n" "$((n+1))" "$((n+2))" | lab_file /lab/backends.txt
+    sort /lab/backends.txt >"$KL_STATE/answer"
+    lab_file /lab/dns/dnsmasq.conf <<'EOF'
+    addn-hosts=/lab/dns/hosts
+    host-record=db.lab.test,10.90.2.5
+    EOF
+    printf '10.90.1.%s web.lab.test\n' "$n" | lab_file /lab/dns/hosts
+    chmod 755 /lab/dns
+    systemd-run --quiet --unit=kl-rr ip netns exec dns dnsmasq --no-daemon --no-resolv --no-hosts --bind-interfaces --listen-address=10.90.0.1 --port=53 --user=root -C /lab/dns/dnsmasq.conf
+    eventually 15 'ip netns exec cl dig +short +time=1 +tries=1 @10.90.0.1 db.lab.test | grep -q 10.90.2.5'
+  check: |
+    q() { ip netns exec cl dig +short +time=2 +tries=1 @10.90.0.1 "$1" A 2>/dev/null | sort; }
+    want=$(cat "$KL_STATE/answer")
+    eventually 10 '[ "$(q web.lab.test)" = "$want" ]' || true
+    check_eq "web.lab.test returns all three backends" "$(q web.lab.test)" "$want"
+    check_eq "db.lab.test still resolves" "$(q db.lab.test)" 10.90.2.5
+  solve: |
+    while read -r ip; do
+      grep -q "^$ip " /lab/dns/hosts || echo "$ip web.lab.test" >> /lab/dns/hosts
+    done </lab/backends.txt
+    sudo systemctl restart kl-rr
+
+- id: net-027
+  title: Different answers inside and outside
+  difficulty: 3
+  kind: fix
+  tags: [dns, dnsmasq, split-horizon, netns]
+  tutorial: |
+    **Concept.** Split-horizon DNS answers the same name differently depending on who asks: private for internal clients, public for the rest. A multi-homed server can decide by where the query arrived.
+
+    **Read up on:**
+    - `man dnsmasq` — options that tie answers to the receiving interface
+    - `dig @SERVER name` — query from different vantage points with `ip netns exec`
+    - `ip -n NS addr` — which subnet each side of the server is on
+    - `systemctl restart` — apply a dnsmasq config change
+  scenario: |
+    A DNS server in namespace **`dns`** (unit **`kl-split`**) has two sides:
+
+    ```
+    in  (10.20.1.2)     --- (10.20.1.1)     dns
+    out (198.51.100.2)  --- (198.51.100.1)  dns
+    ```
+
+    `app.corp.test` has two addresses configured: **10.20.1.50** (internal) and
+    **198.51.100.50** (public). Right now every client is told about both.
+
+    Make clients in **`in`** receive only the internal address and clients in **`out`**
+    only the public one, with `dig @<server address> app.corp.test`. The config is in
+    **`/lab/split/`**.
+  hints:
+    - "Query from each namespace: `sudo ip netns exec in dig +short @10.20.1.1 app.corp.test`."
+    - "The server already knows both addresses and which subnet each interface is on. `man dnsmasq` has an option about answering by receiving interface."
+  solution: |
+    Tell dnsmasq to prefer the address on the subnet of the interface that received the
+    query.
+
+    ```bash
+    echo localise-queries >> /lab/split/dnsmasq.conf
+    sudo systemctl restart kl-split
+    sudo ip netns exec in  dig +short @10.20.1.1 app.corp.test
+    sudo ip netns exec out dig +short @198.51.100.1 app.corp.test
+    ```
+  setup: |
+    on_reset 'systemctl stop kl-split 2>/dev/null; systemctl reset-failed kl-split 2>/dev/null'
+    netns_new dns in out
+    netns_link dns eth0 in eth0
+    netns_link dns eth1 out eth0
+    ip -n dns addr add 10.20.1.1/24 dev eth0
+    ip -n in addr add 10.20.1.2/24 dev eth0
+    ip -n dns addr add 198.51.100.1/24 dev eth1
+    ip -n out addr add 198.51.100.2/24 dev eth0
+    lab_file /lab/split/dnsmasq.conf <<'EOF'
+    addn-hosts=/lab/split/hosts
+    EOF
+    lab_file /lab/split/hosts <<'EOF'
+    10.20.1.50 app.corp.test
+    198.51.100.50 app.corp.test
+    EOF
+    chmod 755 /lab/split
+    systemd-run --quiet --unit=kl-split ip netns exec dns dnsmasq --no-daemon --no-resolv --no-hosts --bind-interfaces --listen-address=10.20.1.1 --listen-address=198.51.100.1 --port=53 --user=root -C /lab/split/dnsmasq.conf
+    eventually 15 'ip netns exec in dig +short +time=1 +tries=1 @10.20.1.1 app.corp.test | grep -q 10.20.1.50'
+  check: |
+    q() { ip netns exec "$1" dig +short +time=2 +tries=1 @"$2" app.corp.test A 2>/dev/null | sort | tr '\n' ' '; }
+    eventually 10 '[ "$(q in 10.20.1.1)" = "10.20.1.50 " ]' || true
+    check_eq "internal clients get the internal address only" "$(q in 10.20.1.1)" "10.20.1.50 "
+    check_eq "external clients get the public address only" "$(q out 198.51.100.1)" "198.51.100.50 "
+  solve: |
+    echo localise-queries >> /lab/split/dnsmasq.conf
+    sudo systemctl restart kl-split
+
+- id: net-028
+  title: The resolver that never remembers
+  difficulty: 3
+  kind: fix
+  tags: [dns, dnsmasq, cache, netem]
+  tutorial: |
+    **Concept.** A caching resolver stores answers for their time-to-live, so repeat queries are served locally instead of crossing a slow link upstream.
+
+    **Read up on:**
+    - `dig` — the `Query time` line in the statistics footer
+    - `man dnsmasq` — options controlling the size of the DNS cache
+    - `dig +noall +answer` — the TTL column of an answer
+    - `systemctl restart` — apply a changed config (this clears the cache)
+  scenario: |
+    Clients ask a caching resolver, which forwards to a slow upstream server:
+
+    ```
+    cl (10.30.1.2) --- (10.30.1.1) res (10.30.2.1) --- (10.30.2.2) up
+    ```
+
+    The resolver runs in **`res`** as unit **`kl-cache-res`** with the config
+    **`/lab/cache/dnsmasq.conf`**. The link to `up` is slow, yet repeat lookups of
+    **`www.cache.test`** from `cl` (`dig @10.30.1.1`) are just as slow as the first one.
+
+    Make the repeat lookups fast without touching the upstream server or its slow link.
+  hints:
+    - "`sudo ip netns exec cl dig @10.30.1.1 www.cache.test | grep 'Query time'`, twice."
+    - "Read the resolver's config file for anything that turns caching off."
+  solution: |
+    The cache size is set to zero. Give the resolver a cache and restart it.
+
+    ```bash
+    sed -i 's/^cache-size=.*/cache-size=500/' /lab/cache/dnsmasq.conf
+    sudo systemctl restart kl-cache-res
+    for i in 1 2; do sudo ip netns exec cl dig @10.30.1.1 www.cache.test | grep 'Query time'; done
+    ```
+  setup: |
+    on_reset 'systemctl stop kl-cache-up kl-cache-res 2>/dev/null; systemctl reset-failed kl-cache-up kl-cache-res 2>/dev/null; rm -rf /srv/kl-cache'
+    netns_new cl res up
+    netns_link cl eth0 res eth0
+    netns_link res eth1 up eth0
+    ip -n cl addr add 10.30.1.2/24 dev eth0
+    ip -n res addr add 10.30.1.1/24 dev eth0
+    ip -n res addr add 10.30.2.1/24 dev eth1
+    ip -n up addr add 10.30.2.2/24 dev eth0
+    ip netns exec up tc qdisc add dev eth0 root netem delay 150ms
+    mkdir -p /srv/kl-cache
+    cat >/srv/kl-cache/up.conf <<'EOF'
+    host-record=www.cache.test,10.30.9.9
+    local-ttl=300
+    EOF
+    lab_file /lab/cache/dnsmasq.conf <<'EOF'
+    server=10.30.2.2
+    cache-size=0
+    EOF
+    chmod 755 /lab/cache
+    systemd-run --quiet --unit=kl-cache-up ip netns exec up dnsmasq --no-daemon --no-resolv --no-hosts --bind-interfaces --listen-address=10.30.2.2 --port=53 --user=root -C /srv/kl-cache/up.conf
+    systemd-run --quiet --unit=kl-cache-res ip netns exec res dnsmasq --no-daemon --no-resolv --no-hosts --bind-interfaces --listen-address=10.30.1.1 --port=53 --user=root -C /lab/cache/dnsmasq.conf
+    eventually 20 'ip netns exec cl dig +short +time=2 +tries=1 @10.30.1.1 www.cache.test | grep -q 10.30.9.9'
+  check: |
+    qt() { ip netns exec cl dig +time=3 +tries=1 @10.30.1.1 www.cache.test 2>/dev/null | sed -n 's/.*Query time: \([0-9]*\) msec.*/\1/p'; }
+    check "the upstream link is still slow" 'ip netns exec up tc qdisc show dev eth0 | grep -q netem'
+    check "the resolver still forwards to the upstream" 'grep -q "^server=10.30.2.2" /lab/cache/dnsmasq.conf'
+    check "the resolver answers" 'ip netns exec cl dig +short +time=3 +tries=1 @10.30.1.1 www.cache.test | grep -q 10.30.9.9'
+    qt >/dev/null
+    t=$(qt)
+    check "a repeat lookup is served from the cache (${t:-?} ms)" '[ -n "$t" ] && [ "$t" -lt 60 ]'
+  solve: |
+    sed -i 's/^cache-size=.*/cache-size=500/' /lab/cache/dnsmasq.conf
+    sudo systemctl restart kl-cache-res
+
+- id: net-029
+  title: Retry on a sick backend
+  difficulty: 3
+  kind: fix
+  tags: [nginx, reverse-proxy, health-checks, docker]
+  tutorial: |
+    **Concept.** A reverse proxy can move on to the next backend, but only for failures it treats as retryable. By default a backend that answers with an error status has still answered.
+
+    **Read up on:**
+    - nginx `proxy_next_upstream` — which conditions trigger a retry
+    - nginx `upstream` and the `server` parameters `max_fails`, `fail_timeout`
+    - `docker exec NAME nginx -t` and `nginx -s reload` — check and apply config
+    - `curl -s -o /dev/null -w '%{http_code}\n'` — print only the status
+  scenario: |
+    nginx runs in the container **`kl-px`** (host networking) and listens on
+    **`127.0.0.1:8091`**, proxying to three backends on `127.0.0.1:9201`, `9202` and
+    `9203`. They answer with their own names (`be1`, `be2`, `be3`).
+
+    One of the backends is broken and keeps answering with an error status, and about
+    a third of the requests fail. Fix the proxy so that clients **never see the error**,
+    while all three `server` lines stay in the configuration.
+
+    The config is in **`/lab/proxy/default.conf`** (the directory is mounted read-only
+    into the container).
+  hints:
+    - "`for i in $(seq 9); do curl -s -o /dev/null -w '%{http_code}\n' http://127.0.0.1:8091/; done`"
+    - "The proxy only retries on connection errors and timeouts unless told otherwise."
+    - "Reload with `docker exec kl-px nginx -s reload`."
+  solution: |
+    Make an error status from a backend a reason to try the next one.
+
+    ```bash
+    sed -i '/proxy_pass/a\        proxy_next_upstream error timeout http_503;' /lab/proxy/default.conf
+    docker exec kl-px nginx -t && docker exec kl-px nginx -s reload
+    for i in $(seq 9); do curl -s http://127.0.0.1:8091/; done
+    ```
+  setup: |
+    on_reset 'docker rm -f kl-px >/dev/null 2>&1; for n in 1 2 3; do systemctl stop kl-pxbe$n 2>/dev/null; systemctl reset-failed kl-pxbe$n 2>/dev/null; done; rm -rf /srv/kl-px'
+    mkdir -p /srv/kl-px
+    cat >/srv/kl-px/be.py <<'PY'
+    import sys, http.server
+    port, name, status = int(sys.argv[1]), sys.argv[2], int(sys.argv[3])
+    class H(http.server.BaseHTTPRequestHandler):
+        def do_GET(self):
+            body = (name + "\n").encode()
+            self.send_response(status)
+            self.send_header("Content-Length", str(len(body)))
+            self.end_headers()
+            self.wfile.write(body)
+        def log_message(self, *a):
+            pass
+    http.server.ThreadingHTTPServer(("127.0.0.1", port), H).serve_forever()
+    PY
+    bad=$((1 + RANDOM % 3))
+    echo "$bad" >"$KL_STATE/answer"
+    for n in 1 2 3; do
+      st=200; [ "$n" = "$bad" ] && st=503
+      systemd-run --quiet --unit=kl-pxbe$n python3 /srv/kl-px/be.py 920$n be$n $st
+    done
+    lab_file /lab/proxy/default.conf <<'EOF'
+    upstream app {
+        server 127.0.0.1:9201;
+        server 127.0.0.1:9202;
+        server 127.0.0.1:9203;
+    }
+
+    server {
+        listen 127.0.0.1:8091;
+
+        location / {
+            proxy_pass http://app;
+        }
+    }
+    EOF
+    chmod 755 /lab/proxy
+    docker rm -f kl-px >/dev/null 2>&1
+    docker run -d --name kl-px --network host -v /lab/proxy:/etc/nginx/conf.d:ro nginx:1.28-alpine >/dev/null
+    eventually 20 'curl -s -m2 -o /dev/null http://127.0.0.1:8091/'
+  check: |
+    codes() { for i in $(seq 15); do curl -s -m3 -o /dev/null -w '%{http_code}\n' http://127.0.0.1:8091/ 2>/dev/null; done | sort | uniq -c | tr -s ' ' | tr '\n' ' '; }
+    bodies() { for i in $(seq 15); do curl -s -m3 http://127.0.0.1:8091/ 2>/dev/null; done | sort -u | wc -l; }
+    check "nginx container is running" 'c_running kl-px'
+    check_eq "all three servers are still configured" "$(grep -c '^ *server 127.0.0.1:920[123];' /lab/proxy/default.conf)" 3
+    eventually 12 '[ "$(codes)" = " 15 200 " ]' || true
+    check_eq "no request fails" "$(codes)" " 15 200 "
+    check_eq "the two healthy backends share the load" "$(bodies)" 2
+  solve: |
+    sed -i '/proxy_pass/a\        proxy_next_upstream error timeout http_503;' /lab/proxy/default.conf
+    docker exec kl-px nginx -s reload
+
+- id: net-030
+  title: HAProxy says every server is down
+  difficulty: 3
+  kind: fix
+  tags: [haproxy, health-checks, docker]
+  tutorial: |
+    **Concept.** HAProxy only sends traffic to servers whose health check passes. If the check asks for the wrong thing or expects the wrong answer, every server is marked down and clients get a 503.
+
+    **Read up on:**
+    - `option httpchk` and the `http-check send` / `http-check expect` rules
+    - `curl -i URL` — what a backend really returns for a given path
+    - `docker logs NAME` — state-change messages such as "is DOWN"
+    - `docker kill -s HUP NAME` — make HAProxy reload its config
+  scenario: |
+    HAProxy runs in the container **`kl-hp`** (host networking) on
+    **`127.0.0.1:8092`** with three backends on `127.0.0.1:9301`-`9303`, each answering
+    with its own name (`web1` to `web3`). Every request returns **503** and the logs say
+    all servers are down, but the backends themselves are up.
+
+    The config is in **`/lab/lb/haproxy.cfg`** (mounted read-only into the container).
+    Make HAProxy use all three backends. Keep `check` on every server.
+  hints:
+    - "Compare what the check requests with what a backend serves: `curl -i http://127.0.0.1:9301/health` and a few other paths."
+    - "Two things in the check configuration can be wrong: the request and the expected answer."
+    - "Apply with `docker kill -s HUP kl-hp`."
+  solution: |
+    The check requests `/healthz` (the backends serve `/health`) and expects status 204
+    (they answer 200).
+
+    ```bash
+    sed -i 's#uri /healthz#uri /health#; s/status 204/status 200/' /lab/lb/haproxy.cfg
+    docker kill -s HUP kl-hp
+    for i in $(seq 6); do curl -s http://127.0.0.1:8092/; done
+    ```
+  setup: |
+    on_reset 'docker rm -f kl-hp >/dev/null 2>&1; for n in 1 2 3; do systemctl stop kl-hpbe$n 2>/dev/null; systemctl reset-failed kl-hpbe$n 2>/dev/null; done; rm -rf /srv/kl-hp'
+    mkdir -p /srv/kl-hp
+    cat >/srv/kl-hp/be.py <<'PY'
+    import sys, http.server
+    port, name = int(sys.argv[1]), sys.argv[2]
+    class H(http.server.BaseHTTPRequestHandler):
+        def do_GET(self):
+            if self.path == "/health":
+                code, body = 200, b"ok\n"
+            elif self.path == "/":
+                code, body = 200, (name + "\n").encode()
+            else:
+                code, body = 404, b"not found\n"
+            self.send_response(code)
+            self.send_header("Content-Length", str(len(body)))
+            self.end_headers()
+            self.wfile.write(body)
+        def log_message(self, *a):
+            pass
+    http.server.ThreadingHTTPServer(("127.0.0.1", port), H).serve_forever()
+    PY
+    for n in 1 2 3; do
+      systemd-run --quiet --unit=kl-hpbe$n python3 /srv/kl-hp/be.py 930$n web$n
+    done
+    lab_file /lab/lb/haproxy.cfg <<'EOF'
+    global
+        maxconn 256
+
+    defaults
+        mode http
+        timeout connect 2s
+        timeout client 10s
+        timeout server 10s
+
+    frontend web
+        bind 127.0.0.1:8092
+        default_backend app
+
+    backend app
+        balance roundrobin
+        option httpchk
+        http-check send meth GET uri /healthz
+        http-check expect status 204
+        server s1 127.0.0.1:9301 check inter 1s rise 1 fall 2
+        server s2 127.0.0.1:9302 check inter 1s rise 1 fall 2
+        server s3 127.0.0.1:9303 check inter 1s rise 1 fall 2
+    EOF
+    chmod 755 /lab/lb
+    docker rm -f kl-hp >/dev/null 2>&1
+    docker run -d --name kl-hp --network host -v /lab/lb:/usr/local/etc/haproxy:ro haproxy:3.0-alpine >/dev/null
+    eventually 20 '[ "$(curl -s -m2 -o /dev/null -w "%{http_code}" http://127.0.0.1:8092/)" = 503 ]'
+  check: |
+    dist() { for i in $(seq 12); do curl -fsS -m2 http://127.0.0.1:8092/ 2>/dev/null; done | sort -u | wc -l; }
+    check "HAProxy container is running" 'c_running kl-hp'
+    check_eq "every server still has a health check" "$(grep -c '^ *server .* check' /lab/lb/haproxy.cfg)" 3
+    check "backend ports are unchanged" 'grep -q ":9301" /lab/lb/haproxy.cfg && grep -q ":9302" /lab/lb/haproxy.cfg && grep -q ":9303" /lab/lb/haproxy.cfg'
+    eventually 14 '[ "$(dist)" = 3 ]' || true
+    check_eq "responses come from all three backends" "$(dist)" 3
+  solve: |
+    sed -i 's#uri /healthz#uri /health#; s/status 204/status 200/' /lab/lb/haproxy.cfg
+    docker kill -s HUP kl-hp
+
+- id: net-031
+  title: Notice a dead peer sooner
+  difficulty: 3
+  kind: build
+  tags: [tcp, keepalive, sysctl, ss, netns]
+  tutorial: |
+    **Concept.** TCP keepalive probes an idle connection to detect a vanished peer. Idle time, probe interval and probe count come from kernel settings, which a socket reads when keepalive is switched on for it.
+
+    **Read up on:**
+    - `sysctl net.ipv4.tcp_keepalive_time` and its two siblings
+    - `ip netns exec NS sysctl ...` — these settings exist per network namespace
+    - `ss -tno` — the `timer:(keepalive,...)` field of a connection
+    - `man 7 tcp` — `TCP_KEEPIDLE` and `SO_KEEPALIVE`
+  scenario: |
+    The service **`kl-ka-cl`** runs in the namespace **`cl`** and keeps one idle TCP
+    connection open to a server at `10.40.0.2:7000` in namespace `srv`. The policy for
+    dead-peer detection is in **`/lab/policy.txt`**: the idle time before the first
+    keepalive probe, the interval between probes and the number of probes.
+
+    Make the client's connection follow that policy. The client program must not be
+    modified, and the settings must be applied to the namespace `cl` only.
+  hints:
+    - "`sudo ip netns exec cl ss -tno` shows the connection and its keepalive timer, now counting from a very long idle time."
+    - "Set the three `net.ipv4.tcp_keepalive_*` values inside `cl` with `sudo ip netns exec cl sysctl -w`."
+    - "A socket reads these values when keepalive is enabled on it, so the existing connection won't change. Restart the service `kl-ka-cl`."
+  solution: |
+    Set the three values in the client namespace and restart the client so that it opens
+    a new connection under the new settings.
+
+    ```bash
+    . /lab/policy.txt
+    sudo ip netns exec cl sysctl -w net.ipv4.tcp_keepalive_time=$idle \
+      net.ipv4.tcp_keepalive_intvl=$interval net.ipv4.tcp_keepalive_probes=$probes
+    sudo systemctl restart kl-ka-cl
+    sudo ip netns exec cl ss -tno
+    ```
+  setup: |
+    on_reset 'systemctl stop kl-ka-srv kl-ka-cl 2>/dev/null; systemctl reset-failed kl-ka-srv kl-ka-cl 2>/dev/null; rm -rf /srv/kl-ka'
+    netns_new cl srv
+    netns_link cl eth0 srv eth0
+    ip -n cl addr add 10.40.0.1/24 dev eth0
+    ip -n srv addr add 10.40.0.2/24 dev eth0
+    mkdir -p /srv/kl-ka
+    cat >/srv/kl-ka/srv.py <<'PY'
+    import socket
+    s = socket.socket()
+    s.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+    s.bind(("10.40.0.2", 7000))
+    s.listen(8)
+    held = []
+    while True:
+        c, _ = s.accept()
+        held.append(c)
+    PY
+    cat >/srv/kl-ka/cl.py <<'PY'
+    import socket, time
+    while True:
+        try:
+            s = socket.create_connection(("10.40.0.2", 7000), timeout=3)
+            s.settimeout(None)
+            s.setsockopt(socket.SOL_SOCKET, socket.SO_KEEPALIVE, 1)
+            break
+        except OSError:
+            time.sleep(1)
+    while True:
+        time.sleep(60)
+    PY
+    ia=(30 40 45); ib=(5 10 15); ic=(3 4 5)
+    idle=${ia[RANDOM % 3]}; interval=${ib[RANDOM % 3]}; probes=${ic[RANDOM % 3]}
+    printf 'idle=%s\ninterval=%s\nprobes=%s\n' "$idle" "$interval" "$probes" | lab_file /lab/policy.txt
+    cp /lab/policy.txt "$KL_STATE/answer"
+    systemd-run --quiet --unit=kl-ka-srv ip netns exec srv python3 /srv/kl-ka/srv.py
+    eventually 10 'ip netns exec srv ss -ltn | grep -q ":7000"'
+    systemd-run --quiet --unit=kl-ka-cl ip netns exec cl python3 /srv/kl-ka/cl.py
+    eventually 15 'ip netns exec cl ss -tn state established | grep -q 10.40.0.2:7000'
+  check: |
+    . "$KL_STATE/answer"
+    sc() { ip netns exec cl sysctl -n "net.ipv4.tcp_keepalive_$1" 2>/dev/null; }
+    check_eq "idle time before the first probe" "$(sc time)" "$idle"
+    check_eq "interval between probes" "$(sc intvl)" "$interval"
+    check_eq "number of probes" "$(sc probes)" "$probes"
+    timer() { ip netns exec cl ss -tno state established dst 10.40.0.2 2>/dev/null | sed -n 's/.*keepalive,\([^,]*\),.*/\1/p' | head -1; }
+    secs() { python3 -c 'import re,sys;print(sum(int(n)*{"h":3600,"min":60,"sec":1,"ms":0}[u] for n,u in re.findall(r"(\d+)(h|min|sec|ms)",sys.argv[1])))' "$1"; }
+    eventually 10 '[ -n "$(timer)" ]' || true
+    t=$(timer)
+    check "the live connection has a keepalive timer" '[ -n "$t" ]'
+    check "the live connection uses the new idle time (timer ${t:-none})" '[ -n "$t" ] && [ "$(secs "$t")" -le "$idle" ]'
+  solve: |
+    . /lab/policy.txt
+    sudo ip netns exec cl sysctl -qw net.ipv4.tcp_keepalive_time=$idle net.ipv4.tcp_keepalive_intvl=$interval net.ipv4.tcp_keepalive_probes=$probes
+    sudo systemctl restart kl-ka-cl
+
+- id: net-032
+  title: Cap the bulk transfer
+  difficulty: 4
+  kind: build
+  tags: [tc, htb, shaping, qdisc, netns]
+  tutorial: |
+    **Concept.** Shaping limits the rate a host sends at. A classful qdisc such as HTB divides the link into classes with their own rates, and filters pick the class for each packet.
+
+    **Read up on:**
+    - `man tc-htb` — root qdisc, classes, `rate`, `ceil` and the `default` class
+    - `man tc-u32` — classify packets by destination port
+    - `tc -s class show dev IF` — what went through which class
+  scenario: |
+    Host **`cl`** (10.70.0.1) uploads to **`srv`** (10.70.0.2), which accepts data on
+    two TCP ports:
+
+    ```
+    cl (10.70.0.1) --- (10.70.0.2) srv      ports 9000 (bulk) and 9001 (interactive)
+    ```
+
+    Limit what `cl` sends to **port 9000** to the rate given in **`/lab/rate.txt`**
+    (megabits per second). Traffic to port **9001** must stay unrestricted.
+
+    Configure this on `cl`'s interface `eth0`. The server `srv` is not yours to change.
+  hints:
+    - "Check the policy with `cat /lab/rate.txt`. Everything not matched by a filter needs somewhere to go: look at the `default` parameter of the root qdisc."
+    - "You need an `htb` root qdisc, two classes (one limited, one fast) and a `u32` filter matching `ip dport 9000 0xffff`."
+    - "Test with `sudo ip netns exec cl python3 -c ...` or `nc` and compare timings for both ports."
+  solution: |
+    Build an HTB tree on `cl eth0`: a slow class for port 9000, a fast default class.
+
+    ```bash
+    . /lab/rate.txt
+    sudo ip netns exec cl tc qdisc add dev eth0 root handle 1: htb default 20
+    sudo ip netns exec cl tc class add dev eth0 parent 1: classid 1:10 htb rate ${rate}mbit ceil ${rate}mbit
+    sudo ip netns exec cl tc class add dev eth0 parent 1: classid 1:20 htb rate 900mbit
+    sudo ip netns exec cl tc filter add dev eth0 parent 1: protocol ip u32 \
+      match ip dport 9000 0xffff flowid 1:10
+    sudo ip netns exec cl tc -s class show dev eth0
+    ```
+  setup: |
+    on_reset 'systemctl stop kl-shape-srv 2>/dev/null; systemctl reset-failed kl-shape-srv 2>/dev/null; rm -rf /srv/kl-shape'
+    netns_new cl srv
+    netns_link cl eth0 srv eth0
+    ip -n cl addr add 10.70.0.1/24 dev eth0
+    ip -n srv addr add 10.70.0.2/24 dev eth0
+    mkdir -p /srv/kl-shape
+    cat >/srv/kl-shape/sink.py <<'PY'
+    import socket, threading
+    def handle(c):
+        while c.recv(65536):
+            pass
+        c.sendall(b"ok")
+        c.close()
+    def serve(port):
+        s = socket.socket()
+        s.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+        s.bind(("10.70.0.2", port))
+        s.listen(16)
+        while True:
+            c, _ = s.accept()
+            threading.Thread(target=handle, args=(c,), daemon=True).start()
+    for p in (9000, 9001):
+        threading.Thread(target=serve, args=(p,), daemon=True).start()
+    threading.Event().wait()
+    PY
+    cat >/srv/kl-shape/send.py <<'PY'
+    import socket, sys, time
+    port, n = int(sys.argv[1]), int(sys.argv[2])
+    s = socket.create_connection(("10.70.0.2", port), timeout=20)
+    t = time.time()
+    s.sendall(b"x" * n)
+    s.shutdown(socket.SHUT_WR)
+    s.recv(2)
+    d = time.time() - t
+    print(int(n * 8 / d / 1000))
+    PY
+    ra=(2 4 6)
+    rate=${ra[RANDOM % 3]}
+    echo "rate=$rate" | lab_file /lab/rate.txt
+    echo "$rate" >"$KL_STATE/answer"
+    systemd-run --quiet --unit=kl-shape-srv ip netns exec srv python3 /srv/kl-shape/sink.py
+    eventually 10 'ip netns exec srv ss -ltn | grep -q ":9000"'
+  check: |
+    rate=$(cat "$KL_STATE/answer")
+    kbps() { ip netns exec cl python3 /srv/kl-shape/send.py "$1" "$2" 2>/dev/null; }
+    check "an htb qdisc is installed on cl eth0" 'ip netns exec cl tc qdisc show dev eth0 | grep -q htb'
+    slow=$(kbps 9000 $((rate * 125000)))
+    fast=$(kbps 9001 500000)
+    lo=$((rate * 500)); hi=$((rate * 1500))
+    check "port 9000 is held to about ${rate} Mbit/s (measured ${slow:-?} kbit/s)" '[ -n "$slow" ] && [ "$slow" -ge "$lo" ] && [ "$slow" -le "$hi" ]'
+    check "port 9001 is not limited (measured ${fast:-?} kbit/s)" '[ -n "$fast" ] && [ "$fast" -ge 30000 ]'
+  solve: |
+    . /lab/rate.txt
+    sudo ip netns exec cl tc qdisc add dev eth0 root handle 1: htb default 20
+    sudo ip netns exec cl tc class add dev eth0 parent 1: classid 1:10 htb rate ${rate}mbit ceil ${rate}mbit
+    sudo ip netns exec cl tc class add dev eth0 parent 1: classid 1:20 htb rate 900mbit
+    sudo ip netns exec cl tc filter add dev eth0 parent 1: protocol ip u32 match ip dport 9000 0xffff flowid 1:10
+
+- id: net-033
+  title: Knock before you enter
+  difficulty: 5
+  kind: build
+  tags: [nftables, port-knocking, sets, netns]
+  tutorial: |
+    **Concept.** Port knocking opens a firewalled service only after a client touches a secret sequence of ports. nftables can remember who completed each step in sets that rules fill as packets arrive.
+
+    **Read up on:**
+    - `man nft` — sets with `flags dynamic` and `timeout`
+    - The `add @set { ip saddr }` statement — filling a set from a rule
+    - Rule order in a chain and `drop` / `accept` verdicts
+    - `nft list ruleset` — watch the set contents change
+  scenario: |
+    The namespace **`srv`** runs a private service on **TCP port 2222** that is
+    currently blocked by an nftables rule in `inet knock`. Two clients can reach it:
+
+    ```
+    cl  (10.50.0.2) --- (10.50.0.1) srv (10.50.1.1) --- (10.50.1.2) cl2
+    ```
+
+    Implement port knocking on `srv`. A client that connects to the first knock port and
+    then to the second one, **in that order**, may use port 2222 for a short while.
+    Everybody else stays blocked. The knock ports are in **`/lab/knock.txt`**.
+
+    The knock connections themselves never get an answer. Do it with nftables only.
+  hints:
+    - "Use two sets with timeouts: sources that did the first knock, and sources allowed in. Both are updated from the packet path, so they need `flags dynamic`."
+    - "A rule for the second knock must also require `ip saddr @first_set`."
+    - "Put the accept rule for 2222 before the final drop, and drop the knock packets so they stay silent."
+    - "Test from `cl` with a few `nc -w1` or `python3` connection attempts to the knock ports, then to 2222."
+  solution: |
+    Replace the table with one that tracks the knock progress per source address.
+
+    ```bash
+    . /lab/knock.txt
+    sudo ip netns exec srv nft delete table inet knock
+    sudo ip netns exec srv nft -f - <<EOF
+    table inet knock {
+      set k1 { type ipv4_addr; flags dynamic; timeout 10s; }
+      set ok { type ipv4_addr; flags dynamic; timeout 30s; }
+      chain input {
+        type filter hook input priority 0; policy accept;
+        tcp dport $K1 add @k1 { ip saddr } drop
+        tcp dport $K2 ip saddr @k1 add @ok { ip saddr } drop
+        tcp dport 2222 ip saddr @ok accept
+        tcp dport 2222 drop
+      }
+    }
+    EOF
+    ```
+  setup: |
+    on_reset 'systemctl stop kl-knock 2>/dev/null; systemctl reset-failed kl-knock 2>/dev/null; rm -rf /srv/kl-knock'
+    netns_new srv cl cl2
+    netns_link srv eth0 cl eth0
+    netns_link srv eth1 cl2 eth0
+    ip -n srv addr add 10.50.0.1/24 dev eth0
+    ip -n cl addr add 10.50.0.2/24 dev eth0
+    ip -n srv addr add 10.50.1.1/24 dev eth1
+    ip -n cl2 addr add 10.50.1.2/24 dev eth0
+    k1=$((7000 + RANDOM % 900)); k2=$((k1 + 1 + RANDOM % 50))
+    printf 'K1=%s\nK2=%s\n' "$k1" "$k2" | lab_file /lab/knock.txt
+    cp /lab/knock.txt "$KL_STATE/answer"
+    mkdir -p /srv/kl-knock
+    chmod 700 /srv/kl-knock
+    echo "KNOCK-$(head -c6 /dev/urandom | od -An -tx1 | tr -d ' \n')" >/srv/kl-knock/banner
+    cat >/srv/kl-knock/svc.py <<'PY'
+    import socket
+    banner = open("/srv/kl-knock/banner").read().encode()
+    s = socket.socket()
+    s.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+    s.bind(("0.0.0.0", 2222))
+    s.listen(8)
+    while True:
+        c, _ = s.accept()
+        c.sendall(banner)
+        c.close()
+    PY
+    systemd-run --quiet --unit=kl-knock ip netns exec srv python3 /srv/kl-knock/svc.py
+    ip netns exec srv nft -f - <<'EOF'
+    table inet knock {
+      chain input {
+        type filter hook input priority 0; policy accept;
+        tcp dport 2222 drop
+      }
+    }
+    EOF
+    eventually 10 'ip netns exec srv ss -ltn | grep -q ":2222"'
+  check: |
+    . "$KL_STATE/answer"
+    want=$(cat /srv/kl-knock/banner)
+    try() {
+      local ns=$1 ip=$2; shift 2
+      ip netns exec "$ns" python3 - "$ip" "$@" <<'PY'
+    import socket, sys
+    ip = sys.argv[1]
+    for p in sys.argv[2:]:
+        try:
+            socket.create_connection((ip, int(p)), timeout=0.4).close()
+        except OSError:
+            pass
+    try:
+        s = socket.create_connection((ip, 2222), timeout=2)
+        s.settimeout(2)
+        print(s.recv(100).decode().strip())
+    except OSError:
+        pass
+    PY
+    }
+    check "the server is private without knocking" '[ "$(try cl2 10.50.1.1)" != "$want" ]'
+    check "the second knock alone does not open it" '[ "$(try cl2 10.50.1.1 $K2)" != "$want" ]'
+    check "the wrong order does not open it" '[ "$(try cl2 10.50.1.1 $K2 $K1)" != "$want" ]'
+    check_eq "the right sequence opens port 2222" "$(try cl 10.50.0.1 $K1 $K2)" "$want"
+  solve: |
+    . /lab/knock.txt
+    sudo ip netns exec srv nft delete table inet knock
+    sudo ip netns exec srv nft -f - <<EOF
+    table inet knock {
+      set k1 { type ipv4_addr; flags dynamic; timeout 10s; }
+      set ok { type ipv4_addr; flags dynamic; timeout 30s; }
+      chain input {
+        type filter hook input priority 0; policy accept;
+        tcp dport $K1 add @k1 { ip saddr } drop
+        tcp dport $K2 ip saddr @k1 add @ok { ip saddr } drop
+        tcp dport 2222 ip saddr @ok accept
+        tcp dport 2222 drop
+      }
+    }
+    EOF
+
+- id: net-034
+  title: Hand out the right lease
+  difficulty: 3
+  kind: fix
+  tags: [dhcp, dnsmasq]
+  tutorial: |
+    **Concept.** A DHCP server leases addresses from a pool and attaches options such as the default gateway, and it can pin a fixed address to a known MAC. dnsmasq expresses all of this in a few config directives, and it can check a file without serving.
+
+    **Read up on:**
+    - `dnsmasq --test --conf-file=FILE` — validate a config without starting the server
+    - `dhcp-range` — pool start, end and lease time (`30m`, `12h`)
+    - `dhcp-option=option:router,...` — the default gateway handed to clients
+    - `dhcp-host` — a fixed address reserved for one MAC
+  scenario: |
+    The DHCP config at **`/lab/dhcp/dnsmasq.conf`** is wrong, and the requirements are in
+    **`/lab/lease-spec.txt`**. Fix the config so that:
+
+    - the pool and lease time match the spec's `pool_start`, `pool_end` and `lease`,
+    - the default gateway handed out matches `router`,
+    - the host with MAC `reserved_mac` always gets `reserved_ip`.
+
+    It must pass `dnsmasq --test --conf-file=/lab/dhcp/dnsmasq.conf`.
+  hints:
+    - "`dnsmasq --test --conf-file=/lab/dhcp/dnsmasq.conf` reports whether the file is valid."
+    - "Three directives carry the answer: `dhcp-range`, `dhcp-option=option:router,...` and `dhcp-host`."
+  solution: |
+    Read the spec, then write the three directives:
+
+    ```bash
+    cat /lab/lease-spec.txt
+    cat > /lab/dhcp/dnsmasq.conf <<EOF
+    dhcp-range=POOL_START,POOL_END,LEASE
+    dhcp-option=option:router,ROUTER
+    dhcp-host=RESERVED_MAC,RESERVED_IP
+    EOF
+    dnsmasq --test --conf-file=/lab/dhcp/dnsmasq.conf
+    ```
+  setup: |
+    on_reset 'rm -rf /lab/dhcp /lab/lease-spec.txt'
+    lease=$(printf '%sm' $((( RANDOM % 4 + 1) * 15)))
+    a=$((RANDOM % 40 + 100)); b=$((a + RANDOM % 40 + 10))
+    router=10.60.0.$((RANDOM % 4 + 1))
+    mac=$(printf '02:00:00:%02x:%02x:%02x' $((RANDOM%256)) $((RANDOM%256)) $((RANDOM%256)))
+    rip=10.60.0.$((RANDOM % 40 + 200))
+    lab_file /lab/lease-spec.txt <<EOF
+    pool_start=10.60.0.$a
+    pool_end=10.60.0.$b
+    lease=$lease
+    router=$router
+    reserved_mac=$mac
+    reserved_ip=$rip
+    EOF
+    echo "dhcp-range=10.60.0.$a,10.60.0.$b,$lease" > "$KL_STATE/r_range"
+    echo "dhcp-option=option:router,$router" > "$KL_STATE/r_router"
+    echo "dhcp-host=$mac,$rip" > "$KL_STATE/r_host"
+    mkdir -p /lab/dhcp
+    cat >/lab/dhcp/dnsmasq.conf <<'EOF'
+    dhcp-range=10.60.0.10,10.60.0.20,12h
+    dhcp-option=option:router,10.60.0.254
+    EOF
+    chmod 755 /lab/dhcp
+    chown -R "$(lab_user):" /lab/dhcp /lab/lease-spec.txt
+  check: |
+    norm() { tr -d '[:space:]' 2>/dev/null <"$1"; }
+    conf=/lab/dhcp/dnsmasq.conf
+    check "the config is valid" 'dnsmasq --test --conf-file=$conf 2>&1 | grep -q "syntax check OK"'
+    check "the pool and lease match the spec" 'grep -qF "$(norm "$KL_STATE/r_range")" "$conf"'
+    check "the router option matches the spec" 'grep -qF "$(norm "$KL_STATE/r_router")" "$conf"'
+    check "the reservation matches the spec" 'grep -qiF "$(norm "$KL_STATE/r_host")" "$conf"'
+  solve: |
+    spec=/lab/lease-spec.txt
+    get() { grep "^$1=" "$spec" | cut -d= -f2; }
+    cat > /lab/dhcp/dnsmasq.conf <<EOF
+    dhcp-range=$(get pool_start),$(get pool_end),$(get lease)
+    dhcp-option=option:router,$(get router)
+    dhcp-host=$(get reserved_mac),$(get reserved_ip)
+    EOF
+- id: net-035
+  title: Anycast across two servers
+  difficulty: 4
+  kind: build
+  tags: [routing, ecmp, anycast, sysctl, netns]
+  tutorial: |
+    **Concept.** With anycast, several servers share one address and the network sends each connection to one of them. Equal-cost routes choose a next hop by hashing packet fields, and which fields decides whether one client's connections spread out.
+
+    **Read up on:**
+    - `ip route` — multipath routes with several `nexthop` entries
+    - `sysctl net.ipv4.fib_multipath_hash_policy` — which header fields feed the hash
+    - `ip route get ADDR sport N dport M ip_proto tcp` — ask which path a flow would take
+    - `ip netns exec NS sysctl` — the setting is per namespace
+  scenario: |
+    Two servers, **`s1`** and **`s2`**, both own the anycast address **10.99.9.9** and run
+    a web server on port 80 that answers with its name. The client **`cl`** reaches
+    each of them over a separate link, using the source address **10.99.0.1**:
+
+    ```
+              (10.99.1.1)--- (10.99.1.2) s1  [10.99.9.9]
+    cl [10.99.0.1]
+              (10.99.2.1)--- (10.99.2.2) s2  [10.99.9.9]
+    ```
+
+    Today `cl` only has a route to 10.99.9.9 through `s1`. Configure `cl` so that
+    separate connections to the anycast address are spread over **both** servers, as
+    seen from `sudo ip netns exec cl curl -s --interface 10.99.0.1 http://10.99.9.9/`.
+
+    Don't change the servers.
+  hints:
+    - "A single route can list several next hops: `ip route replace PREFIX nexthop via A dev X nexthop via B dev Y`. Keep `src 10.99.0.1` on it."
+    - "Once there are two paths, test with 20 curl runs. If every answer is the same server, the hash does not include the ports yet."
+    - "Look at `net.ipv4.fib_multipath_hash_policy` inside the namespace."
+  solution: |
+    Replace the single route with a two-next-hop route and make the kernel hash the
+    layer-4 ports, so each new connection can take a different path.
+
+    ```bash
+    sudo ip -n cl route replace 10.99.9.9/32 src 10.99.0.1 \
+      nexthop via 10.99.1.2 dev eth0 nexthop via 10.99.2.2 dev eth1
+    sudo ip netns exec cl sysctl -w net.ipv4.fib_multipath_hash_policy=1
+    for i in $(seq 10); do
+      sudo ip netns exec cl curl -s --interface 10.99.0.1 http://10.99.9.9/
+    done
+    ```
+  setup: |
+    on_reset 'systemctl stop kl-any-s1 kl-any-s2 2>/dev/null; systemctl reset-failed kl-any-s1 kl-any-s2 2>/dev/null; rm -rf /srv/kl-any'
+    netns_new cl s1 s2
+    netns_link cl eth0 s1 eth0
+    netns_link cl eth1 s2 eth0
+    ip -n cl addr add 10.99.1.1/24 dev eth0
+    ip -n s1 addr add 10.99.1.2/24 dev eth0
+    ip -n cl addr add 10.99.2.1/24 dev eth1
+    ip -n s2 addr add 10.99.2.2/24 dev eth0
+    ip -n cl addr add 10.99.0.1/32 dev lo
+    for s in s1 s2; do
+      ip -n $s addr add 10.99.9.9/32 dev lo
+      ip netns exec $s sysctl -qw net.ipv4.conf.all.rp_filter=0 net.ipv4.conf.default.rp_filter=0 net.ipv4.conf.eth0.rp_filter=0
+      mkdir -p /srv/kl-any/$s
+      echo "$s" >/srv/kl-any/$s/index.html
+    done
+    chmod -R a+rX /srv/kl-any
+    ip netns exec cl sysctl -qw net.ipv4.conf.all.rp_filter=0 net.ipv4.conf.default.rp_filter=0 net.ipv4.conf.eth0.rp_filter=0 net.ipv4.conf.eth1.rp_filter=0
+    ip -n s1 route add 10.99.0.1/32 via 10.99.1.1
+    ip -n s2 route add 10.99.0.1/32 via 10.99.2.1
+    ip -n cl route add 10.99.9.9/32 src 10.99.0.1 via 10.99.1.2
+    for s in s1 s2; do
+      systemd-run --quiet --unit=kl-any-$s --working-directory=/srv/kl-any/$s ip netns exec $s python3 -m http.server 80 --bind 10.99.9.9
+    done
+    eventually 15 'ip netns exec cl curl -fsS -m2 --interface 10.99.0.1 http://10.99.9.9/'
+  check: |
+    hits() { for i in $(seq 24); do ip netns exec cl curl -s -m2 --interface 10.99.0.1 http://10.99.9.9/ 2>/dev/null; done | sort | uniq -c | awk '{print $2"="$1}' | tr '\n' ' '; }
+    check_eq "the route to the anycast address has two next hops" "$(ip -n cl route show 10.99.9.9 | grep -c nexthop)" 2
+    h=$(hits)
+    check "s1 answers some connections ($h)" 'echo "$h" | grep -Eq "s1=([1-9]|[1-9][0-9])"'
+    check "s2 answers some connections" 'echo "$h" | grep -Eq "s2=([1-9]|[1-9][0-9])"'
+  solve: |
+    sudo ip -n cl route replace 10.99.9.9/32 src 10.99.0.1 nexthop via 10.99.1.2 dev eth0 nexthop via 10.99.2.2 dev eth1
+    sudo ip netns exec cl sysctl -qw net.ipv4.fib_multipath_hash_policy=1

