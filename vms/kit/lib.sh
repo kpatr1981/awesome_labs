@@ -109,6 +109,88 @@ netns_link() {
   ip -n "$3" link set "$4" up
 }
 
+# ---------- FRR router helpers ----------
+# Routers and hosts are FRR containers with no docker network; veth links join them.
+# A restarted container loses its links, so labs must not restart routers.
+FRR_IMAGE=quay.io/frrouting/frr:9.1.0
+# frr_image -> make sure the image exists and survives resets, also on VMs built before
+# the image joined images.txt
+frr_image() {
+  docker image inspect "$FRR_IMAGE" >/dev/null 2>&1 || docker pull -q "$FRR_IMAGE" >/dev/null || return 1
+  local p=$KL_STATE/pristine
+  grep -qxF "$FRR_IMAGE" "$p/image-refs.txt" && return 0
+  docker image inspect -f '{{.Id}}' "$FRR_IMAGE" >>"$p/images.txt"
+  echo "$FRR_IMAGE" >>"$p/image-refs.txt"
+  LC_ALL=C sort -u -o "$p/images.txt" "$p/images.txt"
+  LC_ALL=C sort -u -o "$p/image-refs.txt" "$p/image-refs.txt"
+}
+# frr_start NAME -> create one router container
+frr_start() {
+  docker run -d --name "$1" --hostname "$1" --network none --privileged \
+    --restart no --entrypoint sh "$FRR_IMAGE" -c \
+    "sed -i 's/^ospfd=no/ospfd=yes/;s/^bgpd=no/bgpd=yes/' /etc/frr/daemons; touch /etc/frr/vtysh.conf; exec /sbin/tini -- /usr/lib/frr/docker-start" >/dev/null
+}
+# frr_healthy NAME -> startup finished and every daemon is running
+frr_healthy() {
+  docker logs "$1" 2>&1 | awk '/all daemons up/{u=NR} /state -> down|Forked background/{d=NR} END{exit !(u>d)}' || return 1
+  docker exec "$1" sh -c 'ps -o args | grep -q "[w]atchfrr\.sh" && exit 1; for d in zebra mgmtd bgpd ospfd staticd; do pidof $d >/dev/null || exit 1; done'
+}
+# frr_up NAME... -> start routers with ospfd and bgpd enabled and forwarding on.
+# At boot watchfrr can restart the daemons and lose zebra for good, which leaves a router
+# that accepts configuration and can't route. No links exist yet, so such a router is
+# simply recreated.
+frr_up() {
+  local n round bad
+  frr_image || return 1
+  for n in "$@"; do frr_start "$n"; done
+  for round in 1 2 3 4 5; do
+    for n in "$@"; do eventually 30 "frr_healthy $n" || true; done
+    sleep 5
+    bad=
+    for n in "$@"; do frr_healthy "$n" || bad="$bad $n"; done
+    [ -z "$bad" ] && break
+    echo "frr_up: recreating$bad (round $round)" >&2
+    for n in $bad; do docker rm -f "$n" >/dev/null; frr_start "$n"; done
+  done
+  [ -z "$bad" ] || { echo "routers did not start:$bad" >&2; return 1; }
+  for n in "$@"; do docker exec "$n" sysctl -qw net.ipv4.ip_forward=1; done
+}
+# frr_link A IFA ADDR/LEN B IFB ADDR/LEN -> veth between two containers, addresses optional ("-")
+frr_link() {
+  local a="klv$RANDOM" b="klv$RANDOM" pa pb
+  pa=$(docker inspect -f '{{.State.Pid}}' "$1"); pb=$(docker inspect -f '{{.State.Pid}}' "$4")
+  ip link add "$a" type veth peer name "$b"
+  ip link set "$a" netns "$pa" name "$2"
+  ip link set "$b" netns "$pb" name "$5"
+  [ "$3" != - ] && docker exec "$1" ip addr add "$3" dev "$2"
+  [ "$6" != - ] && docker exec "$4" ip addr add "$6" dev "$5"
+  docker exec "$1" ip link set "$2" up
+  docker exec "$4" ip link set "$5" up
+}
+# frr_gw HOST GATEWAY -> give an end host its default route
+frr_gw() { docker exec "$1" ip route replace default via "$2"; }
+# frr_conf ROUTER <<EOF -> apply vtysh configuration from stdin ("configure terminal" is implied)
+frr_conf() {
+  local conf out rc i
+  conf=$(cat)
+  for i in 1 2 3 4 5; do
+    out=$(printf '%s\n' "$conf" | docker exec -i "$1" sh -c 'cat >/tmp/kl.conf; vtysh -f /tmp/kl.conf' 2>&1); rc=$?
+    if [ "$rc" = 0 ] && ! grep -qE '^% |failure|not running|Can.t' <<<"$out"; then return 0; fi
+    echo "frr_conf $1 attempt $i failed (rc=$rc): $(grep -vE 'sending configuration|\] done|Waiting for children' <<<"$out" | head -5)" >&2
+    sleep 1
+  done
+  return 1
+}
+# frr_json ROUTER 'show ... json' -> run a show command
+frr_json() { docker exec "$1" vtysh -c "$2" 2>/dev/null; }
+# frr_route ROUTER PREFIX -> "protocol interface next-hop" of the selected route, empty if none
+frr_route() {
+  frr_json "$1" "show ip route $2 json" | jq -r --arg p "$2" \
+    '.[$p][]? | select(.selected==true) | "\(.protocol) \(.nexthops[0].interfaceName // "-") \(.nexthops[0].ip // "-")"' 2>/dev/null
+}
+# frr_ping NODE ADDRESS -> one reply within a second
+frr_ping() { docker exec "$1" ping -c1 -W1 "$2" >/dev/null 2>&1; }
+
 # ---------- AWS emulator helper ----------
 # moto_start -> run the emulator on 127.0.0.1:5000 and install an `aws` command
 # that talks to it. The CLI runs in a container that can only see /lab.
