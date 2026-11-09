@@ -5,47 +5,146 @@ order: 12
 exercises:
 
 - id: k8s-221
-  title: Stuck in ContainerCreating
-  difficulty: 2
+  title: Fix a pod that won't run
+  difficulty: 3
   kind: fix
-  tags: [troubleshooting, secret, volumes]
+  tags: [troubleshooting, events, secret, named-ports, init-containers, dns]
   tutorial: |
-    **Concept.** A pod stays in ContainerCreating while the kubelet prepares what the pod needs, such as volumes and secrets. Pod events describe what it is waiting for.
+    **Concept.** A workload that "won't run" can be broken at very different layers, and each layer leaves its evidence in a different place. Work from the symptom to the layer:
+
+    - **Pod never starts (`ContainerCreating`).** The kubelet is preparing what the pod needs, such as volumes and Secrets. Pod *events* say what it is waiting for.
+    - **Pod runs but traffic fails.** A Service's `targetPort` may be a number or the *name* of a container port; a name only works if a container port with exactly that name exists. The Service's endpoints show whether backends are registered.
+    - **Pod stuck in `Init:0/1`.** Init containers must finish before app containers start. If one waits for a dependency at the wrong address or port, the cause is in the init container's own logs.
+    - **Pod runs but resolves nothing.** `dnsPolicy` decides which resolver configuration a pod gets. The default uses cluster DNS, but other policies replace it with settings you provide yourself.
 
     **Read up on:**
     - `kubectl describe pod NAME -n NS` — read the Events at the bottom
     - `kubectl get events -n NS --sort-by=.lastTimestamp` — recent happenings
-    - `kubectl explain pod.spec.containers.env.valueFrom` — how env vars reference Secrets
-    - `kubectl create secret generic --help` — creating secrets from literals
+    - `kubectl explain pod.spec.containers.env.valueFrom` and `kubectl create secret generic --help` — how Secrets are referenced and created
+    - `kubectl get endpoints NAME` / `kubectl describe svc NAME` — whether backends are registered, and the target port
+    - `kubectl explain pod.spec.containers.ports` — the `name` field
+    - `kubectl logs POD -c INIT_NAME` — what an init container is waiting for
+    - `kubectl explain pod.spec` — the DNS-related fields; `kubectl exec POD -- cat /etc/resolv.conf` shows what a pod really uses
   scenario: |
-    The **`mailer`** pod (namespace **`notify`**) has been in `ContainerCreating` for an
-    hour. Find out why and fix it. The SMTP password it expects is **`smtp-pass-42`**
-    (key `password`).
+    The team inherited four broken workloads in namespace **`triage`**. Fix every one.
+    Never change the Services' own definitions or the data they serve; fix what is wrong
+    with the workloads.
+
+    1. The **`mailer`** pod has been in `ContainerCreating` for an hour. The SMTP password
+       it expects is **`smtp-pass-42`** (key `password`).
+    2. The **`catalog`** service has endpoints, but every request fails. The service uses
+       `targetPort: http` and is right; the **deployment** changed after a refactoring.
+    3. The **`web`** pods are stuck in `Init:0/1`. The init container waits for the
+       database service **`cms-db`**, which is up and healthy.
+    4. The **`fetcher`** deployment can't resolve *any* name, not even
+       `kubernetes.default`. Other pods are fine. It should use the normal cluster DNS.
   hints:
-    - "`kubectl describe pod mailer -n notify` → Events: *MountVolume.SetUp failed ... secret ... not found*."
+    - "Start every investigation with `kubectl get pods,svc,endpoints -n triage`, then `kubectl describe` the unhappy object. For `mailer` the Events say *MountVolume.SetUp failed ... secret ... not found*; the Secret name comes from the pod's volume definition."
+    - "`catalog`: compare `kubectl get deploy catalog -n triage -o jsonpath='{.spec.template.spec.containers[0].ports}'` with the service's `targetPort`. `web`: `kubectl logs deploy/web -n triage -c wait-for-db`, then check which port `kubectl get svc cms-db -n triage` really exposes."
+    - "`fetcher`: `kubectl exec deploy/fetcher -n triage -- cat /etc/resolv.conf`, then look at `dnsPolicy` and `dnsConfig` in the pod template. Remember `kubectl patch ... --type=json` for precise edits."
   solution: |
     ```bash
-    kubectl describe pod mailer -n notify | tail -5
-    kubectl create secret generic smtp-credentials -n notify --from-literal=password=smtp-pass-42
+    # 1) mailer: the Secret its volume references does not exist
+    kubectl describe pod mailer -n triage | tail -5
+    kubectl create secret generic smtp-credentials -n triage --from-literal=password=smtp-pass-42
+    # the kubelet retries the mount automatically
+
+    # 2) catalog: the port is named "web", the service wants "http"
+    kubectl get deploy catalog -n triage -o jsonpath='{.spec.template.spec.containers[0].ports}'
+    kubectl patch deploy catalog -n triage --type=json -p '[{"op":"replace","path":"/spec/template/spec/containers/0/ports/0/name","value":"http"}]'
+
+    # 3) web: the init container waits for 3306, the database service exposes 5432
+    kubectl logs deploy/web -n triage -c wait-for-db | tail -2
+    kubectl get svc cms-db -n triage
+    kubectl patch deploy web -n triage --type=json -p '[{"op":"replace","path":"/spec/template/spec/initContainers/0/command/2","value":"until nc -z -w 2 cms-db 5432; do echo waiting for cms-db:5432; sleep 2; done"}]'
+
+    # 4) fetcher: dnsPolicy None with a bogus nameserver
+    kubectl exec deploy/fetcher -n triage -- cat /etc/resolv.conf
+    kubectl patch deploy fetcher -n triage --type=json -p '[{"op":"replace","path":"/spec/template/spec/dnsPolicy","value":"ClusterFirst"},{"op":"remove","path":"/spec/template/spec/dnsConfig"}]'
     ```
-    The kubelet retries the mount automatically.
   setup: |
-    k_ns notify
+    k_ns triage
     kubectl apply -f - >/dev/null <<'EOF'
     apiVersion: v1
     kind: Pod
-    metadata: {name: mailer, namespace: notify}
+    metadata: {name: mailer, namespace: triage}
     spec:
       containers:
       - {name: mailer, image: "busybox:1.37", command: ["sh", "-c", "cat /etc/smtp/password; echo; sleep infinity"], volumeMounts: [{name: smtp, mountPath: /etc/smtp}]}
       volumes: [{name: smtp, secret: {secretName: smtp-credentials}}]
+    ---
+    apiVersion: apps/v1
+    kind: Deployment
+    metadata: {name: catalog, namespace: triage}
+    spec:
+      selector: {matchLabels: {app: catalog}}
+      template:
+        metadata: {labels: {app: catalog}}
+        spec:
+          containers:
+          - name: nginx
+            image: nginx:1.28-alpine
+            ports: [{name: web, containerPort: 80}]
+    ---
+    apiVersion: v1
+    kind: Service
+    metadata: {name: catalog, namespace: triage}
+    spec:
+      selector: {app: catalog}
+      ports: [{port: 80, targetPort: http}]
+    ---
+    apiVersion: apps/v1
+    kind: Deployment
+    metadata: {name: web, namespace: triage}
+    spec:
+      selector: {matchLabels: {app: web}}
+      template:
+        metadata: {labels: {app: web}}
+        spec:
+          initContainers:
+          - name: wait-for-db
+            image: busybox:1.37
+            command: ["sh", "-c", "until nc -z -w 2 cms-db 3306; do echo waiting for cms-db:3306; sleep 2; done"]
+          containers: [{name: web, image: "nginx:1.28-alpine"}]
+    ---
+    apiVersion: apps/v1
+    kind: Deployment
+    metadata: {name: fetcher, namespace: triage}
+    spec:
+      selector: {matchLabels: {app: fetcher}}
+      template:
+        metadata: {labels: {app: fetcher}}
+        spec:
+          dnsPolicy: None
+          dnsConfig:
+            nameservers: ["10.96.0.53"]
+            searches: [triage.svc.cluster.local]
+          containers: [{name: f, image: "busybox:1.37", command: ["sleep", "infinity"]}]
     EOF
+    kubectl -n triage run cms-db --image=postgres:16-alpine --labels=app=cms-db --env=POSTGRES_PASSWORD=pw >/dev/null
+    kubectl -n triage expose pod cms-db --port=5432 >/dev/null
+    kj -n triage svc catalog '{.spec}' > $KL_STATE/answer
   check: |
-    wait_pod notify mailer 90
-    check "mailer is running" 'pod_ready notify mailer'
-    check "it read the password" 'kubectl -n notify logs mailer | grep -q smtp-pass-42'
+    # 1) mailer (only wait once the secret exists; the kubelet retries the mount with a backoff)
+    k_exists -n triage secret smtp-credentials && wait_pod triage mailer 100
+    check "mailer is running" 'pod_ready triage mailer'
+    check "mailer read the password" 'kubectl -n triage logs mailer | grep -q smtp-pass-42'
+    # 2) catalog
+    check "catalog service unchanged" '[ "$(kj -n triage svc catalog "{.spec}")" = "$(cat $KL_STATE/answer)" ]'
+    wait_deploy triage catalog 60
+    check "catalog deployment is ready" 'deploy_ready triage catalog'
+    check "catalog service answers" 'k_curl triage http://catalog | grep -q nginx'
+    # 3) web
+    wait_deploy triage web 60
+    check "web is running" 'deploy_ready triage web'
+    # 4) fetcher
+    wait_deploy triage fetcher 60
+    check "fetcher resolves kubernetes.default" 'eventually 10 "kubectl -n triage exec deploy/fetcher -- nslookup kubernetes.default.svc.cluster.local 2>/dev/null | grep -q \"Address: 10.96.0.1\""'
   solve: |
-    kubectl create secret generic smtp-credentials -n notify --from-literal=password=smtp-pass-42
+    kubectl create secret generic smtp-credentials -n triage --from-literal=password=smtp-pass-42
+    kubectl patch deploy catalog -n triage --type=json -p '[{"op":"replace","path":"/spec/template/spec/containers/0/ports/0/name","value":"http"}]'
+    kubectl patch deploy web -n triage --type=json -p '[{"op":"replace","path":"/spec/template/spec/initContainers/0/command/2","value":"until nc -z -w 2 cms-db 5432; do echo waiting for cms-db:5432; sleep 2; done"}]'
+    kubectl patch deploy fetcher -n triage --type=json -p '[{"op":"replace","path":"/spec/template/spec/dnsPolicy","value":"ClusterFirst"},{"op":"remove","path":"/spec/template/spec/dnsConfig"}]'
 
 - id: k8s-222
   title: command vs args
@@ -140,62 +239,6 @@ exercises:
     check "it keeps sending heartbeats" "[ \$(kubectl -n ops logs $p | grep -c 'heartbeat sent') -ge 2 ] && [ \"\$(restarts ops $p)\" = 0 ]"
   solve: |
     kubectl patch deploy heartbeat -n ops --type=json -p '[{"op":"replace","path":"/spec/template/spec/containers/0/command","value":["sh","-c","while true; do echo heartbeat sent; sleep 10; done"]}]'
-
-- id: k8s-224
-  title: A named port that doesn't exist
-  difficulty: 3
-  kind: fix
-  tags: [troubleshooting, service, named-ports]
-  tutorial: |
-    **Concept.** A Service's `targetPort` can be a number or the name of a container port. A name only works if a container port with exactly that name exists.
-
-    **Read up on:**
-    - `kubectl get endpoints NAME` and `kubectl get endpointslice` — whether backends are registered
-    - `kubectl describe svc NAME` — target port setting
-    - `kubectl explain pod.spec.containers.ports` — the `name` field
-    - `kubectl get deploy NAME -o jsonpath='{.spec.template.spec.containers[*].ports}'` — see what the pods declare
-  scenario: |
-    After a refactoring, the **`catalog`** service (namespace **`store`**) has endpoints
-    but every request fails. The service uses `targetPort: http`.
-
-    Fix it — the service is right, the **deployment** changed.
-  hints:
-    - "`kubectl get deploy catalog -n store -o jsonpath='{.spec.template.spec.containers[0].ports}'`"
-  solution: |
-    ```bash
-    kubectl get deploy catalog -n store -o jsonpath='{.spec.template.spec.containers[0].ports}'   # name: web
-    kubectl patch deploy catalog -n store --type=json -p '[{"op":"replace","path":"/spec/template/spec/containers/0/ports/0/name","value":"http"}]'
-    ```
-  setup: |
-    k_ns store
-    kubectl apply -f - >/dev/null <<'EOF'
-    apiVersion: apps/v1
-    kind: Deployment
-    metadata: {name: catalog, namespace: store}
-    spec:
-      selector: {matchLabels: {app: catalog}}
-      template:
-        metadata: {labels: {app: catalog}}
-        spec:
-          containers:
-          - name: nginx
-            image: nginx:1.28-alpine
-            ports: [{name: web, containerPort: 80}]
-    ---
-    apiVersion: v1
-    kind: Service
-    metadata: {name: catalog, namespace: store}
-    spec:
-      selector: {app: catalog}
-      ports: [{port: 80, targetPort: http}]
-    EOF
-    kj -n store svc catalog '{.spec}' > $KL_STATE/answer
-  check: |
-    check "service unchanged" '[ "$(kj -n store svc catalog "{.spec}")" = "$(cat $KL_STATE/answer)" ]'
-    wait_deploy store catalog 60
-    check "service answers" 'k_curl store http://catalog | grep -q nginx'
-  solve: |
-    kubectl patch deploy catalog -n store --type=json -p '[{"op":"replace","path":"/spec/template/spec/containers/0/ports/0/name","value":"http"}]'
 
 - id: k8s-225
   title: Read-only filesystem, writable /tmp
@@ -317,29 +360,48 @@ exercises:
     done
 
 - id: k8s-227
-  title: The autoscaler scales nothing
-  difficulty: 2
+  title: Why won't it scale or roll out
+  difficulty: 3
   kind: fix
-  tags: [troubleshooting, hpa]
+  tags: [troubleshooting, hpa, resourcequota, rolling-update]
   tutorial: |
-    **Concept.** A HorizontalPodAutoscaler points at a workload through `scaleTargetRef`, naming its kind and name. If the reference does not match a real object, metrics and scaling cannot work.
+    **Concept.** "It won't scale" and "the rollout is stuck" both mean the controllers cannot create or adjust pods, and both are explained by conditions and events on the controller object, not on the pods (there may be no pods to look at).
+
+    - A **HorizontalPodAutoscaler** points at a workload through `scaleTargetRef`, naming its kind and name. If the reference does not match a real object, metrics and scaling cannot work, and `describe hpa` says why.
+    - A **ResourceQuota** counts every pod, including the surge pods of a rolling update. If the quota is fully used, the new ReplicaSet cannot create pods. Events on the ReplicaSet show the quota error, and the update strategy decides how much extra capacity a rollout needs.
 
     **Read up on:**
     - `kubectl describe hpa NAME` — conditions and events explain the failure
     - `kubectl explain hpa.spec.scaleTargetRef` (see also `horizontalpodautoscaler`)
     - `kubectl get deploy -n NS` — compare real names
-    - `kubectl patch --help` or `kubectl edit hpa`
+    - `kubectl describe quota -n NS` — used versus hard
+    - `kubectl describe rs -n NS` — events show quota errors
+    - `kubectl explain deployment.spec.strategy.rollingUpdate` — `maxSurge` and `maxUnavailable`
+    - `kubectl patch --help` or `kubectl edit`
   scenario: |
-    The HPA **`api`** (namespace **`shop`**) shows `<unknown>` and `kubectl describe hpa`
-    complains it can't get the scale of its target. The deployment `api` is fine.
+    Two things are stuck in different namespaces. Fix both.
 
-    Fix the HPA (keep its limits and target).
+    1. The HPA **`api`** (namespace **`shop`**) shows `<unknown>` and `kubectl describe hpa`
+       complains it can't get the scale of its target. The deployment `api` is fine. Fix
+       the HPA and keep its limits (min 2, max 6) and target.
+    2. A rollout of **`api`** (namespace **`team-b`**, 3 replicas) to a new image has been
+       stuck for an hour: no new pod gets created. The namespace has a pod quota of **3**.
+       Get the rollout to finish **without changing the quota** and without downtime
+       beyond one replica.
   hints:
-    - "Compare `spec.scaleTargetRef` with the real deployment."
+    - "`kubectl describe hpa api -n shop` and compare `spec.scaleTargetRef` with `kubectl get deploy -n shop`. For the rollout: `kubectl describe quota -n team-b` and `kubectl describe rs -n team-b` (look for *exceeded quota: pods*)."
+    - "Fix the HPA reference with `kubectl patch hpa api -n shop --type=merge -p ...` (only the wrong field). The default rolling update *surges*: it creates an extra pod first, which the full quota forbids."
+    - "With `maxSurge: 0` and `maxUnavailable: 1` the rollout replaces pods in place, within the quota. The ReplicaSet controller backs off after quota errors, so the rollout may take a minute or two to resume."
   solution: |
     ```bash
+    # 1) the HPA points at a deployment that does not exist
     kubectl get hpa api -n shop -o jsonpath='{.spec.scaleTargetRef}'   # name: api-deployment
     kubectl patch hpa api -n shop --type=merge -p '{"spec":{"scaleTargetRef":{"name":"api"}}}'
+
+    # 2) the default surge needs a 4th pod, but the quota allows 3
+    kubectl describe rs -n team-b | grep -i quota
+    kubectl patch deploy api -n team-b -p '{"spec":{"strategy":{"rollingUpdate":{"maxSurge":0,"maxUnavailable":1}}}}'
+    kubectl rollout status deploy/api -n team-b    # takes a minute or two
     ```
   setup: |
     k_ns shop
@@ -357,13 +419,26 @@ exercises:
       - type: Resource
         resource: {name: cpu, target: {type: Utilization, averageUtilization: 70}}
     EOF
+    k_ns team-b
+    kubectl -n team-b create quota pods --hard=pods=3 >/dev/null
+    kubectl -n team-b create deployment api --image=nginx:1.28-alpine --replicas=3 >/dev/null
+    kubectl -n team-b patch deploy api -p '{"spec":{"strategy":{"rollingUpdate":{"maxSurge":1,"maxUnavailable":0}}}}' >/dev/null
+    kubectl -n team-b rollout status deploy/api --timeout=90s >/dev/null
+    kubectl -n team-b set image deploy/api nginx=nginx:1.29-alpine >/dev/null
   check: |
-    check_eq "target" "$(kj -n shop hpa api '{.spec.scaleTargetRef.name}')" "api"
-    check_eq "limits kept" "$(kj -n shop hpa api '{.spec.minReplicas}-{.spec.maxReplicas}')" "2-6"
-    eventually 60 '[ "$(kj -n shop deploy api "{.spec.replicas}")" -ge 2 ]'
+    # 1) the HPA
+    check_eq "HPA target" "$(kj -n shop hpa api '{.spec.scaleTargetRef.name}')" "api"
+    check_eq "HPA limits kept" "$(kj -n shop hpa api '{.spec.minReplicas}-{.spec.maxReplicas}')" "2-6"
+    [ "$(kj -n shop hpa api '{.spec.scaleTargetRef.name}')" = api ] && eventually 60 '[ "$(kj -n shop deploy api "{.spec.replicas}")" -ge 2 ]'
     check "HPA took over (min 2 replicas applied)" '[ "$(kj -n shop deploy api "{.spec.replicas}")" -ge 2 ]'
+    # 2) the quota-blocked rollout
+    check_eq "quota unchanged" "$(kj -n team-b quota pods '{.spec.hard.pods}')" "3"
+    check "maxUnavailable at most 1" '[ "$(kj -n team-b deploy api "{.spec.strategy.rollingUpdate.maxUnavailable}")" -le 1 ] 2>/dev/null'
+    [ "$(kj -n team-b deploy api "{.spec.strategy.rollingUpdate.maxSurge}")" = 0 ] && eventually 300 'deploy_ready team-b api'
+    check "rollout finished on 1.29" 'deploy_ready team-b api && [ "$(deploy_images team-b api)" = nginx:1.29-alpine ]'
   solve: |
     kubectl patch hpa api -n shop --type=merge -p '{"spec":{"scaleTargetRef":{"name":"api"}}}'
+    kubectl patch deploy api -n team-b -p '{"spec":{"strategy":{"rollingUpdate":{"maxSurge":0,"maxUnavailable":1}}}}'
 
 - id: k8s-228
   title: Downtime on every deploy
@@ -437,72 +512,110 @@ exercises:
     kubectl patch deploy checkout -n shop --type=json -p '[{"op":"replace","path":"/spec/strategy/rollingUpdate/maxUnavailable","value":0},{"op":"add","path":"/spec/template/spec/containers/0/readinessProbe","value":{"httpGet":{"path":"/ready","port":8080},"periodSeconds":2}}]'
 
 - id: k8s-229
-  title: Who restarts the most?
-  difficulty: 2
+  title: Read the signals
+  difficulty: 3
   kind: build
-  tags: [troubleshooting, restarts, jsonpath]
+  tags: [troubleshooting, restarts, events, logs, exec, jsonpath]
   tutorial: |
-    **Concept.** Each container's restart count is stored in the pod status. Comparing across namespaces means pulling structured data out of every pod rather than reading columns by eye.
+    **Concept.** Before you change anything on a sick cluster, read what it is already telling you. Four sources answer most "what happened?" questions:
+
+    - **Restart counts** are stored in each pod's status. Comparing across namespaces means pulling structured data out of every pod rather than reading columns by eye.
+    - **Events** record what happened to objects, with a type, reason and the object involved. They can be filtered server-side by field.
+    - **Previous logs.** When a container crashes, the kubelet starts a new one, and the old instance's logs are kept for a while. The fresh container may log nothing useful; the terminated one holds the evidence.
+    - **Exec.** You can run commands inside a running container and capture their output, or copy files out of it, through the API server.
 
     **Read up on:**
-    - `kubectl get pods -A` — the RESTARTS column
-    - `kubectl get pods -A -o json` and `jq` (`man jq`) — fields under `status.containerStatuses`
+    - `kubectl get pods -A` — the RESTARTS column; `kubectl get pods -A -o json` and `jq` (`man jq`) — fields under `status.containerStatuses`
     - `--sort-by` in `kubectl get --help` — sorting by a JSONPath
-    - `kubectl get -o custom-columns` or `-o jsonpath` as alternatives
+    - `kubectl get events -n NS` and `--field-selector` — filter on fields such as type and reason; `-o jsonpath` for `involvedObject`
+    - `kubectl logs --help` — options for previous instances; `kubectl describe pod` — the Last State section
+    - `kubectl exec --help` and `kubectl cp --help` — running a command, selecting a container, copying files
+    - Shell redirection (`>`) and `grep` to write results to files
   scenario: |
-    Across **all namespaces**, find the pod whose containers have **restarted the most**
-    and write it as `namespace/name` to **`/lab/most-restarts.txt`**.
+    Something is wrong in the cluster and you need four facts, written to files in
+    **`/lab`** (the failing workloads live in namespace **`incident`**, plus whatever else
+    the cluster holds).
+
+    1. Across **all namespaces**, which pod's containers have **restarted the most**?
+       Write it as `namespace/name` to **`/lab/most-restarts.txt`**.
+    2. In namespace **`incident`**, which **object** has a `Warning` event with reason
+       **`FailedMount`**? Write its name to **`/lab/failing-object.txt`**.
+    3. The **`ingestor`** pod (namespace **`incident`**) crashed once. Its *current*
+       container logs nothing useful, but the **previous** instance logged a line starting
+       with `PANIC:`. Write that **whole line** to **`/lab/panic.txt`**.
+    4. The **`legacy-app`** pod (namespace **`incident`**) writes its effective configuration
+       to **`/run/app/effective.conf`** inside its container at start-up. Copy that file to
+       **`/lab/effective.conf`** on the control plane.
   hints:
-    - "`kubectl get pods -A --sort-by='.status.containerStatuses[0].restartCount'`"
+    - "Restarts: `kubectl get pods -A --sort-by='.status.containerStatuses[0].restartCount'`, or `kubectl get pods -A -o json | jq ...`. Events: `kubectl get events -n incident --field-selector type=Warning,reason=FailedMount`."
+    - "The `involvedObject.name` field of the event names the object (use `-o jsonpath='{.items[0].involvedObject.name}'`). The crashed instance's logs: `kubectl logs ingestor -n incident --previous | grep PANIC`."
+    - "For the file: `kubectl exec legacy-app -n incident -- cat /run/app/effective.conf > /lab/effective.conf` (or `kubectl cp incident/legacy-app:/run/app/effective.conf /lab/effective.conf`)."
   solution: |
     ```bash
-    kubectl get pods -A -o json | jq -r '.items[] | "\([.status.containerStatuses[]?.restartCount] | add // 0) \(.metadata.namespace)/\(.metadata.name)"' | sort -n | tail -1 | cut -d' ' -f2 > /lab/most-restarts.txt
-    ```
-  setup: |
-    k_ns flaky
-    kubectl -n flaky run crashy --image=busybox:1.37 -- sh -c 'sleep 2; exit 1' >/dev/null
-    kubectl -n flaky run stable --image=busybox:1.37 -- sleep infinity >/dev/null
-    eventually 90 '[ "$(restarts flaky crashy)" -ge 3 ]'
-  check: |
-    want=$(kubectl get pods -A -o json | jq -r '.items[] | "\([.status.containerStatuses[]?.restartCount] | add // 0) \(.metadata.namespace)/\(.metadata.name)"' | sort -n | tail -1 | cut -d' ' -f2)
-    check_eq "pod with most restarts" "$(tr -d '[:space:]' < /lab/most-restarts.txt 2>/dev/null)" "$want"
-  solve: |
+    # 1) restart leader
     kubectl get pods -A -o json | jq -r '.items[] | "\([.status.containerStatuses[]?.restartCount] | add // 0) \(.metadata.namespace)/\(.metadata.name)"' | sort -n | tail -1 | cut -d' ' -f2 > /lab/most-restarts.txt
 
-- id: k8s-230
-  title: Read the events
-  difficulty: 2
-  kind: build
-  tags: [troubleshooting, events]
-  tutorial: |
-    **Concept.** Kubernetes records what happens to objects as Events with a type, reason and the object involved. Events can be filtered server-side by field.
-
-    **Read up on:**
-    - `kubectl get events -n NS` — lists events
-    - `--field-selector` in `kubectl get --help` — filter on fields such as type and reason
-    - `-o jsonpath` or `-o yaml` — the `involvedObject` field
-    - `kubectl describe` — events for one object
-  scenario: |
-    Something in namespace **`orders`** is failing repeatedly. Using the **events**, find
-    the **name of the object** that has a `Warning` event with reason **`FailedMount`** and
-    write it to **`/lab/failing-object.txt`**.
-  hints:
-    - "`kubectl get events -n orders --field-selector type=Warning,reason=FailedMount`"
-  solution: |
-    ```bash
-    kubectl get events -n orders --field-selector type=Warning,reason=FailedMount \
+    # 2) the object behind the FailedMount event
+    kubectl get events -n incident --field-selector type=Warning,reason=FailedMount \
       -o jsonpath='{.items[0].involvedObject.name}' > /lab/failing-object.txt
+
+    # 3) what the crashed instance said
+    kubectl logs ingestor -n incident --previous | grep PANIC > /lab/panic.txt
+
+    # 4) a file from inside a running container
+    kubectl exec legacy-app -n incident -- cat /run/app/effective.conf > /lab/effective.conf
     ```
   setup: |
-    k_ns orders
-    kubectl -n orders create deployment api --image=traefik/whoami:v1.10 --replicas=2 >/dev/null
-    kubectl -n orders run worker --image=busybox:1.37 --overrides='{"spec":{"containers":[{"name":"w","image":"busybox:1.37","command":["sleep","infinity"],"volumeMounts":[{"name":"c","mountPath":"/c"}]}],"volumes":[{"name":"c","configMap":{"name":"worker-config"}}]}}' >/dev/null
-    kubectl -n orders run broken-image --image=traefik/whoami:v0.0-nope >/dev/null
-    eventually 60 'kubectl get events -n orders --field-selector reason=FailedMount -o name | grep -q .'
+    k_ns incident
+    kubectl -n incident run crashy --image=busybox:1.37 -- sh -c 'sleep 2; exit 1' >/dev/null
+    kubectl -n incident run stable --image=busybox:1.37 -- sleep infinity >/dev/null
+    kubectl -n incident create deployment api --image=traefik/whoami:v1.10 --replicas=2 >/dev/null
+    kubectl -n incident run worker --image=busybox:1.37 --overrides='{"spec":{"containers":[{"name":"w","image":"busybox:1.37","command":["sleep","infinity"],"volumeMounts":[{"name":"c","mountPath":"/c"}]}],"volumes":[{"name":"c","configMap":{"name":"worker-config"}}]}}' >/dev/null
+    kubectl -n incident run broken-image --image=traefik/whoami:v0.0-nope >/dev/null
+    # ingestor crashes exactly once: a counter on an emptyDir survives container restarts
+    code="E$RANDOM"
+    echo "PANIC: offset store corrupted ($code)" > $KL_STATE/panic
+    sed "s/__CODE__/$code/" <<'EOF' | kubectl apply -f - >/dev/null
+    apiVersion: v1
+    kind: Pod
+    metadata: {name: ingestor, namespace: incident}
+    spec:
+      containers:
+      - name: ingestor
+        image: busybox:1.37
+        command: ["sh", "-c"]
+        args:
+        - |
+          n=$(cat /state/n 2>/dev/null || echo 0)
+          echo $((n+1)) > /state/n
+          echo starting
+          if [ "$n" = 0 ]; then
+            sleep 3
+            echo "PANIC: offset store corrupted (__CODE__)"
+            exit 2
+          fi
+          echo recovered
+          sleep infinity
+        volumeMounts: [{name: state, mountPath: /state}]
+      volumes: [{name: state, emptyDir: {}}]
+    EOF
+    v="max_connections=$((RANDOM % 900 + 100))"; echo "$v" > $KL_STATE/conf
+    kubectl -n incident run legacy-app --image=busybox:1.37 -- sh -c "mkdir -p /run/app; echo '$v' > /run/app/effective.conf; sleep infinity" >/dev/null
+    kubectl -n incident wait --for=condition=Ready pod/legacy-app --timeout=60s >/dev/null
+    eventually 60 'kubectl get events -n incident --field-selector reason=FailedMount -o name | grep -q .'
+    eventually 90 '[ "$(restarts incident ingestor)" -ge 1 ]'
+    eventually 120 '[ "$(restarts incident crashy)" -ge 2 ]'
   check: |
-    check_eq "object" "$(tr -d '[:space:]' < /lab/failing-object.txt 2>/dev/null)" "worker"
+    want=$(kubectl get pods -A -o json | jq -r '.items[] | select(.metadata.deletionTimestamp == null) | "\([.status.containerStatuses[]?.restartCount] | add // 0) \(.metadata.namespace)/\(.metadata.name)"' | sort -n | tail -1 | cut -d' ' -f2)
+    check_eq "pod with most restarts" "$(tr -d '[:space:]' < /lab/most-restarts.txt 2>/dev/null)" "$want"
+    check_eq "object with the FailedMount warning" "$(tr -d '[:space:]' < /lab/failing-object.txt 2>/dev/null)" "worker"
+    check_eq "previous-instance PANIC line" "$(head -1 /lab/panic.txt 2>/dev/null)" "$(cat $KL_STATE/panic)"
+    check_eq "effective.conf copied from the container" "$(cat /lab/effective.conf 2>/dev/null)" "$(cat $KL_STATE/conf)"
   solve: |
-    kubectl get events -n orders --field-selector type=Warning,reason=FailedMount -o jsonpath='{.items[0].involvedObject.name}' > /lab/failing-object.txt
+    kubectl get pods -A -o json | jq -r '.items[] | "\([.status.containerStatuses[]?.restartCount] | add // 0) \(.metadata.namespace)/\(.metadata.name)"' | sort -n | tail -1 | cut -d' ' -f2 > /lab/most-restarts.txt
+    kubectl get events -n incident --field-selector type=Warning,reason=FailedMount -o jsonpath='{.items[0].involvedObject.name}' > /lab/failing-object.txt
+    kubectl logs ingestor -n incident --previous | grep PANIC | head -1 > /lab/panic.txt
+    kubectl exec legacy-app -n incident -- cat /run/app/effective.conf > /lab/effective.conf
 
 - id: k8s-231
   title: Permission denied on a mounted script
@@ -560,136 +673,6 @@ exercises:
     kubectl patch cronjob backup -n ops --type=json -p '[{"op":"add","path":"/spec/jobTemplate/spec/template/spec/volumes/0/configMap/defaultMode","value":493}]'
     kubectl create job backup-test --from=cronjob/backup -n ops
 
-- id: k8s-232
-  title: What did it say before it died?
-  difficulty: 2
-  kind: build
-  tags: [troubleshooting, logs, previous]
-  tutorial: |
-    **Concept.** When a container crashes, kubelet starts a new one, and the old instance's logs are kept for a while. You can read the terminated instance rather than the fresh one.
-
-    **Read up on:**
-    - `kubectl logs --help` — options for previous instances
-    - `kubectl describe pod` — the Last State section
-    - `grep` (`man grep`) — filter lines
-    - Shell redirection to write a result to a file
-  scenario: |
-    The **`ingestor`** pod (namespace **`data`**) is in `CrashLoopBackOff`. Its *current*
-    container has just started and logs nothing useful. The **previous** container
-    instance logged a line starting with `PANIC:` before crashing.
-
-    Write that **whole line** to **`/lab/panic.txt`**.
-  hints:
-    - "`kubectl logs POD --previous`"
-  solution: |
-    ```bash
-    kubectl logs ingestor -n data --previous | grep PANIC > /lab/panic.txt
-    ```
-  setup: |
-    k_ns data
-    code="E$RANDOM"
-    echo "PANIC: offset store corrupted ($code)" > $KL_STATE/answer
-    kubectl -n data run ingestor --image=busybox:1.37 -- sh -c "echo starting; sleep 3; echo 'PANIC: offset store corrupted ($code)'; exit 2" >/dev/null
-    eventually 90 '[ "$(restarts data ingestor)" -ge 1 ]'
-  check: |
-    check_eq "panic line" "$(head -1 /lab/panic.txt 2>/dev/null)" "$(cat $KL_STATE/answer)"
-  solve: |
-    for i in 1 2 3 4 5; do kubectl logs ingestor -n data --previous 2>/dev/null | grep PANIC | head -1 > /lab/panic.txt; [ -s /lab/panic.txt ] && break; sleep 2; done
-
-- id: k8s-233
-  title: The init container that waits for the wrong port
-  difficulty: 2
-  kind: fix
-  tags: [troubleshooting, init-containers]
-  tutorial: |
-    **Concept.** Init containers must finish before app containers start. If one waits on a dependency using the wrong address or port, the pod stays in an Init state with the cause visible in the init container's logs.
-
-    **Read up on:**
-    - `kubectl logs POD -c INIT_NAME` — what the init container is waiting for
-    - `kubectl describe pod` — init container states
-    - `kubectl get svc NAME` and `kubectl describe svc` — real ports
-    - `kubectl explain pod.spec.initContainers`
-  scenario: |
-    The **`web`** pods (namespace **`cms`**) are stuck in `Init:0/1`. Their init container
-    waits for the database service **`cms-db`** — which is up and healthy.
-
-    Fix the **deployment**.
-  hints:
-    - "`kubectl logs deploy/web -n cms -c wait-for-db`"
-    - "Which port does the service actually expose?"
-  solution: |
-    ```bash
-    kubectl logs deploy/web -n cms -c wait-for-db | tail -2     # waiting for cms-db:3306
-    kubectl get svc cms-db -n cms                              # 5432/TCP
-    kubectl patch deploy web -n cms --type=json -p '[{"op":"replace","path":"/spec/template/spec/initContainers/0/command/2","value":"until nc -z -w 2 cms-db 5432; do echo waiting for cms-db:5432; sleep 2; done"}]'
-    ```
-  setup: |
-    k_ns cms
-    kubectl -n cms run cms-db --image=postgres:16-alpine --labels=app=cms-db --env=POSTGRES_PASSWORD=pw >/dev/null
-    kubectl -n cms expose pod cms-db --port=5432 >/dev/null
-    kubectl apply -f - >/dev/null <<'EOF'
-    apiVersion: apps/v1
-    kind: Deployment
-    metadata: {name: web, namespace: cms}
-    spec:
-      selector: {matchLabels: {app: web}}
-      template:
-        metadata: {labels: {app: web}}
-        spec:
-          initContainers:
-          - name: wait-for-db
-            image: busybox:1.37
-            command: ["sh", "-c", "until nc -z -w 2 cms-db 3306; do echo waiting for cms-db:3306; sleep 2; done"]
-          containers: [{name: web, image: "nginx:1.28-alpine"}]
-    EOF
-  check: |
-    wait_deploy cms web 90
-    check "web is running" 'deploy_ready cms web'
-  solve: |
-    kubectl patch deploy web -n cms --type=json -p '[{"op":"replace","path":"/spec/template/spec/initContainers/0/command/2","value":"until nc -z -w 2 cms-db 5432; do echo waiting for cms-db:5432; sleep 2; done"}]'
-
-- id: k8s-234
-  title: Quota blocks the rollout
-  difficulty: 3
-  kind: fix
-  tags: [troubleshooting, resourcequota, rolling-update]
-  tutorial: |
-    **Concept.** A ResourceQuota counts every pod, including surge pods during a rolling update. If the quota is fully used, the new ReplicaSet cannot create pods, and the rollout strategy decides how much extra capacity is needed.
-
-    **Read up on:**
-    - `kubectl describe quota -n NS` — used versus hard
-    - `kubectl describe rs -n NS` — events show quota errors
-    - `kubectl explain deployment.spec.strategy.rollingUpdate` — surge and unavailable settings
-  scenario: |
-    A rollout of **`api`** (namespace **`team-b`**, 3 replicas) to a new image has been
-    stuck for an hour: no new pod gets created. The namespace has a pod quota of **3**.
-
-    Get the rollout to finish **without changing the quota** and without downtime beyond
-    one replica.
-  hints:
-    - "`kubectl describe rs -n team-b` → *exceeded quota: pods*."
-    - "The default rolling update *surges* (creates an extra pod first). With `maxSurge: 0, maxUnavailable: 1` it replaces in place."
-  solution: |
-    ```bash
-    kubectl describe rs -n team-b | grep -i quota
-    kubectl patch deploy api -n team-b -p '{"spec":{"strategy":{"rollingUpdate":{"maxSurge":0,"maxUnavailable":1}}}}'
-    kubectl rollout status deploy/api -n team-b    # takes a minute or two: the ReplicaSet controller backs off after quota errors
-    ```
-  setup: |
-    k_ns team-b
-    kubectl -n team-b create quota pods --hard=pods=3 >/dev/null
-    kubectl -n team-b create deployment api --image=nginx:1.28-alpine --replicas=3 >/dev/null
-    kubectl -n team-b patch deploy api -p '{"spec":{"strategy":{"rollingUpdate":{"maxSurge":1,"maxUnavailable":0}}}}' >/dev/null
-    kubectl -n team-b rollout status deploy/api --timeout=90s >/dev/null
-    kubectl -n team-b set image deploy/api nginx=nginx:1.29-alpine >/dev/null
-  check: |
-    check_eq "quota unchanged" "$(kj -n team-b quota pods '{.spec.hard.pods}')" "3"
-    check "maxUnavailable at most 1" '[ "$(kj -n team-b deploy api "{.spec.strategy.rollingUpdate.maxUnavailable}")" -le 1 ] 2>/dev/null'
-    [ "$(kj -n team-b deploy api "{.spec.strategy.rollingUpdate.maxSurge}")" = 0 ] && eventually 300 'deploy_ready team-b api'
-    check "rollout finished on 1.29" 'deploy_ready team-b api && [ "$(deploy_images team-b api)" = nginx:1.29-alpine ]'
-  solve: |
-    kubectl patch deploy api -n team-b -p '{"spec":{"strategy":{"rollingUpdate":{"maxSurge":0,"maxUnavailable":1}}}}'
-
 - id: k8s-235
   title: ConfigMap from another namespace
   difficulty: 2
@@ -734,55 +717,6 @@ exercises:
     check "api is running" 'pod_ready team-c api'
   solve: |
     kubectl get cm shared-tls-config -n platform -o json | jq '.metadata = {name: .metadata.name, namespace: "team-c"}' | kubectl apply -f -
-
-- id: k8s-236
-  title: No DNS servers at all
-  difficulty: 3
-  kind: fix
-  tags: [troubleshooting, dns, dnsPolicy]
-  tutorial: |
-    **Concept.** A pod's dnsPolicy decides which resolver configuration it gets. The default uses the cluster DNS, but other policies can replace it with settings you provide explicitly.
-
-    **Read up on:**
-    - `kubectl explain pod.spec` — look through the DNS-related fields and their documented behavior
-    - `kubectl exec POD -- cat /etc/resolv.conf` — what the pod really uses
-    - `kubectl get deploy NAME -o yaml` — compare with a healthy pod
-  scenario: |
-    The **`fetcher`** deployment (namespace **`crawler`**) can't resolve *any* name, not
-    even `kubernetes.default`. Other pods in the namespace are fine.
-
-    Fix the deployment so it uses the normal cluster DNS.
-  hints:
-    - "`kubectl exec deploy/fetcher -n crawler -- cat /etc/resolv.conf`"
-    - "Look at `dnsPolicy` and `dnsConfig` in the pod template."
-  solution: |
-    ```bash
-    kubectl get deploy fetcher -n crawler -o jsonpath='{.spec.template.spec.dnsPolicy} {.spec.template.spec.dnsConfig}'
-    # dnsPolicy: None with an empty nameserver list
-    kubectl patch deploy fetcher -n crawler --type=json -p '[{"op":"replace","path":"/spec/template/spec/dnsPolicy","value":"ClusterFirst"},{"op":"remove","path":"/spec/template/spec/dnsConfig"}]'
-    ```
-  setup: |
-    k_ns crawler
-    kubectl apply -f - >/dev/null <<'EOF'
-    apiVersion: apps/v1
-    kind: Deployment
-    metadata: {name: fetcher, namespace: crawler}
-    spec:
-      selector: {matchLabels: {app: fetcher}}
-      template:
-        metadata: {labels: {app: fetcher}}
-        spec:
-          dnsPolicy: None
-          dnsConfig:
-            nameservers: ["10.96.0.53"]
-            searches: [crawler.svc.cluster.local]
-          containers: [{name: f, image: "busybox:1.37", command: ["sleep", "infinity"]}]
-    EOF
-  check: |
-    wait_deploy crawler fetcher 60
-    check "fetcher resolves kubernetes.default" 'eventually 10 "kubectl -n crawler exec deploy/fetcher -- nslookup kubernetes.default.svc.cluster.local 2>/dev/null | grep -q \"Address: 10.96.0.1\""'
-  solve: |
-    kubectl patch deploy fetcher -n crawler --type=json -p '[{"op":"replace","path":"/spec/template/spec/dnsPolicy","value":"ClusterFirst"},{"op":"remove","path":"/spec/template/spec/dnsConfig"}]'
 
 - id: k8s-237
   title: Two containers, one port
@@ -869,39 +803,6 @@ exercises:
     check "rollout complete" 'deploy_ready web portal'
   solve: |
     kubectl patch deploy portal -n web --type=json -p '[{"op":"replace","path":"/spec/template/spec/containers/0/imagePullPolicy","value":"Always"}]'
-
-- id: k8s-239
-  title: Exec into a running container
-  difficulty: 1
-  kind: build
-  tags: [exec, debugging]
-  tutorial: |
-    **Concept.** You can run commands inside a running container and capture their output, or copy files out of it. Both work through the API server and need the pod and container names.
-
-    **Read up on:**
-    - `kubectl exec --help` — running a command, selecting a container
-    - `kubectl cp --help` — copying files (needs `tar` in the image)
-    - Shell redirection (`>`) — save output locally
-    - `kubectl get pod NAME -o yaml` — container names
-  scenario: |
-    The **`legacy-app`** pod (namespace **`legacy`**) writes its effective configuration to
-    **`/run/app/effective.conf`** inside its container at start-up. Copy that file to
-    **`/lab/effective.conf`** on the control plane.
-  hints:
-    - "`kubectl exec POD -- cat FILE > local-file`, or `kubectl cp NS/POD:PATH LOCAL`."
-  solution: |
-    ```bash
-    kubectl exec legacy-app -n legacy -- cat /run/app/effective.conf > /lab/effective.conf
-    ```
-  setup: |
-    k_ns legacy
-    v="max_connections=$((RANDOM % 900 + 100))"; echo "$v" > $KL_STATE/answer
-    kubectl -n legacy run legacy-app --image=busybox:1.37 -- sh -c "mkdir -p /run/app; echo '$v' > /run/app/effective.conf; sleep infinity" >/dev/null
-    kubectl -n legacy wait --for=condition=Ready pod/legacy-app --timeout=60s >/dev/null
-  check: |
-    check_eq "effective.conf" "$(cat /lab/effective.conf 2>/dev/null)" "$(cat $KL_STATE/answer)"
-  solve: |
-    kubectl exec legacy-app -n legacy -- cat /run/app/effective.conf > /lab/effective.conf
 
 - id: k8s-240
   title: "Incident: the booking platform"

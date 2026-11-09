@@ -5,30 +5,51 @@ order: 15
 exercises:
 
 - id: k8s-281
-  title: Install a chart
-  difficulty: 2
+  title: Install, upgrade, roll back and render a chart
+  difficulty: 3
   kind: build
-  tags: [helm, install]
+  tags: [helm, install, upgrade, rollback, template, uninstall]
   tutorial: |
-    **Concept.** Helm packages Kubernetes manifests as charts, templated by values. Installing creates a release; settings can be overridden at install time, and the chart's defaults live in values.yaml.
+    **Concept.** Helm packages Kubernetes manifests as charts, templated by values. Installing a chart creates a *release*; every install and upgrade is recorded as a numbered *revision*. You can return to an earlier revision (a rollback creates a **new** revision, it does not erase history). `helm template` renders the same manifests locally without touching the cluster, and release status (`deployed`, `failed`, ...) can be used to find and clean up releases that never came up.
 
     **Read up on:**
-    - `helm install --help` — namespaces, `--create-namespace`, value overrides
-    - `cat values.yaml` in the chart — available keys
-    - `helm list -n NS` and `helm status`
-    - `helm get values RELEASE` — what was applied
+    - `helm install --help` — `-n`, `--create-namespace`, `--set key=value`
+    - `cat values.yaml` in the chart, `helm get values RELEASE` — available keys and what was applied
+    - `helm upgrade --help` and `helm history RELEASE` — revisions and their descriptions
+    - `helm rollback --help`; `helm get values RELEASE --revision N`
+    - `helm template --help` — render locally, same flags as install
+    - `helm list --help` — `-A`, `--failed`, `-o json`; `helm uninstall --help`
+    - `jq` and a shell `while read` loop for scripting over JSON
   scenario: |
-    A Helm chart for the team's web app lives in **`/lab/charts/webapp`**. Install it as
-    release **`web`** in namespace **`helm-demo`** (create the namespace through Helm) with
-    **2 replicas**.
+    The team's web app chart lives in **`/lab/charts/webapp`**. Work through the release
+    life cycle:
+
+    1. **Install** it as release **`web`** in namespace **`helm-demo`** (create the namespace
+       through Helm) with **2 replicas**.
+    2. **Upgrade** `web` to image tag **`1.29-alpine`** (keep 2 replicas). QA then rejects the
+       new version.
+    3. **Roll back** to the last good revision using Helm (not kubectl). `web` must end up on
+       `nginx:1.28-alpine` with 2 ready replicas.
+    4. The security team reviews rendered manifests, not charts. Render the chart with release
+       name **`review`** and `replicaCount=4` into **`/lab/rendered.yaml`** — **without
+       installing** anything.
+    5. Across **all namespaces** some other releases are stuck in status **`failed`** and block
+       their teams from reinstalling. **Uninstall every failed release** (and only those; the
+       healthy ones and `web` stay).
   hints:
-    - "`helm install RELEASE CHART -n NS --create-namespace --set key=value`"
-    - "Look at the chart's `values.yaml` to find the right key."
+    - "Install: `helm install web /lab/charts/webapp -n helm-demo --create-namespace --set replicaCount=2`. Upgrade: `helm upgrade web ... --set image.tag=1.29-alpine --set replicaCount=2` (or `--reuse-values`). Then `helm history web -n helm-demo`."
+    - "`helm rollback web 1 -n helm-demo` and `helm template review /lab/charts/webapp --set replicaCount=4 > /lab/rendered.yaml`."
+    - "`helm list -A --failed -o json | jq -r '.[] | \"\\(.name) \\(.namespace)\"'` gives name/namespace pairs to feed `helm uninstall NAME -n NS` in a `while read` loop."
   solution: |
     ```bash
     cat /lab/charts/webapp/values.yaml
     helm install web /lab/charts/webapp -n helm-demo --create-namespace --set replicaCount=2
-    helm list -n helm-demo
+    helm upgrade web /lab/charts/webapp -n helm-demo --set replicaCount=2 --set image.tag=1.29-alpine
+    helm history web -n helm-demo
+    helm rollback web 1 -n helm-demo        # revision 3: Rollback to 1
+    helm template review /lab/charts/webapp --set replicaCount=4 > /lab/rendered.yaml
+    helm list -A --failed
+    helm list -A --failed -o json | jq -r '.[] | "\(.name) \(.namespace)"' | while read n ns; do helm uninstall $n -n $ns; done
     ```
   setup: |
     C=/lab/charts/webapp; mkdir -p $C/templates
@@ -76,68 +97,46 @@ exercises:
       ports: [{port: {{ .Values.service.port }}, targetPort: 80}]
     EOF
     chown -R $(lab_user): /lab/charts
+    # other teams' releases: two healthy, two failed
+    T=/tmp/kl-chart; rm -rf $T; mkdir -p $T/templates
+    cat > $T/Chart.yaml <<'EOF'
+    apiVersion: v2
+    name: tiny
+    version: 0.1.0
+    EOF
+    cat > $T/templates/cm.yaml <<'EOF'
+    apiVersion: v1
+    kind: ConfigMap
+    metadata: {name: "{{ .Release.Name }}-cm"}
+    data: {a: b}
+    EOF
+    for r in "good-a team-a" "good-b team-b"; do set -- $r; helm install $1 $T -n $2 --create-namespace >/dev/null 2>&1; done
+    cat > $T/templates/pod.yaml <<'EOF'
+    apiVersion: v1
+    kind: Pod
+    metadata: {name: "{{ .Release.Name }}-p"}
+    spec: {containers: [{name: c, image: "busybox:1.37-does-not-exist"}]}
+    EOF
+    for r in "bad-a team-a" "bad-c team-c"; do set -- $r; helm install $1 $T -n $2 --create-namespace --wait --timeout 10s >/dev/null 2>&1; done
+    rm -rf $T
+    chown -R $(lab_user): /lab
   check: |
     check "release web is deployed" 'helm status web -n helm-demo -o json 2>/dev/null | jq -e ".info.status == \"deployed\""'
+    check "web was upgraded to 1.29-alpine at revision 2" '[ "$(helm get values web -n helm-demo --revision 2 -o json 2>/dev/null | jq -r .image.tag)" = 1.29-alpine ]'
+    check "rolled back with helm" 'helm history web -n helm-demo -o json 2>/dev/null | jq -e "last | .description | test(\"Rollback\")"'
+    check_eq "image after rollback" "$(deploy_images helm-demo web-webapp)" "nginx:1.28-alpine"
     wait_deploy helm-demo web-webapp 90
-    check_eq "2 replicas" "$(kj -n helm-demo deploy web-webapp '{.status.readyReplicas}')" "2"
+    check_eq "2 replicas ready" "$(kj -n helm-demo deploy web-webapp '{.status.readyReplicas}')" "2"
+    check "rendered deployment review-webapp with 4 replicas" 'kubectl apply --dry-run=client -f /lab/rendered.yaml -o json | jq -e "(.items // [.])[] | select(.kind==\"Deployment\" and .metadata.name==\"review-webapp\" and .spec.replicas==4)"'
+    check "review not installed" '[ -z "$(helm list -A -q | grep -x review)" ] && ! kubectl get deploy -A -o name | grep -q review-webapp'
+    check_eq "no failed releases" "$(helm list -A --failed -q | wc -l | tr -d ' ')" "0"
+    check "good releases kept" 'helm status good-a -n team-a >/dev/null && helm status good-b -n team-b >/dev/null'
   solve: |
     helm install web /lab/charts/webapp -n helm-demo --create-namespace --set replicaCount=2
-
-- id: k8s-282
-  title: Upgrade, then roll back
-  difficulty: 3
-  kind: fix
-  tags: [helm, upgrade, rollback]
-  tutorial: |
-    **Concept.** Helm records each install and upgrade as a numbered revision. You can inspect that history and return to an earlier revision, which creates a new revision rather than erasing the bad one.
-
-    **Read up on:**
-    - `helm history --help` — status and description per revision
-    - `helm rollback --help`
-    - `helm get values` / `helm get manifest` — see what each revision set
-    - `kubectl get pods -n NS` — confirm recovery
-  scenario: |
-    The release **`shop`** (namespace **`helm-shop`**, chart `/lab/charts/webapp`) was just
-    upgraded to a broken image tag and its new pods don't start.
-
-    1. Look at the release **history**.
-    2. **Roll back** to the last working revision with Helm (not kubectl).
-  hints:
-    - "`helm history shop -n helm-shop`"
-    - "`helm rollback shop REVISION -n helm-shop`"
-  solution: |
-    ```bash
-    helm history shop -n helm-shop
-    helm rollback shop 1 -n helm-shop
-    helm history shop -n helm-shop     # revision 3: Rollback to 1
-    ```
-  setup: |
-    C=/lab/charts/webapp; mkdir -p $C/templates
-    printf 'apiVersion: v2\nname: webapp\nversion: 1.2.0\n' > $C/Chart.yaml
-    printf 'replicaCount: 2\nimage:\n  repository: nginx\n  tag: 1.28-alpine\n' > $C/values.yaml
-    cat > $C/templates/deployment.yaml <<'EOF'
-    apiVersion: apps/v1
-    kind: Deployment
-    metadata: {name: "{{ .Release.Name }}-webapp"}
-    spec:
-      replicas: {{ .Values.replicaCount }}
-      selector: {matchLabels: {app: "{{ .Release.Name }}"}}
-      template:
-        metadata: {labels: {app: "{{ .Release.Name }}"}}
-        spec:
-          containers:
-          - name: web
-            image: "{{ .Values.image.repository }}:{{ .Values.image.tag }}"
-    EOF
-    chown -R $(lab_user): /lab/charts
-    as_user "helm install shop $C -n helm-shop --create-namespace --wait --timeout 90s && helm upgrade shop $C -n helm-shop --set image.tag=1.28-alpine-broken" >/dev/null 2>&1
-  check: |
-    check_eq "image" "$(deploy_images helm-shop shop-webapp)" "nginx:1.28-alpine"
-    check "rolled back with helm" 'helm history shop -n helm-shop -o json | jq -e "last | .description | test(\"Rollback\")"'
-    wait_deploy helm-shop shop-webapp 90
-    check "shop is healthy" 'deploy_ready helm-shop shop-webapp'
-  solve: |
-    helm rollback shop 1 -n helm-shop
+    helm upgrade web /lab/charts/webapp -n helm-demo --set replicaCount=2 --set image.tag=1.29-alpine
+    helm rollback web 1 -n helm-demo
+    helm template review /lab/charts/webapp --set replicaCount=4 > /lab/rendered.yaml
+    helm list -A --failed -o json | jq -r '.[] | "\(.name) \(.namespace)"' | while read n ns; do helm uninstall $n -n $ns; done
 
 - id: k8s-283
   title: Production values in a file
@@ -206,71 +205,59 @@ exercises:
     printf 'replicaCount: 3\nimage:\n  tag: 1.29-alpine\nservice:\n  port: 8080\n' > /lab/prod-values.yaml
     helm install prod /lab/charts/webapp -n helm-prod --create-namespace -f /lab/prod-values.yaml
 
-- id: k8s-284
-  title: Render without installing
-  difficulty: 1
-  kind: build
-  tags: [helm, template]
-  tutorial: |
-    **Concept.** `helm template` renders a chart locally into plain manifests without contacting the cluster. It takes the same release name and value overrides as install.
-
-    **Read up on:**
-    - `helm template --help` — arguments and `--set`
-    - `--namespace` and `--values` options
-    - Shell redirection to save output
-    - `kubectl apply --dry-run=client -f FILE` — validate
-  scenario: |
-    The security team reviews **rendered manifests**, not charts. Render
-    `/lab/charts/webapp` with release name **`review`** and `replicaCount=4` into
-    **`/lab/rendered.yaml`** — **without installing** anything.
-  hints:
-    - "`helm template RELEASE CHART --set ... > file`"
-  solution: |
-    ```bash
-    helm template review /lab/charts/webapp --set replicaCount=4 > /lab/rendered.yaml
-    ```
-  setup: |
-    C=/lab/charts/webapp; mkdir -p $C/templates
-    printf 'apiVersion: v2\nname: webapp\nversion: 1.2.0\n' > $C/Chart.yaml
-    printf 'replicaCount: 1\n' > $C/values.yaml
-    printf 'apiVersion: apps/v1\nkind: Deployment\nmetadata: {name: "{{ .Release.Name }}-webapp"}\nspec:\n  replicas: {{ .Values.replicaCount }}\n  selector: {matchLabels: {app: x}}\n  template:\n    metadata: {labels: {app: x}}\n    spec: {containers: [{name: w, image: "nginx:1.28-alpine"}]}\n' > $C/templates/deploy.yaml
-    chown -R $(lab_user): /lab/charts
-  check: |
-    check "rendered deployment review-webapp with 4 replicas" 'kubectl apply --dry-run=client -f /lab/rendered.yaml -o json | jq -e "(.items // [.])[] | select(.kind==\"Deployment\" and .metadata.name==\"review-webapp\" and .spec.replicas==4)"'
-    check "nothing installed" '[ -z "$(helm list -A -q | grep -x review)" ] && ! kubectl get deploy -A -o name | grep -q review-webapp'
-  solve: |
-    helm template review /lab/charts/webapp --set replicaCount=4 > /lab/rendered.yaml
-
 - id: k8s-285
-  title: The chart that won't render
-  difficulty: 2
+  title: Fix chart and schema errors
+  difficulty: 3
   kind: fix
-  tags: [helm, templates, troubleshooting]
+  tags: [helm, templates, crd, validation, troubleshooting]
   tutorial: |
-    **Concept.** Helm templates read values using paths like `.Values.x.y`. If a template refers to a key that doesn't exist in values.yaml, rendering fails with a nil pointer error.
+    **Concept.** Two layers reject bad input before anything runs. *Helm templates* read values using paths like `.Values.x.y`; referencing a key that doesn't exist in values.yaml fails rendering with a nil pointer or `required` error. Then the *API server* validates custom resources against the CRD's OpenAPI schema and rejects mismatches with messages naming the exact field. In both cases the error text points at the culprit; the schema (values.yaml, or the CRD) is the source of truth.
 
     **Read up on:**
-    - `helm lint CHART` — static checks with file and line
-    - `helm template CHART` — see the rendering error
+    - `helm lint CHART` and `helm template CHART` — static checks and the rendering error with file/line
     - The chart's `values.yaml` and `templates/` directories
-    - Helm docs: chart template guide, values
+    - `kubectl explain KIND.spec [--recursive]` — field names and types taken from the CRD
+    - `kubectl get crd NAME -o yaml` — the raw schema
+    - `kubectl apply --dry-run=server -f FILE` — validate without creating
+    - Helm docs: chart template guide, values; Kubernetes docs: CustomResourceDefinitions
   scenario: |
-    `helm install metrics /lab/charts/metrics -n monitoring --create-namespace` fails with a
-    template error. Fix the **chart** and install it.
+    Two things are broken.
+
+    1. `helm install metrics /lab/charts/metrics -n monitoring --create-namespace` fails with a
+       template error. Fix the **chart** (not by overriding values on the command line) so it
+       lints cleanly, and install it as release **`metrics`**.
+    2. `kubectl apply -f /lab/certificate.yaml` is rejected by the API server. The CRD
+       (`certificates.pki.example.com`) is correct — fix the **manifest** and apply it.
   hints:
-    - "`helm lint /lab/charts/metrics` and `helm template /lab/charts/metrics` show the exact file and line."
+    - "`helm lint /lab/charts/metrics` and `helm template /lab/charts/metrics` show the exact file and line; compare the key the template reads with the key in `values.yaml`."
+    - "Read the API error: it names the field and the rule. `kubectl explain certificate.spec` shows the types."
+    - "Fix the template to read `.Values.image.version`; in the certificate, `duration` must be an integer (hours) and `dnsNames` is required."
   solution: |
     ```bash
     helm lint /lab/charts/metrics
-    # templates/deployment.yaml: ... nil pointer evaluating interface {}.tag
+    # templates/deployment.yaml: ... image tag required
     # values.yaml uses image.version, the template uses .Values.image.tag
     sed -i 's/.Values.image.tag/.Values.image.version/' /lab/charts/metrics/templates/deployment.yaml
     helm install metrics /lab/charts/metrics -n monitoring --create-namespace
+
+    kubectl apply -f /lab/certificate.yaml
+    # spec.duration: Invalid value: "string" ... must be of type integer; spec.dnsNames: Required value
+    kubectl explain certificate.spec
+    # fix: duration: 2160 (hours, integer) and add dnsNames: [shop.example.com]
+    kubectl apply -f /lab/certificate.yaml
     ```
   setup: |
     C=/lab/charts/metrics; mkdir -p $C/templates
-    printf 'apiVersion: v2\nname: metrics\nversion: 0.3.0\n' > $C/Chart.yaml
-    printf 'image:\n  repository: traefik/whoami\n  version: v1.10\n' > $C/values.yaml
+    cat > $C/Chart.yaml <<'EOF'
+    apiVersion: v2
+    name: metrics
+    version: 0.3.0
+    EOF
+    cat > $C/values.yaml <<'EOF'
+    image:
+      repository: traefik/whoami
+      version: v1.10
+    EOF
     cat > $C/templates/deployment.yaml <<'EOF'
     apiVersion: apps/v1
     kind: Deployment
@@ -285,52 +272,62 @@ exercises:
             image: "{{ .Values.image.repository }}:{{ .Values.image.tag | required "image tag required" }}"
     EOF
     chown -R $(lab_user): /lab/charts
+    on_reset 'kubectl delete crd certificates.pki.example.com --ignore-not-found >/dev/null 2>&1'
+    kubectl apply -f - >/dev/null <<'EOF'
+    apiVersion: apiextensions.k8s.io/v1
+    kind: CustomResourceDefinition
+    metadata: {name: certificates.pki.example.com}
+    spec:
+      group: pki.example.com
+      scope: Namespaced
+      names: {plural: certificates, singular: certificate, kind: Certificate}
+      versions:
+      - name: v1
+        served: true
+        storage: true
+        schema:
+          openAPIV3Schema:
+            type: object
+            properties:
+              spec:
+                type: object
+                required: [dnsNames, duration]
+                properties:
+                  dnsNames: {type: array, minItems: 1, items: {type: string}, description: "Host names in the certificate"}
+                  duration: {type: integer, description: "Validity in hours"}
+                  issuer: {type: string}
+    EOF
+    k_ns pki
+    lab_file /lab/certificate.yaml <<'EOF'
+    apiVersion: pki.example.com/v1
+    kind: Certificate
+    metadata: {name: shop, namespace: pki}
+    spec:
+      commonName: shop.example.com
+      duration: "90d"
+      issuer: internal-ca
+    EOF
   check: |
     check "chart lints" 'helm lint /lab/charts/metrics'
     check "release metrics deployed" 'helm status metrics -n monitoring -o json 2>/dev/null | jq -e ".info.status == \"deployed\""'
     wait_deploy monitoring metrics 60
     check_eq "image" "$(deploy_images monitoring metrics)" "traefik/whoami:v1.10"
+    check "certificate shop exists" 'k_exists -n pki certificates.pki.example.com shop'
+    check "has dnsNames" '[ -n "$(kj -n pki certificates.pki.example.com shop "{.spec.dnsNames[0]}")" ]'
+    check "duration is an integer" '[ "$(kubectl -n pki get certificates.pki.example.com shop -o json | jq -r ".spec.duration | type")" = number ]'
   solve: |
     sed -i 's/.Values.image.tag/.Values.image.version/' /lab/charts/metrics/templates/deployment.yaml
     helm install metrics /lab/charts/metrics -n monitoring --create-namespace
-
-- id: k8s-286
-  title: Clean up failed releases
-  difficulty: 2
-  kind: fix
-  tags: [helm, list, uninstall]
-  tutorial: |
-    **Concept.** Helm releases have a status such as deployed or failed. Listing can be filtered by status across namespaces and output as JSON for scripting.
-
-    **Read up on:**
-    - `helm list --help` — `-A`, `--failed`, `-o json`
-    - `helm uninstall --help` — namespace flag
-    - `jq` (`man jq`) — extract names and namespaces
-    - Shell `while read` loops
-  scenario: |
-    Across all namespaces, some Helm releases are in status **`failed`** and block their
-    teams from reinstalling. **Uninstall every failed release** (and only those).
-  hints:
-    - "`helm list -A --failed`"
-  solution: |
-    ```bash
-    helm list -A --failed
-    helm list -A --failed -o json | jq -r '.[] | "\(.name) \(.namespace)"' | while read n ns; do helm uninstall $n -n $ns; done
-    ```
-  setup: |
-    C=/tmp/kl-chart; rm -rf $C; mkdir -p $C/templates
-    printf 'apiVersion: v2\nname: tiny\nversion: 0.1.0\n' > $C/Chart.yaml
-    printf 'apiVersion: v1\nkind: ConfigMap\nmetadata: {name: "{{ .Release.Name }}-cm"}\ndata: {a: b}\n' > $C/templates/cm.yaml
-    for r in "good-a team-a" "good-b team-b"; do set -- $r; helm install $1 $C -n $2 --create-namespace >/dev/null 2>&1; done
-    printf 'apiVersion: v1\nkind: Pod\nmetadata: {name: "{{ .Release.Name }}-p"}\nspec: {containers: [{name: c, image: "busybox:1.37-does-not-exist"}]}\n' > $C/templates/pod.yaml
-    for r in "bad-a team-a" "bad-c team-c"; do set -- $r; helm install $1 $C -n $2 --create-namespace --wait --timeout 10s >/dev/null 2>&1; done
-    rm -rf $C
-    chown -R $(lab_user): /lab
-  check: |
-    check_eq "no failed releases" "$(helm list -A --failed -q | wc -l | tr -d ' ')" "0"
-    check "good releases kept" 'helm status good-a -n team-a >/dev/null && helm status good-b -n team-b >/dev/null'
-  solve: |
-    helm list -A --failed -o json | jq -r '.[] | "\(.name) \(.namespace)"' | while read n ns; do helm uninstall $n -n $ns; done
+    cat > /lab/certificate.yaml <<'EOF'
+    apiVersion: pki.example.com/v1
+    kind: Certificate
+    metadata: {name: shop, namespace: pki}
+    spec:
+      dnsNames: [shop.example.com]
+      duration: 2160
+      issuer: internal-ca
+    EOF
+    kubectl apply -f /lab/certificate.yaml
 
 - id: k8s-287
   title: Kustomize overlays
@@ -495,45 +492,85 @@ exercises:
     kubectl -n settings rollout status deploy/app --timeout=60s
 
 - id: k8s-289
-  title: Pin images with Kustomize
-  difficulty: 2
+  title: Tailor and inspect manifests
+  difficulty: 3
   kind: build
-  tags: [kustomize, images]
+  tags: [kustomize, images, jsonpath, custom-columns, reporting]
   tutorial: |
-    **Concept.** Kustomize can rewrite image names and tags for resources in the base without editing their files, using a transformer in the kustomization.
+    **Concept.** Kustomize can rewrite image names and tags for resources in a base without editing their files, using the `images` transformer in the kustomization. Once the workload is running, kubectl can print any field as a table column using JSONPath expressions (`-o custom-columns`) and sort by a field, which makes quick inventory reports; column headers come from the names you give.
 
     **Read up on:**
-    - Kubernetes docs: Kustomize, `images` field
-    - `kubectl kustomize DIR` — preview
-    - `kubectl apply -k --help`
-    - `kubectl get deploy -o jsonpath='{.items[*].spec.template.spec.containers[*].image}'`
+    - Kubernetes docs: Kustomize, the `images` field; `kustomize edit set image`
+    - `kubectl kustomize DIR` — preview the result before applying
+    - `kubectl apply -k --help`; `kubectl rollout status`
+    - `kubectl get --help` — `-o custom-columns` and `--sort-by`
+    - Kubernetes docs: kubectl JSONPath support
+    - `kubectl get pod -o yaml` — locate field paths
   scenario: |
-    **`/lab/kustomize/release`** deploys `api` with `nginx:latest` (yikes). Without editing
-    `deployment.yaml`, make the kustomization deploy **`nginx:1.29-alpine`** instead, into
-    namespace **`release`**, and apply it.
+    **`/lab/kustomize/release`** deploys `api` (2 replicas) with an old image,
+    `nginx:1.27-alpine`.
+
+    1. Without editing `deployment.yaml`, make the kustomization deploy **`nginx:1.29-alpine`**
+       instead, into namespace **`release`**, and apply it. Wait until both pods are running.
+    2. Produce an inventory of the pods in namespace **`release`** as
+       **`/lab/inventory.txt`** with **custom columns** `NAME`, `NODE`, `IMAGE` (first
+       container) and `IP`, **sorted by name**, including the header line.
   hints:
-    - "`images: [{name: nginx, newTag: 1.29-alpine}]` in kustomization.yaml, or `kustomize edit set image`."
+    - "`images: [{name: nginx, newTag: 1.29-alpine}]` in kustomization.yaml, or `kustomize edit set image`; apply with `kubectl apply -k /lab/kustomize/release`."
+    - "`kubectl rollout status deploy/api -n release` before reporting, so every pod has an IP."
+    - "`kubectl get pods -n release --sort-by=.metadata.name -o custom-columns=NAME:.metadata.name,NODE:.spec.nodeName,IMAGE:.spec.containers[0].image,IP:.status.podIP > /lab/inventory.txt`"
   solution: |
     ```yaml
+    # kustomization.yaml
     images:
     - name: nginx
       newTag: 1.29-alpine
     ```
+    ```bash
+    kubectl kustomize /lab/kustomize/release
+    kubectl apply -k /lab/kustomize/release
+    kubectl rollout status deploy/api -n release
+    kubectl get pods -n release --sort-by=.metadata.name \
+      -o custom-columns=NAME:.metadata.name,NODE:.spec.nodeName,IMAGE:.spec.containers[0].image,IP:.status.podIP \
+      > /lab/inventory.txt
+    ```
   setup: |
     k_ns release
     D=/lab/kustomize/release; mkdir -p $D
-    printf 'apiVersion: apps/v1\nkind: Deployment\nmetadata: {name: api}\nspec:\n  selector: {matchLabels: {app: api}}\n  template:\n    metadata: {labels: {app: api}}\n    spec:\n      containers: [{name: api, image: "nginx:latest"}]\n' > $D/deployment.yaml
-    printf 'apiVersion: kustomize.config.k8s.io/v1beta1\nkind: Kustomization\nnamespace: release\nresources: [deployment.yaml]\n' > $D/kustomization.yaml
+    cat > $D/deployment.yaml <<'EOF'
+    apiVersion: apps/v1
+    kind: Deployment
+    metadata: {name: api}
+    spec:
+      replicas: 2
+      selector: {matchLabels: {app: api}}
+      template:
+        metadata: {labels: {app: api}}
+        spec:
+          containers: [{name: api, image: "nginx:1.27-alpine"}]
+    EOF
+    cat > $D/kustomization.yaml <<'EOF'
+    apiVersion: kustomize.config.k8s.io/v1beta1
+    kind: Kustomization
+    namespace: release
+    resources: [deployment.yaml]
+    EOF
     sha256sum $D/deployment.yaml > $KL_STATE/answer
     chown -R $(lab_user): /lab/kustomize
   check: |
     check "deployment.yaml unchanged" 'sha256sum -c --quiet $KL_STATE/answer'
     check_eq "deployed image" "$(deploy_images release api)" "nginx:1.29-alpine"
-    wait_deploy release api 60
+    wait_deploy release api 90
     check "api running" 'deploy_ready release api'
+    want=$(kubectl get pods -n release -o json 2>/dev/null | jq -r '[.items[] | select(.metadata.deletionTimestamp==null)] | sort_by(.metadata.name)[] | [.metadata.name, .spec.nodeName, .spec.containers[0].image, .status.podIP] | join(" ")')
+    check_eq "report header" "$(head -1 /lab/inventory.txt 2>/dev/null | awk '{print $1,$2,$3,$4}')" "NAME NODE IMAGE IP"
+    check_eq "report rows" "$(tail -n +2 /lab/inventory.txt 2>/dev/null | awk '{print $1,$2,$3,$4}')" "$want"
+    check_eq "report has two rows" "$(tail -n +2 /lab/inventory.txt 2>/dev/null | grep -c .)" "2"
   solve: |
     printf 'images:\n- name: nginx\n  newTag: 1.29-alpine\n' >> /lab/kustomize/release/kustomization.yaml
     kubectl apply -k /lab/kustomize/release
+    kubectl rollout status deploy/api -n release --timeout=90s
+    kubectl get pods -n release --sort-by=.metadata.name -o custom-columns=NAME:.metadata.name,NODE:.spec.nodeName,IMAGE:.spec.containers[0].image,IP:.status.podIP > /lab/inventory.txt
 
 - id: k8s-290
   title: Your own resource type
@@ -631,67 +668,6 @@ exercises:
     metadata: {name: nightly, namespace: ops}
     spec: {schedule: "0 2 * * *"}
     EOF
-
-- id: k8s-291
-  title: Rejected by the schema
-  difficulty: 2
-  kind: fix
-  tags: [crd, validation]
-  tutorial: |
-    **Concept.** The API server validates custom resources against the CRD's schema and rejects mismatches with messages naming fields. The CRD is the source of truth for expected types.
-
-    **Read up on:**
-    - `kubectl explain KIND.spec` — field names and types from the CRD
-    - `kubectl get crd NAME -o yaml` — raw schema
-    - `kubectl apply --dry-run=server -f FILE` — validate
-    - Read the error message for each field path
-  scenario: |
-    `kubectl apply -f /lab/certificate.yaml` is rejected by the API server. The CRD
-    (`certificates.pki.example.com`) is correct — fix the **manifest** and apply it.
-  hints:
-    - "Read the error: it names the field and the rule."
-    - "`kubectl explain certificate.spec --recursive`"
-  solution: |
-    ```bash
-    kubectl apply -f /lab/certificate.yaml
-    # spec.duration: Invalid value: "string" ... must be of type integer; spec.dnsNames: Required value
-    kubectl explain certificate.spec
-    # fix: duration: 2160 (hours, integer) and add dnsNames: [shop.example.com]
-    ```
-  setup: |
-    kubectl apply -f - >/dev/null <<'EOF'
-    apiVersion: apiextensions.k8s.io/v1
-    kind: CustomResourceDefinition
-    metadata: {name: certificates.pki.example.com}
-    spec:
-      group: pki.example.com
-      scope: Namespaced
-      names: {plural: certificates, singular: certificate, kind: Certificate}
-      versions:
-      - name: v1
-        served: true
-        storage: true
-        schema:
-          openAPIV3Schema:
-            type: object
-            properties:
-              spec:
-                type: object
-                required: [dnsNames, duration]
-                properties:
-                  dnsNames: {type: array, minItems: 1, items: {type: string}, description: "Host names in the certificate"}
-                  duration: {type: integer, description: "Validity in hours"}
-                  issuer: {type: string}
-    EOF
-    k_ns pki
-    printf 'apiVersion: pki.example.com/v1\nkind: Certificate\nmetadata: {name: shop, namespace: pki}\nspec:\n  commonName: shop.example.com\n  duration: "90d"\n  issuer: internal-ca\n' | lab_file /lab/certificate.yaml
-  check: |
-    check "certificate shop exists" 'k_exists -n pki certificates.pki.example.com shop'
-    check "has dnsNames" '[ -n "$(kj -n pki certificates.pki.example.com shop "{.spec.dnsNames[0]}")" ]'
-    check "duration is an integer" '[ "$(kubectl -n pki get certificates.pki.example.com shop -o json | jq -r ".spec.duration | type")" = number ]'
-  solve: |
-    printf 'apiVersion: pki.example.com/v1\nkind: Certificate\nmetadata: {name: shop, namespace: pki}\nspec:\n  dnsNames: [shop.example.com]\n  duration: 2160\n  issuer: internal-ca\n' > /lab/certificate.yaml
-    kubectl apply -f /lab/certificate.yaml
 
 - id: k8s-292
   title: Know your API
@@ -959,43 +935,6 @@ exercises:
     kubectl patch deploy api -n patching -p '{"spec":{"template":{"metadata":{"labels":{"team":"core"}}}}}'
     kubectl patch deploy api -n patching --type=merge -p '{"spec":{"revisionHistoryLimit":4}}'
     kubectl patch deploy api -n patching --type=json -p '[{"op":"remove","path":"/spec/template/spec/containers/0/env/0"}]'
-
-- id: k8s-297
-  title: An inventory report
-  difficulty: 2
-  kind: build
-  tags: [custom-columns, jsonpath, reporting]
-  tutorial: |
-    **Concept.** kubectl can print any field as a table column using JSONPath expressions, and sort by a field. Column headers come from the names you give.
-
-    **Read up on:**
-    - `kubectl get --help` — `-o custom-columns` and `--sort-by`
-    - Kubernetes docs: kubectl JSONPath support
-    - `kubectl get pod -o yaml` — locate field paths
-    - Shell redirection
-  scenario: |
-    Produce an inventory of all pods in namespace **`inventory`** as **`/lab/inventory.txt`**
-    with **custom columns** `NAME`, `NODE`, `IMAGE` (first container) and `IP`, **sorted by
-    name**, including the header line.
-  hints:
-    - "`kubectl get pods -o custom-columns=NAME:.metadata.name,NODE:.spec.nodeName,... --sort-by=.metadata.name`"
-  solution: |
-    ```bash
-    kubectl get pods -n inventory --sort-by=.metadata.name \
-      -o custom-columns=NAME:.metadata.name,NODE:.spec.nodeName,IMAGE:.spec.containers[0].image,IP:.status.podIP \
-      > /lab/inventory.txt
-    ```
-  setup: |
-    k_ns inventory
-    for p in "zeta busybox:1.37" "alpha nginx:1.28-alpine" "mid redis:7.4-alpine"; do set -- $p
-      kubectl -n inventory run $1 --image=$2 -- sleep infinity >/dev/null 2>&1 || kubectl -n inventory run $1 --image=$2 >/dev/null
-    done
-    kubectl -n inventory wait --for=condition=Ready pod --all --timeout=60s >/dev/null
-  check: |
-    want=$(kubectl get pods -n inventory --sort-by=.metadata.name -o custom-columns=NAME:.metadata.name,NODE:.spec.nodeName,IMAGE:.spec.containers[0].image,IP:.status.podIP | awk '{print $1,$2,$3,$4}')
-    check_eq "report" "$(awk '{print $1,$2,$3,$4}' /lab/inventory.txt 2>/dev/null)" "$want"
-  solve: |
-    kubectl get pods -n inventory --sort-by=.metadata.name -o custom-columns=NAME:.metadata.name,NODE:.spec.nodeName,IMAGE:.spec.containers[0].image,IP:.status.podIP > /lab/inventory.txt
 
 - id: k8s-298
   title: Talk to the API directly

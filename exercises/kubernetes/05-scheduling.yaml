@@ -5,77 +5,85 @@ order: 5
 exercises:
 
 - id: k8s-081
-  title: Only in the EU zone
-  difficulty: 1
+  title: Steer pods with labels and taints
+  difficulty: 2
   kind: build
-  tags: [nodeselector, labels]
+  tags: [nodeselector, labels, taints, cordon]
   tutorial: |
-    **Concept.** Node labels describe node properties, and a pod's nodeSelector restricts scheduling to nodes carrying matching labels. Both sides must agree exactly. It is the simplest placement control.
+    **Concept.** Three node-level controls decide where a pod may land, and they work in different directions.
+
+    - **Labels + nodeSelector** *attract*: a pod's `nodeSelector` restricts it to nodes carrying matching labels. Both sides must agree exactly (key and value).
+    - **Taints** *repel*: a node taint (key, optional value, effect such as `NoSchedule`) keeps out every pod that has no matching toleration. A leftover taint silently closes a node to ordinary workloads, and the fix belongs on the **node**, not in a toleration on every workload. A taint is removed by repeating its key with a trailing `-`.
+    - **Cordon** marks a node unschedulable: no *new* pods are placed there, but pods that are already running keep running. It is lighter than a drain, which also evicts.
+
+    When a pod is `Pending`, the `FailedScheduling` event lists, per reason, how many nodes were rejected, so read it before touching anything.
 
     **Read up on:**
     - `kubectl label node --help` — adding a label.
-    - `kubectl get nodes --show-labels`.
-    - `kubectl explain pod.spec.nodeSelector`.
-    - `kubectl get pod -o wide` — confirm the node used.
+    - `kubectl get nodes --show-labels` and `kubectl explain pod.spec.nodeSelector`.
+    - `kubectl describe node node01` — Taints and Unschedulable.
+    - `kubectl describe pod` — the FailedScheduling message.
+    - `kubectl taint --help`, `kubectl cordon --help`, `kubectl uncordon --help`.
+    - Docs: "Assign Pods to Nodes", "Taints and Tolerations", "Safely Drain a Node".
   scenario: |
-    For data-residency reasons the **`gdpr-export`** pod may only run on nodes labelled
-    **`zone=eu-1`**.
+    Prepare node01 for a busy week, in three stages.
 
-    1. Label **node01** with `zone=eu-1`.
-    2. Run pod **`gdpr-export`** in namespace **`compliance`** (`busybox:1.37`,
-       `sleep 3600`) that can only be scheduled on such nodes.
+    1. **Clean up last week's maintenance.** Every new pod in the cluster is `Pending`,
+       because someone forgot to clean up on node01. Fix the **node** so the pending
+       **`api`** deployment (namespace **`shop`**) gets scheduled. Do not add
+       tolerations to workloads.
+    2. **Data residency.** The **`gdpr-export`** pod may only run on nodes labelled
+       **`zone=eu-1`**. Label **node01** with `zone=eu-1`, then run pod **`gdpr-export`**
+       in namespace **`compliance`** (`busybox:1.37`, `sleep 3600`) that can only be
+       scheduled on such nodes.
+    3. **Firmware update tonight.** Once `api` and `gdpr-export` are running, make sure
+       **no new pods** get scheduled onto node01, but leave the pods that are already
+       running there alone.
+
+    End state: node01 is labelled, has no leftover maintenance taint, is cordoned, and
+    both workloads are running.
   hints:
-    - "`kubectl label node node01 zone=eu-1`"
-    - "`spec.nodeSelector: {zone: eu-1}`"
+    - "`kubectl describe pod -n shop` shows *had untolerated taint*; `kubectl describe node node01 | grep Taints`, and remove a taint with a trailing `-`."
+    - "`kubectl label node node01 zone=eu-1`, then `spec.nodeSelector: {zone: eu-1}` on the pod."
+    - "Do the cordon last: a cordoned node accepts no new pods, so create `gdpr-export` and let both workloads start first. `kubectl cordon node01`."
   solution: |
     ```bash
+    # 1. find and remove the stale taint
+    kubectl describe node node01 | grep -A2 Taints
+    kubectl taint node node01 maintenance-
+
+    # 2. label the node and pin the pod to it
     kubectl label node node01 zone=eu-1
     kubectl run gdpr-export -n compliance --image=busybox:1.37 \
       --overrides='{"spec":{"nodeSelector":{"zone":"eu-1"}}}' -- sleep 3600
-    ```
-  setup: |
-    k_ns compliance
-  check: |
-    check_eq "node01 label" "$(kj node node01 '{.metadata.labels.zone}')" "eu-1"
-    check_eq "pod nodeSelector" "$(kj -n compliance pod gdpr-export '{.spec.nodeSelector.zone}')" "eu-1"
-    wait_pod compliance gdpr-export 60
-    check "running on node01" '[ "$(kj -n compliance pod gdpr-export "{.spec.nodeName}")" = node01 ] && pod_ready compliance gdpr-export'
-  solve: |
-    kubectl label node node01 zone=eu-1
-    kubectl run gdpr-export -n compliance --image=busybox:1.37 --overrides='{"spec":{"nodeSelector":{"zone":"eu-1"}}}' -- sleep 3600
 
-- id: k8s-082
-  title: Keep new pods off node01
-  difficulty: 1
-  kind: build
-  tags: [cordon]
-  tutorial: |
-    **Concept.** Cordoning marks a node unschedulable so no new pods are placed there, while existing pods keep running. It is a lighter operation than draining.
-
-    **Read up on:**
-    - `kubectl cordon --help` and `kubectl uncordon --help`.
-    - `kubectl get nodes` — status shows SchedulingDisabled.
-    - `kubectl get pods -A -o wide` — see what remains on the node.
-    - Docs: "Safely Drain a Node" — compare cordon and drain.
-  scenario: |
-    node01 is about to get a firmware update tonight. Make sure **no new pods** get
-    scheduled onto it, but **leave the pods that are already running** there alone.
-  hints:
-    - "`kubectl cordon`"
-  solution: |
-    ```bash
+    # 3. once everything runs, cordon (existing pods are untouched)
+    kubectl -n shop rollout status deploy/api
     kubectl cordon node01
     kubectl get nodes      # node01 Ready,SchedulingDisabled
     ```
   setup: |
+    k_ns compliance
     k_ns shop
-    kubectl -n shop create deployment web --image=nginx:1.28-alpine --replicas=2 >/dev/null
-    kubectl -n shop rollout status deploy/web --timeout=90s >/dev/null
-    kubectl -n shop get pods -l app=web -o name | sort > $KL_STATE/answer
+    kubectl taint node node01 maintenance=true:NoSchedule --overwrite >/dev/null
+    kubectl -n shop create deployment api --image=traefik/whoami:v1.10 --replicas=2 >/dev/null
   check: |
+    check_not "maintenance taint removed" 'kubectl get node node01 -o json | jq -e ".spec.taints[]? | select(.key==\"maintenance\")"'
+    check_eq "no tolerations added to api" "$(kj -n shop deploy api '{.spec.template.spec.tolerations}')" ""
+    check_eq "node01 label" "$(kj node node01 '{.metadata.labels.zone}')" "eu-1"
+    check_eq "gdpr-export nodeSelector" "$(kj -n compliance pod gdpr-export '{.spec.nodeSelector.zone}')" "eu-1"
+    wait_deploy shop api 60
+    check "api is running" 'deploy_ready shop api'
+    wait_pod compliance gdpr-export 60
+    check "gdpr-export runs on node01" '[ "$(kj -n compliance pod gdpr-export "{.spec.nodeName}")" = node01 ] && pod_ready compliance gdpr-export'
     check_eq "node01 unschedulable" "$(kj node node01 '{.spec.unschedulable}')" "true"
-    check_eq "running pods untouched" "$(kubectl -n shop get pods -l app=web -o name | sort | tr '\n' ' ')" "$(tr '\n' ' ' < $KL_STATE/answer)"
+    check "running pods were left alone" '[ -z "$(kubectl get pods -n shop -o json | jq -r ".items[] | select(.metadata.deletionTimestamp != null) | .metadata.name")" ] && [ "$(kubectl -n shop get pods -l app=api --field-selector=status.phase=Running -o name | wc -l)" = 2 ]'
   solve: |
+    kubectl taint node node01 maintenance-
+    kubectl label node node01 zone=eu-1
+    kubectl run gdpr-export -n compliance --image=busybox:1.37 --overrides='{"spec":{"nodeSelector":{"zone":"eu-1"}}}' -- sleep 3600
+    kubectl -n shop rollout status deploy/api --timeout=120s
+    kubectl -n compliance wait --for=condition=Ready pod/gdpr-export --timeout=120s
     kubectl cordon node01
 
 - id: k8s-083
@@ -131,45 +139,6 @@ exercises:
       containers:
       - {name: trainer, image: "busybox:1.37", command: ["sleep", "3600"]}
     EOF
-
-- id: k8s-084
-  title: Maintenance is over
-  difficulty: 2
-  kind: fix
-  tags: [taints, pending, troubleshooting]
-  tutorial: |
-    **Concept.** Leftover taints or cordons keep nodes closed to normal pods. The scheduler event lists what blocks placement. Identify and clean up node state rather than adding tolerations everywhere.
-
-    **Read up on:**
-    - `kubectl describe pod` — the FailedScheduling message.
-    - `kubectl describe node` — Taints and Unschedulable.
-    - `kubectl taint --help` — removing a taint uses a trailing character.
-    - `kubectl uncordon --help` — undoing cordon.
-  scenario: |
-    Every new pod in the cluster is `Pending`. Last week's maintenance on node01 finished
-    days ago, but someone forgot to clean up after it.
-
-    Fix the **node** so the pending **`api`** deployment (namespace **`shop`**) gets
-    scheduled. Don't add tolerations to workloads.
-  hints:
-    - "`kubectl describe pod` → *had untolerated taint*."
-    - "`kubectl describe node node01 | grep Taints`; remove a taint with a trailing `-`."
-  solution: |
-    ```bash
-    kubectl describe node node01 | grep -A2 Taints
-    kubectl taint node node01 maintenance-
-    ```
-  setup: |
-    kubectl taint node node01 maintenance=true:NoSchedule --overwrite >/dev/null
-    k_ns shop
-    kubectl -n shop create deployment api --image=traefik/whoami:v1.10 --replicas=2 >/dev/null
-  check: |
-    check_not "maintenance taint removed" 'kubectl get node node01 -o json | jq -e ".spec.taints[]? | select(.key==\"maintenance\")"'
-    check_eq "no tolerations added" "$(kj -n shop deploy api '{.spec.template.spec.tolerations}')" ""
-    wait_deploy shop api 60
-    check "api is running" 'deploy_ready shop api'
-  solve: |
-    kubectl taint node node01 maintenance-
 
 - id: k8s-085
   title: An agent on the control plane
@@ -550,43 +519,133 @@ exercises:
     EOF
 
 - id: k8s-091
-  title: A priority for critical workloads
-  difficulty: 2
-  kind: build
-  tags: [priorityclass]
+  title: Diagnose unschedulable pods
+  difficulty: 3
+  kind: fix
+  tags: [pending, troubleshooting, cordon, node-affinity, scheduler, nodename, priorityclass]
   tutorial: |
-    **Concept.** A PriorityClass gives pods a numeric importance used when scheduling and preemption. A pod references it by name; one class may be marked global default, which you must avoid unless asked.
+    **Concept.** A `Pending` pod is rarely "broken"; something in the scheduling path says no. Learn to read the evidence in order.
+
+    - **FailedScheduling events** list how many nodes were rejected and why: untolerated taints, *unschedulable* (cordoned) nodes, *didn't match Pod's node affinity/selector*, insufficient resources.
+    - A **literal mismatch** (for example `node-01` instead of `node01`) is rejected the same way as a real constraint, so compare the template against `kubectl get nodes --show-labels`.
+    - **No events at all** means no scheduler even looked at the pod. A pod is bound only by the scheduler named in `spec.schedulerName`; if that scheduler isn't running, it waits silently. Many pod fields are immutable, so recreate it with `kubectl replace --force`.
+    - **`spec.nodeName`** assigns a pod straight to a node and skips the scheduler (and taint and capacity checks). Useful for debugging, risky otherwise.
+    - A **PriorityClass** gives pods a numeric importance used for queue order and preemption. A pod names it in `spec.priorityClassName`; avoid `globalDefault: true` unless asked.
 
     **Read up on:**
-    - `kubectl create priorityclass --help`.
-    - `kubectl explain priorityclass` — value, globalDefault, description.
-    - `kubectl explain pod.spec.priorityClassName`.
-    - `kubectl get priorityclass` — compare existing classes.
+    - `kubectl describe pod` — FailedScheduling counts per reason.
+    - `kubectl describe node` and `kubectl get nodes --show-labels`.
+    - `kubectl get pod -o yaml` and `kubectl explain pod.spec` — scan the scheduling fields.
+    - `kubectl get pods -n kube-system` — which schedulers exist.
+    - `kubectl uncordon --help`, `kubectl patch --help`, `kubectl replace --force`.
+    - `kubectl create priorityclass --help`, `kubectl explain pod.spec.nodeName`.
+    - Docs: "Assign Pods to Nodes", "Pod Priority and Preemption".
   scenario: |
-    Create a PriorityClass **`business-critical`** with value **`100000`** and the
-    description `Revenue-generating services`. It must **not** be the cluster default.
+    A handful of workloads cannot start, each for a different reason. Work through
+    them one at a time.
 
-    Then run pod **`checkout`** in namespace **`shop`** (`traefik/whoami:v1.10`) with that
-    priority class.
+    1. **Everything is Pending.** The **`builder`** deployment (namespace **`reports`**)
+       never starts: *0/2 nodes are available: 1 node(s) had untolerated taint
+       {node-role.kubernetes.io/control-plane}, 1 node(s) were unschedulable*. Fix the
+       cluster, not the deployment.
+    2. **A typo.** The **`ingest`** deployment (namespace **`pipeline`**) is supposed
+       to be pinned to node01 by node affinity, but its pods are `Pending`. Fix the
+       **deployment's** scheduling rule (keep it pinned by affinity).
+    3. **A scheduler that doesn't exist.** The pod **`ml-train`** (namespace **`ml`**)
+       has been `Pending` with **no events at all**. Its manifest came from a cluster
+       that ran a custom scheduler. Get it running with the default scheduler.
+    4. **A priority for critical workloads.** Create a PriorityClass
+       **`business-critical`** with value **`100000`** and description
+       `Revenue-generating services`, not the cluster default. Run pod **`checkout`** in
+       namespace **`shop`** (`traefik/whoami:v1.10`) with that priority class.
+    5. **Bypass the scheduler.** While the scheduler is being debugged you need a pod
+       on node01 *now*. Create pod **`emergency-shell`** in namespace **`ops`**
+       (`busybox:1.37`, `sleep 3600`) assigned to node01 **directly in its spec**.
   hints:
-    - "`kubectl create priorityclass NAME --value=... --description=...`"
-    - "`spec.priorityClassName`"
+    - "For stage 1 look at `kubectl get nodes`: *unschedulable* means cordoned. Stages 2 and 3 are still blocked after that: read `kubectl describe pod -n pipeline` and `kubectl get pod ml-train -n ml -o jsonpath='{.spec.schedulerName}'`."
+    - "ingest: compare the affinity value with `kubectl get nodes --show-labels | grep hostname`. ml-train: remove `schedulerName` and `kubectl replace --force -f` the pod JSON. checkout: `kubectl create priorityclass NAME --value=... --description=...` and `spec.priorityClassName`."
+    - "emergency-shell: `spec.nodeName: node01` skips the scheduler, so the kubelet on that node just runs it (e.g. `kubectl run ... --overrides='{\"spec\":{\"nodeName\":\"node01\"}}'`)."
   solution: |
     ```bash
+    # 1. node01 is cordoned
+    kubectl get nodes          # node01 Ready,SchedulingDisabled
+    kubectl uncordon node01
+
+    # 2. node-01 should be node01
+    kubectl patch deploy ingest -n pipeline --type=json -p \
+      '[{"op":"replace","path":"/spec/template/spec/affinity/nodeAffinity/requiredDuringSchedulingIgnoredDuringExecution/nodeSelectorTerms/0/matchExpressions/0/values","value":["node01"]}]'
+
+    # 3. schedulerName: volcano is not running here
+    kubectl get pod ml-train -n ml -o json | jq 'del(.spec.schedulerName)' > /lab/ml-train.json
+    kubectl replace --force -f /lab/ml-train.json
+
+    # 4. priority
     kubectl create priorityclass business-critical --value=100000 --description="Revenue-generating services"
-    kubectl run checkout -n shop --image=traefik/whoami:v1.10 --overrides='{"spec":{"priorityClassName":"business-critical"}}'
-    kubectl get pod checkout -n shop -o jsonpath='{.spec.priority}'
+    kubectl run checkout -n shop --image=traefik/whoami:v1.10 \
+      --overrides='{"spec":{"priorityClassName":"business-critical"}}'
+
+    # 5. nodeName skips the scheduler
+    kubectl run emergency-shell -n ops --image=busybox:1.37 \
+      --overrides='{"spec":{"nodeName":"node01"}}' -- sleep 3600
     ```
   setup: |
-    k_ns shop
+    kubectl cordon node01 >/dev/null
+    k_ns reports; k_ns pipeline; k_ns ml; k_ns shop; k_ns ops
+    kubectl -n reports create deployment builder --image=busybox:1.37 --replicas=2 -- sleep infinity >/dev/null
+    kubectl apply -f - >/dev/null <<'EOF'
+    apiVersion: apps/v1
+    kind: Deployment
+    metadata: {name: ingest, namespace: pipeline}
+    spec:
+      selector: {matchLabels: {app: ingest}}
+      template:
+        metadata: {labels: {app: ingest}}
+        spec:
+          affinity:
+            nodeAffinity:
+              requiredDuringSchedulingIgnoredDuringExecution:
+                nodeSelectorTerms:
+                - matchExpressions:
+                  - {key: kubernetes.io/hostname, operator: In, values: [node-01]}
+          containers: [{name: ingest, image: "busybox:1.37", command: ["sleep", "infinity"]}]
+    ---
+    apiVersion: v1
+    kind: Pod
+    metadata: {name: ml-train, namespace: ml}
+    spec:
+      schedulerName: volcano
+      containers: [{name: train, image: "busybox:1.37", command: ["sleep", "infinity"]}]
+    EOF
   check: |
-    check_eq "value" "$(kj priorityclass business-critical '{.value}')" "100000"
-    check_eq "description" "$(kj priorityclass business-critical '{.description}')" "Revenue-generating services"
+    check_not "node01 schedulable" '[ "$(kj node node01 "{.spec.unschedulable}")" = true ]'
+    wait_deploy reports builder 60
+    check "builder is running" 'deploy_ready reports builder'
+    wait_deploy pipeline ingest 60
+    check "ingest is running" 'deploy_ready pipeline ingest'
+    check_eq "ingest pinned to node01" "$(kubectl -n pipeline get pods -l app=ingest -o json | jq -r '[.items[] | select(.metadata.deletionTimestamp == null) | .spec.nodeName] | unique | join(",")')" "node01"
+    check "ingest is still pinned by node affinity" 'kubectl -n pipeline get deploy ingest -o json | jq -e ".spec.template.spec.affinity.nodeAffinity.requiredDuringSchedulingIgnoredDuringExecution.nodeSelectorTerms[0].matchExpressions[0].values | index(\"node01\")"'
+    sch=$(kj -n ml pod ml-train '{.spec.schedulerName}')
+    check_match "ml-train uses the default scheduler" "$sch" '^(default-scheduler)?$'
+    if [[ -z $sch || $sch = default-scheduler ]]; then wait_pod ml ml-train 60; fi
+    check "ml-train is running" 'pod_ready ml ml-train'
+    check_eq "priority value" "$(kj priorityclass business-critical '{.value}')" "100000"
+    check_eq "priority description" "$(kj priorityclass business-critical '{.description}')" "Revenue-generating services"
     check_not "not global default" '[ "$(kj priorityclass business-critical "{.globalDefault}")" = true ]'
-    check_eq "pod priority" "$(kj -n shop pod checkout '{.spec.priorityClassName} {.spec.priority}')" "business-critical 100000"
+    check_eq "checkout priority" "$(kj -n shop pod checkout '{.spec.priorityClassName} {.spec.priority}')" "business-critical 100000"
+    wait_pod shop checkout 60
+    check "checkout is running" 'pod_ready shop checkout'
+    wait_pod ops emergency-shell 60
+    check_eq "emergency-shell nodeName" "$(kj -n ops pod emergency-shell '{.spec.nodeName}')" "node01"
+    check "emergency-shell bypassed the scheduler" 'k_exists -n ops pod emergency-shell && ! kubectl -n ops get events --field-selector involvedObject.name=emergency-shell,reason=Scheduled -o name | grep -q .'
+    check "emergency-shell is running" 'pod_ready ops emergency-shell'
   solve: |
+    kubectl uncordon node01
+    kubectl patch deploy ingest -n pipeline --type=json -p '[{"op":"replace","path":"/spec/template/spec/affinity/nodeAffinity/requiredDuringSchedulingIgnoredDuringExecution/nodeSelectorTerms/0/matchExpressions/0/values","value":["node01"]}]'
+    kubectl get pod ml-train -n ml -o json | jq 'del(.spec.schedulerName)' > /lab/ml-train.json
+    kubectl replace --force -f /lab/ml-train.json
     kubectl create priorityclass business-critical --value=100000 --description="Revenue-generating services"
     kubectl run checkout -n shop --image=traefik/whoami:v1.10 --overrides='{"spec":{"priorityClassName":"business-critical"}}'
+    kubectl run emergency-shell -n ops --image=busybox:1.37 --overrides='{"spec":{"nodeName":"node01"}}' -- sleep 3600
 
 - id: k8s-092
   title: Make room for what matters
@@ -702,43 +761,6 @@ exercises:
   solve: |
     kubectl drain node01 --ignore-daemonsets --delete-emptydir-data --force --timeout=180s
 
-- id: k8s-094
-  title: Everything is Pending
-  difficulty: 2
-  kind: fix
-  tags: [cordon, pending, troubleshooting]
-  tutorial: |
-    **Concept.** Pending pods list in their event every reason each node was rejected. Reading that message tells you which node-level setting to examine: taints, cordons, labels or capacity.
-
-    **Read up on:**
-    - `kubectl describe pod` — the FailedScheduling counts per reason.
-    - `kubectl describe node` — Taints, Unschedulable, Conditions.
-    - `kubectl get nodes` — status column.
-    - `kubectl uncordon --help` and `kubectl taint --help`.
-  scenario: |
-    New deployments in namespace **`reports`** never start; the pods stay `Pending` with
-    *0/2 nodes are available: 1 node(s) had untolerated taint
-    {node-role.kubernetes.io/control-plane}, 1 node(s) were unschedulable*.
-
-    Fix the cluster so the **`builder`** deployment runs.
-  hints:
-    - "*unschedulable* = cordoned."
-  solution: |
-    ```bash
-    kubectl get nodes          # node01 Ready,SchedulingDisabled
-    kubectl uncordon node01
-    ```
-  setup: |
-    kubectl cordon node01 >/dev/null
-    k_ns reports
-    kubectl -n reports create deployment builder --image=busybox:1.37 --replicas=2 -- sleep infinity >/dev/null
-  check: |
-    check_not "node01 schedulable" '[ "$(kj node node01 "{.spec.unschedulable}")" = true ]'
-    wait_deploy reports builder 60
-    check "builder is running" 'deploy_ready reports builder'
-  solve: |
-    kubectl uncordon node01
-
 - id: k8s-095
   title: How much room is left?
   difficulty: 2
@@ -776,103 +798,6 @@ exercises:
     a=$(kubectl get node node01 -o jsonpath='{.status.allocatable.cpu}'); case $a in *m) a=${a%m};; *) a=$((a*1000));; esac
     echo $a > /lab/node01-allocatable-cpu.txt
     kubectl describe node node01 | awk '/Allocated resources/{f=1} f&&$1=="cpu"{print $2; exit}' | sed 's/m//' > /lab/node01-requested-cpu.txt
-
-- id: k8s-096
-  title: node-01 or node01?
-  difficulty: 2
-  kind: fix
-  tags: [node-affinity, troubleshooting]
-  tutorial: |
-    **Concept.** The scheduler matches a pod's node requirements literally against node labels and names. Spelling and the chosen key matter. Compare what the node actually reports to what the Deployment asks for.
-
-    **Read up on:**
-    - `kubectl describe pod` — read FailedScheduling details.
-    - `kubectl get nodes --show-labels`.
-    - `kubectl get deploy -o yaml` — the scheduling fields in the template.
-    - `kubectl edit deployment` or `kubectl patch` — update the template.
-  scenario: |
-    The **`ingest`** deployment (namespace **`pipeline`**) is supposed to be pinned to
-    node01 but its pods are `Pending`. Fix the **deployment's** scheduling rule.
-  hints:
-    - "`kubectl describe pod -n pipeline` → *didn't match Pod's node affinity/selector*."
-    - "`kubectl get nodes --show-labels | grep hostname`"
-  solution: |
-    ```bash
-    kubectl get deploy ingest -n pipeline -o jsonpath='{.spec.template.spec.affinity}'
-    kubectl patch deploy ingest -n pipeline --type=json -p \
-      '[{"op":"replace","path":"/spec/template/spec/affinity/nodeAffinity/requiredDuringSchedulingIgnoredDuringExecution/nodeSelectorTerms/0/matchExpressions/0/values","value":["node01"]}]'
-    ```
-  setup: |
-    k_ns pipeline
-    kubectl apply -f - >/dev/null <<'EOF'
-    apiVersion: apps/v1
-    kind: Deployment
-    metadata: {name: ingest, namespace: pipeline}
-    spec:
-      selector: {matchLabels: {app: ingest}}
-      template:
-        metadata: {labels: {app: ingest}}
-        spec:
-          affinity:
-            nodeAffinity:
-              requiredDuringSchedulingIgnoredDuringExecution:
-                nodeSelectorTerms:
-                - matchExpressions:
-                  - {key: kubernetes.io/hostname, operator: In, values: [node-01]}
-          containers: [{name: ingest, image: "busybox:1.37", command: ["sleep", "infinity"]}]
-    EOF
-  check: |
-    wait_deploy pipeline ingest 60
-    check "ingest is running" 'deploy_ready pipeline ingest'
-    check_eq "pinned to node01" "$(kubectl -n pipeline get pods -l app=ingest -o jsonpath='{.items[*].spec.nodeName}' | tr ' ' '\n' | sort -u)" "node01"
-  solve: |
-    kubectl patch deploy ingest -n pipeline --type=json -p '[{"op":"replace","path":"/spec/template/spec/affinity/nodeAffinity/requiredDuringSchedulingIgnoredDuringExecution/nodeSelectorTerms/0/matchExpressions/0/values","value":["node01"]}]'
-
-- id: k8s-097
-  title: Waiting for a scheduler that doesn't exist
-  difficulty: 3
-  kind: fix
-  tags: [scheduler, pending, troubleshooting]
-  tutorial: |
-    **Concept.** A pod is bound only by the scheduler it requests. If the requested scheduler isn't running, the pod sits Pending silently with no events. Inspect the pod's spec for scheduling-related fields.
-
-    **Read up on:**
-    - `kubectl get pod -o yaml` — read the full spec.
-    - `kubectl explain pod.spec` — scan the scheduling-related fields.
-    - `kubectl get pods -n kube-system` — which schedulers exist.
-    - `kubectl replace --force -f` — recreate a pod, as many fields are immutable.
-  scenario: |
-    The pod **`ml-train`** (namespace **`ml`**) has been `Pending` for a day — and unlike
-    other pending pods, it has **no events at all**. Its manifest came from a cluster
-    that ran a custom scheduler.
-
-    Get it running on this cluster (the default scheduler is fine).
-  hints:
-    - "No *FailedScheduling* events means no scheduler even looked at it."
-    - "`kubectl get pod ml-train -n ml -o jsonpath='{.spec.schedulerName}'`"
-  solution: |
-    ```bash
-    kubectl get pod ml-train -n ml -o jsonpath='{.spec.schedulerName}'   # volcano
-    kubectl get pod ml-train -n ml -o json | jq 'del(.spec.schedulerName)' > /lab/ml-train.json
-    kubectl replace --force -f /lab/ml-train.json
-    ```
-  setup: |
-    k_ns ml
-    kubectl apply -f - >/dev/null <<'EOF'
-    apiVersion: v1
-    kind: Pod
-    metadata: {name: ml-train, namespace: ml}
-    spec:
-      schedulerName: volcano
-      containers: [{name: train, image: "busybox:1.37", command: ["sleep", "infinity"]}]
-    EOF
-  check: |
-    check_match "default scheduler" "$(kj -n ml pod ml-train '{.spec.schedulerName}')" '^(default-scheduler)?$'
-    wait_pod ml ml-train 60
-    check "ml-train is running" 'pod_ready ml ml-train'
-  solve: |
-    kubectl get pod ml-train -n ml -o json | jq 'del(.spec.schedulerName)' > /lab/ml-train.json
-    kubectl replace --force -f /lab/ml-train.json
 
 - id: k8s-098
   title: Survive a flaky network taint
@@ -931,42 +856,6 @@ exercises:
     kubectl -n telemetry wait --for=condition=Ready pod/collector --timeout=60s
     kubectl taint node node01 network=degraded:NoExecute
     sleep 5
-
-- id: k8s-099
-  title: Pin a pod without the scheduler
-  difficulty: 2
-  kind: build
-  tags: [nodename, scheduler]
-  tutorial: |
-    **Concept.** Setting nodeName in the pod spec assigns it straight to a node, so the scheduler is skipped entirely. This ignores taints and resource checks, so it is for special cases only.
-
-    **Read up on:**
-    - `kubectl explain pod.spec.nodeName`.
-    - Docs: "Assign Pods to Nodes" — nodeName.
-    - `kubectl run --dry-run=client -o yaml` — a base manifest.
-    - `kubectl get pod -o wide` — confirm the node.
-  scenario: |
-    The scheduler is being debugged and you need a pod on **node01** *now*, bypassing the
-    scheduler entirely.
-
-    Create pod **`emergency-shell`** in namespace **`ops`** (`busybox:1.37`,
-    `sleep 3600`) that is assigned to node01 **directly in its spec**.
-  hints:
-    - "`spec.nodeName` skips the scheduler — the kubelet on that node just runs it."
-  solution: |
-    ```bash
-    kubectl run emergency-shell -n ops --image=busybox:1.37 \
-      --overrides='{"spec":{"nodeName":"node01"}}' -- sleep 3600
-    ```
-  setup: |
-    k_ns ops
-  check: |
-    wait_pod ops emergency-shell 60
-    check_eq "nodeName" "$(kj -n ops pod emergency-shell '{.spec.nodeName}')" "node01"
-    check "no scheduling event (bypassed the scheduler)" '! kubectl -n ops get events --field-selector involvedObject.name=emergency-shell,reason=Scheduled -o name | grep -q .'
-    check "running" 'pod_ready ops emergency-shell'
-  solve: |
-    kubectl run emergency-shell -n ops --image=busybox:1.37 --overrides='{"spec":{"nodeName":"node01"}}' -- sleep 3600
 
 - id: k8s-100
   title: "Incident: nothing new can be scheduled"

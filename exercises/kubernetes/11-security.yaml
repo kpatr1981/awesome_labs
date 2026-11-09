@@ -47,38 +47,92 @@ exercises:
     kubectl create rolebinding jane-reads-pods -n shop --role=pod-reader --user=jane
 
 - id: k8s-202
-  title: Node viewers
-  difficulty: 2
+  title: Scope access with RBAC
+  difficulty: 3
   kind: build
-  tags: [rbac, clusterrole, groups]
+  tags: [rbac, clusterrole, rolebinding, resourceNames, serviceaccount, troubleshooting]
   tutorial: |
-    **Concept.** Nodes live outside any namespace, so namespaced Roles cannot cover them. Cluster-scoped resources need a ClusterRole attached with a ClusterRoleBinding, and groups are subjects just like users.
+    **Concept.** RBAC is additive: a Role (namespaced) or ClusterRole (cluster-wide) lists verbs on resources, and a binding attaches it to subjects (users, groups, service accounts). Scope comes from the *binding*: a RoleBinding grants only inside its own namespace, even when it references a ClusterRole; a ClusterRoleBinding grants everywhere, and is the only way to reach cluster-scoped kinds such as nodes. Rules can be narrowed to single objects with `resourceNames`. Separately, a pod acts as the service account named in its pod template, so changing identity means changing the template and rolling out new pods.
 
     **Read up on:**
     - `kubectl api-resources --namespaced=false` — which kinds are cluster-scoped
-    - `kubectl create clusterrole --help` and `kubectl create clusterrolebinding --help` — available flags
-    - `kubectl auth can-i --as --as-group` — test as a member of a group
-    - Kubernetes docs: Using RBAC Authorization, Role vs ClusterRole
+    - `kubectl create clusterrole|clusterrolebinding|role|rolebinding --help` — flags for verbs, resources, `--resource-name`, `--group`, `--serviceaccount`
+    - `kubectl auth can-i VERB RESOURCE[/NAME] --as USER [--as-group G]` and `--as system:serviceaccount:NS:SA` — test any subject without logging in as it
+    - `kubectl get rolebinding -A` and `kubectl describe rolebinding` — find where a binding really lives
+    - `kubectl set serviceaccount --help` and `kubectl rollout status` — change a workload's identity
+    - Kubernetes docs: Using RBAC Authorization (Role vs ClusterRole, referring to resources by name)
   scenario: |
-    Everyone in the group **`sre`** must be able to **view nodes** (`get`, `list`,
-    `watch`) — nodes are cluster-scoped, so a Role won't do.
+    Four access requests landed on your desk. Resolve all of them, always giving the
+    **least** privilege that does the job.
 
-    Create ClusterRole **`node-viewer`** and ClusterRoleBinding **`sre-view-nodes`**.
+    1. **Nodes.** Everyone in the group **`sre`** must be able to `get`, `list` and
+       `watch` **nodes**. Create ClusterRole **`node-viewer`** and ClusterRoleBinding
+       **`sre-view-nodes`**.
+    2. **One secret.** Service account **`backup-agent`** (namespace **`ops`**) must read
+       **exactly one secret**, **`s3-credentials`** — not list secrets, not read
+       `db-root`. Create Role **`read-s3-credentials`** and RoleBinding **`backup-agent`**.
+    3. **Broken binding.** Group **`team-x`** should have the built-in **`edit`** role in
+       namespace **`team-x`**. RoleBinding **`team-x-edit`** exists, but
+       `kubectl auth can-i create pods -n team-x --as dev --as-group team-x` says **no**.
+       Fix it (and leave the group with no rights in `default`).
+    4. **Identity.** The **`reporter`** deployment (namespace **`bi`**) runs as the
+       namespace's `default` service account. Create service account **`reporter`** and
+       switch the deployment to it; the running pods must carry the new account.
   hints:
-    - "`kubectl create clusterrole ... --resource=nodes` and `kubectl create clusterrolebinding ... --group=sre`."
-    - "Test: `kubectl auth can-i list nodes --as someone --as-group sre`."
+    - "Nodes are cluster-scoped, so use `create clusterrole ... --resource=nodes` plus `create clusterrolebinding ... --group=sre`. For the secret, `--resource-name=s3-credentials` restricts the rule, and only `get` makes sense (list/watch cannot be limited by name)."
+    - "`kubectl get rolebinding -A | grep team-x-edit` shows which namespace the binding is in. A RoleBinding only grants permissions in its own namespace, so recreate it where it belongs and delete the stray one."
+    - "`kubectl set serviceaccount deployment/reporter reporter -n bi` changes the template and triggers a rollout. Verify every task with `kubectl auth can-i ... --as ...`."
   solution: |
     ```bash
+    # 1. nodes
     kubectl create clusterrole node-viewer --verb=get,list,watch --resource=nodes
     kubectl create clusterrolebinding sre-view-nodes --clusterrole=node-viewer --group=sre
+
+    # 2. one secret
+    kubectl create role read-s3-credentials -n ops --verb=get --resource=secrets --resource-name=s3-credentials
+    kubectl create rolebinding backup-agent -n ops --role=read-s3-credentials --serviceaccount=ops:backup-agent
+
+    # 3. binding in the wrong namespace (it was in default)
+    kubectl delete rolebinding team-x-edit -n default
+    kubectl create rolebinding team-x-edit -n team-x --clusterrole=edit --group=team-x
+
+    # 4. identity
+    kubectl create serviceaccount reporter -n bi
+    kubectl set serviceaccount deployment/reporter reporter -n bi
     ```
+  setup: |
+    on_reset 'kubectl delete clusterrolebinding sre-view-nodes --ignore-not-found; kubectl delete clusterrole node-viewer --ignore-not-found'
+    k_ns ops
+    kubectl -n ops create serviceaccount backup-agent >/dev/null
+    kubectl -n ops create secret generic s3-credentials --from-literal=key=AKIA... >/dev/null
+    kubectl -n ops create secret generic db-root --from-literal=password=root >/dev/null
+    k_ns team-x
+    kubectl -n default create rolebinding team-x-edit --clusterrole=edit --group=team-x >/dev/null
+    k_ns bi
+    kubectl -n bi create deployment reporter --image=busybox:1.37 -- sleep infinity >/dev/null
   check: |
     check_eq "group sre can list nodes" "$(kubectl auth can-i list nodes --as kim --as-group sre 2>/dev/null)" "yes"
+    check_eq "group sre can watch nodes" "$(kubectl auth can-i watch nodes --as kim --as-group sre 2>/dev/null)" "yes"
     check_eq "group sre cannot delete nodes" "$(kubectl auth can-i delete nodes --as kim --as-group sre 2>/dev/null)" "no"
-    check_eq "others cannot list nodes" "$(kubectl auth can-i list nodes --as kim --as-group devs 2>/dev/null)" "no"
+    check_eq "other groups cannot list nodes" "$(kubectl auth can-i list nodes --as kim --as-group devs 2>/dev/null)" "no"
+    sa=system:serviceaccount:ops:backup-agent
+    check_eq "backup-agent gets s3-credentials" "$(kubectl auth can-i get secret/s3-credentials -n ops --as $sa 2>/dev/null)" "yes"
+    check_eq "backup-agent cannot get db-root" "$(kubectl auth can-i get secret/db-root -n ops --as $sa 2>/dev/null)" "no"
+    check_eq "backup-agent cannot list secrets" "$(kubectl auth can-i list secrets -n ops --as $sa 2>/dev/null)" "no"
+    check_eq "team-x can create pods in team-x" "$(kubectl auth can-i create pods -n team-x --as dev --as-group team-x 2>/dev/null)" "yes"
+    check_eq "team-x has no rights in default" "$(kubectl auth can-i create pods -n default --as dev --as-group team-x 2>/dev/null)" "no"
+    check "SA reporter exists" 'k_exists -n bi sa reporter'
+    wait_deploy bi reporter 60
+    check_eq "reporter pods use the new SA" "$(kubectl -n bi get pods -l app=reporter -o json | jq -r '[.items[] | select(.metadata.deletionTimestamp == null) | .spec.serviceAccountName] | unique | join(",")')" "reporter"
   solve: |
     kubectl create clusterrole node-viewer --verb=get,list,watch --resource=nodes
     kubectl create clusterrolebinding sre-view-nodes --clusterrole=node-viewer --group=sre
+    kubectl create role read-s3-credentials -n ops --verb=get --resource=secrets --resource-name=s3-credentials
+    kubectl create rolebinding backup-agent -n ops --role=read-s3-credentials --serviceaccount=ops:backup-agent
+    kubectl delete rolebinding team-x-edit -n default
+    kubectl create rolebinding team-x-edit -n team-x --clusterrole=edit --group=team-x
+    kubectl create serviceaccount reporter -n bi
+    kubectl set serviceaccount deployment/reporter reporter -n bi
 
 - id: k8s-203
   title: A service account for the CI pipeline
@@ -545,35 +599,50 @@ exercises:
     EOF
 
 - id: k8s-211
-  title: "container has runAsNonRoot and image will run as root"
-  difficulty: 2
-  kind: fix
-  tags: [securitycontext, troubleshooting]
+  title: Enforce Pod Security Standards
+  difficulty: 3
+  kind: build
+  tags: [pod-security-admission, psa, securitycontext, troubleshooting]
   tutorial: |
-    **Concept.** With `runAsNonRoot`, the kubelet must know the numeric user at start time. If the image declares no numeric non-root user, it cannot verify the container is safe and refuses to create it.
+    **Concept.** Pod Security Admission applies the privileged, baseline or restricted standard per namespace via labels `pod-security.kubernetes.io/<mode>=<level>`. The modes are `enforce` (reject), `warn` (print a warning to the client) and `audit` (record it). Enforcement happens at pod creation only: existing pods are not evicted, but any replacement pod a controller creates must comply, so a workload that is not compliant will silently stop being able to scale or roll. The `restricted` level requires, among other things, `runAsNonRoot`, `allowPrivilegeEscalation: false`, dropping all capabilities and a seccomp profile. Separately, the kubelet can only verify `runAsNonRoot` against a numeric uid: an image whose user is root or non-numeric fails with `CreateContainerConfigError`.
 
     **Read up on:**
-    - `kubectl describe pod` — the Events show the CreateContainerConfigError message
-    - `kubectl explain pod.spec.securityContext` and the container-level equivalent — which fields exist
-    - `kubectl patch --help` — patch types for editing nested fields
+    - Kubernetes docs: Pod Security Admission and Pod Security Standards (the restricted checklist)
+    - `kubectl label namespace --help` and `kubectl get ns NAME --show-labels` — set and verify modes
+    - `kubectl run ... --dry-run=server` — test whether the API server would admit a pod
+    - `kubectl describe pod` / `kubectl get events` — CreateContainerConfigError and FailedCreate messages
+    - `kubectl explain pod.spec.securityContext` and `kubectl explain pod.spec.containers.securityContext`
+    - `kubectl patch --help` — editing nested fields
   scenario: |
-    The **`cron-runner`** deployment (namespace **`jobs`**) was hardened with
-    `runAsNonRoot: true`, and now its pods are stuck in `CreateContainerConfigError`.
+    Namespace **`payments`** handles card data. Its **`cron-runner`** deployment was
+    hardened with `runAsNonRoot: true`, and its pods are stuck in
+    `CreateContainerConfigError`.
 
-    Keep `runAsNonRoot` and make the pods start by running the container as uid **1001**.
+    1. Make the pods start by running the container as uid **1001** (keep `runAsNonRoot`).
+    2. Make the namespace **enforce** the **`restricted`** Pod Security Standard (the API
+       server must reject any non-compliant pod) and also **warn** at `restricted`.
+    3. `cron-runner` must still run under the new policy, so its pod template must meet
+       `restricted` too: no privilege escalation, all capabilities dropped, and the
+       `RuntimeDefault` seccomp profile.
   hints:
-    - "`kubectl describe pod` shows the error. The busybox image's default user is root (uid 0)."
+    - "`kubectl describe pod -n payments` shows why the container cannot start: busybox's default user is root (uid 0). Add `runAsUser: 1001` to the pod securityContext."
+    - "The restricted level also needs `seccompProfile.type: RuntimeDefault` (pod or container level), and per container `allowPrivilegeEscalation: false` and `capabilities.drop: [ALL]`."
+    - "Label with `pod-security.kubernetes.io/enforce=restricted` and `.../warn=restricted`. Check with `kubectl run t -n payments --image=nginx:1.28-alpine --dry-run=server` (should be rejected) and make sure the deployment's new pods are admitted."
   solution: |
     ```bash
-    kubectl patch deploy cron-runner -n jobs --type=json -p \
-      '[{"op":"add","path":"/spec/template/spec/securityContext/runAsUser","value":1001}]'
+    kubectl patch deploy cron-runner -n payments -p '{"spec":{"template":{"spec":{
+      "securityContext":{"runAsUser":1001,"seccompProfile":{"type":"RuntimeDefault"}},
+      "containers":[{"name":"runner","securityContext":{"allowPrivilegeEscalation":false,"capabilities":{"drop":["ALL"]}}}]}}}}'
+    kubectl label ns payments pod-security.kubernetes.io/enforce=restricted pod-security.kubernetes.io/warn=restricted
+    kubectl run test -n payments --image=nginx:1.28-alpine --dry-run=server   # rejected
+    kubectl rollout status deploy/cron-runner -n payments
     ```
   setup: |
-    k_ns jobs
+    k_ns payments
     kubectl apply -f - >/dev/null <<'EOF'
     apiVersion: apps/v1
     kind: Deployment
-    metadata: {name: cron-runner, namespace: jobs}
+    metadata: {name: cron-runner, namespace: payments}
     spec:
       selector: {matchLabels: {app: cron-runner}}
       template:
@@ -583,12 +652,21 @@ exercises:
           containers: [{name: runner, image: "busybox:1.37", command: ["sleep", "infinity"]}]
     EOF
   check: |
-    check_eq "runAsNonRoot kept" "$(kj -n jobs deploy cron-runner '{.spec.template.spec.securityContext.runAsNonRoot}')" "true"
-    wait_deploy jobs cron-runner 60
-    check "pods run" 'deploy_ready jobs cron-runner'
-    check_eq "as uid 1001" "$(kubectl -n jobs exec deploy/cron-runner -- id -u 2>/dev/null)" "1001"
+    check_eq "enforce" "$(kj ns payments '{.metadata.labels.pod-security\.kubernetes\.io/enforce}')" "restricted"
+    check_eq "warn" "$(kj ns payments '{.metadata.labels.pod-security\.kubernetes\.io/warn}')" "restricted"
+    check_not "a plain pod is rejected" 'kubectl run kl-psa -n payments --image=nginx:1.28-alpine --dry-run=server'
+    check_eq "runAsNonRoot kept" "$(kj -n payments deploy cron-runner '{.spec.template.spec.securityContext.runAsNonRoot}')" "true"
+    check_eq "no privilege escalation" "$(kj -n payments deploy cron-runner '{.spec.template.spec.containers[0].securityContext.allowPrivilegeEscalation}')" "false"
+    check_eq "capabilities dropped" "$(kj -n payments deploy cron-runner '{.spec.template.spec.containers[0].securityContext.capabilities.drop[0]}')" "ALL"
+    seccomp="$(kj -n payments deploy cron-runner '{.spec.template.spec.securityContext.seccompProfile.type}{.spec.template.spec.containers[0].securityContext.seccompProfile.type}')"
+    check_match "seccomp RuntimeDefault" "$seccomp" "RuntimeDefault"
+    wait_deploy payments cron-runner 60
+    check "pods run" 'deploy_ready payments cron-runner'
+    check_eq "as uid 1001" "$(kubectl -n payments exec deploy/cron-runner -- id -u 2>/dev/null)" "1001"
   solve: |
-    kubectl patch deploy cron-runner -n jobs --type=json -p '[{"op":"add","path":"/spec/template/spec/securityContext/runAsUser","value":1001}]'
+    kubectl patch deploy cron-runner -n payments -p '{"spec":{"template":{"spec":{"securityContext":{"runAsUser":1001,"seccompProfile":{"type":"RuntimeDefault"}},"containers":[{"name":"runner","securityContext":{"allowPrivilegeEscalation":false,"capabilities":{"drop":["ALL"]}}}]}}}}'
+    kubectl label ns payments pod-security.kubernetes.io/enforce=restricted pod-security.kubernetes.io/warn=restricted
+    kubectl rollout status deploy/cron-runner -n payments --timeout=90s
 
 - id: k8s-212
   title: Shared files, shared group
@@ -663,39 +741,6 @@ exercises:
       volumes: [{name: shared, emptyDir: {}}]
     EOF
 
-- id: k8s-213
-  title: Enforce the restricted Pod Security Standard
-  difficulty: 2
-  kind: build
-  tags: [pod-security-admission, psa]
-  tutorial: |
-    **Concept.** Pod Security Admission applies the privileged, baseline or restricted standards per namespace via labels. Each label chooses a mode: enforce rejects, warn prints a warning to the client, and audit records it.
-
-    **Read up on:**
-    - Kubernetes docs: Pod Security Admission and Pod Security Standards
-    - `kubectl label namespace --help` — label syntax
-    - `kubectl run ... --dry-run=server` — test whether the API server would admit a pod
-    - `kubectl get ns NAME --show-labels` — verify which modes are set
-  scenario: |
-    Namespace **`payments`** handles card data. Make the API server **reject** any pod in
-    it that doesn't meet the **`restricted`** Pod Security Standard, and also **warn** on
-    `kubectl apply`. Use the built-in Pod Security Admission (namespace labels).
-  hints:
-    - "`pod-security.kubernetes.io/enforce=restricted` and `pod-security.kubernetes.io/warn=restricted`"
-  solution: |
-    ```bash
-    kubectl label ns payments pod-security.kubernetes.io/enforce=restricted pod-security.kubernetes.io/warn=restricted
-    kubectl run test -n payments --image=nginx:1.28-alpine --dry-run=server   # rejected
-    ```
-  setup: |
-    k_ns payments
-  check: |
-    check_eq "enforce" "$(kj ns payments '{.metadata.labels.pod-security\.kubernetes\.io/enforce}')" "restricted"
-    check_eq "warn" "$(kj ns payments '{.metadata.labels.pod-security\.kubernetes\.io/warn}')" "restricted"
-    check_not "a plain pod is rejected" 'kubectl run kl-psa -n payments --image=nginx:1.28-alpine --dry-run=server'
-  solve: |
-    kubectl label ns payments pod-security.kubernetes.io/enforce=restricted pod-security.kubernetes.io/warn=restricted
-
 - id: k8s-214
   title: Make it pass the baseline policy
   difficulty: 3
@@ -757,46 +802,6 @@ exercises:
   solve: |
     kubectl get deploy metrics-agent -n apps -o json | jq 'del(.spec.template.spec.hostNetwork, .spec.template.spec.hostPID) | .spec.template.spec.containers[0].securityContext.privileged = false | .spec.template.spec.volumes = [{"name":"proc","emptyDir":{}}] | del(.metadata.resourceVersion, .status)' | kubectl apply -f -
 
-- id: k8s-215
-  title: Access to one secret only
-  difficulty: 3
-  kind: build
-  tags: [rbac, resourceNames, least-privilege]
-  tutorial: |
-    **Concept.** RBAC rules can be narrowed to individual named objects with `resourceNames`. Some verbs behave differently when restricted this way, so think about which verbs genuinely work on a single name.
-
-    **Read up on:**
-    - `kubectl explain role.rules` — see `resourceNames`
-    - `kubectl create role --help` — flag for restricting to named resources
-    - `kubectl auth can-i get secret/NAME --as system:serviceaccount:NS:SA` — test one object
-    - Kubernetes docs: Using RBAC Authorization, section on referring to resources by name
-  scenario: |
-    The **`backup-agent`** service account (namespace **`ops`**) must be able to **read
-    exactly one secret**: **`s3-credentials`**. Not list secrets, not read any other.
-
-    Create the Role **`read-s3-credentials`** and its RoleBinding **`backup-agent`**.
-  hints:
-    - "`resourceNames: [s3-credentials]` restricts a rule to named objects."
-    - "`list` and `watch` can't be restricted by name in a meaningful way — don't grant them."
-  solution: |
-    ```bash
-    kubectl create role read-s3-credentials -n ops --verb=get --resource=secrets --resource-name=s3-credentials
-    kubectl create rolebinding backup-agent -n ops --role=read-s3-credentials --serviceaccount=ops:backup-agent
-    ```
-  setup: |
-    k_ns ops
-    kubectl -n ops create serviceaccount backup-agent >/dev/null
-    kubectl -n ops create secret generic s3-credentials --from-literal=key=AKIA... >/dev/null
-    kubectl -n ops create secret generic db-root --from-literal=password=root >/dev/null
-  check: |
-    sa=system:serviceaccount:ops:backup-agent
-    check_eq "get s3-credentials" "$(kubectl auth can-i get secret/s3-credentials -n ops --as $sa)" "yes"
-    check_eq "get db-root" "$(kubectl auth can-i get secret/db-root -n ops --as $sa)" "no"
-    check_eq "list secrets" "$(kubectl auth can-i list secrets -n ops --as $sa)" "no"
-  solve: |
-    kubectl create role read-s3-credentials -n ops --verb=get --resource=secrets --resource-name=s3-credentials
-    kubectl create rolebinding backup-agent -n ops --role=read-s3-credentials --serviceaccount=ops:backup-agent
-
 - id: k8s-216
   title: A token for an external tool
   difficulty: 3
@@ -857,44 +862,6 @@ exercises:
     sleep 3
     kubectl get secret dashboard-token -n monitoring -o jsonpath='{.data.token}' | base64 -d > /lab/dashboard.token
 
-- id: k8s-217
-  title: The binding in the wrong namespace
-  difficulty: 2
-  kind: fix
-  tags: [rbac, rolebinding, troubleshooting]
-  tutorial: |
-    **Concept.** A RoleBinding grants permissions only within the namespace it lives in, regardless of the role it references. A binding that looks right can still be in the wrong place.
-
-    **Read up on:**
-    - `kubectl get rolebinding -A` — find bindings across namespaces
-    - `kubectl describe rolebinding NAME -n NS` — role reference and subjects
-    - `kubectl auth can-i ... --as USER --as-group GROUP` — reproduce the failure
-    - `kubectl create rolebinding --help` — creating with explicit namespace
-  scenario: |
-    The team-x developers (group **`team-x`**) are supposed to have the built-in **`edit`**
-    role in namespace **`team-x`**. Someone created the RoleBinding **`team-x-edit`**, but
-    `kubectl auth can-i create pods -n team-x --as dev --as-group team-x` says **no**.
-
-    Fix it.
-  hints:
-    - "`kubectl get rolebinding -A | grep team-x-edit` — where is it?"
-    - "A RoleBinding only grants permissions in **its own** namespace."
-  solution: |
-    ```bash
-    kubectl get rolebinding -A | grep team-x-edit       # in namespace default!
-    kubectl delete rolebinding team-x-edit -n default
-    kubectl create rolebinding team-x-edit -n team-x --clusterrole=edit --group=team-x
-    ```
-  setup: |
-    k_ns team-x
-    kubectl -n default create rolebinding team-x-edit --clusterrole=edit --group=team-x >/dev/null
-  check: |
-    check_eq "team-x can create pods in team-x" "$(kubectl auth can-i create pods -n team-x --as dev --as-group team-x)" "yes"
-    check_eq "team-x has no rights in default" "$(kubectl auth can-i create pods -n default --as dev --as-group team-x)" "no"
-  solve: |
-    kubectl delete rolebinding team-x-edit -n default
-    kubectl create rolebinding team-x-edit -n team-x --clusterrole=edit --group=team-x
-
 - id: k8s-218
   title: Who has the keys to the cluster?
   difficulty: 2
@@ -931,41 +898,6 @@ exercises:
     check_eq "cluster-admin subjects" "$(grep -v '^\s*$' /lab/cluster-admins.txt 2>/dev/null | sort -u | tr '\n' ' ')" "$want"
   solve: |
     kubectl get clusterrolebindings -o json | jq -r '.items[] | select(.roleRef.name=="cluster-admin") | .subjects[]? | if .kind=="ServiceAccount" then "ServiceAccount:\(.namespace)/\(.name)" else "\(.kind):\(.name)" end' | sort -u > /lab/cluster-admins.txt
-
-- id: k8s-219
-  title: Run pods with a specific service account
-  difficulty: 2
-  kind: build
-  tags: [serviceaccount, deployment]
-  tutorial: |
-    **Concept.** Pods take their service account from the pod template, which is fixed at creation. Changing a Deployment's template triggers a rollout, and only the new pods carry the new identity.
-
-    **Read up on:**
-    - `kubectl create serviceaccount --help`
-    - `kubectl set serviceaccount --help` — update a workload's account
-    - `kubectl rollout status deploy/NAME` — wait for replacement pods
-    - `kubectl get pods -o jsonpath='{.items[*].spec.serviceAccountName}'` — confirm the live pods
-  scenario: |
-    The **`reporter`** deployment (namespace **`bi`**) currently runs with the
-    namespace's `default` service account. Create service account **`reporter`** and
-    switch the deployment to it. The running pods must use the new account.
-  hints:
-    - "`kubectl set serviceaccount deployment/reporter reporter -n bi`"
-  solution: |
-    ```bash
-    kubectl create serviceaccount reporter -n bi
-    kubectl set serviceaccount deployment/reporter reporter -n bi
-    ```
-  setup: |
-    k_ns bi
-    kubectl -n bi create deployment reporter --image=busybox:1.37 -- sleep infinity >/dev/null
-  check: |
-    check "SA reporter exists" 'k_exists -n bi sa reporter'
-    wait_deploy bi reporter 60
-    check_eq "pods use it" "$(kubectl -n bi get pods -l app=reporter -o json | jq -r '[.items[] | select(.metadata.deletionTimestamp == null) | .spec.serviceAccountName] | unique | join(",")')" "reporter"
-  solve: |
-    kubectl create serviceaccount reporter -n bi
-    kubectl set serviceaccount deployment/reporter reporter -n bi
 
 - id: k8s-220
   title: "Incident: the release pipeline lost its permissions"

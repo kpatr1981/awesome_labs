@@ -106,81 +106,78 @@ exercises:
     EOF
 
 - id: k8s-163
-  title: The ingress nobody serves
-  difficulty: 2
+  title: Debug a broken Ingress
+  difficulty: 3
   kind: fix
-  tags: [ingress, ingressclass, troubleshooting]
+  tags: [ingress, ingressclass, service-port, endpoints, troubleshooting]
   tutorial: |
-    **Concept.** The ingress controller only acts on Ingresses assigned to its class. An Ingress that no controller claims is just inert data, no matter how correct its rules look.
+    **Concept.** A request travels through several layers before it reaches a pod, and each layer fails in its own way. Learn to read the symptom:
+
+    - **The controller ignores the Ingress** (no class, wrong class) — Traefik answers its generic **404** and `kubectl get ingress` shows no ADDRESS. An Ingress that no controller claims is inert data.
+    - **The route matches but the backend reference is wrong** — the Ingress names a Service port the Service does not expose, so Traefik has nowhere to send traffic and returns an error page (404/502).
+    - **The route and Service port are fine but the Service has no endpoints** — a **503 "no available server"**. A Service finds pods through its label selector and lists them as endpoints; a selector that matches nothing leaves it empty.
+
+    Work from the outside in: class, then backend reference, then Service, then endpoints, then pods.
 
     **Read up on:**
-    - `kubectl get ingressclass` — the available classes
-    - `kubectl describe ingress NAME` — look at class and events
-    - `kubectl explain ingress.spec.ingressClassName` — what the field means
-    - `kubectl get ingress` — CLASS and ADDRESS columns
+    - `kubectl get ingressclass` and `kubectl explain ingress.spec.ingressClassName` — what the controller serves (there is no default class here)
+    - `kubectl describe ingress NAME` — class, backends and warnings
+    - `kubectl get svc NAME -o yaml` — ports, targetPort and selector
+    - `kubectl get endpointslices -l kubernetes.io/service-name=NAME` — are there endpoints?
+    - `kubectl get pods --show-labels` — what the pods really carry
   scenario: |
-    The Ingress **`blog`** (namespace **`blog`**) exists and looks right, but
-    `curl -H 'Host: blog.example.com' http://node01:30080/` returns **404** from Traefik,
-    and `kubectl get ingress -n blog` shows no ADDRESS.
+    Three small sites share the namespace **`portal`**, each published through its own
+    Ingress and each broken for a different reason. All three Deployments are healthy.
 
-    Fix the Ingress.
+    - **`blog.example.com`** (Ingress `blog`) returns Traefik's 404 and `kubectl get ingress -n portal` shows no ADDRESS.
+    - **`docs.example.com`** (Ingress `docs`) returns an error page although the Service `docs` is healthy.
+    - **`status.example.com`** (Ingress `status`) returns **503 Service Unavailable**.
+
+    Fix all three so every site serves its content through
+    `curl -H 'Host: NAME.example.com' http://node01:30080/`.
+    The `status` **Ingress itself is correct** — do not change it; fix what is behind it.
   hints:
-    - "Which controller is supposed to handle it? `kubectl get ingressclass`"
-    - "This cluster has no *default* IngressClass."
+    - "No default IngressClass exists: an Ingress without `ingressClassName: traefik` is ignored. Compare the backend port in the `docs` Ingress with `kubectl get svc docs -n portal`."
+    - "A 503 from the ingress controller usually means the Service has **no endpoints**: `kubectl get endpointslices -n portal`."
+    - "Compare `kubectl get svc status -n portal -o jsonpath='{.spec.selector}'` with `kubectl get pods -n portal --show-labels`."
   solution: |
     ```bash
-    kubectl get ingress blog -n blog -o jsonpath='{.spec.ingressClassName}'   # (empty)
-    kubectl patch ingress blog -n blog -p '{"spec":{"ingressClassName":"traefik"}}'
+    # blog: no ingress class
+    kubectl patch ingress blog -n portal -p '{"spec":{"ingressClassName":"traefik"}}'
+
+    # docs: Ingress points at port 8080, the Service exposes 80
+    kubectl patch ingress docs -n portal --type=json \
+      -p '[{"op":"replace","path":"/spec/rules/0/http/paths/0/backend/service/port/number","value":80}]'
+
+    # status: Service selector matches no pod (statuspage vs status-page)
+    kubectl get endpointslices -n portal -l kubernetes.io/service-name=status
+    kubectl patch svc status -n portal -p '{"spec":{"selector":{"app":"status-page"}}}'
     ```
   setup: |
-    k_ns blog
-    kubectl -n blog create deployment blog --image=httpd:2.4-alpine >/dev/null
-    kubectl -n blog expose deploy blog --port=80 >/dev/null
-    kubectl -n blog create ingress blog --rule='blog.example.com/*=blog:80' >/dev/null
+    k_ns portal
+    kubectl -n portal create deployment blog --image=httpd:2.4-alpine >/dev/null
+    kubectl -n portal expose deploy blog --port=80 >/dev/null
+    kubectl -n portal create ingress blog --rule='blog.example.com/*=blog:80' >/dev/null
+    kubectl -n portal create deployment docs --image=nginx:1.28-alpine >/dev/null
+    kubectl -n portal expose deploy docs --port=80 >/dev/null
+    kubectl -n portal create ingress docs --class=traefik --rule='docs.example.com/*=docs:8080' >/dev/null
+    kubectl -n portal create deployment status-page --image=nginx:1.28-alpine >/dev/null
+    kubectl -n portal create service clusterip status --tcp=80:80 --dry-run=client -o json | jq '.spec.selector={"app":"statuspage"}' | kubectl apply -f - >/dev/null
+    kubectl -n portal create ingress status --class=traefik --rule='status.example.com/*=status:80' >/dev/null
+    kj -n portal ingress status '{.metadata.generation}' > $KL_STATE/answer
   check: |
-    check_eq "ingressClassName" "$(kj -n blog ingress blog '{.spec.ingressClassName}')" "traefik"
-    wait_deploy blog blog 60
-    check "blog.example.com works" 'eventually 15 "ing_get blog.example.com / | grep -q \"It works\""'
+    wait_deploy portal blog 60; wait_deploy portal docs 60; wait_deploy portal status-page 60
+    check_eq "blog ingressClassName" "$(kj -n portal ingress blog '{.spec.ingressClassName}')" "traefik"
+    check_eq "docs backend port" "$(kj -n portal ingress docs '{.spec.rules[0].http.paths[0].backend.service.port.number}')" "80"
+    check_eq "status ingress unchanged" "$(kj -n portal ingress status '{.metadata.generation}')" "$(cat $KL_STATE/answer)"
+    check_eq "status selector matches the pods" "$(kj -n portal svc status '{.spec.selector.app}')" "status-page"
+    check "blog.example.com serves" 'eventually 20 "ing_get blog.example.com / | grep -q \"It works\""'
+    check "docs.example.com serves" 'eventually 20 "ing_get docs.example.com / | grep -q \"Welcome to nginx\""'
+    check "status.example.com serves" 'eventually 20 "ing_get status.example.com / | grep -q \"Welcome to nginx\""'
   solve: |
-    kubectl patch ingress blog -n blog -p '{"spec":{"ingressClassName":"traefik"}}'
-
-- id: k8s-164
-  title: 404 because of the wrong port
-  difficulty: 2
-  kind: fix
-  tags: [ingress, service-port, troubleshooting]
-  tutorial: |
-    **Concept.** An Ingress backend references a Service by name and port. Several port numbers are in play (Ingress, Service, container), so know which layer each one belongs to.
-
-    **Read up on:**
-    - `kubectl describe ingress NAME` — see the backend and any warnings
-    - `kubectl get svc NAME -o yaml` — ports, port names, targetPort
-    - `kubectl explain ingress.spec.rules.http.paths.backend.service.port` — number or name
-    - `kubectl get endpointslices` — confirm the service has endpoints
-  scenario: |
-    **`docs.example.com`** returns an error page from Traefik. The Ingress **`docs`**
-    (namespace **`kb`**) points at the service **`docs`**, which is healthy.
-
-    Fix the Ingress.
-  hints:
-    - "Compare the backend port in the Ingress with the ports the service exposes."
-  solution: |
-    ```bash
-    kubectl get ingress docs -n kb -o jsonpath='{.spec.rules[0].http.paths[0].backend.service.port}'   # 8080
-    kubectl get svc docs -n kb -o jsonpath='{.spec.ports[*].port}'                                     # 80
-    kubectl patch ingress docs -n kb --type=json -p '[{"op":"replace","path":"/spec/rules/0/http/paths/0/backend/service/port/number","value":80}]'
-    ```
-  setup: |
-    k_ns kb
-    kubectl -n kb create deployment docs --image=nginx:1.28-alpine >/dev/null
-    kubectl -n kb expose deploy docs --port=80 >/dev/null
-    kubectl -n kb create ingress docs --class=traefik --rule='docs.example.com/*=docs:8080' >/dev/null
-  check: |
-    wait_deploy kb docs 60
-    check_eq "backend port" "$(kj -n kb ingress docs '{.spec.rules[0].http.paths[0].backend.service.port.number}')" "80"
-    check "docs.example.com works" 'eventually 15 "ing_get docs.example.com / | grep -q \"Welcome to nginx\""'
-  solve: |
-    kubectl patch ingress docs -n kb --type=json -p '[{"op":"replace","path":"/spec/rules/0/http/paths/0/backend/service/port/number","value":80}]'
+    kubectl patch ingress blog -n portal -p '{"spec":{"ingressClassName":"traefik"}}'
+    kubectl patch ingress docs -n portal --type=json -p '[{"op":"replace","path":"/spec/rules/0/http/paths/0/backend/service/port/number","value":80}]'
+    kubectl patch svc status -n portal -p '{"spec":{"selector":{"app":"status-page"}}}'
 
 - id: k8s-165
   title: HTTPS with your own certificate
@@ -230,81 +227,58 @@ exercises:
     kubectl create ingress portal -n secure --class=traefik --rule='secure.example.com/*=portal:80,tls=secure-tls'
 
 - id: k8s-166
-  title: Name-based virtual hosts
+  title: Host- and path-based routing
   difficulty: 2
   kind: build
-  tags: [ingress, virtual-hosts]
+  tags: [ingress, virtual-hosts, pathType]
   tutorial: |
-    **Concept.** Name-based virtual hosting serves many host names from one entry point. The controller picks the backend using the Host header of each request.
+    **Concept.** An Ingress routes on two keys. **Name-based virtual hosting** serves many host names from one entry point: the controller picks the backend from the `Host` header of each request. Within a host, **paths** are compared to the request path according to **`pathType`**:
+
+    - `Exact` — the whole path must be equal (`/v1` does not match `/v1/users`)
+    - `Prefix` — segment-wise prefix (`/v1` matches `/v1`, `/v1/users`, but not `/v10`)
+    - `ImplementationSpecific` — left to the controller
+
+    Which one is right depends on what the URL space looks like. A request matching no rule gets the controller's default 404.
 
     **Read up on:**
-    - `kubectl create ingress --help` — multiple `--rule` flags
-    - `kubectl explain ingress.spec.rules.host` — host matching
-    - `curl -H 'Host: NAME' URL` — simulate a host
-    - `kubectl describe ingress` — verify both rules
+    - `kubectl create ingress --help` — multiple `--rule` flags, and the `/*` suffix for Prefix
+    - `kubectl explain ingress.spec.rules.host` and `...paths.pathType` — host matching and allowed values
+    - Kubernetes docs: Ingress, Path types — the matching examples
+    - `curl -H 'Host: NAME' URL` and `curl -i` — simulate hosts, compare paths
   scenario: |
-    One Ingress **`brands`** (namespace **`brands`**) for two shops:
+    Namespace **`brands`** hosts two shops and a small API.
 
-    - **`acme.example.com`** → service **`acme`**
-    - **`globex.example.com`** → service **`globex`**
+    1. Create one Ingress **`brands`** (class `traefik`) that serves two host names:
+       - **`acme.example.com`** → service **`acme`**
+       - **`globex.example.com`** → service **`globex`**
 
-    Both services listen on port 80.
+       Both services listen on port 80.
+    2. The existing Ingress **`api`** should send everything under `/v1` on
+       **`api.example.com`** to the service **`api-v1`**, but `/v1` works while
+       **`/v1/users`** and **`/v1/orders/42`** return 404. Fix it, without making
+       unrelated paths such as `/v2` routable.
   hints:
     - "One `rules` entry per host; `kubectl create ingress` accepts several `--rule` flags."
+    - "`pathType: Exact` matches only the exact path. Look at `kubectl get ingress api -n brands -o yaml`."
+    - "Patch `/spec/rules/0/http/paths/0/pathType` to `Prefix`."
   solution: |
     ```bash
     kubectl create ingress brands -n brands --class=traefik \
       --rule='acme.example.com/*=acme:80' --rule='globex.example.com/*=globex:80'
+    kubectl patch ingress api -n brands --type=json \
+      -p '[{"op":"replace","path":"/spec/rules/0/http/paths/0/pathType","value":"Prefix"}]'
     ```
   setup: |
     k_ns brands
-    for b in acme globex; do
+    for b in acme globex api-v1; do
       kubectl -n brands create deployment $b --image=traefik/whoami:v1.10 >/dev/null
       kubectl -n brands set env deploy/$b WHOAMI_NAME=$b >/dev/null
       kubectl -n brands expose deploy $b --port=80 >/dev/null
     done
-  check: |
-    wait_deploy brands acme 60; wait_deploy brands globex 60
-    eventually 15 'ing_get acme.example.com / | grep -q "Name: acme"'
-    check "acme.example.com → acme" 'ing_get acme.example.com / | grep -q "Name: acme"'
-    check "globex.example.com → globex" 'ing_get globex.example.com / | grep -q "Name: globex"'
-    check_eq "a single ingress" "$(kubectl -n brands get ingress -o name | wc -l | tr -d ' ')" "1"
-  solve: |
-    kubectl create ingress brands -n brands --class=traefik --rule='acme.example.com/*=acme:80' --rule='globex.example.com/*=globex:80'
-
-- id: k8s-167
-  title: Prefix, not Exact
-  difficulty: 2
-  kind: fix
-  tags: [ingress, pathType, troubleshooting]
-  tutorial: |
-    **Concept.** Ingress path types decide how a request path is compared to the rule's path: whole-string equality or segment-wise prefix. Which one is right depends on what the URL space looks like.
-
-    **Read up on:**
-    - Kubernetes docs: Ingress, Path types — the matching examples
-    - `kubectl explain ingress.spec.rules.http.paths.pathType` — allowed values
-    - `kubectl get ingress NAME -o yaml` — current setting
-    - `curl -i` against several paths — compare results
-  scenario: |
-    On **`api.example.com`**, `/v1` works but **`/v1/users`** and **`/v1/orders`** return
-    404. The Ingress **`api`** (namespace **`api`**) should send everything under `/v1` to
-    the service **`api-v1`**.
-
-    Fix the Ingress.
-  hints:
-    - "`pathType: Exact` matches only the exact path."
-  solution: |
-    ```bash
-    kubectl patch ingress api -n api --type=json -p '[{"op":"replace","path":"/spec/rules/0/http/paths/0/pathType","value":"Prefix"}]'
-    ```
-  setup: |
-    k_ns api
-    kubectl -n api create deployment api-v1 --image=traefik/whoami:v1.10 >/dev/null
-    kubectl -n api expose deploy api-v1 --port=80 >/dev/null
-    kubectl apply -f - >/dev/null <<'EOF'
+    kubectl apply -f - >/dev/null <<'EOF2'
     apiVersion: networking.k8s.io/v1
     kind: Ingress
-    metadata: {name: api, namespace: api}
+    metadata: {name: api, namespace: brands}
     spec:
       ingressClassName: traefik
       rules:
@@ -312,15 +286,19 @@ exercises:
         http:
           paths:
           - {path: /v1, pathType: Exact, backend: {service: {name: api-v1, port: {number: 80}}}}
-    EOF
+    EOF2
   check: |
-    wait_deploy api api-v1 60
-    eventually 15 '[ "$(ing_code api.example.com /v1/users)" = 200 ]'
-    check_eq "/v1/users" "$(ing_code api.example.com /v1/users)" "200"
+    wait_deploy brands acme 60; wait_deploy brands globex 60; wait_deploy brands api-v1 60
+    check_eq "a single brands ingress" "$(kubectl -n brands get ingress brands -o name 2>/dev/null | wc -l | tr -d ' ')" "1"
+    check "acme.example.com → acme" 'eventually 20 "ing_get acme.example.com / | grep -q \"Name: acme\""'
+    check "globex.example.com → globex" 'eventually 20 "ing_get globex.example.com / | grep -q \"Name: globex\""'
+    check "unknown host is not routed" '[ "$(ing_code nobody.example.com /)" = 404 ]'
+    check_eq "/v1/users" "$(eventually 20 '[ "$(ing_code api.example.com /v1/users)" = 200 ]'; ing_code api.example.com /v1/users)" "200"
     check_eq "/v1/orders/42" "$(ing_code api.example.com /v1/orders/42)" "200"
     check_eq "/v2 still not routed" "$(ing_code api.example.com /v2)" "404"
   solve: |
-    kubectl patch ingress api -n api --type=json -p '[{"op":"replace","path":"/spec/rules/0/http/paths/0/pathType","value":"Prefix"}]'
+    kubectl create ingress brands -n brands --class=traefik --rule='acme.example.com/*=acme:80' --rule='globex.example.com/*=globex:80'
+    kubectl patch ingress api -n brands --type=json -p '[{"op":"replace","path":"/spec/rules/0/http/paths/0/pathType","value":"Prefix"}]'
 
 - id: k8s-168
   title: Ingress in the wrong namespace
@@ -365,47 +343,6 @@ exercises:
   solve: |
     kubectl delete ingress wiki -n ingress-rules
     kubectl create ingress wiki -n wiki --class=traefik --rule='wiki.example.com/*=wiki:80'
-
-- id: k8s-169
-  title: "503: no available server"
-  difficulty: 2
-  kind: fix
-  tags: [ingress, endpoints, troubleshooting]
-  tutorial: |
-    **Concept.** A 503 from the proxy usually means the route matched but there is no healthy backend to send traffic to. A Service finds pods through its label selector and lists them as endpoints.
-
-    **Read up on:**
-    - `kubectl get endpointslices -l kubernetes.io/service-name=NAME` — are there endpoints?
-    - `kubectl get svc NAME -o yaml` — how the Service chooses pods
-    - `kubectl get pods --show-labels` — what the pods carry
-    - `kubectl describe pod` — readiness status
-  scenario: |
-    **`status.example.com`** returns **503 Service Unavailable** from Traefik. The
-    Ingress (namespace **`ops`**) is correct.
-
-    Find the real cause and fix it (without changing the Ingress).
-  hints:
-    - "A 503 from the ingress controller usually means the service has **no endpoints**."
-    - "`kubectl get endpointslices -n ops`"
-  solution: |
-    ```bash
-    kubectl get endpointslices -n ops -l kubernetes.io/service-name=status   # no endpoints
-    kubectl get svc status -n ops -o jsonpath='{.spec.selector}'              # app=statuspage
-    kubectl get pods -n ops --show-labels                                    # app=status-page
-    kubectl patch svc status -n ops -p '{"spec":{"selector":{"app":"status-page"}}}'
-    ```
-  setup: |
-    k_ns ops
-    kubectl -n ops create deployment status-page --image=nginx:1.28-alpine >/dev/null
-    kubectl -n ops create service clusterip status --tcp=80:80 --dry-run=client -o json | jq '.spec.selector={"app":"statuspage"}' | kubectl apply -f - >/dev/null
-    kubectl -n ops create ingress status --class=traefik --rule='status.example.com/*=status:80' >/dev/null
-    kj -n ops ingress status '{.metadata.generation}' > $KL_STATE/answer
-  check: |
-    check_eq "ingress unchanged" "$(kj -n ops ingress status '{.metadata.generation}')" "$(cat $KL_STATE/answer)"
-    wait_deploy ops status-page 60
-    check "status.example.com works" 'eventually 15 "ing_get status.example.com / | grep -q \"Welcome to nginx\""'
-  solve: |
-    kubectl patch svc status -n ops -p '{"spec":{"selector":{"app":"status-page"}}}'
 
 - id: k8s-170
   title: A catch-all backend

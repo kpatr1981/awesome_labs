@@ -5,125 +5,69 @@ order: 13
 exercises:
 
 - id: k8s-241
-  title: node01 is NotReady
-  difficulty: 2
+  title: Bring node01 back to Ready
+  difficulty: 3
   kind: fix
-  tags: [node, kubelet, systemd]
+  tags: [node, kubelet, containerd, systemd, labels]
   tutorial: |
-    **Concept.** The kubelet is a systemd service on each node that reports its health to the control plane. If it is not running, the node goes NotReady after a grace period. A service also needs to be enabled to survive reboots.
+    **Concept.** A worker node is only `Ready` when a whole chain works: the container runtime (containerd) must be running, the kubelet must be running and enabled, and the kubelet must be able to load its configuration, including the certificate paths it references. Any broken link makes the node `NotReady` after a grace period, and each link has its own symptom in the logs. Debug from the bottom up: runtime first, then kubelet service, then the kubelet's config. Services must also be *enabled* to survive a reboot. Finally, the ROLES column of `kubectl get nodes` is not a field: it is derived from labels with the prefix `node-role.kubernetes.io/`.
 
     **Read up on:**
     - `ssh node01` — log in to the node
-    - `systemctl status kubelet` — active state and whether it is enabled
-    - `man systemctl` — start, enable and the combined options
-    - `journalctl -u kubelet` — service logs
+    - `systemctl status kubelet` and `systemctl status containerd` — active state and whether each is enabled
+    - `man systemctl` — start, enable and the combined `enable --now`
+    - `journalctl -u kubelet -n 50 --no-pager` — what the kubelet complains about (runtime socket, missing files)
+    - `/var/lib/kubelet/config.yaml` — the KubeletConfiguration file; `ls -l /etc/kubernetes/pki` shows which certificate files really exist
+    - `kubectl label node --help` and `kubectl get nodes --show-labels` — labels and the ROLES column
   scenario: |
-    `kubectl get nodes` shows **node01** as **`NotReady`**. Pods on it are not being
-    updated anymore.
+    `kubectl get nodes` shows **node01** as **`NotReady`**, and its ROLES column is `<none>`.
+    Over the last day several people have touched node01: someone stopped services "to
+    save memory", and someone else "tidied up certificate paths" in the kubelet's
+    configuration (the certificate files themselves are where they always were).
 
-    Log in to node01 (`ssh node01`), find the problem and fix it so the node is `Ready`
-    again — and stays that way after a reboot.
+    Log in to node01 (`ssh node01`) and bring it back so that it is `Ready` and stays that
+    way **after a reboot**. The monitoring dashboards also expect workers to show the role
+    **`worker`**, so make node01 display it.
   hints:
-    - "`kubectl describe node node01` → Conditions: *Kubelet stopped posting node status*."
-    - "On node01: `systemctl status kubelet`"
+    - "Work bottom-up on node01: `systemctl status containerd`, then `systemctl status kubelet`. Both must be running *and* enabled."
+    - "Once both services are enabled and running, if the kubelet still exits, read `sudo journalctl -u kubelet -n 20 --no-pager` — it names a file it cannot load. The config is `/var/lib/kubelet/config.yaml`; compare the path with `ls /etc/kubernetes/pki`."
+    - "The ROLES column comes from labels named `node-role.kubernetes.io/<role>`."
   solution: |
     ```bash
     ssh node01
-    sudo systemctl status kubelet       # inactive (dead), disabled
-    sudo systemctl enable --now kubelet
+    sudo systemctl status containerd kubelet           # both inactive (dead) and disabled
+    sudo systemctl enable --now containerd             # the runtime first
+    sudo grep clientCAFile /var/lib/kubelet/config.yaml
+    # clientCAFile: /etc/kubernetes/pki/ca-cert.pem    <- no such file
+    sudo sed -i 's|/etc/kubernetes/pki/ca-cert.pem|/etc/kubernetes/pki/ca.crt|' /var/lib/kubelet/config.yaml
+    sudo systemctl enable --now kubelet                # kubelet last, now that it can start
     exit
+    kubectl label node node01 node-role.kubernetes.io/worker=
     kubectl get nodes -w
     ```
+    Three independent faults: the runtime was disabled and stopped, the kubelet was
+    disabled and stopped, and the kubelet config pointed at a CA file that does not exist.
+    Starting the kubelet before fixing the config would just make it exit again.
   setup_worker: |
+    sed -i 's|/etc/kubernetes/pki/ca.crt|/etc/kubernetes/pki/ca-cert.pem|' /var/lib/kubelet/config.yaml
     systemctl disable --now kubelet >/dev/null 2>&1
-  setup: |
-    eventually 90 '[ "$(kj node node01 "{.status.conditions[?(@.type==\"Ready\")].status}")" != True ]'
-  check: |
-    eventually 60 '[ "$(kj node node01 "{.status.conditions[?(@.type==\"Ready\")].status}")" = True ]'
-    check "node01 is Ready" '[ "$(kj node node01 "{.status.conditions[?(@.type==\"Ready\")].status}")" = True ]'
-  check_worker: |
-    check "kubelet enabled at boot" 'systemctl is-enabled -q kubelet'
-  solve: |
-    ssh node01 sudo systemctl enable --now kubelet
-
-- id: k8s-242
-  title: The container runtime is down
-  difficulty: 2
-  kind: fix
-  tags: [node, containerd]
-  tutorial: |
-    **Concept.** The kubelet talks to a container runtime over a local socket. If the runtime is unavailable, the kubelet cannot manage pods and the node reports NotReady even though kubelet itself is up.
-
-    **Read up on:**
-    - `journalctl -u kubelet -n 50 --no-pager` — what the kubelet complains about
-    - `systemctl status containerd` — runtime service state
-    - `man systemctl` — enabling services persistently
-    - `crictl info` or `crictl ps` — check the runtime responds
-  scenario: |
-    node01 went **NotReady** again, but this time the kubelet *is* running. Its logs are
-    full of *failed to connect to the container runtime*.
-
-    Fix node01.
-  hints:
-    - "`sudo journalctl -u kubelet -n 20` on node01; then `systemctl status containerd`."
-  solution: |
-    ```bash
-    ssh node01
-    sudo journalctl -u kubelet -n 5 --no-pager    # ... connect: no such file or directory (containerd.sock)
-    sudo systemctl enable --now containerd
-    ```
-  setup_worker: |
     systemctl disable --now containerd >/dev/null 2>&1
   setup: |
     eventually 120 '[ "$(kj node node01 "{.status.conditions[?(@.type==\"Ready\")].status}")" != True ]'
   check: |
-    eventually 90 '[ "$(kj node node01 "{.status.conditions[?(@.type==\"Ready\")].status}")" = True ]'
+    check "node01 has the worker role label" 'kubectl get node node01 -o json | jq -e ".metadata.labels | has(\"node-role.kubernetes.io/worker\")"'
+    check "ROLES column shows worker" 'kubectl get node node01 --no-headers | awk "{print \$3}" | grep -q worker'
+    node_fixed() { on_node01 'systemctl is-enabled -q kubelet && systemctl is-enabled -q containerd && grep -q "clientCAFile: /etc/kubernetes/pki/ca.crt" /var/lib/kubelet/config.yaml'; }
+    check "kubelet, containerd and the CA path are repaired on node01" 'node_fixed'
+    node_fixed && eventually 150 '[ "$(kj node node01 "{.status.conditions[?(@.type==\"Ready\")].status}")" = True ]'
     check "node01 is Ready" '[ "$(kj node node01 "{.status.conditions[?(@.type==\"Ready\")].status}")" = True ]'
   check_worker: |
+    check "kubelet enabled at boot" 'systemctl is-enabled -q kubelet'
     check "containerd enabled and running" 'systemctl is-enabled -q containerd && systemctl is-active -q containerd'
-  solve: |
-    ssh node01 sudo systemctl enable --now containerd
-
-- id: k8s-243
-  title: Kubelet can't find its CA
-  difficulty: 3
-  kind: fix
-  tags: [node, kubelet, config]
-  tutorial: |
-    **Concept.** The kubelet reads a config file and a set of certificate paths when it starts. A wrong path in its configuration makes it exit, and the log message names the missing file.
-
-    **Read up on:**
-    - `journalctl -u kubelet` — the error line with the path
-    - `/var/lib/kubelet/config.yaml` — the KubeletConfiguration file; Kubernetes docs: Set Kubelet Parameters Via A Config File
-    - `ls -l /etc/kubernetes/pki` — what files actually exist
-    - `systemctl restart kubelet`
-  scenario: |
-    After "tidying up certificate paths" on node01, its kubelet won't stay up and the node
-    is **NotReady**. Fix it — the certificate files are where they always were.
-  hints:
-    - "`sudo journalctl -u kubelet -n 20 --no-pager` on node01."
-    - "The kubelet's configuration file is `/var/lib/kubelet/config.yaml`."
-  solution: |
-    ```bash
-    ssh node01
-    sudo journalctl -u kubelet -n 10 --no-pager | grep -i error
-    # unable to load client CA file /etc/kubernetes/pki/ca-cert.pem: no such file
-    sudo grep clientCAFile /var/lib/kubelet/config.yaml
-    sudo sed -i 's|/etc/kubernetes/pki/ca-cert.pem|/etc/kubernetes/pki/ca.crt|' /var/lib/kubelet/config.yaml
-    sudo systemctl restart kubelet
-    ```
-  setup_worker: |
-    sed -i 's|/etc/kubernetes/pki/ca.crt|/etc/kubernetes/pki/ca-cert.pem|' /var/lib/kubelet/config.yaml
-    systemctl restart kubelet
-  setup: |
-    eventually 120 '[ "$(kj node node01 "{.status.conditions[?(@.type==\"Ready\")].status}")" != True ]'
-  check: |
-    eventually 60 '[ "$(kj node node01 "{.status.conditions[?(@.type==\"Ready\")].status}")" = True ]'
-    check "node01 is Ready" '[ "$(kj node node01 "{.status.conditions[?(@.type==\"Ready\")].status}")" = True ]'
-  check_worker: |
     check "clientCAFile points to the real CA" 'grep -q "clientCAFile: /etc/kubernetes/pki/ca.crt" /var/lib/kubelet/config.yaml'
   solve: |
-    ssh node01 "sudo sed -i 's|/etc/kubernetes/pki/ca-cert.pem|/etc/kubernetes/pki/ca.crt|' /var/lib/kubelet/config.yaml && sudo systemctl restart kubelet"
+    ssh node01 "sudo systemctl enable --now containerd; sudo sed -i 's|/etc/kubernetes/pki/ca-cert.pem|/etc/kubernetes/pki/ca.crt|' /var/lib/kubelet/config.yaml && sudo systemctl enable --now kubelet && sudo systemctl restart kubelet"
+    kubectl label node node01 node-role.kubernetes.io/worker=
 
 - id: k8s-244
   title: Swap is on
@@ -174,313 +118,191 @@ exercises:
     ssh node01 "sudo swapoff -a; sudo sed -i '/swapfile/d' /etc/fstab; sudo rm -f /swapfile; sudo systemctl restart kubelet"
 
 - id: k8s-245
-  title: The API server is gone
-  difficulty: 3
+  title: Revive the control plane
+  difficulty: 4
   kind: fix
-  tags: [control-plane, kube-apiserver, static-pods]
+  tags: [control-plane, kube-apiserver, etcd, static-pods, kubeconfig]
   tutorial: |
-    **Concept.** On a kubeadm control plane the API server runs as a static pod defined by a manifest file, which the kubelet watches. When kubectl is down, you debug at the container runtime and manifest level.
+    **Concept.** On a kubeadm control plane the API server runs as a static pod defined by a manifest file, which the kubelet watches. When kubectl is down you debug at the container-runtime and manifest level. The API server may have several independent mistakes in its flags: an unknown flag makes the process exit at once, while a wrong etcd address lets it start but fail as soon as it tries to use its datastore. etcd listens for clients on 2379 and for peers on 2380. Separately, kubectl reads its own connection settings (server URL, credentials) from a kubeconfig; a wrong server address there gives *connection refused* even if the cluster is healthy, so you need to fix the cluster **and** your client.
 
     **Read up on:**
-    - `crictl ps -a` and `crictl logs ID` (`man crictl`) — container state and output
-    - `/etc/kubernetes/manifests/` — static pod manifests
-    - Kubernetes docs: kube-apiserver reference, flag names
+    - `crictl ps -a` and `crictl logs ID` (`man crictl`) — container state and output when kubectl is down
+    - `/etc/kubernetes/manifests/` — static pod manifests (`kube-apiserver.yaml`, `etcd.yaml`)
+    - Kubernetes docs: kube-apiserver reference, flag names; compare `--etcd-servers` with etcd's `--listen-client-urls`
+    - `ss -ltnp` (`man ss`) — which ports are listening
     - `journalctl -u kubelet` — if no container is even created
+    - `kubectl config view --minify` and `kubectl config set-cluster --help` — the active cluster entry in `~/.kube/config`
   scenario: |
     `kubectl get pods` → *The connection to the server controlplane:6443 was refused*.
-    Someone edited the API server's configuration on the control plane an hour ago.
+    Someone edited the API server's configuration on the control plane an hour ago, and
+    the problem is not just one typo.
 
-    Bring the API server back. You'll have to debug **without kubectl** at first.
+    Bring the API server back. You'll have to debug **without kubectl** at first. Once the
+    API server answers for root (`sudo kubectl --kubeconfig /etc/kubernetes/admin.conf get nodes`),
+    check that **your own** `kubectl` works too. If it does not, fix **your** kubeconfig
+    (`~/.kube/config`).
   hints:
-    - "The API server is a static pod: `/etc/kubernetes/manifests/kube-apiserver.yaml`."
-    - "`sudo crictl ps -a | grep apiserver` and `sudo crictl logs <id>`, or look in `/var/log/pods/kube-system_kube-apiserver-*`."
+    - "The API server is a static pod: `/etc/kubernetes/manifests/kube-apiserver.yaml`. Use `sudo crictl ps -a | grep apiserver` and `sudo crictl logs <id>`, or look in `/var/log/pods/kube-system_kube-apiserver-*`."
+    - "After you fix the first error the API server may still fail with a different one. etcd listens for *clients* on **2379**; **2380** is for peer traffic. Compare `--etcd-servers` in the apiserver manifest with `--listen-client-urls` in the etcd manifest."
+    - "When the API server answers for root but not for you: `kubectl config view --minify` — look at the server URL and compare it with the real listening port."
   solution: |
     ```bash
     sudo crictl ps -a --name kube-apiserver
     sudo crictl logs $(sudo crictl ps -a --name kube-apiserver -q | head -1) 2>&1 | tail -3
     # Error: unknown flag: --authorization-mod
     sudo sed -i 's/--authorization-mod=/--authorization-mode=/' /etc/kubernetes/manifests/kube-apiserver.yaml
-    # wait ~30-60s for the kubelet to restart the static pod
-    kubectl get nodes
-    ```
-  setup: |
-    sed -i 's/--authorization-mode=/--authorization-mod=/' /etc/kubernetes/manifests/kube-apiserver.yaml
-    sleep 20
-  check: |
-    grep -q -- "--authorization-mode=" /etc/kubernetes/manifests/kube-apiserver.yaml && eventually 120 'api_up'
-    check "API server answers" 'api_up'
-    check "manifest uses --authorization-mode" 'grep -q -- "--authorization-mode=Node,RBAC" /etc/kubernetes/manifests/kube-apiserver.yaml'
-  solve: |
-    sudo sed -i 's/--authorization-mod=/--authorization-mode=/' /etc/kubernetes/manifests/kube-apiserver.yaml
-    sleep 30
-
-- id: k8s-246
-  title: The API server can't reach etcd
-  difficulty: 3
-  kind: fix
-  tags: [control-plane, kube-apiserver, etcd]
-  tutorial: |
-    **Concept.** The API server stores all state in etcd and reaches it by URL and client certificates given as flags. If those flags are wrong, the API server starts but fails when it tries to use etcd.
-
-    **Read up on:**
-    - `crictl logs` for the kube-apiserver container — etcd connection errors
-    - `/etc/kubernetes/manifests/etcd.yaml` — see which addresses etcd listens on
-    - `/etc/kubernetes/manifests/kube-apiserver.yaml` — the etcd flags
-    - `ss -ltnp` (`man ss`) — which ports are listening
-  scenario: |
-    The API server is crash-looping again. Its logs mention **etcd**. etcd itself is
-    running fine.
-
-    Fix the API server's configuration.
-  hints:
-    - "etcd listens for *clients* on **2379**; **2380** is for peer traffic between etcd members."
-    - "Compare `--etcd-servers` in the apiserver manifest with `--listen-client-urls` in the etcd manifest."
-  solution: |
-    ```bash
+    # the next start fails towards etcd:
     sudo grep etcd-servers /etc/kubernetes/manifests/kube-apiserver.yaml   # https://127.0.0.1:2380
     sudo sed -i 's|--etcd-servers=https://127.0.0.1:2380|--etcd-servers=https://127.0.0.1:2379|' /etc/kubernetes/manifests/kube-apiserver.yaml
-    ```
-  setup: |
-    sed -i 's|--etcd-servers=https://127.0.0.1:2379|--etcd-servers=https://127.0.0.1:2380|' /etc/kubernetes/manifests/kube-apiserver.yaml
-    sleep 20
-  check: |
-    grep -q -- "--etcd-servers=https://127.0.0.1:2379" /etc/kubernetes/manifests/kube-apiserver.yaml && eventually 150 'api_up'
-    check "API server answers" 'api_up'
-    check "etcd-servers on 2379" 'grep -q -- "--etcd-servers=https://127.0.0.1:2379" /etc/kubernetes/manifests/kube-apiserver.yaml'
-  solve: |
-    sudo sed -i 's|--etcd-servers=https://127.0.0.1:2380|--etcd-servers=https://127.0.0.1:2379|' /etc/kubernetes/manifests/kube-apiserver.yaml
-    sleep 30
-
-- id: k8s-247
-  title: Nothing gets scheduled
-  difficulty: 3
-  kind: fix
-  tags: [control-plane, kube-scheduler]
-  tutorial: |
-    **Concept.** The scheduler is a control-plane component that assigns pending pods to nodes. If it is down, pods wait without any scheduling events at all, since no one is reporting on them.
-
-    **Read up on:**
-    - `kubectl get pods -n kube-system` — status of control-plane static pods
-    - `kubectl describe pod` of the scheduler — image and pull errors
-    - `/etc/kubernetes/manifests/` — the scheduler manifest
-    - `crictl images` and `crictl ps -a` — what the node has
-  scenario: |
-    New pods stay `Pending` forever, and `kubectl describe pod` shows **no events at all**
-    — not even *FailedScheduling*. The API server works.
-
-    Find the broken control-plane component and fix it. Test with the pending pod
-    **`probe`** in namespace **`sched`**.
-  hints:
-    - "`kubectl get pods -n kube-system` — which component is missing or not running?"
-    - "Its configuration is a static pod manifest in `/etc/kubernetes/manifests/`."
-  solution: |
-    ```bash
-    kubectl get pods -n kube-system | grep scheduler     # ErrImagePull / missing
-    sudo grep image: /etc/kubernetes/manifests/kube-scheduler.yaml
-    # image: registry.k8s.io/kube-scheduler:v1.36.66  -> v1.36.6
-    sudo sed -i 's|kube-scheduler:v1.36.66|kube-scheduler:v1.36.6|' /etc/kubernetes/manifests/kube-scheduler.yaml
-    ```
-  setup: |
-    sed -i 's|kube-scheduler:v1.36.6|kube-scheduler:v1.36.66|' /etc/kubernetes/manifests/kube-scheduler.yaml
-    sleep 15
-    k_ns sched
-    kubectl -n sched run probe --image=busybox:1.37 -- sleep infinity >/dev/null
-  check: |
-    check "scheduler manifest uses a real image" 'grep -q "kube-scheduler:v1.36.6$" /etc/kubernetes/manifests/kube-scheduler.yaml'
-    grep -q "kube-scheduler:v1.36.6$" /etc/kubernetes/manifests/kube-scheduler.yaml && eventually 120 'pod_ready sched probe'
-    check "probe got scheduled and runs" 'pod_ready sched probe'
-  solve: |
-    sudo sed -i 's|kube-scheduler:v1.36.66|kube-scheduler:v1.36.6|' /etc/kubernetes/manifests/kube-scheduler.yaml
-
-- id: k8s-248
-  title: Deployments that never create pods
-  difficulty: 3
-  kind: fix
-  tags: [control-plane, kube-controller-manager]
-  tutorial: |
-    **Concept.** The controller-manager runs the loops that turn Deployments into ReplicaSets and ReplicaSets into pods. When it fails, objects are accepted by the API but nothing acts on them.
-
-    **Read up on:**
-    - `kubectl get pods -n kube-system` — controller-manager status
-    - `crictl ps -a` and `crictl logs` — its errors if kubectl is limited
-    - `/etc/kubernetes/manifests/kube-controller-manager.yaml` — flags and files it references
-    - `ls /etc/kubernetes` — which files really exist
-  scenario: |
-    `kubectl create deployment` succeeds, but no ReplicaSet and no pods ever appear.
-    Scaling does nothing either. The scheduler and the API server are fine.
-
-    Fix the cluster. Test with the deployment **`probe`** in namespace **`ctrl`**.
-  hints:
-    - "Who creates ReplicaSets from Deployments? → kube-controller-manager."
-    - "`sudo crictl ps -a | grep controller` and its logs."
-  solution: |
-    ```bash
-    kubectl get pods -n kube-system | grep controller-manager
-    sudo crictl logs $(sudo crictl ps -a --name kube-controller-manager -q | head -1) 2>&1 | tail -3
-    # ... stat /etc/kubernetes/controller-manager.config: no such file or directory
-    sudo sed -i 's|/etc/kubernetes/controller-manager.config|/etc/kubernetes/controller-manager.conf|g' /etc/kubernetes/manifests/kube-controller-manager.yaml
-    ```
-  setup: |
-    sed -i 's|/etc/kubernetes/controller-manager.conf|/etc/kubernetes/controller-manager.config|g' /etc/kubernetes/manifests/kube-controller-manager.yaml
-    sleep 20
-    k_ns ctrl
-    kubectl -n ctrl create deployment probe --image=traefik/whoami:v1.10 --replicas=2 >/dev/null
-  check: |
-    check "manifest points at the real kubeconfig" '! grep -q controller-manager.config /etc/kubernetes/manifests/kube-controller-manager.yaml'
-    ! grep -q controller-manager.config /etc/kubernetes/manifests/kube-controller-manager.yaml && eventually 120 'deploy_ready ctrl probe'
-    check "deployment probe has 2 ready pods" 'deploy_ready ctrl probe'
-  solve: |
-    sudo sed -i 's|/etc/kubernetes/controller-manager.config|/etc/kubernetes/controller-manager.conf|g' /etc/kubernetes/manifests/kube-controller-manager.yaml
-
-- id: k8s-249
-  title: kubectl lost its way
-  difficulty: 2
-  kind: fix
-  tags: [kubeconfig, kubectl]
-  tutorial: |
-    **Concept.** kubectl reads its connection settings (server URL, credentials) from a kubeconfig file. A wrong server address gives connection errors even though the cluster itself is healthy.
-
-    **Read up on:**
-    - `kubectl config view --minify` — the active cluster and user settings
-    - `kubectl config set-cluster --help` — modifying a cluster entry
-    - `~/.kube/config` — the file itself
-    - `kubectl cluster-info` and `ss -ltnp` — compare with the real listening port
-  scenario: |
-    On the control plane, **your** `kubectl` suddenly says *connection refused* — but
-    `sudo kubectl --kubeconfig /etc/kubernetes/admin.conf get nodes` works fine.
-
-    Fix **your** kubeconfig (`~/.kube/config`).
-  hints:
-    - "`kubectl config view --minify` — look at the server URL."
-  solution: |
-    ```bash
+    # wait ~30-60s for the kubelet to restart the static pod
+    sudo kubectl --kubeconfig /etc/kubernetes/admin.conf get nodes
+    # now your own kubectl
     kubectl config view --minify -o jsonpath='{.clusters[0].cluster.server}'   # https://controlplane:6444
     kubectl config set-cluster kubelab --server=https://controlplane:6443
     kubectl get nodes
     ```
+    Three independent faults: an unknown API-server flag, the etcd client URL pointing at
+    the peer port, and a stale server port in your own kubeconfig.
   setup: |
+    sed -i 's/--authorization-mode=/--authorization-mod=/' /etc/kubernetes/manifests/kube-apiserver.yaml
+    sed -i 's|--etcd-servers=https://127.0.0.1:2379|--etcd-servers=https://127.0.0.1:2380|' /etc/kubernetes/manifests/kube-apiserver.yaml
     H=$(lab_home)
     sed -i 's|server: https://controlplane:6443|server: https://controlplane:6444|' $H/.kube/config
+    sleep 20
   check: |
+    M=/etc/kubernetes/manifests/kube-apiserver.yaml
+    check "manifest uses --authorization-mode" 'grep -q -- "--authorization-mode=Node,RBAC" $M'
+    check "etcd-servers on 2379" 'grep -q -- "--etcd-servers=https://127.0.0.1:2379" $M'
+    check "your kubeconfig points at :6443" 'grep -q "server: https://controlplane:6443" "$(lab_home)/.kube/config"'
+    grep -q -- "--authorization-mode=Node,RBAC" $M && grep -q -- "--etcd-servers=https://127.0.0.1:2379" $M && eventually 180 'api_up'
+    check "API server answers" 'api_up'
     check "your kubectl works again" 'as_user "kubectl get nodes"'
-    check "points at :6443" 'grep -q "server: https://controlplane:6443" "$(lab_home)/.kube/config"'
   solve: |
+    sudo sed -i 's/--authorization-mod=/--authorization-mode=/' /etc/kubernetes/manifests/kube-apiserver.yaml
+    sudo sed -i 's|--etcd-servers=https://127.0.0.1:2380|--etcd-servers=https://127.0.0.1:2379|' /etc/kubernetes/manifests/kube-apiserver.yaml
     kubectl config set-cluster kubelab --server=https://controlplane:6443
+    sleep 40
 
-- id: k8s-250
-  title: CoreDNS can't start
-  difficulty: 2
+- id: k8s-247
+  title: Fix the cluster's control loops & add-ons
+  difficulty: 4
   kind: fix
-  tags: [coredns, kube-system, images]
+  tags: [control-plane, kube-scheduler, kube-controller-manager, coredns, kube-proxy, kubelet]
   tutorial: |
-    **Concept.** CoreDNS runs as a Deployment in kube-system, and an unpullable image leaves cluster DNS down. The Deployment's image must match a tag that exists in the registry.
+    **Concept.** A working cluster needs more than an API server. The *scheduler* assigns Pending pods to nodes (when it is down, pods wait with no events at all). The *controller-manager* runs the loops that turn Deployments into ReplicaSets and ReplicaSets into pods (when it fails, objects are accepted but nothing acts on them). Both are static pods defined by manifests in `/etc/kubernetes/manifests/`, so a bad image tag or a wrong file path breaks them. On top of that sit add-ons: CoreDNS (a Deployment; an unpullable image leaves cluster DNS down) and kube-proxy (a DaemonSet that reads its settings from a ConfigMap; an invalid value makes it exit at start-up). Finally, each kubelet records the API server URL in `/etc/kubernetes/kubelet.conf`; if that address is wrong the node is healthy but cannot report in. Several of these break different things at once, so find them one at a time and verify each.
 
     **Read up on:**
-    - `kubectl get pods -n kube-system` — pod state
+    - `kubectl get pods -n kube-system` — status of control-plane static pods and add-ons
     - `kubectl describe pod` — pull errors with the exact image
-    - `kubectl set image --help` — changing a container image
-    - `kubectl rollout status` — wait for rollout
+    - `crictl ps -a` and `crictl logs ID` — control-plane container output
+    - `/etc/kubernetes/manifests/` and `ls /etc/kubernetes` — manifests, and which files really exist
+    - `kubectl set image --help`, `kubectl rollout restart --help` — changing images; restarting pods so they re-read a ConfigMap
+    - `kubectl logs -n kube-system ds/kube-proxy` and `kubectl get cm kube-proxy -n kube-system -o yaml` — kube-proxy errors and config
+    - `journalctl -u kubelet` and `/etc/kubernetes/kubelet.conf` (on node01) — the kubelet's view of the API server
   scenario: |
-    Cluster DNS is down: the **`coredns`** pods in `kube-system` are in
-    `ImagePullBackOff` after someone "upgraded" them.
+    The API server works, but the cluster is sick:
 
-    Put CoreDNS back on the version that kubeadm installed (**`registry.k8s.io/coredns/coredns:v1.14.2`**).
+    - New pods stay `Pending` forever and `kubectl describe pod` shows **no events at all**
+      (test pod **`probe`** in namespace **`sched`**).
+    - Deployments are accepted, but no ReplicaSets or pods ever appear
+      (test deployment **`probe`**, 2 replicas, in namespace **`ctrl`**).
+    - Cluster DNS is down: the **`coredns`** pods in `kube-system` are in `ImagePullBackOff`
+      after someone "upgraded" them. Put CoreDNS back on **`registry.k8s.io/coredns/coredns:v1.14.2`**.
+    - The **`kube-proxy`** pods in `kube-system` are in `CrashLoopBackOff` since a
+      configuration change.
+    - **node01** is `NotReady`: its kubelet is running and the runtime is fine, but it
+      logs *dial tcp ...: connect: connection refused* over and over.
+
+    Find every broken piece and fix it, until both test workloads are running, DNS and
+    kube-proxy are healthy on both nodes, and node01 is `Ready`.
   hints:
-    - "`kubectl -n kube-system get deploy coredns -o jsonpath='{..image}'`"
+    - "Control-plane components are static pods: `kubectl get pods -n kube-system`, then look in `/etc/kubernetes/manifests/`. Compare the scheduler's `image:` tag with the others, and check that every file the controller-manager references exists in `/etc/kubernetes`."
+    - "CoreDNS: `kubectl -n kube-system get deploy coredns -o jsonpath='{..image}'`. kube-proxy: `kubectl -n kube-system logs ds/kube-proxy` — its config is in the ConfigMap `kube-proxy` (key `config.conf`) and the pods read it at start-up."
+    - "node01's own kubeconfig is `/etc/kubernetes/kubelet.conf`; the API server listens on `controlplane:6443`. Restart the kubelet after changing it."
   solution: |
     ```bash
+    # 1) scheduler: image tag does not exist
+    sudo grep image: /etc/kubernetes/manifests/kube-scheduler.yaml          # kube-scheduler:v1.36.66
+    sudo sed -i 's|kube-scheduler:v1.36.66|kube-scheduler:v1.36.6|' /etc/kubernetes/manifests/kube-scheduler.yaml
+
+    # 2) controller-manager: kubeconfig path does not exist
+    sudo crictl logs $(sudo crictl ps -a --name kube-controller-manager -q | head -1) 2>&1 | tail -3
+    # ... stat /etc/kubernetes/controller-manager.config: no such file or directory
+    sudo sed -i 's|/etc/kubernetes/controller-manager.config|/etc/kubernetes/controller-manager.conf|g' /etc/kubernetes/manifests/kube-controller-manager.yaml
+
+    # 3) CoreDNS: image tag does not exist
     kubectl -n kube-system set image deploy/coredns coredns=registry.k8s.io/coredns/coredns:v1.14.2
-    kubectl -n kube-system rollout status deploy/coredns
-    ```
-  setup: |
-    kubectl -n kube-system set image deploy/coredns coredns=registry.k8s.io/coredns/coredns:v9.9.9 >/dev/null
-  check: |
-    check_eq "image" "$(deploy_images kube-system coredns)" "registry.k8s.io/coredns/coredns:v1.14.2"
-    wait_deploy kube-system coredns 90
-    check "coredns ready" 'deploy_ready kube-system coredns'
-  solve: |
-    kubectl -n kube-system set image deploy/coredns coredns=registry.k8s.io/coredns/coredns:v1.14.2
 
-- id: k8s-251
-  title: kube-proxy is crash-looping
-  difficulty: 3
-  kind: fix
-  tags: [kube-proxy, configmap, kube-system]
-  tutorial: |
-    **Concept.** kube-proxy programs service rules on every node and reads its settings from a ConfigMap. An invalid value in that config makes it exit at startup, and its logs state which.
-
-    **Read up on:**
-    - `kubectl logs -n kube-system ds/kube-proxy` — startup error
-    - `kubectl get cm kube-proxy -n kube-system -o yaml` — the config
-    - Kubernetes docs: kube-proxy configuration, valid `mode` values
-    - `kubectl rollout restart --help` — pods need restart to read changes
-  scenario: |
-    The **`kube-proxy`** DaemonSet pods in `kube-system` are all in `CrashLoopBackOff`
-    since a configuration change. Existing services still work (the old rules are still
-    in place), but new services won't.
-
-    Fix kube-proxy's configuration and get its pods running.
-  hints:
-    - "`kubectl -n kube-system logs ds/kube-proxy`"
-    - "Its config is in the ConfigMap `kube-proxy` (key `config.conf`); the pods read it at start-up."
-  solution: |
-    ```bash
-    kubectl -n kube-system logs ds/kube-proxy | tail -2     # invalid mode "ipvsx"
-    kubectl -n kube-system edit cm kube-proxy               # mode: "ipvsx" -> mode: ""
-    kubectl -n kube-system rollout restart ds/kube-proxy
-    ```
-    An empty mode means the platform default (iptables/nftables).
-  setup: |
-    kubectl -n kube-system get cm kube-proxy -o json | jq '.data["config.conf"] |= sub("mode: \"[a-z]*\""; "mode: \"ipvsx\"")' | kubectl replace -f - >/dev/null
-    kubectl -n kube-system rollout restart ds/kube-proxy >/dev/null
-    sleep 10
-  check: |
-    check_not "no invalid mode" 'kubectl -n kube-system get cm kube-proxy -o jsonpath="{.data.config\.conf}" | grep -q ipvsx'
-    eventually 90 '[ "$(kj -n kube-system ds kube-proxy "{.status.numberReady}")" = 2 ]'
-    check "kube-proxy ready on both nodes" '[ "$(kj -n kube-system ds kube-proxy "{.status.numberReady}")" = 2 ]'
-  solve: |
-    kubectl -n kube-system get cm kube-proxy -o json | jq '.data["config.conf"] |= sub("mode: \"ipvsx\""; "mode: \"\"")' | kubectl replace -f -
+    # 4) kube-proxy: invalid mode "ipvsx"
+    kubectl -n kube-system logs ds/kube-proxy | tail -2
+    kubectl -n kube-system edit cm kube-proxy                # mode: "ipvsx" -> mode: ""
     kubectl -n kube-system rollout restart ds/kube-proxy
 
-- id: k8s-252
-  title: node01 talks to the wrong API endpoint
-  difficulty: 3
-  kind: fix
-  tags: [node, kubelet, kubeconfig]
-  tutorial: |
-    **Concept.** A kubelet authenticates to the API server using a kubeconfig that records the server URL. If that address is wrong, the kubelet is healthy but cannot report in.
-
-    **Read up on:**
-    - `journalctl -u kubelet` — connection errors and target address
-    - `/etc/kubernetes/kubelet.conf` — the kubeconfig file
-    - `ss -ltnp` on the control plane — which port the API server listens on
-    - `systemctl restart kubelet`
-  scenario: |
-    node01 is **NotReady**; its kubelet is running and the runtime is fine, but it logs
-    *dial tcp ...: connect: connection refused* over and over.
-
-    Fix node01 so its kubelet talks to the right API server endpoint again.
-  hints:
-    - "The kubelet's own kubeconfig is `/etc/kubernetes/kubelet.conf` on node01."
-    - "The API server listens on `controlplane:6443`."
-  solution: |
-    ```bash
+    # 5) node01 kubelet talks to the wrong port
     ssh node01
-    sudo grep server: /etc/kubernetes/kubelet.conf      # https://controlplane:16443
+    sudo grep server: /etc/kubernetes/kubelet.conf          # https://controlplane:16443
     sudo sed -i 's|controlplane:16443|controlplane:6443|' /etc/kubernetes/kubelet.conf
     sudo systemctl restart kubelet
     ```
-  setup_worker: |
-    sed -i 's|server: https://controlplane:6443|server: https://controlplane:16443|' /etc/kubernetes/kubelet.conf
-    systemctl restart kubelet
+    An empty kube-proxy mode means the platform default (iptables/nftables). The probe
+    objects only start once the scheduler, controller-manager and node01 are all healthy.
   setup: |
-    eventually 120 '[ "$(kj node node01 "{.status.conditions[?(@.type==\"Ready\")].status}")" != True ]'
+    # Order matters. Everything that needs the controllers to act (CoreDNS rollout,
+    # kube-proxy restart) happens FIRST, while the scheduler and controller-manager are
+    # still healthy. Then the two control-plane manifests are broken, and only then the
+    # probe objects are created through the (still working) API so they stay unscheduled.
+    # node01's kubelet is broken last, after all API writes are done.
+    kubectl -n kube-system set image deploy/coredns coredns=registry.k8s.io/coredns/coredns:v9.9.9 >/dev/null
+    kubectl -n kube-system get cm kube-proxy -o json | jq '.data["config.conf"] |= sub("mode: \"[a-z]*\""; "mode: \"ipvsx\"")' | kubectl replace -f - >/dev/null
+    kubectl -n kube-system rollout restart ds/kube-proxy >/dev/null
+    eventually 60 '[ "$(kubectl -n kube-system get pods -l k8s-app=kube-dns --no-headers 2>/dev/null | grep -cE "ImagePull|ErrImage")" -ge 1 ]' || true
+    eventually 60 '[ "$(kj -n kube-system ds kube-proxy "{.status.numberReady}")" != 2 ]' || true
+    sed -i 's|kube-scheduler:v1.36.6|kube-scheduler:v1.36.66|' /etc/kubernetes/manifests/kube-scheduler.yaml
+    sed -i 's|/etc/kubernetes/controller-manager.conf|/etc/kubernetes/controller-manager.config|g' /etc/kubernetes/manifests/kube-controller-manager.yaml
+    sleep 25
+    k_ns sched
+    # the controller-manager is broken, so the namespace's default ServiceAccount
+    # won't be auto-created; create it directly (a plain API write) so the pod admits.
+    kubectl -n sched create serviceaccount default >/dev/null 2>&1 || true
+    kubectl -n sched run probe --image=busybox:1.37 -- sleep infinity >/dev/null
+    k_ns ctrl
+    kubectl -n ctrl create serviceaccount default >/dev/null 2>&1 || true
+    kubectl -n ctrl create deployment probe --image=traefik/whoami:v1.10 --replicas=2 >/dev/null
+    on_node01 "sed -i 's|server: https://controlplane:6443|server: https://controlplane:16443|' /etc/kubernetes/kubelet.conf; systemctl restart kubelet"
+    eventually 120 '[ "$(kj node node01 "{.status.conditions[?(@.type==\"Ready\")].status}")" != True ]' || true
   check: |
-    eventually 60 '[ "$(kj node node01 "{.status.conditions[?(@.type==\"Ready\")].status}")" = True ]'
-    check "node01 is Ready" '[ "$(kj node node01 "{.status.conditions[?(@.type==\"Ready\")].status}")" = True ]'
+    sched_ok() { grep -q "kube-scheduler:v1.36.6$" /etc/kubernetes/manifests/kube-scheduler.yaml; }
+    cm_ok() { ! grep -q controller-manager.config /etc/kubernetes/manifests/kube-controller-manager.yaml; }
+    dns_ok() { [ "$(deploy_images kube-system coredns)" = "registry.k8s.io/coredns/coredns:v1.14.2" ]; }
+    proxy_ok() { ! kubectl -n kube-system get cm kube-proxy -o jsonpath="{.data.config\.conf}" | grep -q ipvsx; }
+    node_ok() { on_node01 'grep -q "server: https://controlplane:6443" /etc/kubernetes/kubelet.conf'; }
+    node_ready() { [ "$(kj node node01 "{.status.conditions[?(@.type==\"Ready\")].status}")" = True ]; }
+    check "scheduler manifest uses a real image" 'sched_ok'
+    check "controller-manager manifest points at the real kubeconfig" 'cm_ok'
+    check_eq "coredns image" "$(deploy_images kube-system coredns)" "registry.k8s.io/coredns/coredns:v1.14.2"
+    check_not "kube-proxy config has no invalid mode" 'kubectl -n kube-system get cm kube-proxy -o jsonpath="{.data.config\.conf}" | grep -q ipvsx'
+    check "node01 kubelet.conf points to :6443" 'node_ok'
+    node_ok && eventually 120 'node_ready'
+    check "node01 is Ready" 'node_ready'
+    check "coredns ready" 'eventually 150 "dns_ok && deploy_ready kube-system coredns"'
+    proxy_ok && node_ok && eventually 150 '[ "$(kj -n kube-system ds kube-proxy "{.status.numberReady}")" = 2 ]'
+    check "kube-proxy ready on both nodes" '[ "$(kj -n kube-system ds kube-proxy "{.status.numberReady}")" = 2 ]'
+    sched_ok && node_ok && eventually 180 'pod_ready sched probe'
+    check "probe got scheduled and runs" 'pod_ready sched probe'
+    cm_ok && sched_ok && node_ok && eventually 180 'deploy_ready ctrl probe'
+    check "deployment probe has 2 ready pods" 'deploy_ready ctrl probe'
   check_worker: |
     check "kubelet.conf points to :6443" 'grep -q "server: https://controlplane:6443" /etc/kubernetes/kubelet.conf'
   solve: |
+    sudo sed -i 's|kube-scheduler:v1.36.66|kube-scheduler:v1.36.6|' /etc/kubernetes/manifests/kube-scheduler.yaml
+    sudo sed -i 's|/etc/kubernetes/controller-manager.config|/etc/kubernetes/controller-manager.conf|g' /etc/kubernetes/manifests/kube-controller-manager.yaml
+    # wait for the scheduler and controller-manager static pods to restart before
+    # relying on them to drive the coredns rollout
+    for i in $(seq 1 40); do kubectl get --raw=/readyz >/dev/null 2>&1 && kubectl -n kube-system get deploy coredns >/dev/null 2>&1 && break; sleep 3; done
+    kubectl -n kube-system set image deploy/coredns coredns=registry.k8s.io/coredns/coredns:v1.14.2
+    kubectl -n kube-system rollout restart deploy/coredns
+    kubectl -n kube-system get cm kube-proxy -o json | jq '.data["config.conf"] |= sub("mode: \"ipvsx\""; "mode: \"\"")' | kubectl replace -f -
+    kubectl -n kube-system rollout restart ds/kube-proxy
     ssh node01 "sudo sed -i 's|controlplane:16443|controlplane:6443|' /etc/kubernetes/kubelet.conf && sudo systemctl restart kubelet"
 
 - id: k8s-253
@@ -739,37 +561,6 @@ exercises:
     check "dump file removed" '! test -e /var/tmp/core-dump-2026.bin'
   solve: |
     ssh node01 sudo rm -f /var/tmp/core-dump-2026.bin
-
-- id: k8s-259
-  title: Give node01 a role
-  difficulty: 1
-  kind: build
-  tags: [node, labels, roles]
-  tutorial: |
-    **Concept.** Node roles are not a field; the ROLES column is derived from labels with a special prefix. Adding the right label makes a role appear.
-
-    **Read up on:**
-    - `kubectl get nodes --show-labels` — see existing labels
-    - `kubectl label node --help` — adding labels, including empty values
-    - `kubectl get nodes` — see the ROLES column
-    - Kubernetes docs: Well-Known Labels, Annotations and Taints
-  scenario: |
-    `kubectl get nodes` shows `<none>` in the ROLES column for node01. The monitoring
-    dashboards expect workers to show **`worker`**.
-
-    Make node01 display the role `worker`.
-  hints:
-    - "The ROLES column is derived from labels `node-role.kubernetes.io/<role>`."
-  solution: |
-    ```bash
-    kubectl label node node01 node-role.kubernetes.io/worker=
-    kubectl get nodes
-    ```
-  check: |
-    check "node01 role label" 'kubectl get node node01 -o json | jq -e ".metadata.labels | has(\"node-role.kubernetes.io/worker\")"'
-    check "ROLES column shows worker" 'kubectl get node node01 --no-headers | awk "{print \$3}" | grep -q worker'
-  solve: |
-    kubectl label node node01 node-role.kubernetes.io/worker=
 
 - id: k8s-260
   title: "Incident: Monday morning cluster"

@@ -5,37 +5,81 @@ order: 7
 exercises:
 
 - id: k8s-121
-  title: A one-off Job
-  difficulty: 1
+  title: Run a Job, then fix a failing one
+  difficulty: 2
   kind: build
-  tags: [job]
+  tags: [job, troubleshooting]
   tutorial: |
-    **Concept.** A Job runs pods until they finish successfully, then stops. Unlike a Deployment it doesn't restart completed work, and its pod keeps its logs after completion.
+    **Concept.** A Job runs pods until they finish successfully, then stops. Unlike a Deployment it doesn't restart completed work, and its pod keeps its logs after completion. When a Job's pods fail, it retries until `backoffLimit` is reached and is then marked failed. The cause is almost always visible in the pod's logs or events. A Job's pod template is immutable, so fixing it means recreating the Job under the same name.
 
     **Read up on:**
     - `kubectl create job --help` — imperative creation with a command after `--`
     - `kubectl wait --help` — waiting for `--for=condition=complete`
-    - `kubectl logs job/NAME` — read output of a finished Job
+    - `kubectl logs job/NAME` and `kubectl logs -l job-name=NAME` — output of a finished or failed Job
+    - `kubectl describe pod` — events and exit codes
+    - `kubectl get configmap -o yaml` — see what is in a mounted script
+    - `kubectl get job -o json` — export a Job, strip generated fields and re-apply
     - `kubectl explain job.spec.template.spec.restartPolicy` — allowed values for Jobs
   scenario: |
-    Run a **Job** **`report`** in namespace **`batch`** (`busybox:1.37`) that prints
-    `monthly report generated` and exits. It must complete successfully.
+    Two small tasks around Jobs.
+
+    **1. A one-off Job.** Run a **Job** **`report`** in namespace **`batch`**
+    (`busybox:1.37`) that prints `monthly report generated` and exits. It must complete
+    successfully.
+
+    **2. A failing Job.** The data-migration Job **`migrate-v42`** (namespace
+    **`release`**) has failed. Look at its pod logs, figure out the problem and run the
+    migration **successfully** under the same Job name. (The script lives in the
+    ConfigMap `migrate-script`, which is correct.)
   hints:
     - "`kubectl create job NAME --image=IMAGE -- COMMAND...`"
+    - "`kubectl logs -n release -l job-name=migrate-v42` — compare the path in the error with where the ConfigMap is mounted."
+    - "A Job's pod template is immutable — export it, fix the mount path, delete the Job and create it again."
   solution: |
     ```bash
     kubectl create job report -n batch --image=busybox:1.37 -- echo "monthly report generated"
     kubectl wait --for=condition=complete job/report -n batch
     kubectl logs job/report -n batch
+
+    kubectl logs -n release -l job-name=migrate-v42 --tail=5
+    # sh: /scripts/migrate.sh: not found   (mounted at /script, called as /scripts/...)
+    kubectl get job migrate-v42 -n release -o json > /lab/job.json
+    # fix the mountPath (or the command), remove status/selector/controller-uid labels, recreate
+    kubectl delete job migrate-v42 -n release
+    kubectl apply -f /lab/job.json
     ```
   setup: |
     k_ns batch
+    k_ns release
+    kubectl -n release create configmap migrate-script --from-literal=migrate.sh=$'echo "applying migration 42"\necho "done"\n' >/dev/null
+    kubectl apply -f - >/dev/null <<'YAML'
+    apiVersion: batch/v1
+    kind: Job
+    metadata: {name: migrate-v42, namespace: release}
+    spec:
+      backoffLimit: 1
+      template:
+        spec:
+          restartPolicy: Never
+          containers:
+          - name: migrate
+            image: busybox:1.37
+            command: ["sh", "/scripts/migrate.sh"]
+            volumeMounts: [{name: s, mountPath: /script}]
+          volumes: [{name: s, configMap: {name: migrate-script}}]
+    YAML
   check: |
     k_exists -n batch job report && kubectl -n batch wait --for=condition=complete job/report --timeout=60s >/dev/null 2>&1
-    check_eq "job succeeded" "$(kj -n batch job report '{.status.succeeded}')" "1"
-    check "output" 'kubectl -n batch logs job/report | grep -q "monthly report generated"'
+    check_eq "report job succeeded" "$(kj -n batch job report '{.status.succeeded}')" "1"
+    check "report output" 'kubectl -n batch logs job/report | grep -q "monthly report generated"'
+    k_exists -n release job migrate-v42 && kubectl -n release wait --for=condition=complete job/migrate-v42 --timeout=60s >/dev/null 2>&1
+    check_eq "migrate-v42 succeeded" "$(kj -n release job migrate-v42 '{.status.succeeded}')" "1"
+    check "migration ran" 'kubectl -n release logs job/migrate-v42 | grep -q "applying migration 42"'
   solve: |
     kubectl create job report -n batch --image=busybox:1.37 -- echo "monthly report generated"
+    kubectl get job migrate-v42 -n release -o json | jq 'del(.status, .metadata.resourceVersion, .metadata.uid, .metadata.creationTimestamp, .metadata.generation, .metadata.labels, .spec.selector, .spec.template.metadata.labels) | .spec.template.spec.containers[0].volumeMounts[0].mountPath="/scripts"' > /lab/job.json
+    kubectl delete job migrate-v42 -n release --wait=true
+    kubectl apply -f /lab/job.json
 
 - id: k8s-122
   title: Five thumbnails, two at a time
@@ -152,63 +196,6 @@ exercises:
           - {name: sync, image: "busybox:1.37", command: ["sh", "-c", "echo syncing; sleep 5"]}
     EOF
 
-- id: k8s-124
-  title: The Job that keeps failing
-  difficulty: 2
-  kind: fix
-  tags: [job, troubleshooting]
-  tutorial: |
-    **Concept.** When a Job's pods fail, the cause is almost always visible in the pod's logs or events. A Job's pod template is immutable, so fixing it means recreating the Job under the same name.
-
-    **Read up on:**
-    - `kubectl logs -l job-name=NAME` — pod logs selected by the Job label
-    - `kubectl describe pod` — events and exit codes
-    - `kubectl get configmap -o yaml` — see what is in a mounted script
-    - `kubectl get job -o yaml` — export and re-apply
-  scenario: |
-    The data-migration Job **`migrate-v42`** (namespace **`release`**) has failed. Look at
-    its pod logs, figure out the problem and run the migration **successfully** under the
-    same Job name. (The script lives in the ConfigMap `migrate-script`, which is correct.)
-  hints:
-    - "`kubectl logs -n release -l job-name=migrate-v42`"
-    - "A Job's pod template is immutable — delete the Job and create it again."
-  solution: |
-    ```bash
-    kubectl logs -n release -l job-name=migrate-v42 --tail=5
-    # sh: /scripts/migrate.sh: not found   (mounted at /script, called as /scripts/...)
-    kubectl get job migrate-v42 -n release -o json > /lab/job.json
-    # fix the mountPath (or the command), remove status/selector/controller-uid labels, recreate
-    kubectl delete job migrate-v42 -n release
-    kubectl apply -f /lab/job.json
-    ```
-  setup: |
-    k_ns release
-    kubectl -n release create configmap migrate-script --from-literal=migrate.sh=$'echo "applying migration 42"\necho "done"\n' >/dev/null
-    kubectl apply -f - >/dev/null <<'EOF'
-    apiVersion: batch/v1
-    kind: Job
-    metadata: {name: migrate-v42, namespace: release}
-    spec:
-      backoffLimit: 1
-      template:
-        spec:
-          restartPolicy: Never
-          containers:
-          - name: migrate
-            image: busybox:1.37
-            command: ["sh", "/scripts/migrate.sh"]
-            volumeMounts: [{name: s, mountPath: /script}]
-          volumes: [{name: s, configMap: {name: migrate-script}}]
-    EOF
-  check: |
-    k_exists -n release job migrate-v42 && kubectl -n release wait --for=condition=complete job/migrate-v42 --timeout=60s >/dev/null 2>&1
-    check_eq "migrate-v42 succeeded" "$(kj -n release job migrate-v42 '{.status.succeeded}')" "1"
-    check "migration ran" 'kubectl -n release logs job/migrate-v42 | grep -q "applying migration 42"'
-  solve: |
-    kubectl get job migrate-v42 -n release -o json | jq 'del(.status, .metadata.resourceVersion, .metadata.uid, .metadata.creationTimestamp, .metadata.generation, .metadata.labels, .spec.selector, .spec.template.metadata.labels) | .spec.template.spec.containers[0].volumeMounts[0].mountPath="/scripts"' > /lab/job.json
-    kubectl delete job migrate-v42 -n release --wait=true
-    kubectl apply -f /lab/job.json
-
 - id: k8s-125
   title: A nightly CronJob
   difficulty: 2
@@ -278,104 +265,62 @@ exercises:
     EOF
 
 - id: k8s-126
-  title: Run the CronJob now
-  difficulty: 1
-  kind: build
-  tags: [cronjob, manual-trigger]
+  title: Operate a CronJob
+  difficulty: 2
+  kind: fix
+  tags: [cronjob, manual-trigger, suspend, schedule]
   tutorial: |
-    **Concept.** You can create a one-off Job from an existing CronJob's template without waiting for its schedule or touching the CronJob.
+    **Concept.** A CronJob creates Jobs on a cron schedule, but you operate it with a few simple levers. You can create a one-off Job from its template without waiting for the schedule or touching the CronJob. You can pause it by flipping a spec field (existing Jobs continue; only new runs stop). And it only fires when its five-field schedule expression actually matches the clock, so a wrong expression means it silently never runs.
 
     **Read up on:**
     - `kubectl create job --help` — look for a flag that copies a template from another object
-    - `kubectl get cronjob -n NS` — find the CronJob
-    - `kubectl logs job/NAME` — verify the run
+    - `kubectl explain cronjob.spec` — find the field that pauses scheduling
+    - `kubectl patch --help` — changing a single field
+    - `kubectl get cronjob -o wide` — SCHEDULE, SUSPEND and LAST SCHEDULE columns
+    - `man 5 crontab` — field order and step syntax
     - `kubectl get jobs` — manual and scheduled Jobs show together
   scenario: |
-    The weekly **`invoice-run`** CronJob (namespace **`billing`**) must be run **right now**
-    because of a hotfix. Trigger it manually as a Job named **`invoice-run-manual`**,
-    using the CronJob's own template.
+    Three CronJobs in namespace **`billing`** need attention.
+
+    1. **`invoice-run`** (weekly) must be run **right now** because of a hotfix. Trigger it
+       manually as a Job named **`invoice-run-manual`**, using the CronJob's own template,
+       and make sure it completes.
+    2. The data warehouse is being migrated. Stop **`etl-hourly`** from creating new Jobs
+       — **without deleting it**.
+    3. **`cleanup`** is supposed to run **every 2 minutes**. It has never run once
+       (`LAST SCHEDULE: <none>`), although it isn't suspended. Fix it.
   hints:
     - "`kubectl create job NAME --from=cronjob/CRONJOB`"
+    - "Pausing is `spec.suspend`; `kubectl patch cronjob ... -p '{\"spec\":{\"suspend\":true}}'`."
+    - "Read the schedule of `cleanup` carefully. When would `0 0 31 2 *` fire? Every 2 minutes is `*/2 * * * *`."
   solution: |
     ```bash
     kubectl create job invoice-run-manual --from=cronjob/invoice-run -n billing
     kubectl logs job/invoice-run-manual -n billing
+
+    kubectl patch cronjob etl-hourly -n billing -p '{"spec":{"suspend":true}}'
+
+    kubectl get cronjob cleanup -n billing     # SCHEDULE 0 0 31 2 *   (31st of February...)
+    kubectl patch cronjob cleanup -n billing -p '{"spec":{"schedule":"*/2 * * * *"}}'
     ```
   setup: |
     k_ns billing
     kubectl -n billing create cronjob invoice-run --image=busybox:1.37 --schedule="0 6 * * 1" -- sh -c 'echo "invoices sent: 1287"' >/dev/null
+    kubectl -n billing create cronjob etl-hourly --image=busybox:1.37 --schedule="0 * * * *" -- echo etl >/dev/null
+    kubectl -n billing create cronjob cleanup --image=busybox:1.37 --schedule="0 0 31 2 *" -- sh -c 'echo cleaned' >/dev/null
   check: |
-    check_eq "created from the cronjob" "$(kj -n billing job invoice-run-manual '{.metadata.annotations.cronjob\.kubernetes\.io/instantiate}')" "manual"
+    check_eq "manual job created from the cronjob" "$(kj -n billing job invoice-run-manual '{.metadata.annotations.cronjob\.kubernetes\.io/instantiate}')" "manual"
     k_exists -n billing job invoice-run-manual && kubectl -n billing wait --for=condition=complete job/invoice-run-manual --timeout=60s >/dev/null 2>&1
-    check "it ran" 'kubectl -n billing logs job/invoice-run-manual | grep -q "invoices sent"'
+    check "manual run completed" 'kubectl -n billing logs job/invoice-run-manual | grep -q "invoices sent"'
+    check "invoice-run itself untouched" '[ "$(kj -n billing cronjob invoice-run "{.spec.schedule}")" = "0 6 * * 1" ]'
+    check_eq "etl-hourly suspended" "$(kj -n billing cronjob etl-hourly '{.spec.suspend}')" "true"
+    check "etl-hourly still exists" 'k_exists -n billing cronjob etl-hourly'
+    check_eq "cleanup schedule" "$(kj -n billing cronjob cleanup '{.spec.schedule}')" "*/2 * * * *"
+    check_not "cleanup not suspended" '[ "$(kj -n billing cronjob cleanup "{.spec.suspend}")" = true ]'
   solve: |
     kubectl create job invoice-run-manual --from=cronjob/invoice-run -n billing
-
-- id: k8s-127
-  title: Pause the CronJob
-  difficulty: 1
-  kind: build
-  tags: [cronjob, suspend]
-  tutorial: |
-    **Concept.** CronJobs can be paused without deletion by flipping a spec field. Existing Jobs continue; only new runs stop.
-
-    **Read up on:**
-    - `kubectl explain cronjob.spec` — find the field that pauses scheduling
-    - `kubectl patch --help` — changing a single field
-    - `kubectl get cronjob` — the SUSPEND column
-    - Kubernetes docs: CronJob, schedule suspension
-  scenario: |
-    The data warehouse is being migrated. Stop the **`etl-hourly`** CronJob (namespace
-    **`dwh`**) from creating new Jobs — **without deleting it**.
-  hints:
-    - "`spec.suspend`"
-  solution: |
-    ```bash
-    kubectl patch cronjob etl-hourly -n dwh -p '{"spec":{"suspend":true}}'
-    ```
-  setup: |
-    k_ns dwh
-    kubectl -n dwh create cronjob etl-hourly --image=busybox:1.37 --schedule="0 * * * *" -- echo etl >/dev/null
-  check: |
-    check_eq "suspended" "$(kj -n dwh cronjob etl-hourly '{.spec.suspend}')" "true"
-  solve: |
-    kubectl patch cronjob etl-hourly -n dwh -p '{"spec":{"suspend":true}}'
-
-- id: k8s-128
-  title: The CronJob that never fires
-  difficulty: 2
-  kind: fix
-  tags: [cronjob, schedule, troubleshooting]
-  tutorial: |
-    **Concept.** A CronJob only fires when its schedule expression matches the clock. The expression has five fields, and each one has its own range and syntax, so it pays to read it field by field.
-
-    **Read up on:**
-    - `kubectl get cronjob -o wide` — see the schedule and last schedule time
-    - `man 5 crontab` — field order and step syntax
-    - `kubectl describe cronjob` — events
-    - `kubectl get jobs -w` — watch for new runs
-  scenario: |
-    **`cleanup`** (namespace **`ops`**) is supposed to run **every 2 minutes**. It has
-    never run once (`LAST SCHEDULE: <none>`), although it isn't suspended.
-
-    Fix it, and make sure it actually runs.
-  hints:
-    - "Read the schedule carefully. When would `0 0 31 2 *` fire?"
-    - "Every 2 minutes is `*/2 * * * *`."
-  solution: |
-    ```bash
-    kubectl get cronjob cleanup -n ops     # SCHEDULE 0 0 31 2 *   (31st of February...)
-    kubectl patch cronjob cleanup -n ops -p '{"spec":{"schedule":"*/2 * * * *"}}'
-    kubectl get jobs -n ops -w
-    ```
-  setup: |
-    k_ns ops
-    kubectl -n ops create cronjob cleanup --image=busybox:1.37 --schedule="0 0 31 2 *" -- sh -c 'echo cleaned' >/dev/null
-  check: |
-    check_eq "schedule" "$(kj -n ops cronjob cleanup '{.spec.schedule}')" "*/2 * * * *"
-    check_not "not suspended" '[ "$(kj -n ops cronjob cleanup "{.spec.suspend}")" = true ]'
-  solve: |
-    kubectl patch cronjob cleanup -n ops -p '{"spec":{"schedule":"*/2 * * * *"}}'
+    kubectl patch cronjob etl-hourly -n billing -p '{"spec":{"suspend":true}}'
+    kubectl patch cronjob cleanup -n billing -p '{"spec":{"schedule":"*/2 * * * *"}}'
 
 - id: k8s-129
   title: An agent on every node
@@ -449,79 +394,45 @@ exercises:
     EOF
 
 - id: k8s-130
-  title: The DaemonSet that skips a node
-  difficulty: 2
+  title: DaemonSet rollout
+  difficulty: 3
   kind: fix
-  tags: [daemonset, tolerations, troubleshooting]
+  tags: [daemonset, tolerations, rolling-update, troubleshooting]
   tutorial: |
-    **Concept.** A DaemonSet's DESIRED count is the number of nodes its pods are eligible to run on. Scheduling rules on both the node and the pod side decide eligibility, so compare the two.
+    **Concept.** A DaemonSet's DESIRED count is the number of nodes its pods are eligible to run on. Scheduling rules on both the node and the pod side decide eligibility: control-plane nodes carry a taint that repels ordinary pods, so a DaemonSet needs a matching toleration to land there. DaemonSets also update with a strategy: `OnDelete` never replaces pods by itself, while `RollingUpdate` controls how many nodes may be without a ready pod at once. Changing the pod template (for example the image) triggers the rollout.
 
     **Read up on:**
     - `kubectl get nodes` and `kubectl describe node` — labels and taints
     - `kubectl get pods -o wide` — which nodes have a pod
     - `kubectl describe ds NAME` — events and node counts
-    - `kubectl explain pod.spec` — scheduling-related fields
-  scenario: |
-    The security agent DaemonSet **`falco-lite`** (namespace **`security`**) shows
-    `DESIRED 1` — but the cluster has **two** nodes and the agent must run on both.
-
-    Fix the DaemonSet.
-  hints:
-    - "Which node is missing, and what's special about it?"
-  solution: |
-    ```bash
-    kubectl get pods -n security -o wide    # only on node01
-    kubectl patch ds falco-lite -n security --type=json -p \
-      '[{"op":"add","path":"/spec/template/spec/tolerations","value":[{"key":"node-role.kubernetes.io/control-plane","operator":"Exists","effect":"NoSchedule"}]}]'
-    ```
-  setup: |
-    k_ns security
-    kubectl apply -f - >/dev/null <<'EOF'
-    apiVersion: apps/v1
-    kind: DaemonSet
-    metadata: {name: falco-lite, namespace: security}
-    spec:
-      selector: {matchLabels: {app: falco-lite}}
-      template:
-        metadata: {labels: {app: falco-lite}}
-        spec:
-          containers: [{name: agent, image: "busybox:1.37", command: ["sleep", "infinity"]}]
-    EOF
-  check: |
-    eventually 60 '[ "$(kj -n security ds falco-lite "{.status.numberReady}")" = 2 ]'
-    check_eq "desired/ready" "$(kj -n security ds falco-lite '{.status.desiredNumberScheduled}/{.status.numberReady}')" "2/2"
-  solve: |
-    kubectl patch ds falco-lite -n security --type=json -p '[{"op":"add","path":"/spec/template/spec/tolerations","value":[{"key":"node-role.kubernetes.io/control-plane","operator":"Exists","effect":"NoSchedule"}]}]'
-
-- id: k8s-131
-  title: Roll the agent out node by node
-  difficulty: 2
-  kind: build
-  tags: [daemonset, rolling-update]
-  tutorial: |
-    **Concept.** DaemonSets update with a strategy that controls how many nodes may be without a ready pod at once during a rollout. Changing the image triggers the rollout.
-
-    **Read up on:**
+    - `kubectl explain pod.spec.tolerations` — key, operator, effect
     - `kubectl explain daemonset.spec.updateStrategy` — type and rolling update settings
-    - `kubectl set image --help` — change a container's image
-    - `kubectl rollout status ds/NAME` — follow progress
-    - `kubectl get ds -o wide` — verify the image and READY count
+    - `kubectl set image --help` and `kubectl rollout status ds/NAME` — change an image and follow progress
   scenario: |
-    Upgrade the DaemonSet **`node-exporter`** (namespace **`monitoring`**) from
-    `nginx:1.28-alpine` to **`nginx:1.29-alpine`** (pretend it's an exporter), making sure
-    that at most **one node** is without a ready exporter at any time.
+    The metrics agent DaemonSet **`node-exporter`** (namespace **`monitoring`**, container
+    `exporter`, currently `nginx:1.28-alpine`) shows `DESIRED 1` — but the cluster has
+    **two** nodes and the agent must run on both.
+
+    1. Fix the DaemonSet so it is scheduled on **every** node, including the control plane.
+    2. Upgrade it to **`nginx:1.29-alpine`** (pretend it's an exporter), making sure that
+       at most **one node** is without a ready exporter at any time, and that pods are
+       actually replaced by the rollout.
   hints:
-    - "`spec.updateStrategy: {type: RollingUpdate, rollingUpdate: {maxUnavailable: 1}}`"
-    - "`kubectl set image ds/node-exporter ...`"
+    - "Which node is missing, and what's special about it? Tolerate `node-role.kubernetes.io/control-plane:NoSchedule`."
+    - "The current update strategy is `OnDelete`. Use `spec.updateStrategy: {type: RollingUpdate, rollingUpdate: {maxUnavailable: 1}}`."
+    - "`kubectl set image ds/node-exporter -n monitoring exporter=nginx:1.29-alpine`, then `kubectl rollout status`."
   solution: |
     ```bash
+    kubectl get pods -n monitoring -o wide    # only on node01
+    kubectl patch ds node-exporter -n monitoring --type=json -p \
+      '[{"op":"add","path":"/spec/template/spec/tolerations","value":[{"key":"node-role.kubernetes.io/control-plane","operator":"Exists","effect":"NoSchedule"}]}]'
     kubectl patch ds node-exporter -n monitoring -p '{"spec":{"updateStrategy":{"type":"RollingUpdate","rollingUpdate":{"maxUnavailable":1}}}}'
     kubectl set image ds/node-exporter -n monitoring exporter=nginx:1.29-alpine
     kubectl rollout status ds/node-exporter -n monitoring
     ```
   setup: |
     k_ns monitoring
-    kubectl apply -f - >/dev/null <<'EOF'
+    kubectl apply -f - >/dev/null <<'YAML'
     apiVersion: apps/v1
     kind: DaemonSet
     metadata: {name: node-exporter, namespace: monitoring}
@@ -531,16 +442,18 @@ exercises:
       template:
         metadata: {labels: {app: node-exporter}}
         spec:
-          tolerations: [{key: node-role.kubernetes.io/control-plane, operator: Exists, effect: NoSchedule}]
           containers: [{name: exporter, image: "nginx:1.28-alpine"}]
-    EOF
+    YAML
   check: |
     check_eq "update strategy" "$(kj -n monitoring ds node-exporter '{.spec.updateStrategy.type} {.spec.updateStrategy.rollingUpdate.maxUnavailable}')" "RollingUpdate 1"
+    check "tolerates the control plane" 'kj -n monitoring ds node-exporter "{.spec.template.spec.tolerations}" | grep -q "control-plane"'
     k_exists -n monitoring ds node-exporter && kubectl -n monitoring rollout status ds/node-exporter --timeout=90s >/dev/null 2>&1
-    live_images() { kubectl -n monitoring get pods -l app=node-exporter -o json | jq -r '.items[] | select(.metadata.deletionTimestamp == null) | .spec.containers[0].image' | sort -u; }
-    eventually 45 '[ "$(live_images)" = nginx:1.29-alpine ]'
-    check_eq "all pods run 1.29" "$(live_images)" "nginx:1.29-alpine"
+    live_images() { kubectl -n monitoring get pods -l app=node-exporter -o json | jq -r '.items[] | select(.metadata.deletionTimestamp == null) | .spec.containers[0].image' | sort | uniq -c | awk '{print $1" "$2}'; }
+    eventually 60 '[ "$(live_images)" = "2 nginx:1.29-alpine" ]'
+    check_eq "desired/ready" "$(kj -n monitoring ds node-exporter '{.status.desiredNumberScheduled}/{.status.numberReady}')" "2/2"
+    check_eq "both pods run 1.29" "$(live_images)" "2 nginx:1.29-alpine"
   solve: |
+    kubectl patch ds node-exporter -n monitoring --type=json -p '[{"op":"add","path":"/spec/template/spec/tolerations","value":[{"key":"node-role.kubernetes.io/control-plane","operator":"Exists","effect":"NoSchedule"}]}]'
     kubectl patch ds node-exporter -n monitoring -p '{"spec":{"updateStrategy":{"type":"RollingUpdate","rollingUpdate":{"maxUnavailable":1}}}}'
     kubectl set image ds/node-exporter -n monitoring exporter=nginx:1.29-alpine
 

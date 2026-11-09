@@ -218,35 +218,60 @@ exercises:
     kubectl apply -f /lab/pvc.json
 
 - id: k8s-104
-  title: Access mode mismatch
-  difficulty: 2
+  title: Triage three storage faults
+  difficulty: 3
   kind: fix
-  tags: [pv, pvc, access-modes]
+  tags: [pv, pvc, access-modes, finalizers, resourcequota, triage]
   tutorial: |
-    **Concept.** A claim only binds to a volume that offers the access modes it asks for. Access modes (ReadWriteOnce, ReadWriteMany, ReadOnlyMany) describe how many nodes may mount a volume at once. Some claim fields cannot be edited in place.
+    **Concept.** Storage problems rarely announce themselves; they show up as a claim stuck in `Pending`, a claim stuck in `Terminating`, or a request the API server refuses. Each has a different cause:
+
+    - A claim only binds to a volume that offers the access modes, size and class it asks for. Access modes (ReadWriteOnce, ReadWriteMany, ReadOnlyMany) describe how many nodes may mount a volume at once, and most claim fields cannot be edited in place.
+    - Kubernetes protects a claim that is in use: a finalizer keeps the PVC in `Terminating` until no pod uses it. Finalizers are a safety mechanism, so understand what they guard before touching them.
+    - A ResourceQuota caps aggregate consumption in a namespace, including storage and object counts. The API server rejects requests that would exceed it at admission time.
 
     **Read up on:**
-    - `kubectl get pv,pvc -o wide` — compare access modes side by side
-    - `kubectl describe pvc` — events say why a claim stays Pending
-    - `kubectl explain pvc.spec.accessModes` — the allowed values
-    - Kubernetes docs: Persistent Volumes, Access Modes
+    - `kubectl get pv,pvc -A -o wide` — compare access modes and classes side by side
+    - `kubectl describe pvc` — events say why a claim is Pending; Used By and finalizers explain Terminating
+    - `kubectl explain pvc.spec.accessModes` and `kubectl replace --help` — allowed values, and recreating an object
+    - `kubectl create quota --help` and `kubectl describe quota -n NS` — keys for `--hard`, Used versus Hard
+    - Kubernetes docs: Persistent Volumes (Access Modes), Storage Object in Use Protection, Resource Quotas
   scenario: |
-    The PVC **`shared-assets`** (namespace **`cms`**) stays `Pending` although a matching
-    hand-made PV **`assets-pv`** (5Gi, class `manual`) is `Available`.
+    Three tickets landed on your desk, one per namespace. Fix all three.
 
-    The volume will only ever be mounted by a single pod at a time. Fix the **claim** so it
-    binds to `assets-pv`.
+    1. **`cms`** — the PVC **`shared-assets`** stays `Pending` although a matching
+       hand-made PV **`assets-pv`** (5Gi, class `manual`) is `Available`. The volume will
+       only ever be mounted by a single pod at a time. Fix the **claim** (not the PV) so
+       it binds to `assets-pv`.
+    2. **`scratch`** — you ran `kubectl delete pvc tmp-scratch -n scratch` ten minutes ago
+       and it still shows `Terminating`. Nobody needs that data. Find what is holding it
+       and get the PVC deleted **properly** (don't strip finalizers by hand).
+    3. **`interns`** — this team keeps creating huge volumes. Limit the namespace to at
+       most **3 PVCs** and **2Gi of requested storage in total**. Then verify that a PVC
+       of 3Gi is **rejected** by the API.
   hints:
-    - "Compare `kubectl get pv assets-pv -o jsonpath='{.spec.accessModes}'` with the PVC's access modes."
+    - "1: compare `kubectl get pv assets-pv -o jsonpath='{.spec.accessModes}'` with the PVC's access modes; the claim's modes are immutable, so recreate it."
+    - "2: `kubectl describe pvc tmp-scratch -n scratch` shows *Used By*; the `kubernetes.io/pvc-protection` finalizer waits for that pod to go away."
+    - "3: ResourceQuota keys are `persistentvolumeclaims` and `requests.storage`; `kubectl create quota --hard=...` does it in one line."
   solution: |
     ```bash
-    kubectl get pv assets-pv -o jsonpath='{.spec.accessModes}'          # ["ReadWriteOnce"]
-    kubectl get pvc shared-assets -n cms -o jsonpath='{.spec.accessModes}'  # ["ReadWriteMany"]
-    kubectl get pvc shared-assets -n cms -o yaml > /lab/pvc.yaml   # change to ReadWriteOnce
-    kubectl replace --force -f /lab/pvc.yaml
+    # 1) claim asks ReadWriteMany, PV offers ReadWriteOnce -> recreate the claim as RWO
+    kubectl get pv assets-pv -o jsonpath='{.spec.accessModes}'
+    kubectl get pvc shared-assets -n cms -o jsonpath='{.spec.accessModes}'
+    kubectl get pvc shared-assets -n cms -o json | jq 'del(.status, .metadata.resourceVersion, .metadata.uid, .metadata.creationTimestamp) | .spec.accessModes=["ReadWriteOnce"]' > /lab/pvc.json
+    kubectl replace --force -f /lab/pvc.json
+
+    # 2) a pod still uses the claim -> remove the pod, the finalizer lets go by itself
+    kubectl describe pvc tmp-scratch -n scratch | grep -i 'used by'
+    kubectl delete pod scratch-runner -n scratch
+
+    # 3) quota
+    kubectl create quota storage -n interns --hard=persistentvolumeclaims=3,requests.storage=2Gi
     ```
   setup: |
     k_ns cms
+    k_ns scratch
+    k_ns interns
+    on_reset 'kubectl delete pv assets-pv --ignore-not-found --wait=false'
     kubectl apply -f - >/dev/null <<'EOF'
     apiVersion: v1
     kind: PersistentVolume
@@ -264,14 +289,49 @@ exercises:
       storageClassName: manual
       accessModes: [ReadWriteMany]
       resources: {requests: {storage: 5Gi}}
+    ---
+    apiVersion: v1
+    kind: PersistentVolumeClaim
+    metadata: {name: tmp-scratch, namespace: scratch}
+    spec:
+      accessModes: [ReadWriteOnce]
+      resources: {requests: {storage: 100Mi}}
+    ---
+    apiVersion: v1
+    kind: Pod
+    metadata: {name: scratch-runner, namespace: scratch}
+    spec:
+      terminationGracePeriodSeconds: 2
+      containers:
+      - {name: s, image: "busybox:1.37", command: ["sleep", "infinity"], volumeMounts: [{name: d, mountPath: /scratch}]}
+      volumes:
+      - {name: d, persistentVolumeClaim: {claimName: tmp-scratch}}
     EOF
+    kubectl -n scratch wait --for=condition=Ready pod/scratch-runner --timeout=90s >/dev/null
+    kubectl -n scratch delete pvc tmp-scratch --wait=false >/dev/null
   check: |
     eventually 15 '[ "$(kj -n cms pvc shared-assets "{.status.phase}")" = Bound ]'
-    check_eq "bound to assets-pv" "$(kj -n cms pvc shared-assets '{.status.phase} {.spec.volumeName}')" "Bound assets-pv"
+    check_eq "shared-assets bound to assets-pv" "$(kj -n cms pvc shared-assets '{.status.phase} {.spec.volumeName}')" "Bound assets-pv"
     check_eq "PV unchanged" "$(kj pv assets-pv '{.spec.accessModes[*]}')" "ReadWriteOnce"
+    eventually 30 '! k_exists -n scratch pvc tmp-scratch'
+    check "tmp-scratch PVC is gone" '! k_exists -n scratch pvc tmp-scratch'
+    check "the pod using it is gone" '! k_exists -n scratch pod scratch-runner'
+    q=$(kubectl -n interns get resourcequota -o json | jq -c '[.items[].spec.hard] | add')
+    check_eq "PVC count limit" "$(jq -r '.persistentvolumeclaims' <<<"$q")" "3"
+    check_eq "storage limit" "$(jq -r '."requests.storage"' <<<"$q")" "2Gi"
+    check_not "a 3Gi PVC is rejected" 'kubectl create --dry-run=server -f - <<EOF
+    apiVersion: v1
+    kind: PersistentVolumeClaim
+    metadata: {name: kl-big, namespace: interns}
+    spec:
+      accessModes: [ReadWriteOnce]
+      resources: {requests: {storage: 3Gi}}
+    EOF'
   solve: |
     kubectl get pvc shared-assets -n cms -o json | jq 'del(.status, .metadata.resourceVersion, .metadata.uid, .metadata.creationTimestamp) | .spec.accessModes=["ReadWriteOnce"]' > /lab/pvc.json
     kubectl replace --force -f /lab/pvc.json
+    kubectl delete pod scratch-runner -n scratch
+    kubectl create quota storage -n interns --hard=persistentvolumeclaims=3,requests.storage=2Gi
 
 - id: k8s-105
   title: A storage class that keeps your data
@@ -971,62 +1031,6 @@ exercises:
   solve: |
     kubectl delete pod exporter-v1 -n etl
 
-- id: k8s-115
-  title: A PVC that won't delete
-  difficulty: 2
-  kind: fix
-  tags: [pvc, finalizers, pvc-protection]
-  tutorial: |
-    **Concept.** Kubernetes protects a claim that is in use: a finalizer keeps the PVC in Terminating until deletion is safe. Finalizers are a safety mechanism, so understand what they guard before touching them.
-
-    **Read up on:**
-    - `kubectl describe pvc` — shows finalizers and which pods use the claim
-    - `kubectl get pod -o yaml` — look under volumes to see claim references
-    - `kubectl explain pvc.metadata.finalizers` — what finalizers are
-    - Kubernetes docs: Storage Object in Use Protection
-  scenario: |
-    You ran `kubectl delete pvc tmp-scratch -n lab` ten minutes ago and it still shows
-    **`Terminating`**. Nobody needs that data.
-
-    Find out what's holding it and get the PVC deleted **properly** (don't strip
-    finalizers by hand).
-  hints:
-    - "The `kubernetes.io/pvc-protection` finalizer keeps a PVC while a pod uses it."
-    - "`kubectl describe pvc tmp-scratch -n lab` → *Used By*."
-  solution: |
-    ```bash
-    kubectl describe pvc tmp-scratch -n lab | grep -i 'used by'
-    kubectl delete pod scratch-runner -n lab
-    kubectl get pvc -n lab    # gone
-    ```
-  setup: |
-    k_ns lab
-    kubectl apply -f - >/dev/null <<'EOF'
-    apiVersion: v1
-    kind: PersistentVolumeClaim
-    metadata: {name: tmp-scratch, namespace: lab}
-    spec:
-      accessModes: [ReadWriteOnce]
-      resources: {requests: {storage: 100Mi}}
-    ---
-    apiVersion: v1
-    kind: Pod
-    metadata: {name: scratch-runner, namespace: lab}
-    spec:
-      terminationGracePeriodSeconds: 2
-      containers:
-      - {name: s, image: "busybox:1.37", command: ["sleep", "infinity"], volumeMounts: [{name: d, mountPath: /scratch}]}
-      volumes: [{name: d, persistentVolumeClaim: {claimName: tmp-scratch}}]
-    EOF
-    kubectl -n lab wait --for=condition=Ready pod/scratch-runner --timeout=90s >/dev/null
-    kubectl -n lab delete pvc tmp-scratch --wait=false >/dev/null
-  check: |
-    eventually 30 '! k_exists -n lab pvc tmp-scratch'
-    check "PVC is gone" '! k_exists -n lab pvc tmp-scratch'
-    check "the pod using it is gone" '! k_exists -n lab pod scratch-runner'
-  solve: |
-    kubectl delete pod scratch-runner -n lab
-
 - id: k8s-116
   title: Read-only access to shared content
   difficulty: 2
@@ -1187,40 +1191,6 @@ exercises:
     kubectl -n cache exec redis-0 -- redis-cli set greeting hello
     kubectl -n cache delete pod redis-0
     kubectl -n cache wait --for=condition=Ready pod/redis-0 --timeout=90s
-
-- id: k8s-118
-  title: Storage budget per team
-  difficulty: 3
-  kind: build
-  tags: [resourcequota, storage]
-  tutorial: |
-    **Concept.** A ResourceQuota caps aggregate consumption in a namespace, including storage and object counts. The API server rejects requests that would exceed it at admission time.
-
-    **Read up on:**
-    - `kubectl create quota --help` — imperative creation and its `--hard` option
-    - `kubectl explain resourcequota.spec.hard` — quota key names
-    - `kubectl describe quota -n NS` — Used versus Hard
-    - Kubernetes docs: Resource Quotas, storage resource quota
-  scenario: |
-    Team **`interns`** keeps creating huge volumes. Limit their namespace **`interns`** to
-    at most **3 PVCs** and **2Gi of requested storage in total**.
-
-    Then verify: a PVC of 3Gi must be **rejected** by the API.
-  hints:
-    - "ResourceQuota keys: `persistentvolumeclaims` and `requests.storage`."
-  solution: |
-    ```bash
-    kubectl create quota storage -n interns --hard=persistentvolumeclaims=3,requests.storage=2Gi
-    ```
-  setup: |
-    k_ns interns
-  check: |
-    q=$(kubectl -n interns get resourcequota -o json | jq -c '[.items[].spec.hard] | add')
-    check_eq "PVC count limit" "$(jq -r '.persistentvolumeclaims' <<<"$q")" "3"
-    check_eq "storage limit" "$(jq -r '."requests.storage"' <<<"$q")" "2Gi"
-    check_not "a 3Gi PVC is rejected" 'printf "apiVersion: v1\nkind: PersistentVolumeClaim\nmetadata: {name: kl-big, namespace: interns}\nspec:\n  accessModes: [ReadWriteOnce]\n  resources: {requests: {storage: 3Gi}}\n" | kubectl create --dry-run=server -f -'
-  solve: |
-    kubectl create quota storage -n interns --hard=persistentvolumeclaims=3,requests.storage=2Gi
 
 - id: k8s-119
   title: StatefulSet stuck on a bad template
