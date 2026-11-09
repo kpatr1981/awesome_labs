@@ -5,187 +5,400 @@ order: 10
 exercises:
 
 - id: docker-181
-  title: Forensics on a crashed container
-  difficulty: 2
-  kind: build
-  tags: [forensics, cp, exited]
+  title: Read the evidence of a dead container
+  difficulty: 3
+  kind: fix
+  tags: [forensics, cp, exited, logging, restart-loop, troubleshooting]
   tutorial: |
-    **Concept.** A stopped container keeps its filesystem until removed, so files inside can still be read without starting it. Copying does not require the container to be running.
+    **Concept.** When a container fails, the temptation is to start it again and watch. That often destroys the evidence, and it is rarely necessary, because docker keeps more than you might expect.
+
+    - A **stopped container keeps its filesystem** until it is removed. Files inside it can be copied out without starting it, and `docker diff` shows what it changed.
+    - `docker logs` is only as good as the **logging driver**. Some drivers keep nothing that docker can read back, so the output is lost. Logging options are fixed when a container is created, which means changing them means recreating it, with everything else the same.
+    - A **restart policy can hide a permanent failure**. The container looks alive for a moment, then dies, again and again. The restart count tells you it is looping; the last log lines tell you why. Paths in an error message are paths **inside the container**, so compare them with what is really mounted there.
+
+    A good order of work: find out what state the container is in, read what it left behind, and change something only once you can name the cause.
 
     **Read up on:**
-    - `docker ps -a` — find stopped containers
-    - `docker cp --help` — copying between container and host, direction syntax
-    - `docker diff` — what changed in the container
-    - `docker logs` — last output before the crash
+    - `docker ps -a` — stopped containers and their exit codes
+    - `docker cp --help` — copying between container and host, and which direction is which
+    - `docker diff` — what changed in a container's filesystem
+    - `docker inspect` — `.State`, `.RestartCount`, `.Mounts`, `.Config.Cmd`, `.HostConfig.LogConfig`, `.HostConfig.RestartPolicy`
+    - `docker logs --tail` — the last output before the crash
+    - Docker docs 'Configure logging drivers' — which drivers support reading
+    - nginx `ssl_certificate` directive — and the `-v` option of `docker run` for read-only mounts
   scenario: |
-    The **`importer`** container crashed last night and wrote a crash report to
+    Last night's incident left three casualties on this host. You have the morning to find
+    out what happened to each of them, without making the evidence worse.
+
+    ## Part 1: The crash report
+
+    The **`importer`** container crashed and wrote a crash report to
     **`/var/crash/report.txt`** inside its filesystem before dying. It's stopped, not
-    removed. Don't start it again (it would overwrite the report).
+    removed. **Don't start it again** (it would overwrite the report).
 
     Copy the report out to **`/lab/crash-report.txt`**.
+
+    ## Part 2: The container that logs nothing
+
+    **`ingest`** keeps crashing and restarting, but `docker logs ingest` says *configured
+    logging driver does not support reading*. You have no idea why it crashes.
+
+    1. Recreate **`ingest`** (same image, command and restart policy) with the default
+       **json-file** logging so you can read its output.
+    2. Find the error code it prints before crashing (format `ERR-XXXX`) and write it to
+       **`/lab/ingest-error.txt`**.
+
+    ## Part 3: The restart loop
+
+    **`gateway`** (nginx, port **8197**, restart `always`) has restarted hundreds of
+    times. Its TLS configuration in **`/lab/gw/conf.d/tls.conf`** expects the certificate
+    files to be mounted at **`/etc/nginx/certs`** — they are in **`/lab/gw/certs`** on the
+    host.
+
+    Get **`gateway`** stable: HTTPS on **8443**, the plain-HTTP port **8197** still
+    serving the site. Don't change the nginx config files.
   hints:
-    - "`docker cp` works on stopped containers too."
+    - "Part 1: `docker cp` works on stopped containers too."
+    - "Part 2: `docker inspect ingest --format '{{.HostConfig.LogConfig.Type}}'` gives `none`. Take the command from `{{json .Config.Cmd}}` and the policy from `{{.HostConfig.RestartPolicy.Name}}` before you remove it."
+    - "Part 3: `docker logs gateway | tail` — nginx tells you which file it can't open. Then `docker inspect gateway --format '{{json .Mounts}}'` shows what is really mounted."
   solution: |
+    **Part 1.** Copying needs no running container:
     ```bash
     docker ps -a --filter name=importer
     docker cp importer:/var/crash/report.txt /lab/crash-report.txt
     ```
+
+    **Part 2.** The `none` driver throws the output away. Recreate without it, then read:
+    ```bash
+    docker inspect ingest --format '{{json .Config.Cmd}} {{.HostConfig.RestartPolicy.Name}}'
+    cmd=$(docker inspect -f '{{index .Config.Cmd 2}}' ingest)
+    docker rm -f ingest
+    docker run -d --name ingest --restart always busybox:1.37 sh -c "$cmd"
+    sleep 4; docker logs ingest 2>&1 | grep -o 'ERR-[0-9]*' | head -1 > /lab/ingest-error.txt
+    ```
+
+    **Part 3.** The certificates were never mounted, so nginx exits at startup and the
+    restart policy keeps trying:
+    ```bash
+    docker logs --tail 3 gateway   # cannot load certificate "/etc/nginx/certs/gw.crt"
+    docker rm -f gateway
+    docker run -d --name gateway --restart always -p 8197:80 -p 8443:443 \
+      -v /lab/gw/conf.d:/etc/nginx/conf.d:ro -v /lab/gw/certs:/etc/nginx/certs:ro nginx:1.28-alpine
+    ```
   setup: |
-    id="CRASH-$RANDOM"; echo "$id" > $KL_STATE/answer
+    # --- part 1: The crash report ---
+    id="CRASH-$RANDOM"; echo "$id" > $KL_STATE/answer-importer
     docker run --name importer busybox:1.37 sh -c "mkdir -p /var/crash; echo 'segfault in parser, incident $id' > /var/crash/report.txt; exit 139" >/dev/null 2>&1 || true
-    docker inspect -f '{{.State.FinishedAt}}' importer >> $KL_STATE/answer
+    docker inspect -f '{{.State.FinishedAt}}' importer >> $KL_STATE/answer-importer
+
+    # --- part 2: The container that logs nothing ---
+    code="ERR-$((RANDOM % 9000 + 1000))"; echo "$code" > $KL_STATE/answer-ingest
+    docker run -d --name ingest --restart always --log-driver none busybox:1.37 sh -c "echo starting ingest; sleep 1; echo 'fatal: upstream rejected batch ($code)'; exit 1" >/dev/null
+    docker inspect -f '{{json .Config.Cmd}}' ingest >> $KL_STATE/answer-ingest
+
+    # --- part 3: The restart loop ---
+    mkdir -p /lab/gw/conf.d /lab/gw/certs
+    openssl req -x509 -newkey rsa:2048 -nodes -days 30 -subj "/CN=gw.lab" -keyout /lab/gw/certs/gw.key -out /lab/gw/certs/gw.crt 2>/dev/null
+    chmod 644 /lab/gw/certs/gw.key
+    printf 'server {\n  listen 80;\n  root /usr/share/nginx/html;\n}\n' > /lab/gw/conf.d/http.conf
+    printf 'server {\n  listen 443 ssl;\n  ssl_certificate /etc/nginx/certs/gw.crt;\n  ssl_certificate_key /etc/nginx/certs/gw.key;\n  root /usr/share/nginx/html;\n}\n' > /lab/gw/conf.d/tls.conf
+    chown -R $(lab_user): /lab/gw
+    sha256sum /lab/gw/conf.d/*.conf > $KL_STATE/answer-gw
+    docker run -d --name gateway --restart always -p 8197:80 -p 8443:443 -v /lab/gw/conf.d:/etc/nginx/conf.d:ro nginx:1.28-alpine >/dev/null
   check: |
-    check "report copied" "grep -q '$(head -1 $KL_STATE/answer)' /lab/crash-report.txt"
-    check_eq "importer was not restarted" "$(c_get importer '{{.State.FinishedAt}}')" "$(sed -n 2p $KL_STATE/answer)"
+    info "Part 1: The crash report"
+    check "report copied" "grep -q '$(head -1 $KL_STATE/answer-importer)' /lab/crash-report.txt"
+    check_eq "importer was not restarted" "$(c_get importer '{{.State.FinishedAt}}')" "$(sed -n 2p $KL_STATE/answer-importer)"
+
+    info "Part 2: The container that logs nothing"
+    check_eq "log driver" "$(c_get ingest '{{.HostConfig.LogConfig.Type}}')" "json-file"
+    check_eq "same command" "$(c_get ingest '{{json .Config.Cmd}}')" "$(sed -n 2p $KL_STATE/answer-ingest)"
+    check_eq "restart policy" "$(c_get ingest '{{.HostConfig.RestartPolicy.Name}}')" "always"
+    check_eq "error code" "$(tr -d '[:space:]' < /lab/ingest-error.txt 2>/dev/null)" "$(head -1 $KL_STATE/answer-ingest)"
+
+    info "Part 3: The restart loop"
+    check "config files unchanged" 'sha256sum -c --quiet $KL_STATE/answer-gw'
+    check "gateway is running" 'c_running gateway'
+    r1=$(c_get gateway '{{.RestartCount}}'); sleep 4; r2=$(c_get gateway '{{.RestartCount}}')
+    check "gateway is stable (restarts $r1 → $r2)" "[ '$r1' = '$r2' ]"
+    check "HTTPS on 8443" 'curl -fsk https://localhost:8443/ | grep -q nginx'
+    check "HTTP on 8197" 'http_get localhost:8197 | grep -q nginx'
   solve: |
+    # --- part 1: The crash report ---
     docker cp importer:/var/crash/report.txt /lab/crash-report.txt
 
+    # --- part 2: The container that logs nothing ---
+    cmd=$(docker inspect -f '{{index .Config.Cmd 2}}' ingest)
+    docker rm -f ingest
+    docker run -d --name ingest --restart always busybox:1.37 sh -c "$cmd"
+    sleep 4
+    docker logs ingest 2>&1 | grep -o 'ERR-[0-9]*' | head -1 > /lab/ingest-error.txt
+
+    # --- part 3: The restart loop ---
+    docker rm -f gateway
+    docker run -d --name gateway --restart always -p 8197:80 -p 8443:443 -v /lab/gw/conf.d:/etc/nginx/conf.d:ro -v /lab/gw/certs:/etc/nginx/certs:ro nginx:1.28-alpine
+
 - id: docker-182
-  title: Wrong time zone in the logs
-  difficulty: 2
+  title: Where a setting really comes from
+  difficulty: 3
   kind: fix
-  tags: [timezone, env]
+  tags: [env, timezone, compose, precedence]
   tutorial: |
-    **Concept.** Most Linux programs take the time zone from the `TZ` environment variable or `/etc/localtime`. Container settings are fixed at creation, so changing one means recreating the container.
+    **Concept.** A surprising value is rarely random: it comes from somewhere specific, and the job is to trace it to its source instead of adding one more place that sets it.
+
+    A container's environment is **decided when the container is created**. It can come from the image, from `docker run`, or from compose. Editing a file afterwards changes nothing until the container is recreated. Many behaviours that look like system settings are really environment variables: most Linux programs take their **time zone** from `TZ` (or `/etc/localtime`), provided the image contains the zone files.
+
+    Compose adds layers of its own, and two different jobs get confused:
+
+    - **Interpolation** fills in `${VAR}` placeholders in the compose file itself, while compose reads the file.
+    - **Container environment** is what the process actually sees. Several keys in a service can set it, so one variable can be defined in more than one place and only one of them wins.
+
+    `docker compose config` shows the result after all of that, and `printenv` inside the container is the final word.
 
     **Read up on:**
-    - `man tzset` — how TZ is interpreted
-    - `docker run --help` — environment variable option
-    - `docker inspect` — `.Config.Cmd` and `.Config.Env` to repeat the old setup
-    - Debian `tzdata` — do zone files exist in the image?
+    - `man tzset` — how `TZ` is interpreted
+    - `docker run --help` — the environment variable option
+    - `docker inspect` — `.Config.Cmd` and `.Config.Env`, to repeat the old setup exactly
+    - Debian `tzdata` — do the zone files exist in the image?
+    - Compose docs 'Environment variables precedence' and 'Interpolation'
+    - `docker compose config` — see the resolved values
+    - `env | grep` — is a variable exported in your own shell?
   scenario: |
+    Two teams have opened tickets about values that are "obviously" set correctly, and
+    aren't. Trace each one to its source and fix it there.
+
+    ## Part 1: The wrong time zone
+
     The finance team reads the **`ledger-report`** container's timestamps as Athens time,
     but it prints UTC.
 
     Recreate **`ledger-report`** (`debian:bookworm-slim`, same command) so that `date`
     inside it shows the **Europe/Athens** time zone.
+
+    ## Part 2: Which value wins?
+
+    In **`/lab/precedence`**, the **`api`** service must run with **`LOG_LEVEL=debug`**.
+    The developer set it in `.env`, but the container still shows `warn`.
+
+    Find out where `warn` comes from and fix the project so `LOG_LEVEL` is `debug`,
+    **without** deleting `api.env` (it holds other settings the service needs, and
+    `DB_HOST` must still reach the container).
   hints:
-    - "Most images honour the `TZ` environment variable if time-zone data is installed."
+    - "Part 1: most images honour the `TZ` environment variable if time-zone data is installed. Copy the command from `docker inspect ledger-report --format '{{json .Config.Cmd}}'`."
+    - "Part 2: `.env` is only for **substitution** in the compose file; `env_file:` sets container variables; `environment:` beats `env_file:`."
+    - "Part 2: `docker compose config` shows the final environment. Remember to run `docker compose up -d` after changing the file."
   solution: |
+    **Part 1.** `TZ` has to be set when the container is created:
     ```bash
     docker rm -f ledger-report
     docker run -d --name ledger-report -e TZ=Europe/Athens debian:bookworm-slim \
       sh -c 'while true; do date; sleep 10; done'
     docker exec ledger-report date +%Z      # EET or EEST
     ```
+
+    **Part 2.** `compose.yaml` hard-codes `LOG_LEVEL: warn` under `environment:`, which
+    beats `api.env`, and `.env` only feeds substitution. Make the key use the `.env` value:
+    ```bash
+    cd /lab/precedence
+    docker compose config | grep -A5 environment
+    sed -i 's/LOG_LEVEL: warn/LOG_LEVEL: ${LOG_LEVEL:-info}/' compose.yaml
+    docker compose up -d
+    ```
   setup: |
+    # --- part 1: The wrong time zone ---
     docker run -d --name ledger-report debian:bookworm-slim sh -c 'while true; do date; sleep 10; done' >/dev/null
+
+    # --- part 2: Which value wins? ---
+    D=/lab/precedence; mkdir -p $D
+    echo "LOG_LEVEL=debug" > $D/.env
+    printf 'DB_HOST=db\nLOG_LEVEL=error\nREGION=eu\n' > $D/api.env
+    printf 'services:\n  api:\n    image: busybox:1.37\n    command: sleep infinity\n    env_file: api.env\n    environment:\n      LOG_LEVEL: warn\n' > $D/compose.yaml
+    chown -R $(lab_user): $D
+    as_user "cd $D && docker compose up -d" >/dev/null 2>&1
   check: |
+    info "Part 1: The wrong time zone"
     check "ledger-report is running" 'c_running ledger-report'
     check_match "time zone" "$(docker exec ledger-report date +%Z 2>/dev/null)" '^EES?T$'
     check_eq "same command" "$(c_get ledger-report '{{json .Config.Cmd}}')" '["sh","-c","while true; do date; sleep 10; done"]'
+
+    info "Part 2: Which value wins?"
+    check "api.env still exists" 'test -f /lab/precedence/api.env'
+    check_eq "LOG_LEVEL in the container" "$(cc_exec precedence api printenv LOG_LEVEL 2>/dev/null)" "debug"
+    check_eq "DB_HOST from api.env" "$(cc_exec precedence api printenv DB_HOST 2>/dev/null)" "db"
   solve: |
+    # --- part 1: The wrong time zone ---
     docker rm -f ledger-report
     docker run -d --name ledger-report -e TZ=Europe/Athens debian:bookworm-slim sh -c 'while true; do date; sleep 10; done'
 
+    # --- part 2: Which value wins? ---
+    sed -i 's/LOG_LEVEL: warn/LOG_LEVEL: ${LOG_LEVEL:-info}/' /lab/precedence/compose.yaml
+    (cd /lab/precedence && docker compose up -d)
+
 - id: docker-183
-  title: "exec /entrypoint.sh: permission denied"
+  title: The image isn't what you think
   difficulty: 3
   kind: fix
-  tags: [dockerfile, permissions, entrypoint]
+  tags: [dockerfile, permissions, entrypoint, dockerignore, build-context]
   tutorial: |
-    **Concept.** A container started with a non-executable entrypoint fails with permission denied (exit 126). File modes are carried into the image by COPY, so the build must set them.
+    **Concept.** A successful build proves only that the Dockerfile ran. What is inside the image, and with which permissions, is a separate question, and you can simply look.
+
+    `COPY` brings files in **with the modes they have in the build context**. If the file was not executable on the developer's machine, it is not executable in the image, and a container whose entrypoint can't be executed fails immediately. The exit status tells you a lot: docker reserves **125** for its own errors, **126** for a command it found but could not run, and **127** for a command it could not find.
+
+    `COPY . .` copies **everything in the build context**, including files that exist only on one person's laptop. Those files then ship to production, and anything in the app that looks for them behaves differently there. A `.dockerignore` file decides what the context contains in the first place.
+
+    To see the truth, run a shell or `ls` from the image, overriding the entrypoint if it is the part that is broken.
 
     **Read up on:**
-    - `docker run` exit codes — 125, 126, 127 meaning
-    - Dockerfile docs `COPY --chmod` and `RUN chmod`
-    - `ls -l` inside the image: `docker run --rm --entrypoint ls agent:1.0 -l /`
-    - `git update-index --chmod` — why the mode was lost
+    - `docker run` exit codes — what 125, 126 and 127 mean
+    - Dockerfile docs — `COPY --chmod` and `RUN chmod`
+    - `docker run --rm --entrypoint ls IMAGE -l /` — look inside an image whose entrypoint is broken
+    - `git update-index --chmod` — why an executable bit gets lost
+    - Docker docs '.dockerignore file'
+    - Dockerfile `COPY` — which files it picks up
   scenario: |
+    Two images pass CI and then misbehave as soon as somebody runs them. In both cases, the
+    image doesn't contain quite what its authors believe. Look inside, then fix the build.
+
+    ## Part 1: exec /entrypoint.sh: permission denied
+
     **`/lab/agent`** builds fine, but `docker run --rm agent:1.0` fails with
     *permission denied* (exit code **126**). The developer works on a filesystem that
     doesn't keep the executable bit.
 
-    Fix the **Dockerfile** (not the file on disk — assume you can't change its mode in
-    git) so the image works. Rebuild **`agent:1.0`**.
+    Fix the **Dockerfile** (not the file on disk — `entrypoint.sh` must stay mode `644`,
+    assume you can't change its mode in git) so the image works. Rebuild **`agent:1.0`**.
+
+    ## Part 2: Works on my machine
+
+    The **`geo-api`** image built from **`/lab/geo-api`** tries to connect to
+    **`localhost:5432`** in production, although the production config clearly says
+    `db.prod.internal`. On the developer's laptop everything works.
+
+    Find out why and fix the **build** (don't delete the developer's local file
+    `config.local.json` — they need it). Rebuild **`geo-api:1.0`**;
+    `docker run --rm geo-api:1.0` must print `connecting to db.prod.internal:5432`.
   hints:
-    - "Exit code 126 = found but not executable."
-    - "`COPY --chmod=755 ...` sets the mode at copy time (BuildKit)."
+    - "Part 1: exit code 126 means found but not executable. `docker run --rm --entrypoint ls agent:1.0 -l /entrypoint.sh` shows the mode."
+    - "Part 1: `COPY --chmod=755 ...` sets the mode at copy time (BuildKit)."
+    - "Part 2: `docker run --rm geo-api:1.0 ls -la /app` — which config files ended up in the image? Read `app.py`: which file wins?"
+    - "Part 2: you want the file on disk but not in the build context."
   solution: |
+    **Part 1.** Set the mode while copying, so the state of the file on disk stops mattering:
     ```dockerfile
     FROM alpine:3.22
     COPY --chmod=755 entrypoint.sh /entrypoint.sh
     ENTRYPOINT ["/entrypoint.sh"]
     ```
+    ```bash
+    docker build -t agent:1.0 /lab/agent
+    docker run --rm agent:1.0
+    ```
+
+    **Part 2.** The app prefers `config.local.json` when present, and `COPY . .` shipped the
+    developer's local override into the image:
+    ```bash
+    docker run --rm geo-api:1.0 ls /app      # config.json  config.local.json  app.py ...
+    echo "config.local.json" >> /lab/geo-api/.dockerignore
+    docker build -t geo-api:1.0 /lab/geo-api
+    docker run --rm geo-api:1.0
+    ```
   setup: |
+    # --- part 1: exec /entrypoint.sh: permission denied ---
     D=/lab/agent; mkdir -p $D
     printf '#!/bin/sh\necho "agent registered with $(hostname)"\n' > $D/entrypoint.sh
     chmod 644 $D/entrypoint.sh
     printf 'FROM alpine:3.22\nCOPY entrypoint.sh /entrypoint.sh\nENTRYPOINT ["/entrypoint.sh"]\n' > $D/Dockerfile
     chown -R $(lab_user): $D
+    as_user "docker build -q -t agent:1.0 $D" >/dev/null 2>&1
+
+    # --- part 2: Works on my machine ---
+    D=/lab/geo-api; mkdir -p $D
+    echo '{"db_host": "db.prod.internal", "db_port": 5432}' > $D/config.json
+    echo '{"db_host": "localhost", "db_port": 5432}' > $D/config.local.json
+    cat > $D/app.py <<'EOF'
+    import json, os
+    path = "config.local.json" if os.path.exists("config.local.json") else "config.json"
+    cfg = json.load(open(path))
+    print(f"connecting to {cfg['db_host']}:{cfg['db_port']}")
+    EOF
+    printf 'FROM python:3.12-alpine\nWORKDIR /app\nCOPY . .\nCMD ["python", "app.py"]\n' > $D/Dockerfile
+    chown -R $(lab_user): $D
+    as_user "docker build -q -t geo-api:1.0 $D" >/dev/null
   check: |
+    info "Part 1: exec /entrypoint.sh: permission denied"
     check_eq "entrypoint.sh on disk is still 644" "$(stat -c %a /lab/agent/entrypoint.sh)" "644"
     check "agent:1.0 runs" 'docker run --rm agent:1.0 | grep -q "agent registered"'
+
+    info "Part 2: Works on my machine"
+    check "config.local.json still exists on disk" 'test -f /lab/geo-api/config.local.json'
+    check_eq "geo-api:1.0 output" "$(docker run --rm geo-api:1.0 2>/dev/null)" "connecting to db.prod.internal:5432"
   solve: |
+    # --- part 1: exec /entrypoint.sh: permission denied ---
     printf 'FROM alpine:3.22\nCOPY --chmod=755 entrypoint.sh /entrypoint.sh\nENTRYPOINT ["/entrypoint.sh"]\n' > /lab/agent/Dockerfile
     docker build -t agent:1.0 /lab/agent
 
+    # --- part 2: Works on my machine ---
+    echo "config.local.json" >> /lab/geo-api/.dockerignore
+    docker build -t geo-api:1.0 /lab/geo-api
+
 - id: docker-184
-  title: Unhealthy forever
+  title: Health checks that lie
   difficulty: 3
   kind: fix
-  tags: [healthcheck, troubleshooting]
+  tags: [healthcheck, timeouts, troubleshooting]
   tutorial: |
-    **Concept.** A health check is a command the daemon runs inside the container; its exit status decides healthy or unhealthy. The command must work with tools available inside the image.
+    **Concept.** A health status is not a measurement of your service. It is the exit status of one command the daemon runs **inside the container**, on a schedule, and that command can be wrong in ways that have nothing to do with the app. A service that works perfectly can be reported as unhealthy, and load balancers will believe the report.
+
+    Three things commonly go wrong:
+
+    - The probe tests the wrong thing: another port, another path, or a tool the image doesn't include.
+    - The probe is right, but its **timeout** is shorter than the endpoint's honest response time, so every attempt counts as a failure.
+    - The schedule (**interval**, **retries**, **start period**) doesn't match how the service behaves.
+
+    Docker keeps the recent probe results, including their output and when they ran, so you can read the actual failure instead of guessing. You can also run the probe by hand with `docker exec`. Remember where each setting lives: `docker run` flags apply to one container, while a Dockerfile `HEALTHCHECK` travels with the image and needs a rebuild and a new container.
 
     **Read up on:**
-    - `docker inspect` — `.State.Health.Log`
-    - `docker run --help` — `--health-*` options
-    - Dockerfile `HEALTHCHECK` instruction
-    - `docker exec <c> <check-command>` — run it by hand
+    - `docker inspect` — `.State.Health.Log` shows the output and timing of each probe
+    - `docker run --help` — the `--health-*` options
+    - Dockerfile docs `HEALTHCHECK` — `--interval`, `--timeout`, `--retries`, `--start-period`
+    - `docker exec <c> <check-command>` — run the probe by hand
+    - `time wget` or `time curl` — measure the real response time
   scenario: |
+    The load balancer keeps removing healthy backends. Both services work when you call them
+    yourself, and docker says otherwise. Find out why the probes disagree with reality.
+
+    ## Part 1: Unhealthy forever
+
     **`catalog`** (port **8190**) serves requests perfectly, yet docker reports it as
-    **unhealthy** and the load balancer drops it. Its health check was copied from
-    another project.
+    **unhealthy**. Its health check was copied from another project.
 
     Recreate **`catalog`** (same image, port) with a health check that **works** for this
-    image, checking `http://localhost/` every 5 seconds.
+    image, checking `http://localhost/` every **5 seconds**.
+
+    ## Part 2: The check that times out
+
+    **`reports-api`** (port **8191**) needs about **2 seconds** to answer its `/health`
+    endpoint (it checks the database). It keeps being marked *unhealthy*.
+
+    Recreate it from **`/lab/reports-api`** (rebuild `reports-api:1.0`) so the health
+    check gives the endpoint enough time — **5 seconds** timeout, **10s** interval — and
+    the container becomes stably healthy. Fix it **in the Dockerfile**.
   hints:
-    - "`docker inspect catalog --format '{{json .State.Health}}'` shows the probe's output."
-    - "Which port does nginx listen on inside this container?"
+    - "Part 1: `docker inspect catalog --format '{{json .State.Health}}'` shows the probe's output. Which port does nginx listen on inside this container?"
+    - "Part 1: the options are `--health-cmd` and `--health-interval`."
+    - "Part 2: `HEALTHCHECK --timeout` defaults to 30s, but this Dockerfile sets 1s."
+    - "Part 2: a Dockerfile change needs a rebuild, and a new container from the rebuilt image."
   solution: |
+    **Part 1.** The probe targets port 8080 while nginx listens on 80:
     ```bash
     docker inspect catalog --format '{{range .State.Health.Log}}{{.Output}}{{end}}'
-    # wget: can't connect to remote host: Connection refused   (port 8080 — nginx listens on 80)
+    # wget: can't connect to remote host: Connection refused
     docker rm -f catalog
     docker run -d --name catalog -p 8190:80 --health-cmd 'wget -qO- http://localhost/ || exit 1' \
       --health-interval 5s nginx:1.28-alpine
     ```
-  setup: |
-    docker run -d --name catalog -p 8190:80 --health-cmd 'wget -qO- http://localhost:8080/ || exit 1' --health-interval 3s --health-retries 2 nginx:1.28-alpine >/dev/null
-  check: |
-    check "catalog is running" 'c_running catalog'
-    check_eq "image" "$(c_get catalog '{{.Config.Image}}')" "nginx:1.28-alpine"
-    c_running catalog && eventually 30 '[ "$(c_get catalog "{{.State.Health.Status}}")" = healthy ]'
-    check_eq "health" "$(c_get catalog '{{.State.Health.Status}}')" "healthy"
-    check "port 8190" 'http_get localhost:8190 | grep -q nginx'
-  solve: |
-    docker rm -f catalog
-    docker run -d --name catalog -p 8190:80 --health-cmd 'wget -qO- http://localhost/ || exit 1' --health-interval 5s nginx:1.28-alpine
 
-- id: docker-185
-  title: The health check that times out
-  difficulty: 3
-  kind: fix
-  tags: [healthcheck, timeouts]
-  tutorial: |
-    **Concept.** A health check has an interval, a timeout, and a retry count. If the endpoint takes longer than the timeout, every check counts as a failure.
-
-    **Read up on:**
-    - Dockerfile docs `HEALTHCHECK` — `--interval`, `--timeout`, `--retries`, `--start-period`
-    - `docker inspect` — `.State.Health.Log` shows durations and output
-    - `time curl` or `time wget` — measure the real response time
-    - `docker build` and `docker run` — rebuild and recreate
-  scenario: |
-    **`reports-api`** (port **8191**) needs about **2 seconds** to answer its `/health`
-    endpoint (it checks the database). It flaps between *healthy* and *unhealthy*.
-
-    Recreate it from **`/lab/reports-api`** (rebuild `reports-api:1.0`) so the health
-    check gives the endpoint enough time — **5 seconds** timeout, 10s interval — and the
-    container becomes stably healthy. Fix it **in the Dockerfile**.
-  hints:
-    - "`HEALTHCHECK --timeout` defaults to 30s, but this Dockerfile sets 1s."
-  solution: |
+    **Part 2.** A 1-second timeout can't succeed against a 2-second endpoint:
     ```dockerfile
     HEALTHCHECK --interval=10s --timeout=5s --retries=3 CMD wget -qO- http://127.0.0.1:8000/health || exit 1
     ```
@@ -194,6 +407,10 @@ exercises:
     docker rm -f reports-api && docker run -d --name reports-api -p 8191:8000 reports-api:1.0
     ```
   setup: |
+    # --- part 1: Unhealthy forever ---
+    docker run -d --name catalog -p 8190:80 --health-cmd 'wget -qO- http://localhost:8080/ || exit 1' --health-interval 3s --health-retries 2 nginx:1.28-alpine >/dev/null
+
+    # --- part 2: The check that times out ---
     D=/lab/reports-api; mkdir -p $D
     cat > $D/app.py <<'EOF'
     import time
@@ -210,46 +427,102 @@ exercises:
     chown -R $(lab_user): $D
     as_user "docker build -q -t reports-api:1.0 $D && docker run -d --name reports-api -p 8191:8000 reports-api:1.0" >/dev/null 2>&1
   check: |
+    info "Part 1: Unhealthy forever"
+    check "catalog is running" 'c_running catalog'
+    check_eq "image" "$(c_get catalog '{{.Config.Image}}')" "nginx:1.28-alpine"
+    check_match "the probe fetches the site on port 80" "$(c_get catalog '{{json .Config.Healthcheck.Test}}')" 'http://(localhost|127\.0\.0\.1)(:80)?/'
+    check_match "the probe runs every 5s" "$(c_get catalog '{{.Config.Healthcheck.Interval}}')" '^(5s|5000000000)$'
+    c_running catalog && eventually 30 '[ "$(c_get catalog "{{.State.Health.Status}}")" != starting ]'
+    check_eq "health" "$(c_get catalog '{{.State.Health.Status}}')" "healthy"
+    check "port 8190" 'http_get localhost:8190 | grep -q nginx'
+
+    info "Part 2: The check that times out"
     check_match "image health timeout is 5s" "$(docker image inspect -f '{{.Config.Healthcheck.Timeout}}' reports-api:1.0 2>/dev/null)" '^(5s|5000000000)$'
+    check_match "image health interval is 10s" "$(docker image inspect -f '{{.Config.Healthcheck.Interval}}' reports-api:1.0 2>/dev/null)" '^(10s|10000000000)$'
     check "reports-api runs the rebuilt image" '[ "$(c_get reports-api "{{.Image}}")" = "$(docker image inspect -f "{{.Id}}" reports-api:1.0)" ]'
-    c_running reports-api && eventually 40 '[ "$(c_get reports-api "{{.State.Health.Status}}")" = healthy ]'
+    c_running reports-api && eventually 30 '[ "$(c_get reports-api "{{.State.Health.Status}}")" != starting ]'
     check_eq "healthy" "$(c_get reports-api '{{.State.Health.Status}}')" "healthy"
   solve: |
+    # --- part 1: Unhealthy forever ---
+    docker rm -f catalog
+    docker run -d --name catalog -p 8190:80 --health-cmd 'wget -qO- http://localhost/ || exit 1' --health-interval 5s nginx:1.28-alpine
+
+    # --- part 2: The check that times out ---
     sed -i 's/--interval=3s --timeout=1s --retries=2/--interval=10s --timeout=5s --retries=3/' /lab/reports-api/Dockerfile
     docker build -t reports-api:1.0 /lab/reports-api
     docker rm -f reports-api
     docker run -d --name reports-api -p 8191:8000 reports-api:1.0
 
 - id: docker-186
-  title: Zombies in the container
+  title: The two jobs of PID 1
   difficulty: 3
   kind: fix
-  tags: [pid1, zombies, init]
+  tags: [pid1, zombies, init, signals, graceful-shutdown, dockerfile]
   tutorial: |
-    **Concept.** PID 1 in a container is responsible for reaping orphaned children; ordinary apps usually don't do that, so zombies pile up. A tiny init process can fill that role.
+    **Concept.** The first process in a container runs as **PID 1**, and the kernel treats that position specially. On a normal system an init program does the work that comes with it. In a container your application inherits the job, usually without knowing.
+
+    **Job one: reaping.** When a process exits it stays in the process table as a zombie until its parent collects its exit status. Orphaned processes are handed to PID 1, so if PID 1 never collects them, zombies accumulate until the PID limit is reached. A tiny init can sit at PID 1 and do this for you, without changing the app.
+
+    **Job two: receiving signals.** `docker stop` sends `SIGTERM` to PID 1, waits, then sends `SIGKILL`. The kernel drops signals sent to PID 1 unless that process has installed a handler for them. So if PID 1 is a shell that is merely waiting for your program, the signal goes nowhere, your program's handler never runs, and the stop ends in a kill after the timeout.
+
+    Dockerfile `CMD` and `ENTRYPOINT` have a **shell form** and an **exec form**, and they differ in what becomes PID 1. Some shells replace themselves when given exactly one simple command, so a shell form can behave correctly by accident and then break as soon as someone adds a second command. Check who PID 1 really is.
 
     **Read up on:**
-    - `man 2 wait` / zombie processes concept
+    - `man 2 wait` — zombie processes
     - `docker run --help` — an option related to init
-    - `docker exec <c> ps` — spot defunct processes
+    - `docker exec <c> ps` — spot defunct processes, and see who is PID 1
+    - Dockerfile docs — `CMD`/`ENTRYPOINT` shell vs exec form
+    - `docker stop --help` — signal and timeout
+    - `docker logs` — verify the shutdown message
   scenario: |
-    `docker exec spawner ps` shows a growing list of `[sh] <defunct>` processes. The app
-    starts short-lived child processes but its main process (PID 1) never reaps them.
-    Eventually the PID limit will be hit.
+    Two services are misbehaving at the very start and very end of their processes' lives.
+    The application code in both is fine; the problem is what's running as PID 1.
 
-    Recreate **`spawner`** (same image and command) so zombies get reaped
-    automatically. You can't change the app.
+    ## Part 1: Zombies in the container
+
+    `docker exec spawner ps` shows a growing list of `[sh] <defunct>` or `[python] <defunct>`
+    processes. The app starts short-lived child processes but its main process (PID 1)
+    never reaps them. Eventually the PID limit will be hit.
+
+    Recreate **`spawner`** (same image and command) so zombies get reaped automatically.
+    You can't change the app.
+
+    ## Part 2: Shell form swallows SIGTERM
+
+    **`order-processor`** (built from **`/lab/order-processor`**) is supposed to finish its
+    current order and log **`graceful shutdown`** when stopped. Instead, `docker stop` hangs
+    for 10 seconds and the process is killed — orders get lost.
+
+    The Python code handles `SIGTERM` correctly. Fix the **Dockerfile** so `CMD` uses the
+    **exec form**, rebuild `order-processor:1.0` and run it as **`order-processor`**.
+    `docker stop` must complete in **under 3 seconds**.
   hints:
-    - "PID 1 is responsible for reaping orphaned children. A real init does that."
+    - "Part 1: PID 1 is responsible for reaping orphaned children. A real init does that, and `docker run` can add one for you."
+    - "Part 1: take the exact command from `docker inspect spawner --format '{{json .Config.Cmd}}'`."
+    - "Part 2: a shell-form `CMD` runs under `/bin/sh -c`. Here the shell has to stay around for the second command, so it is PID 1 and doesn't forward signals."
+    - "Part 2: use the exec (JSON array) form, and don't forget that a rebuilt image needs a new container."
   solution: |
+    **Part 1.** With `--init`, `docker-init` is PID 1 and reaps zombies. Reuse the exact
+    command so nothing else changes:
     ```bash
     docker exec spawner ps | grep -c defunct
+    cmd=$(docker inspect -f '{{index .Config.Cmd 2}}' spawner)
     docker rm -f spawner
-    docker run -d --name spawner --init python:3.12-alpine python -c "$(cat <<'EOF' ... EOF)"
+    docker run -d --name spawner --init python:3.12-alpine python -c "$cmd"
     ```
-    (Take the exact command from `docker inspect spawner --format '{{json .Config.Cmd}}'`.)
-    With `--init`, `docker-init` is PID 1 and reaps zombies.
+
+    **Part 2.** The exec form makes Python PID 1, so it receives `SIGTERM` itself:
+    ```dockerfile
+    CMD ["python", "-u", "app.py"]
+    ```
+    ```bash
+    docker build -t order-processor:1.0 /lab/order-processor
+    docker rm -f order-processor; docker run -d --name order-processor order-processor:1.0
+    time docker stop order-processor; docker logs order-processor | tail -1
+    docker start order-processor
+    ```
   setup: |
+    # --- part 1: Zombies in the container ---
     docker run -d --name spawner python:3.12-alpine python -c "import os, time
     while True:
         pid = os.fork()
@@ -260,85 +533,219 @@ exercises:
             os._exit(0)
         os.waitpid(pid, 0)
         time.sleep(0.5)" >/dev/null
-    docker inspect -f '{{json .Config.Cmd}}' spawner > $KL_STATE/answer
+    docker inspect -f '{{json .Config.Cmd}}' spawner > $KL_STATE/answer-spawner
     sleep 4
+
+    # --- part 2: Shell form swallows SIGTERM ---
+    # The trailing echo matters: Alpine's sh execs a lone command, which would make
+    # python PID 1 and hide the bug. With a second command the shell has to stay.
+    D=/lab/order-processor; mkdir -p $D
+    cat > $D/app.py <<'EOF'
+    import signal, sys, time
+    def stop(sig, frame):
+        print("graceful shutdown: finished current order", flush=True)
+        sys.exit(0)
+    signal.signal(signal.SIGTERM, stop)
+    print("processing orders", flush=True)
+    while True:
+        time.sleep(1)
+    EOF
+    printf 'FROM python:3.12-alpine\nWORKDIR /app\nCOPY app.py .\nCMD python -u app.py; echo "order-processor exited"\n' > $D/Dockerfile
+    chown -R $(lab_user): $D
+    as_user "docker build -q -t order-processor:1.0 $D && docker run -d --name order-processor order-processor:1.0" >/dev/null 2>&1
   check: |
+    info "Part 1: Zombies in the container"
     check "spawner is running" 'c_running spawner'
-    check_eq "same command" "$(c_get spawner '{{json .Config.Cmd}}')" "$(cat $KL_STATE/answer)"
+    check_eq "same command" "$(c_get spawner '{{json .Config.Cmd}}')" "$(cat $KL_STATE/answer-spawner)"
     sleep 4
     z=$(docker exec spawner ps -o stat 2>/dev/null | grep -c '^Z')
     check "no zombies accumulate ($z)" "[ $z -le 2 ]"
+
+    info "Part 2: Shell form swallows SIGTERM"
+    check "CMD uses exec form" 'grep -qE "^CMD \[" /lab/order-processor/Dockerfile'
+    check "order-processor is running" 'c_running order-processor'
+    # Only time the stop once the Dockerfile is fixed: the broken form always takes the full 10s.
+    if c_running order-processor && grep -qE '^CMD \[' /lab/order-processor/Dockerfile; then
+      t0=$(date +%s); docker stop order-processor >/dev/null 2>&1; t1=$(date +%s)
+      check "stops in under 3s ($((t1-t0))s)" "[ $((t1-t0)) -lt 3 ]"
+      check "logged graceful shutdown" 'docker logs order-processor 2>&1 | grep -q "graceful shutdown"'
+      docker start order-processor >/dev/null 2>&1
+    else
+      fail "docker stop not measured: use the exec form and run the rebuilt image first"
+    fi
   solve: |
+    # --- part 1: Zombies in the container ---
     cmd=$(docker inspect -f '{{index .Config.Cmd 2}}' spawner)
     docker rm -f spawner
     docker run -d --name spawner --init python:3.12-alpine python -c "$cmd"
 
+    # --- part 2: Shell form swallows SIGTERM ---
+    sed -i 's/^CMD .*/CMD ["python", "-u", "app.py"]/' /lab/order-processor/Dockerfile
+    docker build -t order-processor:1.0 /lab/order-processor
+    docker rm -f order-processor 2>/dev/null || true
+    docker run -d --name order-processor order-processor:1.0
+
 - id: docker-187
-  title: /dev/shm is too small
+  title: Limits that only bite in production
   difficulty: 3
   kind: fix
-  tags: [shm, resources]
+  tags: [shm, resources, cpu, throttling]
   tutorial: |
-    **Concept.** Containers get a small tmpfs at `/dev/shm`, 64 MB by default. Workloads that use shared memory heavily need that size raised at start.
+    **Concept.** "It works on my laptop" often means the two environments have different limits. A container runs inside limits set at creation, and when one is hit the symptom rarely names the limit. You see a disk-full error on a machine with plenty of disk, or a service that is slow on idle hardware.
+
+    Two limits catch people out:
+
+    - **Shared memory.** Each container gets its own small tmpfs at `/dev/shm`, 64 MB by default. Browsers, databases and other programs that use shared memory can run out of it long before the machine is short of RAM, and the error says *No space left on device*.
+    - **CPU quota.** A CPU limit is enforced by the kernel's scheduler through cgroups. Within each short period the container may use only its share, then it is put to sleep until the next period begins. An app under a tiny quota doesn't crash; it just gets slow, while the host looks idle.
+
+    Some limits can be changed on a running container and some can only be set when it is created. Check which one you are dealing with before you reach for `docker rm`.
 
     **Read up on:**
-    - `docker run --help` — shared memory option
-    - `df -h /dev/shm` inside the container — current size
-    - `man shm_overview`
-    - `docker inspect` — `.HostConfig.ShmSize`
+    - `docker run --help` — the shared memory option
+    - `df -h /dev/shm` inside the container, and `man shm_overview`
+    - `docker inspect` — `.HostConfig.ShmSize`, and the CPU fields `NanoCpus`, `CpuQuota`, `CpuShares`
+    - `docker stats --no-stream`
+    - `docker update --help` — change limits in place
+    - `man cgroups` — the cpu controller
   scenario: |
+    Two workloads behave perfectly on developers' laptops and badly on this host. The
+    hardware is fine. Find the limit each one is hitting and raise it.
+
+    ## Part 1: /dev/shm is too small
+
     **`renderer`** (a headless-browser style workload) crashes with *No space left on
     device* when writing **100 MB** to shared memory (`/dev/shm`). Docker gives containers
     only **64 MB** of shm by default.
 
     Recreate **`renderer`** (same image and command) with **256 MB** of shared memory.
+
+    ## Part 2: The app that's slow only in production
+
+    **`pricing-engine`** (port **8196**) answers in ~10 ms on developers' laptops but takes
+    **seconds** on this host. The hardware is the same and nothing else is running.
+
+    Find the cause and fix it **without recreating** the container, so that a request to
+    `http://localhost:8196/quote` completes in **under 1 second**.
   hints:
-    - "`--shm-size`"
+    - "Part 1: the option is `--shm-size`. Take the command from `docker inspect renderer --format '{{json .Config.Cmd}}'`."
+    - "Part 2: `docker stats pricing-engine` — look at CPU %."
+    - "Part 2: `docker inspect pricing-engine --format '{{.HostConfig.NanoCpus}}'`, then see what `docker update` can change."
   solution: |
+    **Part 1.** Shared memory is set at creation, so the container has to be recreated:
     ```bash
     docker rm -f renderer
     docker run -d --name renderer --shm-size 256m busybox:1.37 sh -c 'dd if=/dev/zero of=/dev/shm/frame bs=1M count=100 && echo rendered && sleep infinity'
     docker logs renderer
     ```
+
+    **Part 2.** Someone typed `--cpus 0.02` instead of `--cpus 2`. CFS throttling makes the
+    process sleep most of each 100 ms period. CPU limits can be changed in place:
+    ```bash
+    docker inspect pricing-engine --format '{{.HostConfig.NanoCpus}}'    # 20000000 = 0.02 CPU
+    docker update --cpus 1 pricing-engine
+    time curl -s localhost:8196/quote
+    ```
   setup: |
+    # --- part 1: /dev/shm is too small ---
     docker run -d --name renderer busybox:1.37 sh -c 'dd if=/dev/zero of=/dev/shm/frame bs=1M count=100 && echo rendered && sleep infinity' >/dev/null
+
+    # --- part 2: The app that's slow only in production ---
+    D=/lab/pricing; mkdir -p $D
+    cat > $D/app.py <<'EOF'
+    from http.server import BaseHTTPRequestHandler, HTTPServer
+    class H(BaseHTTPRequestHandler):
+        def do_GET(self):
+            x = 0
+            for i in range(3000000):
+                x += i * i
+            self.send_response(200); self.end_headers(); self.wfile.write(b"quote: 42.00\n")
+        def log_message(self, *a): pass
+    HTTPServer(("0.0.0.0", 8000), H).serve_forever()
+    EOF
+    chown -R $(lab_user): $D
+    docker run -d --name pricing-engine --cpus 0.02 -p 8196:8000 -v $D:/app:ro python:3.12-alpine python /app/app.py >/dev/null
+    docker inspect -f '{{.Id}}' pricing-engine > $KL_STATE/answer-pricing
+    sleep 3
   check: |
+    info "Part 1: /dev/shm is too small"
     check_eq "shm size" "$(c_get renderer '{{.HostConfig.ShmSize}}')" "268435456"
     check "renderer is running and rendered" 'c_running renderer && docker logs renderer 2>&1 | grep -q rendered'
+
+    info "Part 2: The app that's slow only in production"
+    check_eq "same container" "$(c_get pricing-engine '{{.Id}}')" "$(cat $KL_STATE/answer-pricing)"
+    # Let any request still queued in the single-threaded server drain first.
+    eventually 30 '[ "$(curl -s -o /dev/null -m 25 -w "%{http_code}" localhost:8196/quote)" = 200 ]'
+    r=$(curl -s -o /dev/null -m 3 -w '%{http_code} %{time_total}' localhost:8196/quote); t=${r#* }
+    check "a quote returns 200 in less than 1s ($r)" "[ '${r% *}' = 200 ] && awk 'BEGIN{exit !($t < 1)}'"
   solve: |
+    # --- part 1: /dev/shm is too small ---
     docker rm -f renderer
     docker run -d --name renderer --shm-size 256m busybox:1.37 sh -c 'dd if=/dev/zero of=/dev/shm/frame bs=1M count=100 && echo rendered && sleep infinity'
 
+    # --- part 2: The app that's slow only in production ---
+    docker update --cpus 1 pricing-engine
+
 - id: docker-188
-  title: Something on the host already uses the port
+  title: The host around your containers
   difficulty: 3
   kind: fix
-  tags: [ports, systemd, troubleshooting]
+  tags: [ports, systemd, networking, host-gateway, troubleshooting]
   tutorial: |
-    **Concept.** 'Address already in use' can come from any process on the host, not only containers. Find the owner of the port, then decide how to stop it properly.
+    **Concept.** Containers are isolated from the host, but they still depend on it, and problems often sit right on that boundary. The boundary can be crossed in two directions.
+
+    **From the host to the container: published ports.** A published port is a real listening port on the host, so it competes with **every** process there, not only with other containers. `docker ps` will not show you a host service holding the port. Ask the kernel who owns the socket, then find out what keeps that process alive. Killing a process managed by systemd rarely lasts, because the unit starts it again, and a unit that is still enabled returns at the next boot.
+
+    **From the container to the host.** Inside a container, `localhost` is the container itself. To reach a service on the host you need an address for the host as seen from the bridge network. Docker Desktop provides a convenient name for it. On Linux you must add the name yourself, and docker has a special value that resolves to the host's gateway address. The service must also listen on an address the bridge can reach.
 
     **Read up on:**
-    - `ss -ltnp` (`man ss`) — listening sockets and owning processes
-    - `systemctl status <unit>` — find a service for a PID
-    - `systemctl stop` and `disable` — stop and keep it from returning
+    - `ss -ltnp` (`man ss`) — listening sockets and the processes that own them
+    - `systemctl status <unit>` — also accepts a PID
+    - `systemctl stop` and `disable` — stop a service and keep it from returning
     - `docker ps` — rule out containers
+    - `docker run --help` — the `--add-host` option
+    - Docker docs 'Networking' — the host gateway on Linux
+    - `docker exec <c> cat /etc/hosts`
   scenario: |
+    You've inherited this docker host, and it runs more than containers. Two tasks are
+    blocked by what lives on the host itself.
+
+    ## Part 1: Something on the host already uses the port
+
     You need to run **`wiki`** (`nginx:1.28-alpine`) on port **8192**, but docker says the
     address is already in use — and **no container** is using it.
 
     Find what on the **host** listens on 8192, stop it **permanently** (it's an obsolete
     service and must not come back after a reboot), and run `wiki` on 8192.
+
+    ## Part 2: Reach a service on the docker host
+
+    A license server runs **directly on the docker host** on port **9999** (not in a
+    container). The **`app`** container must reach it by the name
+    **`host.docker.internal`** — like on Docker Desktop, which Linux doesn't do
+    automatically.
+
+    Run **`app`** (`busybox:1.37`, `sleep infinity`) so that
+    `wget -qO- http://host.docker.internal:9999/` works inside it.
   hints:
-    - "`sudo ss -ltnp 'sport = :8192'` shows the process."
-    - "`systemctl status <pid>` tells you which unit started it."
+    - "Part 1: `sudo ss -ltnp 'sport = :8192'` shows the process, and `systemctl status <pid>` tells you which unit started it."
+    - "Part 1: `systemctl disable --now` does both halves of the job."
+    - "Part 2: `--add-host host.docker.internal:host-gateway` — `host-gateway` is a magic value resolved by docker."
   solution: |
+    **Part 1.** A systemd service owns the port, so stop it through systemd and disable it:
     ```bash
     sudo ss -ltnp 'sport = :8192'
     systemctl status $(sudo ss -ltnpH 'sport = :8192' | grep -o 'pid=[0-9]*' | cut -d= -f2)
     sudo systemctl disable --now legacy-wiki.service
     docker run -d --name wiki -p 8192:80 nginx:1.28-alpine
     ```
+
+    **Part 2.** Map the name to the host's gateway address:
+    ```bash
+    docker run -d --name app --add-host host.docker.internal:host-gateway busybox:1.37 sleep infinity
+    docker exec app wget -qO- http://host.docker.internal:9999/
+    ```
   setup: |
+    # --- part 1: Something on the host already uses the port ---
     cat > /etc/systemd/system/legacy-wiki.service <<'EOF'
     [Unit]
     Description=Legacy wiki (python)
@@ -351,123 +758,80 @@ exercises:
     systemctl daemon-reload
     systemctl enable --now legacy-wiki.service >/dev/null 2>&1
     on_reset 'systemctl disable --now legacy-wiki.service; rm -f /etc/systemd/system/legacy-wiki.service; systemctl daemon-reload'
-    sleep 1
-  check: |
-    check_not "legacy-wiki is not running" 'systemctl is-active -q legacy-wiki'
-    check_not "legacy-wiki is not enabled" 'systemctl is-enabled -q legacy-wiki'
-    check "wiki runs on 8192" 'c_running wiki && http_get localhost:8192 | grep -q nginx'
-  solve: |
-    sudo systemctl disable --now legacy-wiki.service
-    docker run -d --name wiki -p 8192:80 nginx:1.28-alpine
 
-- id: docker-189
-  title: Reach a service on the docker host
-  difficulty: 3
-  kind: build
-  tags: [networking, host-gateway]
-  tutorial: |
-    **Concept.** On Docker Desktop, `host.docker.internal` points to the host. On Linux you must add that name yourself, and docker offers a special value for the host's gateway address.
-
-    **Read up on:**
-    - `docker run --help` — the `--add-host` option
-    - Docker docs 'Networking' — host gateway on Linux
-    - `docker exec <c> cat /etc/hosts`
-    - `ss -ltn` — check the service listens on an address reachable from the bridge
-  scenario: |
-    A license server runs **directly on the docker host** on port **9999** (not in a
-    container). The **`app`** container must reach it by the name
-    **`host.docker.internal`** — like on Docker Desktop, which Linux doesn't do
-    automatically.
-
-    Run **`app`** (`busybox:1.37`, `sleep infinity`) so that
-    `wget -qO- http://host.docker.internal:9999/` works inside it.
-  hints:
-    - "`--add-host host.docker.internal:host-gateway` — `host-gateway` is a magic value resolved by docker."
-  solution: |
-    ```bash
-    docker run -d --name app --add-host host.docker.internal:host-gateway busybox:1.37 sleep infinity
-    docker exec app wget -qO- http://host.docker.internal:9999/
-    ```
-  setup: |
+    # --- part 2: Reach a service on the docker host ---
     mkdir -p /tmp/kl-lic && echo "LICENSE OK" > /tmp/kl-lic/index.html
     systemd-run --unit kl-license --quiet /usr/bin/python3 -m http.server 9999 --bind 0.0.0.0 --directory /tmp/kl-lic
     on_reset 'systemctl stop kl-license; rm -rf /tmp/kl-lic'
     sleep 1
   check: |
+    info "Part 1: Something on the host already uses the port"
+    check_not "legacy-wiki is not running" 'systemctl is-active -q legacy-wiki'
+    check_not "legacy-wiki is not enabled" 'systemctl is-enabled -q legacy-wiki'
+    check "wiki runs on 8192" 'c_running wiki && http_get localhost:8192 | grep -q nginx'
+
+    info "Part 2: Reach a service on the docker host"
     check "app is running" 'c_running app'
     check "app reaches host.docker.internal:9999" 'docker exec app wget -qO- -T 3 http://host.docker.internal:9999/ | grep -q "LICENSE OK"'
   solve: |
+    # --- part 1: Something on the host already uses the port ---
+    sudo systemctl disable --now legacy-wiki.service
+    docker run -d --name wiki -p 8192:80 nginx:1.28-alpine
+
+    # --- part 2: Reach a service on the docker host ---
     docker run -d --name app --add-host host.docker.internal:host-gateway busybox:1.37 sleep infinity
 
-- id: docker-190
-  title: Which value wins?
-  difficulty: 3
-  kind: fix
-  tags: [compose, env, precedence]
-  tutorial: |
-    **Concept.** Compose resolves variables from several sources with a defined order of precedence: the shell environment, `.env` file, `environment:`, `env_file:`, and more.
-
-    **Read up on:**
-    - Compose docs 'Environment variables precedence'
-    - `docker compose config` — see the resolved values
-    - `env | grep` — is a shell variable exported?
-    - `docker compose up -d` — recreate after changes
-  scenario: |
-    In **`/lab/precedence`**, **`api`** must run with **`LOG_LEVEL=debug`**. The developer
-    set it in `.env`, but the container still shows `warn`.
-
-    Find out where `warn` comes from and fix the project so `LOG_LEVEL` is `debug`,
-    **without** deleting `api.env` (it holds other settings the service needs).
-  hints:
-    - "`.env` is only for **substitution** in the compose file; `env_file:` sets container variables; `environment:` beats `env_file:`."
-    - "`docker compose config` shows the final environment."
-  solution: |
-    ```bash
-    cd /lab/precedence
-    docker compose config | grep -A5 environment
-    # compose.yaml: environment: LOG_LEVEL: warn  (hard-coded, overrides api.env)
-    # change it to: LOG_LEVEL: ${LOG_LEVEL:-info}   (then .env's LOG_LEVEL=debug applies)
-    docker compose up -d
-    ```
-  setup: |
-    D=/lab/precedence; mkdir -p $D
-    echo "LOG_LEVEL=debug" > $D/.env
-    printf 'DB_HOST=db\nLOG_LEVEL=error\nREGION=eu\n' > $D/api.env
-    printf 'services:\n  api:\n    image: busybox:1.37\n    command: sleep infinity\n    env_file: api.env\n    environment:\n      LOG_LEVEL: warn\n' > $D/compose.yaml
-    chown -R $(lab_user): $D
-    as_user "cd $D && docker compose up -d" >/dev/null 2>&1
-  check: |
-    check "api.env still exists" 'test -f /lab/precedence/api.env'
-    check_eq "LOG_LEVEL in the container" "$(cc_exec precedence api printenv LOG_LEVEL 2>/dev/null)" "debug"
-    check_eq "DB_HOST from api.env" "$(cc_exec precedence api printenv DB_HOST 2>/dev/null)" "db"
-  solve: |
-    cd /lab/precedence
-    sed -i 's/LOG_LEVEL: warn/LOG_LEVEL: ${LOG_LEVEL:-info}/' compose.yaml
-    docker compose up -d
-
 - id: docker-191
-  title: The config directory that appeared from nowhere
-  difficulty: 3
+  title: When Docker quietly guesses
+  difficulty: 4
   kind: fix
-  tags: [bind-mount, gotcha]
+  tags: [bind-mount, compose, project-name, gotcha]
   tutorial: |
-    **Concept.** If a bind-mount source path does not exist, docker creates it as an empty root-owned directory. A typo in a path therefore produces a silent failure.
+    **Concept.** Docker fills in things you didn't specify, and it usually does so without a warning. When the guess is wrong, nothing fails at the moment of the mistake. The failure shows up later, somewhere else, and looks unrelated.
+
+    **A bind mount with a missing source.** With `-v`, if the host path doesn't exist, docker creates it as an empty directory owned by root and mounts that. A typo in a path therefore doesn't produce an error: the app simply starts with nothing in its config directory. `--mount` is stricter about this.
+
+    **A compose project with no name.** Compose finds "its" containers by project name, and by default the project is named after the directory holding the compose file. Two projects in different places whose directories share a name are, as far as compose is concerned, the same project. Each deployment then treats the other's containers as its own and replaces them.
+
+    In both cases the fix is to state your intent explicitly, and then clean up whatever the wrong guess already left behind.
 
     **Read up on:**
     - `docker inspect` — `.Mounts` and its `Source`
-    - `ls -la` on the host paths — compare names
-    - `docker run -v` vs `--mount` — `--mount` errors on missing paths
-    - Clean up the stray directory with `rmdir`
+    - `ls -la` on the host paths — compare the names
+    - `docker run -v` vs `--mount` — how each handles a missing path
+    - `rmdir` — remove an empty directory (and only an empty one)
+    - Compose docs 'Specify a project name' — `name:`, `-p`, `COMPOSE_PROJECT_NAME`
+    - `docker compose ls`, and `docker ps --format` with the `com.docker.compose.project` label
   scenario: |
+    Two recent incidents have the same root cause: nobody told docker what they meant, so
+    it guessed. Fix each one, and clean up what the wrong guess left behind.
+
+    ## Part 1: The config directory that appeared from nowhere
+
     **`notifier`** (`busybox:1.37`) should read its rules from **`/lab/notifier/config`**
     (bind-mounted at `/etc/notifier`). It starts, but logs `no rules found`. You notice a
     new, **root-owned, empty** directory on the host that nobody created on purpose.
 
-    Fix the container so it reads the real rules, and remove the stray directory.
+    Fix the container so it reads the real rules (same image and command, so its log says
+    `loaded 2 rules`), and remove the stray directory.
+
+    ## Part 2: Two projects called "app"
+
+    Two teams deploy from **`/lab/team-a/app`** and **`/lab/team-b/app`**. Every time team B
+    runs `docker compose up -d`, team A's **`web`** container gets **replaced** by team B's
+    — and vice versa.
+
+    Fix both projects so they can run side by side: team A's project must be called
+    **`team-a`** and team B's **`team-b`**, set **inside each compose file** (so a plain
+    `docker compose up -d` does the right thing). Bring both up: team A on port **8194**,
+    team B on **8195**, and leave **no containers behind in the old `app` project**.
   hints:
-    - "`docker inspect notifier --format '{{json .Mounts}}'` — look at the `Source`."
-    - "If a bind-mount source doesn't exist, docker silently creates it as an empty root-owned directory."
+    - "Part 1: `docker inspect notifier --format '{{json .Mounts}}'` — look at the `Source`."
+    - "Part 1: if a bind-mount source doesn't exist, docker silently creates it as an empty root-owned directory."
+    - "Part 2: the default project name is the directory name — both are `app`."
+    - "Part 2: a top-level `name:` in the compose file sets the project name. Take the old shared project down first with `docker compose -p app down`."
   solution: |
+    **Part 1.** The mount source has a typo (`confg`), and docker created it for you:
     ```bash
     docker inspect notifier --format '{{range .Mounts}}{{.Source}}{{end}}'   # /lab/notifier/confg
     docker rm -f notifier
@@ -475,80 +839,63 @@ exercises:
     docker run -d --name notifier -v /lab/notifier/config:/etc/notifier:ro busybox:1.37 \
       sh -c 'if ls /etc/notifier/*.rule >/dev/null 2>&1; then echo "loaded $(ls /etc/notifier/*.rule | wc -l) rules"; else echo "no rules found"; fi; sleep infinity'
     ```
-    `--mount type=bind,src=...` refuses to start when the source is missing — safer than `-v`.
+    `--mount type=bind,src=...` refuses to start when the source is missing, which is safer than `-v`.
+
+    **Part 2.** Add `name:` as the first line of each compose file:
+    ```yaml
+    # /lab/team-a/app/compose.yaml
+    name: team-a
+    services:
+      web: ...
+    ```
+    ```bash
+    (cd /lab/team-a/app && docker compose -p app down)   # clean up the shared old project
+    sed -i '1i name: team-a' /lab/team-a/app/compose.yaml
+    sed -i '1i name: team-b' /lab/team-b/app/compose.yaml
+    (cd /lab/team-a/app && docker compose up -d)
+    (cd /lab/team-b/app && docker compose up -d)
+    ```
   setup: |
+    # --- part 1: The config directory that appeared from nowhere ---
     mkdir -p /lab/notifier/config
     echo "page oncall on 5xx" > /lab/notifier/config/errors.rule
     echo "mail on deploy" > /lab/notifier/config/deploys.rule
     chown -R $(lab_user): /lab/notifier
     docker run -d --name notifier -v /lab/notifier/confg:/etc/notifier:ro busybox:1.37 sh -c 'if ls /etc/notifier/*.rule >/dev/null 2>&1; then echo "loaded $(ls /etc/notifier/*.rule | wc -l) rules"; else echo "no rules found"; fi; sleep infinity' >/dev/null
+
+    # --- part 2: Two projects called "app" ---
+    # chown only the team directories: the stray confg directory above must stay root-owned.
+    for t in a b; do
+      D=/lab/team-$t/app; mkdir -p $D
+      port=$([ $t = a ] && echo 8194 || echo 8195)
+      printf 'services:\n  web:\n    image: traefik/whoami:v1.10\n    environment: {WHOAMI_NAME: team-%s}\n    ports: ["%s:80"]\n' "$t" "$port" > $D/compose.yaml
+    done
+    chown -R $(lab_user): /lab/team-a /lab/team-b
+    as_user "cd /lab/team-a/app && docker compose up -d && cd /lab/team-b/app && docker compose up -d" >/dev/null 2>&1
   check: |
+    info "Part 1: The config directory that appeared from nowhere"
     check "stray directory removed" '! test -e /lab/notifier/confg'
     check "notifier is running" 'c_running notifier'
     check "notifier loaded 2 rules" 'docker logs notifier 2>&1 | grep -q "loaded 2 rules"'
+
+    info "Part 2: Two projects called \"app\""
+    check_eq "team-a name in compose.yaml" "$(cd /lab/team-a/app && docker compose config --format json 2>/dev/null | jq -r .name)" "team-a"
+    check_eq "team-b name in compose.yaml" "$(cd /lab/team-b/app && docker compose config --format json 2>/dev/null | jq -r .name)" "team-b"
+    check "team A serves on 8194" 'http_get localhost:8194 | grep -q "Name: team-a"'
+    check "team B serves on 8195" 'http_get localhost:8195 | grep -q "Name: team-b"'
+    check "no leftover project 'app'" '[ -z "$(docker ps -aq --filter label=com.docker.compose.project=app)" ]'
   solve: |
+    # --- part 1: The config directory that appeared from nowhere ---
     docker rm -f notifier
     sudo rmdir /lab/notifier/confg
     docker run -d --name notifier -v /lab/notifier/config:/etc/notifier:ro busybox:1.37 sh -c 'if ls /etc/notifier/*.rule >/dev/null 2>&1; then echo "loaded $(ls /etc/notifier/*.rule | wc -l) rules"; else echo "no rules found"; fi; sleep infinity'
 
-- id: docker-192
-  title: Shell form swallows SIGTERM
-  difficulty: 3
-  kind: fix
-  tags: [dockerfile, signals, graceful-shutdown]
-  tutorial: |
-    **Concept.** Shell-form `CMD` runs the program under `/bin/sh -c`, so signals sent by docker go to the shell instead of your app. Exec form runs the program directly as PID 1.
-
-    **Read up on:**
-    - Dockerfile docs — `CMD`/`ENTRYPOINT` shell vs exec form
-    - `docker stop --help` — signal and timeout
-    - `docker exec <c> ps` — who is PID 1
-    - `docker logs` — verify the shutdown message
-  scenario: |
-    **`order-processor`** (built from **`/lab/order-processor`**) is supposed to finish
-    its current order and log **`graceful shutdown`** when stopped. Instead, `docker stop`
-    hangs for 10 seconds and the process is killed — orders get lost.
-
-    The Python code handles `SIGTERM` correctly. Fix the **Dockerfile**, rebuild
-    `order-processor:1.0` and run it as **`order-processor`**.
-  hints:
-    - "`CMD python app.py` (shell form) runs `/bin/sh -c \"python app.py\"` — the shell is PID 1 and doesn't forward signals."
-    - "Use the exec (JSON array) form."
-  solution: |
-    ```dockerfile
-    CMD ["python", "-u", "app.py"]
-    ```
-    ```bash
-    docker build -t order-processor:1.0 /lab/order-processor
-    docker rm -f order-processor; docker run -d --name order-processor order-processor:1.0
-    time docker stop order-processor; docker logs order-processor | tail -1
-    ```
-  setup: |
-    D=/lab/order-processor; mkdir -p $D
-    cat > $D/app.py <<'EOF'
-    import signal, sys, time
-    def stop(sig, frame):
-        print("graceful shutdown: finished current order", flush=True)
-        sys.exit(0)
-    signal.signal(signal.SIGTERM, stop)
-    print("processing orders", flush=True)
-    while True:
-        time.sleep(1)
-    EOF
-    printf 'FROM python:3.12-alpine\nWORKDIR /app\nCOPY app.py .\nCMD python -u app.py\n' > $D/Dockerfile
-    chown -R $(lab_user): $D
-  check: |
-    check "CMD uses exec form" 'grep -qE "^CMD \[" /lab/order-processor/Dockerfile'
-    check "order-processor is running" 'c_running order-processor'
-    t0=$(date +%s); docker stop order-processor >/dev/null 2>&1; t1=$(date +%s)
-    check "stops in under 3s ($((t1-t0))s)" "[ $((t1-t0)) -lt 3 ]"
-    check "logged graceful shutdown" 'docker logs order-processor 2>&1 | grep -q "graceful shutdown"'
-    docker start order-processor >/dev/null 2>&1
-  solve: |
-    sed -i 's/^CMD python -u app.py$/CMD ["python", "-u", "app.py"]/' /lab/order-processor/Dockerfile
-    docker build -t order-processor:1.0 /lab/order-processor
-    docker rm -f order-processor 2>/dev/null || true
-    docker run -d --name order-processor order-processor:1.0
+    # --- part 2: Two projects called "app" ---
+    (cd /lab/team-a/app && docker compose -p app down)
+    sed -i '1i name: team-a' /lab/team-a/app/compose.yaml
+    sed -i '1i name: team-b' /lab/team-b/app/compose.yaml
+    (cd /lab/team-a/app && docker compose up -d)
+    (cd /lab/team-b/app && docker compose up -d)
 
 - id: docker-193
   title: The build that never uses the cache
@@ -679,268 +1026,6 @@ exercises:
     sed -i 's/    listen 80;/    listen 80;\n    client_max_body_size 50m;/' /lab/upload-gw/conf.d/default.conf
     docker exec upload-gw nginx -t
     docker exec upload-gw nginx -s reload
-
-- id: docker-195
-  title: Two projects called "app"
-  difficulty: 4
-  kind: fix
-  tags: [compose, project-name, gotcha]
-  tutorial: |
-    **Concept.** Compose names a project after its directory by default and uses that name to find its containers. Two projects sharing a name will overwrite each other.
-
-    **Read up on:**
-    - Compose docs 'Specify a project name' — `name:`, `-p`, `COMPOSE_PROJECT_NAME`
-    - `docker compose ls`
-    - `docker ps --format` with labels, such as `com.docker.compose.project`
-    - `docker compose up -d` in each directory
-  scenario: |
-    Two teams deploy from **`/lab/team-a/app`** and **`/lab/team-b/app`**. Every time team B
-    runs `docker compose up -d`, team A's **`web`** container gets **replaced** by team B's
-    — and vice versa.
-
-    Fix both projects so they can run side by side: team A's project must be called
-    **`team-a`** and team B's **`team-b`**, set **inside each compose file** (so a plain
-    `docker compose up -d` does the right thing). Bring both up: team A on port **8194**,
-    team B on **8195**.
-  hints:
-    - "The default project name is the directory name — both are `app`."
-    - "Top-level `name:` in the compose file sets the project name."
-  solution: |
-    ```yaml
-    # /lab/team-a/app/compose.yaml
-    name: team-a
-    services:
-      web: ...
-    ```
-    ```bash
-    cd /lab/team-a/app && docker compose -p app down   # clean up the shared old project
-    docker compose up -d
-    cd /lab/team-b/app && docker compose up -d
-    ```
-  setup: |
-    for t in a b; do
-      D=/lab/team-$t/app; mkdir -p $D
-      port=$([ $t = a ] && echo 8194 || echo 8195)
-      printf 'services:\n  web:\n    image: traefik/whoami:v1.10\n    environment: {WHOAMI_NAME: team-%s}\n    ports: ["%s:80"]\n' "$t" "$port" > $D/compose.yaml
-    done
-    chown -R $(lab_user): /lab
-    as_user "cd /lab/team-a/app && docker compose up -d && cd /lab/team-b/app && docker compose up -d" >/dev/null 2>&1
-  check: |
-    check_eq "team-a name in compose.yaml" "$(cd /lab/team-a/app && docker compose config --format json 2>/dev/null | jq -r .name)" "team-a"
-    check_eq "team-b name in compose.yaml" "$(cd /lab/team-b/app && docker compose config --format json 2>/dev/null | jq -r .name)" "team-b"
-    check "team A serves on 8194" 'http_get localhost:8194 | grep -q "Name: team-a"'
-    check "team B serves on 8195" 'http_get localhost:8195 | grep -q "Name: team-b"'
-    check "no leftover project 'app'" '[ -z "$(docker ps -aq --filter label=com.docker.compose.project=app)" ]'
-  solve: |
-    cd /lab/team-a/app && docker compose -p app down
-    sed -i '1i name: team-a' /lab/team-a/app/compose.yaml
-    sed -i '1i name: team-b' /lab/team-b/app/compose.yaml
-    cd /lab/team-a/app && docker compose up -d
-    cd /lab/team-b/app && docker compose up -d
-
-- id: docker-196
-  title: The app that's slow only in production
-  difficulty: 3
-  kind: fix
-  tags: [resources, cpu, throttling]
-  tutorial: |
-    **Concept.** Containers can have CPU quotas applied through cgroups, and a tight quota makes an app run slowly even on idle hardware. Inspect the configured limits.
-
-    **Read up on:**
-    - `docker inspect` — `.HostConfig` CPU fields (NanoCpus, CpuQuota, CpuShares)
-    - `docker stats --no-stream`
-    - `docker update --help` — change limits in place
-    - `man cgroups` — cpu controller
-  scenario: |
-    **`pricing-engine`** (port **8196**) answers in ~10 ms on developers' laptops but takes
-    **seconds** on this host. The hardware is the same and nothing else is running.
-
-    Find the cause and fix it **without recreating** the container, so that a request to
-    `http://localhost:8196/quote` completes in **under 1 second**.
-  hints:
-    - "`docker stats pricing-engine` — look at CPU %."
-    - "`docker inspect pricing-engine --format '{{.HostConfig.NanoCpus}}'`"
-  solution: |
-    ```bash
-    docker inspect pricing-engine --format '{{.HostConfig.NanoCpus}}'    # 20000000 = 0.02 CPU
-    docker update --cpus 1 pricing-engine
-    time curl -s localhost:8196/quote
-    ```
-    Someone typed `--cpus 0.02` instead of `--cpus 2`. CFS throttling makes the process
-    sleep most of each 100 ms period.
-  setup: |
-    D=/lab/pricing; mkdir -p $D
-    cat > $D/app.py <<'EOF'
-    from http.server import BaseHTTPRequestHandler, HTTPServer
-    class H(BaseHTTPRequestHandler):
-        def do_GET(self):
-            x = 0
-            for i in range(3000000):
-                x += i * i
-            self.send_response(200); self.end_headers(); self.wfile.write(b"quote: 42.00\n")
-        def log_message(self, *a): pass
-    HTTPServer(("0.0.0.0", 8000), H).serve_forever()
-    EOF
-    chown -R $(lab_user): $D
-    docker run -d --name pricing-engine --cpus 0.02 -p 8196:8000 -v $D:/app:ro python:3.12-alpine python /app/app.py >/dev/null
-    docker inspect -f '{{.Id}}' pricing-engine > $KL_STATE/answer
-    sleep 3
-  check: |
-    check_eq "same container" "$(c_get pricing-engine '{{.Id}}')" "$(cat $KL_STATE/answer)"
-    eventually 30 '[ "$(curl -s -o /dev/null -m 25 -w "%{http_code}" localhost:8196/quote)" = 200 ]'
-    r=$(curl -s -o /dev/null -m 20 -w '%{http_code} %{time_total}' localhost:8196/quote); t=${r#* }
-    check "a quote returns 200 in less than 1s ($r)" "[ '${r% *}' = 200 ] && awk 'BEGIN{exit !($t < 1)}'"
-  solve: |
-    docker update --cpus 1 pricing-engine
-
-- id: docker-197
-  title: Works on my machine
-  difficulty: 3
-  kind: fix
-  tags: [dockerignore, config, build-context]
-  tutorial: |
-    **Concept.** Files copied into an image during build live there forever, including local developer files that shouldn't ship. A `.dockerignore` file keeps files out of the build context.
-
-    **Read up on:**
-    - Docker docs '.dockerignore file'
-    - `docker run --rm <image> ls /app` — inspect the image contents
-    - Dockerfile `COPY` — which files it picks up
-    - How the app picks config by file name or env
-  scenario: |
-    The **`geo-api`** image built from **`/lab/geo-api`** tries to connect to
-    **`localhost:5432`** in production, although the production config clearly says
-    `db.prod.internal`. On the developer's laptop everything works.
-
-    Find out why and fix the **build** (don't delete the developer's local file — they
-    need it). Rebuild **`geo-api:1.0`**; `docker run --rm geo-api:1.0` must print
-    `connecting to db.prod.internal:5432`.
-  hints:
-    - "`docker run --rm geo-api:1.0 ls -la /app` — which config files ended up in the image?"
-    - "Read `app.py`: which file wins?"
-  solution: |
-    ```bash
-    docker run --rm geo-api:1.0 ls /app      # config.json  config.local.json  app.py ...
-    echo "config.local.json" >> /lab/geo-api/.dockerignore
-    docker build -t geo-api:1.0 /lab/geo-api
-    ```
-    The app prefers `config.local.json` when present; `COPY . .` shipped the developer's
-    local override into the image.
-  setup: |
-    D=/lab/geo-api; mkdir -p $D
-    echo '{"db_host": "db.prod.internal", "db_port": 5432}' > $D/config.json
-    echo '{"db_host": "localhost", "db_port": 5432}' > $D/config.local.json
-    cat > $D/app.py <<'EOF'
-    import json, os
-    path = "config.local.json" if os.path.exists("config.local.json") else "config.json"
-    cfg = json.load(open(path))
-    print(f"connecting to {cfg['db_host']}:{cfg['db_port']}")
-    EOF
-    printf 'FROM python:3.12-alpine\nWORKDIR /app\nCOPY . .\nCMD ["python", "app.py"]\n' > $D/Dockerfile
-    chown -R $(lab_user): $D
-    as_user "docker build -q -t geo-api:1.0 $D" >/dev/null
-  check: |
-    check "config.local.json still exists on disk" 'test -f /lab/geo-api/config.local.json'
-    check_eq "geo-api:1.0 output" "$(docker run --rm geo-api:1.0 2>/dev/null)" "connecting to db.prod.internal:5432"
-  solve: |
-    echo "config.local.json" >> /lab/geo-api/.dockerignore
-    docker build -t geo-api:1.0 /lab/geo-api
-
-- id: docker-198
-  title: No logs, no clue
-  difficulty: 3
-  kind: fix
-  tags: [logging, troubleshooting]
-  tutorial: |
-    **Concept.** A logging driver that cannot be read hides output from `docker logs`. To debug a crash, recreate the container with a readable driver, then read its output.
-
-    **Read up on:**
-    - `docker inspect` — `.HostConfig.LogConfig` and `.State`
-    - `docker run --help` — log driver option
-    - `docker logs --tail`
-    - Docker docs 'Configure logging drivers' — which drivers support reading
-  scenario: |
-    **`ingest`** keeps crashing and restarting, but `docker logs ingest` says *configured
-    logging driver does not support reading*. You have no idea why it crashes.
-
-    1. Recreate **`ingest`** (same image, command and restart policy) with the default
-       **json-file** logging so you can read its output.
-    2. Find the error code it prints before crashing (format `ERR-XXXX`) and write it to
-       **`/lab/ingest-error.txt`**.
-  hints:
-    - "`docker inspect ingest --format '{{.HostConfig.LogConfig.Type}}'` → `none`."
-  solution: |
-    ```bash
-    docker inspect ingest --format '{{json .Config.Cmd}} {{.HostConfig.RestartPolicy.Name}}'
-    docker rm -f ingest
-    docker run -d --name ingest --restart always busybox:1.37 sh -c '...same command...'
-    sleep 5; docker logs ingest | grep -o 'ERR-[0-9]*' | head -1 > /lab/ingest-error.txt
-    ```
-  setup: |
-    code="ERR-$((RANDOM % 9000 + 1000))"; echo "$code" > $KL_STATE/answer
-    docker run -d --name ingest --restart always --log-driver none busybox:1.37 sh -c "echo starting ingest; sleep 1; echo 'fatal: upstream rejected batch ($code)'; exit 1" >/dev/null
-    docker inspect -f '{{json .Config.Cmd}}' ingest >> $KL_STATE/answer
-  check: |
-    check_eq "log driver" "$(c_get ingest '{{.HostConfig.LogConfig.Type}}')" "json-file"
-    check_eq "same command" "$(c_get ingest '{{json .Config.Cmd}}')" "$(sed -n 2p $KL_STATE/answer)"
-    check_eq "restart policy" "$(c_get ingest '{{.HostConfig.RestartPolicy.Name}}')" "always"
-    check_eq "error code" "$(tr -d '[:space:]' < /lab/ingest-error.txt 2>/dev/null)" "$(head -1 $KL_STATE/answer)"
-  solve: |
-    cmd=$(docker inspect -f '{{index .Config.Cmd 2}}' ingest)
-    docker rm -f ingest
-    docker run -d --name ingest --restart always busybox:1.37 sh -c "$cmd"
-    sleep 4
-    docker logs ingest 2>&1 | grep -o 'ERR-[0-9]*' | head -1 > /lab/ingest-error.txt
-
-- id: docker-199
-  title: Restart loop hides a missing file
-  difficulty: 3
-  kind: fix
-  tags: [troubleshooting, config, restart-loop]
-  tutorial: |
-    **Concept.** A restart policy can mask a persistent startup failure, so the container just loops. Reading the last log lines and comparing them with the config shows what's missing.
-
-    **Read up on:**
-    - `docker logs --tail` — the repeated error
-    - `docker inspect` — `.RestartCount` and `.Mounts`
-    - nginx `ssl_certificate` directive — paths are evaluated inside the container
-    - `docker run -v` — mount files and directories read-only
-  scenario: |
-    **`gateway`** (nginx, port **8197**, restart `always`) has restarted hundreds of
-    times. Its TLS configuration in **`/lab/gw/conf.d/tls.conf`** expects the certificate
-    files to be mounted at **`/etc/nginx/certs`** — they are in **`/lab/gw/certs`** on the
-    host.
-
-    Get **`gateway`** stable: HTTPS on **8443**, the plain-HTTP port **8197** still
-    serving the site. Don't change the nginx config files.
-  hints:
-    - "`docker logs gateway | tail` — nginx tells you which file it can't open."
-    - "`docker inspect gateway --format '{{json .Mounts}}'`"
-  solution: |
-    ```bash
-    docker logs --tail 3 gateway   # cannot load certificate "/etc/nginx/certs/gw.crt"
-    docker rm -f gateway
-    docker run -d --name gateway --restart always -p 8197:80 -p 8443:443 \
-      -v /lab/gw/conf.d:/etc/nginx/conf.d:ro -v /lab/gw/certs:/etc/nginx/certs:ro nginx:1.28-alpine
-    ```
-  setup: |
-    mkdir -p /lab/gw/conf.d /lab/gw/certs
-    openssl req -x509 -newkey rsa:2048 -nodes -days 30 -subj "/CN=gw.lab" -keyout /lab/gw/certs/gw.key -out /lab/gw/certs/gw.crt 2>/dev/null
-    chmod 644 /lab/gw/certs/gw.key
-    printf 'server {\n  listen 80;\n  root /usr/share/nginx/html;\n}\n' > /lab/gw/conf.d/http.conf
-    printf 'server {\n  listen 443 ssl;\n  ssl_certificate /etc/nginx/certs/gw.crt;\n  ssl_certificate_key /etc/nginx/certs/gw.key;\n  root /usr/share/nginx/html;\n}\n' > /lab/gw/conf.d/tls.conf
-    chown -R $(lab_user): /lab/gw
-    sha256sum /lab/gw/conf.d/*.conf > $KL_STATE/answer
-    docker run -d --name gateway --restart always -p 8197:80 -p 8443:443 -v /lab/gw/conf.d:/etc/nginx/conf.d:ro nginx:1.28-alpine >/dev/null
-  check: |
-    check "config files unchanged" 'sha256sum -c --quiet $KL_STATE/answer'
-    check "gateway is running" 'c_running gateway'
-    r1=$(c_get gateway '{{.RestartCount}}'); sleep 4; r2=$(c_get gateway '{{.RestartCount}}')
-    check "gateway is stable (restarts $r1 → $r2)" "[ '$r1' = '$r2' ]"
-    check "HTTPS on 8443" 'curl -fsk https://localhost:8443/ | grep -q nginx'
-    check "HTTP on 8197" 'http_get localhost:8197 | grep -q nginx'
-  solve: |
-    docker rm -f gateway
-    docker run -d --name gateway --restart always -p 8197:80 -p 8443:443 -v /lab/gw/conf.d:/etc/nginx/conf.d:ro -v /lab/gw/certs:/etc/nginx/certs:ro nginx:1.28-alpine
 
 - id: docker-200
   title: "Final boss: Black Friday outage"

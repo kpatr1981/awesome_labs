@@ -3,21 +3,25 @@
 Ideas for future labs. Each topic has one home; where tracks touch, the row says which
 track it relies on.
 
-**Target: 400 exercises in each of the ten topics below, 4,000 in total.** The parts of
-this list that the existing exercises don't cover are not started.
+**Depth over count.** There is no exercise target for any topic. A lab should carry a real
+multi-step scenario and teach a concept, and a smaller catalog after merging thin exercises
+is a good outcome. The parts of this list that the existing exercises don't cover are not
+started.
+
+Exercise counts as of v0.5.0:
 
 | Topic | Exercises | Track | Module files |
 |---|---|---|---|
-| Docker | 200 / 400 | `docker` | `exercises/docker/` |
-| Kubernetes | 300 / 400 | `kubernetes` | `exercises/kubernetes/` |
-| Offensive security | 40 / 400 | `offsec` | `exercises/offsec/` |
-| Linux & systems | 15 / 400 | `linux` | `exercises/linux/` |
-| Networking | 15 / 400 | `networking` | `exercises/networking/` |
-| Cloud & platform | 15 / 400 | `cloud` | `exercises/cloud/` |
-| Data | 15 / 400 | `data` | `exercises/data/` |
-| Defensive security | 15 / 400 | `defensive` | `exercises/defensive/` |
-| Programming | 15 / 400 | `programming` | `exercises/programming/` |
-| Data science | 15 / 400 | `datascience` | `exercises/datascience/` |
+| Docker | 149 | `docker` | `exercises/docker/` |
+| Kubernetes | 231 | `kubernetes` | `exercises/kubernetes/` |
+| Offensive security | 70 | `offsec` | `exercises/offsec/` |
+| Linux & systems | 45 | `linux` | `exercises/linux/` |
+| Networking | 45 | `networking` | `exercises/networking/` |
+| Cloud & platform | 45 | `cloud` | `exercises/cloud/` |
+| Data | 45 | `data` | `exercises/data/` |
+| Defensive security | 45 | `defensive` | `exercises/defensive/` |
+| Programming | 45 | `programming` | `exercises/programming/` |
+| Data science | 45 | `datascience` | `exercises/datascience/` |
 
 - [Suggested order](#suggested-order)
 - [Shared lab foundations](#shared-lab-foundations)
@@ -276,7 +280,7 @@ Moto only emulates the API, so these limits apply:
 
 ### Offensive security modules
 
-The track has 40 exercises so far, against a target of about 400.
+The track has 70 exercises so far.
 
 - **Network and credentials:** enumeration, service misconfigurations, hash cracking,
   pivoting between containers.
