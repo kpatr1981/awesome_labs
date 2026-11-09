@@ -1,0 +1,501 @@
+track: docker
+module: Observability & logging
+profile: docker
+order: 13
+exercises:
+
+- id: docker-221
+  title: The chatty container is eating the disk
+  difficulty: 2
+  kind: fix
+  tags: [logging, json-file, rotation]
+  tutorial: |
+    **Concept.** By default the daemon keeps every line a container prints, in a JSON file on the host that grows without bound. The logging driver accepts options that cap the size of each file and how many rotated files are kept.
+
+    **Read up on:**
+    - `docker run --help` — the logging driver options
+    - Docker docs 'JSON File logging driver' — the options it supports
+    - `docker inspect` — `.HostConfig.LogConfig`
+  scenario: |
+    **`/lab/start.sh`** launches the **`chatty`** container, which prints a line every second
+    and never stops. Its log file grows forever.
+
+    **`/lab/policy.txt`** states the retention policy. Change the script so that `chatty` keeps
+    at most that much log data, with the driver left at its default, and start it with the script.
+  hints:
+    - "The retention settings are options of the logging driver, passed with the run command."
+    - "One option limits the size of a file, another limits how many files are kept."
+    - "Sizes take a unit suffix such as `k` or `m`."
+  solution: |
+    Add the two log options to the `docker run` in `start.sh`:
+
+    ```bash
+    docker run -d --name chatty --log-opt max-size=<S>m --log-opt max-file=<N> busybox:1.37 ...
+    ```
+    Then run `sh /lab/start.sh` and check `docker inspect -f '{{.HostConfig.LogConfig}}' chatty`.
+  setup: |
+    s=$((RANDOM % 4 + 2)); n=$((RANDOM % 3 + 2))
+    echo "$s $n" > "$KL_STATE/answer"
+    lab_file policy.txt <<EOF
+    max size per log file: ${s} MiB
+    max files kept: ${n}
+    EOF
+    lab_file start.sh 0755 <<'EOF'
+    #!/bin/sh
+    docker rm -f chatty >/dev/null 2>&1
+    docker run -d --name chatty busybox:1.37 \
+      sh -c 'while :; do echo "tick $(date +%s)"; sleep 1; done'
+    EOF
+    sh /lab/start.sh >/dev/null 2>&1 || true
+  check: |
+    read -r s n < "$KL_STATE/answer"
+    ms=$(c_get chatty '{{index .HostConfig.LogConfig.Config "max-size"}}')
+    mf=$(c_get chatty '{{index .HostConfig.LogConfig.Config "max-file"}}')
+    check "chatty is running" 'c_running chatty'
+    check_eq "logging driver is still json-file" "$(c_get chatty '{{.HostConfig.LogConfig.Type}}')" "json-file"
+    check "max-size is ${s}m" '[ "$ms" = "${s}m" ] || [ "$ms" = "${s}M" ]'
+    check_eq "max-file" "$mf" "$n"
+  solve: |
+    s=$(grep -o '[0-9]*' /lab/policy.txt | sed -n 1p)
+    n=$(grep -o '[0-9]*' /lab/policy.txt | sed -n 2p)
+    sed -i "s|--name chatty|--name chatty --log-opt max-size=${s}m --log-opt max-file=${n}|" /lab/start.sh
+    sh /lab/start.sh
+
+- id: docker-222
+  title: Which container is burning the CPU?
+  difficulty: 2
+  kind: build
+  tags: [stats, cpu, monitoring]
+  tutorial: |
+    **Concept.** The daemon samples live resource usage of every running container: CPU, memory, network and block I/O. A one-shot snapshot is enough to spot the heavy consumer without attaching to anything.
+
+    **Read up on:**
+    - `docker stats --help` — streaming versus a single snapshot, and output formats
+    - `docker top` — the processes inside one container
+    - `sort -rn` — order lines by a leading number
+  scenario: |
+    Three workers are running on this host and the machine feels slow. One of them is spinning
+    on the CPU.
+
+    Write the name of that container (only the name) to **`/lab/hog.txt`**. Leave all three running.
+  hints:
+    - "`docker stats` refreshes forever unless you tell it not to."
+    - "Compare the CPU percentage column across the three containers."
+  solution: |
+    ```bash
+    docker stats --no-stream --format '{{.CPUPerc}} {{.Name}}'
+    ```
+    The container with the high percentage is the answer; write its name to the file.
+  setup: |
+    set -- $(printf '%s\n' billing cart search mailer audit ledger | shuf -n3)
+    echo "$1" > "$KL_STATE/answer"
+    docker run -d --name "$1" busybox:1.37 sh -c 'while :; do :; done' >/dev/null
+    docker run -d --name "$2" busybox:1.37 sleep 3600 >/dev/null
+    docker run -d --name "$3" busybox:1.37 sleep 3600 >/dev/null
+    sleep 3
+  check: |
+    want=$(cat "$KL_STATE/answer")
+    got=$(tr -d '[:space:]' 2>/dev/null </lab/hog.txt)
+    check_eq "hog.txt names the busy container" "$got" "$want"
+    check "the busy container is still running" 'c_running "$want"'
+    check "all three containers are still running" '[ "$(docker ps -q | wc -l | tr -d " ")" -ge 3 ]'
+  solve: |
+    docker stats --no-stream --format '{{.CPUPerc}} {{.Name}}' | sort -rn | head -1 | awk '{print $2}' > /lab/hog.txt
+
+- id: docker-223
+  title: The healthcheck that always fails
+  difficulty: 3
+  kind: fix
+  tags: [healthcheck, health, troubleshooting]
+  tutorial: |
+    **Concept.** A healthcheck is a command the daemon runs inside the container on a schedule. Its exit status moves the container between `starting`, `healthy` and `unhealthy`. A check that probes the wrong thing reports a problem that is not there, or hides one that is.
+
+    **Read up on:**
+    - `docker run --help` — the `--health-*` options
+    - `docker inspect` — `.State.Health` and its recent log
+    - `docker ps` — the health status in the STATUS column
+  scenario: |
+    **`/lab/start.sh`** launches the **`web`** container, a tiny web server that serves a
+    readiness file on its own port. The container is marked **unhealthy** although the server is
+    fine: the healthcheck probes the wrong address.
+
+    Fix the healthcheck in the script so that it asks the server for its readiness file on
+    the port it really listens on, then start it with the script. `web` must end up **healthy**.
+  hints:
+    - "`docker inspect -f '{{json .State.Health}}' web` shows what the check printed."
+    - "The script shows which port the server listens on and which file it serves."
+    - "Leave the server command alone; only the check is wrong."
+  solution: |
+    Change the `--health-cmd` URL to the server's real port and file:
+
+    ```bash
+    --health-cmd 'wget -q -O /dev/null http://127.0.0.1:<port>/<file>'
+    ```
+    Then `sh /lab/start.sh` and watch `docker ps` until `web` shows `(healthy)`.
+  setup: |
+    p=$((RANDOM % 900 + 8100)); r="ok-$((RANDOM % 9000 + 1000))"
+    echo "$p $r" > "$KL_STATE/answer"
+    lab_file start.sh 0755 <<EOF
+    #!/bin/sh
+    docker rm -f web >/dev/null 2>&1
+    docker run -d --name web \\
+      --health-cmd 'wget -q -O /dev/null http://127.0.0.1:80/healthz' \\
+      --health-interval 2s --health-timeout 2s --health-retries 2 \\
+      busybox:1.37 sh -c 'mkdir -p /www; echo ok > /www/$r; exec httpd -f -p $p -h /www'
+    EOF
+    sh /lab/start.sh >/dev/null 2>&1 || true
+  check: |
+    read -r p r < "$KL_STATE/answer"
+    probe=$(c_get web '{{json .Config.Healthcheck.Test}}')
+    check "web is running" 'c_running web'
+    check "the server command is unchanged" 'c_get web "{{.Config.Cmd}}" | grep -q "httpd -f -p $p"'
+    check "the healthcheck asks for port $p and /$r" 'grep -q "$p/$r" <<<"$probe"'
+    h=no
+    if grep -q "$p/$r" <<<"$probe"; then
+      eventually 30 '[ "$(c_get web "{{.State.Health.Status}}")" = healthy ]' && h=yes
+    fi
+    check "web reports healthy" '[ "$h" = yes ]'
+  solve: |
+    p=$(grep -o 'httpd -f -p [0-9]*' /lab/start.sh | awk '{print $4}')
+    r=$(grep -o 'ok-[0-9]*' /lab/start.sh | head -1)
+    sed -i "s|:80/healthz|:${p}/${r}|" /lab/start.sh
+    sh /lab/start.sh
+
+- id: docker-224
+  title: Reconstruct the failed jobs from events
+  difficulty: 4
+  kind: build
+  tags: [events, exit-code, audit]
+  tutorial: |
+    **Concept.** The daemon keeps a short history of what happened to containers, networks and images. Each event carries a timestamp, the object's name and a set of attributes. This is the only record left for containers that no longer exist.
+
+    **Read up on:**
+    - `docker events --help` — `--since`, `--until` and `--filter`
+    - `docker events --format` — pick fields out of the event with a Go template
+    - Docker docs 'docker events' — which attributes accompany a `die` event
+  scenario: |
+    A few minutes ago five short-lived containers named **`job-<something>`** ran and were
+    removed as soon as they finished, so `docker ps -a` shows nothing. Some of them failed.
+
+    Using the daemon's event history, write the names of the `job-*` containers that exited with
+    a **non-zero** code to **`/lab/failed.txt`**, one per line, sorted alphabetically.
+  hints:
+    - "`docker events` normally waits for new events; give it an end time so it stops."
+    - "The exit code is an attribute of the event that fires when a container's process ends."
+    - "Format the output so that each line holds the name and the exit code, then filter."
+  solution: |
+    ```bash
+    docker events --since 2h --until "$(date +%s)" --filter event=die \
+      --format '{{.Actor.Attributes.name}} {{.Actor.Attributes.exitCode}}'
+    ```
+    Keep the `job-*` names whose code is not `0`, sort them and save them to the file.
+  setup: |
+    set -- $(printf '%s\n' billing cart search mailer audit ledger reports | shuf -n5)
+    fails=$(printf '%s\n' "$@" | shuf -n2)
+    : > "$KL_STATE/answer.tmp"
+    for n in "$@"; do
+      if grep -qx "$n" <<<"$fails"; then
+        rc=$((RANDOM % 5 + 2)); echo "job-$n" >> "$KL_STATE/answer.tmp"
+      else
+        rc=0
+      fi
+      docker run --rm --name "job-$n" busybox:1.37 sh -c "exit $rc" >/dev/null 2>&1 || true
+    done
+    sort "$KL_STATE/answer.tmp" > "$KL_STATE/answer"
+    rm -f "$KL_STATE/answer.tmp"
+  check: |
+    want=$(cat "$KL_STATE/answer")
+    got=$(tr -s '[:space:]' '\n' 2>/dev/null </lab/failed.txt | sed '/^$/d' | sort)
+    check_eq "failed.txt lists exactly the failed jobs" "$got" "$want"
+  solve: |
+    docker events --since 2h --until "$(date +%s)" --filter event=die \
+      --format '{{.Actor.Attributes.name}} {{.Actor.Attributes.exitCode}}' \
+      | awk '$1 ~ /^job-/ && $2 != 0 {print $1}' | sort -u > /lab/failed.txt
+
+- id: docker-225
+  title: "docker logs says: logging driver does not support reading"
+  difficulty: 2
+  kind: fix
+  tags: [logging-driver, local, logs]
+  tutorial: |
+    **Concept.** Every container has a logging driver. Some drivers store the output where `docker logs` can read it back, others forward it elsewhere or discard it. Which one is in effect is a property of the container, chosen when it is created.
+
+    **Read up on:**
+    - `docker logs` — what it needs from the driver
+    - `docker run --help` — `--log-driver`
+    - Docker docs 'Configure logging drivers' — the built-in drivers and their trade-offs
+  scenario: |
+    **`/lab/start.sh`** launches the **`audit`** container. On startup it prints one line
+    that the team needs, but `docker logs audit` refuses to show anything.
+
+    Change the script so `audit` uses the **`local`** logging driver (Docker's compact, rotating
+    format) and start it again, so that the line can be read with `docker logs`.
+  hints:
+    - "`docker inspect -f '{{.HostConfig.LogConfig.Type}}' audit` tells you the driver in use."
+    - "A container's driver cannot be changed in place; it has to be created again."
+  solution: |
+    Replace the driver in the `docker run` of `start.sh`:
+
+    ```bash
+    docker run -d --name audit --log-driver local busybox:1.37 ...
+    ```
+    Run `sh /lab/start.sh`, then `docker logs audit`.
+  setup: |
+    tok=$(rand_flag)
+    echo "$tok" > "$KL_STATE/answer"
+    lab_file start.sh 0755 <<EOF
+    #!/bin/sh
+    docker rm -f audit >/dev/null 2>&1
+    docker run -d --name audit --log-driver none busybox:1.37 \\
+      sh -c 'echo "audit-$tok"; exec sleep 3600'
+    EOF
+    sh /lab/start.sh >/dev/null 2>&1 || true
+  check: |
+    tok=$(cat "$KL_STATE/answer")
+    check "audit is running" 'c_running audit'
+    check_eq "audit uses the local logging driver" "$(c_get audit '{{.HostConfig.LogConfig.Type}}')" "local"
+    check "the startup line is readable with docker logs" 'docker logs audit 2>&1 | grep -qxF "audit-$tok"'
+  solve: |
+    sed -i 's/--log-driver none/--log-driver local/' /lab/start.sh
+    sh /lab/start.sh
+
+- id: docker-226
+  title: Split stdout from stderr
+  difficulty: 2
+  kind: build
+  tags: [logs, stdout, stderr, redirection]
+  tutorial: |
+    **Concept.** A container's output is stored with a tag saying whether each line came from standard output or standard error. `docker logs` replays them on the matching streams of your terminal, so ordinary shell redirection can separate them again.
+
+    **Read up on:**
+    - `docker logs --help`
+    - Shell redirection — `>` for stdout and `2>` for stderr
+    - `diff` — compare two files line by line
+  scenario: |
+    The **`job`** container has finished. It printed a mix of normal output and error messages, and
+    the on-call engineer wants them separated.
+
+    Save its normal output to **`/lab/out.log`** and its error output to **`/lab/err.log`**, with
+    nothing from the other stream in either file.
+  hints:
+    - "`docker logs job` writes the container's stdout to your stdout and its stderr to your stderr."
+    - "You can redirect both streams of a single command to different files."
+  solution: |
+    ```bash
+    docker logs job >/lab/out.log 2>/lab/err.log
+    ```
+  setup: |
+    t=$(head -c4 /dev/urandom | od -An -tx1 | tr -d ' \n')
+    echo "out-$t-1" > "$KL_STATE/out.expected"
+    echo "out-$t-2" >> "$KL_STATE/out.expected"
+    echo "out-$t-3" >> "$KL_STATE/out.expected"
+    echo "err-$t-1" > "$KL_STATE/err.expected"
+    echo "err-$t-2" >> "$KL_STATE/err.expected"
+    docker run -d --name job busybox:1.37 sh -c "echo out-$t-1; echo err-$t-1 >&2; echo out-$t-2; echo err-$t-2 >&2; echo out-$t-3" >/dev/null
+    eventually 20 '[ "$(c_get job "{{.State.Status}}")" = exited ]'
+  check: |
+    check "the job container still exists" 'c_exists job'
+    check "out.log holds exactly the stdout lines" 'diff -q /lab/out.log "$KL_STATE/out.expected"'
+    check "err.log holds exactly the stderr lines" 'diff -q /lab/err.log "$KL_STATE/err.expected"'
+  solve: |
+    docker logs job >/lab/out.log 2>/lab/err.log
+
+- id: docker-227
+  title: Find the failing request in structured logs
+  difficulty: 3
+  kind: build
+  tags: [logs, json, structured-logging]
+  tutorial: |
+    **Concept.** Structured logs put one JSON object on each line, with fields such as level, request id and message. That makes them searchable by field instead of by free text, but a naive text search can match the wrong lines when a word appears in several fields.
+
+    **Read up on:**
+    - `docker logs --help`
+    - `grep` — fixed-string and regular-expression matching
+    - `sed -n 's/.../\1/p'` or `jq` — extract one field from a line
+  scenario: |
+    The **`api`** container logs one JSON object per line. Exactly one line has the field
+    `"level":"error"`. Other lines mention the word "error" in their message, but they are not errors.
+
+    Write the request **`id`** of the single error-level line (for example `1234-7`) to
+    **`/lab/reqid.txt`**.
+  hints:
+    - "Search for the field and its value together, not just the word."
+    - "The id is the value of the `id` field on that same line."
+  solution: |
+    ```bash
+    docker logs api | grep '"level":"error"'
+    ```
+    Copy the value of its `id` field into the file (for example with `sed 's/.*"id":"\([^"]*\)".*/\1/'`).
+  setup: |
+    mkdir -p /srv/kl/api
+    on_reset 'rm -rf /srv/kl/api'
+    bad=$((RANDOM % 30 + 5)); : > /srv/kl/api/app.log
+    for i in $(seq 1 40); do
+      id="$((RANDOM % 9000 + 1000))-$i"
+      ts=$(printf '2025-01-01T00:00:%02dZ' "$i")
+      if [ "$i" = "$bad" ]; then
+        echo "$id" > "$KL_STATE/answer"
+        echo "{\"ts\":\"$ts\",\"level\":\"error\",\"id\":\"$id\",\"msg\":\"upstream refused the connection\"}" >> /srv/kl/api/app.log
+      elif [ $((i % 6)) = 0 ]; then
+        echo "{\"ts\":\"$ts\",\"level\":\"warn\",\"id\":\"$id\",\"msg\":\"recovered from error, retried\"}" >> /srv/kl/api/app.log
+      else
+        echo "{\"ts\":\"$ts\",\"level\":\"info\",\"id\":\"$id\",\"msg\":\"handled request\"}" >> /srv/kl/api/app.log
+      fi
+    done
+    docker run -d --name api -v /srv/kl/api/app.log:/var/log/app.log:ro busybox:1.37 sh -c 'cat /var/log/app.log; exec sleep 3600' >/dev/null
+    eventually 15 'docker logs api 2>&1 | grep -q "\"level\":\"error\""'
+  check: |
+    want=$(cat "$KL_STATE/answer")
+    got=$(tr -d '[:space:]' 2>/dev/null </lab/reqid.txt)
+    check_eq "reqid.txt holds the id of the error line" "$got" "$want"
+  solve: |
+    docker logs api | grep '"level":"error"' | sed 's/.*"id":"\([^"]*\)".*/\1/' > /lab/reqid.txt
+
+- id: docker-228
+  title: The app logs to a file, so docker logs is empty
+  difficulty: 3
+  kind: fix
+  tags: [logs, stdout, twelve-factor, forwarding]
+  tutorial: |
+    **Concept.** `docker logs` shows only what the container's main process writes to its standard output and error. An application that writes to a file inside the container is invisible to it, and so to every log forwarder built on the logging driver. A common remedy is to make the log file lead to the output streams.
+
+    **Read up on:**
+    - `docker logs` — what it captures
+    - `/dev/stdout` and `/dev/stderr` — special files in a container
+    - `ln -s` — symbolic links; `tail -F` as the alternative
+    - The official `nginx` image's Dockerfile — how it handles its access log
+  scenario: |
+    **`/lab/start.sh`** launches **`app`**, which appends a `tick` line to
+    **`/var/log/app/app.log`** inside the container every second. Nothing shows up in
+    `docker logs app`.
+
+    Change the way `app` is started so that its log lines appear in `docker logs app`. The
+    application itself must keep writing to that same file path.
+  hints:
+    - "The application opens the same path every time; you may change what that path is."
+    - "A link to the container's output stream, created before the application starts, is enough."
+    - "A background `tail -F` of the file is another valid approach."
+  solution: |
+    Make the log path lead to stdout before the loop starts, for example by adding this to the
+    shell command in `start.sh`:
+
+    ```bash
+    mkdir -p /var/log/app; ln -sf /dev/stdout /var/log/app/app.log
+    ```
+    Then run `sh /lab/start.sh` and check `docker logs app`.
+  setup: |
+    tok=$(head -c4 /dev/urandom | od -An -tx1 | tr -d ' \n')
+    echo "$tok" > "$KL_STATE/answer"
+    lab_file start.sh 0755 <<EOF
+    #!/bin/sh
+    docker rm -f app >/dev/null 2>&1
+    docker run -d --name app busybox:1.37 \\
+      sh -c 'mkdir -p /var/log/app; i=0; while :; do i=\$((i+1)); echo "tick:$tok:\$i" >> /var/log/app/app.log; sleep 1; done'
+    EOF
+    sh /lab/start.sh >/dev/null 2>&1 || true
+  check: |
+    tok=$(cat "$KL_STATE/answer")
+    check "app is running" 'c_running app'
+    check "the app still writes to /var/log/app/app.log" 'c_get app "{{.Config.Cmd}}" | grep -q "/var/log/app/app.log"'
+    t=no
+    if c_running app; then
+      eventually 20 '[ "$(docker logs app 2>&1 | grep -c "tick:$tok:")" -ge 2 ]' && t=yes
+    fi
+    check "tick lines show up in docker logs" '[ "$t" = yes ]'
+  solve: |
+    sed -i "s|mkdir -p /var/log/app;|mkdir -p /var/log/app; ln -sf /dev/stdout /var/log/app/app.log;|" /lab/start.sh
+    sh /lab/start.sh
+
+- id: docker-229
+  title: Hand over the last lines, with timestamps
+  difficulty: 2
+  kind: build
+  tags: [logs, tail, timestamps]
+  tutorial: |
+    **Concept.** A container's log can be long. `docker logs` can limit how much it prints and can decorate each line with the time the daemon received it. Timestamps let someone else line the output up against other systems.
+
+    **Read up on:**
+    - `docker logs --help` — `--tail`, `--since`, `--timestamps`
+    - `wc -l` — count lines
+    - `awk '{print $2}'` — pick one column out of a line
+  scenario: |
+    The **`batch`** container processed 40 records and exited. The incident ticket needs only the
+    **last records**, and each must carry its timestamp. **`/lab/limit.txt`** gives how many.
+
+    Write exactly that many of the **last** log lines, with timestamps, to **`/lab/last.txt`**.
+  hints:
+    - "One option keeps only the end of the log."
+    - "Another adds an RFC3339 timestamp at the start of each line."
+  solution: |
+    ```bash
+    docker logs --tail <N> --timestamps batch > /lab/last.txt
+    ```
+  setup: |
+    t=$(head -c4 /dev/urandom | od -An -tx1 | tr -d ' \n'); k=$((RANDOM % 6 + 4))
+    echo "$t $k" > "$KL_STATE/answer"
+    lab_file limit.txt <<EOF
+    records to hand over: $k
+    EOF
+    docker run -d --name batch busybox:1.37 sh -c "i=1; while [ \$i -le 40 ]; do echo rec-$t-\$i; i=\$((i+1)); done" >/dev/null
+    eventually 20 '[ "$(c_get batch "{{.State.Status}}")" = exited ]'
+  check: |
+    read -r t k < "$KL_STATE/answer"
+    exp=$(i=$((41 - k)); while [ "$i" -le 40 ]; do echo "rec-$t-$i"; i=$((i + 1)); done)
+    got=$(awk '{print $2}' /lab/last.txt 2>/dev/null)
+    stamped=$(grep -cE '^20[0-9]{2}-[0-9]{2}-[0-9]{2}T[0-9:.]+Z? ' /lab/last.txt 2>/dev/null)
+    check_eq "the last $k records, in order" "$got" "$exp"
+    check_eq "every line carries a timestamp" "${stamped:-0}" "$k"
+  solve: |
+    k=$(grep -o '[0-9]*' /lab/limit.txt | head -1)
+    docker logs --tail "$k" --timestamps batch > /lab/last.txt 2>&1
+
+- id: docker-230
+  title: Which container did the kernel kill?
+  difficulty: 3
+  kind: build
+  tags: [oom, memory, inspect, exit-code]
+  tutorial: |
+    **Concept.** A container can be given a memory ceiling. When it goes over, the kernel kills a process in it and the container exits with code 137. The same code also appears when somebody sends SIGKILL, so the exit code alone cannot tell the two apart; the daemon records the difference separately.
+
+    **Read up on:**
+    - `docker inspect` — the `.State` block, including `.State.OOMKilled`
+    - `docker ps -a` — exit codes in the STATUS column
+    - `docker run --help` — `--memory` and `--memory-swap`
+  scenario: |
+    Three containers were started on this host. Two of them are now down with exit code **137**
+    (they were killed), and one is still running. Only one of the dead ones ran out of memory;
+    the other one was stopped by an operator with a kill signal.
+
+    Write the name of the container that was **killed for exceeding its memory limit** to
+    **`/lab/oom.txt`** (only the name).
+  hints:
+    - "Both stopped containers show the same exit code, so look for another field."
+    - "The daemon keeps a boolean flag for out-of-memory kills in the container's state."
+  solution: |
+    ```bash
+    docker ps -a
+    docker inspect -f '{{.Name}} oom={{.State.OOMKilled}} exit={{.State.ExitCode}}' $(docker ps -aq)
+    ```
+    The one with `oom=true` is the answer.
+  setup: |
+    set -- $(printf '%s\n' billing cart search mailer audit ledger | shuf -n3)
+    echo "$1" > "$KL_STATE/answer"
+    docker run -d --name "$1" -m 32m --memory-swap 32m python:3.12-alpine \
+      python -c 'import time; time.sleep(2); x=b"x"*(300*1024*1024); time.sleep(600)' >/dev/null
+    docker run -d --name "$2" busybox:1.37 sleep 3600 >/dev/null
+    docker run -d --name "$3" -m 32m busybox:1.37 sleep 3600 >/dev/null
+    sleep 1
+    docker kill "$2" >/dev/null
+    oomc="$1"
+    eventually 40 '[ "$(c_get "$oomc" "{{.State.OOMKilled}}")" = true ]'
+  check: |
+    want=$(cat "$KL_STATE/answer")
+    got=$(tr -d '[:space:]' 2>/dev/null </lab/oom.txt)
+    check_eq "oom.txt names the container killed for memory" "$got" "$want"
+    check "the other containers were left alone" '[ "$(docker ps -aq | wc -l | tr -d " ")" = 3 ]'
+  solve: |
+    for c in $(docker ps -aq); do
+      if [ "$(docker inspect -f '{{.State.OOMKilled}}' "$c")" = true ]; then
+        docker inspect -f '{{.Name}}' "$c" | tr -d / > /lab/oom.txt
+      fi
+    done

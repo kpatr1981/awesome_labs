@@ -1,0 +1,616 @@
+track: offsec
+module: Forensics & artifact analysis
+profile: offsec
+order: 5
+exercises:
+
+- id: offsec-for-001
+  title: The token on the wire
+  difficulty: 2
+  kind: build
+  tags: [forensics, pcap, tcpdump]
+  tutorial: |
+    **Concept.** A packet capture (pcap) is a recording of network traffic. When a service speaks plain HTTP, every header and body crosses the wire as readable text, so a credential sent in a header ends up in the capture. Analysts replay the file offline rather than touching the live network.
+
+    **Read up on:**
+    - `man tcpdump` — reading a saved capture with `-r`, and printing payloads with `-A`
+    - `tcpdump -nn` — why you usually turn off name and port resolution
+    - `strings` — pulling printable text out of any binary file
+    - HTTP request headers — which ones commonly carry credentials
+  scenario: |
+    The security team saved a short capture of one workstation's traffic to
+    **`/lab/capture.pcap`**. A script on that machine is suspected of sending a
+    session token over unencrypted HTTP.
+
+    Investigate the capture, find the session token that was transmitted, and
+    write the **`KL{...}`** value to **`/lab/flag.txt`**.
+  hints:
+    - "Replay the capture offline: `tcpdump -nn -r /lab/capture.pcap` lists the packets; add `-A` to print the payloads as text."
+    - "Most packets are ordinary page requests. Look for a request header whose name suggests a credential, for example by filtering with `grep -i token`."
+    - "`tcpdump -nn -A -r /lab/capture.pcap | grep -i 'token'` shows the header line that carries the value."
+  solution: |
+    The capture holds plain HTTP, so the payloads are readable. One POST carries
+    an `X-Session-Token` header:
+
+    ```bash
+    tcpdump -nn -A -r /lab/capture.pcap 2>/dev/null \
+      | grep -i 'x-session-token' | grep -oE 'KL\{[0-9a-f]+\}' | head -1 > /lab/flag.txt
+    ```
+  setup: |
+    FLAG=$(rand_flag); export FLAG
+    echo "$FLAG" > "$KL_STATE/answer"
+    python3 - <<'PY'
+    import os, struct, random
+    flag = os.environ["FLAG"]
+    out = bytearray(struct.pack("<IHHiIII", 0xa1b2c3d4, 2, 4, 0, 0, 65535, 1))
+    ts = 1731000000
+    seq = 1000
+    def pkt(src, dst, sport, dport, payload):
+        global ts, seq
+        tcp = struct.pack(">HHIIBBHHH", sport, dport, seq, 1, 5 << 4, 0x18, 8192, 0, 0)
+        ip = struct.pack(">BBHHHBBH4s4s", 0x45, 0, 40 + len(payload), random.randint(1, 65000), 0x4000, 64, 6, 0,
+                         bytes(map(int, src.split("."))), bytes(map(int, dst.split("."))))
+        eth = bytes.fromhex("525400123456") + bytes.fromhex("525400654321") + b"\x08\x00"
+        frame = eth + ip + tcp + payload
+        out.extend(struct.pack("<IIII", ts, random.randint(0, 999999), len(frame), len(frame)))
+        out.extend(frame)
+        ts += random.randint(1, 4)
+        seq += len(payload)
+    def get(host, path, extra=""):
+        return ("GET %s HTTP/1.1\r\nHost: %s\r\nUser-Agent: curl/8.5\r\n%s\r\n" % (path, host, extra)).encode()
+    ws, srv = "10.20.0.15", "10.20.0.80"
+    pkt(ws, srv, 41000, 80, get("intranet.local", "/"))
+    pkt(ws, srv, 41001, 80, get("intranet.local", "/static/app.css"))
+    pkt(ws, srv, 41002, 80, get("intranet.local", "/news", "X-Request-Id: 7f3a19\r\n"))
+    body = b'{"sync":true}'
+    pkt(ws, srv, 41003, 8080,
+        b"POST /api/sync HTTP/1.1\r\nHost: sync.internal\r\nX-Session-Token: " + flag.encode() +
+        b"\r\nContent-Type: application/json\r\nContent-Length: " + str(len(body)).encode() + b"\r\n\r\n" + body)
+    pkt(srv, ws, 80, 41003, b"HTTP/1.1 200 OK\r\nContent-Length: 2\r\n\r\nok")
+    pkt(ws, srv, 41004, 80, get("intranet.local", "/favicon.ico"))
+    pkt(ws, srv, 41005, 80, get("intranet.local", "/holidays", "X-Request-Id: 91bc02\r\n"))
+    open("/lab/capture.pcap", "wb").write(out)
+    PY
+    chown -R "$(lab_user)": /lab
+  check: |
+    check_flag
+  solve: |
+    tcpdump -nn -A -r /lab/capture.pcap 2>/dev/null \
+      | grep -i 'x-session-token' | grep -oE 'KL\{[0-9a-f]+\}' | head -1 > /lab/flag.txt
+
+- id: offsec-for-002
+  title: What does the agent carry?
+  difficulty: 2
+  kind: build
+  tags: [forensics, strings, binary]
+  tutorial: |
+    **Concept.** Compiled programs often keep human-readable text inside them: error messages, URLs, configuration defaults, and sometimes credentials a developer forgot to remove. `strings` scans a file for runs of printable characters, which makes it the first step in triaging an unknown binary without running it.
+
+    **Read up on:**
+    - `man strings` — the `-n` minimum length option
+    - `file` — identifying what kind of file you hold
+    - `grep -o` — printing only the matching part of a line
+  scenario: |
+    An unfamiliar executable, **`/lab/vendor-agent`**, was found on a build
+    server. Do not run it. It contains a few embedded key strings: some are
+    labelled `sample_key=` (documentation placeholders) and exactly one is
+    labelled **`license_key=`**.
+
+    Inspect the file, find the value labelled `license_key=`, and write the
+    **`KL{...}`** token to **`/lab/flag.txt`**.
+  hints:
+    - "`file /lab/vendor-agent` tells you what it is; you never need to execute it."
+    - "`strings /lab/vendor-agent | grep -i key` narrows the output to the labelled strings."
+    - "Only the `license_key=` line is the real one — `grep -o 'license_key=KL{[0-9a-f]*}'` isolates it."
+  solution: |
+    The strings are stored as plain ASCII, so `strings` finds them. Pick the one
+    with the right label:
+
+    ```bash
+    strings /lab/vendor-agent | grep -o 'license_key=KL{[0-9a-f]*}' \
+      | head -1 | sed 's/^license_key=//' > /lab/flag.txt
+    ```
+  setup: |
+    FLAG=$(rand_flag); export FLAG
+    echo "$FLAG" > "$KL_STATE/answer"
+    python3 - <<'PY'
+    import os
+    flag = os.environ["FLAG"]
+    def decoy():
+        return "KL{" + os.urandom(16).hex() + "}"
+    parts = [b"\x7fELF\x02\x01\x01\x00"]
+    items = [
+        b"sample_key=" + decoy().encode(),
+        b"usage: vendor-agent [--config FILE]",
+        b"sample_key=" + decoy().encode(),
+        b"license_key=" + flag.encode(),
+        b"connection refused, retrying",
+        b"sample_key=" + decoy().encode(),
+    ]
+    for it in items:
+        parts.append(os.urandom(300).replace(b"\n", b"\x00"))
+        parts.append(b"\x00" + it + b"\x00")
+    parts.append(os.urandom(300))
+    open("/lab/vendor-agent", "wb").write(b"".join(parts))
+    PY
+    chmod 644 /lab/vendor-agent
+    chown -R "$(lab_user)": /lab
+  check: |
+    check_flag
+  solve: |
+    strings /lab/vendor-agent | grep -o 'license_key=KL{[0-9a-f]*}' \
+      | head -1 | sed 's/^license_key=//' > /lab/flag.txt
+
+- id: offsec-for-003
+  title: Query the audit trail
+  difficulty: 2
+  kind: build
+  tags: [forensics, sqlite, database]
+  tutorial: |
+    **Concept.** Applications keep their state in embedded databases such as SQLite, and an audit table is often the best record of who did what. A database file can be inspected read-only with the `sqlite3` shell without starting any service.
+
+    **Read up on:**
+    - `sqlite3` shell — `.tables`, `.schema`, and `.mode`
+    - SQL `SELECT ... WHERE ... ORDER BY` — filtering rows by column value
+    - `sqlite3 FILE "SQL"` — running one query non-interactively
+  scenario: |
+    A CRM export was left at **`/lab/crm.db`**. Its `audit_log` table records
+    administrative actions. API keys were revoked several times in the past,
+    but exactly one key is **currently issued** (action `api_key_issued`).
+
+    Investigate the database and write that currently issued **`KL{...}`** key
+    to **`/lab/flag.txt`**.
+  hints:
+    - "Start with `sqlite3 /lab/crm.db .tables` and `.schema audit_log` to learn the layout."
+    - "Filter on the action column: `SELECT * FROM audit_log WHERE action='api_key_issued';`"
+    - "The key sits inside the `detail` text; `grep -o 'KL{[0-9a-f]*}'` on the query output extracts it."
+  solution: |
+    ```bash
+    sqlite3 /lab/crm.db "SELECT detail FROM audit_log WHERE action='api_key_issued';" \
+      | grep -oE 'KL\{[0-9a-f]+\}' > /lab/flag.txt
+    ```
+    The `api_key_revoked` rows hold old, retired keys and are not the answer.
+  setup: |
+    FLAG=$(rand_flag); export FLAG
+    echo "$FLAG" > "$KL_STATE/answer"
+    python3 - <<'PY'
+    import os, sqlite3
+    flag = os.environ["FLAG"]
+    old = lambda: "KL{" + os.urandom(16).hex() + "}"
+    db = sqlite3.connect("/lab/crm.db")
+    db.execute("CREATE TABLE customers (id INTEGER PRIMARY KEY, name TEXT, plan TEXT)")
+    db.execute("CREATE TABLE audit_log (id INTEGER PRIMARY KEY, ts TEXT, actor TEXT, action TEXT, detail TEXT)")
+    db.executemany("INSERT INTO customers (name, plan) VALUES (?, ?)",
+                   [("Northwind", "pro"), ("Contoso", "basic"), ("Initech", "pro"), ("Globex", "free")])
+    rows = [
+        ("2026-09-01 09:00", "admin", "login", "ok"),
+        ("2026-09-03 11:12", "admin", "api_key_revoked", "key=" + old()),
+        ("2026-09-10 14:40", "svc-sync", "export", "customers.csv"),
+        ("2026-09-15 08:05", "admin", "api_key_revoked", "key=" + old()),
+        ("2026-09-20 16:30", "admin", "api_key_issued", "key=" + flag + " scope=read"),
+        ("2026-09-21 10:00", "ops", "login", "ok"),
+        ("2026-09-22 10:07", "admin", "plan_change", "Globex free"),
+        ("2026-10-02 12:00", "admin", "api_key_revoked", "key=" + old()),
+    ]
+    db.executemany("INSERT INTO audit_log (ts, actor, action, detail) VALUES (?, ?, ?, ?)", rows)
+    db.commit()
+    db.close()
+    PY
+    chown -R "$(lab_user)": /lab
+  check: |
+    check_flag
+  solve: |
+    sqlite3 /lab/crm.db "SELECT detail FROM audit_log WHERE action='api_key_issued';" \
+      | grep -oE 'KL\{[0-9a-f]+\}' > /lab/flag.txt
+
+- id: offsec-for-004
+  title: Peel the layers
+  difficulty: 3
+  kind: build
+  tags: [forensics, encoding, base64, hex]
+  tutorial: |
+    **Concept.** Data in an incident is often wrapped in several reversible encodings to make it look like noise. None of these are encryption, because they need no key. The analyst's job is to recognise each layer from its alphabet and undo them in the reverse order they were applied.
+
+    **Read up on:**
+    - `base64 -d` — what the base64 alphabet looks like (letters, digits, `+`, `/`, `=`)
+    - `xxd -r -p` — turning a plain hex string back into bytes
+    - `tr` — character-for-character substitution, and the ROT13 rotation cipher
+  scenario: |
+    A note recovered from a staging directory is saved in
+    **`/lab/intercepted.txt`**. Its last line is a single blob. It was
+    produced by applying three simple encodings one after another: the
+    original **`KL{...}`** text was rotated, then turned into hex, then
+    base64-encoded.
+
+    Reverse the layers and write the original **`KL{...}`** value to
+    **`/lab/flag.txt`**.
+  hints:
+    - "The blob ends in letters and digits only (and maybe `=`), so base64 is the outermost layer: `tail -n1 /lab/intercepted.txt | base64 -d`."
+    - "The result is a string of hex digits. `xxd -r -p` converts it back to the characters."
+    - "What comes out looks almost like a flag but with shifted letters. ROT13 is its own inverse: `tr 'A-Za-z' 'N-ZA-Mn-za-m'`."
+  solution: |
+    Undo the layers in reverse order — base64, then hex, then ROT13:
+
+    ```bash
+    tail -n1 /lab/intercepted.txt | base64 -d | xxd -r -p \
+      | tr 'A-Za-z' 'N-ZA-Mn-za-m' > /lab/flag.txt
+    ```
+  setup: |
+    FLAG=$(rand_flag); export FLAG
+    echo "$FLAG" > "$KL_STATE/answer"
+    python3 - <<'PY'
+    import os, codecs, binascii, base64
+    flag = os.environ["FLAG"]
+    step1 = codecs.encode(flag, "rot13")
+    step2 = binascii.hexlify(step1.encode()).decode()
+    step3 = base64.b64encode(step2.encode()).decode()
+    with open("/lab/intercepted.txt", "w") as f:
+        f.write("# recovered from /srv/staging/.cache on host build-04\n")
+        f.write(step3 + "\n")
+    PY
+    chown -R "$(lab_user)": /lab
+  check: |
+    check_flag
+  solve: |
+    tail -n1 /lab/intercepted.txt | base64 -d | xxd -r -p \
+      | tr 'A-Za-z' 'N-ZA-Mn-za-m' > /lab/flag.txt
+
+- id: offsec-for-005
+  title: Reassemble the beacon
+  difficulty: 3
+  kind: build
+  tags: [forensics, logs, reconstruction]
+  tutorial: |
+    **Concept.** Data that was sent out in pieces leaves its pieces scattered through the logs of the machine that received them. To reconstruct the original you filter the relevant entries out of the noise, put them back in their intended order using a sequence field, and join the payload parts.
+
+    **Read up on:**
+    - `grep -o` — extracting just the interesting substring from each line
+    - `sort -t` and `-k` with `-n` — sorting on a numeric field after a custom delimiter
+    - `sed` and `tr -d '\n'` — trimming a prefix and joining lines
+  scenario: |
+    The web server's access log is at **`/lab/access.log`**. Buried in ordinary
+    traffic are several requests to `/px.gif`. Each one carries two query
+    parameters: `seq` (its position) and `d` (a fragment of a longer value).
+    The requests are **not** in order in the log.
+
+    Rebuild the value by ordering the fragments by `seq` and joining the `d`
+    parts. Write the resulting **`KL{...}`** string to **`/lab/flag.txt`**.
+  hints:
+    - "`grep 'px.gif' /lab/access.log` shows only the interesting requests."
+    - "Extract `seq=N&d=FRAGMENT` with `grep -o 'seq=[0-9]*&d=[^ ]*'`, then sort numerically on the number after `seq=`."
+    - "After sorting, strip everything up to `d=` with `sed 's/.*d=//'` and join with `tr -d '\\n'`."
+  solution: |
+    ```bash
+    grep -o 'seq=[0-9]*&d=[^ ]*' /lab/access.log \
+      | sort -t= -k2n | sed 's/.*d=//' | tr -d '\n' > /lab/flag.txt
+    ```
+  setup: |
+    FLAG=$(rand_flag); export FLAG
+    echo "$FLAG" > "$KL_STATE/answer"
+    python3 - <<'PY'
+    import os, random
+    flag = os.environ["FLAG"]
+    chunks = [flag[i:i + 7] for i in range(0, len(flag), 7)]
+    beacons = ["/px.gif?seq=%d&d=%s" % (i + 1, c) for i, c in enumerate(chunks)]
+    random.shuffle(beacons)
+    paths = ["/", "/index.html", "/static/app.js", "/static/site.css", "/about", "/contact",
+             "/products?page=2", "/favicon.ico", "/login", "/api/status"]
+    lines = []
+    for i in range(60):
+        lines.append(("10.1.%d.%d" % (random.randint(0, 3), random.randint(2, 200)), random.choice(paths), 200))
+    for b in beacons:
+        lines.insert(random.randint(0, len(lines)), ("10.1.2.77", b, 200))
+    with open("/lab/access.log", "w") as f:
+        for n, (ip, path, code) in enumerate(lines):
+            f.write('%s - - [09/Nov/2026:10:%02d:%02d +0000] "GET %s HTTP/1.1" %d %d\n'
+                    % (ip, n // 60, n % 60, path, code, random.randint(40, 4000)))
+    PY
+    chown -R "$(lab_user)": /lab
+  check: |
+    check_flag
+  solve: |
+    grep -o 'seq=[0-9]*&d=[^ ]*' /lab/access.log \
+      | sort -t= -k2n | sed 's/.*d=//' | tr -d '\n' > /lab/flag.txt
+
+- id: offsec-for-006
+  title: Metadata in a compressed chunk
+  difficulty: 3
+  kind: build
+  tags: [forensics, metadata, png, python]
+  tutorial: |
+    **Concept.** Image files carry more than pixels. A PNG is a sequence of typed chunks, and some chunk types store text metadata, either plain (`tEXt`) or compressed (`zTXt`). Compressed text will not show up in `strings`, so an analyst parses the chunk structure and decompresses it.
+
+    **Read up on:**
+    - PNG file structure — an 8-byte signature, then chunks of length, type, data and CRC
+    - Python `struct.unpack` — reading big-endian integers from bytes
+    - Python `zlib.decompress` — undoing the compression used by `zTXt`
+    - `file` and `strings` — what they can and cannot see
+  scenario: |
+    A photo, **`/lab/photo.png`**, was attached to an incident ticket. The
+    reporter says provenance details were stored in the file's metadata.
+    Running `strings` on it shows only a tool name.
+
+    Parse the PNG's chunks, find the compressed text chunk, and recover the
+    **`KL{...}`** reference it contains. Write it to **`/lab/flag.txt`**.
+  hints:
+    - "A PNG begins with 8 signature bytes. After that each chunk is: 4-byte big-endian length, 4-byte type, the data, then a 4-byte CRC."
+    - "Walk the chunks in a Python loop and print each type. You are looking for the one named `zTXt`."
+    - "A `zTXt` body is: keyword, a NUL byte, one compression-method byte, then zlib data. Split on the first NUL, skip the method byte, and `zlib.decompress` the rest."
+  solution: |
+    ```bash
+    python3 - <<'PY' | grep -oE 'KL\{[0-9a-f]+\}' > /lab/flag.txt
+    import struct, zlib
+    d = open('/lab/photo.png', 'rb').read()
+    i = 8
+    while i < len(d):
+        n, t = struct.unpack('>I4s', d[i:i+8])
+        body = d[i+8:i+8+n]
+        if t == b'zTXt':
+            key, _, rest = body.partition(b'\0')
+            print(key.decode(), zlib.decompress(rest[1:]).decode())
+        i += 12 + n
+    PY
+    ```
+  setup: |
+    FLAG=$(rand_flag); export FLAG
+    echo "$FLAG" > "$KL_STATE/answer"
+    python3 - <<'PY'
+    import os, struct, zlib
+    flag = os.environ["FLAG"]
+    def chunk(t, data):
+        return struct.pack(">I", len(data)) + t + data + struct.pack(">I", zlib.crc32(t + data) & 0xffffffff)
+    png = b"\x89PNG\r\n\x1a\n"
+    png += chunk(b"IHDR", struct.pack(">IIBBBBB", 1, 1, 8, 0, 0, 0, 0))
+    png += chunk(b"tEXt", b"Software\x00paintkit 2.1")
+    png += chunk(b"zTXt", b"Provenance\x00\x00" + zlib.compress(("captured-by=field-unit-7; ref=" + flag).encode()))
+    png += chunk(b"IDAT", zlib.compress(b"\x00\x80"))
+    png += chunk(b"IEND", b"")
+    open("/lab/photo.png", "wb").write(png)
+    PY
+    chown -R "$(lab_user)": /lab
+  check: |
+    check_flag
+  solve: |
+    python3 - <<'PY' | grep -oE 'KL\{[0-9a-f]+\}' > /lab/flag.txt
+    import struct, zlib
+    d = open('/lab/photo.png', 'rb').read()
+    i = 8
+    while i < len(d):
+        n, t = struct.unpack('>I4s', d[i:i+8])
+        body = d[i+8:i+8+n]
+        if t == b'zTXt':
+            key, _, rest = body.partition(b'\0')
+            print(key.decode(), zlib.decompress(rest[1:]).decode())
+        i += 12 + n
+    PY
+
+- id: offsec-for-007
+  title: Wide strings in a memory image
+  difficulty: 3
+  kind: build
+  tags: [forensics, memory, strings, utf16]
+  tutorial: |
+    **Concept.** A memory dump is a raw copy of a process's RAM. Secrets that were live in memory can be carved out of it long after the process exited. Many programs, especially on Windows, keep text as 16-bit "wide" characters, so a plain ASCII `strings` pass misses them entirely.
+
+    **Read up on:**
+    - `man strings` — the `-e` encoding option (`s`, `S`, `b`, `l`, `B`, `L`)
+    - UTF-16 little-endian — every ASCII character is followed by a zero byte
+    - `xxd` — viewing the raw bytes around a hit
+  scenario: |
+    A raw memory image of a crashed service was saved as **`/lab/mem.dump`**.
+    The incident responder noted that the service held a session key as a
+    wide (UTF-16 little-endian) string next to the label `SESSKEY`.
+
+    Carve the key out of the image and write the **`KL{...}`** value to
+    **`/lab/flag.txt`**.
+  hints:
+    - "Run plain `strings /lab/mem.dump | grep KL` first and notice that it finds nothing — the text is not stored as single bytes."
+    - "`strings -e l` scans for 16-bit little-endian text. Combine it with `grep`."
+    - "`strings -el /lab/mem.dump | grep -o 'KL{[0-9a-f]*}'` prints the key."
+  solution: |
+    The key is stored as UTF-16LE, so each character is followed by a NUL and
+    ASCII `strings` skips it. Ask for the 16-bit little-endian encoding:
+
+    ```bash
+    strings -el /lab/mem.dump | grep -oE 'KL\{[0-9a-f]+\}' | head -1 > /lab/flag.txt
+    ```
+  setup: |
+    FLAG=$(rand_flag); export FLAG
+    echo "$FLAG" > "$KL_STATE/answer"
+    python3 - <<'PY'
+    import os, random
+    flag = os.environ["FLAG"]
+    size = 524288
+    data = bytearray(os.urandom(size))
+    off = random.randrange(10000, size - 4000, 2)
+    blob = "SESSKEY=".encode("utf-16-le") + flag.encode("utf-16-le") + b"\x00\x00"
+    data[off:off + len(blob)] = blob
+    open("/lab/mem.dump", "wb").write(bytes(data))
+    PY
+    chown -R "$(lab_user)": /lab
+  check: |
+    check_flag
+  solve: |
+    strings -el /lab/mem.dump | grep -oE 'KL\{[0-9a-f]+\}' | head -1 > /lab/flag.txt
+
+- id: offsec-for-008
+  title: One-byte obfuscation
+  difficulty: 4
+  kind: build
+  tags: [forensics, xor, analysis, python]
+  tutorial: |
+    **Concept.** Some tools hide strings by XOR-ing every byte with one fixed key. This hides text from a casual `strings` pass but is trivially reversible: there are only 255 possible keys, and if you know a snippet of the plaintext (a "crib") you can recognise the right key immediately. Analysts use the same idea to decode artifacts safely and offline.
+
+    **Read up on:**
+    - XOR properties — `a ^ k ^ k == a`
+    - Python `bytes` and generator expressions — XOR-ing every byte of a buffer
+    - "Known-plaintext" or "crib" searching — look for a marker such as the flag prefix
+  scenario: |
+    A leftover file, **`/lab/stage.bin`**, contains padding bytes surrounding a
+    short text value that was XOR-obfuscated with a **single-byte key**. The
+    file was recovered from an incident and is safe to analyse offline.
+
+    The hidden text is a **`KL{...}`** value. Try every possible one-byte key
+    and look for a decoded result containing the `KL{` marker. Write the
+    recovered value to **`/lab/flag.txt`**.
+  hints:
+    - "There are only 255 non-zero keys. Loop over them in Python and XOR every byte of the file with each."
+    - "A correct key makes a recognisable pattern appear. Search each decoded buffer for the regex `KL\\{[0-9a-f]+\\}`."
+    - "`re.search(rb'KL\\{[0-9a-f]+\\}', bytes(b ^ k for b in data))` — print the first match and stop."
+  solution: |
+    ```bash
+    python3 - <<'PY' > /lab/flag.txt
+    import re
+    data = open('/lab/stage.bin', 'rb').read()
+    for k in range(1, 256):
+        m = re.search(rb'KL\{[0-9a-f]+\}', bytes(b ^ k for b in data))
+        if m:
+            print(m.group(0).decode())
+            break
+    PY
+    ```
+  setup: |
+    FLAG=$(rand_flag); export FLAG
+    echo "$FLAG" > "$KL_STATE/answer"
+    python3 - <<'PY'
+    import os, random
+    flag = os.environ["FLAG"]
+    key = random.randint(1, 255)
+    enc = bytes(b ^ key for b in flag.encode())
+    open("/lab/stage.bin", "wb").write(os.urandom(64) + enc + os.urandom(64))
+    PY
+    chown -R "$(lab_user)": /lab
+  check: |
+    check_flag
+  solve: |
+    python3 - <<'PY' > /lab/flag.txt
+    import re
+    data = open('/lab/stage.bin', 'rb').read()
+    for k in range(1, 256):
+        m = re.search(rb'KL\{[0-9a-f]+\}', bytes(b ^ k for b in data))
+        if m:
+            print(m.group(0).decode())
+            break
+    PY
+
+- id: offsec-for-009
+  title: Redact before sharing
+  difficulty: 2
+  kind: fix
+  tags: [forensics, logs, redaction, sed]
+  tutorial: |
+    **Concept.** Logs are routinely shared with vendors and ticket systems, but they often contain secrets such as session tokens that must not leave the organisation. Redaction replaces each secret with a placeholder while preserving everything else, so the log stays useful for debugging and line-based tooling keeps working.
+
+    **Read up on:**
+    - `sed -E 's/PATTERN/REPLACEMENT/g'` — extended regular expressions and global replace
+    - `sed -i` — editing a file in place (and why to keep a backup first)
+    - `grep -c` and `wc -l` — verifying that a redaction left the structure intact
+  scenario: |
+    The support bundle **`/lab/support-bundle.log`** is about to be sent to an
+    external vendor, but several lines include live session tokens in the form
+    `token=KL{...}`.
+
+    Redact **every** token by replacing each `KL{...}` value with
+    `[REDACTED]`. Do **not** delete lines and do not alter any other line: the
+    vendor's tooling expects the same line count.
+  hints:
+    - "A token is the literal `KL{`, a run of lowercase hex digits, and a closing `}`. The pattern `KL\\{[0-9a-f]+\\}` matches it."
+    - "Use `sed -E 's/KL\\{[0-9a-f]+\\}/[REDACTED]/g' -i /lab/support-bundle.log`."
+    - "Verify with `grep -c 'KL{' /lab/support-bundle.log` (should be 0) and `wc -l` (should be unchanged)."
+  solution: |
+    Replace every token with a placeholder, in place, without removing lines:
+
+    ```bash
+    sed -E -i 's/KL\{[0-9a-f]+\}/[REDACTED]/g' /lab/support-bundle.log
+    ```
+  setup: |
+    echo ok > "$KL_STATE/answer"
+    T1=$(rand_flag); T2=$(rand_flag); T3=$(rand_flag)
+    lab_file /lab/support-bundle.log <<EOF
+    2026-11-09T08:00:01Z INFO  service started version=4.2.1
+    2026-11-09T08:00:07Z INFO  session established user=alice token=$T1 ip=10.0.0.21
+    2026-11-09T08:01:12Z WARN  slow query took=1840ms table=orders
+    2026-11-09T08:02:30Z INFO  session established user=bob token=$T2 ip=10.0.0.34
+    2026-11-09T08:03:44Z INFO  cache warmed entries=5120
+    2026-11-09T08:04:09Z ERROR upstream timeout host=payments.internal
+    2026-11-09T08:05:51Z INFO  session refreshed user=alice token=$T3 ip=10.0.0.21
+    2026-11-09T08:06:20Z INFO  healthcheck ok
+    EOF
+    wc -l < /lab/support-bundle.log > "$KL_STATE/lines"
+    grep -v 'token=' /lab/support-bundle.log | md5sum | cut -d' ' -f1 > "$KL_STATE/md5"
+  check: |
+    check_not "a session token is still present in the log" "grep -q 'KL{' /lab/support-bundle.log"
+    check_eq "line count is unchanged" "$(wc -l < /lab/support-bundle.log 2>/dev/null | tr -d ' ')" "$(tr -d ' ' < "$KL_STATE/lines")"
+    check_eq "lines without tokens are untouched" "$(grep -v 'token=' /lab/support-bundle.log 2>/dev/null | md5sum | cut -d' ' -f1)" "$(cat "$KL_STATE/md5")"
+  solve: |
+    sed -E -i 's/KL\{[0-9a-f]+\}/[REDACTED]/g' /lab/support-bundle.log
+
+- id: offsec-for-010
+  title: Who got in after the guessing?
+  difficulty: 4
+  kind: build
+  tags: [forensics, logs, auth, incident-response]
+  tutorial: |
+    **Concept.** Authentication logs show both failed and successful logins. A long run of failures followed by a success from the same source address is a classic sign that a password was guessed. Incident responders correlate the two event types per source address to find the compromised session.
+
+    **Read up on:**
+    - `sshd` log lines — the `Failed password` and `Accepted password` messages
+    - `awk` associative arrays — counting events per key
+    - `sort | uniq -c` — a quick way to count occurrences per value
+  scenario: |
+    The SSH authentication log from a bastion host is at
+    **`/lab/auth.log`**. Several addresses appear in it: ordinary users,
+    a scanner that only failed, and one address that failed many times and
+    **then** got in.
+
+    Find the source IP that has **at least 10 failed logins and also one
+    successful login**, and write that IP address (only) to
+    **`/lab/attacker_ip.txt`**.
+  hints:
+    - "Count failures per address: `grep 'Failed password' /lab/auth.log | awk '{print $(NF-3)}' | sort | uniq -c | sort -rn`."
+    - "The scanner has many failures too, so you must also check which addresses appear in an `Accepted password` line."
+    - "`awk '/Failed password/{f[$(NF-3)]++} /Accepted password/{a[$(NF-3)]=1} END{for(i in f) if(f[i]>=10 && a[i]) print i}' /lab/auth.log`"
+  solution: |
+    The source IP is the fourth field from the end of each `sshd` message. Count
+    failures and record successes, then print the address that has both:
+
+    ```bash
+    awk '/Failed password/{f[$(NF-3)]++} /Accepted password/{a[$(NF-3)]=1} \
+         END{for(i in f) if(f[i]>=10 && a[i]) print i}' /lab/auth.log > /lab/attacker_ip.txt
+    ```
+  setup: |
+    export KL_STATE
+    python3 - <<'PY'
+    import os, random
+    octets = random.sample(range(10, 250), 6)
+    ip = lambda n: "198.51.100.%d" % n
+    target, scanner = ip(octets[0]), ip(octets[1])
+    legit = [ip(o) for o in octets[2:]]
+    open(os.environ["KL_STATE"] + "/answer", "w").write(target + "\n")
+    ev = []
+    for _ in range(25):
+        ev.append(("Failed password for root", target))
+    for _ in range(31):
+        ev.append(("Failed password for admin", scanner))
+    for i, l in enumerate(legit):
+        for _ in range(random.randint(0, 3)):
+            ev.append(("Failed password for user%d" % i, l))
+    random.shuffle(ev)
+    for i, l in enumerate(legit):
+        ev.insert(random.randint(0, len(ev)), ("Accepted password for user%d" % i, l))
+    ev.append(("Accepted password for deploy", target))
+    lines = []
+    t = 36000
+    for n, (msg, src) in enumerate(ev):
+        t += random.randint(1, 40)
+        lines.append("Nov  9 %02d:%02d:%02d bastion sshd[%d]: %s from %s port %d ssh2" %
+                     (t // 3600, (t // 60) % 60, t % 60, 2000 + n, msg, src, random.randint(30000, 60000)))
+    open("/lab/auth.log", "w").write("\n".join(lines) + "\n")
+    PY
+    chown -R "$(lab_user)": /lab
+  check: |
+    got=$(tr -d ' \t\r\n' < /lab/attacker_ip.txt 2>/dev/null)
+    want=$(tr -d ' \t\r\n' < "$KL_STATE/answer")
+    check_eq "attacker IP identified in /lab/attacker_ip.txt" "$got" "$want"
+  solve: |
+    awk '/Failed password/{f[$(NF-3)]++} /Accepted password/{a[$(NF-3)]=1} END{for(i in f) if(f[i]>=10 && a[i]) print i}' /lab/auth.log > /lab/attacker_ip.txt
