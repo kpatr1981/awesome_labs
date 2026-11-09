@@ -77,102 +77,48 @@ exercises:
       -p '[{"op":"move","from":"/spec/template/spec/initContainers/1","path":"/spec/template/spec/initContainers/0"}]'
     kubectl -n boot rollout status deploy shop --timeout=120s
 
-- id: k8s-312
-  title: Prefixed settings, optional overrides
-  difficulty: 2
-  kind: build
-  tags: [env, envfrom, configmap, secret, optional]
-  tutorial: |
-    **Concept.** Environment variables can come from a whole ConfigMap or Secret (`envFrom`, optionally with a prefix) or from a single key (`valueFrom`). A missing source normally stops the container from being created, unless the reference is marked optional.
-
-    **Read up on:**
-    - `kubectl explain pod.spec.containers.envFrom` — prefix and the two source kinds
-    - `kubectl explain pod.spec.containers.env.valueFrom` — picking one key
-    - `kubectl get pod NAME -o yaml` — the resulting spec
-    - Kubernetes docs: Define Environment Variables for a Container
-  scenario: |
-    Namespace **`envs`** has a ConfigMap **`site`** and a Secret **`site-creds`** (key `token`).
-
-    Create pod **`reporter`** (`busybox:1.37`, `sleep infinity`) so that its environment has:
-
-    - every key of ConfigMap `site` as a variable, with its name **prefixed by `SITE_`**
-    - **`API_TOKEN`** from the `token` key of the Secret
-    - every key of a Secret named **`site-overrides`** (it does not exist today and may be
-      created later by another team) - the pod must start fine without it
-  hints:
-    - "`envFrom` takes a list; each item can have `prefix` and either `configMapRef` or `secretRef`."
-    - "Look at the key names in the ConfigMap first: `kubectl -n envs get cm site -o yaml`."
-    - "`kubectl explain pod.spec.containers.envFrom.secretRef` lists the field that makes a missing Secret acceptable."
-  solution: |
-    ```yaml
-    envFrom:
-    - prefix: SITE_
-      configMapRef: {name: site}
-    - secretRef: {name: site-overrides, optional: true}
-    env:
-    - name: API_TOKEN
-      valueFrom: {secretKeyRef: {name: site-creds, key: token}}
-    ```
-  setup: |
-    k_ns envs
-    r="eu-$((RANDOM % 900 + 100))"
-    t="tok-$(head -c6 /dev/urandom | od -An -tx1 | tr -d ' \n')"
-    printf '%s\n%s\n' "$r" "$t" >"$KL_STATE/answer"
-    kubectl -n envs create configmap site --from-literal=REGION="$r" --from-literal=TIER=gold >/dev/null
-    kubectl -n envs create secret generic site-creds --from-literal=token="$t" >/dev/null
-  check: |
-    wait_pod envs reporter 60
-    reg=$(sed -n 1p "$KL_STATE/answer" 2>/dev/null); tok=$(sed -n 2p "$KL_STATE/answer" 2>/dev/null)
-    check "SITE_REGION comes from the ConfigMap" '[ "$(kubectl -n envs exec reporter -- printenv SITE_REGION)" = "$reg" ]'
-    check "SITE_TIER comes from the ConfigMap" '[ "$(kubectl -n envs exec reporter -- printenv SITE_TIER)" = gold ]'
-    check "no unprefixed REGION variable" '! kubectl -n envs exec reporter -- printenv REGION'
-    check "API_TOKEN comes from the Secret" '[ "$(kubectl -n envs exec reporter -- printenv API_TOKEN)" = "$tok" ]'
-    check "site-overrides is referenced as optional" '[ "$(kubectl -n envs get pod reporter -o json | jq -r "[.spec.containers[0].envFrom[]? | select(.secretRef.name==\"site-overrides\") | .secretRef.optional] | first")" = true ]'
-  solve: |
-    kubectl apply -f - <<'EOF'
-    apiVersion: v1
-    kind: Pod
-    metadata: {name: reporter, namespace: envs}
-    spec:
-      containers:
-      - name: reporter
-        image: busybox:1.37
-        command: ["sleep", "infinity"]
-        envFrom:
-        - prefix: SITE_
-          configMapRef: {name: site}
-        - secretRef: {name: site-overrides, optional: true}
-        env:
-        - name: API_TOKEN
-          valueFrom: {secretKeyRef: {name: site-creds, key: token}}
-    EOF
-
 - id: k8s-313
-  title: Blue or green, never reserved
-  difficulty: 2
+  title: Placement rules, hard and soft
+  difficulty: 4
   kind: build
-  tags: [affinity, nodeaffinity, labels]
+  tags: [affinity, nodeaffinity, labels, antiaffinity, resilience, scheduling]
   tutorial: |
-    **Concept.** Node affinity selects nodes by their labels with richer operators than a plain node selector: several allowed values, existence tests and negation. Required rules are hard filters; the scheduler never places the pod on a node that fails them.
+    **Concept.** Affinity comes in two strengths. `requiredDuringScheduling…` is a filter: a pod that no node can satisfy stays Pending forever. `preferredDuringScheduling…` is a weighted score: the scheduler honours it when it can and places the pod anyway when it cannot. Node affinity looks at node labels, using operators such as `In` and `DoesNotExist`. Pod anti-affinity looks at where other pods run, within a `topologyKey`.
 
     **Read up on:**
-    - `kubectl get nodes --show-labels` — what labels the nodes carry
-    - `kubectl explain pod.spec.affinity.nodeAffinity` — required versus preferred rules
-    - `kubectl explain pod.spec.affinity.nodeAffinity.requiredDuringSchedulingIgnoredDuringExecution.nodeSelectorTerms.matchExpressions` — the operators
-    - Kubernetes docs: Assigning Pods to Nodes
+    - Kubernetes docs: Assigning Pods to Nodes, "Affinity and anti-affinity"
+    - `kubectl explain pod.spec.affinity.nodeAffinity.requiredDuringSchedulingIgnoredDuringExecution`
+    - `kubectl explain pod.spec.affinity.podAntiAffinity.preferredDuringSchedulingIgnoredDuringExecution`
+    - `kubectl describe pod` — the scheduler's explanation under Events
   scenario: |
-    Create pod **`placer`** (`nginx:1.27-alpine`) in namespace **`aff`** that may only be
-    scheduled on a node that:
+    Two placement problems: one needs a rule the scheduler must obey, and the other has a rule so strict that it cannot be satisfied:
 
-    - has a label **`pool`** whose value is **`blue`** or **`green`**, and
-    - does **not** have a label **`dedicated`** at all.
+    1. **A required node rule.** Create pod **`placer`** (`nginx:1.27-alpine`) in namespace **`aff`** that may only be
+       scheduled on a node that:
 
-    Express it as one **required node-affinity** rule (not `nodeSelector`, not `nodeName`).
-    The pod must end up Running.
+       - has a label **`pool`** whose value is **`blue`** or **`green`**, and
+       - does **not** have a label **`dedicated`** at all.
+
+       Express it as one **required node-affinity** rule (not `nodeSelector`, not `nodeName`).
+       The pod must end up Running.
+
+    2. **Soften a pod anti-affinity.** Deployment **`ledger`** in namespace **`spread`** runs 3 replicas with a required
+       pod anti-affinity rule on `kubernetes.io/hostname`. Only one node of this cluster
+       accepts regular workloads, so two replicas are stuck Pending.
+
+       Make all 3 replicas Ready, but keep the intent: replicas should still be **spread
+       across nodes whenever possible**. Express that as a *preferred* pod anti-affinity on
+       `kubernetes.io/hostname` that selects `app=ledger`, and remove the required rule.
+       Keep 3 replicas, and don't add tolerations or touch the nodes.
   hints:
-    - "Both conditions go into the matchExpressions of the same term, so they must both hold."
-    - "Operators you need are `In` and `DoesNotExist`."
+    - "Part 1: Both conditions go into the matchExpressions of the same term, so they must both hold."
+    - "Part 1: Operators you need are `In` and `DoesNotExist`."
+    - "Part 2: `kubectl -n spread describe pod` shows `didn't match pod anti-affinity rules`."
+    - "Part 2: `kubectl explain pod.spec.affinity.podAntiAffinity.preferredDuringSchedulingIgnoredDuringExecution` — it needs a weight and a `podAffinityTerm`."
+    - "Part 2: Replace the whole `affinity` block of the pod template; a deployment rollout follows."
   solution: |
+    **1. A required node rule**
+
     ```yaml
     affinity:
       nodeAffinity:
@@ -182,12 +128,49 @@ exercises:
             - {key: pool, operator: In, values: [blue, green]}
             - {key: dedicated, operator: DoesNotExist}
     ```
+
+    **2. Soften a pod anti-affinity**
+
+    ```yaml
+    affinity:
+      podAntiAffinity:
+        preferredDuringSchedulingIgnoredDuringExecution:
+        - weight: 100
+          podAffinityTerm:
+            topologyKey: kubernetes.io/hostname
+            labelSelector: {matchLabels: {app: ledger}}
+    ```
   setup: |
+    # --- part 1: A required node rule ---
     k_ns aff
     if [ $((RANDOM % 2)) -eq 0 ]; then p=blue; else p=green; fi
-    echo "$p" >"$KL_STATE/answer"
+    echo "$p" >"$KL_STATE/answer-313"
     kubectl label node node01 pool="$p" --overwrite >/dev/null
+
+    # --- part 2: Soften a pod anti-affinity ---
+    k_ns spread
+    kubectl apply -f - >/dev/null <<'EOF'
+    apiVersion: apps/v1
+    kind: Deployment
+    metadata: {name: ledger, namespace: spread}
+    spec:
+      replicas: 3
+      strategy: {type: Recreate}
+      selector: {matchLabels: {app: ledger}}
+      template:
+        metadata: {labels: {app: ledger}}
+        spec:
+          affinity:
+            podAntiAffinity:
+              requiredDuringSchedulingIgnoredDuringExecution:
+              - topologyKey: kubernetes.io/hostname
+                labelSelector: {matchLabels: {app: ledger}}
+          containers:
+          - name: ledger
+            image: nginx:1.27-alpine
+    EOF
   check: |
+    info "Part 1: A required node rule"
     aff_ok() {
       kubectl -n aff get pod placer -o json | jq -e '
         (.spec.affinity.nodeAffinity.requiredDuringSchedulingIgnoredDuringExecution.nodeSelectorTerms // []) as $t
@@ -198,7 +181,16 @@ exercises:
     }
     check "pod placer has the required node-affinity rule" aff_ok
     check "placer is running on node01" 'aff_ok && wait_pod aff placer 60 && [ "$(kj -n aff pod placer "{.spec.nodeName}")" = node01 ]'
+
+    info "Part 2: Soften a pod anti-affinity"
+    d() { kubectl -n spread get deploy ledger -o json 2>/dev/null | jq -e "$1" >/dev/null 2>&1; }
+    no_req() { d '(.spec.template.spec.affinity.podAntiAffinity.requiredDuringSchedulingIgnoredDuringExecution // []) | length == 0'; }
+    has_pref() { d '[.spec.template.spec.affinity.podAntiAffinity.preferredDuringSchedulingIgnoredDuringExecution[]? | select(.podAffinityTerm.topologyKey == "kubernetes.io/hostname" and .podAffinityTerm.labelSelector.matchLabels.app == "ledger")] | length >= 1'; }
+    check "the required anti-affinity rule is gone" 'no_req'
+    check "a preferred anti-affinity on kubernetes.io/hostname selects app=ledger" 'has_pref'
+    check "3 replicas are configured and Ready" 'no_req && has_pref && [ "$(kj -n spread deploy ledger "{.spec.replicas}")" = 3 ] && wait_deploy spread ledger 120'
   solve: |
+    # --- part 1: A required node rule ---
     kubectl apply -f - <<'EOF'
     apiVersion: v1
     kind: Pod
@@ -215,6 +207,10 @@ exercises:
       - name: placer
         image: nginx:1.27-alpine
     EOF
+
+    # --- part 2: Soften a pod anti-affinity ---
+    kubectl -n spread patch deploy ledger --type=json -p '[{"op":"replace","path":"/spec/template/spec/affinity","value":{"podAntiAffinity":{"preferredDuringSchedulingIgnoredDuringExecution":[{"weight":100,"podAffinityTerm":{"topologyKey":"kubernetes.io/hostname","labelSelector":{"matchLabels":{"app":"ledger"}}}}]}}}]'
+    kubectl -n spread rollout status deploy ledger --timeout=150s
 
 - id: k8s-314
   title: A native sidecar for the logs
@@ -607,78 +603,6 @@ exercises:
       '[{"op":"add","path":"/spec/template/spec/tolerations","value":[{"key":"team","operator":"Equal","value":"'"$t"'","effect":"NoExecute"}]}]'
     kubectl -n team rollout status deploy analytics --timeout=90s
     kubectl taint node node01 "team=$t:NoExecute"
-
-- id: k8s-319
-  title: A startup budget for a slow boot
-  difficulty: 4
-  kind: fix
-  tags: [probes, startupprobe, liveness]
-  tutorial: |
-    **Concept.** A startup probe runs first and holds back the liveness and readiness probes until it succeeds once. Its period and failure threshold together define how long the application may take to boot, without making the later liveness checks lenient.
-
-    **Read up on:**
-    - `kubectl explain pod.spec.containers.startupProbe` — fields shared with other probes
-    - `kubectl describe pod NAME` — probe failures and kill events
-    - `kubectl get pod NAME -w` — the restart counter
-    - Kubernetes docs: Configure Liveness, Readiness and Startup Probes
-  scenario: |
-    Deployment **`slowboot`** in namespace **`slow`** needs between 30 and 50 seconds before
-    it is able to serve, but the liveness probe kills it long before that and the pod
-    restarts forever.
-
-    Fix it without loosening the **liveness** probe (it must keep detecting a hang within
-    15 seconds). The pod should become Ready soon after the app is up: whatever you add must
-    check at least every **3 seconds**, and must allow a boot of up to **60 seconds**.
-    The final pod must show **zero restarts**.
-  hints:
-    - "Total patience of a probe is roughly `periodSeconds * failureThreshold`."
-    - "`kubectl explain pod.spec.containers.startupProbe` - it takes the same handler types as liveness."
-  solution: |
-    Add a startup probe with the same command as the liveness probe:
-
-    ```bash
-    kubectl -n slow patch deploy slowboot --type=json -p '[{"op":"add","path":"/spec/template/spec/containers/0/startupProbe","value":{"exec":{"command":["test","-f","/tmp/up"]},"periodSeconds":2,"failureThreshold":35}}]'
-    ```
-  setup: |
-    k_ns slow
-    d=$((RANDOM % 16 + 30))
-    echo "$d" >"$KL_STATE/answer"
-    kubectl apply -f - >/dev/null <<EOF
-    apiVersion: apps/v1
-    kind: Deployment
-    metadata: {name: slowboot, namespace: slow}
-    spec:
-      replicas: 1
-      selector: {matchLabels: {app: slowboot}}
-      template:
-        metadata: {labels: {app: slowboot}}
-        spec:
-          containers:
-          - name: app
-            image: busybox:1.37
-            command: ["sh", "-c", "sleep $d; touch /tmp/up; sleep infinity"]
-            livenessProbe:
-              exec: {command: ["test", "-f", "/tmp/up"]}
-              periodSeconds: 5
-              failureThreshold: 2
-    EOF
-  check: |
-    probes_ok() {
-      kubectl -n slow get deploy slowboot -o json 2>/dev/null | jq -e '
-        .spec.template.spec.containers[0] as $c
-        | ($c.startupProbe // null) != null
-        and ($c.startupProbe.periodSeconds // 10) <= 3
-        and ($c.startupProbe.periodSeconds // 10) * ($c.startupProbe.failureThreshold // 3) >= 60
-        and ($c.livenessProbe // null) != null
-        and ($c.livenessProbe.periodSeconds // 10) * ($c.livenessProbe.failureThreshold // 3) <= 15' >/dev/null
-    }
-    check "a startup probe (period <= 3s, budget >= 60s) is configured" probes_ok
-    check "liveness probe is still strict" '[ "$(kubectl -n slow get deploy slowboot -o json | jq "(.spec.template.spec.containers[0].livenessProbe.periodSeconds // 10) * (.spec.template.spec.containers[0].livenessProbe.failureThreshold // 3) <= 15")" = true ]'
-    check "slowboot becomes ready" 'probes_ok && eventually 150 "deploy_ready slow slowboot"'
-    check "no restarts" 'probes_ok && [ "$(kubectl -n slow get pods -l app=slowboot -o json | jq "[.items[] | select(.metadata.deletionTimestamp == null) | .status.containerStatuses[]?.restartCount] | add // 0")" = 0 ]'
-  solve: |
-    kubectl -n slow patch deploy slowboot --type=json -p '[{"op":"add","path":"/spec/template/spec/containers/0/startupProbe","value":{"exec":{"command":["test","-f","/tmp/up"]},"periodSeconds":2,"failureThreshold":35}}]'
-    kubectl -n slow rollout status deploy slowboot --timeout=150s
 
 - id: k8s-320
   title: An autoscaler with manners

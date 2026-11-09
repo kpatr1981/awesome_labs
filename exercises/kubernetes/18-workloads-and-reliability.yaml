@@ -5,36 +5,60 @@ order: 18
 exercises:
 
 - id: k8s-321
-  title: Liveness that kills a slow starter
-  difficulty: 2
+  title: Slow starters and impatient probes
+  difficulty: 4
   kind: fix
-  tags: [probes, startupprobe, livenessprobe]
+  tags: [probes, startupprobe, livenessprobe, liveness]
   tutorial: |
-    **Concept.** A liveness probe restarts a container that stops responding, but it cannot tell "broken" from "still booting". A startup probe holds the other probes back until the application has come up once, so slow starters are not killed during start-up.
+    **Concept.** A liveness probe that fires during boot restarts a healthy application forever. `initialDelaySeconds` is enough when start-up time is short and predictable. When it varies, a large delay would also slow down detection of real hangs, so a `startupProbe` takes over: it gets its own budget of `failureThreshold × periodSeconds`, and liveness only begins once it has succeeded. Liveness stays tight and boot gets the time it needs.
 
     **Read up on:**
-    - `kubectl describe pod NAME` — the Events section shows why a container was killed
-    - `kubectl explain pod.spec.containers.startupProbe` — the fields it shares with the other probes
-    - `kubectl get pod NAME` — the RESTARTS column
     - Kubernetes docs: Configure Liveness, Readiness and Startup Probes
+    - `kubectl explain pod.spec.containers.startupProbe`
+    - `kubectl explain pod.spec.containers.livenessProbe` — `initialDelaySeconds`, `periodSeconds`, `failureThreshold`
+    - `kubectl describe pod` — `Unhealthy` events and the restart count
   scenario: |
-    Deployment **`slowapp`** in namespace **`probe1`** takes about 12 seconds to become
-    healthy (it creates `/tmp/up` when it is ready), but its liveness probe starts checking
-    after 3 seconds and kills it again and again.
+    Two applications are being killed by their own liveness probes before they finish booting. The right fix depends on how predictable the boot is:
 
-    Make **`slowapp`** stable and Ready with **zero restarts**. Keep the liveness probe (it
-    must still protect the app once it is running) and don't touch the app command.
+    1. **A short, predictable start.** Deployment **`slowapp`** in namespace **`probe1`** takes about 12 seconds to become
+       healthy (it creates `/tmp/up` when it is ready), but its liveness probe starts checking
+       after 3 seconds and kills it again and again.
+
+       Make **`slowapp`** stable and Ready with **zero restarts**. Keep the liveness probe (it
+       must still protect the app once it is running) and don't touch the app command.
+
+    2. **A long, variable boot.** Deployment **`slowboot`** in namespace **`slow`** needs between 30 and 50 seconds before
+       it is able to serve, but the liveness probe kills it long before that and the pod
+       restarts forever.
+
+       Fix it without loosening the **liveness** probe (it must keep detecting a hang within
+       15 seconds). The pod should become Ready soon after the app is up: whatever you add must
+       check at least every **3 seconds**, and must allow a boot of up to **60 seconds**.
+       The final pod must show **zero restarts**.
   hints:
-    - "`kubectl -n probe1 describe pod` shows `Liveness probe failed` followed by a restart."
-    - "Making the liveness probe slower would also delay failure detection forever; there is a probe type built for slow start-up."
-    - "A startup probe can reuse the same check as the liveness probe; give it a generous `failureThreshold` x `periodSeconds` budget."
+    - "Part 1: `kubectl -n probe1 describe pod` shows `Liveness probe failed` followed by a restart."
+    - "Part 1: Making the liveness probe slower would also delay failure detection forever; there is a probe type built for slow start-up."
+    - "Part 1: A startup probe can reuse the same check as the liveness probe; give it a generous `failureThreshold` x `periodSeconds` budget."
+    - "Part 2: Total patience of a probe is roughly `periodSeconds * failureThreshold`."
+    - "Part 2: `kubectl explain pod.spec.containers.startupProbe` - it takes the same handler types as liveness."
   solution: |
+    **1. A short, predictable start**
+
     Add a startup probe that waits for the file, with a budget well above 12 seconds:
 
     ```bash
     kubectl -n probe1 patch deploy slowapp --type=json -p '[{"op":"add","path":"/spec/template/spec/containers/0/startupProbe","value":{"exec":{"command":["sh","-c","test -f /tmp/up"]},"periodSeconds":3,"failureThreshold":10}}]'
     ```
+
+    **2. A long, variable boot**
+
+    Add a startup probe with the same command as the liveness probe:
+
+    ```bash
+    kubectl -n slow patch deploy slowboot --type=json -p '[{"op":"add","path":"/spec/template/spec/containers/0/startupProbe","value":{"exec":{"command":["test","-f","/tmp/up"]},"periodSeconds":2,"failureThreshold":35}}]'
+    ```
   setup: |
+    # --- part 1: A short, predictable start ---
     k_ns probe1
     kubectl apply -f - >/dev/null <<'EOF'
     apiVersion: apps/v1
@@ -56,81 +80,115 @@ exercises:
               periodSeconds: 3
               failureThreshold: 2
     EOF
+
+    # --- part 2: A long, variable boot ---
+    k_ns slow
+    d=$((RANDOM % 16 + 30))
+    echo "$d" >"$KL_STATE/answer-319"
+    kubectl apply -f - >/dev/null <<EOF
+    apiVersion: apps/v1
+    kind: Deployment
+    metadata: {name: slowboot, namespace: slow}
+    spec:
+      replicas: 1
+      selector: {matchLabels: {app: slowboot}}
+      template:
+        metadata: {labels: {app: slowboot}}
+        spec:
+          containers:
+          - name: app
+            image: busybox:1.37
+            command: ["sh", "-c", "sleep $d; touch /tmp/up; sleep infinity"]
+            livenessProbe:
+              exec: {command: ["test", "-f", "/tmp/up"]}
+              periodSeconds: 5
+              failureThreshold: 2
+    EOF
   check: |
+    info "Part 1: A short, predictable start"
     c0() { kubectl -n probe1 get deploy slowapp -o json 2>/dev/null | jq -e "$1" >/dev/null 2>&1; }
     active_restarts() { kubectl -n probe1 get pods -l app=slowapp -o json | jq '[.items[] | select(.metadata.deletionTimestamp == null) | .status.containerStatuses[]?.restartCount] | add // 0'; }
     check "the container has a startupProbe and keeps its livenessProbe" 'c0 ".spec.template.spec.containers[0] | has(\"startupProbe\") and has(\"livenessProbe\")"'
     check "the app command is unchanged" 'c0 ".spec.template.spec.containers[0].command | join(\" \") | contains(\"sleep 12\")"'
     check "slowapp becomes ready" 'c0 ".spec.template.spec.containers[0] | has(\"startupProbe\")" && wait_deploy probe1 slowapp 90'
     check "the running pod has not been restarted" 'deploy_ready probe1 slowapp && [ "$(active_restarts)" = 0 ]'
+
+    info "Part 2: A long, variable boot"
+    probes_ok() {
+      kubectl -n slow get deploy slowboot -o json 2>/dev/null | jq -e '
+        .spec.template.spec.containers[0] as $c
+        | ($c.startupProbe // null) != null
+        and ($c.startupProbe.periodSeconds // 10) <= 3
+        and ($c.startupProbe.periodSeconds // 10) * ($c.startupProbe.failureThreshold // 3) >= 60
+        and ($c.livenessProbe // null) != null
+        and ($c.livenessProbe.periodSeconds // 10) * ($c.livenessProbe.failureThreshold // 3) <= 15' >/dev/null
+    }
+    check "a startup probe (period <= 3s, budget >= 60s) is configured" probes_ok
+    check "liveness probe is still strict" '[ "$(kubectl -n slow get deploy slowboot -o json | jq "(.spec.template.spec.containers[0].livenessProbe.periodSeconds // 10) * (.spec.template.spec.containers[0].livenessProbe.failureThreshold // 3) <= 15")" = true ]'
+    check "slowboot becomes ready" 'probes_ok && eventually 150 "deploy_ready slow slowboot"'
+    check "no restarts" 'probes_ok && [ "$(kubectl -n slow get pods -l app=slowboot -o json | jq "[.items[] | select(.metadata.deletionTimestamp == null) | .status.containerStatuses[]?.restartCount] | add // 0")" = 0 ]'
   solve: |
+    # --- part 1: A short, predictable start ---
     kubectl -n probe1 patch deploy slowapp --type=json -p '[{"op":"add","path":"/spec/template/spec/containers/0/startupProbe","value":{"exec":{"command":["sh","-c","test -f /tmp/up"]},"periodSeconds":3,"failureThreshold":10}}]'
     kubectl -n probe1 rollout status deploy slowapp --timeout=120s
 
+    # --- part 2: A long, variable boot ---
+    kubectl -n slow patch deploy slowboot --type=json -p '[{"op":"add","path":"/spec/template/spec/containers/0/startupProbe","value":{"exec":{"command":["test","-f","/tmp/up"]},"periodSeconds":2,"failureThreshold":35}}]'
+    kubectl -n slow rollout status deploy slowboot --timeout=150s
+
 - id: k8s-322
-  title: Never fewer than three of four
-  difficulty: 2
-  kind: build
-  tags: [pdb, availability, disruption]
+  title: Budgets for maintenance windows
+  difficulty: 3
+  kind: fix
+  tags: [pdb, availability, disruption, drain, selector, troubleshooting]
   tutorial: |
-    **Concept.** A PodDisruptionBudget limits how many pods of a group may be taken down at once by *voluntary* disruptions such as a node drain. You state either the minimum that must stay available or the maximum that may be unavailable, and eviction requests that would break the budget are refused.
+    **Concept.** A PodDisruptionBudget limits voluntary evictions such as `kubectl drain`, by stating how many selected pods must stay up (`minAvailable`) or may be down (`maxUnavailable`). Its status tells you whether it works: `expectedPods` of zero means the selector matches nothing, and `disruptionsAllowed` of zero with every pod healthy means the budget leaves no room to evict, so a drain hangs forever. Pick numbers against the real replica count.
 
     **Read up on:**
-    - `kubectl explain pdb.spec` — minAvailable, maxUnavailable and selector
-    - `kubectl get pdb -n NS` — the ALLOWED DISRUPTIONS column
-    - `kubectl describe pdb NAME` — current and desired healthy pods
     - Kubernetes docs: Specifying a Disruption Budget for your Application
+    - `kubectl explain poddisruptionbudget.spec`
+    - `kubectl get pdb` and `kubectl describe pdb` — `ALLOWED DISRUPTIONS`
+    - `kubectl get pods --show-labels` — compare with the budget's selector
   scenario: |
-    Deployment **`web`** in namespace **`pdb1`** runs 4 replicas labelled `app=web`.
+    Node maintenance is scheduled for this weekend, and the disruption budgets are not ready. One is missing, one blocks everything, and one protects nothing:
 
-    Create a PodDisruptionBudget named **`web-pdb`** in that namespace so that a node drain
-    can take **at most one** `web` pod down at a time, i.e. at least 3 of the 4 must stay
-    available.
+    1. **Create a budget.** Deployment **`web`** in namespace **`pdb1`** runs 4 replicas labelled `app=web`.
+
+       Create a PodDisruptionBudget named **`web-pdb`** in that namespace so that a node drain
+       can take **at most one** `web` pod down at a time, i.e. at least 3 of the 4 must stay
+       available.
+
+    2. **The budget that blocks every drain.** Deployment **`billing`** in namespace **`pdb2`** runs 2 replicas, protected by the
+       PodDisruptionBudget **`billing-pdb`**. Operators report that draining a node never
+       finishes because evicting a `billing` pod is always refused.
+
+       Fix the situation so that **one `billing` pod can be evicted at a time**, while at
+       least one pod always stays available. Keep the PodDisruptionBudget (don't delete it)
+       and keep its selector.
+
+    3. **The budget that protects nothing.** The PDB **`web-pdb`** in namespace **`ops`** is meant to protect the 3-replica **`web`**
+       deployment during maintenance, but its status shows it doesn't see any pods.
+
+       Fix it so it covers the web pods **and** permits **exactly one** pod to be disrupted
+       at a time. Keep the name `web-pdb`.
   hints:
-    - "The budget selects pods through a label selector, exactly like a Service does."
-    - "`kubectl create pdb --help` shows a quick way to generate one."
-    - "You can express the same rule as `minAvailable: 3` or `maxUnavailable: 1`."
+    - "Part 1: The budget selects pods through a label selector, exactly like a Service does."
+    - "Part 1: `kubectl create pdb --help` shows a quick way to generate one."
+    - "Part 1: You can express the same rule as `minAvailable: 3` or `maxUnavailable: 1`."
+    - "Part 2: `kubectl -n pdb2 get pdb` — look at ALLOWED DISRUPTIONS."
+    - "Part 2: Compare the budget's number with the replica count of the deployment."
+    - "Part 2: You can change the budget or the replica count; either way the result must allow one eviction."
+    - "Part 3: Compare `kubectl get pdb web-pdb -n ops -o yaml` with `kubectl get pods -n ops --show-labels`."
+    - "Part 3: Allowed disruptions = healthy pods minus what the budget demands."
   solution: |
+    **1. Create a budget**
+
     ```bash
     kubectl -n pdb1 create pdb web-pdb --selector=app=web --max-unavailable=1
     ```
-  setup: |
-    k_ns pdb1
-    kubectl -n pdb1 create deployment web --image=nginx:1.27-alpine --replicas=4 >/dev/null
-  check: |
-    p() { kubectl -n pdb1 get pdb web-pdb -o json 2>/dev/null; }
-    covers() { p | jq -e '.status.expectedPods == 4 and .status.desiredHealthy == 3 and .status.disruptionsAllowed == 1' >/dev/null 2>&1; }
-    check "PodDisruptionBudget web-pdb exists" 'k_exists -n pdb1 pdb web-pdb'
-    check "it selects all 4 web pods and allows exactly one disruption" 'k_exists -n pdb1 pdb web-pdb && wait_deploy pdb1 web 60 && eventually 30 covers'
-  solve: |
-    kubectl -n pdb1 create pdb web-pdb --selector=app=web --max-unavailable=1
 
-- id: k8s-323
-  title: The budget that blocks every drain
-  difficulty: 3
-  kind: fix
-  tags: [pdb, drain, availability]
-  tutorial: |
-    **Concept.** A PodDisruptionBudget whose requirement equals the number of replicas allows zero disruptions, so evictions (and therefore node drains and cluster upgrades) hang forever. A useful budget always leaves some headroom.
+    **2. The budget that blocks every drain**
 
-    **Read up on:**
-    - `kubectl get pdb -n NS` — ALLOWED DISRUPTIONS = 0 is the symptom
-    - `kubectl describe pdb NAME` — expected, current and desired healthy pods
-    - `kubectl explain pdb.spec.minAvailable`
-    - Kubernetes docs: Disruptions
-  scenario: |
-    Deployment **`billing`** in namespace **`pdb2`** runs 2 replicas, protected by the
-    PodDisruptionBudget **`billing-pdb`**. Operators report that draining a node never
-    finishes because evicting a `billing` pod is always refused.
-
-    Fix the situation so that **one `billing` pod can be evicted at a time**, while at
-    least one pod always stays available. Keep the PodDisruptionBudget (don't delete it)
-    and keep its selector.
-  hints:
-    - "`kubectl -n pdb2 get pdb` — look at ALLOWED DISRUPTIONS."
-    - "Compare the budget's number with the replica count of the deployment."
-    - "You can change the budget or the replica count; either way the result must allow one eviction."
-  solution: |
     Lower the budget to leave headroom:
 
     ```bash
@@ -138,7 +196,20 @@ exercises:
     ```
 
     (Scaling the deployment to 3 replicas would also work.)
+
+    **3. The budget that protects nothing**
+
+    ```bash
+    kubectl -n ops delete pdb web-pdb
+    kubectl -n ops create pdb web-pdb --selector=app=web --min-available=2
+    kubectl -n ops get pdb web-pdb   # ALLOWED DISRUPTIONS 1
+    ```
   setup: |
+    # --- part 1: Create a budget ---
+    k_ns pdb1
+    kubectl -n pdb1 create deployment web --image=nginx:1.27-alpine --replicas=4 >/dev/null
+
+    # --- part 2: The budget that blocks every drain ---
     k_ns pdb2
     kubectl apply -f - >/dev/null <<'EOF'
     apiVersion: apps/v1
@@ -161,45 +232,86 @@ exercises:
       minAvailable: 2
       selector: {matchLabels: {app: billing}}
     EOF
+
+    # --- part 3: The budget that protects nothing ---
+    k_ns ops
+    kubectl -n ops create deployment web --image=traefik/whoami:v1.10 --replicas=3 >/dev/null
+    kubectl -n ops create pdb web-pdb --selector=app=webb --min-available=3 >/dev/null
   check: |
+    info "Part 1: Create a budget"
+    p() { kubectl -n pdb1 get pdb web-pdb -o json 2>/dev/null; }
+    covers() { p | jq -e '.status.expectedPods == 4 and .status.desiredHealthy == 3 and .status.disruptionsAllowed == 1' >/dev/null 2>&1; }
+    check "PodDisruptionBudget web-pdb exists" 'k_exists -n pdb1 pdb web-pdb'
+    check "it selects all 4 web pods and allows exactly one disruption" 'k_exists -n pdb1 pdb web-pdb && wait_deploy pdb1 web 60 && eventually 30 covers'
+
+    info "Part 2: The budget that blocks every drain"
     p() { kubectl -n pdb2 get pdb billing-pdb -o json 2>/dev/null; }
     sel_ok() { p | jq -e '.spec.selector.matchLabels.app == "billing"' >/dev/null 2>&1; }
     allows() { p | jq -e '.status.disruptionsAllowed >= 1 and .status.desiredHealthy >= 1 and .status.expectedPods >= 2' >/dev/null 2>&1; }
     check "billing-pdb still exists and selects app=billing" 'sel_ok'
     check "billing is up" 'sel_ok && wait_deploy pdb2 billing 60'
     check "one eviction is allowed but one pod must always stay" 'sel_ok && deploy_ready pdb2 billing && eventually 30 allows'
+
+    info "Part 3: The budget that protects nothing"
+    k_exists -n ops pdb web-pdb && wait_deploy ops web 60
+    check "web-pdb exists" 'k_exists -n ops pdb web-pdb'
+    k_exists -n ops pdb web-pdb && eventually 20 '[ "$(kj -n ops pdb web-pdb "{.status.expectedPods}")" = 3 ]'
+    check_eq "the PDB sees the 3 web pods" "$(kj -n ops pdb web-pdb '{.status.expectedPods}')" "3"
+    check_eq "exactly one disruption allowed" "$(kj -n ops pdb web-pdb '{.status.disruptionsAllowed}')" "1"
   solve: |
+    # --- part 1: Create a budget ---
+    kubectl -n pdb1 create pdb web-pdb --selector=app=web --max-unavailable=1
+
+    # --- part 2: The budget that blocks every drain ---
     kubectl -n pdb2 patch pdb billing-pdb --type=merge -p '{"spec":{"minAvailable":1}}'
 
+    # --- part 3: The budget that protects nothing ---
+    kubectl -n ops delete pdb web-pdb
+    kubectl -n ops create pdb web-pdb --selector=app=web --min-available=2
+
 - id: k8s-324
-  title: Guaranteed for one, BestEffort for the other
+  title: QoS classes and the OOM killer
   difficulty: 3
   kind: build
-  tags: [qos, resources, requests, limits]
+  tags: [qos, resources, requests, limits, oomkilled]
   tutorial: |
-    **Concept.** Every pod gets a QoS class from its resources. Guaranteed means every container has CPU and memory requests equal to limits; Burstable means at least one request or limit is set; BestEffort means none at all. Under node pressure BestEffort pods are evicted first and Guaranteed last.
+    **Concept.** Kubernetes derives a pod's QoS class from its resources. Every container with requests equal to limits gives Guaranteed, no requests or limits at all gives BestEffort, anything else Burstable. The class decides who is evicted first under node pressure. A container's memory limit is enforced by the kernel: exceeding it means an immediate kill, reported as `OOMKilled` with exit code 137 in the *previous* state, while the logs may show nothing wrong.
 
     **Read up on:**
-    - `kubectl get pod NAME -o jsonpath='{.status.qosClass}'` — the class the pod received
-    - `kubectl explain pod.spec.containers.resources`
-    - `kubectl describe pod NAME` — shows the QoS Class line
     - Kubernetes docs: Pod Quality of Service Classes
+    - `kubectl get pod -o jsonpath='{.status.qosClass}'`
+    - `kubectl describe pod` — `Last State`, `Reason`, `Exit Code`
+    - Kubernetes docs: Assign Memory Resources to Containers
   scenario: |
-    In namespace **`qos1`** create two pods:
+    Two jobs about what happens when a node or container runs short of memory: set up the right QoS classes, then rescue a workload that keeps being killed:
 
-    - **`critical`**, QoS class **Guaranteed**, with two containers:
-      - **`app`** (`nginx:1.27-alpine`): CPU **100m**, memory **64Mi**
-      - **`log`** (`busybox:1.37`, `sleep infinity`): CPU **50m**, memory **32Mi**
+    1. **Assign QoS classes.** In namespace **`qos1`** create two pods:
 
-      (for each container the requests equal the limits)
-    - **`scavenger`** (`busybox:1.37`, `sleep infinity`), QoS class **BestEffort**
+       - **`critical`**, QoS class **Guaranteed**, with two containers:
+         - **`app`** (`nginx:1.27-alpine`): CPU **100m**, memory **64Mi**
+         - **`log`** (`busybox:1.37`, `sleep infinity`): CPU **50m**, memory **32Mi**
 
-    Both pods must be Running.
+         (for each container the requests equal the limits)
+       - **`scavenger`** (`busybox:1.37`, `sleep infinity`), QoS class **BestEffort**
+
+       Both pods must be Running.
+
+    2. **Killed by its own limit.** Deployment **`cruncher`** in namespace **`oom1`** builds a 30 MB string in memory at
+       start-up, prints `allocated 30000000` and then reports itself ready. It has never
+       become Ready: it keeps dying.
+
+       Find out why and make **`cruncher`** Ready with **zero restarts**. The memory limit
+       must stay in place (don't remove it) and the application command must stay unchanged.
   hints:
-    - "Guaranteed is decided for the whole pod: every container needs both requests and limits for both resources."
-    - "If you only set limits, Kubernetes copies them into the requests."
-    - "BestEffort is the absence of any `resources` section."
+    - "Part 1: Guaranteed is decided for the whole pod: every container needs both requests and limits for both resources."
+    - "Part 1: If you only set limits, Kubernetes copies them into the requests."
+    - "Part 1: BestEffort is the absence of any `resources` section."
+    - "Part 2: `kubectl -n oom1 describe pod` — look at the last state of the container."
+    - "Part 2: Exit code 137 together with OOMKilled means the memory limit was hit."
+    - "Part 2: The limit has to be comfortably above what the process really needs; keep the request at or below it."
   solution: |
+    **1. Assign QoS classes**
+
     ```yaml
     # critical
     containers:
@@ -217,80 +329,17 @@ exercises:
     ```
 
     `scavenger` is a plain pod without `resources`.
-  setup: |
-    k_ns qos1
-  check: |
-    wait_pod qos1 critical 60
-    wait_pod qos1 scavenger 60
-    res_ok() {
-      kubectl -n qos1 get pod critical -o json | jq -e '
-        def r(c; m): .resources | .limits.cpu == c and .limits.memory == m and .requests.cpu == c and .requests.memory == m;
-        (.spec.containers | length) == 2
-        and (.spec.containers | map(select(.name == "app")) | first | r("100m"; "64Mi"))
-        and (.spec.containers | map(select(.name == "log")) | first | r("50m"; "32Mi"))' >/dev/null 2>&1
-    }
-    check "critical is Guaranteed" '[ "$(kj -n qos1 pod critical "{.status.qosClass}")" = Guaranteed ]'
-    check "app and log have the requested CPU and memory (requests = limits)" 'res_ok'
-    check "scavenger is BestEffort" '[ "$(kj -n qos1 pod scavenger "{.status.qosClass}")" = BestEffort ]'
-    check "scavenger is running" 'pod_ready qos1 scavenger'
-  solve: |
-    kubectl apply -f - <<'EOF'
-    apiVersion: v1
-    kind: Pod
-    metadata: {name: critical, namespace: qos1}
-    spec:
-      containers:
-      - name: app
-        image: nginx:1.27-alpine
-        resources:
-          requests: {cpu: 100m, memory: 64Mi}
-          limits: {cpu: 100m, memory: 64Mi}
-      - name: log
-        image: busybox:1.37
-        command: ["sleep", "infinity"]
-        resources:
-          requests: {cpu: 50m, memory: 32Mi}
-          limits: {cpu: 50m, memory: 32Mi}
-    ---
-    apiVersion: v1
-    kind: Pod
-    metadata: {name: scavenger, namespace: qos1}
-    spec:
-      containers:
-      - name: scavenger
-        image: busybox:1.37
-        command: ["sleep", "infinity"]
-    EOF
 
-- id: k8s-325
-  title: Killed by the memory limit
-  difficulty: 3
-  kind: fix
-  tags: [resources, oomkilled, limits]
-  tutorial: |
-    **Concept.** A memory limit is enforced by the kernel: a container that grows past it is killed (OOMKilled, exit code 137) and restarted. Unlike CPU, memory is not throttled, so a limit that is too low turns into a crash loop.
+    **2. Killed by its own limit**
 
-    **Read up on:**
-    - `kubectl describe pod NAME` — Last State: Terminated, Reason: OOMKilled
-    - `kubectl get pod NAME -o jsonpath='{.status.containerStatuses[0].lastState}'`
-    - `kubectl set resources --help`
-    - Kubernetes docs: Resource Management for Pods and Containers
-  scenario: |
-    Deployment **`cruncher`** in namespace **`oom1`** builds a 30 MB string in memory at
-    start-up, prints `allocated 30000000` and then reports itself ready. It has never
-    become Ready: it keeps dying.
-
-    Find out why and make **`cruncher`** Ready with **zero restarts**. The memory limit
-    must stay in place (don't remove it) and the application command must stay unchanged.
-  hints:
-    - "`kubectl -n oom1 describe pod` — look at the last state of the container."
-    - "Exit code 137 together with OOMKilled means the memory limit was hit."
-    - "The limit has to be comfortably above what the process really needs; keep the request at or below it."
-  solution: |
     ```bash
     kubectl -n oom1 set resources deploy cruncher --requests=memory=64Mi --limits=memory=256Mi
     ```
   setup: |
+    # --- part 1: Assign QoS classes ---
+    k_ns qos1
+
+    # --- part 2: Killed by its own limit ---
     k_ns oom1
     kubectl apply -f - >/dev/null <<'EOF'
     apiVersion: apps/v1
@@ -320,6 +369,22 @@ exercises:
               periodSeconds: 2
     EOF
   check: |
+    info "Part 1: Assign QoS classes"
+    wait_pod qos1 critical 60
+    wait_pod qos1 scavenger 60
+    res_ok() {
+      kubectl -n qos1 get pod critical -o json | jq -e '
+        def r(c; m): .resources | .limits.cpu == c and .limits.memory == m and .requests.cpu == c and .requests.memory == m;
+        (.spec.containers | length) == 2
+        and (.spec.containers | map(select(.name == "app")) | first | r("100m"; "64Mi"))
+        and (.spec.containers | map(select(.name == "log")) | first | r("50m"; "32Mi"))' >/dev/null 2>&1
+    }
+    check "critical is Guaranteed" '[ "$(kj -n qos1 pod critical "{.status.qosClass}")" = Guaranteed ]'
+    check "app and log have the requested CPU and memory (requests = limits)" 'res_ok'
+    check "scavenger is BestEffort" '[ "$(kj -n qos1 pod scavenger "{.status.qosClass}")" = BestEffort ]'
+    check "scavenger is running" 'pod_ready qos1 scavenger'
+
+    info "Part 2: Killed by its own limit"
     lim=$(kj -n oom1 deploy cruncher '{.spec.template.spec.containers[0].resources.limits.memory}')
     active_restarts() { kubectl -n oom1 get pods -l app=cruncher -o json | jq '[.items[] | select(.metadata.deletionTimestamp == null) | .status.containerStatuses[]?.restartCount] | add // 0'; }
     check "a memory limit is still set" '[ -n "$lim" ]'
@@ -327,6 +392,36 @@ exercises:
     check "no container restarts" 'deploy_ready oom1 cruncher && [ "$(active_restarts)" = 0 ]'
     check "the application really allocated its 30 MB" 'deploy_ready oom1 cruncher && kubectl -n oom1 logs deploy/cruncher | grep -q "allocated 30000000"'
   solve: |
+    # --- part 1: Assign QoS classes ---
+    kubectl apply -f - <<'EOF'
+    apiVersion: v1
+    kind: Pod
+    metadata: {name: critical, namespace: qos1}
+    spec:
+      containers:
+      - name: app
+        image: nginx:1.27-alpine
+        resources:
+          requests: {cpu: 100m, memory: 64Mi}
+          limits: {cpu: 100m, memory: 64Mi}
+      - name: log
+        image: busybox:1.37
+        command: ["sleep", "infinity"]
+        resources:
+          requests: {cpu: 50m, memory: 32Mi}
+          limits: {cpu: 50m, memory: 32Mi}
+    ---
+    apiVersion: v1
+    kind: Pod
+    metadata: {name: scavenger, namespace: qos1}
+    spec:
+      containers:
+      - name: scavenger
+        image: busybox:1.37
+        command: ["sleep", "infinity"]
+    EOF
+
+    # --- part 2: Killed by its own limit ---
     kubectl -n oom1 set resources deploy cruncher --requests=memory=64Mi --limits=memory=256Mi
     kubectl -n oom1 rollout status deploy cruncher --timeout=120s
 
@@ -350,8 +445,8 @@ exercises:
     written when a pod is deleted: the pod is killed before it finishes.
 
     Change the deployment so that a deleted pod always gets the time it needs to finish
-    its shutdown. Don't change the application command. (The check will delete one of the
-    pods to test it.)
+    its shutdown, without making pod termination wait for more than **2 minutes**. Don't
+    change the application command. (The check will delete one of the pods to test it.)
   hints:
     - "`kubectl -n grace1 get deploy exporter -o yaml | grep -i grace`"
     - "Compare the grace period with the 12 seconds the shutdown handler needs."
@@ -401,6 +496,7 @@ exercises:
       on_node01 'test -f /var/tmp/kl-flush/flushed'
     }
     check "the grace period is long enough for a 12 s flush" '[ "${tg:-30}" -ge 15 ]'
+    check "the grace period is at most 120s" '[ "${tg:-30}" -le 120 ]'
     check "exporter is ready" '[ "${tg:-30}" -ge 15 ] && wait_deploy grace1 exporter 60'
     check "a deleted pod finishes its flush before it dies" '[ "${tg:-30}" -ge 15 ] && deploy_ready grace1 exporter && flush_test'
   solve: |
@@ -612,75 +708,6 @@ exercises:
             emptyDir: {}
     EOF
     kubectl -n init1 rollout status deploy portal --timeout=150s
-
-- id: k8s-329
-  title: Spread out, but don't starve
-  difficulty: 4
-  kind: fix
-  tags: [affinity, antiaffinity, resilience, scheduling]
-  tutorial: |
-    **Concept.** Pod anti-affinity keeps replicas of one application apart. A *required* rule is a hard filter: if the cluster has fewer eligible nodes than replicas, the surplus pods stay Pending. A *preferred* rule only influences scoring, so the scheduler spreads replicas when it can and still places them when it cannot.
-
-    **Read up on:**
-    - `kubectl explain pod.spec.affinity.podAntiAffinity` — required versus preferred
-    - `kubectl describe pod NAME` — the FailedScheduling event says which rule blocked it
-    - `kubectl get nodes` — how many nodes can actually take workloads
-    - Kubernetes docs: Assigning Pods to Nodes
-  scenario: |
-    Deployment **`ledger`** in namespace **`spread`** runs 3 replicas with a required
-    pod anti-affinity rule on `kubernetes.io/hostname`. Only one node of this cluster
-    accepts regular workloads, so two replicas are stuck Pending.
-
-    Make all 3 replicas Ready, but keep the intent: replicas should still be **spread
-    across nodes whenever possible**. Express that as a *preferred* pod anti-affinity on
-    `kubernetes.io/hostname` that selects `app=ledger`, and remove the required rule.
-    Keep 3 replicas, and don't add tolerations or touch the nodes.
-  hints:
-    - "`kubectl -n spread describe pod` shows `didn't match pod anti-affinity rules`."
-    - "`kubectl explain pod.spec.affinity.podAntiAffinity.preferredDuringSchedulingIgnoredDuringExecution` — it needs a weight and a `podAffinityTerm`."
-    - "Replace the whole `affinity` block of the pod template; a deployment rollout follows."
-  solution: |
-    ```yaml
-    affinity:
-      podAntiAffinity:
-        preferredDuringSchedulingIgnoredDuringExecution:
-        - weight: 100
-          podAffinityTerm:
-            topologyKey: kubernetes.io/hostname
-            labelSelector: {matchLabels: {app: ledger}}
-    ```
-  setup: |
-    k_ns spread
-    kubectl apply -f - >/dev/null <<'EOF'
-    apiVersion: apps/v1
-    kind: Deployment
-    metadata: {name: ledger, namespace: spread}
-    spec:
-      replicas: 3
-      strategy: {type: Recreate}
-      selector: {matchLabels: {app: ledger}}
-      template:
-        metadata: {labels: {app: ledger}}
-        spec:
-          affinity:
-            podAntiAffinity:
-              requiredDuringSchedulingIgnoredDuringExecution:
-              - topologyKey: kubernetes.io/hostname
-                labelSelector: {matchLabels: {app: ledger}}
-          containers:
-          - name: ledger
-            image: nginx:1.27-alpine
-    EOF
-  check: |
-    d() { kubectl -n spread get deploy ledger -o json 2>/dev/null | jq -e "$1" >/dev/null 2>&1; }
-    no_req() { d '(.spec.template.spec.affinity.podAntiAffinity.requiredDuringSchedulingIgnoredDuringExecution // []) | length == 0'; }
-    has_pref() { d '[.spec.template.spec.affinity.podAntiAffinity.preferredDuringSchedulingIgnoredDuringExecution[]? | select(.podAffinityTerm.topologyKey == "kubernetes.io/hostname" and .podAffinityTerm.labelSelector.matchLabels.app == "ledger")] | length >= 1'; }
-    check "the required anti-affinity rule is gone" 'no_req'
-    check "a preferred anti-affinity on kubernetes.io/hostname selects app=ledger" 'has_pref'
-    check "3 replicas are configured and Ready" 'no_req && has_pref && [ "$(kj -n spread deploy ledger "{.spec.replicas}")" = 3 ] && wait_deploy spread ledger 120'
-  solve: |
-    kubectl -n spread patch deploy ledger --type=json -p '[{"op":"replace","path":"/spec/template/spec/affinity","value":{"podAntiAffinity":{"preferredDuringSchedulingIgnoredDuringExecution":[{"weight":100,"podAffinityTerm":{"topologyKey":"kubernetes.io/hostname","labelSelector":{"matchLabels":{"app":"ledger"}}}}]}}}]'
-    kubectl -n spread rollout status deploy ledger --timeout=150s
 
 - id: k8s-330
   title: Probes pointing the wrong way
