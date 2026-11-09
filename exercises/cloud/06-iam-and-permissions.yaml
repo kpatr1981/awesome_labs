@@ -1,0 +1,740 @@
+track: cloud
+module: IAM & permissions
+profile: docker
+order: 6
+exercises:
+
+- id: cloud-046
+  title: Bucket and object are different resources
+  difficulty: 2
+  kind: fix
+  tags: [aws, iam, s3, least-privilege]
+  tutorial: |
+    **Concept.** Every AWS request is evaluated the same way. It starts out refused, an `Allow`
+    statement can permit it, and an explicit `Deny` beats any `Allow`. A statement only applies
+    when both its `Action` and its `Resource` match the request, so a correct action on the
+    wrong resource grants nothing, and you get the same `AccessDenied` as having no policy at all.
+
+    *Reading a denial.* The error names the API **operation**, and you need the IAM **action**.
+    They are usually the same word, but not always: `ListObjectsV2` needs `s3:ListBucket`, and
+    `HeadObject` needs `s3:GetObject`, which is why a failed download often reports a bare
+    `(403) Forbidden` from `HeadObject`. On real AWS, S3 may also tell you the principal and why
+    it was refused. The emulator here says only `Access Denied`, so you work from the operation.
+
+    *S3 has two kinds of resource.* A bucket is `arn:aws:s3:::my-bucket` and the objects inside
+    it are `arn:aws:s3:::my-bucket/some/key`. Bucket-level actions match the first form and
+    object-level actions match the second. `*` matches any run of characters, including `/` and
+    `-`, so check what else your wildcard catches.
+
+    *Working as two identities.* The `aws` command here runs as the account administrator (the
+    `[default]` profile in `/lab/.aws/credentials`). `aws --profile NAME` runs as another user,
+    so you can reproduce the failure as that user and repair it as the administrator.
+
+    **Read up on:**
+    - `aws iam list-user-policies help`, `aws iam get-user-policy help`, `aws iam put-user-policy help`
+    - The AWS service authorization reference for S3: which actions apply to a bucket and which to an object
+    - `aws s3 ls`, `aws s3 cp`, `aws s3 rm` with `--profile`
+    - IAM docs, "Policy evaluation logic"
+  scenario: |
+    The `aws` command talks to a local emulator with IAM enforced, and runs as the account
+    administrator. `aws --profile report-bot ...` runs as the service user **`report-bot`**,
+    whose nightly job has started failing with `AccessDenied`. Its permissions come from the
+    inline policy **`report-bot-access`**. Repair that policy as the administrator.
+
+    Buckets in the account: **`acme-reports`** (its data), **`acme-reports-archive`** and
+    **`acme-payroll`** (neither is any of its business).
+
+    ## Part 1: Let it list the reports
+
+    `report-bot` must be able to list the contents of `acme-reports`, and nothing else: it must
+    be refused listing `acme-reports-archive` and `acme-payroll`, and refused `aws s3 ls` of the
+    account's buckets.
+
+    ## Part 2: Let it read the reports
+
+    `report-bot` must be able to download objects from `acme-reports`. Downloads from
+    `acme-reports-archive` and `acme-payroll` must be refused.
+
+    ## Part 3: Keep its uploads in one place
+
+    `report-bot` must be able to upload under the **`outgoing/`** prefix of `acme-reports`, and
+    nowhere else: uploads to `daily/`, to a sibling prefix such as `outgoing-old/`, and to
+    `acme-payroll` must be refused. It must not be able to delete objects.
+  hints:
+    - 'Part 1: reproduce it with `aws --profile report-bot s3 ls s3://acme-reports/`, then read the policy with `aws iam get-user-policy`.'
+    - 'Part 1: `s3:ListBucket` is a bucket-level action. Which ARN form does it need?'
+    - 'Part 2: `s3:GetObject` is an object-level action, so its ARN needs a `/` and a key pattern.'
+    - 'Part 3: a pattern ending in `outgoing/*` is different from one ending in `outgoing*`.'
+    - 'Write the whole policy to a file under `/lab` and pass it with `--policy-document file:///lab/policy.json`. `put-user-policy` replaces a policy of the same name.'
+  solution: |
+    The three statements have their resources wrong: `s3:ListBucket` names objects,
+    `s3:GetObject` names the bucket, and `s3:PutObject` covers the whole bucket.
+
+    ```bash
+    cd /lab
+    cat > policy.json <<'EOF'
+    {"Version":"2012-10-17","Statement":[
+     {"Sid":"ListReports","Effect":"Allow","Action":"s3:ListBucket","Resource":"arn:aws:s3:::acme-reports"},
+     {"Sid":"ReadReports","Effect":"Allow","Action":"s3:GetObject","Resource":"arn:aws:s3:::acme-reports/*"},
+     {"Sid":"WriteOutgoing","Effect":"Allow","Action":"s3:PutObject","Resource":"arn:aws:s3:::acme-reports/outgoing/*"}
+    ]}
+    EOF
+    aws iam put-user-policy --user-name report-bot --policy-name report-bot-access --policy-document file:///lab/policy.json
+    ```
+  setup: |
+    moto_start_iam
+    moto_user report-bot
+    for b in acme-reports acme-reports-archive acme-payroll; do aws s3 mb "s3://$b" >/dev/null; done
+    for o in acme-reports/daily/2026-11-01.csv acme-reports/daily/keep-this.csv acme-reports-archive/2019.csv acme-payroll/salaries.csv; do
+      echo "row,1" | aws s3 cp - "s3://$o" >/dev/null
+    done
+    aws iam put-user-policy --user-name report-bot --policy-name report-bot-access --policy-document '{"Version":"2012-10-17","Statement":[
+      {"Sid":"ListReports","Effect":"Allow","Action":"s3:ListBucket","Resource":"arn:aws:s3:::acme-reports/*"},
+      {"Sid":"ReadReports","Effect":"Allow","Action":"s3:GetObject","Resource":"arn:aws:s3:::acme-reports"},
+      {"Sid":"WriteOutgoing","Effect":"Allow","Action":"s3:PutObject","Resource":"arn:aws:s3:::acme-reports/*"}]}'
+    chown -R "$(lab_user)": /lab
+  check: |
+    rb() { aws --profile report-bot "$@"; }
+    no() { moto_denied report-bot "$@"; }
+
+    info "Part 1: Let it list the reports"
+    check "report-bot can list acme-reports" 'rb s3 ls s3://acme-reports/'
+    check "listing acme-reports-archive is refused" 'no s3 ls s3://acme-reports-archive/'
+    check "listing acme-payroll is refused" 'no s3 ls s3://acme-payroll/'
+    check "listing the account's buckets is refused" 'no s3 ls'
+
+    info "Part 2: Let it read the reports"
+    check "report-bot can download from acme-reports" 'rb s3 cp s3://acme-reports/daily/2026-11-01.csv - | grep -q row'
+    check "downloading from acme-reports-archive is refused" 'no s3 cp s3://acme-reports-archive/2019.csv -'
+    check "downloading from acme-payroll is refused" 'no s3 cp s3://acme-payroll/salaries.csv -'
+
+    info "Part 3: Keep its uploads in one place"
+    check "report-bot can upload under outgoing/" 'echo out | rb s3 cp - s3://acme-reports/outgoing/klcheck.csv'
+    check "uploading under daily/ is refused" 'echo x | no s3 cp - s3://acme-reports/daily/klcheck.csv'
+    check "uploading under outgoing-old/ is refused" 'echo x | no s3 cp - s3://acme-reports/outgoing-old/klcheck.csv'
+    check "uploading to acme-payroll is refused" 'echo x | no s3 cp - s3://acme-payroll/klcheck.csv'
+    check "deleting objects is refused" 'no s3 rm s3://acme-reports/daily/keep-this.csv'
+  solve: |
+    cd /lab
+    cat > policy.json <<'EOF'
+    {"Version":"2012-10-17","Statement":[
+     {"Sid":"ListReports","Effect":"Allow","Action":"s3:ListBucket","Resource":"arn:aws:s3:::acme-reports"},
+     {"Sid":"ReadReports","Effect":"Allow","Action":"s3:GetObject","Resource":"arn:aws:s3:::acme-reports/*"},
+     {"Sid":"WriteOutgoing","Effect":"Allow","Action":"s3:PutObject","Resource":"arn:aws:s3:::acme-reports/outgoing/*"}
+    ]}
+    EOF
+    aws iam put-user-policy --user-name report-bot --policy-name report-bot-access --policy-document file:///lab/policy.json
+
+- id: cloud-047
+  title: The Deny that outranks every Allow
+  difficulty: 3
+  kind: fix
+  tags: [aws, iam, s3, deny, groups]
+  tutorial: |
+    **Concept.** A user's effective permissions are the union of everything attached to them:
+    inline policies on the user, managed policies on the user, and the inline and managed
+    policies of every group they belong to. Evaluation looks at all of it together, and one
+    matching `Deny` anywhere ends the discussion. That's why guardrails are written as `Deny`
+    statements, and why no amount of extra `Allow` will fix a request one of them catches.
+
+    *Debugging a denial means walking all of those places.* Each of a user's policy sources has
+    its own listing command, and a managed policy's text belongs to its **default version**, so
+    you read it in two steps. Give statements a `Sid` and they are much easier to talk about.
+
+    *Changing a managed policy.* You don't edit a managed policy in place. You publish a new
+    version and make it the default, and everything attached to the policy changes at once.
+
+    *Keep it attached.* Removing someone from the group that carries a guardrail makes their
+    denial go away, and also removes the protection. A guardrail that's too wide should be
+    narrowed instead, so that it still catches what it was written for.
+
+    **Read up on:**
+    - `aws iam list-groups-for-user`, `aws iam list-attached-group-policies`, `aws iam list-group-policies`, `aws iam list-user-policies`, `aws iam list-attached-user-policies`
+    - `aws iam get-policy` and `aws iam get-policy-version` — finding and reading a managed policy's current text
+    - `aws iam create-policy-version help` — `--set-as-default`
+    - IAM docs, "Policy evaluation logic" — the role of an explicit deny
+  scenario: |
+    The `aws` command talks to a local emulator with IAM enforced, and runs as the account
+    administrator. `aws --profile maria ...` and `aws --profile aiden ...` run as those users.
+
+    **`maria`** is a developer. Every upload she makes to **`acme-staging`** fails with
+    `AccessDenied`. Someone already added an inline `Allow` to her user, and it made no
+    difference. Don't add any more of them: the access she has is fine. Something is taking it away.
+
+    Production buckets are named **`acme-prod-*`**. The company rule, enforced by a policy on the
+    **`all-staff`** group, is that nobody writes to production through their user account, not
+    even someone like **`aiden`** who has been handed full access to those buckets.
+
+    ## Part 1: Find the statement
+
+    Write to **`/lab/culprit.txt`** a single line holding the name of the policy that causes
+    `maria`'s denial, a space, and the statement's `Sid`.
+
+    ## Part 2: Narrow the guardrail
+
+    Fix that policy by publishing a new default version, so that its scope covers only
+    production. Use a plain `Resource` element and keep its other statement as it is.
+
+    `maria` must be able to upload to and delete from `acme-staging`, and still read objects in
+    `acme-prod-orders`. Neither she nor `aiden` may upload to or delete from any `acme-prod-*`
+    bucket, including one created tomorrow.
+
+    ## Part 3: Clean up, and leave the protection in place
+
+    Remove the inline policy that was added to `maria` in desperation: it never helped, and
+    she must keep her access without it.
+
+    The guardrail still has to apply to everyone. `maria` and `aiden` must stay in `all-staff`,
+    the policy must stay attached to that group, and `aiden` must still be refused deleting an
+    `acme-prod-*` bucket.
+  hints:
+    - "Part 1: start from `aws iam list-groups-for-user --user-name maria`, then list each group's attached and inline policies, and the user's own."
+    - "Part 1: `aws iam get-policy` gives `DefaultVersionId`, and `aws iam get-policy-version` gives the statements."
+    - "Part 2: which bucket names does the statement's `Resource` pattern match? Would `acme-staging` be among them?"
+    - "Part 2: `aws iam create-policy-version --policy-arn ARN --policy-document file:///lab/new.json --set-as-default`. Include both statements."
+    - "Part 3: `aws iam list-user-policies --user-name maria` shows it, and `aws iam delete-user-policy` removes it."
+  solution: |
+    `maria` belongs to `all-staff`, whose attached managed policy `guardrail-prod` has a `Deny`
+    statement `NoProdWrites` whose resource pattern `arn:aws:s3:::acme-*` also matches
+    `acme-staging`. Narrow it, leave the other statement alone, and remove the inline policy
+    that never helped:
+
+    ```bash
+    cd /lab
+    echo "guardrail-prod NoProdWrites" > culprit.txt
+    cat > new.json <<'EOF'
+    {"Version":"2012-10-17","Statement":[
+     {"Sid":"NoProdWrites","Effect":"Deny","Action":["s3:PutObject","s3:DeleteObject"],"Resource":"arn:aws:s3:::acme-prod-*"},
+     {"Sid":"NoBucketDeletes","Effect":"Deny","Action":"s3:DeleteBucket","Resource":"*"}
+    ]}
+    EOF
+    ARN=$(aws iam list-policies --scope Local --query "Policies[?PolicyName=='guardrail-prod'].Arn" --output text)
+    aws iam create-policy-version --policy-arn "$ARN" --policy-document file:///lab/new.json --set-as-default
+    aws iam delete-user-policy --user-name maria --policy-name staging-writes
+    ```
+  setup: |
+    moto_start_iam
+    moto_user maria aiden
+    for b in acme-staging acme-prod-orders acme-prod-billing; do aws s3 mb "s3://$b" >/dev/null; done
+    for o in acme-staging/app.txt acme-prod-orders/orders.csv acme-prod-orders/do-not-delete.csv; do
+      echo data | aws s3 cp - "s3://$o" >/dev/null
+    done
+    aws iam create-group --group-name developers >/dev/null
+    aws iam create-group --group-name all-staff >/dev/null
+    aws iam add-user-to-group --group-name developers --user-name maria
+    aws iam add-user-to-group --group-name all-staff --user-name maria
+    aws iam add-user-to-group --group-name all-staff --user-name aiden
+    dev=$(aws iam create-policy --policy-name dev-s3 --query Policy.Arn --output text --policy-document '{"Version":"2012-10-17","Statement":[
+      {"Sid":"StagingWork","Effect":"Allow","Action":["s3:GetObject","s3:PutObject","s3:DeleteObject"],"Resource":"arn:aws:s3:::acme-staging/*"},
+      {"Sid":"ListBuckets","Effect":"Allow","Action":"s3:ListBucket","Resource":["arn:aws:s3:::acme-staging","arn:aws:s3:::acme-prod-orders"]},
+      {"Sid":"ReadProd","Effect":"Allow","Action":"s3:GetObject","Resource":"arn:aws:s3:::acme-prod-*/*"}]}')
+    aws iam attach-group-policy --group-name developers --policy-arn "$dev"
+    guard=$(aws iam create-policy --policy-name guardrail-prod --query Policy.Arn --output text --policy-document '{"Version":"2012-10-17","Statement":[
+      {"Sid":"NoProdWrites","Effect":"Deny","Action":["s3:PutObject","s3:DeleteObject"],"Resource":"arn:aws:s3:::acme-*"},
+      {"Sid":"NoBucketDeletes","Effect":"Deny","Action":"s3:DeleteBucket","Resource":"*"}]}')
+    aws iam attach-group-policy --group-name all-staff --policy-arn "$guard"
+    aws iam put-user-policy --user-name maria --policy-name staging-writes --policy-document '{"Version":"2012-10-17","Statement":[
+      {"Effect":"Allow","Action":"s3:PutObject","Resource":"arn:aws:s3:::acme-staging/*"}]}'
+    aws iam put-user-policy --user-name aiden --policy-name prod-admin --policy-document '{"Version":"2012-10-17","Statement":[
+      {"Effect":"Allow","Action":"s3:*","Resource":"arn:aws:s3:::acme-prod-*"}]}'
+    chown -R "$(lab_user)": /lab
+  check: |
+    aws s3 mb s3://acme-prod-klcheck >/dev/null 2>&1 || true
+    arn=$(aws iam list-policies --scope Local --query "Policies[?PolicyName=='guardrail-prod'].Arn" --output text 2>/dev/null)
+
+    info "Part 1: Find the statement"
+    check_eq "culprit.txt names the policy and statement" "$(tr -s ' \t\n' ' ' </lab/culprit.txt 2>/dev/null | sed 's/ *$//')" "guardrail-prod NoProdWrites"
+
+    info "Part 2: Narrow the guardrail"
+    check "maria can upload to acme-staging" 'echo x | aws --profile maria s3 cp - s3://acme-staging/klcheck.txt'
+    check "maria can delete from acme-staging" 'aws --profile maria s3 rm s3://acme-staging/klcheck.txt'
+    check "maria can read acme-prod-orders" 'aws --profile maria s3 cp s3://acme-prod-orders/orders.csv - | grep -q data'
+    check "maria is refused uploading to acme-prod-orders" 'echo x | moto_denied maria s3 cp - s3://acme-prod-orders/klcheck.txt'
+    check "maria is refused deleting from acme-prod-orders" 'moto_denied maria s3 rm s3://acme-prod-orders/do-not-delete.csv'
+    check "aiden is refused uploading to acme-prod-billing" 'echo x | moto_denied aiden s3 cp - s3://acme-prod-billing/klcheck.txt'
+    check "aiden is refused uploading to a brand-new prod bucket" 'echo x | moto_denied aiden s3 cp - s3://acme-prod-klcheck/klcheck.txt'
+
+    info "Part 3: Clean up, and leave the protection in place"
+    check_eq "maria has no inline policies left" "$(aws iam list-user-policies --user-name maria --query 'length(PolicyNames)' --output text 2>/dev/null)" 0
+    check_match "maria is still in all-staff" "$(aws iam list-groups-for-user --user-name maria --query 'Groups[*].GroupName' --output text 2>/dev/null)" 'all-staff'
+    check_match "aiden is still in all-staff" "$(aws iam list-groups-for-user --user-name aiden --query 'Groups[*].GroupName' --output text 2>/dev/null)" 'all-staff'
+    check_match "guardrail-prod is still attached to all-staff" "$(aws iam list-attached-group-policies --group-name all-staff --query 'AttachedPolicies[*].PolicyName' --output text 2>/dev/null)" 'guardrail-prod'
+    check "aiden is refused deleting a prod bucket" 'moto_denied aiden s3 rb s3://acme-prod-klcheck'
+  solve: |
+    cd /lab
+    echo "guardrail-prod NoProdWrites" > culprit.txt
+    cat > new.json <<'EOF'
+    {"Version":"2012-10-17","Statement":[
+     {"Sid":"NoProdWrites","Effect":"Deny","Action":["s3:PutObject","s3:DeleteObject"],"Resource":"arn:aws:s3:::acme-prod-*"},
+     {"Sid":"NoBucketDeletes","Effect":"Deny","Action":"s3:DeleteBucket","Resource":"*"}
+    ]}
+    EOF
+    ARN=$(aws iam list-policies --scope Local --query "Policies[?PolicyName=='guardrail-prod'].Arn" --output text)
+    aws iam create-policy-version --policy-arn "$ARN" --policy-document file:///lab/new.json --set-as-default
+    aws iam delete-user-policy --user-name maria --policy-name staging-writes
+
+- id: cloud-048
+  title: Five versions and no room for a sixth
+  difficulty: 3
+  kind: fix
+  tags: [aws, iam, managed-policy, versions]
+  tutorial: |
+    **Concept.** A customer-managed policy keeps a history of versions, and exactly one of them
+    is the default, the only one that is ever evaluated. Rolling back is a single API call, which
+    makes the history useful in an outage and also a liability: a version that grants too much
+    stays one call away from being live again.
+
+    *There's a limit.* A managed policy can hold at most **five** versions. When it's full,
+    `create-policy-version` fails with `LimitExceeded` until you delete one. The default version
+    can't be deleted either, so sometimes the order of your steps matters.
+
+    *Reading the history.* `list-policy-versions` shows the version IDs and which is default,
+    but not their text. To compare them you read each one, and version IDs keep counting up, so
+    a new version will not reuse a number.
+
+    *Fixing forward.* After a bad emergency change, the goal is usually not to return to the
+    last good version unchanged. Requirements have moved on, so you start from what was reviewed
+    and add only what's newly needed.
+
+    **Read up on:**
+    - `aws iam list-policy-versions help`, `aws iam get-policy-version help`
+    - `aws iam create-policy-version help`, `aws iam delete-policy-version help`, `aws iam set-default-policy-version help`
+    - IAM docs, "Versioning IAM policies" — the five-version limit
+  scenario: |
+    The `aws` command talks to a local emulator with IAM enforced, and runs as the account
+    administrator. `aws --profile app-server ...` runs as the application's user, whose
+    permissions come from the managed policy **`app-data`**.
+
+    The policy holds five versions. During last night's incident someone made a version live
+    that lets the application do anything to anything. It stopped the pages, and it's still in
+    place. **`/lab/change-log.txt`** has the background.
+
+    ## Part 1: Find the reviewed version
+
+    Write to **`/lab/good-version.txt`** the ID of the version the security review approved, for
+    example `v2`. It's the one that grants exactly what the change log describes.
+
+    ## Part 2: Replace the wildcard with the reviewed access plus the new need
+
+    Publish a new version and make it the default. Afterwards `app-server` must be able to:
+
+    - list `acme-app`
+    - download from `acme-app/data/` and from `acme-app/config/` (the new requirement)
+    - upload to `acme-app/uploads/`
+
+    It must be refused: uploading to `acme-app/data/`, deleting anything in `acme-app`, and any
+    access to `acme-secrets`.
+
+    ## Part 3: Clear out the dangerous history
+
+    No stored version of `app-data` may grant `s3:*` or `*`, so that nobody can roll back to
+    one. The version from Part 1 must still exist for the audit trail.
+  hints:
+    - "Part 1: loop `aws iam get-policy-version` over the IDs from `list-policy-versions`."
+    - "Part 2: if `create-policy-version` says `LimitExceeded`, there are five stored already, so something has to go first."
+    - "Part 2: start from the reviewed version's document and add one resource."
+    - "Part 3: a version can't be deleted while it's the default. Make the new one default first, and only then remove the old one."
+  solution: |
+    Reading all five versions shows `v3` is the reviewed one, and `v1` and `v5` are the
+    wildcards. `v5` is the default, so `v1` has to go first to make room:
+
+    ```bash
+    cd /lab
+    ARN=$(aws iam list-policies --scope Local --query "Policies[?PolicyName=='app-data'].Arn" --output text)
+    echo v3 > good-version.txt
+    cat > new.json <<'EOF'
+    {"Version":"2012-10-17","Statement":[
+     {"Sid":"List","Effect":"Allow","Action":"s3:ListBucket","Resource":"arn:aws:s3:::acme-app"},
+     {"Sid":"Read","Effect":"Allow","Action":"s3:GetObject","Resource":["arn:aws:s3:::acme-app/data/*","arn:aws:s3:::acme-app/config/*"]},
+     {"Sid":"Upload","Effect":"Allow","Action":"s3:PutObject","Resource":"arn:aws:s3:::acme-app/uploads/*"}
+    ]}
+    EOF
+    aws iam delete-policy-version --policy-arn "$ARN" --version-id v1
+    aws iam create-policy-version --policy-arn "$ARN" --policy-document file:///lab/new.json --set-as-default
+    aws iam delete-policy-version --policy-arn "$ARN" --version-id v5
+    ```
+  setup: |
+    moto_start_iam
+    moto_user app-server
+    for b in acme-app acme-secrets; do aws s3 mb "s3://$b" >/dev/null; done
+    for o in acme-app/data/report.json acme-app/data/do-not-delete.json acme-app/config/app.cfg acme-secrets/key.txt; do
+      echo content | aws s3 cp - "s3://$o" >/dev/null
+    done
+    v1='{"Version":"2012-10-17","Statement":[{"Effect":"Allow","Action":"s3:*","Resource":"*"}]}'
+    v2='{"Version":"2012-10-17","Statement":[{"Effect":"Allow","Action":"s3:ListBucket","Resource":"arn:aws:s3:::acme-app"},{"Effect":"Allow","Action":"s3:GetObject","Resource":"arn:aws:s3:::acme-app/*"}]}'
+    v3='{"Version":"2012-10-17","Statement":[{"Sid":"List","Effect":"Allow","Action":"s3:ListBucket","Resource":"arn:aws:s3:::acme-app"},{"Sid":"Read","Effect":"Allow","Action":"s3:GetObject","Resource":"arn:aws:s3:::acme-app/data/*"},{"Sid":"Upload","Effect":"Allow","Action":"s3:PutObject","Resource":"arn:aws:s3:::acme-app/uploads/*"}]}'
+    v4='{"Version":"2012-10-17","Statement":[{"Sid":"List","Effect":"Allow","Action":"s3:ListBucket","Resource":"arn:aws:s3:::acme-app"},{"Sid":"Read","Effect":"Allow","Action":"s3:GetObject","Resource":"arn:aws:s3:::acme-apps/data/*"},{"Sid":"Upload","Effect":"Allow","Action":"s3:PutObject","Resource":"arn:aws:s3:::acme-app/uploads/*"}]}'
+    v5='{"Version":"2012-10-17","Statement":[{"Sid":"Emergency","Effect":"Allow","Action":"*","Resource":"*"}]}'
+    arn=$(aws iam create-policy --policy-name app-data --policy-document "$v1" --query Policy.Arn --output text)
+    aws iam create-policy-version --policy-arn "$arn" --policy-document "$v2" >/dev/null
+    aws iam create-policy-version --policy-arn "$arn" --policy-document "$v3" >/dev/null
+    aws iam create-policy-version --policy-arn "$arn" --policy-document "$v4" >/dev/null
+    aws iam create-policy-version --policy-arn "$arn" --policy-document "$v5" --set-as-default >/dev/null
+    aws iam attach-user-policy --user-name app-server --policy-arn "$arn"
+    lab_file /lab/change-log.txt <<'LOG'
+    2026-07-03  Security review approved app-data: the application may list acme-app,
+                download objects under data/, and upload objects under uploads/. Nothing else.
+    2026-09-14  A later edit broke downloads. Rolled back and left for follow-up.
+    2026-11-08  INCIDENT: all S3 calls failing. On-call pushed an emergency version to
+                stop the pages, reverting to a wildcard. Temporary!
+    2026-11-09  Ticket APP-2231: the application also needs to download objects under
+                config/ now. Otherwise the reviewed access still stands.
+    LOG
+    chown -R "$(lab_user)": /lab
+  check: |
+    arn=$(aws iam list-policies --scope Local --query "Policies[?PolicyName=='app-data'].Arn" --output text 2>/dev/null)
+    as() { aws --profile app-server "$@"; }
+    no() { moto_denied app-server "$@"; }
+
+    info "Part 1: Find the reviewed version"
+    check_eq "good-version.txt names the reviewed version" "$(tr -d '[:space:]' </lab/good-version.txt 2>/dev/null)" v3
+
+    info "Part 2: Replace the wildcard with the reviewed access plus the new need"
+    check "app-server can list acme-app" 'as s3 ls s3://acme-app/'
+    check "app-server can download from data/" 'as s3 cp s3://acme-app/data/report.json - | grep -q content'
+    check "app-server can download from config/" 'as s3 cp s3://acme-app/config/app.cfg - | grep -q content'
+    check "app-server can upload to uploads/" 'echo x | as s3 cp - s3://acme-app/uploads/klcheck.txt'
+    check "uploading to data/ is refused" 'echo x | no s3 cp - s3://acme-app/data/klcheck.txt'
+    check "deleting in acme-app is refused" 'no s3 rm s3://acme-app/data/do-not-delete.json'
+    check "listing acme-secrets is refused" 'no s3 ls s3://acme-secrets/'
+    check "reading acme-secrets is refused" 'no s3 cp s3://acme-secrets/key.txt -'
+
+    info "Part 3: Clear out the dangerous history"
+    versions=$(aws iam list-policy-versions --policy-arn "${arn:-none}" --query 'Versions[*].VersionId' --output text 2>/dev/null)
+    wild=
+    for v in $versions; do
+      aws iam get-policy-version --policy-arn "$arn" --version-id "$v" --query PolicyVersion.Document --output json 2>/dev/null \
+        | jq -e '[.Statement | if type=="array" then .[] else . end | .Action | if type=="array" then .[] else . end] | any(. == "*" or . == "s3:*")' >/dev/null && wild="$wild $v"
+    done
+    check_eq "no stored version grants a wildcard" "${wild:-none}" none
+    check_match "the reviewed version is still stored" "$versions" '(^|[[:space:]])v3($|[[:space:]])'
+  solve: |
+    cd /lab
+    ARN=$(aws iam list-policies --scope Local --query "Policies[?PolicyName=='app-data'].Arn" --output text)
+    echo v3 > good-version.txt
+    cat > new.json <<'EOF'
+    {"Version":"2012-10-17","Statement":[
+     {"Sid":"List","Effect":"Allow","Action":"s3:ListBucket","Resource":"arn:aws:s3:::acme-app"},
+     {"Sid":"Read","Effect":"Allow","Action":"s3:GetObject","Resource":["arn:aws:s3:::acme-app/data/*","arn:aws:s3:::acme-app/config/*"]},
+     {"Sid":"Upload","Effect":"Allow","Action":"s3:PutObject","Resource":"arn:aws:s3:::acme-app/uploads/*"}
+    ]}
+    EOF
+    aws iam delete-policy-version --policy-arn "$ARN" --version-id v1
+    aws iam create-policy-version --policy-arn "$ARN" --policy-document file:///lab/new.json --set-as-default
+    aws iam delete-policy-version --policy-arn "$ARN" --version-id v5
+
+- id: cloud-049
+  title: The role that wouldn't let you in
+  difficulty: 4
+  kind: fix
+  tags: [aws, iam, sts, assume-role, trust-policy]
+  tutorial: |
+    **Concept.** A role has no long-term keys. Instead a principal calls `sts:AssumeRole` and
+    receives temporary credentials for it. Two different policies are involved, and they answer
+    different questions:
+
+    - The role's **trust policy** answers *who may become this role?* It's attached to the role,
+      and has a `Principal`.
+    - The role's **permissions policies** answer *what may the role do once assumed?*
+
+    The caller's own identity policy also has a say in whether they may call `sts:AssumeRole`.
+    Within a single account a trust policy that names a user directly is enough on its own, and
+    across accounts both sides have to agree, so when debugging always read both.
+
+    *An `AccessDenied` from AssumeRole is about getting in.* An `AccessDenied` from S3 after a
+    successful AssumeRole is about the role's permissions. They're different failures with
+    different fixes, and only the error's operation name tells them apart.
+
+    *Using the temporary credentials.* `assume-role` returns `AccessKeyId`, `SecretAccessKey`
+    and `SessionToken`. Exported as `AWS_ACCESS_KEY_ID`, `AWS_SECRET_ACCESS_KEY` and
+    `AWS_SESSION_TOKEN`, they take effect for the `aws` command in that shell (and `--profile`
+    must then not be given, as it would override them). `aws sts get-caller-identity` shows who
+    you currently are, and an assumed role has an `arn:aws:sts::...:assumed-role/...` identity.
+
+    **Read up on:**
+    - `aws iam get-role help` — the trust policy is in `AssumeRolePolicyDocument`
+    - `aws iam update-assume-role-policy help`
+    - `aws iam list-role-policies`, `aws iam list-attached-role-policies`, `aws iam get-role-policy`, `aws iam put-role-policy`
+    - `aws sts assume-role help`, `aws sts get-caller-identity help`
+  scenario: |
+    The `aws` command talks to a local emulator with IAM enforced, and runs as the account
+    administrator. `aws --profile ci-deployer ...` runs as the CI system's user. The users
+    `legacy-jenkins` and `intern` have profiles too.
+
+    The release pipeline must assume the role **`release-role`** and publish artifacts under
+    **`releases/`** in the bucket **`acme-artifacts`**. Since the migration from the old CI
+    system, the pipeline dies with `AccessDenied`. The role's account ID is `123456789012`.
+
+    ## Part 1: Let the right identity in
+
+    `ci-deployer` must be able to assume `release-role`. Its trust policy must have **one**
+    statement whose only principal is `ci-deployer`. Both `legacy-jenkins` (retired) and
+    `intern` must be refused, and the user `ci-deployer` itself must have no direct S3 access:
+    everything goes through the role.
+
+    Assume the role yourself and write to **`/lab/role-identity.txt`** the `Arn` that
+    `aws sts get-caller-identity` reports while holding it.
+
+    ## Part 2: Make the role do its job, and only its job
+
+    Using the role's credentials, the pipeline must be able to:
+
+    - list `acme-artifacts`
+    - download from and upload to `acme-artifacts/releases/`
+
+    The role must be refused: uploading outside `releases/` (for example `internal/`), deleting
+    anything, and any access to `acme-secrets`. Fix the role's existing policies rather than
+    adding broader ones.
+  hints:
+    - "Part 1: the trust policy is on the role: `aws iam get-role --role-name release-role --query Role.AssumeRolePolicyDocument`."
+    - "Part 1: `aws iam update-assume-role-policy` replaces the whole document. The principal is the user's full ARN."
+    - "Part 1: `aws sts assume-role --role-arn ARN --role-session-name deploy --profile ci-deployer`, then export the three values."
+    - "Part 2: there is an inline and a managed policy on the role. Read both, and compare each bucket and prefix with what's in S3."
+    - "Part 2: `create-policy-version --set-as-default` updates the managed one, and `put-role-policy` the inline one."
+  solution: |
+    The trust policy names the retired user. The inline policy has a typo in the bucket name for
+    listing and is far too broad on writes, including delete. The managed policy has a typo in the prefix.
+
+    ```bash
+    cd /lab
+    cat > trust.json <<'EOF'
+    {"Version":"2012-10-17","Statement":[{"Effect":"Allow","Principal":{"AWS":"arn:aws:iam::123456789012:user/ci-deployer"},"Action":"sts:AssumeRole"}]}
+    EOF
+    aws iam update-assume-role-policy --role-name release-role --policy-document file:///lab/trust.json
+
+    cat > inline.json <<'EOF'
+    {"Version":"2012-10-17","Statement":[
+     {"Sid":"ListArtifacts","Effect":"Allow","Action":"s3:ListBucket","Resource":"arn:aws:s3:::acme-artifacts"},
+     {"Sid":"Publish","Effect":"Allow","Action":"s3:PutObject","Resource":"arn:aws:s3:::acme-artifacts/releases/*"}
+    ]}
+    EOF
+    aws iam put-role-policy --role-name release-role --policy-name release-access --policy-document file:///lab/inline.json
+
+    cat > read.json <<'EOF'
+    {"Version":"2012-10-17","Statement":[{"Sid":"Read","Effect":"Allow","Action":"s3:GetObject","Resource":"arn:aws:s3:::acme-artifacts/releases/*"}]}
+    EOF
+    ARN=$(aws iam list-policies --scope Local --query "Policies[?PolicyName=='release-read'].Arn" --output text)
+    aws iam create-policy-version --policy-arn "$ARN" --policy-document file:///lab/read.json --set-as-default
+
+    eval "$(aws --profile ci-deployer sts assume-role --role-arn arn:aws:iam::123456789012:role/release-role --role-session-name deploy \
+      --query 'Credentials.[AccessKeyId,SecretAccessKey,SessionToken]' --output text \
+      | awk '{print "export AWS_ACCESS_KEY_ID="$1" AWS_SECRET_ACCESS_KEY="$2" AWS_SESSION_TOKEN="$3}')"
+    aws sts get-caller-identity --query Arn --output text > role-identity.txt
+    ```
+  setup: |
+    moto_start_iam
+    moto_user ci-deployer legacy-jenkins intern
+    for b in acme-artifacts acme-secrets; do aws s3 mb "s3://$b" >/dev/null; done
+    for o in acme-artifacts/releases/1.0.0/app.tgz acme-artifacts/internal/notes.txt acme-secrets/key.txt; do
+      echo blob | aws s3 cp - "s3://$o" >/dev/null
+    done
+    assume='{"Version":"2012-10-17","Statement":[{"Effect":"Allow","Action":"sts:AssumeRole","Resource":"arn:aws:iam::123456789012:role/release-role"}]}'
+    for u in ci-deployer legacy-jenkins intern; do
+      aws iam put-user-policy --user-name "$u" --policy-name may-assume-release --policy-document "$assume"
+    done
+    aws iam create-role --role-name release-role --assume-role-policy-document \
+      '{"Version":"2012-10-17","Statement":[{"Effect":"Allow","Principal":{"AWS":"arn:aws:iam::123456789012:user/legacy-jenkins"},"Action":"sts:AssumeRole"}]}' >/dev/null
+    aws iam put-role-policy --role-name release-role --policy-name release-access --policy-document '{"Version":"2012-10-17","Statement":[
+      {"Sid":"ListArtifacts","Effect":"Allow","Action":"s3:ListBucket","Resource":"arn:aws:s3:::acme-artifact"},
+      {"Sid":"Publish","Effect":"Allow","Action":["s3:PutObject","s3:DeleteObject"],"Resource":"arn:aws:s3:::acme-artifacts/*"}]}'
+    read_arn=$(aws iam create-policy --policy-name release-read --query Policy.Arn --output text --policy-document \
+      '{"Version":"2012-10-17","Statement":[{"Sid":"Read","Effect":"Allow","Action":"s3:GetObject","Resource":"arn:aws:s3:::acme-artifacts/release/*"}]}')
+    aws iam attach-role-policy --role-name release-role --policy-arn "$read_arn"
+    chown -R "$(lab_user)": /lab
+  check: |
+    role_arn=arn:aws:iam::123456789012:role/release-role
+    echo canary | aws s3 cp - s3://acme-artifacts/releases/klcheck-canary.txt >/dev/null 2>&1
+    read -r AK SK ST < <(aws --profile ci-deployer sts assume-role --role-arn "$role_arn" --role-session-name kl-check \
+      --query 'Credentials.[AccessKeyId,SecretAccessKey,SessionToken]' --output text 2>/dev/null </dev/null)
+    as_role() { AWS_ACCESS_KEY_ID=$AK AWS_SECRET_ACCESS_KEY=$SK AWS_SESSION_TOKEN=$ST aws "$@"; }
+    role_no() { as_role "$@" 2>&1 | grep -qE 'AccessDenied|\(403\)'; }
+    assume_no() { moto_denied "$1" sts assume-role --role-arn "$role_arn" --role-session-name kl-check; }
+    who=$(as_role sts get-caller-identity --query Arn --output text 2>/dev/null </dev/null)
+
+    info "Part 1: Let the right identity in"
+    check "ci-deployer can assume release-role" '[ -n "$AK" ]'
+    check_match "the assumed identity is release-role" "$who" '^arn:aws:sts::123456789012:assumed-role/release-role/'
+    principals=$(aws iam get-role --role-name release-role --query 'Role.AssumeRolePolicyDocument.Statement' --output json 2>/dev/null \
+      | jq -c 'if type=="array" then . else [.] end | [.[] | .Principal.AWS] | flatten' 2>/dev/null)
+    check_eq "the trust policy names only ci-deployer" "$principals" '["arn:aws:iam::123456789012:user/ci-deployer"]'
+    check "legacy-jenkins is refused" 'assume_no legacy-jenkins'
+    check "intern is refused" 'assume_no intern'
+    check "ci-deployer has no direct S3 access" 'moto_denied ci-deployer s3 ls s3://acme-artifacts/'
+    check_match "role-identity.txt holds the assumed-role ARN" "$(tr -d '[:space:]' </lab/role-identity.txt 2>/dev/null)" '^arn:aws:sts::123456789012:assumed-role/release-role/.+'
+
+    info "Part 2: Make the role do its job, and only its job"
+    if [ -n "$AK" ]; then
+      check "the role can list acme-artifacts" 'as_role s3 ls s3://acme-artifacts/'
+      check "the role can download from releases/" 'as_role s3 cp s3://acme-artifacts/releases/1.0.0/app.tgz - | grep -q blob'
+      check "the role can upload to releases/" 'echo x | as_role s3 cp - s3://acme-artifacts/releases/klcheck.txt'
+      check "uploading to internal/ is refused" 'echo x | role_no s3 cp - s3://acme-artifacts/internal/klcheck.txt'
+      check "deleting from releases/ is refused" 'role_no s3 rm s3://acme-artifacts/releases/klcheck-canary.txt'
+      check "listing acme-secrets is refused" 'role_no s3 ls s3://acme-secrets/'
+      check "reading acme-secrets is refused" 'role_no s3 cp s3://acme-secrets/key.txt -'
+    else
+      fail "the role's permissions can't be tested until it can be assumed"
+    fi
+  solve: |
+    cd /lab
+    cat > trust.json <<'EOF'
+    {"Version":"2012-10-17","Statement":[{"Effect":"Allow","Principal":{"AWS":"arn:aws:iam::123456789012:user/ci-deployer"},"Action":"sts:AssumeRole"}]}
+    EOF
+    aws iam update-assume-role-policy --role-name release-role --policy-document file:///lab/trust.json
+
+    cat > inline.json <<'EOF'
+    {"Version":"2012-10-17","Statement":[
+     {"Sid":"ListArtifacts","Effect":"Allow","Action":"s3:ListBucket","Resource":"arn:aws:s3:::acme-artifacts"},
+     {"Sid":"Publish","Effect":"Allow","Action":"s3:PutObject","Resource":"arn:aws:s3:::acme-artifacts/releases/*"}
+    ]}
+    EOF
+    aws iam put-role-policy --role-name release-role --policy-name release-access --policy-document file:///lab/inline.json
+
+    cat > read.json <<'EOF'
+    {"Version":"2012-10-17","Statement":[{"Sid":"Read","Effect":"Allow","Action":"s3:GetObject","Resource":"arn:aws:s3:::acme-artifacts/releases/*"}]}
+    EOF
+    ARN=$(aws iam list-policies --scope Local --query "Policies[?PolicyName=='release-read'].Arn" --output text)
+    aws iam create-policy-version --policy-arn "$ARN" --policy-document file:///lab/read.json --set-as-default
+
+    eval "$(aws --profile ci-deployer sts assume-role --role-arn arn:aws:iam::123456789012:role/release-role --role-session-name deploy \
+      --query 'Credentials.[AccessKeyId,SecretAccessKey,SessionToken]' --output text \
+      | awk '{print "export AWS_ACCESS_KEY_ID="$1" AWS_SECRET_ACCESS_KEY="$2" AWS_SESSION_TOKEN="$3}')"
+    aws sts get-caller-identity --query Arn --output text > role-identity.txt
+
+- id: cloud-050
+  title: Cut a policy down to what the app really calls
+  difficulty: 4
+  kind: build
+  tags: [aws, iam, s3, least-privilege]
+  tutorial: |
+    **Concept.** The usual way a service ends up with `s3:*` is that nobody knew exactly what it
+    calls. The way out is the same on any cloud: record what the workload really does, translate
+    those calls into permissions, grant exactly that, then prove the excess is gone.
+
+    *From a call to a permission.* A call log records **operations** on **resources**. An IAM
+    statement names **actions** and **resources**, and the mapping isn't always word for word.
+    Listing with `ListObjectsV2` needs `s3:ListBucket`, a `HeadObject` needs `s3:GetObject`, and
+    writes to a key need a permission on that key, not on the bucket. Several operations collapse
+    into the same action, so a long log can become a short policy.
+
+    *Scope each action separately.* Grant each action to only the resources it was used on. It's
+    common for an application to read from one place and write to another, or to delete only what
+    it has consumed. A single statement with every action on every path gives back what you just
+    took away. A specific object can be named in full, with no wildcard.
+
+    *Test the negative space.* A policy is correct when the needed calls work **and** the calls
+    you meant to remove are refused. Try the second kind deliberately, as the service's user.
+
+    **Read up on:**
+    - `aws iam put-user-policy help`
+    - The AWS service authorization reference for S3
+    - IAM docs, "Security best practices in IAM" — apply least-privilege permissions
+  scenario: |
+    The `aws` command talks to a local emulator with IAM enforced, and runs as the account
+    administrator. `aws --profile media-worker ...` runs as a media-processing service user. Its
+    inline policy **`media-worker-access`** currently grants `s3:*` on `*`, because nobody knew
+    what it needed.
+
+    Now someone does: **`/lab/calls.log`** records a week of everything the worker called.
+
+    ## Part 1: Translate the log
+
+    Write to **`/lab/actions.txt`** the IAM actions the worker needs, one per line, as they
+    are spelled in a policy (like `s3:Example`), with no duplicates.
+
+    ## Part 2: Grant what the log shows
+
+    Replace `media-worker-access` with a policy that scopes every action to the resources the
+    log shows it being used on. Each logged kind of call must still work.
+
+    ## Part 3: Refuse everything else
+
+    Calls the log doesn't show must be refused. In particular `media-worker` must be refused:
+
+    - listing the account's buckets, and listing `acme-config` or `acme-billing`
+    - reading from `processed/` in `acme-media`, and any file in `acme-config` other than the one logged
+    - uploading to `incoming/` in `acme-media`, or to `acme-config`
+    - deleting under `processed/` in `acme-media`
+    - reading from `acme-billing`
+  hints:
+    - "Part 1: which IAM action do `ListObjectsV2` and `HeadObject` use? Remember several operations can share one action."
+    - "Part 2: write a statement per action with its own resource list."
+    - "Part 2: the file in `acme-config` can be named exactly, without a wildcard."
+    - "Part 3: try each refused call yourself with `--profile media-worker` before running the check."
+  solution: |
+    The log contains `ListObjectsV2` (bucket `acme-media`), `HeadObject` and `GetObject` (keys
+    under `incoming/` in `acme-media` and the single `acme-config/settings.json`), `PutObject`
+    (under `processed/`), and `DeleteObject` (under `incoming/`).
+
+    ```bash
+    cd /lab
+    printf '%s\n' s3:DeleteObject s3:GetObject s3:ListBucket s3:PutObject > actions.txt
+    cat > policy.json <<'EOF'
+    {"Version":"2012-10-17","Statement":[
+     {"Sid":"ListMedia","Effect":"Allow","Action":"s3:ListBucket","Resource":"arn:aws:s3:::acme-media"},
+     {"Sid":"ReadInputs","Effect":"Allow","Action":"s3:GetObject","Resource":["arn:aws:s3:::acme-media/incoming/*","arn:aws:s3:::acme-config/settings.json"]},
+     {"Sid":"WriteOutput","Effect":"Allow","Action":"s3:PutObject","Resource":"arn:aws:s3:::acme-media/processed/*"},
+     {"Sid":"ConsumeInputs","Effect":"Allow","Action":"s3:DeleteObject","Resource":"arn:aws:s3:::acme-media/incoming/*"}
+    ]}
+    EOF
+    aws iam put-user-policy --user-name media-worker --policy-name media-worker-access --policy-document file:///lab/policy.json
+    ```
+  setup: |
+    moto_start_iam
+    moto_user media-worker
+    for b in acme-media acme-config acme-billing; do aws s3 mb "s3://$b" >/dev/null; done
+    for o in acme-media/incoming/clip-0412.mp4 acme-media/incoming/clip-0413.mp4 acme-media/processed/clip-0099.mp4 acme-media/processed/do-not-delete.mp4 acme-config/settings.json acme-config/secrets.json acme-billing/invoice.pdf; do
+      echo media | aws s3 cp - "s3://$o" >/dev/null
+    done
+    aws iam put-user-policy --user-name media-worker --policy-name media-worker-access --policy-document '{"Version":"2012-10-17","Statement":[{"Effect":"Allow","Action":"s3:*","Resource":"*"}]}'
+    lab_file /lab/calls.log <<'LOG'
+    2026-11-02T01:00:01Z ListObjectsV2 acme-media prefix=incoming/
+    2026-11-02T01:00:02Z HeadObject    acme-media incoming/clip-0412.mp4
+    2026-11-02T01:00:02Z GetObject     acme-media incoming/clip-0412.mp4
+    2026-11-02T01:00:03Z GetObject     acme-config settings.json
+    2026-11-02T01:00:40Z PutObject     acme-media processed/clip-0412.mp4
+    2026-11-02T01:00:41Z DeleteObject  acme-media incoming/clip-0412.mp4
+    2026-11-02T01:05:01Z ListObjectsV2 acme-media prefix=incoming/
+    2026-11-02T01:05:02Z HeadObject    acme-media incoming/clip-0413.mp4
+    2026-11-02T01:05:02Z GetObject     acme-media incoming/clip-0413.mp4
+    2026-11-02T01:05:03Z GetObject     acme-config settings.json
+    2026-11-02T01:05:44Z PutObject     acme-media processed/clip-0413.mp4
+    2026-11-02T01:05:45Z DeleteObject  acme-media incoming/clip-0413.mp4
+    LOG
+    chown -R "$(lab_user)": /lab
+  check: |
+    mw() { aws --profile media-worker "$@"; }
+    no() { moto_denied media-worker "$@"; }
+
+    info "Part 1: Translate the log"
+    check_eq "actions.txt lists the needed actions" "$(tr -d ' \r' </lab/actions.txt 2>/dev/null | grep -v '^$' | sort -u | tr '\n' ' ')" "s3:DeleteObject s3:GetObject s3:ListBucket s3:PutObject "
+
+    info "Part 2: Grant what the log shows"
+    echo canary | aws s3 cp - s3://acme-media/incoming/klcheck-consume.mp4 >/dev/null 2>&1
+    check "the worker can list acme-media" 'mw s3 ls s3://acme-media/incoming/'
+    check "the worker can read from incoming/" 'mw s3 cp s3://acme-media/incoming/clip-0412.mp4 - | grep -q media'
+    check "the worker can read settings.json" 'mw s3 cp s3://acme-config/settings.json - | grep -q media'
+    check "the worker can write under processed/" 'echo out | mw s3 cp - s3://acme-media/processed/klcheck.mp4'
+    check "the worker can delete from incoming/" 'mw s3 rm s3://acme-media/incoming/klcheck-consume.mp4'
+
+    info "Part 3: Refuse everything else"
+    check "listing the account's buckets is refused" 'no s3 ls'
+    check "listing acme-config is refused" 'no s3 ls s3://acme-config/'
+    check "listing acme-billing is refused" 'no s3 ls s3://acme-billing/'
+    check "reading from processed/ is refused" 'no s3 cp s3://acme-media/processed/clip-0099.mp4 -'
+    check "reading other acme-config files is refused" 'no s3 cp s3://acme-config/secrets.json -'
+    check "reading from acme-billing is refused" 'no s3 cp s3://acme-billing/invoice.pdf -'
+    check "uploading to incoming/ is refused" 'echo x | no s3 cp - s3://acme-media/incoming/klcheck.mp4'
+    check "uploading to acme-config is refused" 'echo x | no s3 cp - s3://acme-config/klcheck.txt'
+    check "deleting under processed/ is refused" 'no s3 rm s3://acme-media/processed/do-not-delete.mp4'
+  solve: |
+    cd /lab
+    printf '%s\n' s3:DeleteObject s3:GetObject s3:ListBucket s3:PutObject > actions.txt
+    cat > policy.json <<'EOF'
+    {"Version":"2012-10-17","Statement":[
+     {"Sid":"ListMedia","Effect":"Allow","Action":"s3:ListBucket","Resource":"arn:aws:s3:::acme-media"},
+     {"Sid":"ReadInputs","Effect":"Allow","Action":"s3:GetObject","Resource":["arn:aws:s3:::acme-media/incoming/*","arn:aws:s3:::acme-config/settings.json"]},
+     {"Sid":"WriteOutput","Effect":"Allow","Action":"s3:PutObject","Resource":"arn:aws:s3:::acme-media/processed/*"},
+     {"Sid":"ConsumeInputs","Effect":"Allow","Action":"s3:DeleteObject","Resource":"arn:aws:s3:::acme-media/incoming/*"}
+    ]}
+    EOF
+    aws iam put-user-policy --user-name media-worker --policy-name media-worker-access --policy-document file:///lab/policy.json

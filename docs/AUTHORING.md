@@ -77,9 +77,12 @@ control plane, `KUBECONFIG` is `/etc/kubernetes/admin.conf`; the lab user has it
 | `frr_conf R <<EOF`, `frr_json R 'show ...'`, `frr_route R PREFIX`, `frr_ping NODE ADDR` | configure a router, read its state, test reachability |
 | `frr_gw6 HOST GW`, `frr_route6 R PREFIX`, `frr_ping6 NODE ADDR` | the IPv6 versions |
 | `moto_start` | run the AWS emulator and install an `aws` command that uses it (sees only `/lab`) |
+| `moto_start_iam`, `moto_user NAME...`, `moto_denied PROFILE ARGS...` | the emulator with IAM enforced: `aws` is the administrator and `aws --profile NAME` another user; true only if IAM refused the call |
 | `ds_start` | install `dspy`, which runs Python with pandas and scikit-learn in `/lab` |
 | `go_test <<'GO'` | run a hidden Go test file against the learner's `/lab/*.go` |
 | `pg_start`, `pg_sql 'SQL'` | PostgreSQL in container `kl-pg`, and run SQL from a script |
+| `kr_up`, `kr_guard_calico`, `kr_conf <<EOF`, `kr_json 'show ...'`, `kr_ip`, `kr_nodes` | an FRR router outside the pod network, Pod `router` in `edge`, reachable from both k8s nodes; `kr_guard_calico` restores Calico's BGP settings on reset |
+| `kr_estab IP`, `kr_hops PREFIX`, `kr_wget URL`, `kr_x CMD...` | read a BGP session, the next hops of a route, fetch a URL from the router, run a command in it |
 
 ## Offensive-security exercises (`profile: offsec`)
 

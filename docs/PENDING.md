@@ -3,25 +3,25 @@
 Ideas for future labs. Each topic has one home; where tracks touch, the row says which
 track it relies on.
 
-**Depth over count.** There is no exercise target for any topic. A lab should carry a real
-multi-step scenario and teach a concept, and a smaller catalog after merging thin exercises
-is a good outcome. The parts of this list that the existing exercises don't cover are not
-started.
+**Target: 250 labs in each of the ten tracks, 2,500 in total.** Once tracks reach it, review
+what to consolidate. The target doesn't lower the bar: a lab should carry a real multi-step
+scenario and teach a concept. The parts of this list that the existing exercises don't cover
+are not started.
 
-Exercise counts as of v0.10.0:
+Exercise counts as of v0.11.0:
 
-| Topic | Exercises | Track | Module files |
-|---|---|---|---|
-| Docker | 149 | `docker` | `exercises/docker/` |
-| Kubernetes | 231 | `kubernetes` | `exercises/kubernetes/` |
-| Offensive security | 45 | `offsec` | `exercises/offsec/` |
-| Linux & systems | 30 | `linux` | `exercises/linux/` |
-| Networking | 42 | `networking` | `exercises/networking/` |
-| Cloud & platform | 42 | `cloud` | `exercises/cloud/` |
-| Data | 27 | `data` | `exercises/data/` |
-| Defensive security | 30 | `defensive` | `exercises/defensive/` |
-| Programming | 45 | `programming` | `exercises/programming/` |
-| Data science | 43 | `datascience` | `exercises/datascience/` |
+| Topic | Exercises | Target | Track | Module files |
+|---|---|---|---|---|
+| Docker | 149 | 250 | `docker` | `exercises/docker/` |
+| Kubernetes | 234 | 250 | `kubernetes` | `exercises/kubernetes/` |
+| Offensive security | 45 | 250 | `offsec` | `exercises/offsec/` |
+| Linux & systems | 34 | 250 | `linux` | `exercises/linux/` |
+| Networking | 42 | 250 | `networking` | `exercises/networking/` |
+| Cloud & platform | 47 | 250 | `cloud` | `exercises/cloud/` |
+| Data | 27 | 250 | `data` | `exercises/data/` |
+| Defensive security | 30 | 250 | `defensive` | `exercises/defensive/` |
+| Programming | 45 | 250 | `programming` | `exercises/programming/` |
+| Data science | 43 | 250 | `datascience` | `exercises/datascience/` |
 
 - [Suggested order](#suggested-order)
 - [Shared lab foundations](#shared-lab-foundations)
@@ -33,6 +33,7 @@ Exercise counts as of v0.10.0:
 - [Programming](#programming)
 - [Practice modes](#practice-modes)
 - [awesome_labs features](#awesome_labs-features)
+- [More lab ideas](#more-lab-ideas)
 - [Left out for now](#left-out-for-now)
 
 ## Suggested order
@@ -97,7 +98,7 @@ For Networking, Degraded networks, VPN creation and DNS & email.
 |---|---|---|
 | **Linux admin & troubleshooting** | systemd units, full disks and inodes, LVM, permissions and ACLs, runaway processes | Docker VM; cheapest to build |
 | **Shell & text processing** | Bash scripting, `awk`, `sed`, `jq`, log parsing, fixing buggy scripts | Any VM; very easy to check |
-| **Git** | Merge and rebase conflicts, recovering lost commits with reflog, bisect, hooks, cleaning secrets out of history | Any VM; very easy to check |
+| **Git** | Done in `exercises/linux/06-git.yaml`: merge and rebase conflicts, recovering lost work, hooks, cleaning secrets out of history; `bisect` in `linux-015` | Any VM; very easy to check |
 | **Performance debugging** | `strace`, `perf`, `bpftrace`, memory leaks, I/O bottlenecks, CPU throttling | Docker VM; checks are harder to write |
 | **Container internals** | Namespaces and cgroups by hand, building a container from scratch, `runc`, `ctr` and `crictl`, overlayfs | Docker VM or k8s nodes |
 | **QEMU & virtualization** | See below | Docker VM or a dedicated VM; needs nested KVM |
@@ -150,7 +151,7 @@ Rescue is the most valuable module: it breaks a throwaway guest and not the lab 
 | **BGP** | Done in `06-dynamic-routing.yaml`: peering, route filters, communities, path selection, route leaks |
 | **High availability** | VRRP (FRR's `vrrpd`) and ECMP done in `06-dynamic-routing.yaml`; anycast in `net-035` |
 | **Packet analysis** | `tcpdump` and `tshark`, the TCP handshake, MTU problems, finding faults from captures |
-| **Kubernetes** | Peer Calico with an FRR router over BGP, MetalLB in BGP mode, trace a packet from pod to outside |
+| **Kubernetes** | Done in `exercises/kubernetes/19-bgp-and-external-routing.yaml`: peer Calico with an FRR router over BGP, MetalLB in BGP mode, trace a packet from pod to outside |
 
 - **Router software:** FRR is open source and its CLI is close to Cisco's, so no licensed
   vendor images are needed.
@@ -331,6 +332,114 @@ New ways to use exercises, most of them reusing existing content.
   data is already recorded.
 - **Exercise packs:** install extra exercises from a Git repo, building on the existing
   `AWESOME_LABS_EXERCISES` setting.
+
+## More lab ideas
+
+Not started. All should fit the existing VMs unless noted. The first table is the suggested
+starting point.
+
+| Idea | The lab | Builds on |
+|---|---|---|
+| **OpenTofu against Moto** | Fix state drift, import hand-made resources, recover a broken plan | The AWS emulator |
+| **VXLAN and EVPN fabric** | Leaf-spine on FRR with a stretched Layer 2 network, then debug a missing VNI | The FRR helpers |
+| **Prometheus and alerting** | Write the rule that would have caught an outage, fix an alert that never fires | Docker or k8s lab |
+| **eBPF with bpftrace** | Find which process touches a file, or what causes latency, without restarting anything | Docker VM |
+| **End-to-end capstones** | Dockerfile to registry to cluster to TLS ingress to metrics, with faults at each step | Docker and k8s labs |
+
+| Area | Ideas |
+|---|---|
+| **Linux and performance** | Flame graphs with `perf`; cgroups v2 by hand, with no container runtime; `mdadm` RAID failure and rebuild on loop devices; systemd sandboxing scored with `systemd-analyze security` |
+| **Data** | Postgres point-in-time recovery after a bad `DELETE`; replication with a lagging replica, a broken slot and a failover; Redis Sentinel split-brain and the writes it loses |
+| **Delivery and Kubernetes** | Broken Helm charts and a failed upgrade to roll back; GitOps drift (Argo CD may be tight on these nodes); killing a node under load while meeting an availability target |
+| **Security** | SSH certificates from a small CA in place of `authorized_keys`; WAF tuning that blocks an attack and not real users; writing a detection from a real attack's logs and proving it catches a variant |
+| **Networking** | BGP hijack, then stopping it with RPKI route validation |
+
+### Useful but niche
+
+Problems that are rare until they ruin your day. The first three are the suggested starting point.
+
+| Idea | The lab |
+|---|---|
+| **Boot repair in a QEMU guest** | Break `initramfs` or `fstab` in the Alpine guest and rescue it from the console |
+| **Conntrack table full** | Packets drop at random, and the only clue is one kernel log line |
+| **Admission webhook outage** | The webhook is down, and now nothing can be created |
+| **Reading AppArmor denials** | A service fails with "permission denied" while the file permissions are fine |
+| **Seccomp profile from `strace`** | Build the smallest profile that lets an app run |
+| **Core dumps with `gdb`** | A crash with no logs: find the failing line from the dump |
+| **Ephemeral port exhaustion** | Connections fail under load with plenty of CPU and memory free |
+| **PMTUD black hole** | Small requests work and large ones hang through a tunnel |
+
+| Area | Ideas |
+|---|---|
+| **Identity and time** | Clock skew breaking TLS, tokens and logs, fixed with `chrony`; a bad PAM change recovered without losing the last root session; local ACME with Pebble and a failed challenge; timezone and DST cron traps |
+| **Kubernetes corners** | A namespace stuck `Terminating` on a finalizer; `ndots:5` DNS storms |
+| **Data and storage** | Redis AOF corruption and what was lost; PgBouncer pool exhaustion with an idle database; NFS root squash and stale file handles; sparse files and `rsync` |
+
+### Packet capture labs
+
+Only `offsec-for-001` and `net-016` use captures today, both at low difficulty, and the defensive
+track has none. Build the defensive set first. `tshark` isn't on the VMs yet, only `tcpdump`:
+add it to provisioning, pinned like the other packages, and fetch it on first use on existing VMs.
+
+| Track | Ideas |
+|---|---|
+| **Defensive** | Reconstruct an intrusion from a capture (timeline, attacker's host, what was taken); find DNS tunnelling and recover the data; find C2 beaconing among normal traffic; carve a dropped payload from an HTTP stream; read TLS metadata (SNI, certificates, handshake) without decrypting |
+| **Offsec** | Sniff plaintext credentials on an isolated lab network; ARP spoofing between namespaces, then the defender's view of it; reverse a custom binary protocol from captures |
+| **Networking** | Diagnose faults from captures: retransmissions, zero windows, RST storms and MTU problems |
+
+### CI/CD pipeline labs
+
+No lab runs a real pipeline today: `docker-120`, `k8s-203`, `k8s-220` and `cloud-049` only use CI
+as the story. Fleshes out the **CI/CD & GitOps** row above. Gitea and a runner look light enough
+for the 3GiB Docker VM, which still needs testing. Argo CD needs a feasibility test first, on
+nodes that already run the cluster.
+
+| Lab | What goes wrong |
+|---|---|
+| **A build that fails only in CI** | It works locally, but the runner has a different environment |
+| **Secrets in pipelines** | One masked in logs, and one leaking through a step that prints it |
+| **Caching and artifacts** | A stale cache serves old code, and a build's output must pass between jobs |
+| **Deploy gates** | Tests must pass before an image reaches the registry |
+| **A compromised pipeline** | A pull request tries to steal a secret, then the fix |
+| **Full delivery** | Commit to image to cluster, with a rollback when the health check fails |
+
+### Object storage labs (MinIO)
+
+The cloud track uses S3 through the Moto emulator, so learners practise the API and never operate
+object storage. MinIO should fit on the Docker VM, not yet tried. **Check first:** MinIO's community
+edition may have lost admin features and changed how it distributes builds. Confirm a version can
+still be pinned and pulled. If not, consider Garage or SeaweedFS, though the commands would differ.
+
+| Lab | What it covers |
+|---|---|
+| **Erasure coding and a failed disk** | Lose drives, keep reading, then heal and prove the data is intact |
+| **Going past the limit** | Lose one drive too many, and see exactly what stops working |
+| **Versioning and accidental deletes** | Recover an object from a delete marker |
+| **Lifecycle rules** | Expire old versions, and debug the rule that matches nothing |
+| **Bucket policies and service accounts** | A real access-denied to debug on a real server |
+| **Replication between two sites** | One site goes down, then resync it |
+| **Presigned URLs and clock skew** | A link that fails because of the time |
+| **Object storage for Kubernetes** | An app or backup job writing to it from the cluster |
+
+### Authentication and authorization labs
+
+Today only basics and token attacks are covered: no OAuth2, OIDC, SSO, Keycloak or LDAP. Keycloak
+is the main tool, because it's the most common self-hosted identity provider. The OIDC concepts
+carry over to Okta, Entra ID and Auth0, which can't run in a lab.
+
+**Tested on the 3GiB Docker VM with Keycloak 26.4.7 in `start-dev`:** ready in about 18s, 475MiB idle
+and about 515MiB after creating a realm, client and user and logging in. Works under an 800MiB
+limit, and is OOM-killed at 500MiB, so give it 800MiB. The image is 684MB, so pre-pull it.
+
+| Lab | What it covers | Tool |
+|---|---|---|
+| **Stand up a realm** | Realm, clients, users and roles | Keycloak |
+| **Protect an app with OIDC** | Put a real web app behind login | Keycloak, oauth2-proxy |
+| **Debug a broken login** | Wrong redirect URI, wrong audience, clock skew, expired token | Keycloak |
+| **401 versus 403** | A valid token that lacks the right role | Keycloak |
+| **Service-to-service auth** | Client credentials and token validation | Keycloak |
+| **LDAP federation** | Connect a directory and fix a failing bind or group mapping | Keycloak, lldap |
+| **Kubernetes OIDC** | Log in to the API server and map groups to RBAC | Dex, because Keycloak is too heavy for the 3GiB and 2.5GiB nodes |
 
 ## Left out for now
 

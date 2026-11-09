@@ -1,0 +1,723 @@
+track: kubernetes
+module: BGP & routing to the outside
+profile: k8s
+order: 19
+exercises:
+
+- id: k8s-331
+  title: Peer the cluster with an edge router over BGP
+  difficulty: 4
+  kind: build
+  tags: [calico, bgp, frr, routing, ippool]
+  tutorial: |
+    **Concept.** Calico routes pod traffic between nodes with **BIRD**, a BGP daemon inside
+    every `calico-node`. Out of the box the nodes peer only with each other (the **node-to-node
+    mesh**); nothing outside the cluster learns where pods live. Adding a **BGPPeer** tells every
+    selected node to open a session to a device outside the cluster, and from then on that device
+    receives the routes the node knows about.
+
+    *What gets announced.* Calico hands each node one or more **IP blocks** (a `/26` by default)
+    out of the IP pool, and those blocks are what BGP carries: a route like
+    `10.244.49.64/26 next-hop <node>`. The Service ranges are announced too, but only when
+    `BGPConfiguration` lists them.
+
+    *Next hops.* A node that passes a route along normally puts itself as the next hop. Each
+    node knows every block, so an external router learns every block from both nodes and, with
+    ECMP, splits traffic between them. A flow can then enter a node that does not host the pod
+    while the reply leaves the node that does: the first node's conntrack sees only half of the
+    TCP handshake and drops the rest. A BGPPeer can instead be told to keep the original next hop, so each
+    block points at the node that really owns it.
+
+    *Going the other way.* BGP is bidirectional: routes the router announces are programmed
+    into the node's kernel by BIRD (`proto bird`). When a pod talks to an address outside the
+    pool, the pool's **`natOutgoing`** decides what happens: on, the node SNATs the pod to its own
+    address; off, the packet leaves with the pod's real address and the outside world must
+    route replies back to it. An extra **IPPool** lets you make that choice per workload rather
+    than cluster-wide.
+
+    There's no `calicoctl` in this cluster. These are ordinary CRDs: always spell the type in
+    full, `bgppeers.crd.projectcalico.org`.
+
+    **Read up on:**
+    - `kubectl explain bgppeers.spec`, `kubectl explain bgpconfigurations.spec` (add
+      `--api-version=crd.projectcalico.org/v1` if the short name is ambiguous)
+    - `kubectl get ippool default-ipv4-ippool -o yaml`, and the pod annotation
+      `cni.projectcalico.org/ipv4pools`
+    - On the router: `show bgp summary`, `show ip bgp`, `show ip route`
+    - `ip route | grep bird` on a node
+    - `traceroute`
+  scenario: |
+    The network team has racked an edge router and given you a BGP session to it. It runs
+    **FRR** as the Pod **`router`** in namespace **`edge`**, wired directly onto the node
+    network. It's outside the cluster's pod network, and its AS and neighbors are already
+    configured. Its address, and your nodes', are in **`/lab/topology.txt`**.
+
+    ```
+    pod ---- node (controlplane, node01) ---- router (FRR, AS 65010)
+                                                |
+                                             198.51.100.1 (a server "on the internet")
+    ```
+
+    Open the router's shell (read-only, please; don't change its configuration):
+
+    ```
+    kubectl -n edge exec -it router -c frr -- vtysh
+    ```
+
+    Namespace **`demo`** runs Deployment `web` with Service `web`, and a test pod `client` on the
+    default pod network.
+
+    ## Part 1: Bring up the sessions
+
+    The router expects this cluster to be **AS 64520**, on both nodes. Set the cluster's AS, and
+    create a **global** peer named **`edge-router`** to the router (AS **65010**). `show bgp summary`
+    on the router must show both nodes `Established`.
+
+    ## Part 2: Announce pods with honest next hops
+
+    The router must learn every pod block, each with **a single next hop: the node that owns
+    that block**. The router itself must be able to reach a `web` pod's address directly.
+
+    ## Part 3: Make Services reachable
+
+    The router must learn the Service range **`10.96.0.0/12`** from **both** nodes, with ECMP, and
+    must get an answer from the `web` Service's ClusterIP. Don't remove any other setting of the
+    `BGPConfiguration`.
+
+    ## Part 4: Trace a pod to the outside
+
+    The address `198.51.100.1`, on the router, answers HTTP on port 80 with what it saw as the
+    client's address.
+
+    1. Create an **IPPool** named **`edge-pool`**, CIDR **`10.245.0.0/24`**, block size **26**,
+       IPIP **Always**, and **no SNAT** for traffic leaving the pool. Leave the default pool as it is.
+    2. Run a **`busybox:1.37`** pod named **`tracer`** in `demo`, that sleeps, and that takes its address
+       from `edge-pool`.
+    3. `tracer` must reach `http://198.51.100.1/` and be seen there with **its own pod address**,
+       while `client` keeps being seen as its node's address.
+    4. Trace the route from `tracer` to `198.51.100.1` and write the addresses of the hops, one per
+       line and in order, to **`/lab/trace.txt`**.
+  hints:
+  - 'Part 1: `kubectl patch bgpconfigurations.crd.projectcalico.org default --type=merge -p ...` sets the AS without touching other fields. A global peer is a `BGPPeer` with `peerIP` and `asNumber` and no `node` or `nodeSelector`.'
+  - 'Part 1: `kubectl explain bgppeers.spec --api-version=crd.projectcalico.org/v1` lists the fields. `show bgp summary` on the router shows why a session is down.'
+  - 'Part 2: `show ip route 10.244.0.0/16 longer-prefixes` on the router shows two next hops for each block. `kubectl explain` the peer: there is a field that makes the node keep the original next hop.'
+  - 'Part 3: `serviceClusterIPs` on the BGPConfiguration is a list of `{cidr: ...}` objects.'
+  - 'Part 4: annotate the pod with `cni.projectcalico.org/ipv4pools: ''["edge-pool"]''`. `kubectl -n demo exec tracer -- wget -qO- http://198.51.100.1/` shows the `RemoteAddr` the server saw. `busybox` has `traceroute`.'
+  solution: |
+    ```bash
+    R=$(awk '/^router/ {print $2}' /lab/topology.txt)
+
+    kubectl patch bgpconfigurations.crd.projectcalico.org default --type=merge \
+      -p '{"spec":{"asNumber":64520,"serviceClusterIPs":[{"cidr":"10.96.0.0/12"}]}}'
+
+    kubectl apply -f - <<EOF
+    apiVersion: crd.projectcalico.org/v1
+    kind: BGPPeer
+    metadata:
+      name: edge-router
+    spec:
+      peerIP: $R
+      asNumber: 65010
+      nextHopMode: Keep
+    EOF
+
+    kubectl apply -f - <<EOF
+    apiVersion: crd.projectcalico.org/v1
+    kind: IPPool
+    metadata:
+      name: edge-pool
+    spec:
+      cidr: 10.245.0.0/24
+      blockSize: 26
+      ipipMode: Always
+      vxlanMode: Never
+      natOutgoing: false
+      nodeSelector: all()
+    EOF
+
+    kubectl -n demo apply -f - <<EOF
+    apiVersion: v1
+    kind: Pod
+    metadata:
+      name: tracer
+      annotations:
+        cni.projectcalico.org/ipv4pools: '["edge-pool"]'
+    spec:
+      containers:
+      - name: tracer
+        image: busybox:1.37
+        command: ["sleep", "3600"]
+    EOF
+
+    # after the pod is Ready, on the router: show ip route, show bgp summary
+    kubectl -n demo exec tracer -- wget -qO- http://198.51.100.1/ | grep RemoteAddr
+    kubectl -n demo exec tracer -- traceroute -n -m 5 -w 2 198.51.100.1 | awk 'NR>1 {print $2}' > /lab/trace.txt
+    ```
+  setup: |
+    kr_up
+    kr_guard_calico
+    CP=$(kr_nodes | sed -n 1p); W=$(kr_nodes | sed -n 2p); R=$(kr_ip)
+    kr_conf <<EOF
+    router bgp 65010
+     bgp router-id $R
+     no bgp ebgp-requires-policy
+     no bgp network import-check
+     neighbor $CP remote-as 64520
+     neighbor $W remote-as 64520
+     address-family ipv4 unicast
+      network 198.51.100.0/24
+      maximum-paths 8
+     exit-address-family
+    EOF
+    lab_file /lab/topology.txt <<EOF
+    router $R
+    router-as 65010
+    controlplane $CP
+    node01 $W
+    EOF
+    k_ns demo
+    kubectl -n demo create deployment web --image=traefik/whoami:v1.10 --replicas=2 >/dev/null
+    kubectl -n demo expose deployment web --port=80 >/dev/null
+    kubectl -n demo run client --image=busybox:1.37 --restart=Never --command -- sleep 3600 >/dev/null
+    wait_deploy demo web 120
+    wait_pod demo client 90
+  check: |
+    CP=$(kr_nodes | sed -n 1p); W=$(kr_nodes | sed -n 2p); R=$(kr_ip)
+    PEER=bgppeers.crd.projectcalico.org
+    BOTH=$(printf '%s\n' "$CP" "$W" | LC_ALL=C sort | paste -sd,)
+
+    info "Part 1: Bring up the sessions"
+    check_eq "the cluster is AS 64520" "$(kj bgpconfigurations.crd.projectcalico.org default '{.spec.asNumber}')" 64520
+    check_eq "BGPPeer edge-router peers with the router" "$(kj $PEER edge-router '{.spec.peerIP}')" "$R"
+    check_eq "BGPPeer edge-router expects AS 65010" "$(kj $PEER edge-router '{.spec.asNumber}')" 65010
+    check "the peer is global" 'k_exists $PEER edge-router && [ -z "$(kj $PEER edge-router "{.spec.node}{.spec.nodeSelector}")" ]'
+    if k_exists $PEER edge-router; then
+      eventually 40 'kr_estab "$CP" && kr_estab "$W"' || true
+    fi
+    check "controlplane's session to the router is Established" 'kr_estab "$CP"'
+    check "node01's session to the router is Established" 'kr_estab "$W"'
+
+    info "Part 2: Announce pods with honest next hops"
+    BLOCKS=$(kubectl get blockaffinities.crd.projectcalico.org -o json | jq -r '.items[] | select(.spec.state=="confirmed") | select(.spec.cidr | startswith("10.244.")) | "\(.spec.cidr) \(.spec.node)"')
+    ip_of() { [ "$1" = controlplane ] && echo "$CP" || echo "$W"; }
+    hops_ok() {
+      local c n
+      while read -r c n; do
+        [ "$(kr_hops "$c")" = "$(ip_of "$n")" ] || return 1
+      done <<<"$BLOCKS"
+    }
+    if kr_estab "$CP" && kr_estab "$W"; then
+      eventually 25 hops_ok || true
+    fi
+    check "every pod block has its owner as the only next hop" 'hops_ok'
+    POD=$(kj -n demo pod -l app=web '{.items[0].status.podIP}')
+    check_match "the router reaches a web pod" "$(kr_wget "http://$POD/" | grep Hostname)" 'Hostname: web-'
+
+    info "Part 3: Make Services reachable"
+    CIP=$(kj -n demo svc web '{.spec.clusterIP}')
+    if kr_estab "$CP"; then
+      eventually 25 '[ "$(kr_hops 10.96.0.0/12)" = "$BOTH" ]' || true
+    fi
+    check_eq "10.96.0.0/12 reaches the router from both nodes" "$(kr_hops 10.96.0.0/12)" "$BOTH"
+    check_match "the router reaches the web Service" "$(kr_wget "http://$CIP/" | grep Hostname)" 'Hostname: web-'
+    check_eq "other BGP settings survive" "$(kj bgpconfigurations.crd.projectcalico.org default '{.spec.programClusterRoutes}')" EnabledNoEncapOnly
+
+    info "Part 4: Trace a pod to the outside"
+    P=ippools.crd.projectcalico.org
+    check_eq "edge-pool CIDR" "$(kj $P edge-pool '{.spec.cidr}')" 10.245.0.0/24
+    check_eq "edge-pool block size" "$(kj $P edge-pool '{.spec.blockSize}')" 26
+    check_eq "edge-pool uses IPIP Always" "$(kj $P edge-pool '{.spec.ipipMode}')" Always
+    check_eq "edge-pool does not SNAT" "$(kj $P edge-pool '{.spec.natOutgoing}')" false
+    check_eq "the default pool still SNATs" "$(kj $P default-ipv4-ippool '{.spec.natOutgoing}')" true
+    TIP=
+    if k_exists -n demo pod tracer && wait_pod demo tracer 90; then
+      TIP=$(kj -n demo pod tracer '{.status.podIP}')
+    fi
+    check_match "tracer has an edge-pool address" "$TIP" '^10\.245\.0\.'
+    check_eq "tracer runs busybox:1.37" "$(kj -n demo pod tracer '{.spec.containers[0].image}')" busybox:1.37
+    seen() { kubectl -n demo exec "$1" -- wget -qO- -T 3 http://198.51.100.1/ 2>/dev/null | sed -n 's/^RemoteAddr: \([^:]*\):.*/\1/p'; }
+    if [ -n "$TIP" ] && kr_estab "$CP"; then
+      eventually 30 '[ "$(seen tracer)" = "$TIP" ]' || true
+    fi
+    if [ -n "$TIP" ]; then
+      check_eq "the router sees tracer's pod address" "$(seen tracer)" "$TIP"
+    else
+      check "the router sees tracer's pod address" 'false'
+    fi
+    CNODE=$(kj -n demo pod client '{.spec.nodeName}')
+    check_eq "the router sees client as its node" "$(seen client)" "$(ip_of "$CNODE")"
+    if [ -n "$TIP" ]; then
+      TNODE=$(kj -n demo pod tracer '{.spec.nodeName}')
+      HOPS=$(kubectl -n demo exec tracer -- traceroute -n -m 5 -w 2 198.51.100.1 2>/dev/null | awk 'NR>1 {print $2}')
+      FILE=$(grep -E '^[0-9]' /lab/trace.txt 2>/dev/null)
+      check_eq "the first hop is tracer's node" "$(sed -n 1p <<<"$HOPS")" "$(ip_of "$TNODE")"
+      check_eq "the last hop is the router" "$(tail -1 <<<"$HOPS")" 198.51.100.1
+      check_eq "/lab/trace.txt lists the same hops" "$FILE" "$HOPS"
+    else
+      check "/lab/trace.txt lists the same hops" 'false'
+    fi
+  solve: |
+    R=$(awk '/^router / {print $2}' /lab/topology.txt)
+    kubectl patch bgpconfigurations.crd.projectcalico.org default --type=merge \
+      -p '{"spec":{"asNumber":64520,"serviceClusterIPs":[{"cidr":"10.96.0.0/12"}]}}'
+    kubectl apply -f - <<EOF
+    apiVersion: crd.projectcalico.org/v1
+    kind: BGPPeer
+    metadata: {name: edge-router}
+    spec: {peerIP: $R, asNumber: 65010, nextHopMode: Keep}
+    EOF
+    kubectl apply -f - <<EOF
+    apiVersion: crd.projectcalico.org/v1
+    kind: IPPool
+    metadata: {name: edge-pool}
+    spec: {cidr: 10.245.0.0/24, blockSize: 26, ipipMode: Always, vxlanMode: Never, natOutgoing: false, nodeSelector: all()}
+    EOF
+    kubectl -n demo apply -f - <<EOF
+    apiVersion: v1
+    kind: Pod
+    metadata:
+      name: tracer
+      annotations:
+        cni.projectcalico.org/ipv4pools: '["edge-pool"]'
+    spec:
+      containers:
+      - {name: tracer, image: "busybox:1.37", command: ["sleep", "3600"]}
+    EOF
+    kubectl -n demo wait --for=condition=Ready pod/tracer --timeout=120s
+    for i in $(seq 40); do
+      kubectl -n demo exec tracer -- wget -qO- -T 2 http://198.51.100.1/ >/dev/null 2>&1 && break
+      sleep 2
+    done
+    kubectl -n demo exec tracer -- traceroute -n -m 5 -w 2 198.51.100.1 2>/dev/null | awk 'NR>1 {print $2}' > /lab/trace.txt
+
+- id: k8s-332
+  title: The router lost the cluster
+  difficulty: 4
+  kind: fix
+  tags: [calico, bgp, frr, troubleshooting]
+  tutorial: |
+    **Concept.** A BGP failure at the edge is usually one of a few things, and each one has a
+    different signature on the router.
+
+    - A session that won't come up shows `Active`, `Idle` or `Connect` in `show bgp summary`. A
+      peering is two-sided: each side declares the other's AS, and a mismatch tears the session
+      down right after the `OPEN`. Check what each side *really* says with `show bgp neighbors`.
+    - If a session comes up for some nodes and not others, look at what selects the nodes that
+      peer: Calico's `BGPPeer.spec.node` and `spec.nodeSelector`.
+    - A session that's up but carries nothing is a filtering question. `PfxRcd` of `0`, or a route
+      that's merely absent, points at a policy. Calico's **BGPFilter** applies import and export
+      rules to the peers that reference it.
+    - A prefix that's present but wrong is an announcement question: what did you ask the
+      cluster to announce? A Service range is only announced when listed in `BGPConfiguration`,
+      and it has to be the cluster's actual Service CIDR.
+
+    Work from the outside in: read the router first, then find the Kubernetes object that
+    explains what it's seeing.
+
+    **Read up on:**
+    - `show bgp summary`, `show bgp neighbors <ip>`, `show ip bgp` on the router
+    - `kubectl get bgppeers.crd.projectcalico.org,bgpfilters.crd.projectcalico.org -o yaml`
+    - `kubectl get bgpconfigurations.crd.projectcalico.org default -o yaml`
+    - `kubectl get cm -n kube-system kubeadm-config -o yaml` for the Service CIDR
+    - `kubectl -n kube-system logs ds/calico-node -c calico-node | grep -i bgp`, and
+      `kubectl -n kube-system exec ds/calico-node -c calico-node -- birdcl -s /var/run/calico/bird.ctl show protocols`
+  scenario: |
+    Yesterday someone "tidied up" the BGP configuration between this cluster and the edge
+    router. It worked before. Now nothing outside the cluster can reach pods or Services.
+
+    The router is FRR, Pod **`router`** in namespace **`edge`**, AS **65010**, and it's been left
+    exactly as the network team set it up; don't change its configuration. It expects the cluster
+    to be **AS 64520**. Addresses are in **`/lab/topology.txt`**. Open its shell with:
+
+    ```
+    kubectl -n edge exec -it router -c frr -- vtysh
+    ```
+
+    Namespace **`shop`** runs Deployment `web` with Service `web`.
+
+    Keep the peer named **`edge-router`** (you may edit it). Fix the cluster's BGP objects so
+    that:
+
+    ## Part 1: Sessions are up
+
+    Both `controlplane` and `node01` have an `Established` session to the router.
+
+    ## Part 2: Pods are reachable
+
+    The router learns every pod block with the owning node as next hop, and can reach a `web`
+    pod's address directly.
+
+    ## Part 3: Services are reachable
+
+    The router learns the cluster's real Service range from both nodes, nothing else from
+    `serviceClusterIPs`, and gets an answer from the `web` Service's ClusterIP.
+  hints:
+  - 'Part 1: run `show bgp summary` and `show bgp neighbors` on the router, then read `kubectl get bgppeers.crd.projectcalico.org edge-router -o yaml`. Compare the AS it expects with the router''s real AS.'
+  - 'Part 1: one node has no session at all. Which field decides the nodes this peer applies to?'
+  - 'Part 2: with the sessions up, the router still has no `10.244.x.x` routes. `kubectl get bgpfilters.crd.projectcalico.org -o yaml`, and see which filter the peer references.'
+  - 'Part 3: `kubectl get cm -n kube-system kubeadm-config -o jsonpath=''{.data.ClusterConfiguration}'' | grep -i subnet`. Compare it to `serviceClusterIPs` in the BGPConfiguration.'
+  solution: |
+    Sessions: the peer states the wrong AS (65001 vs. the router's 65010), and `nodeSelector`
+    limits it to `controlplane` so `node01` doesn't peer at all:
+
+    ```bash
+    kubectl patch bgppeers.crd.projectcalico.org edge-router --type=json -p \
+      '[{"op":"replace","path":"/spec/asNumber","value":65010},
+        {"op":"remove","path":"/spec/nodeSelector"}]'
+    ```
+
+    Pods: the BGPFilter `edge-export` rejects the pod CIDR on the way out, so the peer stops
+    announcing it. Remove the reference:
+
+    ```bash
+    kubectl patch bgppeers.crd.projectcalico.org edge-router --type=json -p \
+      '[{"op":"remove","path":"/spec/filters"}]'
+    ```
+
+    Services: the BGPConfiguration lists the wrong range:
+
+    ```bash
+    kubectl patch bgpconfigurations.crd.projectcalico.org default --type=merge \
+      -p '{"spec":{"serviceClusterIPs":[{"cidr":"10.96.0.0/12"}]}}'
+    ```
+  setup: |
+    kr_up
+    kr_guard_calico
+    CP=$(kr_nodes | sed -n 1p); W=$(kr_nodes | sed -n 2p); R=$(kr_ip)
+    kr_conf <<EOF
+    router bgp 65010
+     bgp router-id $R
+     no bgp ebgp-requires-policy
+     no bgp network import-check
+     neighbor $CP remote-as 64520
+     neighbor $W remote-as 64520
+     address-family ipv4 unicast
+      network 198.51.100.0/24
+      maximum-paths 8
+     exit-address-family
+    EOF
+    lab_file /lab/topology.txt <<EOF
+    router $R
+    router-as 65010
+    controlplane $CP
+    node01 $W
+    EOF
+    k_ns shop
+    kubectl -n shop create deployment web --image=traefik/whoami:v1.10 --replicas=2 >/dev/null
+    kubectl -n shop expose deployment web --port=80 >/dev/null
+    wait_deploy shop web 120
+    kubectl patch bgpconfigurations.crd.projectcalico.org default --type=merge \
+      -p '{"spec":{"asNumber":64520,"serviceClusterIPs":[{"cidr":"10.200.0.0/16"}]}}' >/dev/null
+    kapply <<EOF
+    apiVersion: crd.projectcalico.org/v1
+    kind: BGPFilter
+    metadata: {name: edge-export}
+    spec:
+      exportV4:
+      - {action: Reject, cidr: 10.244.0.0/16, matchOperator: In}
+    ---
+    apiVersion: crd.projectcalico.org/v1
+    kind: BGPPeer
+    metadata: {name: edge-router}
+    spec:
+      peerIP: $R
+      asNumber: 65001
+      nextHopMode: Keep
+      nodeSelector: kubernetes.io/hostname == 'controlplane'
+      filters: [edge-export]
+    EOF
+  check: |
+    CP=$(kr_nodes | sed -n 1p); W=$(kr_nodes | sed -n 2p); R=$(kr_ip)
+    BOTH=$(printf '%s\n' "$CP" "$W" | LC_ALL=C sort | paste -sd,)
+    ip_of() { [ "$1" = controlplane ] && echo "$CP" || echo "$W"; }
+
+    info "Part 1: Sessions are up"
+    check "the peer edge-router still exists" 'k_exists bgppeers.crd.projectcalico.org edge-router'
+    check_eq "the router's AS is unchanged" "$(kr_json 'show bgp summary json' | jq -r '.ipv4Unicast.as')" 65010
+    check_eq "the router still expects AS 64520 on controlplane" "$(kr_json 'show bgp summary json' | jq -r --arg n "$CP" '.ipv4Unicast.peers[$n].remoteAs')" 64520
+    check_eq "the router still expects AS 64520 on node01" "$(kr_json 'show bgp summary json' | jq -r --arg n "$W" '.ipv4Unicast.peers[$n].remoteAs')" 64520
+    if [ "$(kj bgppeers.crd.projectcalico.org edge-router '{.spec.asNumber}')" = 65010 ]; then
+      eventually 40 'kr_estab "$CP"' || true
+      [ -z "$(kj bgppeers.crd.projectcalico.org edge-router '{.spec.nodeSelector}{.spec.node}')" ] &&
+        eventually 40 'kr_estab "$W"' || true
+    fi
+    check "controlplane's session is Established" 'kr_estab "$CP"'
+    check "node01's session is Established" 'kr_estab "$W"'
+
+    info "Part 2: Pods are reachable"
+    BLOCKS=$(kubectl get blockaffinities.crd.projectcalico.org -o json | jq -r '.items[] | select(.spec.state=="confirmed") | select(.spec.cidr | startswith("10.244.")) | "\(.spec.cidr) \(.spec.node)"')
+    hops_ok() {
+      local c n
+      [ -n "$BLOCKS" ] || return 1
+      while read -r c n; do
+        [ "$(kr_hops "$c")" = "$(ip_of "$n")" ] || return 1
+      done <<<"$BLOCKS"
+    }
+    if kr_estab "$CP" && kr_estab "$W"; then
+      eventually 25 hops_ok || true
+    fi
+    check "every pod block has its owner as next hop" 'hops_ok'
+    POD=$(kj -n shop pod -l app=web '{.items[0].status.podIP}')
+    check_match "the router reaches a web pod" "$(kr_wget "http://$POD/" | grep Hostname)" 'Hostname: web-'
+
+    info "Part 3: Services are reachable"
+    CIP=$(kj -n shop svc web '{.spec.clusterIP}')
+    if kr_estab "$CP" && kr_estab "$W"; then
+      eventually 25 '[ "$(kr_hops 10.96.0.0/12)" = "$BOTH" ]' || true
+    fi
+    check_eq "10.96.0.0/12 comes from both nodes" "$(kr_hops 10.96.0.0/12)" "$BOTH"
+    check_eq "only the real Service range is announced" "$(kj bgpconfigurations.crd.projectcalico.org default '{.spec.serviceClusterIPs[*].cidr}')" 10.96.0.0/12
+    if kr_estab "$CP" && kr_estab "$W"; then
+      eventually 25 '[ -z "$(kr_hops 10.200.0.0/16)" ]' || true
+    fi
+    check_eq "the old range is gone from the router" "$(kr_hops 10.200.0.0/16)" ""
+    check_match "the router reaches the web Service" "$(kr_wget "http://$CIP/" | grep Hostname)" 'Hostname: web-'
+  solve: |
+    kubectl patch bgppeers.crd.projectcalico.org edge-router --type=json -p \
+      '[{"op":"replace","path":"/spec/asNumber","value":65010},
+        {"op":"remove","path":"/spec/nodeSelector"},
+        {"op":"remove","path":"/spec/filters"}]'
+    kubectl patch bgpconfigurations.crd.projectcalico.org default --type=merge \
+      -p '{"spec":{"serviceClusterIPs":[{"cidr":"10.96.0.0/12"}]}}'
+
+- id: k8s-333
+  title: Announce a LoadBalancer over BGP with MetalLB
+  difficulty: 4
+  kind: build
+  tags: [metallb, bgp, frr, loadbalancer, service]
+  tutorial: |
+    **Concept.** A `Service` of type `LoadBalancer` needs something to hand it an address and
+    make that address reach the cluster. On bare metal that something is **MetalLB**: the
+    **controller** assigns addresses from an `IPAddressPool`, and a **speaker** on every
+    eligible node tells the network where to send them. In BGP mode each speaker opens a BGP
+    session to your router and announces each assigned address as a `/32` with itself as the next
+    hop. The router sees one path per node and spreads traffic across them with ECMP.
+
+    Three objects drive this, all in `metallb-system`:
+
+    - `IPAddressPool` — the addresses MetalLB may hand out.
+    - `BGPPeer` — a router to peer with (`myASN`, `peerASN`, `peerAddress`).
+    - `BGPAdvertisement` — says which pools are announced, and how. It can tag routes with BGP
+      communities, for instance, which the router can act on.
+
+    *Which nodes announce.* A speaker runs on every node, but not every node is allowed to
+    announce: MetalLB skips nodes carrying the label
+    `node.kubernetes.io/exclude-from-external-load-balancers`, which `kubeadm` puts on
+    control-plane nodes.
+
+    *`externalTrafficPolicy`.* `Cluster` (the default) lets every node accept traffic and forward
+    it to a backend anywhere, with SNAT, so backends see the node's address. `Local` keeps traffic
+    on nodes that host a ready backend, which preserves the client's address, and MetalLB follows
+    that: it only announces from nodes that have one.
+
+    MetalLB's `bgppeers` CRD shares a name with Calico's. Spell it `bgppeers.metallb.io`.
+
+    **Read up on:**
+    - `kubectl explain ipaddresspools.metallb.io.spec`, `bgppeers.metallb.io.spec`,
+      `bgpadvertisements.metallb.io.spec`
+    - `kubectl -n metallb-system logs ds/speaker`
+    - On the router: `show bgp summary`, `show ip bgp <prefix>`, `show ip route <prefix>`
+    - `kubectl get svc`, `.spec.externalTrafficPolicy`
+    - `kubectl get node controlplane --show-labels`
+  scenario: |
+    MetalLB (`v0.16.1`) is already installed in **`metallb-system`** with no configuration. The
+    edge router is FRR, Pod **`router`** in namespace **`edge`**, AS **65010**, and it's waiting for
+    both nodes to peer as AS **64513**. Don't change the router; read it with:
+
+    ```
+    kubectl -n edge exec -it router -c frr -- vtysh
+    ```
+
+    Addresses are in **`/lab/topology.txt`**. The network team gave you **`203.0.113.0/24`** for
+    public IPs. Namespace **`store`** runs Deployments `shop` (2 replicas) and `shop-local` (1 replica,
+    on `node01`).
+
+    ## Part 1: Peer with the router
+
+    Create the address pool **`public`** (`203.0.113.0/24`) and a MetalLB **`BGPPeer`** named
+    **`edge`** using AS **64513** locally and **65010** on the router. Both nodes must have an
+    `Established` session on the router.
+
+    ## Part 2: Announce a Service from both nodes
+
+    Expose `shop` as Service **`shop`** of type **`LoadBalancer`**, port **80**. Announce the
+    `public` pool with a `BGPAdvertisement` named **`public`**. The router must learn the
+    Service's `/32` from **both** nodes, with two next hops, and get an answer from it through
+    the assigned address.
+
+    ## Part 3: Tag the route
+
+    Routes from `public` must carry the BGP community **`64513:100`** when the router receives
+    them.
+
+    ## Part 4: Keep the client address
+
+    Expose `shop-local` as Service **`shop-local`**, type `LoadBalancer`, port 80, such that the
+    backend sees the router's own address as the client. The router must learn its `/32`
+    **from `node01` only**.
+  hints:
+  - 'Part 1: pool and peer are short manifests in `metallb-system`. `apiVersion: metallb.io/v1beta1` for `IPAddressPool`, `metallb.io/v1beta2` for `BGPPeer`.'
+  - 'Part 2: the Service has an address before the router hears about it: `kubectl -n metallb-system logs ds/speaker` shows what the speakers announce. No `BGPAdvertisement` means nothing is announced.'
+  - 'Part 2: if only one next hop appears, compare what each speaker is doing. `kubectl get node controlplane --show-labels`: which label stops a node from announcing?'
+  - 'Part 3: `communities` on the `BGPAdvertisement` is a list. `show ip bgp <ip>/32` on the router shows what arrived.'
+  - 'Part 4: `externalTrafficPolicy: Local` on the Service. `shop-local`''s only pod is on `node01`, so only `node01` should announce.'
+  solution: |
+    ```bash
+    R=$(awk '/^router / {print $2}' /lab/topology.txt)
+
+    kubectl apply -f - <<EOF
+    apiVersion: metallb.io/v1beta1
+    kind: IPAddressPool
+    metadata: {name: public, namespace: metallb-system}
+    spec:
+      addresses: [203.0.113.0/24]
+    ---
+    apiVersion: metallb.io/v1beta2
+    kind: BGPPeer
+    metadata: {name: edge, namespace: metallb-system}
+    spec:
+      myASN: 64513
+      peerASN: 65010
+      peerAddress: $R
+    ---
+    apiVersion: metallb.io/v1beta1
+    kind: BGPAdvertisement
+    metadata: {name: public, namespace: metallb-system}
+    spec:
+      ipAddressPools: [public]
+      communities: ["64513:100"]
+    EOF
+
+    # control-plane nodes are excluded from announcing by default
+    kubectl label node controlplane node.kubernetes.io/exclude-from-external-load-balancers-
+
+    kubectl -n store expose deployment shop --type=LoadBalancer --port=80
+    kubectl -n store expose deployment shop-local --type=LoadBalancer --port=80
+    kubectl -n store patch svc shop-local -p '{"spec":{"externalTrafficPolicy":"Local"}}'
+    ```
+  setup: |
+    kr_up
+    kr_guard_calico
+    CP=$(kr_nodes | sed -n 1p); W=$(kr_nodes | sed -n 2p); R=$(kr_ip)
+    kr_conf <<EOF
+    router bgp 65010
+     bgp router-id $R
+     no bgp ebgp-requires-policy
+     no bgp network import-check
+     neighbor $CP remote-as 64513
+     neighbor $W remote-as 64513
+     address-family ipv4 unicast
+      maximum-paths 8
+     exit-address-family
+    EOF
+    lab_file /lab/topology.txt <<EOF
+    router $R
+    router-as 65010
+    controlplane $CP
+    node01 $W
+    EOF
+    kubectl apply -f /opt/kubelab/metallb-native.yaml >/dev/null
+    kubectl -n metallb-system rollout status deploy/controller --timeout=240s >/dev/null
+    kubectl -n metallb-system rollout status ds/speaker --timeout=240s >/dev/null
+    # the webhook answers some time after the controller is Ready
+    probe() {
+      kubectl apply --dry-run=server -f - >/dev/null 2>&1 <<EOF
+    apiVersion: metallb.io/v1beta1
+    kind: IPAddressPool
+    metadata: {name: kl-probe, namespace: metallb-system}
+    spec: {addresses: [192.0.2.0/30]}
+    EOF
+    }
+    eventually 120 probe
+    k_ns store
+    kubectl -n store create deployment shop --image=traefik/whoami:v1.10 --replicas=2 >/dev/null
+    kapply <<EOF
+    apiVersion: apps/v1
+    kind: Deployment
+    metadata: {name: shop-local, namespace: store}
+    spec:
+      replicas: 1
+      selector: {matchLabels: {app: shop-local}}
+      template:
+        metadata: {labels: {app: shop-local}}
+        spec:
+          nodeSelector: {kubernetes.io/hostname: node01}
+          containers:
+          - {name: whoami, image: "traefik/whoami:v1.10"}
+    EOF
+    wait_deploy store shop 120
+    wait_deploy store shop-local 120
+  check: |
+    CP=$(kr_nodes | sed -n 1p); W=$(kr_nodes | sed -n 2p); R=$(kr_ip)
+    BOTH=$(printf '%s\n' "$CP" "$W" | LC_ALL=C sort | paste -sd,)
+    MP=metallb-system
+
+    info "Part 1: Peer with the router"
+    check_eq "pool public holds 203.0.113.0/24" "$(kj -n $MP ipaddresspools.metallb.io public '{.spec.addresses[*]}')" 203.0.113.0/24
+    check_eq "peer edge uses AS 64513" "$(kj -n $MP bgppeers.metallb.io edge '{.spec.myASN}')" 64513
+    check_eq "peer edge expects AS 65010" "$(kj -n $MP bgppeers.metallb.io edge '{.spec.peerASN}')" 65010
+    check_eq "peer edge points at the router" "$(kj -n $MP bgppeers.metallb.io edge '{.spec.peerAddress}')" "$R"
+    if k_exists -n $MP bgppeers.metallb.io edge; then
+      eventually 40 'kr_estab "$CP" && kr_estab "$W"' || true
+    fi
+    check "controlplane's speaker is Established" 'kr_estab "$CP"'
+    check "node01's speaker is Established" 'kr_estab "$W"'
+
+    info "Part 2: Announce a Service from both nodes"
+    LB=$(kj -n store svc shop '{.status.loadBalancer.ingress[0].ip}')
+    check_eq "shop is a LoadBalancer" "$(kj -n store svc shop '{.spec.type}')" LoadBalancer
+    check_match "shop has an address from the pool" "$LB" '^203\.0\.113\.'
+    check_eq "the advertisement covers public" "$(kj -n $MP bgpadvertisements.metallb.io public '{.spec.ipAddressPools[*]}')" public
+    if [ -n "$LB" ] && kr_estab "$W"; then
+      eventually 30 '[ "$(kr_hops "$LB/32")" = "$BOTH" ]' || true
+    fi
+    check_eq "the router learned $LB/32 from both nodes" "$(kr_hops "$LB/32")" "$BOTH"
+    check_match "the router reaches shop through the address" "$(kr_wget "http://$LB/" | grep Hostname)" 'Hostname: shop-'
+
+    info "Part 3: Tag the route"
+    comm() { kr_json "show ip bgp $LB/32 json" | jq -r '[.paths[]?.community.string // empty] | unique | join(" ")' 2>/dev/null; }
+    if [ -n "$LB" ] && kr_estab "$W"; then
+      eventually 20 'comm | grep -q "64513:100"' || true
+    fi
+    check_match "the route carries community 64513:100" "$(comm)" '64513:100'
+
+    info "Part 4: Keep the client address"
+    LB2=$(kj -n store svc shop-local '{.status.loadBalancer.ingress[0].ip}')
+    check_eq "shop-local keeps the client address" "$(kj -n store svc shop-local '{.spec.externalTrafficPolicy}')" Local
+    if [ -n "$LB2" ] && kr_estab "$W"; then
+      eventually 30 '[ "$(kr_hops "$LB2/32")" = "$W" ]' || true
+    fi
+    check_eq "only node01 announces $LB2/32" "$(kr_hops "$LB2/32")" "$W"
+    seen() { kr_wget "http://$LB2/" | sed -n 's/^RemoteAddr: \([^:]*\):.*/\1/p'; }
+    if [ -n "$LB2" ]; then
+      eventually 15 '[ "$(seen)" = "$R" ]' || true
+    fi
+    check_eq "the backend sees the router's address" "$(seen)" "$R"
+  solve: |
+    R=$(awk '/^router / {print $2}' /lab/topology.txt)
+    kubectl apply -f - <<EOF
+    apiVersion: metallb.io/v1beta1
+    kind: IPAddressPool
+    metadata: {name: public, namespace: metallb-system}
+    spec:
+      addresses: [203.0.113.0/24]
+    ---
+    apiVersion: metallb.io/v1beta2
+    kind: BGPPeer
+    metadata: {name: edge, namespace: metallb-system}
+    spec:
+      myASN: 64513
+      peerASN: 65010
+      peerAddress: $R
+    ---
+    apiVersion: metallb.io/v1beta1
+    kind: BGPAdvertisement
+    metadata: {name: public, namespace: metallb-system}
+    spec:
+      ipAddressPools: [public]
+      communities: ["64513:100"]
+    EOF
+    kubectl label node controlplane node.kubernetes.io/exclude-from-external-load-balancers-
+    kubectl -n store expose deployment shop --type=LoadBalancer --port=80
+    kubectl -n store expose deployment shop-local --type=LoadBalancer --port=80
+    kubectl -n store patch svc shop-local -p '{"spec":{"externalTrafficPolicy":"Local"}}'

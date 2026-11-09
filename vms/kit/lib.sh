@@ -215,6 +215,55 @@ WRAP
   eventually 30 'curl -fsS -m 2 http://127.0.0.1:5000/moto-api/ >/dev/null'
 }
 
+# moto_start_iam -> the emulator with IAM enforced. The first three calls create the
+# administrator, every later call needs valid credentials. The `aws` command reads its
+# identities from /lab/.aws/credentials, where [default] is that administrator.
+moto_start_iam() {
+  local k s doc='{"Version":"2012-10-17","Statement":[{"Effect":"Allow","Action":"*","Resource":"*"}]}'
+  docker rm -f kl-moto >/dev/null 2>&1 || true
+  docker run -d --name kl-moto --network host -e INITIAL_NO_AUTH_ACTION_COUNT=3 \
+    motoserver/moto:5.2.4 -H 127.0.0.1 -p 5000 >/dev/null
+  cat >/usr/local/bin/aws <<'WRAP'
+#!/bin/bash
+exec docker run --rm -i --network host -e AWS_ENDPOINT_URL=http://127.0.0.1:5000 \
+  -e AWS_ACCESS_KEY_ID -e AWS_SECRET_ACCESS_KEY -e AWS_SESSION_TOKEN -e AWS_PROFILE \
+  -e AWS_SHARED_CREDENTIALS_FILE=/lab/.aws/credentials -e AWS_CONFIG_FILE=/lab/.aws/config \
+  -e AWS_DEFAULT_REGION=us-east-1 -e AWS_PAGER= -v /lab:/lab -w /lab amazon/aws-cli:2.39.0 "$@"
+WRAP
+  chmod 755 /usr/local/bin/aws
+  on_reset 'rm -f /usr/local/bin/aws'
+  eventually 30 'curl -fsS -m 2 http://127.0.0.1:5000/moto-api/ >/dev/null' || return 1
+  (
+    export AWS_ACCESS_KEY_ID=test AWS_SECRET_ACCESS_KEY=test
+    aws iam create-user --user-name lab-admin >/dev/null
+    aws iam put-user-policy --user-name lab-admin --policy-name administrator --policy-document "$doc"
+    aws iam create-access-key --user-name lab-admin --query 'AccessKey.[AccessKeyId,SecretAccessKey]' --output text >"$KL_STATE/moto-admin"
+  ) </dev/null || return 1
+  read -r k s <"$KL_STATE/moto-admin"
+  rm -f "$KL_STATE/moto-admin"
+  [ -n "$k" ] && [ -n "$s" ] || return 1
+  mkdir -p /lab/.aws
+  printf '[default]\naws_access_key_id = %s\naws_secret_access_key = %s\n' "$k" "$s" >/lab/.aws/credentials
+  chmod 600 /lab/.aws/credentials
+  chown -R "$(lab_user)": /lab/.aws
+}
+# moto_user NAME... -> create IAM users and add a profile for each to /lab/.aws/credentials
+moto_user() {
+  local u k s
+  for u in "$@"; do
+    aws iam create-user --user-name "$u" >/dev/null </dev/null || return 1
+    read -r k s < <(aws iam create-access-key --user-name "$u" \
+      --query 'AccessKey.[AccessKeyId,SecretAccessKey]' --output text </dev/null)
+    [ -n "$k" ] && [ -n "$s" ] || return 1
+    printf '[%s]\naws_access_key_id = %s\naws_secret_access_key = %s\n' "$u" "$k" "$s" >>/lab/.aws/credentials
+  done
+}
+# moto_denied PROFILE AWS-ARGS... -> true only when IAM refused the call
+moto_denied() {
+  local p=$1; shift
+  aws --profile "$p" "$@" 2>&1 | grep -qE 'AccessDenied|\(403\)'
+}
+
 # ---------- data-science helper ----------
 # ds_start -> install `dspy`, which runs Python with pandas and scikit-learn in /lab.
 # The container can only see /lab and runs as the calling user.
@@ -432,3 +481,136 @@ ing_get() { local h=$1 p=$2; shift 2; curl -s -m 5 -H "Host: $h" "$@" "http://no
 ing_code() { curl -s -o /dev/null -m 5 -w '%{http_code}' -H "Host: $1" "http://node01:30080$2"; }
 # ing_tls HOST PATH [curl args...] — HTTPS through the ingress controller (SNI = HOST)
 ing_tls() { local h=$1 p=$2; shift 2; curl -s -m 5 --resolve "$h:30443:$(getent hosts node01 | awk '{print $1}')" "$@" "https://$h:30443$p"; }
+
+# ---------- edge router helpers (kubernetes) ----------
+# An FRR router as Pod "router" in namespace "edge" on the control plane. calico-node's BIRD
+# holds TCP 179 on the node, so the router has its own network namespace. It is cabled to the
+# node network with a macvlan interface (net0, .200) so that both nodes reach it directly, and
+# its Calico eth0 is brought down: it behaves as a device outside the cluster. A second macvlan
+# (kl-shim) lets the control plane itself reach the router, which macvlan otherwise forbids.
+# kl-shim must never take part in ARP: it would answer for the node's own address with its own
+# MAC, the rest of the network would believe it, and removing the shim then cuts the node off.
+# So it ignores ARP, and both ends of that one link use static neighbor entries.
+# Sidecar "web" (traefik/whoami) answers on the router on port 80 and reports the client address.
+KR_NS=edge
+KR_MAC=02:4b:4c:00:00:c8
+KR_SHIM_MAC=02:4b:4c:00:00:c9
+# kr_ip -> the router's address on the node network
+# /etc/hosts also maps the VM's own name to 127.0.1.1, so ask the API for node addresses
+kr_node_ip() { kubectl get node "$1" -o jsonpath='{.status.addresses[?(@.type=="InternalIP")].address}'; }
+kr_ip() { local cp; cp=$(kr_node_ip controlplane); echo "${cp%.*}.200"; }
+# kr_nodes -> the node addresses, control plane first
+kr_nodes() { kr_node_ip controlplane; echo; kr_node_ip node01; echo; }
+# kr_x CMD... -> run a command in the router (network namespace and all); stdin stays free
+kr_x() { kubectl -n "$KR_NS" exec router -c frr -- "$@" </dev/null; }
+# kr_json 'show ... json' -> run a vtysh show command on the router
+kr_json() { kr_x vtysh -c "$1" 2>/dev/null; }
+# kr_healthy -> startup finished and every daemon runs (see frr_healthy for why)
+kr_healthy() {
+  kubectl -n "$KR_NS" logs router -c frr 2>/dev/null |
+    awk '/all daemons up/{u=NR} /state -> down|Forked background/{d=NR} END{exit !(u>d)}' || return 1
+  kr_x sh -c 'ps -o args | grep -q "[w]atchfrr\.sh" && exit 1; for d in zebra mgmtd bgpd staticd; do pidof $d >/dev/null || exit 1; done' >/dev/null 2>&1
+}
+# kr_pod_start -> create the Pod, plug the macvlan into its namespace, then let FRR start.
+# FRR waits for /tmp/kl-go so zebra starts with the final set of interfaces.
+kr_pod_start() {
+  local ip cp dev sandbox cid pid i
+  ip=$(kr_ip)
+  cp=$(kr_node_ip controlplane)
+  dev=$(ip route get "$(kr_node_ip node01)" | sed -n 's/.* dev \([^ ]*\).*/\1/p' | head -1)
+  kubectl -n "$KR_NS" delete pod router --force --grace-period=0 --ignore-not-found >/dev/null 2>&1
+  kubectl -n "$KR_NS" wait --for=delete pod/router --timeout=60s >/dev/null 2>&1
+  kubectl apply -f - >/dev/null <<YAML
+apiVersion: v1
+kind: Pod
+metadata: {name: router, namespace: $KR_NS, labels: {app: router}}
+spec:
+  nodeName: controlplane
+  restartPolicy: Never
+  automountServiceAccountToken: false
+  terminationGracePeriodSeconds: 0
+  tolerations: [{operator: Exists}]
+  containers:
+  - name: frr
+    image: $FRR_IMAGE
+    securityContext: {privileged: true}
+    command: ["sh", "-c", "until [ -e /tmp/kl-go ]; do sleep 1; done; sed -i 's/^bgpd=no/bgpd=yes/' /etc/frr/daemons; touch /etc/frr/vtysh.conf; exec /sbin/tini -- /usr/lib/frr/docker-start"]
+  - name: web
+    image: traefik/whoami:v1.10
+YAML
+  kubectl -n "$KR_NS" wait --for=condition=Ready pod/router --timeout=180s >/dev/null || return 1
+  for i in 1 2 3 4 5 6 7 8 9 10; do
+    sandbox=$(crictl pods --namespace "$KR_NS" --name '^router$' --state ready -q | head -1)
+    cid=$(crictl ps --pod "$sandbox" --name '^frr$' --state running -q | head -1)
+    pid=$(crictl inspect "$cid" 2>/dev/null | jq -r '.info.pid // empty')
+    [ -n "$pid" ] && break
+    sleep 1
+  done
+  [ -n "$pid" ] || return 1
+  ip link add kr-net0 link "$dev" address "$KR_MAC" type macvlan mode bridge || return 1
+  ip link set kr-net0 netns "$pid" || return 1
+  nsenter -t "$pid" -n sh -c "ip link set kr-net0 name net0 && ip addr add $ip/24 dev net0 && ip link set net0 up && ip neigh replace $cp lladdr $KR_SHIM_MAC dev net0 nud permanent && ip link set eth0 down && ip addr add 198.51.100.1/24 dev lo && sysctl -qw net.ipv4.ip_forward=1" || return 1
+  kr_x touch /tmp/kl-go
+}
+# kr_up -> run the router and wait for it; recreate it if zebra was lost at boot
+kr_up() {
+  local round ok ip cp dev
+  ip=$(kr_ip)
+  cp=$(kr_node_ip controlplane)
+  dev=$(ip route get "$(kr_node_ip node01)" | sed -n 's/.* dev \([^ ]*\).*/\1/p' | head -1)
+  k_ns "$KR_NS"
+  ip link del kl-shim 2>/dev/null
+  ip link add kl-shim link "$dev" address "$KR_SHIM_MAC" type macvlan mode bridge
+  sysctl -qw net.ipv4.conf.kl-shim.arp_ignore=8 net.ipv6.conf.kl-shim.disable_ipv6=1
+  ip link set kl-shim up
+  ip neigh replace "$ip" lladdr "$KR_MAC" dev kl-shim nud permanent
+  ip route replace "$ip/32" dev kl-shim src "$cp"
+  on_reset 'ip link del kl-shim 2>/dev/null'
+  for round in 1 2 3 4 5; do
+    kr_pod_start || { echo "kr_up: pod did not start (round $round)" >&2; continue; }
+    ok=
+    if eventually 40 kr_healthy; then
+      sleep 5
+      kr_healthy && ok=1
+    fi
+    [ -n "$ok" ] && break
+    echo "kr_up: recreating the router (round $round)" >&2
+  done
+  [ -n "$ok" ] || { echo "edge router did not start" >&2; return 1; }
+  # ARP settles now rather than during the first BGP connection
+  eventually 20 "ping -c1 -W1 $ip" || true
+  on_node01 "ping -c2 -W1 $ip" >/dev/null 2>&1 || true
+}
+# kr_conf <<EOF -> apply vtysh configuration from stdin ("configure terminal" is implied)
+kr_conf() {
+  local conf out rc i
+  conf=$(cat)
+  for i in 1 2 3 4 5; do
+    out=$(printf '%s\n' "$conf" | kubectl -n "$KR_NS" exec -i router -c frr -- sh -c 'cat >/tmp/kl.conf; vtysh -f /tmp/kl.conf' 2>&1); rc=$?
+    if [ "$rc" = 0 ] && ! grep -qE '^% |failure|not running|Can.t' <<<"$out"; then return 0; fi
+    echo "kr_conf attempt $i failed (rc=$rc): $(grep -vE 'sending configuration|\] done|Waiting for children' <<<"$out" | head -5)" >&2
+    sleep 2
+  done
+  return 1
+}
+# kr_estab NEIGHBOR -> the BGP session to that neighbor is Established
+kr_estab() { [ "$(kr_json 'show bgp summary json' | jq -r --arg n "$1" '.ipv4Unicast.peers[$n].state // empty')" = Established ]; }
+# kr_hops PREFIX -> next-hop addresses of the selected route, sorted, comma-separated
+kr_hops() {
+  kr_json "show ip route $1 json" | jq -r --arg p "$1" \
+    '[.[$p][]? | select(.selected==true) | .nexthops[]? | select(.active==true) | .ip] | sort | join(",")' 2>/dev/null
+}
+# kr_wget URL -> HTTP from the router itself (its source address is the router's .200)
+kr_wget() { kr_x wget -qO- -T 4 "$1" 2>/dev/null; }
+# kr_guard_calico -> remember Calico's BGP settings now and remove what a lab adds on the next
+# reset. The cluster reset leaves custom resources alone, so this is not optional.
+kr_guard_calico() {
+  kubectl get bgpconfigurations.crd.projectcalico.org default -o json | jq -c .spec >"$KL_STATE/kr-bgpconf.json"
+  kubectl get ippools.crd.projectcalico.org default-ipv4-ippool -o json | jq -c .spec >"$KL_STATE/kr-ippool.json"
+  on_reset 'kubectl delete bgppeers.crd.projectcalico.org,bgpfilters.crd.projectcalico.org --all --ignore-not-found --wait=false
+kubectl get ippools.crd.projectcalico.org -o name | grep -v /default-ipv4-ippool$ | xargs -r kubectl delete --wait=false
+for t in "bgpconfigurations.crd.projectcalico.org default kr-bgpconf" "ippools.crd.projectcalico.org default-ipv4-ippool kr-ippool"; do set -- $t
+  [ -s "$KL_STATE/$3.json" ] && kubectl patch "$1" "$2" --type=json -p "[{\"op\":\"replace\",\"path\":\"/spec\",\"value\":$(cat "$KL_STATE/$3.json")}]"
+  rm -f "$KL_STATE/$3.json"
+done'
+}

@@ -26,18 +26,18 @@ have a short tutorial on the concepts and commands to read first.
 
 | Track | Modules | Exercises |
 |-------|---------|-----------|
-| **Docker** | containers · images & Dockerfiles · volumes · networking · Compose · registries · security & limits · the daemon & host · production patterns · real-world troubleshooting | 200 |
-| **Kubernetes** | pods · deployments · services & DNS · ConfigMaps & Secrets · scheduling · storage · Jobs/CronJobs/DaemonSets · probes, resources & autoscaling · Ingress & Gateway API · NetworkPolicies · RBAC & pod security · app troubleshooting · cluster troubleshooting · cluster administration · Helm, Kustomize & CRDs | 300 |
-| **Offensive Security** | web exploitation (recon · SQL injection · path traversal · command injection · IDOR · SSRF · XXE · JWT · remediation) · privilege escalation · *(more modules in progress)* | 40 |
-| **Linux** | disks, systemd, shell, Git, cgroups, namespaces, LVM *(growing)* | 15 |
-| **Networking** | routing, NAT, firewalls, DNS, TLS, proxies, WireGuard, netem *(growing)* | 15 |
-| **Cloud** | AWS CLI and CloudFormation against a local emulator *(growing)* | 15 |
-| **Data** | SQL, PostgreSQL operations and Redis *(growing)* | 15 |
-| **Defensive Security** | incident response and hardening *(growing)* | 15 |
-| **Programming** | Python and Go *(growing)* | 15 |
-| **Data Science** | pandas, statistics and machine learning *(growing)* | 15 |
+| **Docker** | containers · images & Dockerfiles · volumes · networking · Compose · registries · security & limits · the daemon & host · production patterns · real-world troubleshooting | 149 |
+| **Kubernetes** | pods · deployments · services & DNS · ConfigMaps & Secrets · scheduling · storage · Jobs/CronJobs/DaemonSets · probes, resources & autoscaling · Ingress & Gateway API · NetworkPolicies · RBAC & pod security · app troubleshooting · cluster troubleshooting · cluster administration · Helm, Kustomize & CRDs · BGP with Calico and MetalLB | 234 |
+| **Offensive Security** | web exploitation (recon · SQL injection · path traversal · command injection · IDOR · SSRF · XXE · JWT · remediation) · privilege escalation · *(more modules in progress)* | 45 |
+| **Linux** | disks, systemd, shell, cgroups, namespaces, LVM · Git beyond the basics *(growing)* | 34 |
+| **Networking** | routing, NAT, firewalls, DNS, TLS, proxies, WireGuard, netem · OSPF, BGP, VRRP and IPv6 routing on FRR *(growing)* | 42 |
+| **Cloud** | AWS CLI, CloudFormation and IAM permission debugging against a local emulator *(growing)* | 47 |
+| **Data** | SQL, PostgreSQL operations and Redis *(growing)* | 27 |
+| **Defensive Security** | incident response and hardening *(growing)* | 30 |
+| **Programming** | Python and Go *(growing)* | 45 |
+| **Data Science** | pandas, statistics and machine learning *(growing)* | 43 |
 
-That's 645 exercises so far, growing toward 400 per topic; ideas for what comes next are
+That's 696 exercises so far, with a target of 250 per track; ideas for what comes next are
 in [docs/PENDING.md](docs/PENDING.md).
 
 Difficulty rises through each module (1 = beginner … 5 = expert), mixing **build** tasks
@@ -74,8 +74,8 @@ reset can't undo; awesome_labs rebuilds the cluster before your next Kubernetes 
 ## Requirements
 
 The labs are tested on Fedora 45 (x86_64) on a machine with 16 GB of RAM. The installer is
-tested on Ubuntu 24.04, Fedora 45 and Arch Linux. macOS is supported but hasn't been tested
-yet.
+tested on Ubuntu 24.04, Fedora 45 and Arch Linux. macOS is supported and
+confirmed working.
 
 `awesome_labs install` detects macOS or Linux and sets up what's missing: Lima (Homebrew
 on macOS when available, otherwise the official release, checksum-verified, into
@@ -179,8 +179,8 @@ awesome_labs exam history    # past results
 ### Saving memory
 
 Only one environment needs to run at a time. With `auto_stop: true` (the default),
-starting a Docker exercise stops the Kubernetes VMs and vice versa; `Q` in the browser
-quits and stops everything. Settings live in `~/.awesome_labs/config.yaml`:
+starting a Docker exercise stops the Kubernetes VMs and vice versa, and solving an exercise
+stops its VMs (except during an exam); `Q` in the browser quits and stops everything. Settings live in `~/.awesome_labs/config.yaml`:
 
 ```yaml
 auto_stop: true
