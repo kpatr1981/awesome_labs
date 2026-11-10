@@ -528,6 +528,8 @@ func (m *model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 				m.result[msg.id] = "failed"
 				m.flash = "not yet — read the failing checks in Output"
 			}
+		case msg.kind == "stop":
+			m.flash = msg.id + " ended — its VMs are stopped"
 		case msg.kind == "env":
 			if msg.err == nil {
 				m.flash = "done"
@@ -715,12 +717,7 @@ func (m *model) updateDetail(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 	k := msg.String()
 	switch k {
 	case "esc", "q", "backspace", "left":
-		m.screen = scrBrowse
-		if m.fromExam {
-			m.screen = scrExam
-		}
-		m.flash = ""
-		return m, nil
+		return m, m.leaveExercise()
 	case "tab", "right", "l":
 		m.tab = (m.tab + 1) % 5
 		m.refreshViewport(false)
@@ -811,6 +808,29 @@ func (m *model) updateDetail(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 		return m, c
 	}
 	return m, nil
+}
+
+// leaveExercise goes back from the exercise screen. Leaving the exercise that is
+// set up on the VMs ends it and stops its VMs; inside an exam the VMs carry on
+// to the next question, so they are left alone.
+func (m *model) leaveExercise() tea.Cmd {
+	ex := m.cur
+	m.flash = ""
+	if m.fromExam {
+		m.screen = scrExam
+		return nil
+	}
+	m.screen = scrBrowse
+	if m.exam != nil || !m.isActive(ex) {
+		return nil
+	}
+	if m.op != "" {
+		m.flash = "lab left running — busy: " + m.op
+		return nil
+	}
+	return m.startOp("stop", "Ending "+ex.ID+" and stopping its VMs", ex.ID, func(ctx context.Context, w io.Writer) (bool, error) {
+		return false, m.mgr.EndExercise(ctx, ex, w)
+	})
 }
 
 func (m *model) revealHint() tea.Cmd {

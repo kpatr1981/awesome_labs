@@ -190,7 +190,13 @@ func (m *model) menus() []menu {
 		openKey = "o"
 	}
 	file := menu{"File", 'f', []menuItem{
-		{label: "Exercise list", key: backKey, hidden: onBrowse, run: func() tea.Cmd { m.screen = scrBrowse; return nil }},
+		{label: "Exercise list", key: backKey, hidden: onBrowse, run: func() tea.Cmd {
+			if onDetail && !m.fromExam {
+				return m.leaveExercise()
+			}
+			m.screen = scrBrowse
+			return nil
+		}},
 		menuItem{label: "Go to the active exercise", key: "a", run: func() tea.Cmd { m.goActive(); return nil }}.
 			off(!m.hasActive, "no exercise is set up on the VMs yet"),
 		{label: "Started labs", key: "S", hidden: onStarted, run: func() tea.Cmd { m.openStarted(); return nil }},
@@ -1017,7 +1023,7 @@ Exercise list   ↑↓ move · enter open · / filter · esc clear filter
 
 Exercise        s start the lab · t terminal · w node01 terminal (Kubernetes)
                 c check · h next hint · v solution · R reset progress
-                1–5 or tab switch tabs · n/N next/previous · esc back
+                1–5 or tab switch tabs · n/N next/previous · esc back (ends the lab, stops its VMs)
 
 Environments    ↑↓ select · u start · x stop · R reset VMs · B rebuild · D delete
                 X stop all · K delete all · r refresh · esc back
