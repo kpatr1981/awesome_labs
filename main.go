@@ -81,6 +81,21 @@ func run(args []string) error {
 	if err != nil {
 		return err
 	}
+	// only one awesome_labs changes the VMs and the progress at a time; the
+	// read-only commands may run beside it
+	cmd := ""
+	if len(args) > 0 {
+		cmd = args[0]
+	}
+	switch cmd {
+	case "-h", "--help", "help", "lint", "list", "show", "status", "paths":
+	default:
+		release, err := mgr.LockApp()
+		if err != nil {
+			return err
+		}
+		defer release()
+	}
 	prog, err := progress.Open(mgr.StateDir)
 	if err != nil {
 		return err

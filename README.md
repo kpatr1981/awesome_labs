@@ -251,6 +251,11 @@ You work on **one exercise at a time**: starting one resets its environment, so 
 replaces whatever was set up before (the UI asks first). It stops being active when
 you solve it, or when its environment is reset, rebuilt or deleted.
 
+Only **one awesome_labs runs at a time**: the app and every command that changes the
+VMs or your progress take a lock on `~/.awesome_labs/app.lock`, and a second one exits with
+*another awesome_labs is already running*. The lock goes away with the process, even after
+a crash. The read-only `list`, `show`, `status`, `paths` and `lint` still run beside it.
+
 Progress is stored in `~/.awesome_labs/progress.json`, logs in `~/.awesome_labs/logs/`.
 
 ## Writing exercises
@@ -265,8 +270,7 @@ awesome_labs verify [id-prefix ...]
 
 runs each one end to end — *reset → setup → check must fail → solve → check must
 pass* — which is how the whole catalogue is tested. Each exercise gets 25 minutes (50 for the
-destructive ones), and while a verify run is going its environment is marked busy, so
-auto-stop or `Q` in another awesome_labs leaves it alone. Set `AWESOME_LABS_EXERCISES=./exercises`
+destructive ones). Like the app, a verify run needs to be the only awesome_labs running. Set `AWESOME_LABS_EXERCISES=./exercises`
 to work on exercise files without rebuilding.
 
 ## Project layout
