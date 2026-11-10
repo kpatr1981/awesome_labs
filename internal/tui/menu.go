@@ -542,8 +542,9 @@ func sc(id, prefix string, n *int) bool {
 
 type button struct{ label, key string }
 
-// buttons renders a row of clickable buttons starting at body position (x, y).
-func (m *model) buttons(x, y int, bs ...button) string {
+// buttons renders a row of clickable buttons starting at body position (x, y),
+// without their keys when bare.
+func (m *model) buttons(x, y int, bare bool, bs ...button) string {
 	var parts []string
 	for _, b := range bs {
 		id := "key:" + b.key
@@ -551,7 +552,7 @@ func (m *model) buttons(x, y int, bs ...button) string {
 		if m.hover == id {
 			st = sBtnHot
 		}
-		r := st.Render(b.label)
+		r := b.render(st, m.hover == id, bare)
 		m.addZone(id, x, y, lipgloss.Width(r), 1)
 		x += lipgloss.Width(r) + 1
 		parts = append(parts, r)
@@ -559,16 +560,50 @@ func (m *model) buttons(x, y int, bs ...button) string {
 	return strings.Join(parts, " ")
 }
 
+// render draws a button as its label followed by its key in a dimmer colour.
+func (b button) render(st lipgloss.Style, hot, bare bool) string {
+	if bare {
+		return st.Render(b.label)
+	}
+	inner := st.UnsetPadding()
+	key := inner.Foreground(colMuted)
+	if hot {
+		key = inner
+	}
+	return inner.Render(" "+b.label+" ") + key.Render(b.key+" ")
+}
+
+// width is the rendered width of the button.
+func (b button) width(bare bool) int {
+	if bare {
+		return lipgloss.Width(b.label) + 2
+	}
+	return lipgloss.Width(b.label) + lipgloss.Width(b.key) + 3
+}
+
+// fitButtons reports how a row of buttons fits in avail columns: with their
+// keys if that fits, else as bare labels, else ok is false. w is the row width.
+func fitButtons(avail int, bs []button) (bare bool, w int, ok bool) {
+	for _, bare := range []bool{false, true} {
+		w := 0
+		for _, b := range bs {
+			w += b.width(bare) + 1
+		}
+		if w <= avail {
+			return bare, w, true
+		}
+	}
+	return true, 0, false
+}
+
 // titleButtons appends buttons to title when they fit on the line.
 func (m *model) titleButtons(title string, y int, bs ...button) string {
-	w := lipgloss.Width(title)
-	for _, b := range bs {
-		w += lipgloss.Width(b.label) + 3
-	}
-	if w > m.w {
+	tw := lipgloss.Width(title)
+	bare, _, ok := fitButtons(m.w-tw, bs)
+	if !ok {
 		return strings.TrimRight(title, " ")
 	}
-	return title + m.buttons(lipgloss.Width(title), y, bs...)
+	return title + m.buttons(tw, y, bare, bs...)
 }
 
 func (m *model) menuBar() string {

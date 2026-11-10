@@ -306,12 +306,9 @@ func (m *model) viewDetail() string {
 		bs = append(bs, button{"Hint", "h"}, button{"Solution", "v"})
 	}
 	bs = append(bs, button{"Back", "esc"})
-	bw := 0
-	for _, b := range bs {
-		bw += lipgloss.Width(b.label) + 3
-	}
-	if gap := m.w - x - bw; gap >= 2 {
-		tabRow += strings.Repeat(" ", gap) + m.buttons(x+gap, 1, bs...)
+	if bare, bw, ok := fitButtons(m.w-x-2, bs); ok {
+		gap := m.w - x - bw
+		tabRow += strings.Repeat(" ", gap) + m.buttons(x+gap, 1, bare, bs...)
 	}
 	box := sBorder.Width(m.w - 2).Render(m.vp.View())
 	// the buttons above and the menus cover the actions; list only the rest

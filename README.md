@@ -124,7 +124,8 @@ keyboard shortcut, and items that don't apply on the current screen are greyed o
 
 The mouse works throughout: pick a track from the **Tracks** menu, click a row to select
 it and double-click to open it, click the tabs and the buttons (Start, Terminal, Check,
-Hint, Solution…) on the exercise screen, and scroll with the wheel. Confirmations open
+Hint, Solution…) on the exercise screen, and scroll with the wheel. Each button shows its
+key next to its name (on a narrow terminal, just the name). Confirmations open
 as a dialog with **Yes** / **No** buttons (`y`/`n` still work). `F1` lists every
 shortcut. While the mouse is in use, most terminals select text with `shift`+drag.
 
