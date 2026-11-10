@@ -52,8 +52,8 @@ func (m *Manager) ClearActive(id string) {
 }
 
 // EndExercise abandons ex when it is the active exercise: it is forgotten and
-// its environment's VMs are stopped. An environment that a verify run is using
-// is left running.
+// its environment's VMs are deleted, so the next exercise on it starts from
+// fresh VMs. An environment that a verify run is using is left alone.
 func (m *Manager) EndExercise(ctx context.Context, ex *exercise.Exercise, log io.Writer) error {
 	m.ClearActive(ex.ID)
 	env := EnvFor(ex.Profile)
@@ -61,7 +61,7 @@ func (m *Manager) EndExercise(ctx context.Context, ex *exercise.Exercise, log io
 		fmt.Fprintf(log, "==> leaving %s running: a awesome_labs verify run is using it\n", env.Title)
 		return nil
 	}
-	return m.Stop(ctx, env, log)
+	return m.Destroy(ctx, env, log)
 }
 
 // clearActiveIn forgets the active exercise when it lives in env, whose lab

@@ -108,7 +108,7 @@ type model struct {
 	vmInfo    map[string]lab.VMInfo
 	envCursor int
 	envBack   screen // where the environments screen returns to
-	// endLab ends the active exercise and stops its VMs; tests replace it
+	// endLab ends the active exercise and deletes its VMs; tests replace it
 	endLab func(ctx context.Context, ex *exercise.Exercise, w io.Writer) error
 	// deleteVMs deletes every lab VM, on start and on exit; tests replace it
 	deleteVMs func(ctx context.Context, w io.Writer) error
@@ -565,7 +565,7 @@ func (m *model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 				m.flash = "not yet — read the failing checks in Output"
 			}
 		case msg.kind == "stop":
-			m.flash = msg.id + " ended — its VMs are stopped"
+			m.flash = msg.id + " ended — its VMs are deleted"
 		case msg.kind == "cleanup":
 			m.flash = "no lab VMs left over"
 		case msg.kind == "env":
@@ -860,7 +860,7 @@ func (m *model) goTo(s screen) {
 
 // leave runs then, which moves off the exercise screen. Every way off it goes
 // through here. Leaving the exercise set up on the VMs always ends it: it is
-// cleared and its VMs are stopped. Inside an exam the VMs carry on to the next
+// cleared and its VMs are deleted. Inside an exam the VMs carry on to the next
 // question, so they are left alone.
 func (m *model) leave(then func() tea.Cmd) tea.Cmd {
 	ex := m.cur
@@ -872,9 +872,9 @@ func (m *model) leave(then func() tea.Cmd) tea.Cmd {
 		m.flash = "lab left running — busy: " + m.op
 		return c
 	}
-	// start the stop first: then may open another exercise, whose Output tab
-	// the stop must not take over
-	end := m.startOp("stop", "Ending "+ex.ID+" and stopping its VMs", ex.ID, func(ctx context.Context, w io.Writer) (bool, error) {
+	// start the delete first: then may open another exercise, whose Output tab
+	// the delete must not take over
+	end := m.startOp("stop", "Ending "+ex.ID+" and deleting its VMs", ex.ID, func(ctx context.Context, w io.Writer) (bool, error) {
 		return false, m.endLab(ctx, ex, w)
 	})
 	return tea.Batch(end, then())

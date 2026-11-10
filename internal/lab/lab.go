@@ -611,6 +611,55 @@ func (m *Manager) stopOthers(ctx context.Context, keep Env, log io.Writer) {
 	}
 }
 
+// deleteStopped deletes the VMs of every environment that has a stopped one,
+// so no stopped VM is left behind and the exercise's own environment is
+// rebuilt from fresh VMs instead of booting a stopped one. A whole environment
+// goes at once: a Kubernetes control plane can't be re-created beside an old
+// worker. Stray kl-* instances that are stopped go too. An environment that a
+// verify run is using is left alone. The caller holds m.mu.
+func (m *Manager) deleteStopped(ctx context.Context, log io.Writer) error {
+	all, err := lima.List(ctx)
+	if err != nil {
+		return err
+	}
+	stopped := func(name string) bool { s := all[name].Status; return s != "" && s != "Running" }
+	known := map[string]bool{}
+	for _, env := range AllEnvs() {
+		hasStopped := false
+		for _, vm := range env.VMs {
+			known[vm.Name] = true
+			hasStopped = hasStopped || stopped(vm.Name)
+		}
+		if !hasStopped {
+			continue
+		}
+		if m.busy(env) {
+			fmt.Fprintf(log, "==> leaving %s alone: a awesome_labs verify run is using it\n", env.Title)
+			continue
+		}
+		for _, vm := range env.VMs {
+			if all[vm.Name].Status == "" {
+				continue
+			}
+			fmt.Fprintf(log, "==> deleting %s (%s has a stopped VM)\n", vm.Name, env.Title)
+			if err := lima.Delete(ctx, vm.Name, log); err != nil {
+				return err
+			}
+		}
+		m.SetTainted(env, false)
+		m.clearActiveIn(env)
+	}
+	for name := range all {
+		if !known[name] && strings.HasPrefix(name, "kl-") && stopped(name) {
+			fmt.Fprintf(log, "==> deleting stopped %s\n", name)
+			if err := lima.Delete(ctx, name, log); err != nil {
+				return err
+			}
+		}
+	}
+	return nil
+}
+
 func (m *Manager) lockPath(env Env) string {
 	return filepath.Join(m.StateDir, "busy-"+string(env.Profile)+".pid")
 }
@@ -721,6 +770,9 @@ func (m *Manager) Start(ctx context.Context, ex *exercise.Exercise, log io.Write
 	}
 	if m.AutoStop {
 		m.stopOthers(ctx, env, log)
+	}
+	if err := m.deleteStopped(ctx, log); err != nil {
+		return err
 	}
 	if !m.HoldEnvs {
 		m.ClearActive("") // one exercise at a time: this start replaces it

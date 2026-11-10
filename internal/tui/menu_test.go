@@ -360,7 +360,7 @@ func TestLeavingTheActiveExerciseStopsIt(t *testing.T) {
 				t.Errorf("%s: ended %s, want d-1", name, id)
 			}
 		case <-time.After(2 * time.Second):
-			t.Errorf("%s: left without stopping the lab", name)
+			t.Errorf("%s: left without ending the lab", name)
 		}
 	}
 

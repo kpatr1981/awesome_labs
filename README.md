@@ -179,8 +179,10 @@ shortcut. While the mouse is in use, most terminals select text with `shift`+dra
 | `esc` / `q` | back to where you opened it from |
 
 Leaving the exercise that is set up on the VMs, by any route except the environments
-screen, always ends it and powers off its VMs (a full shutdown, not a pause; the
-containers inside go down with them). During an exam the VMs
+screen, always ends it and **deletes its VMs**, so the next exercise on that
+environment builds fresh ones. Starting an exercise also deletes any environment
+that has a stopped VM (from `x` on the environments screen, or `auto_stop`) instead
+of booting it again. During an exam the VMs
 keep running, since they carry on to the next question. The environments screen goes
 back to the exercise you came from.
 
@@ -221,7 +223,7 @@ awesome_labs exam history    # past results
 
 Only one environment needs to run at a time. With `auto_stop: true` (the default),
 starting a Docker exercise stops the Kubernetes VMs and vice versa, and solving an exercise
-stops its VMs (except during an exam); exiting always deletes every lab VM, running or stopped, and starting deletes any left over. Settings live in `~/.awesome_labs/config.yaml`:
+stops its VMs (except during an exam); the next exercise start deletes stopped VMs, leaving an exercise deletes its VMs, and exiting always deletes every lab VM, running or stopped, and starting deletes any left over. Settings live in `~/.awesome_labs/config.yaml`:
 
 ```yaml
 auto_stop: true
