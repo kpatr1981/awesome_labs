@@ -2,6 +2,7 @@ package tui
 
 import (
 	"fmt"
+	"sort"
 	"strings"
 	"time"
 
@@ -111,6 +112,8 @@ func (m *model) header() string {
 	left := sTitle.Render(" awesome_labs ") + sMuted.Render("hands-on labs")
 	if m.exam != nil {
 		left += "   " + sBigOKInline(m.exam)
+	} else if m.hasActive {
+		left += "   " + sWarn.Render("▶ working on "+m.active.ID) + sMuted.Render(" (a)")
 	}
 	right := sOK.Render(fmt.Sprintf("✔ %d", solved)) + sMuted.Render(fmt.Sprintf("/%d solved  ", len(ids))) +
 		sWarn.Render(fmt.Sprintf("● %d", started)) + sMuted.Render(" in progress ")
@@ -209,7 +212,12 @@ func (m *model) viewBrowse() string {
 			}
 		}
 		mark := m.prog.Get(e.ID).Mark()
+		if m.isActive(e) {
+			mark = "▶"
+		}
 		switch mark {
+		case "▶":
+			mark = sTitle.Render(mark)
 		case "✔":
 			mark = sOK.Render(mark)
 		case "●":
@@ -242,7 +250,7 @@ func (m *model) viewBrowse() string {
 	}
 	prevBox := sBorder.Width(prevW - 2).Height(lh).Render(prev)
 
-	help := "↑↓ move · enter open · / filter · tab track · n/p module · u unsolved · L paths · X exam · e envs · S started · q quit · Q quit+stop VMs"
+	help := "↑↓ move · enter open · / filter · tab track · n/p module · u unsolved · a active · L paths · X exam · e envs & VMs · S started · q quit · Q quit+stop VMs"
 	return lipgloss.JoinVertical(lipgloss.Left,
 		m.header(), bar,
 		lipgloss.JoinHorizontal(lipgloss.Top, list, prevBox),
@@ -381,17 +389,28 @@ func (m *model) refreshViewport(follow bool) {
 }
 
 func (m *model) viewStarted() string {
-	title := sTitle.Render(" Started labs ") + sMuted.Render("in progress, not yet solved")
+	title := sTitle.Render(" Your labs ") + sMuted.Render("one exercise is set up on the VMs at a time")
 	if len(m.started) == 0 {
 		return lipgloss.JoinVertical(lipgloss.Left, title, "",
 			sMuted.Render("  Nothing in progress. Start a lab with s on an exercise."),
 			m.statusLine("esc back"))
 	}
 	var b strings.Builder
+	if !m.hasActive {
+		b.WriteString(sMuted.Render("  No exercise is set up right now.") + "\n\n")
+	}
 	for i, e := range m.started {
 		p := m.prog.Get(e.ID)
-		line := fmt.Sprintf("%-10s %s %s", e.ID, trunc(e.Title, 40),
-			sMuted.Render("· started "+p.Started.Format("2006-01-02 15:04")))
+		if m.isActive(e) && i == 0 {
+			b.WriteString(sHeader.Render("  ▶ Working on") + "\n")
+		} else if i == 0 || m.isActive(m.started[i-1]) {
+			b.WriteString(sHeader.Render("  Started earlier, not solved") + sMuted.Render(" — their lab was reset; press enter, then s to start one again") + "\n")
+		}
+		info := "· started " + p.Started.Format("2006-01-02 15:04")
+		if m.isActive(e) {
+			info = fmt.Sprintf("· since %s · %d checks · %s", m.active.Since.Format("2006-01-02 15:04"), p.Checks, lab.EnvFor(e.Profile).Title)
+		}
+		line := fmt.Sprintf("%-10s %s %s", e.ID, trunc(e.Title, 40), sMuted.Render(info))
 		if i == m.startedCursor {
 			b.WriteString(sTitle.Render("▸ ") + line + "\n")
 		} else {
@@ -425,7 +444,7 @@ func (m *model) markdown(key, src string, w int) string {
 func (m *model) viewEnv() string {
 	var b strings.Builder
 	b.WriteString(m.header() + "\n\n")
-	b.WriteString(sTitle.Render(" Lab environments") + "\n\n")
+	b.WriteString(sTitle.Render(" Lab environments & VMs") + "\n\n")
 	for i, env := range lab.AllEnvs() {
 		st, ok := m.envStatus[env.Profile]
 		if !ok {
@@ -440,9 +459,23 @@ func (m *model) viewEnv() string {
 		default:
 			stStyle = sWarn
 		}
+		active := ""
+		if m.hasActive && m.active.Profile == env.Profile {
+			active = sTitle.Render("  ▶ " + m.active.ID)
+		}
 		var vms []string
 		for _, v := range env.VMs {
-			vms = append(vms, fmt.Sprintf("%s (%s, %d CPU, %s)", v.Name, v.Hostname, v.CPUs, v.Memory))
+			live, ok := m.vmInfo[v.Name]
+			switch {
+			case !ok:
+				vms = append(vms, sMuted.Render(fmt.Sprintf("%s (%s, %d CPU, %s)", v.Name, v.Hostname, v.CPUs, v.Memory)))
+			case live.Running():
+				vms = append(vms, sOK.Render("● ")+fmt.Sprintf("%-12s running   %d CPU %s", v.Name, live.CPUs, live.MemoryLabel()))
+			case live.Status == "":
+				vms = append(vms, sMuted.Render(fmt.Sprintf("○ %-12s not created (%d CPU, %s)", v.Name, v.CPUs, v.Memory)))
+			default:
+				vms = append(vms, sMuted.Render(fmt.Sprintf("○ %-12s %-9s %d CPU %s", v.Name, strings.ToLower(live.Status), live.CPUs, live.MemoryLabel())))
+			}
 		}
 		cur := "  "
 		if i == m.envCursor {
@@ -452,8 +485,28 @@ func (m *model) viewEnv() string {
 		if m.mgr.Tainted(env) {
 			tainted = sWarn.Render("  (will be rebuilt before the next exercise)")
 		}
-		fmt.Fprintf(&b, "%s%-22s %s%s\n", cur, env.Title, stStyle.Render(st), tainted)
-		fmt.Fprintf(&b, "     %s\n\n", sMuted.Render(strings.Join(vms, " · ")))
+		fmt.Fprintf(&b, "%s%-22s %s%s%s\n", cur, env.Title, stStyle.Render(st), active, tainted)
+		for _, v := range vms {
+			fmt.Fprintf(&b, "     %s\n", v)
+		}
+		b.WriteString("\n")
+	}
+	var stray []string
+	n, cpus, mem := 0, 0, int64(0)
+	for _, v := range m.vmInfo {
+		if v.Running() {
+			n, cpus, mem = n+1, cpus+v.CPUs, mem+v.Memory
+		}
+		if v.Env == "" {
+			stray = append(stray, v.Name+" ("+strings.ToLower(v.Status)+")")
+		}
+	}
+	if len(stray) > 0 {
+		sort.Strings(stray)
+		b.WriteString(sWarn.Render("  Other lab VMs: "+strings.Join(stray, ", ")+" — K deletes them too") + "\n\n")
+	}
+	if m.vmInfo != nil {
+		b.WriteString(fmt.Sprintf("  %s\n\n", sMuted.Render(fmt.Sprintf("%d running · %d CPU · %.0f GiB in use", n, cpus, float64(mem)/(1<<30)))))
 	}
 	b.WriteString(sMuted.Render(fmt.Sprintf("  Kubernetes v%s · Calico %s · Traefik ingress/gateway · metrics-server · local-path storage", lab.K8sVersion, lab.CalicoVersion)) + "\n")
 	b.WriteString(sMuted.Render("  First start of an environment takes 5–15 minutes. Full log: "+m.mgr.LogPath()) + "\n\n")
@@ -466,7 +519,7 @@ func (m *model) viewEnv() string {
 		b.WriteString(sBorder.Width(m.w - 2).Render(strings.Join(lines, "\n")))
 		b.WriteString("\n")
 	}
-	help := "↑↓ select · u up/create · x stop · R reset · B rebuild · D delete · r refresh · esc back"
+	help := "↑↓ select · u up/create · x stop · R reset · B rebuild · D delete · X stop all · K delete all · r refresh · esc back"
 	return b.String() + m.statusLine(help)
 }
 

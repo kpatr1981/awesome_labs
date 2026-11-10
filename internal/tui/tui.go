@@ -55,7 +55,10 @@ type opDoneMsg struct {
 	err    error
 	passed bool
 }
-type envStatusMsg map[exercise.Profile]string
+type envStatusMsg struct {
+	status map[exercise.Profile]string
+	vms    map[string]lab.VMInfo
+}
 type shellDoneMsg struct{ err error }
 type tickMsg time.Time
 type stoppedMsg struct{ err error }
@@ -100,7 +103,12 @@ type model struct {
 
 	// env screen
 	envStatus map[exercise.Profile]string
+	vmInfo    map[string]lab.VMInfo
 	envCursor int
+
+	// the one exercise set up on the VMs right now
+	active    lab.Active
+	hasActive bool
 
 	// started-labs screen
 	startedCursor int
@@ -168,9 +176,17 @@ func Run(d Deps) error {
 	if m.exam != nil && m.exam.Over() {
 		m.finishExam()
 	}
+	m.refreshActive()
 	m.refilter()
 	_, err := tea.NewProgram(m, tea.WithAltScreen(), tea.WithMouseCellMotion()).Run()
 	return err
+}
+
+func (m *model) refreshActive() { m.active, m.hasActive = m.mgr.Active() }
+
+// isActive reports whether ex is the exercise currently set up on the VMs.
+func (m *model) isActive(ex *exercise.Exercise) bool {
+	return ex != nil && m.hasActive && m.active.ID == ex.ID
 }
 
 func (m *model) Init() tea.Cmd { return tea.Batch(m.spin.Tick, tick()) }
@@ -360,9 +376,14 @@ func (m *model) cmdShell(worker bool) tea.Cmd {
 func (m *model) cmdEnvStatus() tea.Cmd {
 	return func() tea.Msg {
 		ctx := context.Background()
-		st := envStatusMsg{}
+		st := envStatusMsg{status: map[exercise.Profile]string{}, vms: map[string]lab.VMInfo{}}
 		for _, env := range lab.AllEnvs() {
-			st[env.Profile] = m.mgr.EnvStatus(ctx, env)
+			st.status[env.Profile] = m.mgr.EnvStatus(ctx, env)
+		}
+		if vms, err := m.mgr.VMs(ctx); err == nil {
+			for _, v := range vms {
+				st.vms[v.Name] = v
+			}
 		}
 		return st
 	}
@@ -390,6 +411,14 @@ func (m *model) envAction(action string) tea.Cmd {
 		return run(func(ctx context.Context, w io.Writer) error { return m.mgr.Destroy(ctx, env, w) })
 	case "rebuild":
 		return run(func(ctx context.Context, w io.Writer) error { return m.mgr.Rebuild(ctx, env, w) })
+	case "stop-all":
+		return m.startOp("env", "Stopping all lab VMs", "env", func(ctx context.Context, w io.Writer) (bool, error) {
+			return false, m.mgr.StopAll(ctx, w)
+		})
+	case "delete-all":
+		return m.startOp("env", "Deleting all lab VMs", "env", func(ctx context.Context, w io.Writer) (bool, error) {
+			return false, m.mgr.DeleteAll(ctx, w)
+		})
 	}
 	return nil
 }
@@ -424,6 +453,7 @@ func (m *model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 
 	case opDoneMsg:
 		m.op = ""
+		m.refreshActive()
 		b := m.out(msg.id)
 		switch {
 		case msg.err != nil:
@@ -445,17 +475,20 @@ func (m *model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 				m.flash = "not yet — read the failing checks in Output"
 			}
 		case msg.kind == "env":
-			m.flash = "done"
+			if msg.err == nil {
+				m.flash = "done"
+			}
 			return m, m.cmdEnvStatus()
 		}
 		m.refreshViewport(true)
 		return m, nil
 
 	case envStatusMsg:
-		m.envStatus = msg
+		m.envStatus, m.vmInfo = msg.status, msg.vms
 		return m, nil
 
 	case tickMsg:
+		m.refreshActive()
 		if m.exam != nil && m.exam.Over() && m.op == "" {
 			m.finishExam()
 			m.screen = scrExamResult
@@ -606,6 +639,12 @@ func (m *model) updateBrowse(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 		return m, m.cmdEnvStatus()
 	case "S":
 		m.openStarted()
+	case "a":
+		if ex := m.cat.Get(m.active.ID); m.hasActive && ex != nil {
+			m.openDetail(ex)
+		} else {
+			m.flash = "no exercise in progress — open one and press s to start it"
+		}
 	case "L":
 		m.screen = scrPaths
 	case "X":
@@ -674,6 +713,11 @@ func (m *model) updateDetail(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 	case "s":
 		if m.op != "" {
 			m.flash = "busy: " + m.op
+			return m, nil
+		}
+		if m.hasActive && m.active.ID != ex.ID && m.exam == nil {
+			m.confirm = "You're working on " + m.active.ID + " — starting " + ex.ID + " replaces it and resets the lab. Continue? (y/n)"
+			m.onYes = m.cmdStart
 			return m, nil
 		}
 		if !m.prog.Get(ex.ID).Started.IsZero() || m.result[ex.ID] != "" {
@@ -814,12 +858,16 @@ func (m *model) askForget() {
 	}
 }
 
-// startedLabs returns the exercises started but not yet solved, in catalog order.
+// startedLabs returns the active exercise first, then the others started but
+// not yet solved, in catalog order.
 func (m *model) startedLabs() []*exercise.Exercise {
 	var out []*exercise.Exercise
+	if ex := m.cat.Get(m.active.ID); m.hasActive && ex != nil {
+		out = append(out, ex)
+	}
 	for _, e := range m.cat.Exercises {
 		p := m.prog.Get(e.ID)
-		if !p.Started.IsZero() && p.Solved.IsZero() {
+		if !p.Started.IsZero() && p.Solved.IsZero() && !m.isActive(e) {
 			out = append(out, e)
 		}
 	}
@@ -827,6 +875,7 @@ func (m *model) startedLabs() []*exercise.Exercise {
 }
 
 func (m *model) openStarted() {
+	m.refreshActive()
 	m.started = m.startedLabs()
 	if m.startedCursor >= len(m.started) {
 		m.startedCursor = max(0, len(m.started)-1)
@@ -922,6 +971,11 @@ func (m *model) updateEnv(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 	case "B":
 		m.confirm = "Destroy and rebuild this environment from scratch (takes minutes)? (y/n)"
 		m.onYes = func() tea.Cmd { return m.envAction("rebuild") }
+	case "X":
+		return m, m.envAction("stop-all")
+	case "K":
+		m.confirm = "Delete ALL lab VMs (every environment)? They are re-created on the next start. (y/n)"
+		m.onYes = func() tea.Cmd { return m.envAction("delete-all") }
 	}
 	return m, nil
 }

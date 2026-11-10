@@ -516,6 +516,7 @@ func (m *Manager) Reset(ctx context.Context, env Env, log io.Writer) error {
 	if err := m.pushKit(ctx, env, log); err != nil {
 		return err
 	}
+	m.clearActiveIn(env)
 	return m.reset(ctx, env, log)
 }
 
@@ -683,6 +684,7 @@ func (m *Manager) Destroy(ctx context.Context, env Env, log io.Writer) error {
 		}
 	}
 	m.SetTainted(env, false)
+	m.clearActiveIn(env)
 	return nil
 }
 
@@ -715,6 +717,9 @@ func (m *Manager) Start(ctx context.Context, ex *exercise.Exercise, log io.Write
 	if m.AutoStop {
 		m.stopOthers(ctx, env, log)
 	}
+	if !m.HoldEnvs {
+		m.ClearActive("") // one exercise at a time: this start replaces it
+	}
 	if m.Tainted(env) {
 		fmt.Fprintf(log, "==> the previous exercise changed the cluster beyond repair — rebuilding %s\n", env.Title)
 		for _, vm := range env.VMs {
@@ -745,6 +750,9 @@ func (m *Manager) Start(ctx context.Context, ex *exercise.Exercise, log io.Write
 		m.SetTainted(env, true)
 	}
 	task := fmt.Sprintf("# %s — %s\n\n%s\n", ex.ID, ex.Title, strings.TrimSpace(ex.Scenario))
+	if !m.HoldEnvs { // verify runs through every exercise; it isn't the user's work
+		m.setActive(ex)
+	}
 	_, _ = m.root(ctx, env.Primary(), fmt.Sprintf("echo %s > /var/lib/kubelab/current\nsource /opt/kubelab/lib.sh\nlab_file /lab/TASK.md <<'AWESOME_LABS_TASK_EOF'\n%s\nAWESOME_LABS_TASK_EOF", ex.ID, task), nil, io.Discard)
 	fmt.Fprintf(log, "==> ready: open a terminal and solve the task\n")
 	return nil
@@ -775,6 +783,9 @@ func (m *Manager) Check(ctx context.Context, ex *exercise.Exercise, log io.Write
 		if err := run(w, ex.CheckWorker); err != nil {
 			return false, err
 		}
+	}
+	if ok && !m.HoldEnvs {
+		m.ClearActive(ex.ID) // solved: no longer being worked on
 	}
 	return ok, nil
 }

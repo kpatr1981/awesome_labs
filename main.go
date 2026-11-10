@@ -34,6 +34,7 @@ usage:
   awesome_labs                         open the interactive exercise browser
   awesome_labs install [--dry-run] [--yes] [--bin-dir DIR]
                                   detect the OS, install Lima and QEMU, and put this binary on your PATH
+  awesome_labs status                  the exercise you're working on and the running VMs
   awesome_labs list [filter]           list exercises
   awesome_labs paths [path-id]         learning paths and your progress
   awesome_labs exam [status|history|abandon]  timed exams (start one from the UI with X)
@@ -43,6 +44,7 @@ usage:
   awesome_labs forget <id>             erase your progress on an exercise
   awesome_labs shell [docker|k8s|node01|offsec]  open a shell in a lab VM
   awesome_labs env status|up|stop|destroy|rebuild|reset [docker|k8s|offsec]
+  awesome_labs vms [stop|delete <name|all>]  list lab VMs, or stop/delete them
   awesome_labs verify [-from id] [ids or prefixes...]
                                   author tool: setup -> check fails -> solve -> check passes
   awesome_labs lint                    validate all exercise files
@@ -217,6 +219,10 @@ func run(args []string) error {
 		}
 		c := mgr.ShellCommand(env, worker)
 		return c.Run()
+	case "status":
+		return statusCmd(ctx, cat, mgr, prog)
+	case "vms":
+		return vmsCmd(ctx, mgr, rest)
 	case "paths":
 		return pathsCmd(paths, prog, rest)
 	case "exam":
@@ -230,6 +236,106 @@ func run(args []string) error {
 		return fmt.Errorf("unknown command %q", cmd)
 	}
 	return nil
+}
+
+func statusCmd(ctx context.Context, cat *exercise.Catalog, mgr *lab.Manager, prog *progress.Store) error {
+	if a, ok := mgr.Active(); ok {
+		title := ""
+		if ex := cat.Get(a.ID); ex != nil {
+			title = ex.Title
+		}
+		e := prog.Get(a.ID)
+		fmt.Printf("working on  %s — %s\n            started %s · %d checks · %d hints\n",
+			a.ID, title, a.Since.Format("2006-01-02 15:04"), e.Checks, e.HintsUsed)
+		fmt.Printf("            awesome_labs check %s · awesome_labs shell %s\n", a.ID, a.Profile)
+	} else {
+		fmt.Println("working on  nothing — start an exercise with: awesome_labs start <id>")
+	}
+	vms, err := mgr.VMs(ctx)
+	if err != nil {
+		return err
+	}
+	fmt.Println()
+	printVMs(vms, true)
+	return nil
+}
+
+func printVMs(vms []lab.VMInfo, runningOnly bool) {
+	n, cpus, mem := 0, 0, int64(0)
+	for _, v := range vms {
+		if v.Running() {
+			n, cpus, mem = n+1, cpus+v.CPUs, mem+v.Memory
+		}
+	}
+	if runningOnly && n == 0 {
+		fmt.Println("no lab VMs running")
+		return
+	}
+	fmt.Printf("%-14s %-24s %-11s %4s %7s\n", "VM", "ENVIRONMENT", "STATUS", "CPU", "MEMORY")
+	for _, v := range vms {
+		if runningOnly && !v.Running() {
+			continue
+		}
+		st, env := v.Status, v.Env
+		if st == "" {
+			st = "not created"
+		}
+		if env == "" {
+			env = "(stray)"
+		}
+		cpu := "-"
+		if v.CPUs > 0 {
+			cpu = fmt.Sprint(v.CPUs)
+		}
+		fmt.Printf("%-14s %-24s %-11s %4s %7s\n", v.Name, env, st, cpu, v.MemoryLabel())
+	}
+	fmt.Printf("\n%d running · %d CPU · %.0f GiB\n", n, cpus, float64(mem)/(1<<30))
+}
+
+func vmsCmd(ctx context.Context, mgr *lab.Manager, args []string) error {
+	if len(args) == 0 || args[0] == "list" {
+		vms, err := mgr.VMs(ctx)
+		if err != nil {
+			return err
+		}
+		printVMs(vms, false)
+		return nil
+	}
+	action := args[0]
+	if action != "stop" && action != "delete" {
+		return fmt.Errorf("unknown vms action %q (stop|delete)", action)
+	}
+	if len(args) < 2 {
+		return fmt.Errorf("vms %s needs a VM name or all", action)
+	}
+	target := args[1]
+	if target == "all" {
+		if action == "stop" {
+			return mgr.StopAll(ctx, os.Stdout)
+		}
+		return mgr.DeleteAll(ctx, os.Stdout)
+	}
+	vms, err := mgr.VMs(ctx)
+	if err != nil {
+		return err
+	}
+	for _, v := range vms {
+		if v.Name != target {
+			continue
+		}
+		if v.Status == "" {
+			return fmt.Errorf("%s is not created", target)
+		}
+		if action == "stop" {
+			if !v.Running() {
+				fmt.Printf("%s is already %s\n", target, strings.ToLower(v.Status))
+				return nil
+			}
+			return mgr.StopVM(ctx, target, os.Stdout)
+		}
+		return mgr.DeleteVM(ctx, target, os.Stdout)
+	}
+	return fmt.Errorf("no lab VM %q (see: awesome_labs vms)", target)
 }
 
 func stars(d int) string { return strings.Repeat("★", d) + strings.Repeat("☆", 5-d) }

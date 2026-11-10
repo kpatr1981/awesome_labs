@@ -126,7 +126,9 @@ builds one for Linux and macOS on x86-64 and ARM into `dist/`, with checksums.
 | `enter` | open an exercise |
 | `L` | **learning paths** — focus the list on a curated path, with progress |
 | `X` | **exam mode** — start a timed exam, or return to the running one |
-| `e` | environments screen (create, stop, reset, rebuild, delete VMs) |
+| `a` | jump to the exercise you're **working on** (shown as `▶` in the header and list) |
+| `S` | your labs: the active exercise, then others started earlier and not solved |
+| `e` | environments & VMs: live state of every VM; create, stop, reset, rebuild, delete — `X` stops all, `K` deletes all |
 | `Q` | quit **and stop all lab VMs** |
 
 ### In an exercise
@@ -193,6 +195,7 @@ worker:       {cpus: 2, memory: 2560MiB}
 
 ```bash
 awesome_labs install [--dry-run] [--yes] [--bin-dir DIR]   # set up Lima, QEMU and the binary
+awesome_labs status                     # the exercise you're working on + running VMs
 awesome_labs list [filter]              # list exercises (✔ solved, ● started)
 awesome_labs paths [path-id]            # learning paths and progress
 awesome_labs show k8s-101 [--solution]
@@ -201,7 +204,13 @@ awesome_labs shell docker|k8s|node01|offsec    # open a shell
 awesome_labs check docker-042           # grade (exit code 0 = solved)
 awesome_labs forget docker-042          # erase progress on one exercise
 awesome_labs env status|up|stop|reset|rebuild|destroy [docker|k8s|offsec]
+awesome_labs vms                        # every lab VM with status, CPU and memory
+awesome_labs vms stop|delete <name|all> # e.g. vms delete kl-offsec · vms stop all
 ```
+
+You work on **one exercise at a time**: starting one resets its environment, so it
+replaces whatever was set up before (the UI asks first). It stops being active when
+you solve it, or when its environment is reset, rebuilt or deleted.
 
 Progress is stored in `~/.awesome_labs/progress.json`, logs in `~/.awesome_labs/logs/`.
 
