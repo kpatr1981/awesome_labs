@@ -65,7 +65,7 @@ func (m *model) viewPaths() string {
 	var b strings.Builder
 	b.WriteString("\n")
 	t := sTitle.Render(" Learning paths") + sMuted.Render("  — pick one to focus the exercise list on it") + "   "
-	b.WriteString(m.titleButtons(t, 1, button{"Apply", "enter"}, button{"Back", "esc"}) + "\n\n")
+	b.WriteString(m.titleButtons(t, 1, button{label: "Apply", key: "enter"}, button{label: "Back", key: "esc"}) + "\n\n")
 	for i, p := range m.paths {
 		s, t := m.pathProgress(p)
 		cur := "  "
@@ -196,7 +196,7 @@ func (m *model) viewExamSetup() string {
 	var b strings.Builder
 	b.WriteString("\n")
 	t := sTitle.Render(" New exam") + "   "
-	b.WriteString(m.titleButtons(t, 1, button{"Start exam", "enter"}, button{"Cancel", "esc"}) + "\n\n")
+	b.WriteString(m.titleButtons(t, 1, button{label: "Start exam", key: "enter"}, button{label: "Cancel", key: "esc"}) + "\n\n")
 	rows := []struct{ label, value string }{
 		{"Pool", fmt.Sprintf("%s  (%d exercises)", srcs[m.setupSource].label, len(srcs[m.setupSource].pool))},
 		{"Questions", fmt.Sprint(examCounts[m.setupCount])},
@@ -239,16 +239,14 @@ func (m *model) updateExam(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 		m.examCursor = min(len(e.Questions)-1, m.examCursor+1)
 	case "enter":
 		if ex := m.cat.Get(e.Questions[m.examCursor].ID); ex != nil {
-			m.openDetail(ex)
-			m.fromExam = true
+			m.openDetail(ex, scrExam)
 		}
 	case "F":
-		m.confirm = "Finish the exam now and see your result? (y/n)"
-		m.onYes = func() tea.Cmd {
+		m.ask("Finish the exam now and see your result?", func() tea.Cmd {
 			m.finishExam()
 			m.screen = scrExamResult
 			return nil
-		}
+		}, nil)
 	}
 	return m, nil
 }
@@ -317,7 +315,7 @@ func (m *model) updateExamResult(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 	case "o":
 		if e != nil {
 			if ex := m.cat.Get(e.Questions[m.examCursor].ID); ex != nil {
-				m.openDetail(ex)
+				m.openDetail(ex, scrExamResult)
 			}
 		}
 	}

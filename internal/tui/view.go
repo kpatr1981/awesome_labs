@@ -4,12 +4,10 @@ import (
 	"fmt"
 	"sort"
 	"strings"
-	"time"
 
 	"github.com/charmbracelet/glamour"
 	"github.com/charmbracelet/lipgloss"
 
-	"awesome_labs/internal/exam"
 	"awesome_labs/internal/exercise"
 	"awesome_labs/internal/lab"
 )
@@ -22,17 +20,16 @@ var (
 	colBad    = lipgloss.AdaptiveColor{Light: "#cf222e", Dark: "#ff7b72"}
 	colSelBg  = lipgloss.AdaptiveColor{Light: "#dbeafe", Dark: "#1f3a5f"}
 
-	sTitle   = lipgloss.NewStyle().Bold(true).Foreground(colAccent)
-	sMuted   = lipgloss.NewStyle().Foreground(colMuted)
-	sOK      = lipgloss.NewStyle().Foreground(colOK)
-	sWarn    = lipgloss.NewStyle().Foreground(colWarn)
-	sBad     = lipgloss.NewStyle().Foreground(colBad)
-	sSel     = lipgloss.NewStyle().Background(colSelBg).Bold(true)
-	sHeader  = lipgloss.NewStyle().Bold(true).Foreground(colWarn)
-	sTabOn   = lipgloss.NewStyle().Bold(true).Foreground(colAccent).Underline(true).Padding(0, 1)
-	sTabOff  = lipgloss.NewStyle().Foreground(colMuted).Padding(0, 1)
-	sBorder  = lipgloss.NewStyle().Border(lipgloss.RoundedBorder()).BorderForeground(colMuted)
-	sConfirm = lipgloss.NewStyle().Bold(true).Foreground(colWarn)
+	sTitle  = lipgloss.NewStyle().Bold(true).Foreground(colAccent)
+	sMuted  = lipgloss.NewStyle().Foreground(colMuted)
+	sOK     = lipgloss.NewStyle().Foreground(colOK)
+	sWarn   = lipgloss.NewStyle().Foreground(colWarn)
+	sBad    = lipgloss.NewStyle().Foreground(colBad)
+	sSel    = lipgloss.NewStyle().Background(colSelBg).Bold(true)
+	sHeader = lipgloss.NewStyle().Bold(true).Foreground(colWarn)
+	sTabOn  = lipgloss.NewStyle().Bold(true).Foreground(colAccent).Underline(true).Padding(0, 1)
+	sTabOff = lipgloss.NewStyle().Foreground(colMuted).Padding(0, 1)
+	sBorder = lipgloss.NewStyle().Border(lipgloss.RoundedBorder()).BorderForeground(colMuted)
 )
 
 func diffStyle(d int) lipgloss.Style {
@@ -106,12 +103,13 @@ func (m *model) View() string {
 	if len(lines) > m.h {
 		lines = lines[:m.h]
 	}
-	out := m.menuBar() + "\n" + strings.Join(lines, "\n")
-	if m.menuOpen >= len(m.menus()) { // the screen changed under an open menu
+	mns := m.menus()            // once per frame: the bar and the open menu share it
+	if m.menuOpen >= len(mns) { // the screen changed under an open menu
 		m.closeMenu()
 	}
+	out := m.menuBar(mns) + "\n" + strings.Join(lines, "\n")
 	if m.menuOpen >= 0 {
-		box, x := m.dropdown()
+		box, x := m.dropdown(mns[m.menuOpen])
 		out = overlay(out, box, x, 1)
 	}
 	if m.confirm != "" {
@@ -126,10 +124,9 @@ func (m *model) View() string {
 	return out
 }
 
+// statusLine shows the running operation or the last message, then help. A
+// pending question is in its dialog, not here.
 func (m *model) statusLine(help string) string {
-	if m.confirm != "" {
-		return sConfirm.Render(" " + m.confirm)
-	}
 	var s string
 	if m.op != "" {
 		s = " " + m.spin.View() + " " + sWarn.Render(m.op+"…") + "  "
@@ -300,25 +297,33 @@ func (m *model) viewDetail() string {
 		x += lipgloss.Width(t)
 	}
 	tabRow := strings.Join(tabs, "")
-	bs := []button{{"▶ Start", "s"}, {"Terminal", "t"}}
+	// terminals and checks need the lab set up, which only the active
+	// exercise has: dimmed otherwise, they say why when pressed
+	active := m.isActive(e)
+	start := "▶ Start"
+	if active {
+		start = "↻ Restart"
+	}
+	bs := []button{{label: start, key: "s"}, {label: "Terminal", key: "t", off: !active}}
 	if e.Profile == exercise.ProfileK8s {
-		bs = append(bs, button{"node01", "w"})
+		bs = append(bs, button{label: "node01", key: "w", off: !active})
 	}
-	bs = append(bs, button{"✔ Check", "c"})
+	bs = append(bs, button{label: "✔ Check", key: "c", off: !active})
 	if !m.examLocked(e) {
-		bs = append(bs, button{"Hint", "h"}, button{"Solution", "v"})
+		bs = append(bs, button{label: "Hint", key: "h"}, button{label: "Solution", key: "v"})
 	}
-	bs = append(bs, button{"Back", "esc"})
+	bs = append(bs, button{label: "Back", key: "esc"})
 	if bare, bw, ok := fitButtons(m.w-x-2, bs); ok {
 		gap := m.w - x - bw
 		tabRow += strings.Repeat(" ", gap) + m.buttons(x+gap, 1, bare, bs...)
 	}
 	box := sBorder.Width(m.w - 2).Render(m.vp.View())
 	// the buttons above and the menus cover the actions; list only the rest
-	help := "tab switch · n/N next/prev · F10 menu · F1 keys"
-	if m.examLocked(e) {
-		help = "tab switch · n/N next/prev question · esc exam · F10 menu · F1 keys"
+	back := map[screen]string{scrStarted: "started labs", scrExam: "exam", scrExamResult: "exam result"}[m.back]
+	if back == "" {
+		back = "list"
 	}
+	help := "←→ switch tab · n/N next/previous " + m.siblingNoun() + " · esc back to the " + back + " · F10 menu · F1 keys"
 	return lipgloss.JoinVertical(lipgloss.Left, title, tabRow, box, m.statusLine(help))
 }
 
@@ -383,7 +388,7 @@ func (m *model) refreshViewport(follow bool) {
 
 func (m *model) viewStarted() string {
 	title := sTitle.Render(" Your labs ") + sMuted.Render("one exercise is set up on the VMs at a time") + "   "
-	title = m.titleButtons(title, 0, button{"Open", "enter"}, button{"Reset selected", "r"}, button{"Reset all", "A"}, button{"Back", "esc"})
+	title = m.titleButtons(title, 0, button{label: "Open", key: "enter"}, button{label: "Reset selected", key: "r"}, button{label: "Reset all", key: "A"}, button{label: "Back", key: "esc"})
 	if len(m.started) == 0 {
 		return lipgloss.JoinVertical(lipgloss.Left, title, "",
 			sMuted.Render("  No started labs. Start a lab with s on an exercise."),
@@ -440,8 +445,8 @@ func (m *model) viewEnv() string {
 	var b strings.Builder
 	b.WriteString("\n")
 	t := sTitle.Render(" Lab environments & VMs") + "   "
-	b.WriteString(m.titleButtons(t, 1, button{"Start", "u"}, button{"Stop", "x"}, button{"Reset", "R"},
-		button{"Rebuild", "B"}, button{"Delete", "D"}, button{"Stop all", "X"}, button{"Delete all", "K"}, button{"Refresh", "r"}, button{"Back", "esc"}) + "\n\n")
+	b.WriteString(m.titleButtons(t, 1, button{label: "Start", key: "u"}, button{label: "Stop", key: "x"}, button{label: "Reset", key: "R"},
+		button{label: "Rebuild", key: "B"}, button{label: "Delete", key: "D"}, button{label: "Stop all", key: "X"}, button{label: "Delete all", key: "K"}, button{label: "Refresh", key: "r"}, button{label: "Back", key: "esc"}) + "\n\n")
 	for i, env := range lab.AllEnvs() {
 		st, ok := m.envStatus[env.Profile]
 		if !ok {
@@ -539,17 +544,4 @@ func padRight(s string, w int) string {
 		return s + strings.Repeat(" ", d)
 	}
 	return s
-}
-
-// sBigOKInline renders the exam countdown for the header.
-func sBigOKInline(e *exam.Exam) string {
-	left := e.Remaining()
-	st := sOK
-	if left < 10*time.Minute {
-		st = sBad
-	} else if left < 30*time.Minute {
-		st = sWarn
-	}
-	p, n, _ := e.Score()
-	return st.Bold(true).Render("EXAM "+exam.FormatDuration(left)) + sMuted.Render(fmt.Sprintf(" %d/%d · X", p, n))
 }

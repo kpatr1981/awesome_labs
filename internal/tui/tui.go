@@ -89,8 +89,10 @@ type model struct {
 	vp        viewport.Model
 	hintsShow int
 	solShow   bool
+	back      screen // where the exercise screen returns to
 	confirm   string // pending confirmation question
 	onYes     func() tea.Cmd
+	onNo      func() tea.Cmd
 
 	// operations
 	op     string // running operation label, "" = idle
@@ -105,6 +107,7 @@ type model struct {
 	envStatus map[exercise.Profile]string
 	vmInfo    map[string]lab.VMInfo
 	envCursor int
+	envBack   screen // where the environments screen returns to
 
 	// the one exercise set up on the VMs right now
 	active    lab.Active
@@ -114,9 +117,10 @@ type model struct {
 	startedCursor int
 	started       []*exercise.Exercise
 
-	style   string
-	mdMu    sync.Mutex
-	mdCache map[string]string
+	style    string
+	trackIDs map[string][]string // exercise ids per track, "" = all of them
+	mdMu     sync.Mutex
+	mdCache  map[string]string
 
 	// learning paths
 	paths      []*exercise.Path
@@ -134,12 +138,11 @@ type model struct {
 	setupMins   int
 	setupHints  bool
 	quitting    bool
-	fromExam    bool // detail opened from the exam screen
 
 	// menus, dialogs and the mouse
-	menuOpen    int // index of the open menu, -1 = none
-	menuItem    int
-	menuX       []int // x of each menu title
+	menuOpen    int    // index of the open menu, -1 = none
+	menuSel     string // label of the highlighted item of the open menu
+	menuX       []int  // x of each menu title
 	modal       string
 	confirmYes  bool // the Yes button of the confirmation has the focus
 	zones       []zone
@@ -148,9 +151,14 @@ type model struct {
 	lastClickAt time.Time
 }
 
+// inExam reports whether ex is a question of the running exam.
+func (m *model) inExam(ex *exercise.Exercise) bool {
+	return ex != nil && m.exam != nil && !m.exam.Over() && m.exam.Has(ex.ID)
+}
+
 // examLocked reports whether hints/solution of ex are hidden by a running exam.
 func (m *model) examLocked(ex *exercise.Exercise) bool {
-	return ex != nil && m.exam != nil && !m.exam.Over() && m.exam.Has(ex.ID) && !m.exam.AllowHints
+	return m.inExam(ex) && !m.exam.AllowHints
 }
 
 // Deps are the services the TUI works with.
@@ -164,11 +172,17 @@ type Deps struct {
 
 // Run starts the TUI.
 func Run(d Deps) error {
-	cat, mgr, prog := d.Catalog, d.Manager, d.Progress
 	style := "dark"
 	if !lipgloss.HasDarkBackground() {
 		style = "light"
 	}
+	m := newModel(d, style)
+	_, err := tea.NewProgram(m, tea.WithAltScreen(), tea.WithMouseAllMotion()).Run()
+	return err
+}
+
+func newModel(d Deps, style string) *model {
+	cat, mgr, prog := d.Catalog, d.Manager, d.Progress
 	ti := textinput.New()
 	ti.Placeholder = "type to filter (id, title, tag, module)…"
 	ti.Prompt = "/ "
@@ -187,10 +201,14 @@ func Run(d Deps) error {
 	if m.exam != nil && m.exam.Over() {
 		m.finishExam()
 	}
+	m.trackIDs = map[string][]string{}
+	for _, e := range cat.Exercises {
+		m.trackIDs[e.Track] = append(m.trackIDs[e.Track], e.ID)
+		m.trackIDs[""] = append(m.trackIDs[""], e.ID)
+	}
 	m.refreshActive()
 	m.refilter()
-	_, err := tea.NewProgram(m, tea.WithAltScreen(), tea.WithMouseAllMotion()).Run()
-	return err
+	return m
 }
 
 func (m *model) refreshActive() { m.active, m.hasActive = m.mgr.Active() }
@@ -672,13 +690,6 @@ func (m *model) updateBrowse(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 		m.refilter()
 	case "u":
 		m.setProgFilter((m.progFilter + 1) % progFilterCount)
-	case "e":
-		m.screen = scrEnv
-		return m, m.cmdEnvStatus()
-	case "S":
-		m.openStarted()
-	case "a":
-		m.goActive()
 	case "L":
 		m.screen = scrPaths
 	case "X":
@@ -687,19 +698,19 @@ func (m *model) updateBrowse(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 		} else {
 			m.screen = scrExamSetup
 		}
-	case "Q":
-		return m, m.quitAndStop()
 	case "enter", "right", "l":
 		if len(m.visible) > 0 {
-			m.openDetail(m.visible[m.cursor])
+			m.openDetail(m.visible[m.cursor], scrBrowse)
 		}
 	}
 	return m, nil
 }
 
-func (m *model) openDetail(ex *exercise.Exercise) {
+// openDetail opens ex on the exercise screen; back is the screen it returns
+// to, and the list there is the one n/N walk.
+func (m *model) openDetail(ex *exercise.Exercise, back screen) {
 	m.cur = ex
-	m.fromExam = false
+	m.back = back
 	m.screen = scrDetail
 	m.tab = tabScenario
 	m.solShow = m.prog.Get(ex.ID).SawSolution
@@ -712,96 +723,76 @@ func (m *model) openDetail(ex *exercise.Exercise) {
 	m.vp.GotoTop()
 }
 
+func (m *model) setTab(t tab) {
+	m.tab = t
+	m.refreshViewport(false)
+	m.vp.GotoTop()
+}
+
 func (m *model) updateDetail(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 	ex := m.cur
 	k := msg.String()
 	switch k {
-	case "esc", "q", "backspace", "left":
-		return m, m.leaveExercise()
+	case "esc", "q":
+		m.flash = ""
+		return m, m.leave(func() tea.Cmd { m.goTo(m.back); return nil })
 	case "tab", "right", "l":
-		m.tab = (m.tab + 1) % 5
-		m.refreshViewport(false)
-		m.vp.GotoTop()
-	case "shift+tab":
-		m.tab = (m.tab + 4) % 5
-		m.refreshViewport(false)
-		m.vp.GotoTop()
+		m.setTab((m.tab + 1) % 5)
+	case "shift+tab", "left":
+		m.setTab((m.tab + 4) % 5)
 	case "1", "2", "3", "4", "5":
-		m.tab = tab(k[0] - '1')
-		if m.tab == tabSolution && !m.solShow {
+		t := tab(k[0] - '1')
+		if t == tabSolution && !m.solShow {
 			return m, m.askSolution()
 		}
-		m.refreshViewport(false)
-		m.vp.GotoTop()
+		m.setTab(t)
 	case "s":
 		if m.op != "" {
 			m.flash = "busy: " + m.op
 			return m, nil
 		}
 		if m.hasActive && m.active.ID != ex.ID && m.exam == nil {
-			m.confirm = "You're working on " + m.active.ID + " — starting " + ex.ID + " replaces it and resets the lab. Continue? (y/n)"
-			m.onYes = m.cmdStart
+			m.ask("You're working on "+m.active.ID+" — starting "+ex.ID+" replaces it and resets the lab. Continue?", m.cmdStart, nil)
 			return m, nil
 		}
-		if !m.prog.Get(ex.ID).Started.IsZero() || m.result[ex.ID] != "" {
-			m.confirm = "Reset the lab and set this exercise up from scratch? (y/n)"
-			m.onYes = m.cmdStart
+		if m.wasStarted(ex) {
+			m.ask("Reset the lab and set this exercise up from scratch?", m.cmdStart, nil)
 			return m, nil
 		}
 		return m, m.cmdStart()
-	case "t":
-		if m.op != "" {
+	case "t", "w", "c":
+		switch {
+		case m.op != "":
 			m.flash = "wait for: " + m.op
-			return m, nil
-		}
-		return m, m.cmdShell(false)
-	case "w":
-		if ex.Profile != exercise.ProfileK8s {
+		case k == "w" && ex.Profile != exercise.ProfileK8s:
 			m.flash = "node01 exists only in the Kubernetes lab"
-			return m, nil
+		case !m.isActive(ex):
+			// every start resets the environment, so the VMs hold another
+			// exercise's lab, or none: a check would grade the wrong thing
+			m.flash = "the lab isn't set up for " + ex.ID + " — press s to start it"
+		case k == "c":
+			return m, m.cmdCheck()
+		default:
+			return m, m.cmdShell(k == "w")
 		}
-		return m, m.cmdShell(true)
-	case "c":
-		return m, m.cmdCheck()
+		return m, nil
 	case "h", "H":
 		return m, m.revealHint()
 	case "v":
 		return m, m.askSolution()
 	case "R":
-		m.askForget()
+		m.askForget(ex, "Forget all progress on this exercise, including solved status?", func() {
+			m.solShow, m.hintsShow = false, 0
+			m.flash = "progress reset"
+			m.setTab(tabScenario)
+		})
 		return m, nil
 	case "n", "N":
-		if m.fromExam && m.exam != nil {
-			d := 1
-			if k == "N" {
-				d = -1
-			}
-			for i, q := range m.exam.Questions {
-				if q.ID == ex.ID {
-					j := i + d
-					if j >= 0 && j < len(m.exam.Questions) {
-						m.examCursor = j
-						m.openDetail(m.cat.Get(m.exam.Questions[j].ID))
-						m.fromExam = true
-					}
-					break
-				}
-			}
-			return m, nil
+		d := 1
+		if k == "N" {
+			d = -1
 		}
-		// next / previous exercise
-		for i, e := range m.cat.Exercises {
-			if e == ex {
-				j := i + 1
-				if k == "N" {
-					j = i - 1
-				}
-				if j >= 0 && j < len(m.cat.Exercises) {
-					m.openDetail(m.cat.Exercises[j])
-				}
-				break
-			}
-		}
+		return m, m.step(d)
 	default:
 		var c tea.Cmd
 		m.vp, c = m.vp.Update(msg)
@@ -810,27 +801,138 @@ func (m *model) updateDetail(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 	return m, nil
 }
 
-// leaveExercise goes back from the exercise screen. Leaving the exercise that is
-// set up on the VMs ends it and stops its VMs; inside an exam the VMs carry on
-// to the next question, so they are left alone.
-func (m *model) leaveExercise() tea.Cmd {
-	ex := m.cur
-	m.flash = ""
-	if m.fromExam {
-		m.screen = scrExam
-		return nil
+// wasStarted reports whether a lab was ever set up for ex.
+func (m *model) wasStarted(ex *exercise.Exercise) bool {
+	return ex != nil && (!m.prog.Get(ex.ID).Started.IsZero() || m.result[ex.ID] != "")
+}
+
+// hasProgress reports whether anything is recorded for ex.
+func (m *model) hasProgress(ex *exercise.Exercise) bool {
+	return ex != nil && (!m.prog.Get(ex.ID).IsZero() || m.result[ex.ID] != "")
+}
+
+// ask shows a Yes/No dialog; yes or no (either may be nil) runs on the answer.
+func (m *model) ask(q string, yes, no func() tea.Cmd) {
+	m.confirm, m.confirmYes = q, false
+	m.onYes, m.onNo = yes, no
+}
+
+// goTo shows screen s, or the exercise list when s has nothing left to show.
+func (m *model) goTo(s screen) {
+	switch {
+	case s == scrStarted:
+		m.openStarted()
+		return
+	case s == scrDetail && m.cur == nil, s == scrExam && m.exam == nil, s == scrExamResult && m.finished == nil:
+		s = scrBrowse
 	}
-	m.screen = scrBrowse
-	if m.exam != nil || !m.isActive(ex) {
-		return nil
+	m.screen = s
+	if s == scrDetail { // its output may have grown while it was away
+		m.refreshViewport(false)
+	}
+}
+
+// leave runs then, which moves off the exercise screen. Every way off it goes
+// through here. Leaving the exercise set up on the VMs asks whether to end it:
+// yes clears it and stops its VMs, no leaves them running. Inside an exam the
+// VMs carry on to the next question, so nothing is asked.
+func (m *model) leave(then func() tea.Cmd) tea.Cmd {
+	ex := m.cur
+	if m.screen != scrDetail || m.exam != nil || !m.isActive(ex) {
+		return then()
 	}
 	if m.op != "" {
+		c := then()
 		m.flash = "lab left running — busy: " + m.op
-		return nil
+		return c
 	}
-	return m.startOp("stop", "Ending "+ex.ID+" and stopping its VMs", ex.ID, func(ctx context.Context, w io.Writer) (bool, error) {
-		return false, m.mgr.EndExercise(ctx, ex, w)
-	})
+	m.ask("You're leaving "+ex.ID+". End the lab and stop its VMs? No leaves them running.",
+		func() tea.Cmd {
+			// start the stop first: then may open another exercise, whose
+			// Output tab the stop must not take over
+			end := m.startOp("stop", "Ending "+ex.ID+" and stopping its VMs", ex.ID, func(ctx context.Context, w io.Writer) (bool, error) {
+				return false, m.mgr.EndExercise(ctx, ex, w)
+			})
+			return tea.Batch(end, then())
+		}, then)
+	return nil
+}
+
+// siblings is the list the open exercise was picked from, which n/N walk, and
+// a pointer to that list's cursor (nil for the whole catalog). Exam lists keep
+// the questions' positions, with nil for one missing from the catalog.
+func (m *model) siblings() ([]*exercise.Exercise, *int) {
+	questions := func(e *exam.Exam) []*exercise.Exercise {
+		out := make([]*exercise.Exercise, len(e.Questions))
+		for i, q := range e.Questions {
+			out[i] = m.cat.Get(q.ID)
+		}
+		return out
+	}
+	var list []*exercise.Exercise
+	var cur *int
+	switch m.back {
+	case scrBrowse:
+		list, cur = m.visible, &m.cursor
+	case scrStarted:
+		list, cur = m.started, &m.startedCursor
+	case scrExam:
+		if m.exam != nil {
+			list, cur = questions(m.exam), &m.examCursor
+		}
+	case scrExamResult:
+		if m.finished != nil {
+			list, cur = questions(m.finished), &m.examCursor
+		}
+	}
+	for _, e := range list {
+		if e == m.cur {
+			return list, cur
+		}
+	}
+	return m.cat.Exercises, nil
+}
+
+// siblingNoun names what n/N move between.
+func (m *model) siblingNoun() string {
+	if m.back == scrExam || m.back == scrExamResult {
+		return "question"
+	}
+	return "exercise"
+}
+
+// step opens the next (d=1) or previous (d=-1) exercise of the list the open
+// one came from, and moves that list's cursor along.
+func (m *model) step(d int) tea.Cmd {
+	list, cur := m.siblings()
+	i := -1
+	for j, e := range list {
+		if e == m.cur {
+			i = j
+		}
+	}
+	for j := i + d; i >= 0 && j >= 0 && j < len(list); j += d {
+		if list[j] == nil {
+			continue
+		}
+		next, at := list[j], j
+		return m.leave(func() tea.Cmd {
+			if cur != nil {
+				*cur = at
+			}
+			if cur == &m.cursor {
+				m.clampOffset()
+			}
+			m.openDetail(next, m.back)
+			return nil
+		})
+	}
+	where := "next"
+	if d < 0 {
+		where = "previous"
+	}
+	m.flash = "no " + where + " " + m.siblingNoun() + " in this list"
+	return nil
 }
 
 func (m *model) revealHint() tea.Cmd {
@@ -859,49 +961,43 @@ func (m *model) askSolution() tea.Cmd {
 		return nil
 	}
 	if m.solShow {
-		m.tab = tabSolution
-		m.refreshViewport(false)
-		m.vp.GotoTop()
+		m.setTab(tabSolution)
 		return nil
 	}
-	m.confirm = "Reveal the solution? Try the hints first! (y/n)"
-	m.onYes = func() tea.Cmd {
+	m.ask("Reveal the solution? Try the hints first!", func() tea.Cmd {
 		m.solShow = true
 		m.prog.SawSolution(m.cur.ID)
-		m.tab = tabSolution
-		m.refreshViewport(false)
-		m.vp.GotoTop()
+		m.setTab(tabSolution)
 		return nil
-	}
+	}, nil)
 	return nil
 }
 
-// askForget offers to erase the recorded progress of the open exercise.
-func (m *model) askForget() {
-	ex := m.cur
-	if m.op != "" {
-		m.flash = "busy: " + m.op
+// forgetBlocked says why the progress of ex can't be reset now, or "".
+func (m *model) forgetBlocked(ex *exercise.Exercise) string {
+	switch {
+	case m.op != "":
+		return "busy: " + m.op
+	case m.inExam(ex):
+		return "progress can't be reset during an exam on this question"
+	case !m.hasProgress(ex):
+		return "no progress recorded for this exercise"
+	}
+	return ""
+}
+
+// askForget offers to erase the recorded progress of ex; done runs after.
+func (m *model) askForget(ex *exercise.Exercise, q string, done func()) {
+	if why := m.forgetBlocked(ex); why != "" {
+		m.flash = why
 		return
 	}
-	if m.exam != nil && !m.exam.Over() && m.exam.Has(ex.ID) {
-		m.flash = "progress can't be reset during an exam on this question"
-		return
-	}
-	if m.prog.Get(ex.ID).IsZero() && m.result[ex.ID] == "" {
-		m.flash = "no progress recorded for this exercise"
-		return
-	}
-	m.confirm = "Forget all progress on this exercise, including solved status? (y/n)"
-	m.onYes = func() tea.Cmd {
+	m.ask(q, func() tea.Cmd {
 		m.prog.Reset(ex.ID)
 		delete(m.result, ex.ID)
-		m.solShow, m.hintsShow = false, 0
-		m.tab = tabScenario
-		m.flash = "progress reset"
-		m.refreshViewport(false)
-		m.vp.GotoTop()
+		done()
 		return nil
-	}
+	}, nil)
 }
 
 // startedLabs returns the active exercise first, then the others started but
@@ -951,33 +1047,28 @@ func (m *model) updateStarted(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 		}
 	case "enter":
 		if m.startedCursor < len(m.started) {
-			m.openDetail(m.started[m.startedCursor])
+			m.openDetail(m.started[m.startedCursor], scrStarted)
 		}
 	case "r":
 		if m.startedCursor >= len(m.started) {
 			return m, nil
 		}
 		ex := m.started[m.startedCursor]
-		if m.exam != nil && !m.exam.Over() && m.exam.Has(ex.ID) {
-			m.flash = "can't reset a question of the running exam"
-			return m, nil
-		}
-		m.confirm = "Reset progress on " + ex.ID + "? (y/n)"
-		m.onYes = func() tea.Cmd {
-			m.prog.Reset(ex.ID)
-			delete(m.result, ex.ID)
+		m.askForget(ex, "Reset progress on "+ex.ID+"?", func() {
 			m.resetStarted()
 			m.flash = "reset " + ex.ID
-			return nil
-		}
+		})
 	case "A":
 		if len(m.started) == 0 {
 			return m, nil
 		}
-		m.confirm = fmt.Sprintf("Reset progress on all %d started labs? (y/n)", len(m.started))
-		m.onYes = func() tea.Cmd {
+		if m.op != "" {
+			m.flash = "busy: " + m.op
+			return m, nil
+		}
+		m.ask(fmt.Sprintf("Reset progress on all %d started labs?", len(m.started)), func() tea.Cmd {
 			for _, e := range m.started {
-				if m.exam != nil && !m.exam.Over() && m.exam.Has(e.ID) {
+				if m.inExam(e) {
 					continue
 				}
 				m.prog.Reset(e.ID)
@@ -986,7 +1077,7 @@ func (m *model) updateStarted(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 			m.resetStarted()
 			m.flash = "reset started labs"
 			return nil
-		}
+		}, nil)
 	}
 	return m, nil
 }
@@ -994,7 +1085,7 @@ func (m *model) updateStarted(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 func (m *model) updateEnv(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 	switch msg.String() {
 	case "esc", "q", "e":
-		m.screen = scrBrowse
+		m.goTo(m.envBack)
 	case "up", "k":
 		if m.envCursor > 0 {
 			m.envCursor--
@@ -1012,16 +1103,13 @@ func (m *model) updateEnv(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 	case "R":
 		return m, m.envAction("reset")
 	case "D":
-		m.confirm = "Delete the VMs of this environment? (y/n)"
-		m.onYes = func() tea.Cmd { return m.envAction("destroy") }
+		m.ask("Delete the VMs of this environment?", func() tea.Cmd { return m.envAction("destroy") }, nil)
 	case "B":
-		m.confirm = "Destroy and rebuild this environment from scratch (takes minutes)? (y/n)"
-		m.onYes = func() tea.Cmd { return m.envAction("rebuild") }
+		m.ask("Destroy and rebuild this environment from scratch (takes minutes)?", func() tea.Cmd { return m.envAction("rebuild") }, nil)
 	case "X":
 		return m, m.envAction("stop-all")
 	case "K":
-		m.confirm = "Delete ALL lab VMs (every environment)? They are re-created on the next start. (y/n)"
-		m.onYes = func() tea.Cmd { return m.envAction("delete-all") }
+		m.ask("Delete ALL lab VMs (every environment)? They are re-created on the next start.", func() tea.Cmd { return m.envAction("delete-all") }, nil)
 	}
 	return m, nil
 }

@@ -122,14 +122,20 @@ Everything is also reachable from the **menu bar** at the top: click a menu, pre
 `alt+t` Tracks, `alt+m` VMs, `alt+x` Exam, `alt+h` Help). Menu items show their
 keyboard shortcut only on the screens where pressing that key does the same thing, so a
 shown key works with the menu open or closed. `a` (active exercise), `S` (started labs),
-`e` (environments & VMs) and `Q` (quit and stop the VMs) work on every screen. Menus only
-offer what applies to the current screen: Exercise acts on the selected exercise on the
-list, the exercise screen, Started labs and the exam screens, while hints and the solution
-appear only once the exercise is open; File moves between the exercise screens; View and
-Tracks shape the list (View also holds learning paths, and picks the tab on the exercise
-screen); VMs holds everything about the lab environments. **View → Show** filters the list by progress: all, solved, in
-progress (started, not solved) or no progress. **Tracks** shows how many exercises of each
-track you have solved. A greyed-out item says why when you pick it.
+`e` (environments & VMs) and `Q` (quit and stop the VMs) work on every screen.
+
+Menus only offer what applies to the current screen. **Exercise** acts on the selected
+exercise on the list, the exercise screen, Started labs and the exam screens; hints and the
+solution appear only once the exercise is open. Opening a terminal and checking your work
+need the lab set up, and only the active exercise has it (every start resets the
+environment, in an exam too). Away from the exercise screen they are offered only for that
+exercise; on it they are greyed out, like the Terminal and Check buttons. Resetting
+progress is offered only for an exercise you have tried. **File** moves between the
+exercise screens. **View** and **Tracks** shape the list: View also holds learning paths,
+and picks the tab on the exercise screen. **VMs** holds everything about the lab
+environments. **View → Show** filters the list by progress: all, solved, in progress
+(started, not solved) or no progress. **Tracks** shows how many exercises of each track you
+have solved. A greyed-out item says why when you pick it.
 
 The mouse works throughout: pick a track from the **Tracks** menu, click a row to select
 it and double-click to open it, click the tabs and the buttons (Start, Terminal, Check,
@@ -165,8 +171,14 @@ shortcut. While the mouse is in use, most terminals select text with `shift`+dra
 | `h` | reveal the next **hint** |
 | `v` | reveal the **solution** (asks first) |
 | `R` | **reset progress** on this exercise (asks first) |
-| `1`–`5` / `tab` | Scenario · Learn · Hints · Solution · Output |
-| `n` / `N` | next / previous exercise |
+| `1`–`5` / `tab` / `←→` | Scenario · Learn · Hints · Solution · Output |
+| `n` / `N` | next / previous in the list you opened it from: the filtered list, Started labs, or the exam's questions |
+| `esc` / `q` | back to where you opened it from |
+
+Leaving the exercise that is set up on the VMs, by any route except the environments
+screen, asks whether to end it: **Yes** stops its VMs, **No** leaves them running (`a`
+brings you back to it). During an exam nothing is asked, since the VMs carry on to the
+next question. The environments screen goes back to the exercise you came from.
 
 Inside the VMs the scenario is also in **`/lab/TASK.md`**; `/lab` is your working
 directory. On the control plane `kubectl` (alias `k`, with completion) is configured
