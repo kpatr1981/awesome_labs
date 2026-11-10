@@ -81,6 +81,7 @@ func (m *model) View() string {
 	if m.w == 0 {
 		return "loading…"
 	}
+	m.zones = m.zones[:0]
 	var body string
 	switch m.screen {
 	case scrBrowse:
@@ -100,25 +101,26 @@ func (m *model) View() string {
 	case scrExamResult:
 		body = m.viewExamResult()
 	}
-	return body
-}
-
-func (m *model) header() string {
-	ids := make([]string, 0, len(m.cat.Exercises))
-	for _, e := range m.cat.Exercises {
-		ids = append(ids, e.ID)
+	// keep the frame inside the window so overlays line up
+	lines := strings.Split(body, "\n")
+	if len(lines) > m.h {
+		lines = lines[:m.h]
 	}
-	solved, started := m.prog.Counts(ids)
-	left := sTitle.Render(" awesome_labs ") + sMuted.Render("hands-on labs")
-	if m.exam != nil {
-		left += "   " + sBigOKInline(m.exam)
-	} else if m.hasActive {
-		left += "   " + sWarn.Render("▶ working on "+m.active.ID) + sMuted.Render(" (a)")
+	out := m.menuBar() + "\n" + strings.Join(lines, "\n")
+	if m.menuOpen >= 0 {
+		box, x := m.dropdown()
+		out = overlay(out, box, x, 1)
 	}
-	right := sOK.Render(fmt.Sprintf("✔ %d", solved)) + sMuted.Render(fmt.Sprintf("/%d solved  ", len(ids))) +
-		sWarn.Render(fmt.Sprintf("● %d", started)) + sMuted.Render(" started, unsolved ")
-	gap := max(1, m.w-lipgloss.Width(left)-lipgloss.Width(right))
-	return left + strings.Repeat(" ", gap) + right
+	if m.confirm != "" {
+		box, x, y := m.dialog()
+		out = overlay(out, box, x, y)
+	}
+	if m.modal != "" {
+		box, x, y := m.modalBox()
+		m.zones = append(m.zones, zone{0, 0, m.w, m.h + 1, "dlg:close"})
+		out = overlay(out, box, x, y)
+	}
+	return out
 }
 
 func (m *model) statusLine(help string) string {
@@ -145,9 +147,20 @@ func (m *model) statusLine(help string) string {
 
 // fitTabs joins tabs, showing a window around the active one when they don't all
 // fit in width w. Hidden tabs on either side are marked with an arrow.
-func fitTabs(tabs []string, active, w int) string {
+func fitTabs(tabs []string, active, w int) (string, []int) {
+	xs := make([]int, len(tabs))
+	pos := func(lo, hi, x int) {
+		for i := range xs {
+			xs[i] = -1
+		}
+		for i := lo; i <= hi; i++ {
+			xs[i] = x
+			x += lipgloss.Width(tabs[i])
+		}
+	}
 	if lipgloss.Width(strings.Join(tabs, "")) <= w {
-		return strings.Join(tabs, "")
+		pos(0, len(tabs)-1, 0)
+		return strings.Join(tabs, ""), xs
 	}
 	const arrows = 4 // room for "‹ " and " ›"
 	lo, hi := active, active
@@ -166,13 +179,16 @@ func fitTabs(tabs []string, active, w int) string {
 		}
 	}
 	bar := strings.Join(tabs[lo:hi+1], "")
+	start := 0
 	if lo > 0 {
 		bar = sMuted.Render("‹ ") + bar
+		start = 2
 	}
 	if hi < len(tabs)-1 {
 		bar += sMuted.Render(" ›")
 	}
-	return bar
+	pos(lo, hi, start)
+	return bar, xs
 }
 
 func (m *model) viewBrowse() string {
@@ -185,7 +201,12 @@ func (m *model) viewBrowse() string {
 			tabs = append(tabs, sTabOff.Render(label))
 		}
 	}
-	bar := fitTabs(tabs, m.trackIdx, m.w)
+	bar, xs := fitTabs(tabs, m.trackIdx, m.w)
+	for i, x := range xs {
+		if x >= 0 {
+			m.addZone(fmt.Sprintf("track:%d", i), x, 0, lipgloss.Width(tabs[i]), 1)
+		}
+	}
 	if m.path != nil {
 		ps, pt := m.pathProgress(m.path)
 		bar += sWarn.Render("  path: "+m.path.Title) + sMuted.Render(fmt.Sprintf(" %d/%d", ps, pt))
@@ -194,7 +215,9 @@ func (m *model) viewBrowse() string {
 		bar += sWarn.Render("  [unsolved only]")
 	}
 	if m.filterOn || m.filter.Value() != "" {
-		bar += "   " + m.filter.View()
+		bar += "   "
+		m.addZone("filter", lipgloss.Width(bar), 0, m.w, 1)
+		bar += m.filter.View()
 	}
 
 	listW := min(max(46, m.w*45/100), m.w-20)
@@ -205,7 +228,7 @@ func (m *model) viewBrowse() string {
 	var rows []string
 	for i := m.offset; i < len(m.visible) && len(rows) < lh; i++ {
 		e := m.visible[i]
-		if i == m.offset || e.Module != m.visible[i-1].Module || e.Track != m.visible[i-1].Track {
+		if i == m.offset || e.Module != m.visible[i-1].Module || e.Track != m.visible[i-1].Track { // module header row
 			rows = append(rows, sHeader.Render(trunc(fmt.Sprintf("▸ %s · %s", trackLabel(e.Track), e.Module), listW-2)))
 			if len(rows) >= lh {
 				break
@@ -232,6 +255,7 @@ func (m *model) viewBrowse() string {
 		if i == m.cursor {
 			line = sSel.Render(padRight(line, listW-2))
 		}
+		m.addZone(fmt.Sprintf("row:%d", i), 0, 2+len(rows), listW, 1)
 		rows = append(rows, line)
 	}
 	if len(m.visible) == 0 {
@@ -249,10 +273,11 @@ func (m *model) viewBrowse() string {
 		prev = m.preview(e, prevW-2, lh)
 	}
 	prevBox := sBorder.Width(prevW - 2).Height(lh).Render(prev)
+	m.addZone("preview", listW, 1, prevW, lh+2)
 
-	help := "↑↓ move · enter open · / filter · tab track · n/p module · u unsolved · a active · L paths · X exam · e envs & VMs · S started · q quit · Q quit+stop VMs"
+	help := "↑↓ move · enter open · / filter · tab track · u unsolved · a active · S started · e VMs · F10 menu · F1 keys · q quit"
 	return lipgloss.JoinVertical(lipgloss.Left,
-		m.header(), bar,
+		bar,
 		lipgloss.JoinHorizontal(lipgloss.Top, list, prevBox),
 		m.statusLine(help))
 }
@@ -312,11 +337,35 @@ func (m *model) viewDetail() string {
 		if tab(i) == tabOutput && m.op != "" && m.opID == e.ID {
 			label += " " + m.spin.View()
 		}
+		st := sTabOff
 		if tab(i) == m.tab {
-			tabs = append(tabs, sTabOn.Render(label))
-		} else {
-			tabs = append(tabs, sTabOff.Render(label))
+			st = sTabOn
+		} else if m.hover == fmt.Sprintf("tab:%d", i) {
+			st = sTabOff.Foreground(colAccent)
 		}
+		tabs = append(tabs, st.Render(label))
+	}
+	x := 0
+	for i, t := range tabs {
+		m.addZone(fmt.Sprintf("tab:%d", i), x, 1, lipgloss.Width(t), 1)
+		x += lipgloss.Width(t)
+	}
+	tabRow := strings.Join(tabs, "")
+	bs := []button{{"▶ Start", "s"}, {"Terminal", "t"}}
+	if e.Profile == exercise.ProfileK8s {
+		bs = append(bs, button{"node01", "w"})
+	}
+	bs = append(bs, button{"✔ Check", "c"})
+	if !m.examLocked(e) {
+		bs = append(bs, button{"Hint", "h"}, button{"Solution", "v"})
+	}
+	bs = append(bs, button{"Back", "esc"})
+	bw := 0
+	for _, b := range bs {
+		bw += lipgloss.Width(b.label) + 3
+	}
+	if gap := m.w - x - bw; gap >= 2 {
+		tabRow += strings.Repeat(" ", gap) + m.buttons(x+gap, 1, bs...)
 	}
 	box := sBorder.Width(m.w - 2).Render(m.vp.View())
 	help := "s start lab · t terminal"
@@ -328,7 +377,8 @@ func (m *model) viewDetail() string {
 	} else {
 		help += " · c check · h hint · v solution · R reset progress · tab switch · n/N next/prev · esc back"
 	}
-	return lipgloss.JoinVertical(lipgloss.Left, title, strings.Join(tabs, ""), box, m.statusLine(help))
+	help += " · F10 menu"
+	return lipgloss.JoinVertical(lipgloss.Left, title, tabRow, box, m.statusLine(help))
 }
 
 func (m *model) refreshViewport(follow bool) {
@@ -391,7 +441,8 @@ func (m *model) refreshViewport(follow bool) {
 }
 
 func (m *model) viewStarted() string {
-	title := sTitle.Render(" Your labs ") + sMuted.Render("one exercise is set up on the VMs at a time")
+	title := sTitle.Render(" Your labs ") + sMuted.Render("one exercise is set up on the VMs at a time") + "   "
+	title = m.titleButtons(title, 0, button{"Open", "enter"}, button{"Reset selected", "r"}, button{"Reset all", "A"}, button{"Back", "esc"})
 	if len(m.started) == 0 {
 		return lipgloss.JoinVertical(lipgloss.Left, title, "",
 			sMuted.Render("  No started labs. Start a lab with s on an exercise."),
@@ -413,6 +464,7 @@ func (m *model) viewStarted() string {
 			info = fmt.Sprintf("· since %s · %d checks · %s", m.active.Since.Format("2006-01-02 15:04"), p.Checks, lab.EnvFor(e.Profile).Title)
 		}
 		line := fmt.Sprintf("%-10s %s %s", e.ID, trunc(e.Title, 40), sMuted.Render(info))
+		m.addZone(fmt.Sprintf("row:%d", i), 0, 2+strings.Count(b.String(), "\n"), m.w, 1)
 		if i == m.startedCursor {
 			b.WriteString(sTitle.Render("▸ ") + line + "\n")
 		} else {
@@ -445,8 +497,10 @@ func (m *model) markdown(key, src string, w int) string {
 
 func (m *model) viewEnv() string {
 	var b strings.Builder
-	b.WriteString(m.header() + "\n\n")
-	b.WriteString(sTitle.Render(" Lab environments & VMs") + "\n\n")
+	b.WriteString("\n")
+	t := sTitle.Render(" Lab environments & VMs") + "   "
+	b.WriteString(m.titleButtons(t, 1, button{"Start", "u"}, button{"Stop", "x"}, button{"Reset", "R"},
+		button{"Rebuild", "B"}, button{"Delete", "D"}, button{"Stop all", "X"}, button{"Delete all", "K"}, button{"Refresh", "r"}, button{"Back", "esc"}) + "\n\n")
 	for i, env := range lab.AllEnvs() {
 		st, ok := m.envStatus[env.Profile]
 		if !ok {
@@ -487,6 +541,7 @@ func (m *model) viewEnv() string {
 		if m.mgr.Tainted(env) {
 			tainted = sWarn.Render("  (will be rebuilt before the next exercise)")
 		}
+		m.addZone(fmt.Sprintf("row:%d", i), 0, strings.Count(b.String(), "\n"), m.w, 1+len(vms))
 		fmt.Fprintf(&b, "%s%-22s %s%s%s\n", cur, env.Title, stStyle.Render(st), active, tainted)
 		for _, v := range vms {
 			fmt.Fprintf(&b, "     %s\n", v)

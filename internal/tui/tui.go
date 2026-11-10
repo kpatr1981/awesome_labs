@@ -135,6 +135,17 @@ type model struct {
 	setupHints  bool
 	quitting    bool
 	fromExam    bool // detail opened from the exam screen
+
+	// menus, dialogs and the mouse
+	menuOpen    int // index of the open menu, -1 = none
+	menuItem    int
+	menuX       []int // x of each menu title
+	modal       string
+	confirmYes  bool // the Yes button of the confirmation has the focus
+	zones       []zone
+	hover       string
+	lastClick   string
+	lastClickAt time.Time
 }
 
 // examLocked reports whether hints/solution of ex are hidden by a running exam.
@@ -170,7 +181,7 @@ func Run(d Deps) error {
 		filter: ti, spin: sp, style: style,
 		output: map[string]*strings.Builder{}, result: map[string]string{},
 		mdCache: map[string]string{}, envStatus: map[exercise.Profile]string{},
-		paths: d.Paths, exams: d.Exams, setupCount: 1, setupMins: 1,
+		paths: d.Paths, exams: d.Exams, setupCount: 1, setupMins: 1, menuOpen: -1,
 	}
 	m.exam = d.Exams.Current()
 	if m.exam != nil && m.exam.Over() {
@@ -178,7 +189,7 @@ func Run(d Deps) error {
 	}
 	m.refreshActive()
 	m.refilter()
-	_, err := tea.NewProgram(m, tea.WithAltScreen(), tea.WithMouseCellMotion()).Run()
+	_, err := tea.NewProgram(m, tea.WithAltScreen(), tea.WithMouseAllMotion()).Run()
 	return err
 }
 
@@ -233,7 +244,7 @@ func (m *model) refilter() {
 	m.clampOffset()
 }
 
-func (m *model) listHeight() int { return max(3, m.h-7) }
+func (m *model) listHeight() int { return max(3, m.h-6) }
 
 func (m *model) clampOffset() {
 	lh := m.listHeight()
@@ -428,7 +439,8 @@ func (m *model) envAction(action string) tea.Cmd {
 func (m *model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 	switch msg := msg.(type) {
 	case tea.WindowSizeMsg:
-		m.w, m.h = msg.Width, msg.Height
+		// m.h is the height below the menu bar
+		m.w, m.h = msg.Width, max(1, msg.Height-1)
 		m.vp.Width, m.vp.Height = m.w-2, max(3, m.h-7)
 		m.clampOffset()
 		m.refreshViewport(false)
@@ -505,31 +517,14 @@ func (m *model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		return m, nil
 
 	case tea.MouseMsg:
-		if m.screen == scrDetail {
-			var c tea.Cmd
-			m.vp, c = m.vp.Update(msg)
-			return m, c
-		}
-		if msg.Button == tea.MouseButtonWheelUp {
-			m.move(-3)
-		} else if msg.Button == tea.MouseButtonWheelDown {
-			m.move(3)
-		}
-		return m, nil
+		return m.mouse(msg)
 
 	case tea.KeyMsg:
-		if m.confirm != "" {
-			k := msg.String()
-			m.confirm = ""
-			if k == "y" || k == "Y" {
-				f := m.onYes
-				m.onYes = nil
-				return m, f()
-			}
-			return m, nil
-		}
 		if msg.String() == "ctrl+c" {
 			return m, tea.Quit
+		}
+		if c, ok := m.globalKey(msg.String()); ok {
+			return m, c
 		}
 		switch m.screen {
 		case scrBrowse:
@@ -640,11 +635,7 @@ func (m *model) updateBrowse(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 	case "S":
 		m.openStarted()
 	case "a":
-		if ex := m.cat.Get(m.active.ID); m.hasActive && ex != nil {
-			m.openDetail(ex)
-		} else {
-			m.flash = "no exercise is set up on the VMs — open one and press s to start it (S lists labs started earlier)"
-		}
+		m.goActive()
 	case "L":
 		m.screen = scrPaths
 	case "X":
@@ -654,13 +645,7 @@ func (m *model) updateBrowse(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 			m.screen = scrExamSetup
 		}
 	case "Q":
-		if m.op != "" {
-			m.flash = "busy: " + m.op
-			return m, nil
-		}
-		m.quitting = true
-		m.flash = "stopping all lab VMs…"
-		return m, func() tea.Msg { return stoppedMsg{m.mgr.StopAll(context.Background(), io.Discard)} }
+		return m, m.quitAndStop()
 	case "enter", "right", "l":
 		if len(m.visible) > 0 {
 			m.openDetail(m.visible[m.cursor])

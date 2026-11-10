@@ -10,7 +10,7 @@ exercise has a scenario, progressive hints and a full solution you can reveal, a
 have a short tutorial on the concepts and commands to read first.
 
 ```text
- awesome_labs hands-on labs                                           ✔ 37/645 solved  ● 2 started, unsolved
+ awesome_labs  File  Exercise  View  Tracks  VMs  Exam  Help     ✔ 37/726 solved  ● 2 started, unsolved
  All  Docker  Kubernetes  Offensive Sec  Linux  Networking  Cloud  Data  Defensive Sec  Programming  Data Science
 ╭──────────────────────────────────────────────╮╭───────────────────────────────────────────────╮
 │▸ Kubernetes · Troubleshooting the cluster     ││k8s-245 — The API server is gone               │
@@ -19,7 +19,7 @@ have a short tutorial on the concepts and commands to read first.
 │   k8s-245   ●●●○○ fix   The API server is gone││  kubectl get pods → The connection to the     │
 │   ...                                         ││  server controlplane:6443 was refused …       │
 ╰──────────────────────────────────────────────╯╰───────────────────────────────────────────────╯
- ↑↓ move · enter open · / filter · tab track · n/p module · u unsolved · e environments · q quit
+ ↑↓ move · enter open · / filter · tab track · u unsolved · a active · S started · e VMs · F10 menu · F1 keys · q quit
 ```
 
 ## What you get
@@ -114,6 +114,19 @@ awesome_labs             # interactive browser
 
 `make build` produces a single static binary with the exercises built in. `make release`
 builds one for Linux and macOS on x86-64 and ARM into `dist/`, with checksums.
+
+### Menus and the mouse
+
+Everything is also reachable from the **menu bar** at the top: click a menu, press
+`F10`, or `alt` + the underlined letter (`alt+f` File, `alt+e` Exercise, `alt+v` View,
+`alt+t` Tracks, `alt+m` VMs, `alt+x` Exam, `alt+h` Help). Menu items show their
+keyboard shortcut, and items that don't apply on the current screen are greyed out.
+
+The mouse works throughout: click a track name to switch track, click a row to select
+it and double-click to open it, click the tabs and the buttons (Start, Terminal, Check,
+Hint, Solution…) on the exercise screen, and scroll with the wheel. Confirmations open
+as a dialog with **Yes** / **No** buttons (`y`/`n` still work). `F1` lists every
+shortcut. While the mouse is in use, most terminals select text with `shift`+drag.
 
 ### In the browser
 

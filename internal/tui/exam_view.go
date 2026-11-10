@@ -63,8 +63,9 @@ func (m *model) updatePaths(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 
 func (m *model) viewPaths() string {
 	var b strings.Builder
-	b.WriteString(m.header() + "\n\n")
-	b.WriteString(sTitle.Render(" Learning paths") + sMuted.Render("  — pick one to focus the exercise list on it") + "\n\n")
+	b.WriteString("\n")
+	t := sTitle.Render(" Learning paths") + sMuted.Render("  — pick one to focus the exercise list on it") + "   "
+	b.WriteString(m.titleButtons(t, 1, button{"Apply", "enter"}, button{"Back", "esc"}) + "\n\n")
 	for i, p := range m.paths {
 		s, t := m.pathProgress(p)
 		cur := "  "
@@ -75,6 +76,7 @@ func (m *model) viewPaths() string {
 		if m.path == p {
 			active = sWarn.Render("  (active)")
 		}
+		m.addZone(fmt.Sprintf("row:%d", i), 0, strings.Count(b.String(), "\n"), m.w, 2)
 		fmt.Fprintf(&b, "%s%s %s %s%s\n", cur, padRight(sTitle.Render(p.Title), 42), bar(s, t, 24), sMuted.Render(fmt.Sprintf("%3d/%-3d", s, t)), active)
 		fmt.Fprintf(&b, "    %s\n\n", sMuted.Render(p.Description))
 	}
@@ -82,6 +84,7 @@ func (m *model) viewPaths() string {
 	if m.pathCursor == len(m.paths) {
 		cur = sTitle.Render("▸ ")
 	}
+	m.addZone(fmt.Sprintf("row:%d", len(m.paths)), 0, strings.Count(b.String(), "\n"), m.w, 1)
 	fmt.Fprintf(&b, "%s%s\n\n", cur, sTitle.Render("All exercises"))
 	return b.String() + m.statusLine("↑↓ select · enter apply · esc back")
 }
@@ -191,8 +194,9 @@ func (m *model) updateExamSetup(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 func (m *model) viewExamSetup() string {
 	srcs := m.examSources()
 	var b strings.Builder
-	b.WriteString(m.header() + "\n\n")
-	b.WriteString(sTitle.Render(" New exam") + "\n\n")
+	b.WriteString("\n")
+	t := sTitle.Render(" New exam") + "   "
+	b.WriteString(m.titleButtons(t, 1, button{"Start exam", "enter"}, button{"Cancel", "esc"}) + "\n\n")
 	rows := []struct{ label, value string }{
 		{"Pool", fmt.Sprintf("%s  (%d exercises)", srcs[m.setupSource].label, len(srcs[m.setupSource].pool))},
 		{"Questions", fmt.Sprint(examCounts[m.setupCount])},
@@ -204,6 +208,7 @@ func (m *model) viewExamSetup() string {
 		if i == m.setupField {
 			cur, val = sTitle.Render("▸ "), sSel.Render(" ◀ "+r.value+" ▶ ")
 		}
+		m.addZone(fmt.Sprintf("row:%d", i), 0, strings.Count(b.String(), "\n"), m.w, 1)
 		fmt.Fprintf(&b, "%s%-20s %s\n", cur, r.label, val)
 	}
 	b.WriteString("\n" + sMuted.Render(strings.Join([]string{
@@ -269,7 +274,7 @@ func (m *model) questionMark(q exam.Question) string {
 func (m *model) viewExam() string {
 	e := m.exam
 	var b strings.Builder
-	b.WriteString(m.header() + "\n\n")
+	b.WriteString("\n")
 	p, n, _ := e.Score()
 	left := e.Remaining()
 	ts := sOK
@@ -289,6 +294,7 @@ func (m *model) viewExam() string {
 		if i == m.examCursor {
 			line = sSel.Render(padRight(line, m.w-2))
 		}
+		m.addZone(fmt.Sprintf("row:%d", i), 0, strings.Count(b.String(), "\n"), m.w, 1)
 		b.WriteString(line + "\n")
 	}
 	b.WriteString("\n")
@@ -321,7 +327,7 @@ func (m *model) updateExamResult(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 func (m *model) viewExamResult() string {
 	e := m.finished
 	var b strings.Builder
-	b.WriteString(m.header() + "\n\n")
+	b.WriteString("\n")
 	if e == nil {
 		return b.String() + m.statusLine("esc back")
 	}
@@ -347,6 +353,7 @@ func (m *model) viewExamResult() string {
 		if i == m.examCursor {
 			line = sSel.Render(padRight(line, m.w-2))
 		}
+		m.addZone(fmt.Sprintf("row:%d", i), 0, strings.Count(b.String(), "\n"), m.w, 1)
 		b.WriteString(line + "\n")
 	}
 	if hist := m.exams.History(); len(hist) > 1 {
