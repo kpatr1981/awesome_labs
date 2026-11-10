@@ -145,79 +145,24 @@ func (m *model) statusLine(help string) string {
 
 // ---- browse ----
 
-// fitTabs joins tabs, showing a window around the active one when they don't all
-// fit in width w. Hidden tabs on either side are marked with an arrow.
-func fitTabs(tabs []string, active, w int) (string, []int) {
-	xs := make([]int, len(tabs))
-	pos := func(lo, hi, x int) {
-		for i := range xs {
-			xs[i] = -1
-		}
-		for i := lo; i <= hi; i++ {
-			xs[i] = x
-			x += lipgloss.Width(tabs[i])
-		}
-	}
-	if lipgloss.Width(strings.Join(tabs, "")) <= w {
-		pos(0, len(tabs)-1, 0)
-		return strings.Join(tabs, ""), xs
-	}
-	const arrows = 4 // room for "‹ " and " ›"
-	lo, hi := active, active
-	used := lipgloss.Width(tabs[active])
-	for grew := true; grew; {
-		grew = false
-		if hi+1 < len(tabs) && used+lipgloss.Width(tabs[hi+1]) <= w-arrows {
-			hi++
-			used += lipgloss.Width(tabs[hi])
-			grew = true
-		}
-		if lo > 0 && used+lipgloss.Width(tabs[lo-1]) <= w-arrows {
-			lo--
-			used += lipgloss.Width(tabs[lo])
-			grew = true
-		}
-	}
-	bar := strings.Join(tabs[lo:hi+1], "")
-	start := 0
-	if lo > 0 {
-		bar = sMuted.Render("‹ ") + bar
-		start = 2
-	}
-	if hi < len(tabs)-1 {
-		bar += sMuted.Render(" ›")
-	}
-	pos(lo, hi, start)
-	return bar, xs
-}
-
 func (m *model) viewBrowse() string {
-	var tabs []string
-	for i, t := range m.tracks {
-		label := trackLabel(t)
-		if i == m.trackIdx {
-			tabs = append(tabs, sTabOn.Render(label))
-		} else {
-			tabs = append(tabs, sTabOff.Render(label))
-		}
-	}
-	bar, xs := fitTabs(tabs, m.trackIdx, m.w)
-	for i, x := range xs {
-		if x >= 0 {
-			m.addZone(fmt.Sprintf("track:%d", i), x, 0, lipgloss.Width(tabs[i]), 1)
-		}
-	}
+	// the track is picked from the Track menu (or tab); this line only shows
+	// the active path, the unsolved filter and the search box when in use
+	var bar string
 	if m.path != nil {
 		ps, pt := m.pathProgress(m.path)
-		bar += sWarn.Render("  path: "+m.path.Title) + sMuted.Render(fmt.Sprintf(" %d/%d", ps, pt))
+		bar += sWarn.Render("path: "+m.path.Title) + sMuted.Render(fmt.Sprintf(" %d/%d  ", ps, pt))
 	}
 	if m.unsolved {
-		bar += sWarn.Render("  [unsolved only]")
+		bar += sWarn.Render("[unsolved only]  ")
 	}
 	if m.filterOn || m.filter.Value() != "" {
-		bar += "   "
 		m.addZone("filter", lipgloss.Width(bar), 0, m.w, 1)
 		bar += m.filter.View()
+	}
+	top := 0 // rows taken by the info line
+	if m.hasBrowseBar() {
+		top = 1
 	}
 
 	listW := min(max(46, m.w*45/100), m.w-20)
@@ -255,7 +200,7 @@ func (m *model) viewBrowse() string {
 		if i == m.cursor {
 			line = sSel.Render(padRight(line, listW-2))
 		}
-		m.addZone(fmt.Sprintf("row:%d", i), 0, 2+len(rows), listW, 1)
+		m.addZone(fmt.Sprintf("row:%d", i), 0, top+1+len(rows), listW, 1)
 		rows = append(rows, line)
 	}
 	if len(m.visible) == 0 {
@@ -273,13 +218,14 @@ func (m *model) viewBrowse() string {
 		prev = m.preview(e, prevW-2, lh)
 	}
 	prevBox := sBorder.Width(prevW - 2).Height(lh).Render(prev)
-	m.addZone("preview", listW, 1, prevW, lh+2)
+	m.addZone("preview", listW, top, prevW, lh+2)
 
-	help := "↑↓ move · enter open · / filter · tab track · u unsolved · a active · S started · e VMs · F10 menu · F1 keys · q quit"
-	return lipgloss.JoinVertical(lipgloss.Left,
-		bar,
-		lipgloss.JoinHorizontal(lipgloss.Top, list, prevBox),
-		m.statusLine(help))
+	help := "↑↓ move · enter open · / filter · tab next track · F10 menu · F1 keys · q quit"
+	body := lipgloss.JoinHorizontal(lipgloss.Top, list, prevBox)
+	if top > 0 {
+		body = lipgloss.JoinVertical(lipgloss.Left, bar, body)
+	}
+	return lipgloss.JoinVertical(lipgloss.Left, body, m.statusLine(help))
 }
 
 func (m *model) meta(e *exercise.Exercise) string {
@@ -368,16 +314,11 @@ func (m *model) viewDetail() string {
 		tabRow += strings.Repeat(" ", gap) + m.buttons(x+gap, 1, bs...)
 	}
 	box := sBorder.Width(m.w - 2).Render(m.vp.View())
-	help := "s start lab · t terminal"
-	if e.Profile == exercise.ProfileK8s {
-		help += " · w node01"
-	}
+	// the buttons above and the menus cover the actions; list only the rest
+	help := "tab switch · n/N next/prev · F10 menu · F1 keys"
 	if m.examLocked(e) {
-		help += " · c check · tab switch · n/N next/prev question · esc exam"
-	} else {
-		help += " · c check · h hint · v solution · R reset progress · tab switch · n/N next/prev · esc back"
+		help = "tab switch · n/N next/prev question · esc exam · F10 menu · F1 keys"
 	}
-	help += " · F10 menu"
 	return lipgloss.JoinVertical(lipgloss.Left, title, tabRow, box, m.statusLine(help))
 }
 
@@ -471,7 +412,7 @@ func (m *model) viewStarted() string {
 			b.WriteString("  " + line + "\n")
 		}
 	}
-	help := "↑↓ move · enter open · r reset selected · A reset all · esc back"
+	help := "↑↓ move · F10 menu · F1 keys"
 	return lipgloss.JoinVertical(lipgloss.Left, title, "", b.String(), m.statusLine(help))
 }
 
@@ -576,7 +517,7 @@ func (m *model) viewEnv() string {
 		b.WriteString(sBorder.Width(m.w - 2).Render(strings.Join(lines, "\n")))
 		b.WriteString("\n")
 	}
-	help := "↑↓ select · u up/create · x stop · R reset · B rebuild · D delete · X stop all · K delete all · r refresh · esc back"
+	help := "↑↓ select · F10 menu · F1 keys"
 	return b.String() + m.statusLine(help)
 }
 

@@ -8,7 +8,6 @@ package tui
 //
 //	key:<k>    a button: acts as if key k was pressed on the current screen
 //	row:<n>    a list row: click selects it, double-click opens it
-//	track:<n>  a track tab in the browser
 //	tab:<n>    a tab of the exercise screen
 //	menu:<n>   a menu title in the menu bar
 //	mi:<n>     an item of the open menu
@@ -476,9 +475,6 @@ func (m *model) mouse(msg tea.MouseMsg) (tea.Model, tea.Cmd) {
 	case strings.HasPrefix(id, "key:"):
 		m.flash = ""
 		return m, m.press(strings.TrimPrefix(id, "key:"))
-	case sc(id, "track:", &n):
-		m.trackIdx, m.cursor, m.offset = n, 0, 0
-		m.refilter()
 	case sc(id, "tab:", &n):
 		return m, m.press(fmt.Sprint(n + 1))
 	case id == "preview":
@@ -759,8 +755,8 @@ Dialogs         y/n, or ←→ and enter`
 const mouseText = `Using the mouse
 
 • Click a menu title to open it; hover to move between menus.
-• Click a track name to switch track, a row to select it,
-  and double-click a row to open it.
+• Click a row to select it and double-click it to open it;
+  switch track from the Tracks menu.
 • Click the tabs and buttons on the exercise screen.
 • The wheel scrolls lists and text.
 • Click Yes or No in a confirmation.

@@ -244,7 +244,17 @@ func (m *model) refilter() {
 	m.clampOffset()
 }
 
-func (m *model) listHeight() int { return max(3, m.h-6) }
+func (m *model) listHeight() int {
+	if m.hasBrowseBar() {
+		return max(3, m.h-6)
+	}
+	return max(3, m.h-5)
+}
+
+// hasBrowseBar reports whether the browse screen shows its info line above the list.
+func (m *model) hasBrowseBar() bool {
+	return m.path != nil || m.unsolved || m.filterOn || m.filter.Value() != ""
+}
 
 func (m *model) clampOffset() {
 	lh := m.listHeight()

@@ -86,7 +86,7 @@ func (m *model) viewPaths() string {
 	}
 	m.addZone(fmt.Sprintf("row:%d", len(m.paths)), 0, strings.Count(b.String(), "\n"), m.w, 1)
 	fmt.Fprintf(&b, "%s%s\n\n", cur, sTitle.Render("All exercises"))
-	return b.String() + m.statusLine("↑↓ select · enter apply · esc back")
+	return b.String() + m.statusLine("↑↓ select")
 }
 
 // ---------------- exam setup ----------------
@@ -218,7 +218,7 @@ func (m *model) viewExamSetup() string {
 		"  • Your last check (c) per question counts. Starting a question again (s) resets its lab.",
 		fmt.Sprintf("  • Pass mark: %.0f%%. When time runs out, checking stops and you get your result.", exam.PassMark*100),
 	}, "\n")) + "\n\n")
-	return b.String() + m.statusLine("↑↓ field · ←→ change · enter start · esc back")
+	return b.String() + m.statusLine("↑↓ field · ←→ change")
 }
 
 // ---------------- running exam ----------------

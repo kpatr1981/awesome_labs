@@ -122,7 +122,7 @@ Everything is also reachable from the **menu bar** at the top: click a menu, pre
 `alt+t` Tracks, `alt+m` VMs, `alt+x` Exam, `alt+h` Help). Menu items show their
 keyboard shortcut, and items that don't apply on the current screen are greyed out.
 
-The mouse works throughout: click a track name to switch track, click a row to select
+The mouse works throughout: pick a track from the **Tracks** menu, click a row to select
 it and double-click to open it, click the tabs and the buttons (Start, Terminal, Check,
 Hint, Solution…) on the exercise screen, and scroll with the wheel. Confirmations open
 as a dialog with **Yes** / **No** buttons (`y`/`n` still work). `F1` lists every
