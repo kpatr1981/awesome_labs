@@ -346,13 +346,17 @@ func (m *Manager) pushKit(ctx context.Context, env Env, log io.Writer) error {
 	tw.Close()
 	gz.Close()
 	for _, vm := range env.VMs {
+		var out bytes.Buffer
 		code, err := lima.Run(ctx, vm.Name, lima.Script{
 			AsRoot: true,
 			Body:   "mkdir -p /opt/kubelab /var/lib/kubelab && tar -m --warning=no-timestamp -xzf - -C /opt/kubelab",
 			Stdin:  bytes.NewReader(buf.Bytes()),
-		}, m.detail(log))
-		if err != nil || code != 0 {
-			return fmt.Errorf("copy kit to %s failed (exit %d): %v", vm.Name, code, err)
+		}, io.MultiWriter(&out, m.detail(log)))
+		if err != nil {
+			return fmt.Errorf("copy kit to %s: %w", vm.Name, err)
+		}
+		if code != 0 {
+			return fmt.Errorf("copy kit to %s failed (exit %d): %s", vm.Name, code, lastLine(out.String()))
 		}
 	}
 	return nil
@@ -509,11 +513,12 @@ grep -qF %q "$H/.ssh/authorized_keys" || echo %q >> "$H/.ssh/authorized_keys"`, 
 	return m.runBootstrap(ctx, cp, "k8s-finalize.sh", nil, log)
 }
 
-// Reset restores every VM of env to its pristine state.
+// Reset restores every VM of env to its pristine state. VMs that were
+// deleted or stopped are created/started first (ensure also pushes the kit).
 func (m *Manager) Reset(ctx context.Context, env Env, log io.Writer) error {
 	m.mu.Lock()
 	defer m.mu.Unlock()
-	if err := m.pushKit(ctx, env, log); err != nil {
+	if err := m.ensure(ctx, env, log); err != nil {
 		return err
 	}
 	m.clearActiveIn(env)
@@ -763,6 +768,15 @@ func (m *Manager) Check(ctx context.Context, ex *exercise.Exercise, log io.Write
 	m.mu.Lock()
 	defer m.mu.Unlock()
 	env := EnvFor(ex.Profile)
+	all, err := lima.List(ctx)
+	if err != nil {
+		return false, err
+	}
+	for _, vm := range env.VMs {
+		if all[vm.Name].Status != "Running" {
+			return false, fmt.Errorf("%s is not running: open the exercise (enter) to set the lab up again", vm.Hostname)
+		}
+	}
 	ok := true
 	run := func(vm VM, body string) error {
 		code, err := lima.Run(ctx, vm.Name, lima.Script{AsRoot: true, Body: m.exScript(body, true)}, log)
