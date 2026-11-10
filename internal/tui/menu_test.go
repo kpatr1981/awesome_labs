@@ -6,6 +6,7 @@ import (
 	"io"
 	"os"
 	"path/filepath"
+	"slices"
 	"strings"
 	"testing"
 	"testing/fstest"
@@ -696,5 +697,22 @@ func TestStartDeletesLeftoverVMs(t *testing.T) {
 	}
 	if m.op != "" || m.hasActive {
 		t.Errorf("after the cleanup: op %q, active %v", m.op, m.hasActive)
+	}
+}
+
+// Resetting progress takes the exercise off a progress-filtered list at once.
+func TestResetProgressRefilters(t *testing.T) {
+	m := newTestModel(t)
+	m.op = "" // forgetting progress runs no lab operation
+	m.prog.MarkStarted("d-2")
+	m.setProgFilter(progInProgress)
+	shown := func() bool { return slices.Contains(m.visible, m.ex(t, "d-2")) }
+	if !shown() {
+		t.Fatal("started d-2 not listed under In progress")
+	}
+	m.askForget(m.ex(t, "d-2"), "reset?", func() {})
+	m.onYes()
+	if shown() {
+		t.Fatal("d-2 still listed under In progress after its progress was reset")
 	}
 }

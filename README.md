@@ -10,8 +10,7 @@ exercise has a scenario, progressive hints and a full solution you can reveal, a
 have a short tutorial on the concepts and commands to read first.
 
 ```text
- awesome_labs  Program  View  Tracks  VMs  Exam  Help            ✔ 37/726 solved  ● 2 started, unsolved
- All  Docker  Kubernetes  Offensive Sec  Linux  Networking  Cloud  Data  Defensive Sec  Programming  Data Science
+ awesome_labs  Program  View  Tracks  Help                        ✔ 37/726 solved  ● 2 started, unsolved
 ╭──────────────────────────────────────────────╮╭───────────────────────────────────────────────╮
 │▸ Kubernetes · Troubleshooting the cluster     ││k8s-245 — The API server is gone               │
 │ ✔ k8s-241   ●●○○○ fix   node01 is NotReady    ││●●●○○ Medium · Fix something · Kubernetes      │
@@ -19,7 +18,7 @@ have a short tutorial on the concepts and commands to read first.
 │   k8s-245   ●●●○○ fix   The API server is gone││  kubectl get pods → The connection to the     │
 │   ...                                         ││  server controlplane:6443 was refused …       │
 ╰──────────────────────────────────────────────╯╰───────────────────────────────────────────────╯
- ↑↓ move · enter open · / filter · tab track · u progress · a active · S started · e VMs · F10 menu · F1 keys · q quit
+ ↑↓ move · enter open · / filter · tab next track · F10 menu · F1 keys · q quit
 ```
 
 ## What you get

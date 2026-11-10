@@ -544,9 +544,11 @@ func (m *model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 			m.flash = "failed: " + msg.err.Error()
 		case msg.kind == "start":
 			m.prog.MarkStarted(msg.id)
+			m.refilter()
 			m.flash = "lab ready — press t to open a terminal"
 		case msg.kind == "check":
 			m.prog.RecordCheck(msg.id, msg.passed)
+			m.refilter()
 			if m.exam != nil && m.exam.Record(msg.id, msg.passed) {
 				_ = m.exams.Save(m.exam)
 			}
@@ -558,7 +560,7 @@ func (m *model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 				m.flash = "not yet — read the failing checks in Output"
 			}
 		case msg.kind == "stop":
-			m.flash = msg.id + " ended — its VMs are deleted"
+			m.flash = msg.id + " ended — its VMs are cleaned for the next exercise"
 		case msg.kind == "cleanup":
 			m.flash = "no lab VMs left over"
 		case msg.kind == "env":
@@ -1011,6 +1013,7 @@ func (m *model) askForget(ex *exercise.Exercise, q string, done func()) {
 	m.ask(q, func() tea.Cmd {
 		m.prog.Reset(ex.ID)
 		delete(m.result, ex.ID)
+		m.refilter() // the progress filter may no longer keep ex
 		done()
 		return nil
 	}, nil)
@@ -1090,6 +1093,7 @@ func (m *model) updateStarted(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 				m.prog.Reset(e.ID)
 				delete(m.result, e.ID)
 			}
+			m.refilter()
 			m.resetStarted()
 			m.flash = "reset started labs"
 			return nil
