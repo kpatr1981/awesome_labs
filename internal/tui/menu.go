@@ -177,13 +177,25 @@ func (m *model) menus() []menu {
 	if onDetail && m.fromExam {
 		backKey = ""
 	}
+	// a key is shown next to an item only where pressing it does the same thing
+	on := func(cond bool, k string) string {
+		if cond {
+			return k
+		}
+		return ""
+	}
+	exKey := func(k string) string { return on(onDetail, k) } // lab keys work on the exercise screen
+	openKey := "enter"
+	if onResult {
+		openKey = "o"
+	}
 	file := menu{"File", 'f', []menuItem{
 		{label: "Exercise list", key: backKey, hidden: onBrowse, run: func() tea.Cmd { m.screen = scrBrowse; return nil }},
 		menuItem{label: "Go to the active exercise", key: "a", run: func() tea.Cmd { m.goActive(); return nil }}.
 			off(!m.hasActive, "no exercise is set up on the VMs yet"),
 		{label: "Started labs", key: "S", hidden: onStarted, run: func() tea.Cmd { m.openStarted(); return nil }},
 		sep(),
-		{label: "Quit", key: "q", run: func() tea.Cmd { return tea.Quit }},
+		{label: "Quit", key: on(onBrowse, "q"), run: func() tea.Cmd { return tea.Quit }},
 		{label: "Quit and stop all VMs", key: "Q", run: m.quitAndStop},
 	}}
 
@@ -196,13 +208,13 @@ func (m *model) menus() []menu {
 			hasHints = len(ex.Hints) > 0
 		}
 		exm.items = []menuItem{
-			menuItem{label: "Open", key: "enter", hidden: onDetail, run: func() tea.Cmd { m.openTarget(ex); return nil }}.
+			menuItem{label: "Open", key: openKey, hidden: onDetail, run: func() tea.Cmd { m.openTarget(ex); return nil }}.
 				off(noEx, "nothing is selected"),
 			head("Lab", ""),
-			menuItem{label: "Start / set up the lab", key: "s", run: m.onExercise("s")}.off(noEx, "nothing is selected"),
-			menuItem{label: "Open a terminal", key: "t", run: m.onExercise("t")}.off(noEx, "nothing is selected"),
-			{label: "Terminal on node01", key: "w", hidden: noEx || ex.Profile != exercise.ProfileK8s, run: m.onExercise("w")},
-			menuItem{label: "Check my work", key: "c", run: m.onExercise("c")}.off(noEx, "nothing is selected"),
+			menuItem{label: "Start / set up the lab", key: exKey("s"), run: m.onExercise("s")}.off(noEx, "nothing is selected"),
+			menuItem{label: "Open a terminal", key: exKey("t"), run: m.onExercise("t")}.off(noEx, "nothing is selected"),
+			{label: "Terminal on node01", key: exKey("w"), hidden: noEx || ex.Profile != exercise.ProfileK8s, run: m.onExercise("w")},
+			menuItem{label: "Check my work", key: exKey("c"), run: m.onExercise("c")}.off(noEx, "nothing is selected"),
 			// hints and the solution belong to the open exercise, not to a list
 			{label: "Help with it", sep: true, hidden: !onDetail},
 			menuItem{label: "Show the next hint", key: "h", hidden: !onDetail, run: m.onExercise("h")}.
@@ -210,7 +222,9 @@ func (m *model) menus() []menu {
 			menuItem{label: "Reveal the solution…", key: "v", hidden: !onDetail, run: m.onExercise("v")}.
 				off(noEx, "nothing is selected").off(locked, "the solution is "+lockedWhy),
 			sep(),
-			menuItem{label: "Reset my progress…", key: "R", run: m.onExercise("R")}.off(noEx, "nothing is selected"),
+			menuItem{label: "Reset my progress…", key: exKey("R"), hidden: onStarted, run: m.onExercise("R")}.off(noEx, "nothing is selected"),
+			// the started-labs list resets in place, with its own key
+			{label: "Reset my progress…", key: "r", hidden: !onStarted, run: func() tea.Cmd { return m.press("r") }},
 			menuItem{label: "Reset all started labs…", key: "A", hidden: !onStarted, run: func() tea.Cmd { return m.press("A") }}.
 				off(len(m.started) == 0, "no labs are started"),
 			sep(),
@@ -284,12 +298,12 @@ func (m *model) menus() []menu {
 		head("Selected environment", ""),
 		{label: "Start / create", key: "u", hidden: !onEnv, run: func() tea.Cmd { return m.press("u") }},
 		{label: "Stop", key: "x", hidden: !onEnv, run: func() tea.Cmd { return m.press("x") }},
-		{label: "Reset", key: "R", hidden: !onEnv, run: func() tea.Cmd { return m.press("R") }},
+		{label: "Reset VMs", key: "R", hidden: !onEnv, run: func() tea.Cmd { return m.press("R") }},
 		{label: "Rebuild…", key: "B", hidden: !onEnv, run: func() tea.Cmd { return m.press("B") }},
 		{label: "Delete…", key: "D", hidden: !onEnv, run: func() tea.Cmd { return m.press("D") }},
 		head("All environments", ""),
-		{label: "Stop all lab VMs", key: "X", run: m.onScreen(scrEnv, "X")},
-		{label: "Delete all lab VMs…", key: "K", run: m.onScreen(scrEnv, "K")},
+		{label: "Stop all lab VMs", key: on(onEnv, "X"), run: m.onScreen(scrEnv, "X")},
+		{label: "Delete all lab VMs…", key: on(onEnv, "K"), run: m.onScreen(scrEnv, "K")},
 	}}
 
 	examKey := "X" // X opens the exam from the list
@@ -523,7 +537,31 @@ func (m *model) globalKey(k string) (tea.Cmd, bool) {
 		m.openMenu(i)
 		return nil, true
 	}
-	return nil, false
+	return m.navKey(k)
+}
+
+// navKey handles the File and VMs menu keys that work on every screen: a
+// (active exercise), S (started labs), e (environments) and Q (quit and stop
+// the VMs). Not while typing a filter, and not on a screen that gives the key
+// its own meaning (S and e lead back from their own screens).
+func (m *model) navKey(k string) (tea.Cmd, bool) {
+	if m.filterOn && m.screen == scrBrowse {
+		return nil, false
+	}
+	switch {
+	case k == "a":
+		m.goActive()
+	case k == "S" && m.screen != scrStarted:
+		m.openStarted()
+	case k == "e" && m.screen != scrEnv:
+		m.screen = scrEnv
+		return m.cmdEnvStatus(), true
+	case k == "Q":
+		return m.quitAndStop(), true
+	default:
+		return nil, false
+	}
+	return nil, true
 }
 
 func (m *model) answer(yes bool) tea.Cmd {
@@ -969,19 +1007,19 @@ func formatLeft(d time.Duration) string {
 const shortcutsText = `Keyboard shortcuts
 
 Everywhere      F10 menu bar · alt+f/e/v/t/m/x/h open a menu · F1 this help
-                ctrl+c quit
+                a active exercise · S started labs · e environments & VMs
+                Q quit and stop VMs · ctrl+c quit
 
 Exercise list   ↑↓ move · enter open · / filter · esc clear filter
                 tab next track · n/p next/previous module
                 u cycle all / solved / in progress / no progress
-                a active exercise · S started labs · L learning paths
-                e environments & VMs · X exam · q quit · Q quit and stop VMs
+                L learning paths · X exam · q quit
 
 Exercise        s start the lab · t terminal · w node01 terminal (Kubernetes)
                 c check · h next hint · v solution · R reset progress
                 1–5 or tab switch tabs · n/N next/previous · esc back
 
-Environments    ↑↓ select · u start · x stop · R reset · B rebuild · D delete
+Environments    ↑↓ select · u start · x stop · R reset VMs · B rebuild · D delete
                 X stop all · K delete all · r refresh · esc back
 
 Menus           ←→ switch menu · ↑↓ move · enter choose · esc close

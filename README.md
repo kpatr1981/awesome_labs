@@ -120,7 +120,9 @@ builds one for Linux and macOS on x86-64 and ARM into `dist/`, with checksums.
 Everything is also reachable from the **menu bar** at the top: click a menu, press
 `F10`, or `alt` + the underlined letter (`alt+f` File, `alt+e` Exercise, `alt+v` View,
 `alt+t` Tracks, `alt+m` VMs, `alt+x` Exam, `alt+h` Help). Menu items show their
-keyboard shortcut, and pressing that key while the menu is open picks it. Menus only
+keyboard shortcut only on the screens where pressing that key does the same thing, so a
+shown key works with the menu open or closed. `a` (active exercise), `S` (started labs),
+`e` (environments & VMs) and `Q` (quit and stop the VMs) work on every screen. Menus only
 offer what applies to the current screen: Exercise acts on the selected exercise on the
 list, the exercise screen, Started labs and the exam screens, while hints and the solution
 appear only once the exercise is open; File moves between the exercise screens; View and
