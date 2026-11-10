@@ -116,7 +116,7 @@ func (m *model) header() string {
 		left += "   " + sWarn.Render("▶ working on "+m.active.ID) + sMuted.Render(" (a)")
 	}
 	right := sOK.Render(fmt.Sprintf("✔ %d", solved)) + sMuted.Render(fmt.Sprintf("/%d solved  ", len(ids))) +
-		sWarn.Render(fmt.Sprintf("● %d", started)) + sMuted.Render(" in progress ")
+		sWarn.Render(fmt.Sprintf("● %d", started)) + sMuted.Render(" started, unsolved ")
 	gap := max(1, m.w-lipgloss.Width(left)-lipgloss.Width(right))
 	return left + strings.Repeat(" ", gap) + right
 }
@@ -273,8 +273,10 @@ func (m *model) preview(e *exercise.Exercise, w, h int) string {
 	switch {
 	case !p.Solved.IsZero():
 		status = sOK.Render("✔ solved " + p.Solved.Format("2006-01-02"))
+	case m.isActive(e):
+		status = sWarn.Render("▶ set up on the VMs now")
 	case !p.Started.IsZero():
-		status = sWarn.Render("● in progress")
+		status = sWarn.Render("● started, not solved")
 	}
 	head := sTitle.Render(e.ID+" — "+e.Title) + "\n" + m.meta(e) + "\n" + status
 	if len(e.Tags) > 0 {
@@ -392,7 +394,7 @@ func (m *model) viewStarted() string {
 	title := sTitle.Render(" Your labs ") + sMuted.Render("one exercise is set up on the VMs at a time")
 	if len(m.started) == 0 {
 		return lipgloss.JoinVertical(lipgloss.Left, title, "",
-			sMuted.Render("  Nothing in progress. Start a lab with s on an exercise."),
+			sMuted.Render("  No started labs. Start a lab with s on an exercise."),
 			m.statusLine("esc back"))
 	}
 	var b strings.Builder

@@ -643,7 +643,7 @@ func (m *model) updateBrowse(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 		if ex := m.cat.Get(m.active.ID); m.hasActive && ex != nil {
 			m.openDetail(ex)
 		} else {
-			m.flash = "no exercise in progress — open one and press s to start it"
+			m.flash = "no exercise is set up on the VMs — open one and press s to start it (S lists labs started earlier)"
 		}
 	case "L":
 		m.screen = scrPaths

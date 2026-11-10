@@ -10,7 +10,7 @@ exercise has a scenario, progressive hints and a full solution you can reveal, a
 have a short tutorial on the concepts and commands to read first.
 
 ```text
- awesome_labs hands-on labs                                           ✔ 37/645 solved  ● 2 in progress
+ awesome_labs hands-on labs                                           ✔ 37/645 solved  ● 2 started, unsolved
  All  Docker  Kubernetes  Offensive Sec  Linux  Networking  Cloud  Data  Defensive Sec  Programming  Data Science
 ╭──────────────────────────────────────────────╮╭───────────────────────────────────────────────╮
 │▸ Kubernetes · Troubleshooting the cluster     ││k8s-245 — The API server is gone               │
