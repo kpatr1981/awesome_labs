@@ -47,7 +47,9 @@ type zone struct {
 
 type menuItem struct {
 	label, key string
-	sep        bool
+	note       string // shown in the key column when there is no key
+	why        string // why the item is disabled, shown when it is clicked
+	sep        bool   // a separator; with a label it heads a group of items
 	disabled   bool
 	hidden     bool // not offered on this screen
 	checked    bool
@@ -61,6 +63,18 @@ type menu struct {
 }
 
 func sep() menuItem { return menuItem{sep: true} }
+
+// head is a separator that names the group below it; key is the shortcut that
+// cycles through the group.
+func head(label, key string) menuItem { return menuItem{sep: true, label: label, key: key} }
+
+// off disables an item with a reason when cond holds.
+func (it menuItem) off(cond bool, why string) menuItem {
+	if cond && !it.disabled {
+		it.disabled, it.why = true, why
+	}
+	return it
+}
 
 // keyMsg builds the key message a real key press would produce.
 func keyMsg(k string) tea.KeyMsg {
@@ -98,8 +112,28 @@ func (m *model) target() *exercise.Exercise {
 		if len(m.visible) > 0 {
 			return m.visible[m.cursor]
 		}
+	case scrStarted:
+		if m.startedCursor < len(m.started) {
+			return m.started[m.startedCursor]
+		}
+	case scrExam:
+		if m.exam != nil && m.examCursor < len(m.exam.Questions) {
+			return m.cat.Get(m.exam.Questions[m.examCursor].ID)
+		}
+	case scrExamResult:
+		if m.finished != nil && m.examCursor < len(m.finished.Questions) {
+			return m.cat.Get(m.finished.Questions[m.examCursor].ID)
+		}
 	}
 	return nil
+}
+
+// openTarget opens ex on the exercise screen, keeping the way back to the
+// exam when it is opened from there.
+func (m *model) openTarget(ex *exercise.Exercise) {
+	fromExam := m.screen == scrExam
+	m.openDetail(ex)
+	m.fromExam = fromExam
 }
 
 // onExercise runs key k on the exercise screen of the target exercise.
@@ -110,7 +144,7 @@ func (m *model) onExercise(k string) func() tea.Cmd {
 			if ex == nil {
 				return nil
 			}
-			m.openDetail(ex)
+			m.openTarget(ex)
 		}
 		_, c := m.updateDetail(keyMsg(k))
 		return c
@@ -129,19 +163,25 @@ func (m *model) onScreen(s screen, k string) func() tea.Cmd {
 
 // menus builds the menu bar for the current screen. Items that only make
 // sense on another screen are hidden rather than greyed out, and a menu left
-// with nothing to offer is dropped from the bar.
+// with nothing to offer is dropped from the bar. Greyed-out items say why
+// when clicked.
 func (m *model) menus() []menu {
 	ex := m.target()
 	noEx := ex == nil
 	locked := m.examLocked(ex)
 	onBrowse, onDetail, onEnv := m.screen == scrBrowse, m.screen == scrDetail, m.screen == scrEnv
+	onStarted, onExam, onResult := m.screen == scrStarted, m.screen == scrExam, m.screen == scrExamResult
+	const lockedWhy = "locked during this exam"
 
+	backKey := "esc" // esc leads back to the list, except from an exam question
+	if onDetail && m.fromExam {
+		backKey = ""
+	}
 	file := menu{"File", 'f', []menuItem{
-		{label: "Browse exercises", key: "esc", hidden: onBrowse, run: func() tea.Cmd { m.screen = scrBrowse; return nil }},
-		{label: "Go to the active exercise", key: "a", disabled: !m.hasActive, run: func() tea.Cmd { m.goActive(); return nil }},
-		{label: "Started labs", key: "S", hidden: m.screen == scrStarted, run: func() tea.Cmd { m.openStarted(); return nil }},
-		{label: "Learning paths", key: "L", hidden: m.screen == scrPaths, run: func() tea.Cmd { m.screen = scrPaths; return nil }},
-		{label: "Lab environments & VMs", key: "e", hidden: onEnv, run: func() tea.Cmd { m.screen = scrEnv; return m.cmdEnvStatus() }},
+		{label: "Exercise list", key: backKey, hidden: onBrowse, run: func() tea.Cmd { m.screen = scrBrowse; return nil }},
+		menuItem{label: "Go to the active exercise", key: "a", run: func() tea.Cmd { m.goActive(); return nil }}.
+			off(!m.hasActive, "no exercise is set up on the VMs yet"),
+		{label: "Started labs", key: "S", hidden: onStarted, run: func() tea.Cmd { m.openStarted(); return nil }},
 		sep(),
 		{label: "Quit", key: "q", run: func() tea.Cmd { return tea.Quit }},
 		{label: "Quit and stop all VMs", key: "Q", run: m.quitAndStop},
@@ -149,55 +189,75 @@ func (m *model) menus() []menu {
 
 	// the Exercise menu acts on the selected or open exercise
 	exm := menu{"Exercise", 'e', nil}
-	if onBrowse || onDetail {
+	// on the list it stays, greyed out, when the filter leaves nothing selected
+	if onBrowse || !noEx && (onDetail || onStarted || onExam || onResult) {
+		var hasHints bool
+		if ex != nil {
+			hasHints = len(ex.Hints) > 0
+		}
 		exm.items = []menuItem{
-			{label: "Open", key: "enter", hidden: !onBrowse, disabled: noEx, run: func() tea.Cmd { m.openDetail(ex); return nil }},
-			sep(),
-			{label: "Start / set up the lab", key: "s", disabled: noEx, run: m.onExercise("s")},
-			{label: "Open a terminal", key: "t", disabled: noEx, run: m.onExercise("t")},
+			menuItem{label: "Open", key: "enter", hidden: onDetail, run: func() tea.Cmd { m.openTarget(ex); return nil }}.
+				off(noEx, "nothing is selected"),
+			head("Lab", ""),
+			menuItem{label: "Start / set up the lab", key: "s", run: m.onExercise("s")}.off(noEx, "nothing is selected"),
+			menuItem{label: "Open a terminal", key: "t", run: m.onExercise("t")}.off(noEx, "nothing is selected"),
 			{label: "Terminal on node01", key: "w", hidden: noEx || ex.Profile != exercise.ProfileK8s, run: m.onExercise("w")},
-			{label: "Check my work", key: "c", disabled: noEx, run: m.onExercise("c")},
+			menuItem{label: "Check my work", key: "c", run: m.onExercise("c")}.off(noEx, "nothing is selected"),
+			// hints and the solution belong to the open exercise, not to a list
+			{label: "Help with it", sep: true, hidden: !onDetail},
+			menuItem{label: "Show the next hint", key: "h", hidden: !onDetail, run: m.onExercise("h")}.
+				off(noEx, "nothing is selected").off(locked, "hints are "+lockedWhy).off(!hasHints, "this exercise has no hints"),
+			menuItem{label: "Reveal the solution…", key: "v", hidden: !onDetail, run: m.onExercise("v")}.
+				off(noEx, "nothing is selected").off(locked, "the solution is "+lockedWhy),
 			sep(),
-			{label: "Show the next hint", key: "h", disabled: noEx || locked || len(ex.Hints) == 0, run: m.onExercise("h")},
-			{label: "Reveal the solution…", key: "v", disabled: noEx || locked, run: m.onExercise("v")},
-			{label: "Reset my progress…", key: "R", disabled: noEx, run: m.onExercise("R")},
+			menuItem{label: "Reset my progress…", key: "R", run: m.onExercise("R")}.off(noEx, "nothing is selected"),
+			menuItem{label: "Reset all started labs…", key: "A", hidden: !onStarted, run: func() tea.Cmd { return m.press("A") }}.
+				off(len(m.started) == 0, "no labs are started"),
 			sep(),
 			{label: "Next exercise", key: "n", hidden: !onDetail, run: m.onExercise("n")},
 			{label: "Previous exercise", key: "N", hidden: !onDetail, run: m.onExercise("N")},
 		}
 	}
 
-	// View and Tracks shape the exercise list
+	// View shapes the exercise list, or picks the tab of the exercise screen
 	view := menu{"View", 'v', nil}
 	tracks := menu{title: "Tracks", acc: 't'}
-	if onBrowse {
+	switch {
+	case onDetail:
+		view.items = []menuItem{head("Tab", "tab")}
+		for i, name := range tabNames {
+			k := fmt.Sprint(i + 1)
+			it := menuItem{label: name, key: k, checked: m.tab == tab(i), run: func() tea.Cmd { return m.press(k) }}
+			if tab(i) == tabSolution {
+				it = it.off(locked, "the solution is "+lockedWhy)
+			}
+			view.items = append(view.items, it)
+		}
+	case onBrowse:
 		view.items = []menuItem{
 			{label: "Filter…", key: "/", run: func() tea.Cmd {
 				m.filterOn = true
 				m.filter.Focus()
 				return textinput.Blink
 			}},
-			{label: "Clear the filter", key: "esc", disabled: m.filter.Value() == "", run: func() tea.Cmd {
+			menuItem{label: "Clear the filter", key: "esc", run: func() tea.Cmd {
 				m.filter.SetValue("")
 				m.refilter()
 				return nil
-			}},
-			sep(),
+			}}.off(m.filter.Value() == "", "no filter is set"),
+			head("Show", "u"),
 		}
 		for i, name := range progFilterNames {
 			f := progFilter(i)
-			key := ""
-			if i == 0 {
-				key = "u cycles"
-			}
-			view.items = append(view.items, menuItem{label: "Show: " + name, key: key, checked: m.progFilter == f,
+			view.items = append(view.items, menuItem{label: name, checked: m.progFilter == f,
 				run: func() tea.Cmd { m.setProgFilter(f); return nil }})
 		}
 		view.items = append(view.items,
-			sep(),
+			head("Jump", ""),
 			menuItem{label: "Next module", key: "n", run: func() tea.Cmd { return m.press("n") }},
 			menuItem{label: "Previous module", key: "p", run: func() tea.Cmd { return m.press("p") }},
-			sep(),
+			head("Learning path", ""),
+			menuItem{label: "Choose a learning path…", key: "L", run: func() tea.Cmd { m.screen = scrPaths; return nil }},
 			menuItem{label: "Clear the learning path", hidden: m.path == nil, run: func() tea.Cmd {
 				m.path = nil
 				m.cursor, m.offset = 0, 0
@@ -206,13 +266,11 @@ func (m *model) menus() []menu {
 			}},
 		)
 
+		tracks.items = []menuItem{head("Track", "tab")}
+		counts := m.trackCounts()
 		for i, t := range m.tracks {
 			i := i
-			key := ""
-			if i == 0 {
-				key = "tab cycles"
-			}
-			tracks.items = append(tracks.items, menuItem{label: trackLabel(t), key: key, checked: i == m.trackIdx, run: func() tea.Cmd {
+			tracks.items = append(tracks.items, menuItem{label: trackName(t), note: counts[t], checked: i == m.trackIdx, run: func() tea.Cmd {
 				m.trackIdx, m.cursor, m.offset = i, 0, 0
 				m.refilter()
 				return nil
@@ -221,25 +279,30 @@ func (m *model) menus() []menu {
 	}
 
 	envs := menu{"VMs", 'm', []menuItem{
-		{label: "Show environments & VMs", key: "e", hidden: onEnv, run: func() tea.Cmd { m.screen = scrEnv; return m.cmdEnvStatus() }},
+		{label: "Lab environments & VMs", key: "e", hidden: onEnv, run: func() tea.Cmd { m.screen = scrEnv; return m.cmdEnvStatus() }},
 		{label: "Refresh status", key: "r", hidden: !onEnv, run: func() tea.Cmd { return m.press("r") }},
-		sep(),
-		{label: "Start / create selected", key: "u", hidden: !onEnv, run: func() tea.Cmd { return m.press("u") }},
-		{label: "Stop selected", key: "x", hidden: !onEnv, run: func() tea.Cmd { return m.press("x") }},
-		{label: "Reset selected", key: "R", hidden: !onEnv, run: func() tea.Cmd { return m.press("R") }},
-		{label: "Rebuild selected…", key: "B", hidden: !onEnv, run: func() tea.Cmd { return m.press("B") }},
-		{label: "Delete selected…", key: "D", hidden: !onEnv, run: func() tea.Cmd { return m.press("D") }},
-		sep(),
+		head("Selected environment", ""),
+		{label: "Start / create", key: "u", hidden: !onEnv, run: func() tea.Cmd { return m.press("u") }},
+		{label: "Stop", key: "x", hidden: !onEnv, run: func() tea.Cmd { return m.press("x") }},
+		{label: "Reset", key: "R", hidden: !onEnv, run: func() tea.Cmd { return m.press("R") }},
+		{label: "Rebuild…", key: "B", hidden: !onEnv, run: func() tea.Cmd { return m.press("B") }},
+		{label: "Delete…", key: "D", hidden: !onEnv, run: func() tea.Cmd { return m.press("D") }},
+		head("All environments", ""),
 		{label: "Stop all lab VMs", key: "X", run: m.onScreen(scrEnv, "X")},
 		{label: "Delete all lab VMs…", key: "K", run: m.onScreen(scrEnv, "K")},
 	}}
 
+	examKey := "X" // X opens the exam from the list
+	if !onBrowse {
+		examKey = ""
+	}
 	exams := menu{"Exam", 'x', []menuItem{
-		{label: "New exam…", hidden: m.exam != nil || m.screen == scrExamSetup, run: func() tea.Cmd { m.screen = scrExamSetup; return nil }},
-		{label: "Return to the exam", key: "X", hidden: m.exam == nil || m.screen == scrExam, run: func() tea.Cmd { m.screen = scrExam; return nil }},
+		{label: "New exam…", key: examKey, hidden: m.exam != nil || m.screen == scrExamSetup, run: func() tea.Cmd { m.screen = scrExamSetup; return nil }},
+		{label: "Return to the exam", key: examKey, hidden: m.exam == nil || onExam, run: func() tea.Cmd { m.screen = scrExam; return nil }},
 		{label: "Finish the exam…", key: "F", hidden: m.exam == nil, run: m.onScreen(scrExam, "F")},
 		sep(),
-		{label: "Last result", hidden: m.screen == scrExamResult, disabled: m.finished == nil, run: func() tea.Cmd { m.screen = scrExamResult; return nil }},
+		menuItem{label: "Last result", hidden: onResult, run: func() tea.Cmd { m.screen = scrExamResult; return nil }}.
+			off(m.finished == nil, "no exam finished in this session"),
 	}}
 
 	help := menu{"Help", 'h', []menuItem{
@@ -258,13 +321,50 @@ func (m *model) menus() []menu {
 	return out
 }
 
+// trackCounts returns "solved/total" for every track ("" is all of them).
+func (m *model) trackCounts() map[string]string {
+	ids := map[string][]string{}
+	for _, e := range m.cat.Exercises {
+		ids[e.Track] = append(ids[e.Track], e.ID)
+		ids[""] = append(ids[""], e.ID)
+	}
+	out := map[string]string{}
+	for t, l := range ids {
+		s, _ := m.prog.Counts(l)
+		out[t] = fmt.Sprintf("%d/%d", s, len(l))
+	}
+	return out
+}
+
+// trackName is the full name of a track, for places with room for it.
+func trackName(t string) string {
+	switch t {
+	case "":
+		return "All tracks"
+	case "offsec":
+		return "Offensive Security"
+	case "defensive":
+		return "Defensive Security"
+	}
+	return trackLabel(t)
+}
+
 // visibleItems drops hidden items and the separators left at the ends or
-// doubled up by them.
+// doubled up by them. A group heading may open the menu; a separator or heading
+// with nothing under it before the next one is dropped.
 func visibleItems(items []menuItem) []menuItem {
 	var out []menuItem
 	for _, it := range items {
-		if it.hidden || (it.sep && (len(out) == 0 || out[len(out)-1].sep)) {
+		if it.hidden {
 			continue
+		}
+		if it.sep {
+			if len(out) > 0 && out[len(out)-1].sep {
+				out = out[:len(out)-1]
+			}
+			if len(out) == 0 && it.label == "" {
+				continue
+			}
 		}
 		out = append(out, it)
 	}
@@ -317,11 +417,30 @@ func (m *model) menuStep(d int) {
 func (m *model) runMenuItem(i int) tea.Cmd {
 	items := m.menus()[m.menuOpen].items
 	m.closeMenu()
-	if i < 0 || i >= len(items) || items[i].sep || items[i].disabled {
+	if i < 0 || i >= len(items) || items[i].sep {
+		return nil
+	}
+	if items[i].disabled {
+		m.flash = items[i].label + ": " + items[i].why
 		return nil
 	}
 	m.flash = ""
 	return items[i].run()
+}
+
+// menuShortcut is the item of the open menu whose key is k, or -1. Keys that
+// move around the menu don't count.
+func (m *model) menuShortcut(k string) int {
+	fkey := len(k) > 1 && k[0] == 'f' // F1 and the like
+	if len([]rune(k)) != 1 && !fkey {
+		return -1
+	}
+	for i, it := range m.menus()[m.menuOpen].items {
+		if !it.sep && it.key != "" && (it.key == k || fkey && strings.EqualFold(it.key, k)) {
+			return i
+		}
+	}
+	return -1
 }
 
 func (m *model) menuKey(k string) tea.Cmd {
@@ -337,11 +456,19 @@ func (m *model) menuKey(k string) tea.Cmd {
 		m.menuStep(-1)
 	case "down":
 		m.menuStep(1)
+	case "home", "pgup":
+		m.menuItem = -1
+		m.menuStep(1)
+	case "end", "pgdown":
+		m.menuItem = 0
+		m.menuStep(-1)
 	case "enter", " ":
 		return m.runMenuItem(m.menuItem)
 	default:
 		if i := m.menuForAlt(k); i >= 0 {
 			m.openMenu(i)
+		} else if i := m.menuShortcut(k); i >= 0 {
+			return m.runMenuItem(i) // an item's own key picks it
 		}
 	}
 	return nil
@@ -708,10 +835,20 @@ func (m *model) dropdown() (string, int) {
 	mn := m.menus()[m.menuOpen]
 	lw, kw := 0, 0
 	for _, it := range mn.items {
-		lw = max(lw, lipgloss.Width(it.label))
-		kw = max(kw, lipgloss.Width(it.key))
+		if it.sep {
+			lw = max(lw, lipgloss.Width(it.label)-1)
+		} else {
+			lw = max(lw, lipgloss.Width(it.label))
+		}
+		kw = max(kw, lipgloss.Width(it.key), lipgloss.Width(it.note))
 	}
 	inner := 2 + lw + 3 + kw + 1
+	for _, it := range mn.items {
+		if it.sep && it.key != "" { // room for "─ label ─ key cycles ─"
+			inner = max(inner, lipgloss.Width(it.label)+lipgloss.Width(it.key)+14)
+		}
+	}
+	lw = inner - kw - 6
 	x := m.menuX[m.menuOpen]
 	if x+inner+2 > m.w {
 		x = max(0, m.w-inner-2)
@@ -720,25 +857,47 @@ func (m *model) dropdown() (string, int) {
 	var lines []string
 	for i, it := range mn.items {
 		if it.sep {
-			lines = append(lines, base.Foreground(colMuted).Render(strings.Repeat("─", inner)))
+			lines = append(lines, sepLine(base, it, inner))
 			continue
 		}
 		mark := " "
 		if it.checked {
 			mark = "✓"
 		}
-		text := " " + mark + padRight(it.label, lw) + "   " + fmt.Sprintf("%*s", kw, it.key) + " "
 		st := base
+		keySt := base.Foreground(colMuted)
+		right := it.key
+		if right == "" {
+			right = it.note
+		} else {
+			keySt = base
+		}
 		switch {
 		case it.disabled:
-			st = base.Foreground(colMuted)
+			st, keySt = base.Foreground(colMuted), base.Foreground(colMuted)
 		case i == m.menuItem:
 			st = lipgloss.NewStyle().Background(colAccent).Foreground(colHiFg)
+			keySt = st
 		}
-		lines = append(lines, st.Width(inner).Render(text))
+		lines = append(lines, st.Render(" "+mark+padRight(it.label, lw)+"   ")+keySt.Render(fmt.Sprintf("%*s ", kw, right)))
 		m.zones = append(m.zones, zone{x, 2 + i, inner + 2, 1, fmt.Sprintf("mi:%d", i)})
 	}
 	return sMenuBox.Render(strings.Join(lines, "\n")), x
+}
+
+// sepLine draws a separator, or a group heading with the key that cycles it.
+func sepLine(base lipgloss.Style, it menuItem, w int) string {
+	line := base.Foreground(colMuted)
+	if it.label == "" {
+		return line.Render(strings.Repeat("─", w))
+	}
+	l := "─ " + it.label + " "
+	r := ""
+	if it.key != "" {
+		r = " " + it.key + " cycles ─"
+	}
+	fill := max(0, w-lipgloss.Width(l)-lipgloss.Width(r))
+	return line.Render("─ ") + line.Bold(true).Render(it.label) + line.Render(" "+strings.Repeat("─", fill)+r)
 }
 
 // dialog renders the confirmation question as a centered box with buttons.
@@ -814,7 +973,7 @@ Everywhere      F10 menu bar · alt+f/e/v/t/m/x/h open a menu · F1 this help
 
 Exercise list   ↑↓ move · enter open · / filter · esc clear filter
                 tab next track · n/p next/previous module
-                u cycle all / unsolved / in progress / no progress
+                u cycle all / solved / in progress / no progress
                 a active exercise · S started labs · L learning paths
                 e environments & VMs · X exam · q quit · Q quit and stop VMs
 
@@ -826,6 +985,7 @@ Environments    ↑↓ select · u start · x stop · R reset · B rebuild · D 
                 X stop all · K delete all · r refresh · esc back
 
 Menus           ←→ switch menu · ↑↓ move · enter choose · esc close
+                or press the key shown next to an item
 Dialogs         y/n, or ←→ and enter`
 
 const mouseText = `Using the mouse
@@ -837,6 +997,7 @@ const mouseText = `Using the mouse
 • Click the tabs and buttons on the exercise screen.
 • The wheel scrolls lists and text.
 • Click Yes or No in a confirmation.
+• A greyed-out menu item says why when you click it.
 
 Most terminals select text with shift+drag while the mouse is in use.`
 

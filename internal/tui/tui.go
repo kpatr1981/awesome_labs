@@ -213,19 +213,19 @@ type progFilter int
 
 const (
 	progAll        progFilter = iota
-	progUnsolved              // anything not solved yet
+	progSolved                // solved (✔ in the list)
 	progInProgress            // started, not solved (● in the list)
 	progNone                  // not started, not solved
 	progFilterCount
 )
 
-var progFilterNames = []string{"All exercises", "Unsolved", "In progress", "No progress"}
+var progFilterNames = []string{"All exercises", "Solved", "In progress", "No progress"}
 
 func (f progFilter) keep(p progress.Entry) bool {
 	solved, started := !p.Solved.IsZero(), !p.Started.IsZero()
 	switch f {
-	case progUnsolved:
-		return !solved
+	case progSolved:
+		return solved
 	case progInProgress:
 		return started && !solved
 	case progNone:
