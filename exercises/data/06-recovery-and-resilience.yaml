@@ -1,0 +1,1619 @@
+track: data
+module: Recovery & resilience
+profile: docker
+order: 6
+exercises:
+
+- id: data-046
+  title: Undo the DELETE at a known second
+  difficulty: 4
+  kind: fix
+  tags: [postgres, backup, pitr, wal, archive, recovery]
+  tutorial: |
+    **Concept.** A dump restores the database as it was when the dump ran. Point-in-time recovery (PITR) restores it as it was at *any* moment you choose. It needs two things taken before the accident: a **base backup** (a copy of the data directory, from `pg_basebackup`) and a continuous **WAL archive** (every write-ahead log segment, copied away by `archive_command` as it fills).
+
+    To recover, you lay the base backup down in an empty data directory, create a `recovery.signal` file and tell the server where the archive is (`restore_command`) and where to stop (`recovery_target_time`, `recovery_target_xid` or `recovery_target_lsn`). On start it replays the archived WAL from the backup forward and stops at the first transaction that committed **after** the target. What happens then is set by `recovery_target_action`: by default it **pauses**, read-only, so you can look before deciding.
+
+    A recovered copy is rarely the new production database: everything written after the target would be lost. The usual move is to recover a side copy to just before the mistake and copy the damaged rows back.
+
+    **Read up on:**
+    - Continuous archiving and point-in-time recovery, in the PostgreSQL manual
+    - `pg_basebackup -Ft`: what `base.tar.gz` and `pg_wal.tar.gz` contain
+    - `recovery.signal`, `restore_command`, `recovery_target_time`, `recovery_target_action`
+    - `pg_get_wal_replay_pause_state()` and `pg_is_in_recovery()`
+    - `COPY ... TO STDOUT` and `COPY ... FROM STDIN` for moving rows between servers
+  scenario: |
+    PostgreSQL runs in **`kl-pg`** (`docker exec -it kl-pg psql -U lab -d lab`). Its data is in
+    the volume `kl-pg-data`. Every WAL segment is archived to the volume **`kl-archive`**
+    (mounted at `/archive`), and last night's base backup is in the volume **`kl-backup`**
+    under `/backup/base`.
+
+    Someone ran a bad `DELETE` on the **`orders`** table. **`/lab/INCIDENT.md`** has the exact
+    second it ran and what happened since. The shop kept taking orders and updating others
+    after the mistake, and none of that may be lost.
+
+    ## Part 1: Recover a copy to just before the DELETE
+
+    Start a **second** PostgreSQL container named **`kl-pitr`** from the base backup and the
+    WAL archive, recovered to the moment given in `/lab/INCIDENT.md`: its `orders` table must
+    hold every order as it was just before the `DELETE`, and nothing that happened after it.
+    Use the `postgres:16-alpine` image. Leave `kl-pg` running throughout.
+
+    ## Part 2: Put the deleted orders back
+
+    Copy the deleted orders from `kl-pitr` back into **`kl-pg`**. When you are done, `kl-pg`
+    must have every order: the ones the `DELETE` removed, exactly as they were, and every
+    order created or changed after it, with its later changes intact.
+  hints:
+    - "Look inside the backup first: `docker run --rm -v kl-backup:/backup alpine:3.22 ls -l /backup/base`. A `-Ft` backup is a tar of the data directory plus a separate tar of the WAL it needs."
+    - "Prepare the new data directory in a volume with a throw-away container: extract `base.tar.gz` into it, and `pg_wal.tar.gz` into its `pg_wal` directory."
+    - "Recovery settings go in `postgresql.auto.conf` (or `postgresql.conf`), and recovery only happens if `recovery.signal` exists in the data directory. `restore_command` runs inside the container, so `kl-archive` must be mounted there."
+    - "Give `recovery_target_time` with a time zone, for example `'2026-01-01 10:00:00+00'`. When recovery reaches it, `SELECT pg_get_wal_replay_pause_state()` on `kl-pitr` says `paused`."
+    - "The deleted rows are the ones in `kl-pitr` whose id is missing from `kl-pg`. Load all of kl-pitr's orders into a temporary table on `kl-pg`, then insert only the ids that are missing."
+  solution: |
+    ## Part 1: Recover a copy to just before the DELETE
+
+    ```bash
+    T=$(sed -n 's/.*`\(20[0-9-]* [0-9:]*\) UTC`.*/\1/p' /lab/INCIDENT.md | head -1)
+    docker run --rm -v kl-backup:/backup -v kl-pitr-data:/var/lib/postgresql/data postgres:16-alpine sh -c "
+      cd /var/lib/postgresql/data &&
+      tar xzf /backup/base/base.tar.gz &&
+      tar xzf /backup/base/pg_wal.tar.gz -C pg_wal &&
+      touch recovery.signal &&
+      echo \"restore_command = 'cp /archive/%f %p'\" >> postgresql.auto.conf &&
+      echo \"recovery_target_time = '$T+00'\" >> postgresql.auto.conf"
+    docker run -d --name kl-pitr -v kl-pitr-data:/var/lib/postgresql/data \
+      -v kl-archive:/archive:ro postgres:16-alpine
+    docker exec kl-pitr psql -U lab -d lab -c 'SELECT pg_get_wal_replay_pause_state()'   # paused
+    ```
+
+    ## Part 2: Put the deleted orders back
+
+    ```bash
+    docker exec kl-pitr psql -U lab -d lab -c 'COPY orders TO STDOUT' > /lab/before.copy
+    docker exec -i kl-pg psql -U lab -d lab -v ON_ERROR_STOP=1 \
+      -c 'CREATE TEMP TABLE before (LIKE orders)' \
+      -c 'COPY before FROM STDIN' \
+      -c 'INSERT INTO orders SELECT * FROM before b WHERE NOT EXISTS (SELECT 1 FROM orders o WHERE o.id = b.id)' \
+      < /lab/before.copy
+    ```
+
+    Recovering `kl-pg` itself to that time would also have worked for the deleted rows, but it
+    would have thrown away every order taken after the mistake.
+  setup: |
+    docker volume create kl-archive >/dev/null
+    docker volume create kl-backup >/dev/null
+    docker run --rm -v kl-archive:/archive -v kl-backup:/backup alpine:3.22 chown 70:70 /archive /backup
+    docker run -d --name kl-pg -e POSTGRES_USER=lab -e POSTGRES_PASSWORD=lab -e POSTGRES_DB=lab \
+      -v kl-pg-data:/var/lib/postgresql/data -v kl-archive:/archive -v kl-backup:/backup \
+      postgres:16-alpine -c archive_mode=on -c 'archive_command=test ! -f /archive/%f && cp %p /archive/%f' >/dev/null
+    eventually 60 "pg_x kl-pg 'select 1'"
+    pg_x kl-pg "CREATE TABLE orders (id int PRIMARY KEY, customer text NOT NULL, amount numeric(10,2) NOT NULL,
+                status text NOT NULL DEFAULT 'paid', created_at timestamptz NOT NULL DEFAULT clock_timestamp())"
+    pg_x kl-pg "INSERT INTO orders (id, customer, amount, status)
+                SELECT g, 'customer-' || (g % 37), ((g * 7919) % 25000) / 100.0, 'paid' FROM generate_series(1, 400) g"
+    # last night's base backup
+    docker exec kl-pg su-exec postgres pg_basebackup -U lab -D /backup/base -Ft -z -X stream -c fast
+    # the day's business before the mistake
+    for b in 0 1 2 3; do
+      pg_x kl-pg "INSERT INTO orders (id, customer, amount, status)
+                  SELECT g, 'customer-' || (g % 37), ((g * 7919) % 25000) / 100.0, 'paid' FROM generate_series(401 + $b * 50, 450 + $b * 50) g"
+      pg_x kl-pg "UPDATE orders SET status = 'shipped' WHERE id % 9 = $b AND id <= 400"
+      sleep 1
+    done
+    sleep 2.2
+    t=$(pg_x kl-pg "SELECT to_char(date_trunc('second', clock_timestamp() AT TIME ZONE 'UTC'), 'YYYY-MM-DD HH24:MI:SS')")
+    sleep 2
+    # the mistake: meant to clean up the test customer's small orders only
+    pg_x kl-pg "COPY (SELECT * FROM orders WHERE amount < 100 ORDER BY id) TO STDOUT" > "$KL_STATE/deleted.copy"
+    pg_x kl-pg "DELETE FROM orders WHERE amount < 100"
+    sleep 1.5
+    # business after the mistake, which must survive
+    pg_x kl-pg "INSERT INTO orders (id, customer, amount, status)
+                SELECT g, 'customer-' || (g % 37), ((g * 7919) % 25000) / 100.0, 'paid' FROM generate_series(601, 650) g"
+    pg_x kl-pg "UPDATE orders SET status = 'refunded' WHERE id IN (13, 205, 488, 590, 612)"
+    w=$(pg_x kl-pg "SELECT pg_walfile_name(pg_current_wal_lsn())")
+    pg_x kl-pg "SELECT pg_switch_wal()" >/dev/null
+    eventually 30 "[ \"\$(pg_x kl-pg \"SELECT last_archived_wal >= '$w' FROM pg_stat_archiver\")\" = t ]"
+    # what a correct repair leaves, computed without changing kl-pg
+    q="SELECT md5(string_agg(o::text, '|' ORDER BY id)) FROM orders o"
+    { echo "BEGIN; CREATE TEMP TABLE d (LIKE orders); COPY d FROM STDIN;"; cat "$KL_STATE/deleted.copy"; echo '\.'
+      echo "SELECT count(*) || ' ' || md5(string_agg(o::text, '|' ORDER BY id)) FROM (SELECT * FROM orders UNION ALL SELECT * FROM d) o; ROLLBACK;"
+    } | docker exec -i kl-pg psql -h 127.0.0.1 -U lab -d lab -qAt -v ON_ERROR_STOP=1 >"$KL_STATE/expected"
+    wc -l <"$KL_STATE/deleted.copy" >"$KL_STATE/deleted.n"
+    lab_file /lab/INCIDENT.md <<EOF
+    # Incident: orders deleted
+
+    - At \`$t UTC\` an engineer ran \`DELETE FROM orders WHERE amount < 100\` on \`kl-pg\`.
+      They meant to add \`AND customer = 'test'\`. Nothing else wrote to the database in the
+      two seconds before it.
+    - Since then the shop has kept running: new orders came in and some existing orders were
+      refunded. All of that must be kept.
+    - Base backup: volume \`kl-backup\`, directory \`/backup/base\` (taken with
+      \`pg_basebackup -Ft -z -X stream\`). WAL archive: volume \`kl-archive\`.
+    EOF
+  check: |
+    info "Part 1: Recover a copy to just before the DELETE"
+    n=$(cat "$KL_STATE/deleted.n")
+    check "kl-pitr is running" 'c_running kl-pitr'
+    check_eq "kl-pitr has the 600 orders that existed before the DELETE" "$(pg_x kl-pitr 'SELECT count(*) || chr(47) || max(id) FROM orders' 2>/dev/null)" "600/600"
+    check_eq "kl-pitr still has the $n orders the DELETE removed" "$(pg_x kl-pitr 'SELECT count(*) FROM orders WHERE amount < 100' 2>/dev/null)" "$n"
+    check_eq "kl-pitr has none of the refunds made after the DELETE" "$(pg_x kl-pitr "SELECT count(*) FROM orders WHERE status = 'refunded'" 2>/dev/null)" 0
+
+    info "Part 2: Put the deleted orders back"
+    check "kl-pg is running" 'c_running kl-pg'
+    check_eq "kl-pg has every order, with every change made after the DELETE" \
+      "$(pg_x kl-pg "SELECT count(*) || ' ' || md5(string_agg(o::text, '|' ORDER BY id)) FROM orders o" 2>/dev/null)" "$(cat "$KL_STATE/expected")"
+  solve: |
+    # --- part 1: Recover a copy to just before the DELETE ---
+    T=$(sed -n 's/.*`\(20[0-9-]* [0-9:]*\) UTC`.*/\1/p' /lab/INCIDENT.md | head -1)
+    docker run --rm -v kl-backup:/backup -v kl-pitr-data:/var/lib/postgresql/data postgres:16-alpine sh -c "
+      cd /var/lib/postgresql/data &&
+      tar xzf /backup/base/base.tar.gz &&
+      tar xzf /backup/base/pg_wal.tar.gz -C pg_wal &&
+      touch recovery.signal &&
+      echo \"restore_command = 'cp /archive/%f %p'\" >> postgresql.auto.conf &&
+      echo \"recovery_target_time = '$T+00'\" >> postgresql.auto.conf"
+    docker run -d --name kl-pitr -v kl-pitr-data:/var/lib/postgresql/data -v kl-archive:/archive:ro postgres:16-alpine >/dev/null
+    for i in $(seq 60); do
+      [ "$(docker exec kl-pitr psql -h 127.0.0.1 -U lab -d lab -qAt -c 'SELECT pg_get_wal_replay_pause_state()' 2>/dev/null)" = paused ] && break
+      sleep 2
+    done
+
+    # --- part 2: Put the deleted orders back ---
+    docker exec kl-pitr psql -h 127.0.0.1 -U lab -d lab -c 'COPY orders TO STDOUT' > /lab/before.copy
+    docker exec -i kl-pg psql -h 127.0.0.1 -U lab -d lab -v ON_ERROR_STOP=1 \
+      -c 'CREATE TEMP TABLE before (LIKE orders)' \
+      -c 'COPY before FROM STDIN' \
+      -c 'INSERT INTO orders SELECT * FROM before b WHERE NOT EXISTS (SELECT 1 FROM orders o WHERE o.id = b.id)' \
+      < /lab/before.copy
+
+- id: data-047
+  title: The replica that fell behind and the slot nobody owns
+  difficulty: 3
+  kind: fix
+  tags: [postgres, replication, lag, replication-slot, wal, netem]
+  tutorial: |
+    **Concept.** A streaming standby is behind for one of three reasons, and `pg_stat_replication` on the primary tells you which. It reports four positions in the WAL for each standby: `sent_lsn` (what the primary has sent), `write_lsn` and `flush_lsn` (what the standby has received and saved) and `replay_lsn` (what it has applied). If `sent_lsn` trails the primary's `pg_current_wal_lsn()`, the network or the sender is the bottleneck. If the standby has received the WAL but `replay_lsn` trails, the standby is choosing not to apply it, or can't apply it fast enough. On the standby, `pg_last_wal_receive_lsn()` and `pg_last_wal_replay_lsn()` show the same split.
+
+    A **replication slot** makes the primary keep every WAL segment its consumer hasn't confirmed yet, so a standby that disconnects can always catch up. The cost is that a slot whose consumer is gone keeps WAL forever, and `pg_wal` grows until the disk fills and the primary stops. `pg_replication_slots` shows each slot, whether something is connected (`active`) and how far back it holds WAL (`restart_lsn`). `max_slot_wal_keep_size` caps what any slot may hold; a slot past the cap is invalidated instead of filling the disk.
+
+    Traffic control (`tc`) can shape a Linux interface. Its `netem` queueing discipline adds delay, loss or a bandwidth limit, which is useful for tests and easy to forget afterwards. Each container's `eth0` is one end of a veth pair whose other end lives on the host.
+
+    **Read up on:**
+    - `pg_stat_replication` and its `*_lsn` and `*_lag` columns; `pg_wal_lsn_diff()`
+    - `recovery_min_apply_delay`, and `ALTER SYSTEM` / `ALTER SYSTEM RESET` with `pg_reload_conf()`
+    - `pg_replication_slots`, `pg_drop_replication_slot()`, `max_slot_wal_keep_size`
+    - `pg_ls_waldir()` and `CHECKPOINT`
+    - `tc qdisc show` and `tc qdisc del`; finding a container's host-side veth from `/sys/class/net/eth0/iflink`
+  scenario: |
+    The primary **`kl-pg`** streams to the standby **`kl-replica`** on the Docker network
+    `kl-repl`, through the replication slot **`replica_slot`**. Connect to either with
+    `docker exec -it <name> psql -U lab -d lab`.
+
+    ## Part 1: Bring the replica up to date
+
+    The reporting team reads from `kl-replica`, and its data is hours old. Find every reason
+    it is behind and remove each one, so that a write on `kl-pg` is received **and applied**
+    on `kl-replica` within seconds. The network between the two is meant to run at full speed.
+    Keep `kl-replica` as it is, streaming through `replica_slot`: don't rebuild it.
+
+    ## Part 2: Stop the slot that's filling the disk
+
+    `pg_wal` on `kl-pg` is far larger than its `max_wal_size` of 64 MB. Find what is holding
+    the WAL and release it, without breaking `kl-replica`. Then make sure no replication slot
+    can ever make the primary keep more than **1 GB** of WAL, a setting that survives restarts.
+    Once the replica has caught up and a checkpoint has run, `pg_wal` must be back under
+    200 MB.
+  hints:
+    - "Part 1: compare `sent_lsn`, `flush_lsn` and `replay_lsn` in `pg_stat_replication` on `kl-pg` with `pg_current_wal_lsn()`. More than one of them trails."
+    - "Part 1: on `kl-replica`, `SELECT name, setting FROM pg_settings WHERE source <> 'default'` shows what was changed on the standby."
+    - "Part 1: if WAL isn't even being sent fast enough, look at the link. `docker exec kl-replica cat /sys/class/net/eth0/iflink` prints an interface index; `ip -o link` on the host shows which veth has it, and `tc qdisc show dev <veth>` what is attached."
+    - "Part 2: `SELECT slot_name, active, restart_lsn FROM pg_replication_slots` on `kl-pg`. A slot that isn't active and isn't `replica_slot` belongs to nobody."
+    - "Part 2: `ALTER SYSTEM SET max_slot_wal_keep_size = '1GB'` writes it to `postgresql.auto.conf`, and `SELECT pg_reload_conf()` applies it. Run `CHECKPOINT` and look at `SELECT pg_size_pretty(sum(size)) FROM pg_ls_waldir()`."
+  solution: |
+    ## Part 1: Bring the replica up to date
+
+    Two things hold it back: a leftover `netem` rule throttling the link to 1 Mbit/s, and a
+    `recovery_min_apply_delay` that makes the standby wait before applying what it received.
+
+    ```bash
+    i=$(docker exec kl-replica cat /sys/class/net/eth0/iflink)
+    veth=$(ip -o link | awk -F': ' -v i="$i" '$1 == i { sub(/@.*/, "", $2); print $2 }')
+    sudo tc qdisc del dev "$veth" root
+    docker exec kl-replica psql -U lab -d lab -c 'ALTER SYSTEM RESET recovery_min_apply_delay' -c 'SELECT pg_reload_conf()'
+    ```
+
+    ## Part 2: Stop the slot that's filling the disk
+
+    ```bash
+    docker exec kl-pg psql -U lab -d lab \
+      -c "SELECT pg_drop_replication_slot('old_reporting')" \
+      -c "ALTER SYSTEM SET max_slot_wal_keep_size = '1GB'" \
+      -c 'SELECT pg_reload_conf()' -c 'CHECKPOINT' \
+      -c 'SELECT pg_size_pretty(sum(size)) FROM pg_ls_waldir()'
+    ```
+  setup: |
+    pg_primary kl-pg kl-repl -c max_wal_size=64MB -c min_wal_size=32MB
+    pg_standby kl-replica kl-repl kl-pg replica replica_slot
+    # a reporting replica was retired last month; its slot stayed
+    pg_x kl-pg "SELECT pg_create_physical_replication_slot('old_reporting', true)" >/dev/null
+    # a WAN test that was never cleaned up, and an apply delay someone tried once
+    tc qdisc add dev "$(c_veth kl-replica)" root netem rate 1mbit delay 40ms
+    pg_x kl-replica "ALTER SYSTEM SET recovery_min_apply_delay = '45min'" >/dev/null
+    pg_x kl-replica 'SELECT pg_reload_conf()' >/dev/null
+    pg_x kl-pg "CREATE TABLE events (id bigint PRIMARY KEY, payload text NOT NULL)"
+    pg_x kl-pg "INSERT INTO events SELECT g, repeat(md5(g::text), 6) FROM generate_series(1, 1000000) g"
+    pg_x kl-pg 'CHECKPOINT'
+    # prove both faults: WAL is held, and the replica has not applied the table
+    check_wal() { [ "$(pg_x kl-pg 'SELECT sum(size) > 200 * 1024 * 1024 FROM pg_ls_waldir()')" = t ]; }
+    check_wal || { echo "setup: pg_wal is not being held" >&2; exit 1; }
+    [ "$(pg_x kl-replica "SELECT count(*) FROM pg_class WHERE relname = 'events'")" = 0 ] || { echo "setup: the replica is not behind" >&2; exit 1; }
+  check: |
+    veth=$(c_veth kl-replica)
+    info "Part 1: Bring the replica up to date"
+    check "kl-replica is still a standby" '[ "$(pg_x kl-replica "SELECT pg_is_in_recovery()")" = t ]'
+    check "kl-replica streams through replica_slot" '[ "$(pg_x kl-pg "SELECT active FROM pg_replication_slots WHERE slot_name = '"'replica_slot'"'")" = t ]'
+    delay=$(pg_x kl-replica "SELECT setting::int FROM pg_settings WHERE name = 'recovery_min_apply_delay'" 2>/dev/null)
+    if [ "${delay:-1}" -gt 5000 ] || tc qdisc show dev "$veth" 2>/dev/null | grep -q 'netem.*rate'; then
+      fail "a 20 MB write on kl-pg is applied on kl-replica within 30 seconds"
+    else
+      m=$(date +%s%N)
+      pg_x kl-pg "CREATE TABLE IF NOT EXISTS kl_probe (m text, pad text); INSERT INTO kl_probe SELECT '', repeat(md5(g::text), 20) FROM generate_series(1, 30000) g; INSERT INTO kl_probe VALUES ('$m', '')" >/dev/null
+      check "a 20 MB write on kl-pg is applied on kl-replica within 30 seconds" \
+        "eventually 30 '[ \"\$(pg_x kl-replica \"SELECT count(*) FROM kl_probe WHERE m = '\''$m'\''\")\" = 1 ]'"
+    fi
+
+    info "Part 2: Stop the slot that's filling the disk"
+    check_eq "the abandoned slot is gone" "$(pg_x kl-pg "SELECT count(*) FROM pg_replication_slots WHERE slot_name <> 'replica_slot'")" 0
+    check_eq "max_slot_wal_keep_size is 1 GB or less" \
+      "$(pg_x kl-pg "SELECT setting::bigint BETWEEN 1 AND 1024 FROM pg_settings WHERE name = 'max_slot_wal_keep_size'")" t
+    check "it is saved in postgresql.auto.conf" \
+      'docker exec kl-pg grep -Eq "^max_slot_wal_keep_size" /var/lib/postgresql/data/postgresql.auto.conf'
+    pg_x kl-pg 'CHECKPOINT' >/dev/null 2>&1
+    check "after a checkpoint pg_wal is under 200 MB" '[ "$(pg_x kl-pg "SELECT sum(size) < 200 * 1024 * 1024 FROM pg_ls_waldir()")" = t ]'
+  solve: |
+    # --- part 1: Bring the replica up to date ---
+    i=$(docker exec kl-replica cat /sys/class/net/eth0/iflink)
+    veth=$(ip -o link | awk -F': ' -v i="$i" '$1 == i { sub(/@.*/, "", $2); print $2 }')
+    sudo tc qdisc del dev "$veth" root
+    docker exec kl-replica psql -h 127.0.0.1 -U lab -d lab -qAt -c 'ALTER SYSTEM RESET recovery_min_apply_delay' -c 'SELECT pg_reload_conf()'
+
+    # --- part 2: Stop the slot that's filling the disk ---
+    docker exec kl-pg psql -h 127.0.0.1 -U lab -d lab -qAt \
+      -c "SELECT pg_drop_replication_slot('old_reporting')" \
+      -c "ALTER SYSTEM SET max_slot_wal_keep_size = '1GB'" \
+      -c 'SELECT pg_reload_conf()'
+    # let the replica catch up before the checkpoint can recycle its WAL
+    for i in $(seq 60); do
+      [ "$(docker exec kl-pg psql -h 127.0.0.1 -U lab -d lab -qAt -c 'SELECT replay_lsn = pg_current_wal_lsn() FROM pg_stat_replication')" = t ] && break
+      sleep 2
+    done
+    docker exec kl-pg psql -h 127.0.0.1 -U lab -d lab -qAt -c 'CHECKPOINT'
+
+- id: data-048
+  title: The primary is gone
+  difficulty: 5
+  kind: fix
+  tags: [postgres, replication, failover, promote, pg_rewind, timeline]
+  tutorial: |
+    **Concept.** Failing over is three jobs, not one. **Promote** a standby: `pg_promote()` (or `pg_ctl promote`) ends recovery, and the server starts a new **timeline**, a new branch of WAL history numbered one higher, and accepts writes. **Repoint** the other standbys: each one's `primary_conninfo` must name the new primary. A standby can follow the timeline switch because `recovery_target_timeline` defaults to `latest`, as long as it hasn't replayed past the point where the new timeline branched off. **Rejoin** the old primary as a standby, but only after it has been made consistent with the new history.
+
+    That last step is the dangerous one. If the old primary wrote WAL that never reached the standbys before it died, its history has **diverged**: started as a standby it refuses to follow the new timeline, and started as it was it becomes a second primary that accepts writes nobody else sees (split brain). `pg_rewind` repairs a diverged data directory by copying from the new primary only the blocks that changed since the fork, which is much faster than a new base backup. It needs `wal_log_hints = on` (or data checksums) on the old primary, and since PostgreSQL 13 it finishes the target's crash recovery itself if it was not shut down cleanly. `pg_rewind -R` also writes `standby.signal` and a `primary_conninfo` for you.
+
+    Replication slots belong to one server and are not replicated. A promoted standby has none, so standbys that use slots need them created on the new primary.
+
+    **Read up on:**
+    - `pg_promote()`, `pg_is_in_recovery()`, timelines and `.history` files
+    - `primary_conninfo` and `primary_slot_name` (both reloadable), `recovery_target_timeline`
+    - `pg_create_physical_replication_slot()`, `pg_replication_slots`
+    - `pg_rewind`: `--target-pgdata`, `--source-server`, `-R`, and what it needs
+    - `docker run --rm -v VOLUME:/var/lib/postgresql/data ...` to run a tool against a stopped container's data, and `su-exec postgres` in the alpine image
+  scenario: |
+    Three PostgreSQL servers run on the Docker network `kl-repl`: the primary **`kl-pg1`**
+    and two streaming standbys, **`kl-pg2`** and **`kl-pg3`**. Each container keeps its
+    data in a volume named after it with `-data` added (`kl-pg1-data` and so on). User and
+    password are both `lab`, the database is `lab`.
+
+    `kl-pg1` has just crashed. It had been cut off from both standbys for a moment before it
+    died, so it may hold writes they never received.
+
+    ## Part 1: Promote kl-pg2
+
+    Make **`kl-pg2`** the new primary, accepting writes, with all the orders the standbys had.
+
+    ## Part 2: Repoint kl-pg3
+
+    Make **`kl-pg3`** stream from `kl-pg2` without rebuilding it, through a physical
+    replication slot on `kl-pg2` named **`pg3`**. A write on `kl-pg2` must reach `kl-pg3`.
+
+    ## Part 3: Bring kl-pg1 back as a standby
+
+    Bring **`kl-pg1`** back as a standby of `kl-pg2` through a slot named **`pg1`**. Its data
+    must match the new primary: the writes only it had are gone. It must never run as a
+    second primary, and it keeps its volume `kl-pg1-data`.
+  hints:
+    - "Part 1: `SELECT pg_promote()` on `kl-pg2`, then `SELECT pg_is_in_recovery()` should say `f`."
+    - "Part 2: on `kl-pg3`, `ALTER SYSTEM SET primary_conninfo = '...'` with `host=kl-pg2`, then `SELECT pg_reload_conf()`. Its log (`docker logs kl-pg3`) tells you if the slot it asks for is missing on the new primary."
+    - "Part 3: don't `docker start kl-pg1` yet, it would come up as a primary. Run `pg_rewind` in a throw-away container on the `kl-repl` network with the `kl-pg1-data` volume mounted, as the `postgres` user."
+    - "Part 3: `pg_rewind -D /var/lib/postgresql/data --source-server='host=kl-pg2 user=lab password=lab dbname=lab' -R` leaves a standby configuration behind. Add `primary_slot_name` before you start the container."
+    - "Part 3: a crashed server leaves `postmaster.pid` behind, naming PID 1. Inside any container PID 1 is alive, so the crash recovery pg_rewind runs thinks a server is still up. With `kl-pg1` confirmed stopped, the file is stale and safe to remove."
+  solution: |
+    ## Part 1: Promote kl-pg2
+
+    ```bash
+    docker exec kl-pg2 psql -U lab -d lab -c 'SELECT pg_promote()'
+    ```
+
+    ## Part 2: Repoint kl-pg3
+
+    ```bash
+    docker exec kl-pg2 psql -U lab -d lab -c "SELECT pg_create_physical_replication_slot('pg3')" \
+      -c "SELECT pg_create_physical_replication_slot('pg1')"
+    docker exec kl-pg3 psql -U lab -d lab \
+      -c "ALTER SYSTEM SET primary_conninfo = 'host=kl-pg2 user=lab password=lab application_name=pg3'" \
+      -c 'SELECT pg_reload_conf()'
+    ```
+
+    `kl-pg3` keeps `primary_slot_name = 'pg3'` and follows the new timeline on its own.
+
+    ## Part 3: Bring kl-pg1 back as a standby
+
+    ```bash
+    docker run --rm --network kl-repl -v kl-pg1-data:/var/lib/postgresql/data postgres:16-alpine \
+      su-exec postgres sh -c "rm -f /var/lib/postgresql/data/postmaster.pid &&
+        pg_rewind -D /var/lib/postgresql/data -R \
+        --source-server='host=kl-pg2 user=lab password=lab dbname=lab' &&
+        echo \"primary_slot_name = 'pg1'\" >> /var/lib/postgresql/data/postgresql.auto.conf"
+    docker start kl-pg1
+    ```
+
+    The crashed server's `postmaster.pid` names PID 1, which is alive in every container, so
+    it has to go before pg_rewind can run crash recovery. Started without the rewind, `kl-pg1` would either refuse to follow timeline 2 or, without
+    `standby.signal`, run as a second primary.
+  setup: |
+    pg_primary kl-pg1 kl-repl -c wal_log_hints=on -c wal_keep_size=256MB
+    # also in the config file: pg_rewind's crash recovery runs the server without these flags
+    pg_x kl-pg1 "ALTER SYSTEM SET wal_log_hints = on" >/dev/null
+    pg_x kl-pg1 "ALTER SYSTEM SET wal_keep_size = '256MB'" >/dev/null
+    pg_standby kl-pg2 kl-repl kl-pg1 pg2 pg2
+    pg_standby kl-pg3 kl-repl kl-pg1 pg3 pg3
+    pg_x kl-pg1 "CREATE TABLE orders (id int PRIMARY KEY, item text NOT NULL, placed timestamptz NOT NULL DEFAULT now())"
+    pg_x kl-pg1 "INSERT INTO orders (id, item) SELECT g, 'item-' || g FROM generate_series(1, 100) g"
+    caught_up() { [ "$(pg_x kl-pg1 "SELECT count(*) FROM pg_stat_replication WHERE replay_lsn = pg_current_wal_lsn()")" = 2 ]; }
+    eventually 30 caught_up || { echo "setup: standbys did not catch up" >&2; exit 1; }
+    # cut both standbys off, then the primary takes writes they never see, and dies
+    v2=$(c_veth kl-pg2); v3=$(c_veth kl-pg3)
+    tc qdisc add dev "$v2" root netem loss 100%
+    tc qdisc add dev "$v3" root netem loss 100%
+    pg_x kl-pg1 "INSERT INTO orders (id, item) SELECT g, 'item-' || g FROM generate_series(101, 103) g"
+    docker kill kl-pg1 >/dev/null
+    tc qdisc del dev "$v2" root
+    tc qdisc del dev "$v3" root
+    for s in kl-pg2 kl-pg3; do
+      [ "$(pg_x $s 'SELECT count(*) FROM orders')" = 100 ] || { echo "setup: $s saw the lost writes" >&2; exit 1; }
+    done
+  check: |
+    probe() { # probe STANDBY -> a fresh write on kl-pg2 shows up on STANDBY within 20 seconds
+      local m; m=$(date +%s%N)
+      pg_x kl-pg2 "CREATE TABLE IF NOT EXISTS kl_probe (m text); INSERT INTO kl_probe VALUES ('$m')" >/dev/null 2>&1 || return 1
+      eventually 20 "[ \"\$(pg_x $1 \"SELECT count(*) FROM kl_probe WHERE m = '$m'\")\" = 1 ]"
+    }
+    slot_active() { [ "$(pg_x kl-pg2 "SELECT active FROM pg_replication_slots WHERE slot_name = '$1' AND slot_type = 'physical'" 2>/dev/null)" = t ]; }
+    info "Part 1: Promote kl-pg2"
+    check "kl-pg2 is running" 'c_running kl-pg2'
+    check_eq "kl-pg2 accepts writes" "$(pg_x kl-pg2 'SELECT NOT pg_is_in_recovery()' 2>/dev/null)" t
+    check_eq "kl-pg2 has the 100 replicated orders" "$(pg_x kl-pg2 'SELECT count(*) FROM orders' 2>/dev/null)" 100
+
+    info "Part 2: Repoint kl-pg3"
+    check_eq "kl-pg3 is a standby" "$(pg_x kl-pg3 'SELECT pg_is_in_recovery()' 2>/dev/null)" t
+    check "kl-pg3 streams from kl-pg2 through slot pg3" 'eventually 10 slot_active pg3'
+    if slot_active pg3; then check "a write on kl-pg2 reaches kl-pg3" 'probe kl-pg3'
+    else fail "a write on kl-pg2 reaches kl-pg3"; fi
+
+    info "Part 3: Bring kl-pg1 back as a standby"
+    check "kl-pg1 is running" 'c_running kl-pg1'
+    check "kl-pg1 still uses the volume kl-pg1-data" \
+      'docker inspect -f "{{range .Mounts}}{{.Name}} {{end}}" kl-pg1 | grep -qw kl-pg1-data'
+    check_eq "kl-pg1 is a standby, not a second primary" "$(pg_x kl-pg1 'SELECT pg_is_in_recovery()' 2>/dev/null)" t
+    check "kl-pg1 streams from kl-pg2 through slot pg1" 'eventually 10 slot_active pg1'
+    if slot_active pg1; then check "a write on kl-pg2 reaches kl-pg1" 'probe kl-pg1'
+    else fail "a write on kl-pg2 reaches kl-pg1"; fi
+    check_eq "kl-pg1 no longer has the writes only it saw" "$(pg_x kl-pg1 'SELECT count(*) FROM orders WHERE id > 100' 2>/dev/null)" 0
+  solve: |
+    # --- part 1: Promote kl-pg2 ---
+    docker exec kl-pg2 psql -h 127.0.0.1 -U lab -d lab -qAt -c 'SELECT pg_promote()'
+
+    # --- part 2: Repoint kl-pg3 ---
+    docker exec kl-pg2 psql -h 127.0.0.1 -U lab -d lab -qAt \
+      -c "SELECT pg_create_physical_replication_slot('pg3')" \
+      -c "SELECT pg_create_physical_replication_slot('pg1')"
+    docker exec kl-pg3 psql -h 127.0.0.1 -U lab -d lab -qAt \
+      -c "ALTER SYSTEM SET primary_conninfo = 'host=kl-pg2 user=lab password=lab application_name=pg3'" \
+      -c 'SELECT pg_reload_conf()'
+
+    # --- part 3: Bring kl-pg1 back as a standby ---
+    docker run --rm --network kl-repl -v kl-pg1-data:/var/lib/postgresql/data postgres:16-alpine \
+      su-exec postgres sh -c "rm -f /var/lib/postgresql/data/postmaster.pid &&
+        pg_rewind -D /var/lib/postgresql/data -R \
+        --source-server='host=kl-pg2 user=lab password=lab dbname=lab' &&
+        echo \"primary_slot_name = 'pg1'\" >> /var/lib/postgresql/data/postgresql.auto.conf"
+    docker start kl-pg1
+
+- id: data-049
+  title: Every write hangs, and one job may skip the wait
+  difficulty: 4
+  kind: fix
+  tags: [postgres, replication, synchronous, quorum, synchronous_commit, netem]
+  tutorial: |
+    **Concept.** With **synchronous replication** a commit doesn't return to the client until a standby confirms it has the WAL, so an acknowledged write survives the loss of the primary. `synchronous_standby_names` says which standbys count, matched against each standby's `application_name`:
+
+    - `'s1'` or `'FIRST 1 (s1, s2)'`: priority. The first listed standby that is connected is the synchronous one; the others are spares.
+    - `'ANY 1 (s1, s2)'`: quorum. A commit waits for any one of them, whichever answers first.
+    - `''`: no synchronous replication at all.
+
+    If no standby that counts is reachable, commits wait forever. They are already durable on the primary, but the client never hears back, and in `pg_stat_activity` the session waits with `wait_event = 'SyncRep'`. The setting is reloadable, so changing it releases waiting commits at once.
+
+    `synchronous_commit` decides, per transaction, how long a commit waits: `remote_apply`, `on` (the default: flushed on the standby), `remote_write`, `local` (only the primary's own disk) or `off`. It can be set for the whole server, a database, a role (`ALTER ROLE ... SET`) or a session, so data that can afford to lose its last few seconds doesn't have to pay for the round trip.
+
+    **Read up on:**
+    - `synchronous_standby_names`: the `FIRST` and `ANY` syntax
+    - `pg_stat_replication.sync_state`: `sync`, `potential`, `quorum`, `async`
+    - `synchronous_commit` and its levels
+    - `ALTER ROLE ... SET`, and `wal_sender_timeout`
+    - `pg_stat_activity.wait_event`
+  scenario: |
+    The primary **`kl-pg`** replicates to two standbys on the Docker network `kl-repl`:
+    **`kl-s1`** (application name `s1`) and **`kl-s2`** (application name `s2`). Commits are
+    synchronous, so every order is on a standby before the shop tells the customer it's
+    placed. Connect with `docker exec -it kl-pg psql -U lab -d lab`.
+
+    The link to `kl-s1` died a few minutes ago and won't be repaired today. Since then every
+    write on `kl-pg` hangs. Leave the link as it is.
+
+    ## Part 1: Writes complete while one standby is down
+
+    Change the replication setup so that writes by **`lab`** complete while **either**
+    standby is unreachable, and the write that is hung right now completes. Commits by `lab`
+    must still wait until at least one standby has the data: if **both** standbys are
+    unreachable, a commit by `lab` must wait.
+
+    ## Part 2: The audit job doesn't wait for anyone
+
+    The role **`audit`** (password `audit`) writes a high-volume trail into `audit_log`,
+    which may lose its last few seconds in a crash. Make commits by `audit` return without
+    waiting for any standby, even when both are unreachable, without changing how `lab`
+    commits.
+  hints:
+    - "`SELECT pid, usename, wait_event, query FROM pg_stat_activity WHERE wait_event = 'SyncRep'` shows who is stuck. `SELECT application_name, state, sync_state FROM pg_stat_replication` shows who is connected."
+    - "Part 1: `SHOW synchronous_standby_names`. A single name means one particular standby has to answer. The `ANY n (...)` form takes a quorum instead."
+    - "Part 1: `ALTER SYSTEM SET synchronous_standby_names = '...'` and `SELECT pg_reload_conf()`. Don't set it to an empty string, and don't turn `synchronous_commit` off for everyone."
+    - "Part 2: `synchronous_commit` can be set per role with `ALTER ROLE audit SET ...`. The `local` level waits only for the primary's own disk."
+  solution: |
+    ## Part 1: Writes complete while one standby is down
+
+    ```bash
+    docker exec kl-pg psql -U lab -d lab \
+      -c "ALTER SYSTEM SET synchronous_standby_names = 'ANY 1 (s1, s2)'" \
+      -c 'SELECT pg_reload_conf()'
+    ```
+
+    `FIRST 1 (s1, s2)` would also work once `kl-s1` has been disconnected, but a quorum doesn't
+    depend on which one fails.
+
+    ## Part 2: The audit job doesn't wait for anyone
+
+    ```bash
+    docker exec kl-pg psql -U lab -d lab -c "ALTER ROLE audit SET synchronous_commit = local"
+    ```
+  setup: |
+    pg_primary kl-pg kl-repl -c wal_sender_timeout=10s
+    pg_standby kl-s1 kl-repl kl-pg s1
+    pg_standby kl-s2 kl-repl kl-pg s2
+    pg_x kl-pg "CREATE ROLE audit LOGIN PASSWORD 'audit'"
+    pg_x kl-pg "CREATE TABLE orders (id serial PRIMARY KEY, item text NOT NULL, placed timestamptz NOT NULL DEFAULT now())"
+    pg_x kl-pg "CREATE TABLE audit_log (id bigserial PRIMARY KEY, event text NOT NULL, at timestamptz NOT NULL DEFAULT now())"
+    pg_x kl-pg "GRANT INSERT, SELECT ON audit_log TO audit; GRANT USAGE ON SEQUENCE audit_log_id_seq TO audit"
+    pg_x kl-pg "INSERT INTO orders (item) SELECT 'item-' || g FROM generate_series(1, 50) g"
+    pg_x kl-pg "ALTER SYSTEM SET synchronous_standby_names = 's1'" >/dev/null
+    pg_x kl-pg 'SELECT pg_reload_conf()' >/dev/null
+    eventually 20 "[ \"\$(pg_x kl-pg \"SELECT sync_state FROM pg_stat_replication WHERE application_name = 's1'\")\" = sync ]"
+    # the link to s1 dies
+    tc qdisc add dev "$(c_veth kl-s1)" root netem loss 100%
+    docker exec -d kl-pg psql -h 127.0.0.1 -U lab -d lab -c "INSERT INTO orders (item) VALUES ('the stuck order')"
+    eventually 10 "[ \"\$(pg_x kl-pg \"SELECT count(*) FROM pg_stat_activity WHERE wait_event = 'SyncRep'\")\" = 1 ]" \
+      || { echo "setup: the write did not hang" >&2; exit 1; }
+  check: |
+    v1=$(c_veth kl-s1); v2=$(c_veth kl-s2)
+    # commit ROLE: true if a commit by ROLE returns within 6 seconds
+    commit() {
+      local pw=lab; [ "$1" = audit ] && pw=audit
+      local sql="INSERT INTO orders (item) VALUES ('probe')"; [ "$1" = audit ] && sql="INSERT INTO audit_log (event) VALUES ('probe')"
+      docker exec -e PGPASSWORD=$pw kl-pg timeout 6 psql -h 127.0.0.1 -U "$1" -d lab -qAt -c "$sql" >/dev/null 2>&1
+    }
+    release() { pg_x kl-pg "SELECT pg_terminate_backend(pid) FROM pg_stat_activity WHERE wait_event = 'SyncRep'" >/dev/null 2>&1; }
+
+    info "Part 1: Writes complete while one standby is down"
+    check "the link to kl-s1 is still down" 'tc qdisc show dev "$v1" | grep -q "loss 100%"'
+    check_not "synchronous replication is still on" '[ -z "$(pg_x kl-pg "SHOW synchronous_standby_names")" ]'
+    check "the write that was hung has completed" "eventually 10 '[ \"\$(pg_x kl-pg \"SELECT count(*) FROM orders WHERE item = '\\''the stuck order'\\''\")\" = 1 ]'"
+    check "with kl-s1 down, a commit by lab returns" 'commit lab'
+    # both standbys unreachable: lab must wait, audit must not
+    tc qdisc add dev "$v2" root netem loss 100%
+    sleep 1
+    check_not "with both standbys down, a commit by lab still waits" 'commit lab'
+    check_match "lab's commits wait for a standby" "$(docker exec -e PGPASSWORD=lab kl-pg psql -h 127.0.0.1 -U lab -d lab -qAt -c 'SHOW synchronous_commit')" '^(on|remote_write|remote_apply)$'
+
+    info "Part 2: The audit job doesn't wait for anyone"
+    check "with both standbys down, a commit by audit returns" 'commit audit'
+    tc qdisc del dev "$v2" root
+    release
+    eventually 30 "[ \"\$(pg_x kl-pg \"SELECT count(*) FROM pg_stat_replication WHERE application_name = 's2' AND state = 'streaming'\")\" = 1 ]"
+  solve: |
+    # --- part 1: Writes complete while one standby is down ---
+    docker exec kl-pg psql -h 127.0.0.1 -U lab -d lab -qAt \
+      -c "ALTER SYSTEM SET synchronous_standby_names = 'ANY 1 (s1, s2)'" \
+      -c 'SELECT pg_reload_conf()'
+
+    # --- part 2: The audit job doesn't wait for anyone ---
+    docker exec kl-pg psql -h 127.0.0.1 -U lab -d lab -qAt -c "ALTER ROLE audit SET synchronous_commit = local"
+
+- id: data-050
+  title: Three things VACUUM is waiting for
+  difficulty: 4
+  kind: fix
+  tags: [postgres, vacuum, xmin, prepared-transactions, replication-slot, bloat, operations]
+  tutorial: |
+    **Concept.** An `UPDATE` or `DELETE` in PostgreSQL leaves the old row version behind, and `VACUUM` reclaims it once **no transaction could still see it**. The oldest snapshot anyone might still use is the **xmin horizon**, and VACUUM can't remove anything newer than it. One old holder anywhere stops cleanup in every table of the database, so tables bloat, queries slow down and, left long enough, the server heads toward transaction ID wraparound.
+
+    Three holders are easy to forget, because none of them shows up as a busy query:
+
+    - **A session idle in a transaction.** An open `REPEATABLE READ` transaction keeps its snapshot until it ends. `pg_stat_activity` shows it with `state = 'idle in transaction'` and a `backend_xmin`. `idle_in_transaction_session_timeout` ends such sessions automatically, and it can be set per role.
+    - **A prepared transaction.** `PREPARE TRANSACTION` (two-phase commit) detaches a transaction from its session, and it lives on, across restarts, until someone runs `COMMIT PREPARED` or `ROLLBACK PREPARED`. They are listed in `pg_prepared_xacts`.
+    - **A replication slot.** A standby with `hot_standby_feedback = on` reports its oldest snapshot to the primary, and the slot stores it in `pg_replication_slots.xmin`. If the standby goes away, the slot keeps that old xmin forever.
+
+    `VACUUM (VERBOSE)` reports dead row versions it found but couldn't remove, and the oldest xmin that stopped it.
+
+    **Read up on:**
+    - `VACUUM (VERBOSE)` output: "dead but not yet removable" and "removable cutoff"
+    - `pg_stat_activity.backend_xmin`, `pg_prepared_xacts`, `pg_replication_slots.xmin`
+    - `COMMIT PREPARED` and `ROLLBACK PREPARED`
+    - `pg_terminate_backend()`
+    - `idle_in_transaction_session_timeout` and `ALTER ROLE ... SET`
+    - `pg_stat_user_tables.n_dead_tup`
+  scenario: |
+    PostgreSQL runs in **`kl-pg`** (`docker exec -it kl-pg psql -U lab -d lab`). The
+    `events` table is updated constantly and is now several times its real size: `VACUUM`
+    runs but removes nothing. Find what holds it back and release each holder. Don't restart
+    `kl-pg`: production can't take the outage.
+
+    ## Part 1: The import that never finished
+
+    The importer's log says **batch 17** failed halfway and should be discarded. Its
+    transaction is still around. Make sure none of its rows are applied.
+
+    ## Part 2: The report that never closed
+
+    A reporting session (role **`report`**) opened a transaction hours ago and walked away.
+    End it. Then make sure no `report` session can do this again: a `report` session that is
+    idle inside a transaction for more than **5 minutes** must be ended by the server.
+
+    ## Part 3: The replica that was switched off
+
+    A reporting replica was decommissioned last week, and `kl-pg` is still keeping its place.
+    Release it.
+
+    ## Part 4: Clean the table
+
+    When nothing holds the horizon back any more, `VACUUM events` must leave **no** dead row
+    versions behind. The 200,000 rows in `events` must all still be there.
+  hints:
+    - "Start with `VACUUM (VERBOSE) events`: it tells you how many dead rows it couldn't remove and the cutoff it used. Then look for anything older than that cutoff."
+    - "Part 1: `SELECT * FROM pg_prepared_xacts`. A prepared transaction is ended by `COMMIT PREPARED 'gid'` or `ROLLBACK PREPARED 'gid'`, from any session."
+    - "Part 2: `SELECT pid, usename, state, backend_xmin, xact_start FROM pg_stat_activity WHERE backend_xmin IS NOT NULL`. `pg_terminate_backend(pid)` ends one."
+    - "Part 2: `ALTER ROLE report SET idle_in_transaction_session_timeout = '5min'` applies to every new session of that role."
+    - "Part 3: `SELECT slot_name, active, xmin FROM pg_replication_slots`. A slot with no connection and an old xmin is the one."
+  solution: |
+    ## Part 1: The import that never finished
+
+    ```sql
+    SELECT gid, prepared FROM pg_prepared_xacts;
+    ROLLBACK PREPARED 'import-batch-17';
+    ```
+
+    ## Part 2: The report that never closed
+
+    ```sql
+    SELECT pg_terminate_backend(pid) FROM pg_stat_activity
+     WHERE usename = 'report' AND state = 'idle in transaction';
+    ALTER ROLE report SET idle_in_transaction_session_timeout = '5min';
+    ```
+
+    ## Part 3: The replica that was switched off
+
+    ```sql
+    SELECT pg_drop_replication_slot('reporting_replica');
+    ```
+
+    ## Part 4: Clean the table
+
+    ```sql
+    VACUUM (VERBOSE) events;   -- "0 are dead but not yet removable"
+    ```
+  setup: |
+    pg_primary kl-pg kl-repl -c max_prepared_transactions=5 -c autovacuum=off
+    # a standby needs at least as many prepared-transaction slots; it gets this from the base backup
+    pg_x kl-pg "ALTER SYSTEM SET max_prepared_transactions = 5" >/dev/null
+    pg_x kl-pg "CREATE ROLE report LOGIN PASSWORD 'report'"
+    pg_x kl-pg "CREATE TABLE events (id int PRIMARY KEY, n int NOT NULL DEFAULT 0, payload text NOT NULL)"
+    pg_x kl-pg "INSERT INTO events (id, payload) SELECT g, md5(g::text) FROM generate_series(1, 200000) g"
+    pg_x kl-pg "CREATE TABLE imports (batch int NOT NULL, row_no int NOT NULL, payload text)"
+    pg_x kl-pg "GRANT SELECT ON events TO report"
+    # 3: a reporting replica with hot_standby_feedback, then switched off without dropping its slot
+    pg_standby kl-old-replica kl-repl kl-pg reporting reporting_replica
+    pg_x kl-old-replica "ALTER SYSTEM SET hot_standby_feedback = on" >/dev/null
+    pg_x kl-old-replica 'SELECT pg_reload_conf()' >/dev/null
+    eventually 20 "[ -n \"\$(pg_x kl-pg \"SELECT xmin FROM pg_replication_slots WHERE slot_name = 'reporting_replica'\")\" ]" \
+      || { echo "setup: the slot holds no xmin" >&2; exit 1; }
+    docker rm -f kl-old-replica >/dev/null
+    docker volume rm kl-old-replica-data >/dev/null
+    # 1: a two-phase import that failed after PREPARE
+    pg_x kl-pg "BEGIN; INSERT INTO imports SELECT 17, g, md5(g::text) FROM generate_series(1, 500) g; PREPARE TRANSACTION 'import-batch-17'"
+    # 2: a report session idle in a REPEATABLE READ transaction
+    docker run -d --name kl-report --network kl-repl -e PGPASSWORD=report postgres:16-alpine sh -c \
+      '(echo "BEGIN ISOLATION LEVEL REPEATABLE READ; SELECT count(*) FROM events;"; sleep 1000000) | psql -h kl-pg -U report -d lab' >/dev/null
+    eventually 20 "[ \"\$(pg_x kl-pg \"SELECT count(*) FROM pg_stat_activity WHERE usename = 'report' AND state = 'idle in transaction' AND backend_xmin IS NOT NULL\")\" = 1 ]" \
+      || { echo "setup: the report session is not idle in a transaction" >&2; exit 1; }
+    # the workload that leaves dead rows behind
+    for i in 1 2 3; do pg_x kl-pg "UPDATE events SET n = n + 1"; done
+    # prove the fault: all three holders predate the updates, so VACUUM removes nothing
+    left=$(docker exec kl-pg psql -h 127.0.0.1 -U lab -d lab -c 'VACUUM (VERBOSE) events' 2>&1 | sed -n 's/.* \([0-9]*\) are dead but not yet removable.*/\1/p' | head -1)
+    [ "${left:-0}" -ge 600000 ] || { echo "setup: vacuum was not held back ($left)" >&2; exit 1; }
+  check: |
+    info "Part 1: The import that never finished"
+    check_eq "no prepared transaction is left" "$(pg_x kl-pg 'SELECT count(*) FROM pg_prepared_xacts')" 0
+    check_eq "batch 17 was discarded, not applied" "$(pg_x kl-pg 'SELECT count(*) FROM imports WHERE batch = 17')" 0
+
+    info "Part 2: The report that never closed"
+    check_eq "no report session is idle in a transaction" \
+      "$(pg_x kl-pg "SELECT count(*) FROM pg_stat_activity WHERE usename = 'report' AND state LIKE 'idle in transaction%'")" 0
+    t=$(docker exec -e PGPASSWORD=report kl-pg psql -h 127.0.0.1 -U report -d lab -qAt \
+      -c "SELECT setting::int FROM pg_settings WHERE name = 'idle_in_transaction_session_timeout'" 2>/dev/null)
+    check "report sessions idle in a transaction are ended after 5 minutes at most" '[ "${t:-0}" -gt 0 ] && [ "$t" -le 300000 ]'
+
+    info "Part 3: The replica that was switched off"
+    check_eq "no replication slot holds the horizon back" "$(pg_x kl-pg 'SELECT count(*) FROM pg_replication_slots WHERE xmin IS NOT NULL OR catalog_xmin IS NOT NULL')" 0
+
+    info "Part 4: Clean the table"
+    out=$(docker exec kl-pg psql -h 127.0.0.1 -U lab -d lab -c 'VACUUM (VERBOSE) events' 2>&1)
+    left=$(printf '%s\n' "$out" | sed -n 's/.* \([0-9]*\) are dead but not yet removable.*/\1/p' | head -1)
+    check_eq "VACUUM leaves no dead row versions in events" "${left:-?}" 0
+    check_eq "events still has its 200000 rows" "$(pg_x kl-pg 'SELECT count(*) FROM events')" 200000
+  solve: |
+    psql() { docker exec -i kl-pg psql -h 127.0.0.1 -U lab -d lab -qAt "$@"; }
+    # --- part 1: The import that never finished ---
+    psql -c "ROLLBACK PREPARED 'import-batch-17'"
+
+    # --- part 2: The report that never closed ---
+    psql -c "SELECT pg_terminate_backend(pid) FROM pg_stat_activity WHERE usename = 'report' AND state = 'idle in transaction'"
+    psql -c "ALTER ROLE report SET idle_in_transaction_session_timeout = '5min'"
+
+    # --- part 3: The replica that was switched off ---
+    psql -c "SELECT pg_drop_replication_slot('reporting_replica')"
+
+    # --- part 4: Clean the table ---
+    psql -c 'VACUUM (VERBOSE) events'
+
+- id: data-051
+  title: The pool is full and the database is idle
+  difficulty: 4
+  kind: fix
+  tags: [postgres, pgbouncer, connection-pooling, pool_mode, operations]
+  tutorial: |
+    **Concept.** Every PostgreSQL connection is a process, so applications put a pooler such as **PgBouncer** in front: clients connect to PgBouncer, and it hands them one of a small number of real server connections. The pool mode decides how long a client keeps the server connection it was given:
+
+    - `session`: until the client disconnects. A client that connects and then sits idle holds a server connection the whole time.
+    - `transaction`: only until the end of each transaction, so idle clients cost nothing. Features that live in a session (session-level `SET`, advisory locks held across transactions, `LISTEN`, and depending on the version prepared statements) don't work reliably.
+    - `statement`: after every statement; multi-statement transactions aren't allowed.
+
+    When every server connection in a pool is taken, new requests **queue inside PgBouncer**. PostgreSQL itself looks idle, because the waiting is in front of it. Even in transaction mode a client that opens a transaction and then goes quiet pins its server connection; `idle_transaction_timeout` makes PgBouncer close such clients. Separately, `max_client_conn` caps how many clients PgBouncer accepts at all, and past it new clients are refused at once.
+
+    PgBouncer has an admin console: connect to the special database `pgbouncer` as a user listed in `admin_users` and run `SHOW POOLS`, `SHOW CLIENTS`, `SHOW SERVERS`, `SHOW CONFIG` or `RELOAD`.
+
+    **Read up on:**
+    - PgBouncer pool modes and their feature limits
+    - `default_pool_size`, `max_client_conn`, `idle_transaction_timeout` in `pgbouncer.ini`
+    - The admin console: `SHOW POOLS` (`cl_active`, `cl_waiting`, `sv_active`, `sv_idle`) and `RELOAD`
+    - `pgbench -n -f FILE -c CLIENTS -t TRANSACTIONS` for load tests with your own script
+  scenario: |
+    PostgreSQL runs in **`kl-pg`**, and the application reaches it only through PgBouncer in
+    **`kl-pgb`** on port 6432 of the Docker network `kl-pool`. PgBouncer's configuration is
+    **`/lab/pgbouncer/pgbouncer.ini`**, mounted into the container; user and password are
+    both `lab`, and `lab` may use the admin console. For a shell with the tools:
+    `docker run --rm -it --network kl-pool -e PGPASSWORD=lab postgres:16-alpine sh`, then
+    `psql -h kl-pgb -p 6432 -U lab lab` (or `... pgbouncer` for the console).
+
+    The web workers' requests hang, yet PostgreSQL is doing nothing. The pool must stay at
+    **5 server connections** (`default_pool_size = 5`): the database server is small.
+    The application doesn't rely on any session state between transactions.
+
+    ## Part 1: Idle clients must not starve the pool
+
+    The dashboard service keeps 5 connections open and idle. With those 5 open, 10 web
+    workers running short transactions must all get through, quickly.
+
+    ## Part 2: A forgotten transaction must not pin a connection
+
+    The batch job sometimes opens a transaction and then stalls. A client idle inside a
+    transaction for more than **30 seconds** must be disconnected, so it gives its server
+    connection back.
+
+    ## Part 3: Room for every client
+
+    At peak, 60 clients connect at once (the 5 dashboard connections plus the web workers).
+    PgBouncer must accept them all and serve them.
+
+    Apply your changes to the running `kl-pgb`, which keeps using
+    `/lab/pgbouncer/pgbouncer.ini`.
+  hints:
+    - "On the console, `SHOW POOLS` shows clients waiting (`cl_waiting`) while all 5 server connections are taken. `SHOW CLIENTS` shows who holds them."
+    - "Part 1: in `session` mode a server connection belongs to its client until it disconnects. Another pool mode gives it back at the end of each transaction."
+    - "Part 2: PgBouncer has its own setting for clients that sit idle inside a transaction. It's in seconds."
+    - "Part 3: one setting limits how many clients PgBouncer accepts, independent of the pool size. Look at the error a client gets when it's over the limit."
+    - "After editing the file, `RELOAD` on the admin console (or `docker restart kl-pgb`) applies it. Check with `SHOW CONFIG`."
+  solution: |
+    Edit `/lab/pgbouncer/pgbouncer.ini`:
+
+    ## Part 1: Idle clients must not starve the pool
+
+    ```ini
+    pool_mode = transaction
+    ```
+
+    ## Part 2: A forgotten transaction must not pin a connection
+
+    ```ini
+    idle_transaction_timeout = 30
+    ```
+
+    ## Part 3: Room for every client
+
+    ```ini
+    max_client_conn = 200
+    ```
+
+    Then apply it:
+
+    ```bash
+    docker run --rm --network kl-pool -e PGPASSWORD=lab postgres:16-alpine \
+      psql -h kl-pgb -p 6432 -U lab pgbouncer -c RELOAD
+    ```
+  setup: |
+    pgb_image || { echo "setup: no PgBouncer image" >&2; exit 1; }
+    docker network create kl-pool >/dev/null
+    docker run -d --name kl-pg --network kl-pool -e POSTGRES_USER=lab -e POSTGRES_PASSWORD=lab -e POSTGRES_DB=lab postgres:16-alpine >/dev/null
+    eventually 60 "pg_x kl-pg 'select 1'"
+    pg_x kl-pg "CREATE TABLE hits (page text PRIMARY KEY, n bigint NOT NULL DEFAULT 0); INSERT INTO hits VALUES ('home', 0)"
+    lab_file /lab/pgbouncer/pgbouncer.ini <<'EOF'
+    [databases]
+    lab = host=kl-pg port=5432 dbname=lab
+
+    [pgbouncer]
+    listen_addr = 0.0.0.0
+    listen_port = 6432
+    auth_type = scram-sha-256
+    auth_file = /etc/pgbouncer/userlist.txt
+    admin_users = lab
+    ignore_startup_parameters = extra_float_digits
+
+    pool_mode = session
+    default_pool_size = 5
+    max_client_conn = 20
+    EOF
+    lab_file /lab/pgbouncer/userlist.txt <<'EOF'
+    "lab" "lab"
+    EOF
+    docker run -d --name kl-pgb --network kl-pool -v /lab/pgbouncer:/etc/pgbouncer "$PGB_IMAGE" >/dev/null
+    eventually 30 "docker run --rm --network kl-pool -e PGPASSWORD=lab postgres:16-alpine psql -h kl-pgb -p 6432 -U lab -d lab -c 'select 1'"
+    # the dashboard's idle connections, and a stalled batch transaction
+    docker run -d --name kl-dashboard --network kl-pool -e PGPASSWORD=lab postgres:16-alpine sh -c \
+      'for i in 1 2 3 4 5; do (echo "SELECT 1;"; sleep 1000000) | psql -h kl-pgb -p 6432 -U lab -d lab & done; wait' >/dev/null
+    docker run -d --name kl-batch --network kl-pool -e PGPASSWORD=lab postgres:16-alpine sh -c \
+      '(echo "BEGIN; UPDATE hits SET n = n + 1;"; sleep 1000000) | psql -h kl-pgb -p 6432 -U lab -d lab' >/dev/null
+    # prove the symptom: a short query through the pool can't get a server connection
+    sleep 3
+    ! docker run --rm --network kl-pool -e PGPASSWORD=lab postgres:16-alpine timeout 5 psql -h kl-pgb -p 6432 -U lab -d lab -c 'select 1' >/dev/null 2>&1 \
+      || { echo "setup: the pool is not exhausted" >&2; exit 1; }
+  check: |
+    tool() { docker run --rm --network kl-pool -e PGPASSWORD=lab postgres:16-alpine "$@"; }
+    conf() { tool psql -h kl-pgb -p 6432 -U lab -qAt -F' ' pgbouncer -c 'SHOW CONFIG' 2>/dev/null | awk -v k="$1" '$1 == k { print $2 }'; }
+    # load CLIENTS TX -> that many clients each run TX short transactions through kl-pgb, within 25 seconds
+    load() {
+      tool sh -c "echo 'UPDATE hits SET n = n + 1 WHERE page = '\''home'\'';' > /tmp/t.sql &&
+        timeout -s KILL 25 pgbench -n -h kl-pgb -p 6432 -U lab -f /tmp/t.sql -c $1 -j 4 -t $2 lab" 2>&1 \
+        | grep -q "actually processed: $(($1 * $2))/$(($1 * $2))\$"
+    }
+    # clients NAME -> how many PgBouncer clients come from container NAME
+    clients() {
+      local ip; ip=$(c_get "$1" '{{range .NetworkSettings.Networks}}{{.IPAddress}}{{end}}')
+      tool psql -h kl-pgb -p 6432 -U lab -qAt pgbouncer -c 'SHOW CLIENTS' 2>/dev/null | awk -F'|' -v ip="$ip" '$6 == ip' | wc -l
+    }
+    # hogs NAME SQL -> 5 clients that run SQL and then sit idle, connected before this returns
+    hogs() {
+      docker rm -f "$1" >/dev/null 2>&1
+      docker run -d --name "$1" --network kl-pool -e PGPASSWORD=lab postgres:16-alpine sh -c \
+        "for i in 1 2 3 4 5; do (echo \"$2\"; sleep 1000000) | psql -h kl-pgb -p 6432 -U lab -d lab & done; wait" >/dev/null
+      eventually 20 "[ \"\$(clients $1)\" = 5 ]"
+    }
+    docker rm -f kl-dashboard kl-batch >/dev/null 2>&1
+    check "kl-pgb is running with /lab/pgbouncer" 'c_running kl-pgb && docker inspect -f "{{range .Mounts}}{{.Source}} {{end}}" kl-pgb | grep -qw /lab/pgbouncer'
+    check_eq "the pool stays at 5 server connections" "$(conf default_pool_size)" 5
+
+    info "Part 1: Idle clients must not starve the pool"
+    hogs kl-chk-dash 'SELECT 1;'
+    check "with 5 idle clients open, 10 workers get through" 'load 10 20'
+
+    info "Part 3: Room for every client"
+    check "with 5 idle clients open, 55 more clients are accepted and served" 'load 55 5'
+    docker rm -f kl-chk-dash >/dev/null 2>&1
+
+    info "Part 2: A forgotten transaction must not pin a connection"
+    t=$(conf idle_transaction_timeout)
+    if [ "${t:-0}" -gt 0 ] && [ "${t:-0}" -le 30 ]; then
+      hogs kl-chk-batch 'BEGIN; SELECT 1;'
+      check "clients idle in a transaction are disconnected within 30 seconds" \
+        'eventually 40 "[ \"\$(clients kl-chk-batch)\" = 0 ]"'
+      check "after that the workers get through again" 'load 10 20'
+      docker rm -f kl-chk-batch >/dev/null 2>&1
+    else
+      fail "clients idle in a transaction are disconnected within 30 seconds (idle_transaction_timeout is '${t}')"
+    fi
+  solve: |
+    f=/lab/pgbouncer/pgbouncer.ini
+    # --- part 1: Idle clients must not starve the pool ---
+    sed -i 's/^pool_mode = .*/pool_mode = transaction/' "$f"
+
+    # --- part 2: A forgotten transaction must not pin a connection ---
+    echo 'idle_transaction_timeout = 30' >> "$f"
+
+    # --- part 3: Room for every client ---
+    sed -i 's/^max_client_conn = .*/max_client_conn = 200/' "$f"
+    docker run --rm --network kl-pool -e PGPASSWORD=lab postgres:16-alpine \
+      psql -h kl-pgb -p 6432 -U lab pgbouncer -c RELOAD
+
+- id: data-052
+  title: The migration that failed halfway
+  difficulty: 4
+  kind: fix
+  tags: [postgres, migration, index, concurrently, lock_timeout, operations]
+  tutorial: |
+    **Concept.** A migration runner applies numbered SQL files in order and records each one in a table such as `schema_migrations`. Wrapping each file and its record in one transaction makes it all-or-nothing: a failure leaves no trace and the file can simply run again.
+
+    Some statements can't run in a transaction. `CREATE INDEX CONCURRENTLY` builds an index without blocking writes, but it commits in several steps of its own. If it fails part way (a duplicate value for a unique index, a cancelled session), PostgreSQL leaves the index behind marked **invalid**: it isn't used for queries, but it is still updated on every write, and its name is taken, so running the migration again fails with "already exists". `pg_index.indisvalid` shows it, as does `\d table` in psql.
+
+    Schema changes also need locks. `ALTER TABLE` takes an `ACCESS EXCLUSIVE` lock, which has to wait for every transaction that has touched the table, even one that only read it and has been idle for hours. While it waits, it queues **in front of** everyone else, so ordinary queries on that table stop too. `lock_timeout` makes the statement give up after a bounded wait instead, so a migration fails fast and harmlessly and can be retried later.
+
+    **Read up on:**
+    - `CREATE INDEX CONCURRENTLY` and what happens when it fails; `pg_index.indisvalid`
+    - `ALTER TABLE ... ADD CONSTRAINT ... UNIQUE USING INDEX`
+    - `lock_timeout`, and setting it with `SET`, or `PGOPTIONS='-c lock_timeout=5s'` for a whole client
+    - `pg_locks`, `pg_blocking_pids()` and `pg_terminate_backend()`
+    - Merging duplicate rows that other tables reference: `UPDATE ... FROM` then `DELETE`
+  scenario: |
+    PostgreSQL runs in **`kl-pg`** (`docker exec -it kl-pg psql -U lab -d lab`). The schema
+    is managed by **`/lab/migrate.sh`**, which applies the files in **`/lab/migrations`** in
+    order and records each version in `schema_migrations`. It reads the directory from
+    `MIGRATIONS_DIR`, defaulting to `/lab/migrations`. Files starting with `-- no-transaction`
+    run outside a transaction.
+
+    Last night's deploy failed. Migration `004_users_email_unique` died, and a second
+    attempt then hung and blocked checkout for ten minutes until someone pressed Ctrl-C.
+
+    ## Part 1: Finish migration 004
+
+    Migration 004 makes `users.email` unique. It failed because some customers were
+    registered twice with the same email, and both copies have orders. Merge each set of
+    duplicates into the **oldest** user (lowest `id`), moving their orders to it, so that no
+    order is lost or changes owner email. Then clean up whatever the failed run left behind
+    and get 004 applied by `/lab/migrate.sh` itself. Don't edit the migration file.
+
+    ## Part 2: Migrations must not queue behind a lock
+
+    Change **`/lab/migrate.sh`** so that every statement it runs waits at most **5 seconds**
+    for a lock, then fails. A migration that fails this way must not be recorded as
+    applied, and the script must exit with an error. This must hold for migrations with and
+    without `-- no-transaction`.
+
+    ## Part 3: Apply the rest
+
+    Get every remaining migration applied by `/lab/migrate.sh`. Whatever is holding the
+    lock that migration 005 needs belongs to a reporting tool that is safe to disconnect.
+  hints:
+    - "Part 1: `\\d users` in psql marks a failed concurrent index as `INVALID`. It has to be dropped before the migration can run again."
+    - "Part 1: `SELECT email, array_agg(id ORDER BY id) FROM users GROUP BY email HAVING count(*) > 1` lists the duplicates. Point their orders at the lowest id first, then delete the others."
+    - "Part 2: `lock_timeout` can be set for every statement a client runs with `PGOPTIONS`. The runner's psql runs inside the container, so pass it with `docker exec -e`."
+    - "Part 3: `SELECT pid, usename, state, query FROM pg_stat_activity WHERE pid = ANY (pg_blocking_pids(<pid of the waiting ALTER>))`, or look for a session that is `idle in transaction`."
+  solution: |
+    ## Part 1: Finish migration 004
+
+    ```sql
+    DROP INDEX users_email_key;               -- the invalid leftover
+    UPDATE orders o SET user_id = k.keep
+      FROM (SELECT id, min(id) OVER (PARTITION BY email) AS keep FROM users) k
+     WHERE o.user_id = k.id AND k.id <> k.keep;
+    DELETE FROM users u WHERE id > (SELECT min(id) FROM users x WHERE x.email = u.email);
+    ```
+
+    ## Part 2: Migrations must not queue behind a lock
+
+    Give the runner's psql a lock timeout for every statement:
+
+    ```bash
+    sed -i "s/docker exec -i kl-pg psql/docker exec -i -e PGOPTIONS='-c lock_timeout=5s' kl-pg psql/" /lab/migrate.sh
+    ```
+
+    ## Part 3: Apply the rest
+
+    ```sql
+    SELECT pg_terminate_backend(pid) FROM pg_stat_activity
+     WHERE usename = 'lab' AND state = 'idle in transaction';
+    ```
+
+    ```bash
+    /lab/migrate.sh
+    ```
+  setup: |
+    docker network create kl-mig >/dev/null
+    docker run -d --name kl-pg --network kl-mig -e POSTGRES_USER=lab -e POSTGRES_PASSWORD=lab -e POSTGRES_DB=lab postgres:16-alpine >/dev/null
+    eventually 60 "pg_x kl-pg 'select 1'"
+    lab_file /lab/migrate.sh 0755 <<'EOF'
+    #!/bin/bash
+    # migrate.sh - apply pending migrations in order, recording each in schema_migrations
+    set -euo pipefail
+    DIR=${MIGRATIONS_DIR:-/lab/migrations}
+    psql() { docker exec -i kl-pg psql -h 127.0.0.1 -U lab -d lab -v ON_ERROR_STOP=1 -qAt "$@"; }
+
+    psql -c 'CREATE TABLE IF NOT EXISTS schema_migrations (version text PRIMARY KEY, applied_at timestamptz NOT NULL DEFAULT now())'
+    for f in "$DIR"/*.sql; do
+      v=$(basename "$f" .sql)
+      [ "$(psql -c "SELECT count(*) FROM schema_migrations WHERE version = '$v'")" = 1 ] && continue
+      echo "applying $v"
+      if head -1 "$f" | grep -q -- '-- no-transaction'; then
+        psql < "$f"
+        psql -c "INSERT INTO schema_migrations (version) VALUES ('$v')"
+      else
+        { echo 'BEGIN;'; cat "$f"; echo "INSERT INTO schema_migrations (version) VALUES ('$v');"; echo 'COMMIT;'; } | psql
+      fi
+    done
+    echo "all migrations applied"
+    EOF
+    lab_file /lab/migrations/001_create_users.sql <<'EOF'
+    CREATE TABLE users (id serial PRIMARY KEY, email text NOT NULL, name text NOT NULL);
+    EOF
+    lab_file /lab/migrations/002_create_orders.sql <<'EOF'
+    CREATE TABLE orders (id serial PRIMARY KEY, user_id int NOT NULL REFERENCES users (id), total numeric(10,2) NOT NULL);
+    CREATE INDEX orders_user_id ON orders (user_id);
+    EOF
+    as_user /lab/migrate.sh >/dev/null
+    pg_x kl-pg "INSERT INTO users (email, name) SELECT 'user' || g || '@example.com', 'User ' || g FROM generate_series(1, 1000) g"
+    # the same customers registered a second time by an old signup bug
+    pg_x kl-pg "INSERT INTO users (email, name) SELECT 'user' || g || '@example.com', 'User ' || g || ' (again)' FROM generate_series(7, 1000, 83) g"
+    pg_x kl-pg "INSERT INTO orders (user_id, total) SELECT 1 + (g * 7919) % (SELECT count(*) FROM users), (g % 400) + 0.99 FROM generate_series(1, 5000) g"
+    pg_x kl-pg "SELECT md5(string_agg(o.id || ':' || u.email || ':' || o.total, ',' ORDER BY o.id)) FROM orders o JOIN users u ON u.id = o.user_id" >"$KL_STATE/orders.md5"
+    [ "$(pg_x kl-pg 'SELECT count(*) FROM orders o JOIN users u ON u.id = o.user_id WHERE u.id > 1000')" -gt 0 ] || { echo "setup: duplicates have no orders" >&2; exit 1; }
+    lab_file /lab/migrations/004_users_email_unique.sql <<'EOF'
+    -- no-transaction
+    -- CREATE INDEX CONCURRENTLY can't run inside a transaction block
+    CREATE UNIQUE INDEX CONCURRENTLY users_email_key ON users (email);
+    ALTER TABLE users ADD CONSTRAINT users_email_unique UNIQUE USING INDEX users_email_key;
+    EOF
+    lab_file /lab/migrations/005_orders_status.sql <<'EOF'
+    ALTER TABLE orders ADD COLUMN status text NOT NULL DEFAULT 'new';
+    EOF
+    # the deploy: 004 fails and leaves an invalid index
+    ! as_user /lab/migrate.sh >/dev/null 2>&1 || { echo "setup: migration 004 did not fail" >&2; exit 1; }
+    [ "$(pg_x kl-pg "SELECT count(*) FROM pg_index WHERE NOT indisvalid")" = 1 ] || { echo "setup: no invalid index" >&2; exit 1; }
+    # the reporting tool's forgotten transaction on orders
+    docker run -d --name kl-report --network kl-mig -e PGPASSWORD=lab postgres:16-alpine sh -c \
+      '(echo "BEGIN; SELECT count(*) FROM orders;"; sleep 1000000) | psql -h kl-pg -U lab -d lab' >/dev/null
+    eventually 20 "[ \"\$(pg_x kl-pg \"SELECT count(*) FROM pg_stat_activity WHERE state = 'idle in transaction'\")\" = 1 ]" \
+      || { echo "setup: the reporting session is not holding a transaction" >&2; exit 1; }
+  check: |
+    applied() { [ "$(pg_x kl-pg "SELECT count(*) FROM schema_migrations WHERE version = '$1'")" = 1 ]; }
+    info "Part 1: Finish migration 004"
+    check_eq "no invalid index is left" "$(pg_x kl-pg 'SELECT count(*) FROM pg_index WHERE NOT indisvalid')" 0
+    check "users.email has the unique constraint users_email_unique" \
+      '[ "$(pg_x kl-pg "SELECT count(*) FROM pg_constraint WHERE conname = '"'users_email_unique'"' AND contype = '"'u'"'")" = 1 ]'
+    check "migration 004 is recorded as applied" 'applied 004_users_email_unique'
+    check_eq "each duplicate was merged into the oldest user" \
+      "$(pg_x kl-pg "SELECT count(*) || '/' || max(id) FROM users WHERE id <= 1000")/$(pg_x kl-pg 'SELECT count(*) FROM users')" "1000/1000/1000"
+    check_eq "every order kept its total and its owner's email" \
+      "$(pg_x kl-pg "SELECT md5(string_agg(o.id || ':' || u.email || ':' || o.total, ',' ORDER BY o.id)) FROM orders o JOIN users u ON u.id = o.user_id")" "$(cat "$KL_STATE/orders.md5")"
+
+    info "Part 2: Migrations must not queue behind a lock"
+    # run the learner's runner on a probe migration while another session holds a lock on orders
+    docker rm -f kl-chk-lock >/dev/null 2>&1
+    docker run -d --name kl-chk-lock --network kl-mig -e PGPASSWORD=lab postgres:16-alpine sh -c \
+      '(echo "SET application_name = kl_chk_lock; BEGIN; SELECT count(*) FROM orders;"; sleep 1000000) | psql -h kl-pg -U lab -d lab' >/dev/null
+    eventually 20 "[ \"\$(pg_x kl-pg \"SELECT count(*) FROM pg_stat_activity WHERE application_name = 'kl_chk_lock' AND state = 'idle in transaction'\")\" = 1 ]"
+    probe() { # probe NAME HEADER -> exit code of the runner on one migration, killed after 12 seconds
+      local d; d=$(mktemp -d /tmp/kl-mig-XXXX)
+      { [ -n "$2" ] && echo "$2"; echo "ALTER TABLE orders ADD COLUMN $1 int;"; } >"$d/900_$1.sql"
+      chmod -R a+rX "$d"
+      as_user "MIGRATIONS_DIR=$d timeout 12 /lab/migrate.sh" >/dev/null 2>&1; local rc=$?
+      rm -rf "$d"
+      # stop anything the killed runner left waiting, before the lock is released
+      pg_x kl-pg "SELECT pg_terminate_backend(pid) FROM pg_stat_activity WHERE wait_event_type = 'Lock'" >/dev/null
+      return $rc
+    }
+    for kind in tx notx; do
+      h=''; [ $kind = notx ] && h='-- no-transaction'
+      probe "kl_probe_$kind" "$h"; rc=$?
+      label="in a migration"; [ $kind = notx ] && label="in a -- no-transaction migration"
+      check "$label, a blocked statement fails within 5 seconds and the script exits with an error" "[ $rc -ne 0 ] && [ $rc -ne 124 ]"
+      check_not "$label, the failed migration is not recorded" "applied 900_kl_probe_$kind"
+    done
+    pg_x kl-pg "SELECT pg_terminate_backend(pid) FROM pg_stat_activity WHERE application_name = 'kl_chk_lock'" >/dev/null
+    docker rm -f kl-chk-lock >/dev/null 2>&1
+    # (the probe columns can't exist: their ALTERs were stopped while still waiting for the lock)
+    pg_x kl-pg "DELETE FROM schema_migrations WHERE version LIKE '900_%'" >/dev/null
+
+    info "Part 3: Apply the rest"
+    check "migration 005 is recorded as applied" 'applied 005_orders_status'
+    check_eq "orders has the status column" "$(pg_x kl-pg "SELECT count(*) FROM information_schema.columns WHERE table_name = 'orders' AND column_name = 'status'")" 1
+    check "migrate.sh now has nothing left to do" 'as_user "timeout 20 /lab/migrate.sh" | grep -q "all migrations applied"'
+  solve: |
+    psql() { docker exec -i kl-pg psql -h 127.0.0.1 -U lab -d lab -qAt -v ON_ERROR_STOP=1 "$@"; }
+    # --- part 1: Finish migration 004 ---
+    psql <<'SQL'
+    DROP INDEX users_email_key;
+    UPDATE orders o SET user_id = k.keep
+      FROM (SELECT id, min(id) OVER (PARTITION BY email) AS keep FROM users) k
+     WHERE o.user_id = k.id AND k.id <> k.keep;
+    DELETE FROM users u WHERE id > (SELECT min(id) FROM users x WHERE x.email = u.email);
+    SQL
+
+    # --- part 2: Migrations must not queue behind a lock ---
+    sed -i "s/docker exec -i kl-pg psql/docker exec -i -e PGOPTIONS='-c lock_timeout=5s' kl-pg psql/" /lab/migrate.sh
+
+    # --- part 3: Apply the rest ---
+    psql -c "SELECT pg_terminate_backend(pid) FROM pg_stat_activity WHERE usename = 'lab' AND state = 'idle in transaction'"
+    /lab/migrate.sh
+
+- id: data-053
+  title: Two masters for twenty seconds
+  difficulty: 5
+  kind: fix
+  tags: [redis, sentinel, failover, split-brain, replication, min-replicas]
+  tutorial: |
+    **Concept.** **Redis Sentinel** watches a master and its replicas. When enough sentinels (the **quorum**) can't reach the master for `down-after-milliseconds`, they elect a leader, which promotes a replica and tells the others to follow it. Clients ask a sentinel where the master is (`SENTINEL get-master-addr-by-name`).
+
+    A network partition can leave the old master running on the far side, cut off from the sentinels and replicas but still reachable by some clients. Redis replication is asynchronous, and by default a master accepts writes whether or not any replica is listening. So for as long as the partition lasts there are **two masters**, and clients on the old one get `OK` for every write. When the partition heals, the sentinels find the old master and turn it into a replica of the new one. A replica that resyncs throws its data away and loads the master's, so every write the old master acknowledged during the partition **disappears**, with no error anywhere.
+
+    Redis can't prevent the split, but it can limit the damage. With `min-replicas-to-write N` and `min-replicas-max-lag S`, a master refuses writes (`NOREPLICAS`) unless at least N replicas have acknowledged it within the last S seconds. An isolated old master then stops accepting writes about S seconds after it is cut off, which bounds how much can be lost. Settings changed with `CONFIG SET` last until a restart, unless `CONFIG REWRITE` saves them to the configuration file.
+
+    **Read up on:**
+    - Redis Sentinel: `SENTINEL masters`, `SENTINEL get-master-addr-by-name`, the `+switch-master` and `+convert-to-slave` events in its log
+    - `INFO replication`: `role`, `master_host`, `connected_slaves`, `slaveN ... lag=`
+    - `min-replicas-to-write`, `min-replicas-max-lag`, and the `NOREPLICAS` error
+    - `CONFIG SET`, `CONFIG GET`, `CONFIG REWRITE`
+  scenario: |
+    Redis runs as a master and two replicas, **`kl-r1`** (172.31.77.11), **`kl-r2`** (.12) and
+    **`kl-r3`** (.13), watched by three sentinels **`kl-s1`**, **`kl-s2`** and **`kl-s3`**
+    (port 26379) under the master name **`shop`**, all on the Docker network `kl-sent`. Each
+    Redis node reads its configuration from `/data/redis.conf` in its container. Use
+    `docker exec -it kl-r1 redis-cli` and `docker exec -it kl-s1 redis-cli -p 26379`.
+
+    For about twenty seconds this morning `kl-r1`, then the master, was cut off from the
+    replicas and the sentinels, while the checkout service could still reach it. The
+    checkout service logs every write and the reply it got in **`/lab/app.log`**, including
+    the address of the node that answered. Every line there says `OK`, yet customers are
+    missing orders.
+
+    ## Part 1: Which acknowledged writes were lost
+
+    Find every order key that the checkout service wrote and got `OK` for, but that the
+    **current** master doesn't have. Write them to **`/lab/lost.txt`**, one key per line.
+
+    ## Part 2: Put them back
+
+    Re-apply each lost write to the current master, with the value from the log. Don't
+    change the topology: the sentinels must still agree on the current master.
+
+    ## Part 3: An isolated master must stop taking writes
+
+    Configure **all three** Redis nodes so that a master refuses writes once it has had no
+    replica acknowledging it for more than **10 seconds**, while writes keep working when at
+    least one replica is connected. The setting must survive a restart of each node. Any
+    node may be the master next time.
+  hints:
+    - "Part 1: `docker exec kl-s1 redis-cli -p 26379 SENTINEL get-master-addr-by-name shop` gives the current master. `docker logs kl-s1` shows the failover as it happened."
+    - "Part 1: for each `SET` line in the log, ask the current master whether the key exists. The node that answered each write is in the log too: compare it with the sentinel's history."
+    - "Part 2: the log has the value for each key. `SET` them on the current master; replicas follow by themselves."
+    - "Part 3: the two settings are `min-replicas-to-write` and `min-replicas-max-lag`. Set them with `CONFIG SET` on each node, then `CONFIG REWRITE` writes them into `/data/redis.conf`."
+  solution: |
+    ## Part 1: Which acknowledged writes were lost
+
+    ```bash
+    m=$(docker exec kl-s1 redis-cli -p 26379 SENTINEL get-master-addr-by-name shop | head -1)
+    awk '$2 == "SET" { print $3 }' /lab/app.log | sort -u | while read -r k; do
+      [ "$(docker exec kl-r1 redis-cli -h "$m" EXISTS "$k")" = 0 ] && echo "$k"
+    done > /lab/lost.txt
+    ```
+
+    ## Part 2: Put them back
+
+    ```bash
+    while read -r k; do
+      v=$(awk -v k="$k" '$2 == "SET" && $3 == k { print $4 }' /lab/app.log | tail -1)
+      docker exec kl-r1 redis-cli -h "$m" SET "$k" "$v"
+    done < /lab/lost.txt
+    ```
+
+    ## Part 3: An isolated master must stop taking writes
+
+    ```bash
+    for n in kl-r1 kl-r2 kl-r3; do
+      docker exec $n redis-cli CONFIG SET min-replicas-to-write 1
+      docker exec $n redis-cli CONFIG SET min-replicas-max-lag 10
+      docker exec $n redis-cli CONFIG REWRITE
+    done
+    ```
+
+    The orders written to `kl-r1` while it was cut off were lost when the sentinels made it a
+    replica of the new master. With these settings it would have answered `NOREPLICAS`
+    after ten seconds instead of `OK`.
+  setup: |
+    docker network create --subnet 172.31.77.0/24 kl-sent >/dev/null
+    ip_of() { case $1 in kl-r1) echo 172.31.77.11 ;; kl-r2) echo 172.31.77.12 ;; kl-r3) echo 172.31.77.13 ;;
+      kl-s1) echo 172.31.77.21 ;; kl-s2) echo 172.31.77.22 ;; kl-s3) echo 172.31.77.23 ;; kl-app) echo 172.31.77.30 ;; esac; }
+    conf() { # conf NAME FILE <<EOF -> write a config file into the container's data volume
+      docker run --rm -i -v "$1-data:/data" redis:7.4-alpine sh -c "cat > /data/$2 && chown redis:redis /data/$2"
+    }
+    for n in kl-r1 kl-r2 kl-r3; do
+      { echo 'port 6379'; echo 'appendonly yes'; echo 'dir /data'
+        [ $n = kl-r1 ] || echo 'replicaof 172.31.77.11 6379'; } | conf $n redis.conf
+      docker run -d --name $n --network kl-sent --ip "$(ip_of $n)" -v "$n-data:/data" redis:7.4-alpine redis-server /data/redis.conf >/dev/null
+    done
+    for n in kl-s1 kl-s2 kl-s3; do
+      printf '%s\n' 'port 26379' 'dir /data' 'sentinel monitor shop 172.31.77.11 6379 2' \
+        'sentinel down-after-milliseconds shop 3000' 'sentinel failover-timeout shop 10000' | conf $n sentinel.conf
+      docker run -d --name $n --network kl-sent --ip "$(ip_of $n)" -v "$n-data:/data" redis:7.4-alpine redis-server /data/sentinel.conf --sentinel >/dev/null
+    done
+    docker run -d --name kl-app --network kl-sent --ip 172.31.77.30 redis:7.4-alpine sleep 1000000 >/dev/null
+    master() { docker exec kl-s1 redis-cli -p 26379 SENTINEL get-master-addr-by-name shop 2>/dev/null | head -1; }
+    eventually 30 '[ "$(docker exec kl-r1 redis-cli info replication | grep -c "state=online")" = 2 ]' \
+      || { echo "setup: replicas did not connect" >&2; exit 1; }
+    eventually 30 '[ "$(docker exec kl-s1 redis-cli -p 26379 SENTINEL master shop | grep -A1 "^num-other-sentinels$" | tail -1)" = 2 ]' \
+      || { echo "setup: sentinels did not find each other" >&2; exit 1; }
+    : >/lab/app.log
+    write() { # write HOST N -> the checkout service writes order N to HOST and logs the reply
+      local v="cart-$(( $2 * 7919 % 1000 ))-items-$(( $2 % 5 + 1 ))"
+      local r; r=$(docker exec kl-app redis-cli -h "$1" SET "order:$2" "$v" 2>&1)
+      echo "$(date -u +%FT%TZ) SET order:$2 $v -> $r ($1)" >>/lab/app.log
+    }
+    for i in $(seq 1001 1020); do write 172.31.77.11 $i; done
+    sleep 1
+    # kl-r1 is cut off from the replicas and sentinels; the checkout service can still reach it
+    pid=$(docker inspect -f '{{.State.Pid}}' kl-r1)
+    for n in kl-r2 kl-r3 kl-s1 kl-s2 kl-s3; do nsenter -t "$pid" -n ip route add blackhole "$(ip_of $n)/32"; done
+    i=1021
+    for t in $(seq 1 12); do write 172.31.77.11 $i; i=$((i + 1)); sleep 1; done
+    eventually 30 '[ -n "$(master)" ] && [ "$(master)" != 172.31.77.11 ]' || { echo "setup: no failover" >&2; exit 1; }
+    new=$(master)
+    # half the clients have found the new master, the rest still use the old one
+    for t in $(seq 1 10); do
+      if [ $((t % 2)) = 1 ]; then write "$new" $i; else write 172.31.77.11 $i; fi
+      i=$((i + 1)); sleep 0.5
+    done
+    for n in kl-r2 kl-r3 kl-s1 kl-s2 kl-s3; do nsenter -t "$pid" -n ip route del blackhole "$(ip_of $n)/32"; done
+    # the sentinels turn kl-r1 into a replica, and it throws its writes away
+    eventually 40 '[ "$(docker exec kl-r1 redis-cli info replication | grep -c "master_link_status:up")" = 1 ]' \
+      || { echo "setup: kl-r1 did not rejoin" >&2; exit 1; }
+    for k in $(awk '$6 == "OK" { print $3 }' /lab/app.log); do
+      [ "$(docker exec kl-app redis-cli -h "$new" EXISTS "$k")" = 1 ] || echo "$k"
+    done | sort >"$KL_STATE/lost"
+    [ "$(wc -l <"$KL_STATE/lost")" -ge 10 ] || { echo "setup: too few writes were lost" >&2; exit 1; }
+    grep -q -v ' -> OK ' /lab/app.log && { echo "setup: a write was refused" >&2; exit 1; }
+    chown "$(lab_user)": /lab/app.log
+  check: |
+    master() { docker exec kl-s1 redis-cli -p 26379 SENTINEL get-master-addr-by-name shop 2>/dev/null | head -1; }
+    m=$(master)
+    mc() { docker exec kl-app redis-cli -h "$m" "$@" 2>&1; }
+    info "Part 1: Which acknowledged writes were lost"
+    check_eq "/lab/lost.txt lists exactly the lost orders" \
+      "$(tr -d ' \r' </lab/lost.txt 2>/dev/null | grep -v '^$' | sort -u | tr '\n' ' ')" "$(tr '\n' ' ' <"$KL_STATE/lost")"
+
+    info "Part 2: Put them back"
+    agree=1
+    for s in kl-s2 kl-s3; do
+      [ "$(docker exec $s redis-cli -p 26379 SENTINEL get-master-addr-by-name shop | head -1)" = "$m" ] || agree=0
+    done
+    check "the sentinels agree on the master, and it is a master" "[ $agree = 1 ] && mc info replication | grep -q role:master"
+    bad=0
+    while read -r k; do
+      v=$(awk -v k="$k" '$2 == "SET" && $3 == k { print $4 }' /lab/app.log | tail -1)
+      [ "$(mc get "$k")" = "$v" ] || bad=$((bad + 1))
+    done <"$KL_STATE/lost"
+    check_eq "every lost order is back on the master with its logged value" "$bad" 0
+    ok=0
+    for k in $(awk '$2 == "SET" { print $3 }' /lab/app.log); do [ "$(mc exists "$k")" = 1 ] && ok=$((ok + 1)); done
+    check_eq "the master has every order in the log" "$ok" "$(grep -c ' SET ' /lab/app.log)"
+
+    info "Part 3: An isolated master must stop taking writes"
+    for n in kl-r1 kl-r2 kl-r3; do
+      to=$(docker exec $n redis-cli config get min-replicas-to-write | tail -1)
+      lag=$(docker exec $n redis-cli config get min-replicas-max-lag | tail -1)
+      check "$n refuses writes after at most 10 seconds without a replica" "[ \"${to:-0}\" -ge 1 ] && [ \"${lag:-0}\" -ge 1 ] && [ \"${lag:-0}\" -le 10 ]"
+      # CONFIG REWRITE leaves out values equal to the default, and min-replicas-max-lag defaults to 10
+      check "$n keeps it in /data/redis.conf" "docker exec $n grep -Eq '^min-replicas-to-write [1-9]' /data/redis.conf && ! docker exec $n grep -Eq '^min-replicas-max-lag ([0-9]{3,}|[2-9][0-9]|1[1-9]|0)\$' /data/redis.conf"
+    done
+    # live test: cut the master off from its replicas only, so the sentinels don't fail over
+    mn=$(docker ps --format '{{.Names}}' | grep '^kl-r' | while read -r n; do
+      [ "$(docker inspect -f '{{range .NetworkSettings.Networks}}{{.IPAddress}}{{end}}' "$n")" = "$m" ] && echo "$n"; done)
+    to=$(mc config get min-replicas-to-write | tail -1)
+    if [ -n "$mn" ] && [ "${to:-0}" -ge 1 ]; then
+      check "with a replica connected, the master accepts writes" 'mc set kl:probe 1 | grep -q OK'
+      # cut add|del: block or restore traffic both ways between the master and each replica
+      cut() {
+        local n ip pid mp; mp=$(docker inspect -f '{{.State.Pid}}' "$mn")
+        for n in kl-r1 kl-r2 kl-r3; do
+          [ "$n" = "$mn" ] && continue
+          ip=$(docker inspect -f '{{range .NetworkSettings.Networks}}{{.IPAddress}}{{end}}' "$n")
+          pid=$(docker inspect -f '{{.State.Pid}}' "$n")
+          nsenter -t "$mp" -n ip route "$1" blackhole "$ip/32" 2>/dev/null
+          nsenter -t "$pid" -n ip route "$1" blackhole "$m/32" 2>/dev/null
+        done
+      }
+      cut add
+      check "cut off from its replicas, the master refuses writes within 15 seconds" 'eventually 15 "mc set kl:probe 2 | grep -q NOREPLICAS"'
+      cut del
+      check "once the replicas are back, writes work again" 'eventually 30 "mc set kl:probe 3 | grep -q OK"'
+      mc del kl:probe >/dev/null
+    else
+      fail "cut off from its replicas, the master refuses writes within 15 seconds"
+    fi
+  solve: |
+    m=$(docker exec kl-s1 redis-cli -p 26379 SENTINEL get-master-addr-by-name shop | head -1)
+    # --- part 1: Which acknowledged writes were lost ---
+    awk '$2 == "SET" { print $3 }' /lab/app.log | sort -u | while read -r k; do
+      [ "$(docker exec kl-r1 redis-cli -h "$m" EXISTS "$k")" = 0 ] && echo "$k"
+    done > /lab/lost.txt
+
+    # --- part 2: Put them back ---
+    while read -r k; do
+      v=$(awk -v k="$k" '$2 == "SET" && $3 == k { print $4 }' /lab/app.log | tail -1)
+      docker exec kl-r1 redis-cli -h "$m" SET "$k" "$v"
+    done < /lab/lost.txt
+
+    # --- part 3: An isolated master must stop taking writes ---
+    for n in kl-r1 kl-r2 kl-r3; do
+      docker exec $n redis-cli CONFIG SET min-replicas-to-write 1
+      docker exec $n redis-cli CONFIG SET min-replicas-max-lag 10
+      docker exec $n redis-cli CONFIG REWRITE
+    done
+
+- id: data-054
+  title: The append-only file that won't load
+  difficulty: 4
+  kind: fix
+  tags: [redis, aof, persistence, corruption, recovery]
+  tutorial: |
+    **Concept.** With `appendonly yes`, Redis logs every write command to the **append-only file** (AOF) and rebuilds its data at start-up by replaying it. Since Redis 7 the AOF is a directory (`appendonlydir`) of several files listed in a **manifest**: a **base** file (a snapshot, in RDB format by default) and one or more **incr** files holding the commands written since that snapshot, in the Redis protocol (RESP): `*3\r\n$3\r\nSET\r\n$3\r\nkey\r\n$5\r\nvalue\r\n` is `SET key value`.
+
+    If the last command in the file is cut short (a crash mid-write), Redis loads everything before it and carries on, because `aof-load-truncated` is on. Damage in the **middle** of a file is different: Redis refuses to start, because it can't know what the damaged bytes said. `redis-check-aof` finds the first bad offset. With `--fix` it repairs the file the only way it can: it **truncates** the file at the damage, which throws away the damaged command *and every command after it*, intact or not.
+
+    So a fix that "works" can silently lose far more than the damaged command. The commands after the damage are still in the original file, in order; `redis-cli --pipe` sends raw RESP to a server, so they can be replayed once the server is up again. Commands such as `INCRBY` or `RPUSH` are not idempotent: replaying one twice gives a different result from replaying it once.
+
+    **Read up on:**
+    - Redis persistence: AOF, the multi-part AOF and its manifest, `aof-load-truncated`
+    - `redis-check-aof` and `--fix`
+    - The RESP protocol: arrays (`*N`) and bulk strings (`$len`)
+    - `redis-cli --pipe`
+    - Running a tool against a stopped container's volume: `docker run --rm -v VOLUME:/data ...`
+  scenario: |
+    Redis ran in the container **`kl-redis`** (`redis:7.4-alpine`) with AOF persistence,
+    its data in the volume **`kl-redis-data`** (mounted at `/data`). After a storage incident
+    it won't start any more: `docker logs kl-redis` says why.
+
+    Copy the AOF somewhere safe before you change it: you will need the original later.
+
+    ## Part 1: Get Redis running again
+
+    Start `kl-redis` again with the same volume and AOF persistence still on. Everything
+    written before the damaged command must be there.
+
+    ## Part 2: Replay what the repair dropped
+
+    Once Redis is running, put back the effect of every **intact** command that came after
+    the damaged one, each exactly once, in its original order. Everything must still be
+    there after `docker restart kl-redis`.
+
+    ## Part 3: Name what is really lost
+
+    The damaged command can't be recovered. Write the key it wrote to into
+    **`/lab/lost.txt`**, one key per line, and don't invent a value for it: the key must not
+    exist in Redis.
+  hints:
+    - "Part 1: run `redis-check-aof` in a throw-away container on the volume: `docker run --rm -v kl-redis-data:/data -w /data/appendonlydir redis:7.4-alpine redis-check-aof appendonly.aof.manifest`. Copy the directory before you add `--fix`."
+    - "Part 1: the check prints the byte offset where the damage starts. `--fix` truncates the incr file there and asks for confirmation."
+    - "Part 2: open the saved incr file with `od -c` or `cat -v` around that offset. The damaged command is the one containing the offset; the next command starts at the next `*3` line after it."
+    - "Part 2: `tail -c +N file` prints a file from byte N (counting from 1). Pipe the intact tail into `docker exec -i kl-redis redis-cli --pipe`."
+    - "Part 3: the damaged command's key is still readable in the saved file, just before the damage."
+  solution: |
+    ## Part 1: Get Redis running again
+
+    ```bash
+    docker run --rm -v kl-redis-data:/data redis:7.4-alpine cp -a /data/appendonlydir /data/aof-backup
+    docker run --rm -v kl-redis-data:/data -w /data/appendonlydir redis:7.4-alpine redis-check-aof appendonly.aof.manifest
+    #   ... ok_up_to=OK (the damaged command starts here)
+    docker run --rm -v kl-redis-data:/data -w /data/appendonlydir redis:7.4-alpine \
+      sh -c 'echo y | redis-check-aof --fix appendonly.aof.manifest'
+    docker start kl-redis
+    ```
+
+    ## Part 2: Replay what the repair dropped
+
+    Find the end of the damaged command in the saved copy: it is the first `*3` record
+    that starts after the damage.
+
+    ```bash
+    docker run --rm -v kl-redis-data:/data redis:7.4-alpine sh -c \
+      'f=$(ls /data/aof-backup/*.incr.aof); od -A d -c "$f" | less'
+    # with NEXT = byte offset (from 0) of the first command after the damaged one:
+    docker run --rm -v kl-redis-data:/data redis:7.4-alpine \
+      sh -c "tail -c +$((NEXT + 1)) /data/aof-backup/*.incr.aof" | docker exec -i kl-redis redis-cli --pipe
+    ```
+
+    ## Part 3: Name what is really lost
+
+    ```bash
+    echo order:2040 > /lab/lost.txt
+    ```
+  setup: |
+    docker run -d --name kl-redis -v kl-redis-data:/data redis:7.4-alpine \
+      redis-server --appendonly yes --appendfsync always >/dev/null
+    eventually 30 'docker exec kl-redis redis-cli ping | grep -q PONG'
+    r() { docker exec -i kl-redis redis-cli "$@" >/dev/null; }
+    # the history, compacted into the AOF's base file
+    { for i in $(seq 1 300); do echo "SET order:$i id=$i,total=$((i * 53 % 900)).50"; done
+      for k in 0 1 2 3 4 5 6; do echo "SET stock:sku-$k 100"; done
+      for c in $(seq 0 10); do echo "HSET customer:$c name customer-$c orders 0"; done
+      echo "RPUSH audit opened"
+    } | docker exec -i kl-redis redis-cli >/dev/null
+    r BGREWRITEAOF
+    eventually 20 'docker exec kl-redis redis-cli info persistence | grep -q "aof_rewrite_in_progress:0"' && sleep 1
+    # today's writes, in the incr file
+    for i in $(seq 1 80); do
+      case $((i % 4)) in
+        0) r SET "order:$((2000 + i))" "{\"id\":$((2000 + i)),\"total\":$((i * 37 % 500)).99}" ;;
+        1) r INCRBY "stock:sku-$((i % 7))" "-$((i % 3 + 1))" ;;
+        2) r HINCRBY "customer:$((i % 11))" orders 1 ;;
+        3) r RPUSH audit "order $((2000 + i)) paid" ;;
+      esac
+      [ $i = 60 ] && r DEL order:2020
+    done
+    dump() { # every key with its type and value, sorted
+      docker exec kl-redis sh -c 'redis-cli --scan | sort | while read -r k; do
+        t=$(redis-cli type "$k")
+        case $t in
+          string) v=$(redis-cli get "$k") ;;
+          hash) v=$(redis-cli hgetall "$k" | awk "NR % 2 { k = \$0; next } { print k \"=\" \$0 }" | sort | tr "\n" " ") ;;
+          list) v=$(redis-cli lrange "$k" 0 -1 | tr "\n" "|") ;;
+        esac
+        echo "$k $t $v"
+      done'
+    }
+    # a correct repair loses only order:2040, the damaged command
+    dump | grep -v '^order:2040 ' >"$KL_STATE/expected"
+    [ "$(wc -l <"$KL_STATE/expected")" = 337 ] || { echo "setup: unexpected key count" >&2; exit 1; }
+    docker stop kl-redis >/dev/null
+    # the storage incident: the value of one command in the middle of the incr file is destroyed
+    f=$(ls "$(docker volume inspect -f '{{.Mountpoint}}' kl-redis-data)"/appendonlydir/*.incr.aof)
+    off=$(grep -abo '{"id":2040,' "$f" | cut -d: -f1)
+    [ -n "$off" ] || { echo "setup: damaged command not found" >&2; exit 1; }
+    # start at the value's "$26" length header, so the damage breaks the file's structure
+    off=$((off - 5))
+    [ "$(dd if="$f" bs=1 skip="$off" count=1 status=none)" = '$' ] || { echo "setup: unexpected record layout" >&2; exit 1; }
+    printf '\0\0\0\0\0\0\0\0\0\0\0\0\0\0' | dd of="$f" bs=1 seek="$off" conv=notrunc status=none
+    docker start kl-redis >/dev/null
+    sleep 2
+    ! c_running kl-redis || { echo "setup: redis still starts" >&2; exit 1; }
+    docker logs kl-redis 2>&1 | grep -q 'Bad file format' || { echo "setup: redis did not refuse the AOF" >&2; exit 1; }
+  check: |
+    dump() {
+      docker exec kl-redis sh -c 'redis-cli --scan | sort | while read -r k; do
+        t=$(redis-cli type "$k")
+        case $t in
+          string) v=$(redis-cli get "$k") ;;
+          hash) v=$(redis-cli hgetall "$k" | awk "NR % 2 { k = \$0; next } { print k \"=\" \$0 }" | sort | tr "\n" " ") ;;
+          list) v=$(redis-cli lrange "$k" 0 -1 | tr "\n" "|") ;;
+        esac
+        echo "$k $t $v"
+      done' 2>/dev/null
+    }
+    rc() { docker exec kl-redis redis-cli "$@" 2>/dev/null; }
+    same() { [ "$(dump | md5sum)" = "$(md5sum <"$KL_STATE/expected")" ]; }
+    want() { grep "^$1 " "$KL_STATE/expected" | cut -d' ' -f3-; }
+
+    info "Part 1: Get Redis running again"
+    check "kl-redis is running" 'c_running kl-redis && rc ping | grep -q PONG'
+    check "it uses the volume kl-redis-data" \
+      'docker inspect -f "{{range .Mounts}}{{.Name}} {{end}}" kl-redis | grep -qw kl-redis-data'
+    check_eq "AOF persistence is on" "$(rc config get appendonly | tail -1)" yes
+    check_eq "the 300 old orders are there" "$(rc --scan --pattern 'order:*' | awk -F: '$2 <= 300' | wc -l)" 300
+    check_eq "orders written before the damage are there" "$(rc get order:2004)|$(rc get order:2036)" "$(want order:2004)|$(want order:2036)"
+
+    info "Part 2: Replay what the repair dropped"
+    check "every intact command after the damage took effect exactly once" 'same'
+    if same; then
+      docker restart kl-redis >/dev/null
+      eventually 20 'rc ping | grep -q PONG'
+      check "all of it is still there after a restart" 'same'
+    else
+      fail "all of it is still there after a restart"
+    fi
+
+    info "Part 3: Name what is really lost"
+    check_eq "/lab/lost.txt names the damaged command's key" "$(tr -d ' \r' </lab/lost.txt 2>/dev/null | grep -v '^$' | sort | tr '\n' ' ')" "order:2040 "
+    check_eq "the lost key has no invented value" "$(rc exists order:2040)" 0
+  solve: |
+    # --- part 1: Get Redis running again ---
+    docker run --rm -v kl-redis-data:/data redis:7.4-alpine cp -a /data/appendonlydir /data/aof-backup
+    docker run --rm -v kl-redis-data:/data -w /data/appendonlydir redis:7.4-alpine \
+      sh -c 'echo y | redis-check-aof --fix appendonly.aof.manifest'
+    docker start kl-redis
+    until docker exec kl-redis redis-cli ping 2>/dev/null | grep -q PONG; do sleep 1; done
+
+    # --- part 2: Replay what the repair dropped ---
+    # the truncated file ends where the damaged command began; the next command starts at the
+    # first "*" that begins a line after the damage
+    ok=$(docker run --rm -v kl-redis-data:/data redis:7.4-alpine sh -c 'stat -c %s /data/appendonlydir/*.incr.aof')
+    next=$(docker run --rm -v kl-redis-data:/data redis:7.4-alpine sh -c \
+      "tail -c +$((ok + 2)) /data/aof-backup/*.incr.aof | tr '\\0' X | awk '/^\\*[0-9]/ { print n; exit } { n += length(\$0) + 1 }'")
+    docker run --rm -v kl-redis-data:/data redis:7.4-alpine \
+      sh -c "tail -c +$((ok + 2 + next)) /data/aof-backup/*.incr.aof" | docker exec -i kl-redis redis-cli --pipe
+
+    # --- part 3: Name what is really lost ---
+    echo order:2040 > /lab/lost.txt
+
+- id: data-055
+  title: The replica that resyncs forever
+  difficulty: 4
+  kind: fix
+  tags: [redis, replication, full-sync, output-buffer, backlog, netem]
+  tutorial: |
+    **Concept.** A Redis replica starts with a **full synchronisation**: the master snapshots its whole dataset as an RDB and streams it to the replica. Every write the master takes meanwhile is held in that replica's **output buffer** and sent once the snapshot is loaded. `client-output-buffer-limit replica <hard> <soft> <seconds>` protects the master's memory: a replica whose buffer passes the hard limit, or stays over the soft limit for the given seconds, is disconnected at once. Over a slow link with steady writes the buffer grows for as long as the snapshot takes to send, so a limit that is too small kills every attempt partway, and the replica starts over, forever. Each attempt costs the master a fork and a full snapshot. The master's log says `scheduled to be closed ASAP for overcoming of output buffer limits`.
+
+    Once a replica is in sync, a short disconnection doesn't need a full sync again. The master keeps the most recent part of its replication stream in the **replication backlog** (`repl-backlog-size`), and a reconnecting replica asks to continue from its offset (`PSYNC`). If that offset is still in the backlog, the master sends only the missing part (a **partial resync**); if not, it falls back to a full sync. The backlog has to hold everything written during the longest outage you want to survive cheaply: write rate times outage length.
+
+    `INFO stats` on the master counts `sync_full`, `sync_partial_ok` and `sync_partial_err`. `INFO replication` shows each replica's state and offset, and on the replica `master_link_status` and `master_sync_in_progress`.
+
+    **Read up on:**
+    - Redis replication: full sync, `PSYNC`, the replication ID and offset
+    - `client-output-buffer-limit` and its `replica` class
+    - `repl-backlog-size` and `repl-backlog-ttl`
+    - `INFO stats` and `INFO replication`; `master_repl_offset`
+    - `CONFIG SET` and `CONFIG REWRITE`
+  scenario: |
+    The master **`kl-rm`** and its replica **`kl-rr`** run on the Docker network `kl-rnet`.
+    The master holds about 30 MB of data, and a writer service (`kl-writer`) adds roughly
+    **100 KB/s** of writes all day. The replica is in another region: its link runs at
+    8 Mbit/s, emulated with `tc` on its host-side veth. That link is not going to get faster,
+    so leave the `tc` rule alone, and keep the writer running.
+
+    The master's configuration file is `/data/redis.conf` in its container
+    (`docker exec -it kl-rm redis-cli`).
+
+    ## Part 1: Let the full sync finish
+
+    `kl-rr` has never managed to finish its first synchronisation. Change the master so a
+    full sync over this link completes and the replica stays connected, with the writer
+    running. Save the change in the master's configuration file.
+
+    ## Part 2: Short outages must not cost a full sync
+
+    The link drops now and then for up to **30 seconds**. Change the master so that after
+    such an outage the replica continues with a **partial** resync, not a full one. Save
+    this in the master's configuration file too.
+  hints:
+    - "`docker logs kl-rm` shows each attempt and why it ended. `docker exec kl-rm redis-cli info stats | grep sync_` counts them."
+    - "Part 1: `CONFIG GET client-output-buffer-limit` on the master. The `replica` class decides how much a replica may fall behind during a sync before it is disconnected."
+    - "Part 1: the snapshot takes about 30 seconds to cross the link, and the buffer grows by about 100 KB each second meanwhile, plus headroom. `0 0 0` removes the limit entirely, at the risk of the master's memory."
+    - "Part 2: `CONFIG GET repl-backlog-size`. At 100 KB/s, a 30-second outage is about 3 MB of stream."
+    - "`CONFIG REWRITE` saves the running configuration into `/data/redis.conf`."
+  solution: |
+    ## Part 1: Let the full sync finish
+
+    ```bash
+    docker exec kl-rm redis-cli CONFIG SET client-output-buffer-limit 'replica 256mb 64mb 120'
+    ```
+
+    ## Part 2: Short outages must not cost a full sync
+
+    ```bash
+    docker exec kl-rm redis-cli CONFIG SET repl-backlog-size 16mb
+    docker exec kl-rm redis-cli CONFIG REWRITE
+    ```
+  setup: |
+    docker network create kl-rnet >/dev/null
+    for n in kl-rm kl-rr; do
+      { echo 'port 6379'; echo 'dir /data'; echo 'save ""'; echo 'appendonly no'
+        [ $n = kl-rm ] && printf '%s\n' 'repl-backlog-size 64kb' 'client-output-buffer-limit replica 2mb 512kb 10'
+      } | docker run --rm -i -v "$n-data:/data" redis:7.4-alpine sh -c 'cat > /data/redis.conf && chown redis:redis /data/redis.conf'
+      docker run -d --name $n --network kl-rnet -v "$n-data:/data" redis:7.4-alpine redis-server /data/redis.conf >/dev/null
+    done
+    eventually 20 'docker exec kl-rm redis-cli ping | grep -q PONG && docker exec kl-rr redis-cli ping | grep -q PONG'
+    # 30 MB of data that doesn't compress
+    python3 -c '
+    import base64, os, sys
+    out = sys.stdout.buffer
+    for i in range(1, 3001):
+        v = base64.b64encode(os.urandom(7500))
+        out.write(b"*3\r\n$3\r\nSET\r\n$%d\r\nblob:%d\r\n$%d\r\n%s\r\n" % (len(b"blob:%d" % i), i, len(v), v))
+    ' | docker exec -i kl-rm redis-cli --pipe >/dev/null
+    [ "$(docker exec kl-rm redis-cli dbsize)" = 3000 ] || { echo "setup: data did not load" >&2; exit 1; }
+    # the writer: 20 writes of 1 KB every 0.2 seconds
+    docker run -d --name kl-writer --network kl-rnet redis:7.4-alpine sh -c '
+      v=$(head -c 768 /dev/urandom | base64 -w0)
+      while :; do for j in $(seq 1 20); do echo "SET hot:$j $v"; done; sleep 0.2; done | redis-cli -h kl-rm >/dev/null' >/dev/null
+    tc qdisc add dev "$(c_veth kl-rr)" root netem rate 8mbit delay 20ms
+    docker exec kl-rr redis-cli REPLICAOF kl-rm 6379 >/dev/null
+    docker exec kl-rr redis-cli CONFIG REWRITE >/dev/null
+    # prove the loop: the master keeps dropping the replica for its output buffer
+    eventually 60 '[ "$(docker logs kl-rm 2>&1 | grep -c "overcoming of output buffer limits")" -ge 2 ]' \
+      || { echo "setup: the sync loop did not start" >&2; exit 1; }
+  check: |
+    rm_() { docker exec kl-rm redis-cli "$@" 2>/dev/null; }
+    stat() { rm_ info stats | tr -d '\r' | sed -n "s/^$1://p"; }
+    link_up() { docker exec kl-rr redis-cli info replication | tr -d '\r' | grep -q '^master_link_status:up'; }
+    veth=$(c_veth kl-rr)
+    check "the link to kl-rr is still limited" 'tc qdisc show dev "$veth" | grep -q "rate 8Mbit"'
+    check "the writer is still running" 'c_running kl-writer'
+
+    info "Part 1: Let the full sync finish"
+    lim=$(rm_ config get client-output-buffer-limit | tail -1 | sed -En 's/.*(slave|replica) ([0-9]+) ([0-9]+) ([0-9]+).*/\2 \3 \4/p')
+    set -- $lim
+    big() { [ "$1" = 0 ] || [ "$1" -ge $((8 * 1024 * 1024)) ]; }
+    if [ $# = 3 ] && big "$1" && { [ "$2" = 0 ] || [ "$3" = 0 ] || big "$2" || [ "$3" -ge 60 ]; }; then
+      check "kl-rr completes its sync with the writer running" 'eventually 120 link_up'
+      if link_up; then
+        full=$(stat sync_full)
+        sleep 12
+        check "kl-rr stays connected without another full sync" "link_up && [ \"\$(stat sync_full)\" = '$full' ]"
+        check_eq "kl-rr has all 3000 blobs" "$(docker exec kl-rr redis-cli --scan --pattern 'blob:*' | wc -l)" 3000
+      else
+        fail "kl-rr stays connected without another full sync"
+      fi
+    else
+      fail "kl-rr completes its sync with the writer running (the replica buffer limit is '$lim')"
+    fi
+    check "the buffer limit is saved in /data/redis.conf" \
+      "docker exec kl-rm grep -E '^client-output-buffer-limit (slave|replica) ' /data/redis.conf | grep -vq ' 2mb 512kb 10'"
+
+    info "Part 2: Short outages must not cost a full sync"
+    bl=$(rm_ config get repl-backlog-size | tail -1)
+    if [ "${bl:-0}" -ge $((3 * 1024 * 1024)) ] && link_up; then
+      full=$(stat sync_full); part=$(stat sync_partial_ok)
+      pid=$(docker inspect -f '{{.State.Pid}}' kl-rr)
+      ip=$(docker inspect -f '{{range .NetworkSettings.Networks}}{{.IPAddress}}{{end}}' kl-rm)
+      # a 20-second outage: the replica can't reach the master, and its connection is dropped
+      nsenter -t "$pid" -n ip route add blackhole "$ip/32"
+      rm_ client kill type replica >/dev/null
+      sleep 20
+      nsenter -t "$pid" -n ip route del blackhole "$ip/32"
+      # wait for the reconnection itself: the replica may not notice the cut until the link is back
+      eventually 90 "[ \"\$(stat sync_partial_ok)\" -gt '$part' ] || [ \"\$(stat sync_full)\" -gt '$full' ]"
+      check "after a 20-second outage kl-rr resumes with a partial resync" \
+        "[ \"\$(stat sync_partial_ok)\" -gt '$part' ] && [ \"\$(stat sync_full)\" = '$full' ]"
+    else
+      fail "after a 20-second outage kl-rr resumes with a partial resync (repl-backlog-size is '$bl')"
+    fi
+    check "the backlog size is saved in /data/redis.conf" "docker exec kl-rm grep -q '^repl-backlog-size' /data/redis.conf && [ \"\$(docker exec kl-rm sed -n 's/^repl-backlog-size //p' /data/redis.conf)\" != 64kb ]"
+  solve: |
+    # --- part 1: Let the full sync finish ---
+    docker exec kl-rm redis-cli CONFIG SET client-output-buffer-limit 'replica 256mb 64mb 120'
+
+    # --- part 2: Short outages must not cost a full sync ---
+    docker exec kl-rm redis-cli CONFIG SET repl-backlog-size 16mb
+    docker exec kl-rm redis-cli CONFIG REWRITE

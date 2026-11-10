@@ -82,6 +82,7 @@ control plane, `KUBECONFIG` is `/etc/kubernetes/admin.conf`; the lab user has it
 | `ds_start` | install `dspy`, which runs Python with pandas and scikit-learn in `/lab` |
 | `go_test <<'GO'` | run a hidden Go test file against the learner's `/lab/*.go` |
 | `pg_start`, `pg_sql 'SQL'` | PostgreSQL in container `kl-pg`, and run SQL from a script |
+| `pg_primary NAME NET [flags]`, `pg_standby NAME NET PRIMARY [APP] [SLOT]`, `pg_x NAME 'SQL'`, `c_veth NAME`, `pgb_image` | Replicating PostgreSQL containers on a network, SQL on a named one, a container's host veth for `tc`, the PgBouncer image kept across resets (docker host) |
 | `kr_up`, `kr_guard_calico`, `kr_conf <<EOF`, `kr_json 'show ...'`, `kr_ip`, `kr_nodes` | an FRR router outside the pod network, Pod `router` in `edge`, reachable from both k8s nodes; `kr_guard_calico` restores Calico's BGP settings on reset |
 | `kr_estab IP`, `kr_hops PREFIX`, `kr_wget URL`, `kr_x CMD...` | read a BGP session, the next hops of a route, fetch a URL from the router, run a command in it |
 

@@ -8,7 +8,7 @@ what to consolidate. The target doesn't lower the bar: a lab should carry a real
 scenario and teach a concept. The parts of this list that the existing exercises don't cover
 are not started.
 
-Exercise counts as of v0.12.0:
+Exercise counts as of v0.13.0:
 
 | Topic | Exercises | Target | Track | Module files |
 |---|---|---|---|---|
@@ -18,7 +18,7 @@ Exercise counts as of v0.12.0:
 | Linux & systems | 34 | 250 | `linux` | `exercises/linux/` |
 | Networking | 42 | 250 | `networking` | `exercises/networking/` |
 | Cloud & platform | 47 | 250 | `cloud` | `exercises/cloud/` |
-| Data | 27 | 250 | `data` | `exercises/data/` |
+| Data | 37 | 250 | `data` | `exercises/data/` |
 | Defensive security | 40 | 250 | `defensive` | `exercises/defensive/` |
 | Programming | 45 | 250 | `programming` | `exercises/programming/` |
 | Data science | 43 | 250 | `datascience` | `exercises/datascience/` |
@@ -258,7 +258,7 @@ Moto only emulates the API, so these limits apply:
 | Track | What you'd practise | Runs on |
 |---|---|---|
 | **Databases & SQL** | See below | Docker VM; easy to check |
-| **Messaging & caching** | Redis persistence and eviction, Redis replicas resyncing over bad links (netem), RabbitMQ queues and dead letters | Docker VM; Kafka would be heavier |
+| **Messaging & caching** | Redis persistence and eviction, RabbitMQ queues and dead letters. Replica resyncs, AOF repair and Sentinel split-brain are done in `data-053` to `data-055` | Docker VM; Kafka would be heavier |
 
 ### Databases & SQL modules
 
@@ -266,9 +266,9 @@ Moto only emulates the API, so these limits apply:
 |---|---|
 | **SQL** | Joins and window functions |
 | **Query performance** | Reading query plans, fixing slow queries with indexes, locks |
-| **Backup & restore** | Backup and point-in-time restore |
-| **Replication** | Postgres replication, lag and stalled synchronous commits over bad links (netem) |
-| **Migrations** | Failed migrations |
+| **Backup & restore** | Point-in-time restore is done in `data-046` |
+| **Replication** | Done in `data-047` to `data-049`: a lagging replica and its slot, failover, stalled synchronous commits |
+| **Migrations** | A failed migration is done in `data-052` |
 
 ## Security
 
@@ -349,7 +349,7 @@ starting point.
 | Area | Ideas |
 |---|---|
 | **Linux and performance** | Flame graphs with `perf`; cgroups v2 by hand, with no container runtime; `mdadm` RAID failure and rebuild on loop devices; systemd sandboxing scored with `systemd-analyze security` |
-| **Data** | Postgres point-in-time recovery after a bad `DELETE`; replication with a lagging replica, a broken slot and a failover; Redis Sentinel split-brain and the writes it loses |
+| **Data** | Done in `exercises/data/06-recovery-and-resilience.yaml` |
 | **Delivery and Kubernetes** | Broken Helm charts and a failed upgrade to roll back; GitOps drift (Argo CD may be tight on these nodes); killing a node under load while meeting an availability target |
 | **Security** | SSH certificates from a small CA in place of `authorized_keys`; WAF tuning that blocks an attack and not real users; writing a detection from a real attack's logs and proving it catches a variant |
 | **Networking** | BGP hijack, then stopping it with RPKI route validation |
@@ -373,7 +373,7 @@ Problems that are rare until they ruin your day. The first three are the suggest
 |---|---|
 | **Identity and time** | Clock skew breaking TLS, tokens and logs, fixed with `chrony`; a bad PAM change recovered without losing the last root session; local ACME with Pebble and a failed challenge; timezone and DST cron traps |
 | **Kubernetes corners** | A namespace stuck `Terminating` on a finalizer; `ndots:5` DNS storms |
-| **Data and storage** | Redis AOF corruption and what was lost; PgBouncer pool exhaustion with an idle database; NFS root squash and stale file handles; sparse files and `rsync` |
+| **Data and storage** | NFS root squash and stale file handles; sparse files and `rsync` |
 
 ### Packet capture labs
 
@@ -440,6 +440,40 @@ limit, and is OOM-killed at 500MiB, so give it 800MiB. The image is 684MB, so pr
 | **Service-to-service auth** | Client credentials and token validation | Keycloak |
 | **LDAP federation** | Connect a directory and fix a failing bind or group mapping | Keycloak, lldap |
 | **Kubernetes OIDC** | Log in to the API server and map groups to RBAC | Dex, because Keycloak is too heavy for the 3GiB and 2.5GiB nodes |
+
+### Microservices labs
+
+Only `docker-080` and `k8s-300` touch this today, as themed incidents. Use small services and Traefik
+or a lightweight proxy, since a service mesh is too heavy for these nodes.
+
+| Lab | What goes wrong |
+|---|---|
+| **Find the slow service** | Distributed tracing across several services |
+| **Cascading failure** | One slow dependency takes everything down, fixed with timeouts and circuit breakers |
+| **Retry storms** | Retries turn a blip into an outage |
+| **Partial failure** | Degrade gracefully when one service is gone |
+| **Saga gone wrong** | An order left half complete across services, then compensate |
+| **Message queues** | Poison messages, dead-letter queues and non-idempotent consumers |
+| **API gateway** | Routing, rate limits and authentication at the edge |
+
+### Critical-thinking labs
+
+Labs that force the reasoning, not just the right answer. A check sees the answer and not the
+thinking, so ask for the evidence behind it, randomise the cause, use several related cases, and
+optionally have an LLM grade written reasoning against a rubric, which is less reliable than a
+scripted check. Real stakes, pressure and escalation can't be modelled fully; on-call mode gets
+partway there.
+
+| Skill | How a lab forces it |
+|---|---|
+| **Symptom versus cause** | The obvious fix silences the alert, and the check proves the real fault remains |
+| **Doubting the report** | The ticket states a confident diagnosis the evidence contradicts |
+| **Correlation versus causation** | A deploy came just before the outage, but the logs show it started earlier |
+| **Ignoring red herrings** | Alarming errors in the logs that have been there for months and mean nothing |
+| **Knowing what you don't know** | The data can't settle it, and the right answer is "can't tell yet, I need X" |
+| **Testing a hypothesis** | State a prediction first, and it only counts if the evidence matches |
+| **Weighing the cost of checking** | Each diagnostic costs something, so running everything scores lower |
+| **Judging trade-offs** | Two valid fixes, and the constraints make only one acceptable |
 
 ## Left out for now
 

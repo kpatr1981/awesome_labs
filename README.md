@@ -32,12 +32,12 @@ have a short tutorial on the concepts and commands to read first.
 | **Linux** | disks, systemd, shell, cgroups, namespaces, LVM · Git beyond the basics *(growing)* | 34 |
 | **Networking** | routing, NAT, firewalls, DNS, TLS, proxies, WireGuard, netem · OSPF, BGP, VRRP and IPv6 routing on FRR *(growing)* | 42 |
 | **Cloud** | AWS CLI, CloudFormation and IAM permission debugging against a local emulator *(growing)* | 47 |
-| **Data** | SQL, PostgreSQL operations and Redis *(growing)* | 27 |
+| **Data** | SQL, PostgreSQL operations and Redis · point-in-time recovery, replication and failover, PgBouncer, Redis Sentinel and AOF repair *(growing)* | 37 |
 | **Defensive Security** | incident response and hardening · packet-capture forensics with tshark · AppArmor, seccomp, SSH certificates and WAF tuning *(growing)* | 40 |
 | **Programming** | Python and Go *(growing)* | 45 |
 | **Data Science** | pandas, statistics and machine learning *(growing)* | 43 |
 
-That's 706 exercises so far, with a target of 250 per track; ideas for what comes next are
+That's 716 exercises so far, with a target of 250 per track; ideas for what comes next are
 in [docs/PENDING.md](docs/PENDING.md).
 
 Difficulty rises through each module (1 = beginner … 5 = expert), mixing **build** tasks

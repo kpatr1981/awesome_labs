@@ -347,6 +347,50 @@ go_test() {
   return "$rc"
 }
 
+# ---------- PostgreSQL replication and PgBouncer helpers ----------
+PGB_IMAGE=edoburu/pgbouncer:v1.24.1-p1
+# pgb_image -> make sure the PgBouncer image exists and survives resets, also on VMs built
+# before the image joined images.txt
+pgb_image() {
+  docker image inspect "$PGB_IMAGE" >/dev/null 2>&1 || docker pull -q "$PGB_IMAGE" >/dev/null || return 1
+  local p=$KL_STATE/pristine
+  grep -qxF "$PGB_IMAGE" "$p/image-refs.txt" && return 0
+  docker image inspect -f '{{.Id}}' "$PGB_IMAGE" >>"$p/images.txt"
+  echo "$PGB_IMAGE" >>"$p/image-refs.txt"
+  LC_ALL=C sort -u -o "$p/images.txt" "$p/images.txt"
+  LC_ALL=C sort -u -o "$p/image-refs.txt" "$p/image-refs.txt"
+}
+# pg_x NAME 'SQL' -> run SQL in the PostgreSQL container NAME and print bare rows
+pg_x() { docker exec -i "$1" psql -h 127.0.0.1 -U lab -d lab -v ON_ERROR_STOP=1 -qAt -c "$2"; }
+# pg_primary NAME NETWORK [postgres flags...] -> a primary on NETWORK that allows replication,
+# with its data in the volume NAME-data
+pg_primary() {
+  local n=$1 net=$2; shift 2
+  docker network create "$net" >/dev/null 2>&1 || true
+  docker run -d --name "$n" --network "$net" -e POSTGRES_USER=lab -e POSTGRES_PASSWORD=lab -e POSTGRES_DB=lab \
+    -v "$n-data:/var/lib/postgresql/data" postgres:16-alpine -c wal_level=replica "$@" >/dev/null
+  eventually 60 "pg_x '$n' 'select 1'" || return 1
+  docker exec "$n" sh -c "echo 'host replication lab all scram-sha-256' >> /var/lib/postgresql/data/pg_hba.conf"
+  pg_x "$n" 'SELECT pg_reload_conf()' >/dev/null
+}
+# pg_standby NAME NETWORK PRIMARY [APP_NAME] [SLOT] -> a streaming standby of PRIMARY
+pg_standby() {
+  local n=$1 net=$2 pri=$3 app=${4:-} slot=${5:-} d=/var/lib/postgresql/data
+  docker run --rm --network "$net" -e PGPASSWORD=lab -v "$n-data:$d" postgres:16-alpine \
+    su-exec postgres pg_basebackup -h "$pri" -U lab -D "$d" -R -X stream -c fast ${slot:+-C -S "$slot"} || return 1
+  if [ -n "$app" ]; then
+    docker run --rm -v "$n-data:$d" postgres:16-alpine \
+      sed -i "s/^primary_conninfo = '/primary_conninfo = 'application_name=$app /" "$d/postgresql.auto.conf"
+  fi
+  docker run -d --name "$n" --network "$net" -v "$n-data:$d" postgres:16-alpine >/dev/null
+  eventually 60 "[ \"\$(pg_x '$n' 'SELECT pg_is_in_recovery()')\" = t ]"
+}
+# c_veth NAME -> the host-side veth of a container's eth0, for tc netem on that link
+c_veth() {
+  local i; i=$(docker exec "$1" cat /sys/class/net/eth0/iflink) || return 1
+  grep -lx "$i" /sys/class/net/*/ifindex | cut -d/ -f5
+}
+
 # ---------- PostgreSQL helper ----------
 # pg_start -> run PostgreSQL as container kl-pg (database and user "lab")
 pg_start() {
