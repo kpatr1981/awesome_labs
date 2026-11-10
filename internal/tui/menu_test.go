@@ -551,15 +551,17 @@ func TestLabActionsNeedTheActiveExercise(t *testing.T) {
 	}
 }
 
-func TestFinishExamKeyOnlyOnTheExamScreen(t *testing.T) {
+// The VMs and Exam screens are reached by key, not from the menu bar.
+func TestNoVMsOrExamMenu(t *testing.T) {
 	m := newTestModel(t)
 	m.runningExam("d-1")
-	if it, _ := m.item("Exam", "Finish the exam…"); it.key != "" {
-		t.Errorf("Finish shows key %q on the list, where F does nothing", it.key)
-	}
-	m.screen = scrExam
-	if it, _ := m.item("Exam", "Finish the exam…"); it.key != "F" {
-		t.Errorf("Finish shows key %q on the exam screen, want F", it.key)
+	for _, s := range []screen{scrBrowse, scrEnv, scrExam, scrExamSetup, scrStarted} {
+		m.screen = s
+		for _, mn := range m.menus() {
+			if mn.title == "VMs" || mn.title == "Exam" {
+				t.Errorf("screen %d has a %s menu", s, mn.title)
+			}
+		}
 	}
 }
 

@@ -52,8 +52,12 @@ func (m *Manager) ClearActive(id string) {
 }
 
 // EndExercise abandons ex when it is the active exercise: it is forgotten and
-// its environment's VMs are deleted, so the next exercise on it starts from
-// fresh VMs. An environment that a verify run is using is left alone.
+// its environment is reset to pristine in place, so the VMs stay up, clean and
+// ready for the next exercise, whose start then skips the reset. An
+// environment that the exercise broke beyond a reset (a destructive one) is
+// deleted instead, and one that isn't fully running is left for the next
+// start to boot and reset. An environment that a verify run is using is left
+// alone.
 func (m *Manager) EndExercise(ctx context.Context, ex *exercise.Exercise, log io.Writer) error {
 	m.ClearActive(ex.ID)
 	env := EnvFor(ex.Profile)
@@ -61,7 +65,29 @@ func (m *Manager) EndExercise(ctx context.Context, ex *exercise.Exercise, log io
 		fmt.Fprintf(log, "==> leaving %s running: a awesome_labs verify run is using it\n", env.Title)
 		return nil
 	}
-	return m.Destroy(ctx, env, log)
+	if m.Tainted(env) {
+		fmt.Fprintf(log, "==> %s was changed beyond a reset — deleting its VMs\n", env.Title)
+		return m.Destroy(ctx, env, log)
+	}
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	all, err := lima.List(ctx)
+	if err != nil {
+		return err
+	}
+	for _, vm := range env.VMs {
+		if all[vm.Name].Status != "Running" {
+			m.setClean(env, false)
+			return nil
+		}
+	}
+	if err := m.reset(ctx, env, log); err != nil {
+		m.setClean(env, false)
+		return err
+	}
+	m.setClean(env, true)
+	fmt.Fprintf(log, "==> %s is clean and ready for the next exercise\n", env.Title)
+	return nil
 }
 
 // clearActiveIn forgets the active exercise when it lives in env, whose lab
@@ -145,6 +171,9 @@ func (m *Manager) StopVM(ctx context.Context, name string, log io.Writer) error 
 	if env, ok := envOf(name); ok && m.busy(env) {
 		return fmt.Errorf("%s is in use by a running awesome_labs verify", name)
 	}
+	if env, ok := envOf(name); ok {
+		m.setClean(env, false)
+	}
 	fmt.Fprintf(log, "==> stopping %s\n", name)
 	return lima.Stop(ctx, name, log)
 }
@@ -166,6 +195,7 @@ func (m *Manager) DeleteVM(ctx context.Context, name string, log io.Writer) erro
 		return err
 	}
 	if ok {
+		m.setClean(env, false)
 		m.clearActiveIn(env)
 	}
 	return nil

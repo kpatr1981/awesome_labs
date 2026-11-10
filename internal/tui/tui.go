@@ -108,7 +108,7 @@ type model struct {
 	vmInfo    map[string]lab.VMInfo
 	envCursor int
 	envBack   screen // where the environments screen returns to
-	// endLab ends the active exercise and deletes its VMs; tests replace it
+	// endLab ends the active exercise and cleans its VMs; tests replace it
 	endLab func(ctx context.Context, ex *exercise.Exercise, w io.Writer) error
 	// deleteVMs deletes every lab VM, on start and on exit; tests replace it
 	deleteVMs func(ctx context.Context, w io.Writer) error
@@ -432,17 +432,10 @@ func (m *model) cmdStart() tea.Cmd {
 
 func (m *model) cmdCheck() tea.Cmd {
 	ex := m.cur
-	inExam := m.exam != nil
 	return m.startOp("check", "Checking "+ex.ID, ex.ID, func(ctx context.Context, w io.Writer) (bool, error) {
 		fmt.Fprintf(w, "Checking %s — %s\n\n", ex.ID, ex.Title)
-		passed, err := m.mgr.Check(ctx, ex, w)
-		// an exam moves on to its next task on the same VM, so only stop outside one
-		if err == nil && passed && !inExam {
-			if serr := m.mgr.StopAfterPass(ctx, ex, w); serr != nil {
-				fmt.Fprintf(w, "(could not stop the lab VM: %v)\n", serr)
-			}
-		}
-		return passed, err
+		// the VMs stay up after a pass: leaving the exercise cleans them for the next one
+		return m.mgr.Check(ctx, ex, w)
 	})
 }
 
@@ -860,7 +853,8 @@ func (m *model) goTo(s screen) {
 
 // leave runs then, which moves off the exercise screen. Every way off it goes
 // through here. Leaving the exercise set up on the VMs always ends it: it is
-// cleared and its VMs are deleted. Inside an exam the VMs carry on to the next
+// cleared and its environment is reset in place, so the VMs are clean and
+// ready for the next exercise. Inside an exam the VMs carry on to the next
 // question, so they are left alone.
 func (m *model) leave(then func() tea.Cmd) tea.Cmd {
 	ex := m.cur
@@ -872,9 +866,9 @@ func (m *model) leave(then func() tea.Cmd) tea.Cmd {
 		m.flash = "lab left running — busy: " + m.op
 		return c
 	}
-	// start the delete first: then may open another exercise, whose Output tab
-	// the delete must not take over
-	end := m.startOp("stop", "Ending "+ex.ID+" and deleting its VMs", ex.ID, func(ctx context.Context, w io.Writer) (bool, error) {
+	// start the cleanup first: then may open another exercise, whose Output tab
+	// the cleanup must not take over
+	end := m.startOp("stop", "Ending "+ex.ID+" and cleaning its VMs", ex.ID, func(ctx context.Context, w io.Writer) (bool, error) {
 		return false, m.endLab(ctx, ex, w)
 	})
 	return tea.Batch(end, then())

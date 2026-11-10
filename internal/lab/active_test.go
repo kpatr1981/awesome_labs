@@ -51,3 +51,27 @@ func TestStopDeleteRefuseNonLabVMs(t *testing.T) {
 		t.Fatal("StopVM accepted a non-lab instance")
 	}
 }
+
+// An environment cleaned when its exercise ended lets exactly the next start
+// skip the reset; a shell into it, or another environment, doesn't count.
+func TestCleanMark(t *testing.T) {
+	m := &Manager{StateDir: t.TempDir()}
+	if m.takeClean(DockerEnv) {
+		t.Fatal("fresh state is marked clean")
+	}
+	m.setClean(DockerEnv, true)
+	if m.takeClean(K8sEnv) {
+		t.Fatal("cleaning the docker env marked k8s clean")
+	}
+	if !m.takeClean(DockerEnv) {
+		t.Fatal("cleaned env not marked clean")
+	}
+	if m.takeClean(DockerEnv) {
+		t.Fatal("the clean mark served two starts")
+	}
+	m.setClean(DockerEnv, true)
+	_ = m.ShellCommand(DockerEnv, false)
+	if m.takeClean(DockerEnv) {
+		t.Fatal("still clean after a shell was opened")
+	}
+}

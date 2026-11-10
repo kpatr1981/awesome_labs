@@ -108,7 +108,7 @@ type Manager struct {
 	StateDir string
 	User     string
 	Verbose  bool // copy bootstrap output to the operation log
-	// AutoStop stops the other environment before an exercise starts.
+	// AutoStop stops an environment once its exercise passes (StopAfterPass).
 	AutoStop bool
 	// HoldEnvs marks every environment this process starts as busy, so that
 	// another awesome_labs's auto-stop leaves it alone (used by verify).
@@ -233,6 +233,7 @@ func (m *Manager) ensure(ctx context.Context, env Env, log io.Writer) error {
 		if st == "Running" {
 			continue
 		}
+		m.setClean(env, false) // a boot or a fresh VM goes through reset again
 		wg.Add(1)
 		go func(i int, vm VM, st string) {
 			defer wg.Done()
@@ -522,7 +523,11 @@ func (m *Manager) Reset(ctx context.Context, env Env, log io.Writer) error {
 		return err
 	}
 	m.clearActiveIn(env)
-	return m.reset(ctx, env, log)
+	if err := m.reset(ctx, env, log); err != nil {
+		return err
+	}
+	m.setClean(env, true)
+	return nil
 }
 
 func (m *Manager) reset(ctx context.Context, env Env, log io.Writer) error {
@@ -562,6 +567,7 @@ func (m *Manager) Stop(ctx context.Context, env Env, log io.Writer) error {
 	if err != nil {
 		return err
 	}
+	m.setClean(env, false)
 	for _, vm := range env.VMs {
 		if all[vm.Name].Status == "Running" {
 			fmt.Fprintf(log, "==> stopping %s\n", vm.Name)
@@ -588,49 +594,29 @@ func (m *Manager) StopAfterPass(ctx context.Context, ex *exercise.Exercise, log 
 	return m.Stop(ctx, env, log)
 }
 
-// stopOthers stops every running VM that belongs to another environment.
-func (m *Manager) stopOthers(ctx context.Context, keep Env, log io.Writer) {
-	all, err := lima.List(ctx)
-	if err != nil {
-		return
-	}
-	for _, env := range AllEnvs() {
-		if env.Profile == keep.Profile {
-			continue
-		}
-		if m.busy(env) {
-			fmt.Fprintf(log, "==> leaving %s running: a awesome_labs verify run is using it\n", env.Title)
-			continue
-		}
-		for _, vm := range env.VMs {
-			if all[vm.Name].Status == "Running" {
-				fmt.Fprintf(log, "==> stopping %s (%s) to free memory — auto_stop in %s\n", vm.Name, env.Title, filepath.Join(m.StateDir, "config.yaml"))
-				_ = lima.Stop(ctx, vm.Name, m.detail(log))
-			}
-		}
-	}
-}
-
-// deleteStopped deletes the VMs of every environment that has a stopped one,
-// so no stopped VM is left behind and the exercise's own environment is
-// rebuilt from fresh VMs instead of booting a stopped one. A whole environment
-// goes at once: a Kubernetes control plane can't be re-created beside an old
-// worker. Stray kl-* instances that are stopped go too. An environment that a
-// verify run is using is left alone. The caller holds m.mu.
-func (m *Manager) deleteStopped(ctx context.Context, log io.Writer) error {
+// deleteOthers deletes the VMs of every environment other than keep, running
+// or stopped, and any stray kl-* instance: the exercise about to start doesn't
+// need them, and only its own environment is kept ready between exercises.
+// An environment that a verify run is using is left alone. The caller holds
+// m.mu.
+func (m *Manager) deleteOthers(ctx context.Context, keep Env, log io.Writer) error {
 	all, err := lima.List(ctx)
 	if err != nil {
 		return err
 	}
-	stopped := func(name string) bool { s := all[name].Status; return s != "" && s != "Running" }
 	known := map[string]bool{}
 	for _, env := range AllEnvs() {
-		hasStopped := false
 		for _, vm := range env.VMs {
 			known[vm.Name] = true
-			hasStopped = hasStopped || stopped(vm.Name)
 		}
-		if !hasStopped {
+		if env.Profile == keep.Profile {
+			continue
+		}
+		created := false
+		for _, vm := range env.VMs {
+			created = created || all[vm.Name].Status != ""
+		}
+		if !created {
 			continue
 		}
 		if m.busy(env) {
@@ -641,17 +627,18 @@ func (m *Manager) deleteStopped(ctx context.Context, log io.Writer) error {
 			if all[vm.Name].Status == "" {
 				continue
 			}
-			fmt.Fprintf(log, "==> deleting %s (%s has a stopped VM)\n", vm.Name, env.Title)
+			fmt.Fprintf(log, "==> deleting %s (%s isn't needed by this exercise)\n", vm.Name, env.Title)
 			if err := lima.Delete(ctx, vm.Name, log); err != nil {
 				return err
 			}
 		}
 		m.SetTainted(env, false)
+		m.setClean(env, false)
 		m.clearActiveIn(env)
 	}
 	for name := range all {
-		if !known[name] && strings.HasPrefix(name, "kl-") && stopped(name) {
-			fmt.Fprintf(log, "==> deleting stopped %s\n", name)
+		if !known[name] && strings.HasPrefix(name, "kl-") {
+			fmt.Fprintf(log, "==> deleting stray %s\n", name)
 			if err := lima.Delete(ctx, name, log); err != nil {
 				return err
 			}
@@ -738,6 +725,7 @@ func (m *Manager) Destroy(ctx context.Context, env Env, log io.Writer) error {
 		}
 	}
 	m.SetTainted(env, false)
+	m.setClean(env, false)
 	m.clearActiveIn(env)
 	return nil
 }
@@ -768,10 +756,7 @@ func (m *Manager) Start(ctx context.Context, ex *exercise.Exercise, log io.Write
 	if m.HoldEnvs {
 		m.hold(env)
 	}
-	if m.AutoStop {
-		m.stopOthers(ctx, env, log)
-	}
-	if err := m.deleteStopped(ctx, log); err != nil {
+	if err := m.deleteOthers(ctx, env, log); err != nil {
 		return err
 	}
 	if !m.HoldEnvs {
@@ -786,7 +771,9 @@ func (m *Manager) Start(ctx context.Context, ex *exercise.Exercise, log io.Write
 	if err := m.ensure(ctx, env, log); err != nil {
 		return err
 	}
-	if err := m.reset(ctx, env, log); err != nil {
+	if m.takeClean(env) {
+		fmt.Fprintf(log, "==> %s was cleaned when the last exercise ended\n", env.Title)
+	} else if err := m.reset(ctx, env, log); err != nil {
 		return err
 	}
 	fmt.Fprintf(log, "==> setting up %s: %s\n", ex.ID, ex.Title)
@@ -864,6 +851,7 @@ func (m *Manager) Solve(ctx context.Context, ex *exercise.Exercise, log io.Write
 	if strings.TrimSpace(ex.Solve) == "" {
 		return fmt.Errorf("%s has no solve script", ex.ID)
 	}
+	m.setClean(env, false)
 	code, err := lima.Run(ctx, env.Primary().Name, lima.Script{Workdir: "/lab", Body: m.exScript(ex.Solve, false)}, log)
 	if err != nil {
 		return err
@@ -894,6 +882,7 @@ func (m *Manager) ShellCommand(env Env, worker bool) *exec.Cmd {
 			vm = w
 		}
 	}
+	m.setClean(env, false) // a shell can change anything
 	return lima.ShellCommand(vm.Name, "/lab")
 }
 
@@ -916,6 +905,28 @@ func (m *Manager) SetTainted(env Env, v bool) {
 	} else {
 		_ = os.Remove(m.taintFile(env))
 	}
+}
+
+// ---- clean environments (reset since the last exercise) ----
+
+func (m *Manager) cleanFile(env Env) string {
+	return filepath.Join(m.StateDir, "clean-"+string(env.Profile))
+}
+
+// setClean marks env as reset to pristine since anything last used it, or
+// clears the mark. Anything that can change the VMs clears it.
+func (m *Manager) setClean(env Env, v bool) {
+	if v {
+		_ = os.WriteFile(m.cleanFile(env), []byte(time.Now().Format(time.RFC3339)), 0o644)
+	} else {
+		_ = os.Remove(m.cleanFile(env))
+	}
+}
+
+// takeClean reports whether env is marked clean and clears the mark: the
+// exercise about to be set up uses it up.
+func (m *Manager) takeClean(env Env) bool {
+	return os.Remove(m.cleanFile(env)) == nil
 }
 
 // ---- helpers ----

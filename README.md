@@ -118,8 +118,9 @@ builds one for Linux and macOS on x86-64 and ARM into `dist/`, with checksums.
 ### Menus and the mouse
 
 Away from the exercise screen, everything is also reachable from the **menu bar** at the top: click a menu, press
-`F10`, or `alt` + the underlined letter (`alt+f` File, `alt+v` View,
-`alt+t` Tracks, `alt+m` VMs, `alt+x` Exam, `alt+h` Help). Menu items show their
+`F10`, or `alt` + the underlined letter (`alt+p` Program, `alt+v` View,
+`alt+t` Tracks, `alt+h` Help). The environments & VMs screen opens with `e` and the exam
+with `X` on the exercise list. Menu items show their
 keyboard shortcut only on the screens where pressing that key does the same thing, so a
 shown key works with the menu open or closed. `a` (active exercise), `S` (started labs),
 `e` (environments & VMs) and `Q` (quit) work on every screen.
@@ -179,11 +180,12 @@ shortcut. While the mouse is in use, most terminals select text with `shift`+dra
 | `esc` / `q` | back to where you opened it from |
 
 Leaving the exercise that is set up on the VMs, by any route except the environments
-screen, always ends it and **deletes its VMs**, so the next exercise on that
-environment builds fresh ones. Starting an exercise also deletes any environment
-that has a stopped VM (from `x` on the environments screen, or `auto_stop`) instead
-of booting it again. During an exam the VMs
-keep running, since they carry on to the next question. The environments screen goes
+screen, always ends it and **cleans its VMs**: the environment is reset to pristine in
+place and stays running, so the next exercise on it starts without building or booting
+anything (and skips its own reset). An exercise that breaks its environment beyond a
+reset has its VMs deleted instead. Starting an exercise **deletes the VMs of every
+other environment**, running or stopped, since that exercise doesn't need them. During
+an exam the VMs keep running, since they carry on to the next question. The environments screen goes
 back to the exercise you came from.
 
 Inside the VMs the scenario is also in **`/lab/TASK.md`**; `/lab` is your working
@@ -221,9 +223,11 @@ awesome_labs exam history    # past results
 
 ### Saving memory
 
-Only one environment needs to run at a time. With `auto_stop: true` (the default),
-starting a Docker exercise stops the Kubernetes VMs and vice versa, and solving an exercise
-stops its VMs (except during an exam); the next exercise start deletes stopped VMs, leaving an exercise deletes its VMs, and exiting always deletes every lab VM, running or stopped, and starting deletes any left over. Settings live in `~/.awesome_labs/config.yaml`:
+Only one environment runs at a time: starting a Docker exercise deletes the Kubernetes
+VMs and vice versa, while the environment you're using stays up and is cleaned between
+exercises. Exiting always deletes every lab VM, running or stopped, and starting the app
+deletes any left over. With `auto_stop: true` (the default), solving an exercise with
+`awesome_labs check` stops its VMs. Settings live in `~/.awesome_labs/config.yaml`:
 
 ```yaml
 auto_stop: true

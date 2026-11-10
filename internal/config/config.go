@@ -17,9 +17,9 @@ type VMSize struct {
 
 // Config is the user configuration.
 type Config struct {
-	// AutoStop stops the other lab environment when you start an exercise, so
-	// only one runs at a time (saves ~3-6 GiB of RAM), and stops an exercise's
-	// environment once you solve it. Default true.
+	// AutoStop stops an exercise's environment once you solve it from the
+	// command line (awesome_labs check). Default true. The app always keeps
+	// only the environment of the exercise you start, deleting the others.
 	AutoStop *bool `yaml:"auto_stop"`
 
 	Docker       VMSize `yaml:"docker"`
@@ -33,9 +33,9 @@ func (c Config) AutoStopEnabled() bool { return c.AutoStop == nil || *c.AutoStop
 
 const template = `# awesome_labs configuration
 #
-# Stop the other lab environment when you start an exercise, so that only one
-# of them (Docker host or Kubernetes cluster) uses memory at a time, and stop
-# an exercise's environment once you solve it.
+# Stop an exercise's environment once you solve it with "awesome_labs check".
+# The app always keeps only the environment of the exercise you start: the
+# others are deleted, and exiting or starting the app deletes every lab VM.
 auto_stop: true
 
 # VM sizes. Changes apply when a VM is created: run

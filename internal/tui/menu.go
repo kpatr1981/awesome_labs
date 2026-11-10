@@ -118,14 +118,6 @@ func (m *model) openEnv() tea.Cmd {
 	return m.cmdEnvStatus()
 }
 
-// onEnv presses k on the environments screen.
-func (m *model) onEnv(k string) func() tea.Cmd {
-	return func() tea.Cmd {
-		c := m.openEnv()
-		return tea.Batch(m.press(k), c)
-	}
-}
-
 // menus builds the menu bar for the current screen. Items that only make
 // sense on another screen are hidden rather than greyed out, and a menu left
 // with nothing to offer is dropped from the bar. Greyed-out items say why
@@ -137,17 +129,10 @@ func (m *model) menus() []menu {
 	if m.screen == scrDetail {
 		return nil
 	}
-	onBrowse, onEnv := m.screen == scrBrowse, m.screen == scrEnv
-	onExam, onResult := m.screen == scrExam, m.screen == scrExamResult
+	onBrowse := m.screen == scrBrowse
 
-	// a key is shown next to an item only where pressing it does the same thing
-	on := func(cond bool, k string) string {
-		if cond {
-			return k
-		}
-		return ""
-	}
 	press := func(k string) func() tea.Cmd { return func() tea.Cmd { return m.press(k) } }
+	// a key is shown next to an item only where pressing it does the same thing
 	quitKey := "Q" // q is taken off the exercise list
 	if onBrowse {
 		quitKey = "q"
@@ -206,31 +191,6 @@ func (m *model) menus() []menu {
 		}
 	}
 
-	envs := menu{"VMs", 'm', []menuItem{
-		{label: "Lab environments & VMs", key: "e", hidden: onEnv, run: m.openEnv},
-		{label: "Refresh status", key: "r", hidden: !onEnv, run: press("r")},
-		head("Selected environment", ""),
-		{label: "Start / create", key: "u", hidden: !onEnv, run: press("u")},
-		{label: "Stop", key: "x", hidden: !onEnv, run: press("x")},
-		{label: "Reset VMs", key: "R", hidden: !onEnv, run: press("R")},
-		{label: "Rebuild…", key: "B", hidden: !onEnv, run: press("B")},
-		{label: "Delete…", key: "D", hidden: !onEnv, run: press("D")},
-		head("All environments", ""),
-		{label: "Stop all lab VMs", key: on(onEnv, "X"), run: m.onEnv("X")},
-		{label: "Delete all lab VMs…", key: on(onEnv, "K"), run: m.onEnv("K")},
-	}}
-
-	examKey := on(onBrowse, "X") // X opens the exam from the list
-	exams := menu{"Exam", 'x', []menuItem{
-		{label: "New exam…", key: examKey, hidden: m.exam != nil || m.screen == scrExamSetup, run: m.leaveTo(scrExamSetup)},
-		{label: "Return to the exam", key: examKey, hidden: m.exam == nil || onExam, run: m.leaveTo(scrExam)},
-		{label: "Finish the exam…", key: on(onExam, "F"), hidden: m.exam == nil, run: func() tea.Cmd {
-			return m.leave(func() tea.Cmd { m.screen = scrExam; return m.press("F") })
-		}},
-		sep(),
-		{label: "Last result", hidden: onResult || m.finished == nil, run: m.leaveTo(scrExamResult)},
-	}}
-
 	help := menu{"Help", 'h', []menuItem{
 		{label: "Keyboard shortcuts", key: "F1", run: func() tea.Cmd { m.modal = shortcutsText; return nil }},
 		{label: "Using the mouse", run: func() tea.Cmd { m.modal = mouseText; return nil }},
@@ -239,7 +199,7 @@ func (m *model) menus() []menu {
 	}}
 
 	var out []menu
-	for _, mn := range []menu{program, view, tracks, envs, exams, help} {
+	for _, mn := range []menu{program, view, tracks, help} {
 		if mn.items = visibleItems(mn.items); len(mn.items) > 0 {
 			out = append(out, mn)
 		}
@@ -977,7 +937,7 @@ func formatLeft(d time.Duration) string {
 
 const shortcutsText = `Keyboard shortcuts
 
-Everywhere      F10 menu bar (not on the exercise screen) · alt+f/v/t/m/x/h open a menu · F1 this help
+Everywhere      F10 menu bar (not on the exercise screen) · alt+p/v/t/h open a menu · F1 this help
                 a active exercise · S started labs · e environments & VMs
                 Q (q on the list) exit and delete all lab VMs · ctrl+c the same; while busy or deleting, exit at once
 
@@ -989,7 +949,7 @@ Exercise list   ↑↓ move · enter open · / filter · esc clear filter
 Exercise        s start the lab · t terminal · w node01 terminal (Kubernetes)
                 c check · h next hint · v solution · R reset progress
                 ←→, tab or 1–5 switch tabs · n/N next/previous in the list it came from
-                esc/q back — leaving the lab that is set up stops its VMs
+                esc/q back — leaving the lab that is set up cleans its VMs for the next one
 
 Started labs    ↑↓ move · enter open · r reset selected · A reset all · esc back
 Learning paths  ↑↓ move · enter apply · esc back
