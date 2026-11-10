@@ -1,0 +1,1602 @@
+track: linux
+module: Container internals
+profile: docker
+order: 7
+exercises:
+
+- id: linux-050
+  title: A container from a root filesystem and nothing else
+  difficulty: 4
+  kind: build
+  tags: [namespaces, unshare, pivot_root, containers, proc]
+  tutorial: |
+    **Concept.** A container runtime does three things before it runs your program: it gives the process **new namespaces**, so it has its own process tree, hostname, mounts and network; it **swaps the root filesystem** for the image's; and it **mounts the pseudo-filesystems** the program expects, such as `/proc`.
+
+    `unshare` creates the namespaces. Two of them need care:
+
+    - **PID namespace.** The process that calls `unshare --pid` stays in the old namespace; only its *children* land in the new one, and the first child becomes PID 1 there. That is what `--fork` is for. `/proc` still shows the host's processes until a new `proc` is mounted inside the new mount namespace.
+    - **Mount namespace.** It starts as a copy of the host's mount table. If the mounts are *shared* with the host, which is the default on systemd hosts, a mount made inside also appears outside. `--propagation private` stops that.
+
+    `chroot` only changes how paths are resolved, and the old root is still mounted and reachable. **`pivot_root NEW PUT_OLD`** really swaps the root mount of the mount namespace: the new root must be a mount point, so a runtime bind-mounts the image directory onto itself first, then pivots, then **unmounts the old root** so nothing of the host is left in the container's mount table.
+
+    **Read up on:**
+    - `man unshare`: `--pid --fork`, `--mount`, `--uts`, `--ipc`, `--net`, `--propagation`
+    - `man 2 pivot_root` and `man 8 pivot_root`, and why the new root must be a mount point
+    - `umount -l` (lazy unmount) for the old root after the pivot
+    - `/proc/self/mountinfo`: one line per mount, the fifth field is the mount point
+    - `man 7 pid_namespaces`: PID 1 and what `/proc` shows
+  scenario: |
+    **`/srv/kl-root`** holds an unpacked Alpine root filesystem. There is no container runtime
+    in this lab: write the part of one that matters, as the script **`/lab/box.sh`**.
+
+    ```bash
+    sudo /lab/box.sh NAME COMMAND [ARGS...]
+    ```
+
+    must run `COMMAND` as a container on `/srv/kl-root` with hostname `NAME`, wait for it,
+    and exit with its exit code. Use `unshare`, `mount` and `pivot_root`, not `docker`,
+    `runc` or `chroot`.
+
+    ## Part 1: Its own process tree, hostname and network
+
+    The command must run as **PID 1** of a new PID namespace, with its own hostname `NAME`,
+    its own IPC namespace, and a new network namespace in which only the loopback interface
+    exists, and is **up**.
+
+    ## Part 2: Its own root, with the host gone
+
+    Inside, `/` must be `/srv/kl-root` (so `/etc/alpine-release` exists). The host's
+    filesystem must not be reachable at all: no mount of the old root may be left in the
+    container's mount table. `/proc` must be mounted and show only the container's own
+    processes.
+
+    ## Part 3: Leave the host as it was
+
+    Nothing the script mounts may appear in the host's mount table, during or after the
+    run.
+  hints:
+    - "`unshare --pid --fork --mount --uts --ipc --net --propagation private` gets you the namespaces. Everything after that has to run *inside*, so hand `unshare` a small `sh -c '...'` script and pass `NAME` and the command to it as arguments."
+    - "`pivot_root` refuses a directory that isn't a mount point: `mount --bind /srv/kl-root /srv/kl-root` first, inside the new mount namespace."
+    - "After `cd /srv/kl-root && mkdir -p .old && pivot_root . .old`, the host's root is at `/.old`. `mount -t proc proc /proc`, then `umount -l /.old`."
+    - "Once you've pivoted, the host's binaries are gone. Set the hostname *before* the pivot, or use the image's busybox `hostname` after it. `ip link set lo up` works with busybox too."
+    - "End the inner script with `exec \"$@\"` so the command replaces the shell and really is PID 1."
+  solution: |
+    ```bash
+    cat > /lab/box.sh <<'EOF'
+    #!/bin/bash
+    set -e
+    name=$1; shift
+    exec unshare --pid --fork --mount --uts --ipc --net --propagation private \
+      sh -ec '
+        hostname "$0"
+        mount --bind /srv/kl-root /srv/kl-root
+        cd /srv/kl-root
+        mkdir -p .old
+        pivot_root . .old
+        mount -t proc proc /proc
+        umount -l /.old
+        rmdir /.old
+        ip link set lo up
+        exec "$@"
+      ' "$name" "$@"
+    EOF
+    chmod +x /lab/box.sh
+    sudo /lab/box.sh demo sh -c 'echo pid $$ on $(hostname); ps; cat /proc/self/mountinfo'
+    ```
+
+    `unshare --fork` makes the shell the first process of the new PID namespace, and
+    `exec "$@"` makes the command take its place as PID 1. The bind mount turns the
+    directory into a mount point so `pivot_root` accepts it, and the lazy unmount drops the
+    last reference to the host's filesystem. `--propagation private` is why none of this
+    reaches the host's mount table.
+  setup: |
+    on_reset 'rm -rf /srv/kl-root'
+    docker rm -f kl-rootsrc >/dev/null 2>&1
+    docker create --name kl-rootsrc alpine:3.22 >/dev/null
+    mkdir -p /srv/kl-root
+    docker export kl-rootsrc | tar -x -C /srv/kl-root
+    docker rm -f kl-rootsrc >/dev/null
+    echo "this file is on the host" > /srv/kl-host-only
+    on_reset 'rm -f /srv/kl-host-only'
+    lab_file /lab/box.sh 0755 <<'EOF'
+    #!/bin/bash
+    # sudo /lab/box.sh NAME COMMAND [ARGS...]
+    echo "not written yet" >&2
+    exit 1
+    EOF
+  check: |
+    box() { timeout 20 /lab/box.sh "$@" </dev/null 2>/dev/null; }
+    before=$(findmnt -rno TARGET | sort | md5sum)
+
+    info "Part 1: Its own process tree, hostname and network"
+    check_eq "the command is PID 1" "$(box kl-t1 sh -c 'echo $$')" 1
+    check_eq "the hostname is NAME" "$(box kl-t2 hostname)" kl-t2
+    check_eq "the host's hostname is unchanged" "$(hostname)" "$(cat /etc/hostname)"
+    host_ipc=$(readlink /proc/self/ns/ipc)
+    check "the IPC namespace is a new one" "[ \"\$(box x readlink /proc/self/ns/ipc)\" != '$host_ipc' ] && box x readlink /proc/self/ns/ipc | grep -q ipc"
+    check_eq "only the loopback interface exists" "$(box x ip -o link | awk -F': ' '{print $2}' | tr '\n' ' ')" "lo "
+    check "loopback is up" "box x ip -o link show lo | grep -q ',UP'"
+    box x sh -c 'exit 7'
+    check_eq "the script exits with the command's exit code" "$?" 7
+
+    info "Part 2: Its own root, with the host gone"
+    check "/ is the Alpine root filesystem" "box x cat /etc/alpine-release | grep -q '^3\.22'"
+    check_not "a host-only file is not visible" "box x cat /srv/kl-host-only | grep -q host"
+    # the old root is a mount of the host's root device at its root ("/"), wherever it sits
+    dev=$(findmnt -no MAJ:MIN /)
+    mi=$(box x cat /proc/self/mountinfo)
+    check "the container has its own mount table" "[ -n \"\$(box x cat /proc/self/mountinfo)\" ]"
+    check_eq "no mount of the old root is left" "$(awk -v d="$dev" '$3==d && $4=="/"' <<<"$mi" | wc -l)" 0
+    check "/proc is mounted" "box x sh -c 'grep -q \" /proc proc \" /proc/mounts'"
+    n=$(box x sh -c 'ls /proc | grep -c "^[0-9]"')
+    check "/proc shows only the container's processes (it shows ${n:-none})" "[ -n '$n' ] && [ '$n' -le 4 ]"
+
+    info "Part 3: Leave the host as it was"
+    ( timeout 20 /lab/box.sh kl-t3 sleep 4 </dev/null >/dev/null 2>&1 & )
+    sleep 2
+    during=$(findmnt -rno TARGET | sort | md5sum)
+    sleep 3
+    after=$(findmnt -rno TARGET | sort | md5sum)
+    check_eq "the host's mount table is unchanged while it runs" "$during" "$before"
+    check_eq "and after it exits" "$after" "$before"
+    check "the script uses pivot_root, not chroot or a runtime" "grep -q pivot_root /lab/box.sh && ! grep -qwE 'chroot|runc|docker' /lab/box.sh"
+  solve: |
+    cat > /lab/box.sh <<'EOF'
+    #!/bin/bash
+    set -e
+    name=$1; shift
+    exec unshare --pid --fork --mount --uts --ipc --net --propagation private \
+      sh -ec '
+        hostname "$0"
+        mount --bind /srv/kl-root /srv/kl-root
+        cd /srv/kl-root
+        mkdir -p .old
+        pivot_root . .old
+        mount -t proc proc /proc
+        umount -l /.old
+        rmdir /.old
+        ip link set lo up
+        exec "$@"
+      ' "$name" "$@"
+    EOF
+    chmod +x /lab/box.sh
+
+- id: linux-051
+  title: Hold a job to its memory, processes and CPU by hand
+  difficulty: 4
+  kind: build
+  tags: [cgroups, cgroup-v2, memory, pids, cpu, oom]
+  tutorial: |
+    **Concept.** cgroup v2 is a single tree of directories under **`/sys/fs/cgroup`**. Each directory is a group of processes, and the files in it are its limits and its statistics. There's no command to learn: you `mkdir` a group, write limits into its files, and write a PID into its **`cgroup.procs`** to move that process in. Children a process forks stay in its group.
+
+    Two rules trip everyone up:
+
+    - **Controllers are handed down explicitly.** A group only has `memory.max`, `pids.max` or `cpu.max` if its *parent* lists that controller in **`cgroup.subtree_control`** (`echo '+memory +pids +cpu' > parent/cgroup.subtree_control`).
+    - **No internal processes.** A group that hands controllers to its children can't hold processes itself. Put processes only in the leaves.
+
+    The limits behave differently. Past **`memory.max`** the kernel reclaims, then the OOM killer kills a process *in that group*, and `memory.events` counts it in `oom_kill`. At **`pids.max`** `fork()` simply fails with `EAGAIN`, and `pids.events` counts it in `max`. **`cpu.max`** is a quota per period, `"25000 100000"` meaning 25 ms of CPU every 100 ms: the group is throttled, not killed, and `cpu.stat` shows the time used and throttled.
+
+    **Read up on:**
+    - The kernel's cgroup v2 documentation (`Documentation/admin-guide/cgroup-v2.rst`): "Controlling Controllers", "No Internal Process Constraint"
+    - `memory.max`, `memory.swap.max`, `memory.events`
+    - `pids.max`, `pids.events`
+    - `cpu.max`, `cpu.stat` (`usage_usec`, `nr_throttled`)
+    - `cgroup.procs`, and moving the current shell with `echo $$`
+  scenario: |
+    Three badly behaved programs live in **`/opt/kl-cg`**: `leak.py` allocates memory
+    forever, `forker.py` forks as many children as it can, and `spin.py` burns CPU.
+
+    Write **`/lab/jail.sh`**, so that
+
+    ```bash
+    sudo /lab/jail.sh NAME COMMAND [ARGS...]
+    ```
+
+    runs `COMMAND` inside the cgroup **`/sys/fs/cgroup/kl/NAME`**, creating it if needed,
+    with the limits below. Every job gets its own group under `kl`. Write the cgroup files
+    yourself: don't use `systemd-run`, `cgexec` or Docker.
+
+    ## Part 1: Memory
+
+    A job gets at most **64 MiB** of memory (`67108864` bytes), and no swap where swap
+    exists. `leak.py` must be killed by the OOM killer *inside its group* while the rest of
+    the host carries on.
+
+    ## Part 2: Processes
+
+    A job can have at most **20** processes. `forker.py` must hit the limit.
+
+    ## Part 3: CPU
+
+    A job gets at most **a quarter of one CPU**.
+  hints:
+    - "Start with the parent: `mkdir /sys/fs/cgroup/kl`, then `echo '+memory +pids +cpu' > /sys/fs/cgroup/kl/cgroup.subtree_control`. Without that, the job's group has no `memory.max` to write."
+    - "Move the script itself into the job's group with `echo $$ > .../cgroup.procs`, then `exec \"$@\"`: the command inherits the group, and so does everything it forks."
+    - "`memory.swap.max` only exists when swap accounting is on, so write it only if the file is there."
+    - "`cpu.max` takes `QUOTA PERIOD` in microseconds."
+    - "Run a job and look: `cat /sys/fs/cgroup/kl/NAME/memory.events` after `leak.py` dies, and `pids.events` after `forker.py`."
+  solution: |
+    ```bash
+    cat > /lab/jail.sh <<'EOF'
+    #!/bin/bash
+    set -e
+    name=$1; shift
+    root=/sys/fs/cgroup/kl
+    mkdir -p "$root"
+    echo '+memory +pids +cpu' > "$root/cgroup.subtree_control"
+    g=$root/$name
+    mkdir -p "$g"
+    echo 67108864 > "$g/memory.max"
+    [ -e "$g/memory.swap.max" ] && echo 0 > "$g/memory.swap.max"
+    echo 20 > "$g/pids.max"
+    echo '25000 100000' > "$g/cpu.max"
+    echo $$ > "$g/cgroup.procs"
+    exec "$@"
+    EOF
+    chmod +x /lab/jail.sh
+    sudo /lab/jail.sh demo python3 /opt/kl-cg/leak.py; echo "exit $?"
+    cat /sys/fs/cgroup/kl/demo/memory.events
+    ```
+
+    `kl` only delegates controllers and holds no processes; each job lives in a leaf below
+    it. The script moves itself into the leaf before `exec`, so the job and every child it
+    forks are counted against that group's limits.
+  setup: |
+    on_reset 'for g in /sys/fs/cgroup/kl/*/; do [ -d "$g" ] && { cat "$g/cgroup.procs" | xargs -r kill -9; sleep 0.5; rmdir "$g"; }; done 2>/dev/null; rmdir /sys/fs/cgroup/kl 2>/dev/null; rm -rf /opt/kl-cg; true'
+    mkdir -p /opt/kl-cg
+    cat > /opt/kl-cg/leak.py <<'EOF'
+    import sys, time
+    hog = []
+    while True:
+        hog.append(bytearray(4 * 1024 * 1024))
+        print(len(hog) * 4, flush=True)
+        time.sleep(0.02)
+        if len(hog) * 4 >= 400:
+            print("never limited", flush=True)
+            sys.exit(0)
+    EOF
+    cat > /opt/kl-cg/forker.py <<'EOF'
+    import os, time
+    kids = 0
+    for _ in range(60):
+        try:
+            pid = os.fork()
+        except OSError:
+            break
+        if pid == 0:
+            time.sleep(3)
+            os._exit(0)
+        kids += 1
+    print(kids, flush=True)
+    for _ in range(kids):
+        os.wait()
+    EOF
+    cat > /opt/kl-cg/spin.py <<'EOF'
+    while True:
+        pass
+    EOF
+    chmod 644 /opt/kl-cg/*.py
+    lab_file /lab/jail.sh 0755 <<'EOF'
+    #!/bin/bash
+    # sudo /lab/jail.sh NAME COMMAND [ARGS...]
+    echo "not written yet" >&2
+    exit 1
+    EOF
+  check: |
+    K=/sys/fs/cgroup/kl
+    t=kl$RANDOM
+    info "Part 1: Memory"
+    last=$(timeout 60 /lab/jail.sh "$t-mem" python3 /opt/kl-cg/leak.py </dev/null 2>/dev/null | tail -1)
+    check "leak.py is stopped before 100 MiB (it reached '${last:-nothing}')" "[ '$last' != 'never limited' ] && [ -n '$last' ] && [ '$last' -le 100 ]"
+    check_eq "the job's group has memory.max 64 MiB" "$(cat $K/$t-mem/memory.max 2>/dev/null)" 67108864
+    check "the OOM kill happened inside the job's group" "[ \"\$(awk '/^oom_kill /{print \$2}' $K/$t-mem/memory.events)\" -ge 1 ]"
+    check "no swap for the job, where swap accounting exists" "[ ! -e $K/$t-mem/memory.swap.max ] || [ \"\$(cat $K/$t-mem/memory.swap.max)\" = 0 ]"
+
+    info "Part 2: Processes"
+    kids=$(timeout 60 /lab/jail.sh "$t-pid" python3 /opt/kl-cg/forker.py </dev/null 2>/dev/null | tail -1)
+    check "forker.py gets fewer than 20 children (it got '${kids:-nothing}')" "[ -n '$kids' ] && [ '$kids' -lt 20 ] && [ '$kids' -ge 10 ]"
+    check_eq "the job's group has pids.max 20" "$(cat $K/$t-pid/pids.max 2>/dev/null)" 20
+    check "the group recorded hitting the limit" "[ \"\$(awk '/^max /{print \$2}' $K/$t-pid/pids.events)\" -ge 1 ]"
+
+    info "Part 3: CPU"
+    timeout 5 /lab/jail.sh "$t-cpu" python3 /opt/kl-cg/spin.py </dev/null >/dev/null 2>&1
+    used=$(awk '/^usage_usec /{print $2}' $K/$t-cpu/cpu.stat 2>/dev/null)
+    check "spin.py used about a quarter of a CPU over 5 seconds (${used:-0} µs)" "[ -n '$used' ] && [ '$used' -ge 700000 ] && [ '$used' -le 1700000 ]"
+    check "it was throttled, not stopped" "[ \"\$(awk '/^nr_throttled /{print \$2}' $K/$t-cpu/cpu.stat)\" -ge 10 ]"
+    { read -r q p < "$K/$t-cpu/cpu.max"; } 2>/dev/null
+    check "cpu.max is a quarter of a CPU ('$q $p')" "[ '$q' != max ] && [ \$(( $q * 4 )) -eq $p ]"
+
+    info "Every job in its own group"
+    check "kl holds no processes itself" "[ -z \"\$(cat $K/cgroup.procs 2>/dev/null)\" ] && [ -d $K/$t-cpu ]"
+    check "the script writes the cgroup files itself" "! grep -qE 'systemd-run|cgexec|docker' /lab/jail.sh"
+    for g in "$K/$t"-*/; do cat "$g/cgroup.procs" | xargs -r kill -9; sleep 0.3; rmdir "$g"; done 2>/dev/null
+  solve: |
+    cat > /lab/jail.sh <<'EOF'
+    #!/bin/bash
+    set -e
+    name=$1; shift
+    root=/sys/fs/cgroup/kl
+    mkdir -p "$root"
+    echo '+memory +pids +cpu' > "$root/cgroup.subtree_control"
+    g=$root/$name
+    mkdir -p "$g"
+    echo 67108864 > "$g/memory.max"
+    [ -e "$g/memory.swap.max" ] && echo 0 > "$g/memory.swap.max"
+    echo 20 > "$g/pids.max"
+    echo '25000 100000' > "$g/cpu.max"
+    echo $$ > "$g/cgroup.procs"
+    exec "$@"
+    EOF
+    chmod +x /lab/jail.sh
+
+- id: linux-052
+  title: Assemble an image from its layers, deletions included
+  difficulty: 4
+  kind: build
+  tags: [overlayfs, image-layers, whiteouts, oci, containers]
+  tutorial: |
+    **Concept.** An image is a stack of layers, each a tar of the files that changed. Stacked with **overlayfs**, `lowerdir=TOP:...:BOTTOM` gives one merged view: the leftmost directory wins, and a writable `upperdir` (with its scratch `workdir`) on top takes every change the container makes.
+
+    Additions and edits are easy: a file in a higher layer hides the same path below. **Deletions** are the hard part, because a tar can't contain "nothing". The OCI image format records them with marker files that overlayfs doesn't understand:
+
+    - **`.wh.NAME`** (a *whiteout*) means "`NAME` was deleted in this layer". Overlayfs's own whiteout is a **character device 0:0** called `NAME`.
+    - **`.wh..wh..opq`** in a directory (an *opaque* marker) means "this directory was replaced: ignore everything below it in lower layers". Overlayfs marks an opaque directory with the extended attribute **`trusted.overlay.opaque=y`**.
+
+    Unpack a layer without converting these and the deleted files come back, and the marker files turn up as junk in the container. Container runtimes convert them as they unpack each layer; that's what you'll do here.
+
+    **Read up on:**
+    - The kernel's overlayfs documentation: multiple lower layers, whiteouts and opaque directories
+    - The OCI image spec, "Image Layer Filesystem Changeset": whiteouts and opaque whiteouts
+    - `mknod NAME c 0 0`, and `setfattr` or Python's `os.setxattr`
+    - `mount -t overlay overlay -o lowerdir=...,upperdir=...,workdir=... TARGET`
+    - `tar --numeric-owner`, so ownership inside the image survives unpacking
+  scenario: |
+    **`/srv/kl-image`** holds an image the way a registry ships it: `layer-1.tar` (the base),
+    `layer-2.tar` and `layer-3.tar`, applied in that order. `/srv/kl-image/NOTES.md` says what
+    each layer changed. No container tool may be used; build the root filesystem yourself.
+
+    ## Part 1: Unpack the layers the way overlayfs needs them
+
+    Unpack each layer into its own directory, **`/srv/kl-layers/1`**, **`/srv/kl-layers/2`**
+    and **`/srv/kl-layers/3`**, converting the OCI deletion markers into the form overlayfs
+    uses. No `.wh.` file may be left in any layer directory.
+
+    ## Part 2: Mount the image
+
+    Mount an overlay at **`/srv/kl-merged`** with the three layers as read-only lower layers
+    in the right order, and a writable layer in **`/srv/kl-rw/upper`** (work directory
+    **`/srv/kl-rw/work`**). The merged view must be exactly what the image describes.
+
+    ## Part 3: Run it
+
+    `chroot /srv/kl-merged /app/run.sh` must print the line the image's notes say it should.
+  hints:
+    - "Look before you unpack: `tar -tvf /srv/kl-image/layer-3.tar` shows the `.wh.` entries, and `NOTES.md` tells you what they mean."
+    - "Unpack each layer as root with `tar -x --numeric-owner -f layer-N.tar -C /srv/kl-layers/N`, then convert in that directory only."
+    - "For each `DIR/.wh.NAME` that isn't an opaque marker: `rm DIR/.wh.NAME && mknod DIR/NAME c 0 0`. A whiteout can hide a whole directory, not just a file."
+    - "For each `DIR/.wh..wh..opq`: remove it and set the xattr on `DIR`: `python3 -c 'import os,sys; os.setxattr(sys.argv[1], \"trusted.overlay.opaque\", b\"y\")' DIR`."
+    - "The leftmost `lowerdir` is the top: `lowerdir=/srv/kl-layers/3:/srv/kl-layers/2:/srv/kl-layers/1`."
+  solution: |
+    ```bash
+    sudo bash <<'EOF'
+    set -e
+    for n in 1 2 3; do
+      d=/srv/kl-layers/$n
+      mkdir -p "$d"
+      tar -x --numeric-owner -f /srv/kl-image/layer-$n.tar -C "$d"
+      # opaque directories first, then plain whiteouts
+      find "$d" -name '.wh..wh..opq' | while read -r m; do
+        dir=$(dirname "$m"); rm "$m"
+        python3 -c 'import os,sys; os.setxattr(sys.argv[1], "trusted.overlay.opaque", b"y")' "$dir"
+      done
+      find "$d" -name '.wh.*' | while read -r w; do
+        dir=$(dirname "$w"); name=$(basename "$w"); rm "$w"
+        mknod "$dir/${name#.wh.}" c 0 0
+      done
+    done
+    mkdir -p /srv/kl-rw/upper /srv/kl-rw/work /srv/kl-merged
+    mount -t overlay overlay \
+      -o lowerdir=/srv/kl-layers/3:/srv/kl-layers/2:/srv/kl-layers/1,upperdir=/srv/kl-rw/upper,workdir=/srv/kl-rw/work \
+      /srv/kl-merged
+    chroot /srv/kl-merged /app/run.sh
+    EOF
+    ```
+
+    Each `.wh.NAME` becomes a 0:0 character device, which overlayfs treats as "this name
+    doesn't exist", and each opaque marker becomes the `trusted.overlay.opaque` xattr, which
+    stops overlayfs from merging the directory with the layers below it.
+  setup: |
+    on_reset 'umount -l /srv/kl-merged 2>/dev/null; rm -rf /srv/kl-image /srv/kl-layers /srv/kl-rw /srv/kl-merged'
+    mkdir -p /srv/kl-image
+    W=$(mktemp -d)
+    docker rm -f kl-imgsrc >/dev/null 2>&1
+    docker create --name kl-imgsrc alpine:3.22 >/dev/null
+    docker export kl-imgsrc > /srv/kl-image/layer-1.tar
+    docker rm -f kl-imgsrc >/dev/null
+    # layer 2: the app, its settings and a plugin directory
+    mkdir -p $W/2/app/plugins/legacy $W/2/etc/kl.d
+    printf '#!/bin/sh\n. /etc/kl.d/version\necho "kl-app $VERSION: $(ls /etc/kl.d | tr "\\n" " ")plugins: $(ls /app/plugins | tr "\\n" " ")"\n' > $W/2/app/run.sh
+    chmod 755 $W/2/app/run.sh
+    echo 'VERSION=1.0' > $W/2/etc/kl.d/version
+    echo 'debug=true' > $W/2/etc/kl.d/debug
+    echo 'cache=on' > $W/2/etc/kl.d/cache
+    echo 'old' > $W/2/app/plugins/legacy/plugin.so
+    echo 'old' > $W/2/app/plugins/legacy/helper.so
+    echo 'auth' > $W/2/app/plugins/auth.so
+    echo 'secret-token-from-the-build' > $W/2/app/build-token
+    tar -C $W/2 --numeric-owner --owner=0 --group=0 -cf /srv/kl-image/layer-2.tar app etc
+    # layer 3: delete the token and the legacy plugin directory, replace /etc/kl.d, bump the version
+    mkdir -p $W/3/app/plugins $W/3/etc/kl.d
+    : > $W/3/app/.wh.build-token
+    : > $W/3/app/plugins/.wh.legacy
+    : > $W/3/etc/kl.d/.wh..wh..opq
+    echo 'VERSION=2.0' > $W/3/etc/kl.d/version
+    echo 'metrics=on' > $W/3/etc/kl.d/metrics
+    echo 'search' > $W/3/app/plugins/search.so
+    tar -C $W/3 --numeric-owner --owner=0 --group=0 -cf /srv/kl-image/layer-3.tar app etc
+    rm -rf "$W"
+    cat > /srv/kl-image/NOTES.md <<'EOF'
+    # kl-app image
+
+    - layer-1.tar: Alpine 3.22 base
+    - layer-2.tar: the app in /app, its settings in /etc/kl.d, plugins in /app/plugins
+    - layer-3.tar: release 2.0
+      - removes /app/build-token (it should never have shipped)
+      - removes the whole /app/plugins/legacy directory
+      - replaces /etc/kl.d entirely with the 2.0 settings
+      - adds the search plugin
+
+    `/app/run.sh` in a correct image prints:
+
+        kl-app 2.0: metrics version plugins: auth.so search.so
+    EOF
+    chmod -R a+rX /srv/kl-image
+  check: |
+    M=/srv/kl-merged
+    info "Part 1: Unpack the layers the way overlayfs needs them"
+    check "the three layer directories exist" "[ -d /srv/kl-layers/1/etc ] && [ -d /srv/kl-layers/2/app ] && [ -d /srv/kl-layers/3/app ]"
+    check_eq "no .wh. file is left in any layer" "$(find /srv/kl-layers -name '.wh.*' 2>/dev/null | wc -l)" 0
+    check "layer 3 has whiteouts for the deleted file and directory" "[ -c /srv/kl-layers/3/app/build-token ] && [ -c /srv/kl-layers/3/app/plugins/legacy ] && [ \"\$(stat -c %t:%T /srv/kl-layers/3/app/build-token)\" = 0:0 ]"
+    check "layer 3's /etc/kl.d is opaque" "[ \"\$(getfattr --only-values -n trusted.overlay.opaque /srv/kl-layers/3/etc/kl.d 2>/dev/null || python3 -c 'import os; print(os.getxattr(\"/srv/kl-layers/3/etc/kl.d\",\"trusted.overlay.opaque\").decode())' 2>/dev/null)\" = y ]"
+
+    info "Part 2: Mount the image"
+    opts=$(findmnt -no FSTYPE,OPTIONS "$M" 2>/dev/null)
+    check "an overlay is mounted at $M" "[[ '$opts' == overlay* ]]"
+    check "the layers are lower layers, 3 on top" "[[ '$opts' == *lowerdir=/srv/kl-layers/3:/srv/kl-layers/2:/srv/kl-layers/1* ]]"
+    check "the writable layer is /srv/kl-rw/upper" "[[ '$opts' == *upperdir=/srv/kl-rw/upper* ]] && [[ '$opts' == *workdir=/srv/kl-rw/work* ]]"
+    check_not "the build token is gone" "[ -e $M/app/build-token ]"
+    check_not "the legacy plugin directory is gone" "[ -e $M/app/plugins/legacy ]"
+    check_eq "/etc/kl.d holds only the 2.0 settings" "$(ls $M/etc/kl.d 2>/dev/null | tr '\n' ' ')" "metrics version "
+    check_eq "no .wh. file shows in the image" "$(find $M -xdev -name '.wh.*' 2>/dev/null | wc -l)" 0
+    check "the base layer is there" "[ -x $M/bin/busybox ] && grep -q '^3\.22' $M/etc/alpine-release"
+    info "Part 3: Run it"
+    check_eq "/app/run.sh prints the right line" "$(timeout 10 chroot $M /app/run.sh 2>&1)" "kl-app 2.0: metrics version plugins: auth.so search.so "
+
+    info "The writable layer"
+    if [[ $opts == overlay* ]] && [ -f $M/app/plugins/auth.so ]; then
+      echo probe > $M/tmp/kl-probe
+      check "a write lands in the upper layer" "[ -f /srv/kl-rw/upper/tmp/kl-probe ] && [ ! -e /srv/kl-layers/1/tmp/kl-probe ]"
+      rm -f $M/tmp/kl-probe
+      cp -p $M/app/plugins/auth.so /tmp/kl-auth.so; rm -f $M/app/plugins/auth.so
+      check "a deletion leaves a whiteout in the upper layer, and the lower layer untouched" "[ -c /srv/kl-rw/upper/app/plugins/auth.so ] && [ -f /srv/kl-layers/2/app/plugins/auth.so ]"
+      cp -p /tmp/kl-auth.so $M/app/plugins/auth.so; rm -f /tmp/kl-auth.so
+    else
+      fail "a write lands in the upper layer"; fail "a deletion leaves a whiteout in the upper layer, and the lower layer untouched"
+    fi
+  solve: |
+    sudo bash <<'EOF'
+    set -e
+    for n in 1 2 3; do
+      d=/srv/kl-layers/$n
+      mkdir -p "$d"
+      tar -x --numeric-owner -f /srv/kl-image/layer-$n.tar -C "$d"
+      find "$d" -name '.wh..wh..opq' | while read -r m; do
+        dir=$(dirname "$m"); rm "$m"
+        python3 -c 'import os,sys; os.setxattr(sys.argv[1], "trusted.overlay.opaque", b"y")' "$dir"
+      done
+      find "$d" -name '.wh.*' | while read -r w; do
+        dir=$(dirname "$w"); name=$(basename "$w"); rm "$w"
+        mknod "$dir/${name#.wh.}" c 0 0
+      done
+    done
+    mkdir -p /srv/kl-rw/upper /srv/kl-rw/work /srv/kl-merged
+    mount -t overlay overlay \
+      -o lowerdir=/srv/kl-layers/3:/srv/kl-layers/2:/srv/kl-layers/1,upperdir=/srv/kl-rw/upper,workdir=/srv/kl-rw/work \
+      /srv/kl-merged
+    EOF
+
+- id: linux-053
+  title: Write the OCI config that runc runs
+  difficulty: 4
+  kind: build
+  tags: [runc, oci, bundle, config.json, containers]
+  tutorial: |
+    **Concept.** Under Docker and containerd sits **runc**, which runs one container from an **OCI bundle**: a directory with a `rootfs/` and a **`config.json`** describing the process and its isolation. Everything `docker run` flags turn into ends up in that file:
+
+    - **`process`**: `args`, `env`, `cwd`, `user.uid`/`gid`, `terminal`, `capabilities`, `noNewPrivileges`
+    - **`root`**: the path of the root filesystem and `readonly`
+    - **`hostname`** and **`mounts`**: each with a `destination`, `type`, `source` and `options` (`bind`, `ro`, `nosuid` ...)
+    - **`linux.namespaces`**: which namespaces are new. Leave one out and the container *shares the host's*: no `network` entry means the host's network stack
+    - **`linux.resources`**: cgroup limits such as `memory.limit` and `pids.limit`
+
+    `runc spec` writes a starting template, `runc run -d ID` starts the bundle in the current directory in the background, and `runc list`, `runc state ID`, `runc exec ID CMD` and `runc delete -f ID` manage it. The template has `"terminal": true`, which needs a console; a background service needs `false`, with its output sent somewhere.
+
+    **Read up on:**
+    - The OCI runtime spec: `config.md` and `config-linux.md`
+    - `runc spec`, `runc run -d`, `runc state`, `runc delete`
+    - `jq` for editing JSON in place: `jq '.process.terminal=false' config.json > tmp && mv tmp config.json`
+    - What a `bind` mount entry looks like in `config.json`
+  scenario: |
+    **`/srv/kl-bundle`** has a `rootfs/` with Python and a small service in `/app/server.py`,
+    and no `config.json`. Write the config, then run the bundle with **`runc`** (as root,
+    with `sudo`) as the container **`kl-web`**, in the background.
+
+    The service listens on port **18053** and answers every request with what it can see of
+    its own environment, so `curl -s 127.0.0.1:18053` tells you how far you've got.
+
+    ## Part 1: The process
+
+    - It runs `python3 /app/server.py` with working directory `/app`.
+    - Its environment has `APP_MODE=production` and a `PATH` that finds `python3`.
+    - It runs as **uid 1000, gid 1000**, never as root, and with `noNewPrivileges`.
+    - Its hostname is **`kl-web`**.
+
+    ## Part 2: The filesystem
+
+    - The root filesystem is **read-only**, with a writable **tmpfs at `/tmp`**.
+    - The host directory **`/srv/kl-data`** is at **`/data`**, read-only.
+
+    ## Part 3: Isolation and limits
+
+    - It has its own PID, mount, IPC and UTS namespaces, but uses the **host's network**, so
+      the service is reachable on `127.0.0.1:18053` from the host.
+    - Its memory limit is **128 MiB** and it may have at most **32** processes.
+  hints:
+    - "`cd /srv/kl-bundle && sudo runc spec` writes the template. Read it once before changing it: you'll keep most of it."
+    - "Do the edits with one `jq` program: `.process.args`, `.process.cwd`, `.process.env`, `.process.user`, `.process.terminal=false`, `.hostname`, `.root.readonly`."
+    - "The template already mounts a tmpfs at `/dev`; add `{\"destination\":\"/tmp\",\"type\":\"tmpfs\",\"source\":\"tmpfs\",\"options\":[\"nosuid\",\"nodev\",\"mode=1777\"]}` and a bind mount with `\"options\":[\"rbind\",\"ro\"]` for `/data`."
+    - "Delete the network namespace: `.linux.namespaces |= map(select(.type != \"network\"))`."
+    - "Limits go under `.linux.resources`: `memory.limit` is in bytes, `pids.limit` is a number."
+    - "Start it from the bundle directory: `sudo runc run -d kl-web > /srv/kl-web.log 2>&1 < /dev/null`. If it fails, the log and `sudo runc list` tell you why; `sudo runc delete -f kl-web` before trying again."
+  solution: |
+    ```bash
+    cd /srv/kl-bundle
+    sudo runc spec
+    sudo jq '
+      .process.terminal = false
+      | .process.args = ["python3", "/app/server.py"]
+      | .process.cwd = "/app"
+      | .process.env = ["PATH=/usr/local/bin:/usr/bin:/bin", "APP_MODE=production"]
+      | .process.user = {"uid": 1000, "gid": 1000}
+      | .process.noNewPrivileges = true
+      | .hostname = "kl-web"
+      | .root.readonly = true
+      | .mounts += [
+          {"destination": "/tmp", "type": "tmpfs", "source": "tmpfs", "options": ["nosuid", "nodev", "mode=1777"]},
+          {"destination": "/data", "type": "bind", "source": "/srv/kl-data", "options": ["rbind", "ro"]}
+        ]
+      | .linux.namespaces |= map(select(.type != "network"))
+      | .linux.resources.memory = {"limit": 134217728}
+      | .linux.resources.pids = {"limit": 32}
+    ' config.json | sudo tee config.new >/dev/null && sudo mv config.new config.json
+    sudo runc run -d kl-web > /srv/kl-web.log 2>&1 < /dev/null
+    curl -s 127.0.0.1:18053
+    ```
+
+    Leaving the `network` entry out of `linux.namespaces` is how a runtime implements
+    `--network host`; every other line maps to a `docker run` flag you already know.
+  setup: |
+    on_reset 'runc delete -f kl-web >/dev/null 2>&1; rm -rf /srv/kl-bundle /srv/kl-data /srv/kl-web.log'
+    runc delete -f kl-web >/dev/null 2>&1
+    mkdir -p /srv/kl-bundle/rootfs /srv/kl-data
+    docker rm -f kl-bsrc >/dev/null 2>&1
+    docker create --name kl-bsrc python:3.12-alpine >/dev/null
+    docker export kl-bsrc | tar -x -C /srv/kl-bundle/rootfs
+    docker rm -f kl-bsrc >/dev/null
+    mkdir -p /srv/kl-bundle/rootfs/app
+    cat > /srv/kl-bundle/rootfs/app/server.py <<'EOF'
+    import http.server, json, os, socket
+
+    def rd(path):
+        try:
+            with open(path) as f:
+                return f.read().strip()
+        except OSError as e:
+            return "unreadable: %s" % e.strerror
+
+    def can_write(path):
+        try:
+            with open(path, "w") as f:
+                f.write("x")
+            os.unlink(path)
+            return True
+        except OSError:
+            return False
+
+    class H(http.server.BaseHTTPRequestHandler):
+        def do_GET(self):
+            info = {
+                "uid": os.getuid(), "gid": os.getgid(),
+                "hostname": socket.gethostname(),
+                "app_mode": os.environ.get("APP_MODE"),
+                "cwd": os.getcwd(),
+                "no_new_privs": rd("/proc/self/status").split("NoNewPrivs:")[1].split()[0],
+                "pid1_is_server": rd("/proc/1/cmdline").replace("\0", " ").strip(),
+                "root_writable": can_write("/kl-probe"),
+                "tmp_writable": can_write("/tmp/kl-probe"),
+                "data": rd("/data/greeting.txt"),
+                "data_writable": can_write("/data/kl-probe"),
+                "memory_max": rd("/sys/fs/cgroup/memory.max"),
+                "pids_max": rd("/sys/fs/cgroup/pids.max"),
+            }
+            body = json.dumps(info, indent=1).encode()
+            self.send_response(200)
+            self.send_header("Content-Type", "application/json")
+            self.end_headers()
+            self.wfile.write(body)
+
+        def log_message(self, *a):
+            pass
+
+    http.server.HTTPServer(("0.0.0.0", 18053), H).serve_forever()
+    EOF
+    echo "hello from the host" > /srv/kl-data/greeting.txt
+    chmod 755 /srv/kl-data; chmod 644 /srv/kl-data/greeting.txt
+  check: |
+    j=$(curl -s -m 5 127.0.0.1:18053 2>/dev/null)
+    f() { jq -r ".$1" <<<"$j" 2>/dev/null; }
+    check "kl-web is running under runc" "runc state kl-web 2>/dev/null | jq -e '.status == \"running\"'"
+    check "the service answers on 127.0.0.1:18053 from the host" "[ -n '$j' ] && jq -e . <<<'$j'"
+    if [ -f /srv/kl-bundle/config.json ]; then
+      check "the bundle's config.json is the one that runs" "[ \"\$(runc state kl-web | jq -r .bundle)\" = /srv/kl-bundle ]"
+    fi
+
+    info "Part 1: The process"
+    check_eq "it runs python3 /app/server.py as PID 1" "$(f pid1_is_server)" "python3 /app/server.py"
+    check_eq "the working directory is /app" "$(f cwd)" /app
+    check_eq "APP_MODE is production" "$(f app_mode)" production
+    check_eq "it runs as uid 1000" "$(f uid)" 1000
+    check_eq "and gid 1000" "$(f gid)" 1000
+    check_eq "noNewPrivileges is set" "$(f no_new_privs)" 1
+    check_eq "the hostname is kl-web" "$(f hostname)" kl-web
+
+    info "Part 2: The filesystem"
+    check_eq "the root filesystem is read-only" "$(f root_writable)" false
+    check_eq "/tmp is writable" "$(f tmp_writable)" true
+    check "/tmp is a tmpfs" "runc exec kl-web grep -q ' /tmp tmpfs ' /proc/mounts"
+    check_eq "/data shows the host's /srv/kl-data" "$(f data)" "hello from the host"
+    check_eq "/data is read-only" "$(f data_writable)" false
+
+    info "Part 3: Isolation and limits"
+    pid=$(runc state kl-web 2>/dev/null | jq -r .pid)
+    for ns in pid mnt ipc uts; do
+      check "it has its own $ns namespace" "[ -n '$pid' ] && [ \"\$(readlink /proc/$pid/ns/$ns)\" != \"\$(readlink /proc/1/ns/$ns)\" ]"
+    done
+    check "it uses the host's network namespace" "[ -n '$pid' ] && [ \"\$(readlink /proc/$pid/ns/net)\" = \"\$(readlink /proc/1/ns/net)\" ]"
+    check_eq "the memory limit is 128 MiB" "$(f memory_max)" 134217728
+    check_eq "at most 32 processes" "$(f pids_max)" 32
+  solve: |
+    cd /srv/kl-bundle
+    sudo runc spec
+    sudo jq '
+      .process.terminal = false
+      | .process.args = ["python3", "/app/server.py"]
+      | .process.cwd = "/app"
+      | .process.env = ["PATH=/usr/local/bin:/usr/bin:/bin", "APP_MODE=production"]
+      | .process.user = {"uid": 1000, "gid": 1000}
+      | .process.noNewPrivileges = true
+      | .hostname = "kl-web"
+      | .root.readonly = true
+      | .mounts += [
+          {"destination": "/tmp", "type": "tmpfs", "source": "tmpfs", "options": ["nosuid", "nodev", "mode=1777"]},
+          {"destination": "/data", "type": "bind", "source": "/srv/kl-data", "options": ["rbind", "ro"]}
+        ]
+      | .linux.namespaces |= map(select(.type != "network"))
+      | .linux.resources.memory = {"limit": 134217728}
+      | .linux.resources.pids = {"limit": 32}
+    ' config.json | sudo tee config.new >/dev/null && sudo mv config.new config.json
+    sudo bash -c 'runc run -d kl-web > /srv/kl-web.log 2>&1 < /dev/null'
+    for i in $(seq 20); do curl -s -m 2 127.0.0.1:18053 >/dev/null && break; sleep 0.5; done
+
+- id: linux-054
+  title: Root in the container, nobody on the host
+  difficulty: 5
+  kind: fix
+  tags: [user-namespaces, uid-mapping, runc, idmap, containers]
+  tutorial: |
+    **Concept.** A **user namespace** gives a process its own set of user IDs, translated to host IDs by a map. With the map `0 100000 65536`, uid 0 *inside* is uid 100000 *outside*, uid 1000 inside is 101000 outside, and so on for 65536 IDs. The container's "root" can do root things to what its namespace owns, but to the host it's an unprivileged nobody: escape the container and you're uid 100000.
+
+    The catch is the files. The kernel stores *host* IDs on disk. A root filesystem unpacked by host root is owned by host uid 0, which is **not in the map**, so inside it shows up as the overflow user `nobody` (65534) and container root can't write it. Runtimes solve this by **shifting** the image: every file owned by uid N is chowned to `100000 + N`, which keeps the ownership structure (root files stay root's, the app user's files stay the app user's) instead of flattening everything to one owner. Newer kernels can do it without copying, with idmapped mounts.
+
+    In runc, a user namespace is a `{"type": "user"}` entry in `linux.namespaces` plus `linux.uidMappings` and `linux.gidMappings`, each a list of `{"containerID", "hostID", "size"}`.
+
+    **Read up on:**
+    - `man 7 user_namespaces`: `uid_map`, unmapped IDs and the overflow user
+    - `/proc/PID/uid_map` and the `Uid:` line of `/proc/PID/status`
+    - The OCI runtime spec, `config-linux.md`: "User namespace mappings"
+    - `chown -h` and why symlinks must be shifted too, and `find -printf '%U'`
+  scenario: |
+    **`/srv/kl-ns`** is a runc bundle for a small worker, **`kl-ns`**. It runs as root inside the
+    container, and so it runs as **real root on the host**: a break-out would own the machine.
+    The security team wants it in a user namespace: container uids **0 to 65535** mapped to
+    host uids **200000 to 265535**, and the same for gids.
+
+    Someone tried. Their attempt is `/srv/kl-ns/config.userns.json`, and the container it
+    starts keeps dying. Get the worker running in a user namespace.
+
+    ## Part 1: The mapping
+
+    `/srv/kl-ns/config.json` must put the container in a new user namespace with exactly
+    that uid and gid mapping. Start it as **`kl-ns`** in the background (`sudo runc run -d`).
+    On the host, its processes must run as uid **200000**.
+
+    ## Part 2: Files the container can own
+
+    The worker writes `/var/lib/worker/state` as root, and its helper runs as the image's
+    user **`app`** (uid 1000) and appends to `/home/app/worker.log`. Both must work, and so
+    must writes to the host directory **`/srv/kl-ns-data`**, bind-mounted at `/data`.
+
+    Shift the ownership, don't flatten it: every file must keep its owner from the image,
+    just moved into the mapped range. Nothing in the root filesystem may stay owned by a
+    host uid outside it, and nothing may be made world-writable.
+  hints:
+    - "`diff <(jq -S . /srv/kl-ns/config.json) <(jq -S . /srv/kl-ns/config.userns.json)` shows what the attempt changed. Then run it in the foreground and read the error: `cd /srv/kl-ns && sudo cp config.userns.json config.json && sudo runc run kl-ns`."
+    - "Check each mapping entry against the task. A mapping must also cover every uid the image uses."
+    - "Inside a user namespace, a file owned by an unmapped host uid shows as `nobody`. `ls -ln /srv/kl-ns/rootfs/var/lib` shows what the kernel stores."
+    - "Shift with a loop that keeps per-file owners: `find rootfs -print0 | while IFS= read -r -d '' f; do chown -h \"$((200000 + $(stat -c %u \"$f\"))):$((200000 + $(stat -c %g \"$f\")))\" \"$f\"; done`, or the same in Python with `os.lchown`, which is much faster."
+    - "`/srv/kl-ns-data` is a host directory: it belongs to the host uid that container root becomes. Look at what's already in it, too."
+  solution: |
+    The attempt mapped the right range to the wrong host IDs and only 1000 IDs, so uid 1000
+    wasn't mapped at all, and nobody shifted the files.
+
+    ```bash
+    cd /srv/kl-ns
+    sudo runc delete -f kl-ns 2>/dev/null
+    sudo jq '
+      .linux.namespaces |= (map(select(.type != "user")) + [{"type": "user"}])
+      | .linux.uidMappings = [{"containerID": 0, "hostID": 200000, "size": 65536}]
+      | .linux.gidMappings = [{"containerID": 0, "hostID": 200000, "size": 65536}]
+    ' config.json | sudo tee config.new >/dev/null && sudo mv config.new config.json
+    # shift every owner by 200000, symlinks included
+    sudo python3 - <<'EOF'
+    import os
+    for top in ["/srv/kl-ns/rootfs"]:
+        for d, dirs, files in os.walk(top):
+            for p in [d] + [os.path.join(d, n) for n in files + [x for x in dirs if os.path.islink(os.path.join(d, x))]]:
+                st = os.lstat(p)
+                if st.st_uid < 200000:
+                    os.lchown(p, st.st_uid + 200000, st.st_gid + 200000)
+    EOF
+    sudo chown -R 200000:200000 /srv/kl-ns-data
+    sudo bash -c 'runc run -d kl-ns > /srv/kl-ns.log 2>&1 < /dev/null'
+    ```
+
+    After the shift, `rootfs/etc/passwd` belongs to host uid 200000 (container root) and
+    `rootfs/home/app` to 201000 (container `app`), exactly mirroring the image.
+  setup: |
+    on_reset 'runc delete -f kl-ns >/dev/null 2>&1; rm -rf /srv/kl-ns /srv/kl-ns-data /srv/kl-ns.log'
+    runc delete -f kl-ns >/dev/null 2>&1
+    B=/srv/kl-ns
+    mkdir -p $B/rootfs /srv/kl-ns-data
+    docker rm -f kl-nssrc >/dev/null 2>&1
+    docker create --name kl-nssrc alpine:3.22 >/dev/null
+    docker export kl-nssrc | tar -x --numeric-owner -C $B/rootfs
+    docker rm -f kl-nssrc >/dev/null
+    echo 'app:x:1000:1000:app:/home/app:/bin/sh' >> $B/rootfs/etc/passwd
+    echo 'app:x:1000:' >> $B/rootfs/etc/group
+    mkdir -p $B/rootfs/home/app $B/rootfs/var/lib/worker
+    chown 1000:1000 $B/rootfs/home/app
+    chmod 755 $B/rootfs/home/app
+    cat > $B/rootfs/worker.sh <<'EOF'
+    #!/bin/sh
+    # the worker: root writes its state, the helper runs as app and writes its log
+    while true; do
+      date +%s > /var/lib/worker/state || exit 11
+      su app -s /bin/sh -c 'date +%s >> /home/app/worker.log' || exit 12
+      date +%s > /data/heartbeat || exit 13
+      sleep 2
+    done
+    EOF
+    chmod 755 $B/rootfs/worker.sh
+    (cd $B && runc spec >/dev/null)
+    jq '.process.terminal = false
+        | .process.capabilities |= with_entries(.value += ["CAP_SETUID", "CAP_SETGID"])
+        | .process.args = ["/worker.sh"]
+        | .root.readonly = false
+        | .hostname = "kl-ns"
+        | .mounts += [{"destination": "/data", "type": "bind", "source": "/srv/kl-ns-data", "options": ["rbind", "rw"]}]' \
+      $B/config.json > $B/c.tmp && mv $B/c.tmp $B/config.json
+    jq '.linux.namespaces += [{"type": "user"}]
+        | .linux.uidMappings = [{"containerID": 0, "hostID": 100000, "size": 1000}]
+        | .linux.gidMappings = [{"containerID": 0, "hostID": 100000, "size": 1000}]' \
+      $B/config.json > $B/config.userns.json
+    (cd $B && runc run -d kl-ns > /srv/kl-ns.log 2>&1 < /dev/null)
+    sleep 3
+    cat > $B/README.md <<'EOF'
+    The worker runs from this bundle with: cd /srv/kl-ns && sudo runc run -d kl-ns
+    config.userns.json is the user-namespace attempt. It didn't work.
+    EOF
+  check: |
+    B=/srv/kl-ns
+    cfg=$B/config.json
+    info "Part 1: The mapping"
+    check "config.json creates a user namespace" "jq -e '.linux.namespaces | map(.type) | index(\"user\")' $cfg"
+    check_eq "the uid mapping is 0 → 200000, 65536 ids" "$(jq -c '.linux.uidMappings' $cfg 2>/dev/null)" '[{"containerID":0,"hostID":200000,"size":65536}]'
+    check_eq "the gid mapping is 0 → 200000, 65536 ids" "$(jq -c '.linux.gidMappings' $cfg 2>/dev/null)" '[{"containerID":0,"hostID":200000,"size":65536}]'
+    check "kl-ns is running" "runc state kl-ns 2>/dev/null | jq -e '.status == \"running\"'"
+    pid=$(runc state kl-ns 2>/dev/null | jq -r .pid)
+    check_eq "its processes run as host uid 200000" "$(awk '/^Uid:/{print $2}' /proc/$pid/status 2>/dev/null)" 200000
+    check_eq "the kernel's map matches" "$(awk '{print $1, $2, $3}' /proc/$pid/uid_map 2>/dev/null)" "0 200000 65536"
+
+    info "Part 2: Files the container can own"
+    if [ -n "$pid" ] && [ "$pid" != null ]; then
+      s0=$(cat $B/rootfs/var/lib/worker/state 2>/dev/null); l0=$(wc -l < $B/rootfs/home/app/worker.log 2>/dev/null)
+      sleep 5
+      s1=$(cat $B/rootfs/var/lib/worker/state 2>/dev/null); l1=$(wc -l < $B/rootfs/home/app/worker.log 2>/dev/null)
+    fi
+    check "the worker keeps writing /var/lib/worker/state as root" "[ -n '$s1' ] && [ '$s1' != '$s0' ] && [ \"\$(stat -c %u $B/rootfs/var/lib/worker/state)\" = 200000 ]"
+    check "the helper keeps appending to worker.log as app" "[ -n '$l1' ] && [ '${l1:-0}' -gt '${l0:-0}' ] && [ \"\$(stat -c %u $B/rootfs/home/app/worker.log)\" = 201000 ]"
+    check "it keeps writing /data/heartbeat" "[ -f /srv/kl-ns-data/heartbeat ] && [ \$(( \$(date +%s) - \$(cat /srv/kl-ns-data/heartbeat) )) -le 6 ] && [ \"\$(stat -c %u /srv/kl-ns-data/heartbeat)\" = 200000 ]"
+    check_eq "the image's root files belong to container root" "$(stat -c %u:%g $B/rootfs/etc/passwd $B/rootfs/bin/busybox 2>/dev/null | sort -u | tr '\n' ' ')" "200000:200000 "
+    check_eq "/home/app still belongs to app, shifted" "$(stat -c %u:%g $B/rootfs/home/app 2>/dev/null)" "201000:201000"
+    check "symlinks were shifted too" "[ \"\$(stat -c %u $B/rootfs/bin/sh)\" = 200000 ]"
+    check_eq "nothing in the rootfs is owned outside the mapped range" "$(find $B/rootfs -xdev \( -uid -200000 -o -uid +265535 -o -gid -200000 -o -gid +265535 \) 2>/dev/null | wc -l)" 0
+    check_eq "nothing was made world-writable" "$(find $B/rootfs/var/lib/worker $B/rootfs/home/app /srv/kl-ns-data -perm -o+w ! -type l 2>/dev/null | wc -l)" 0
+  solve: |
+    cd /srv/kl-ns
+    sudo runc delete -f kl-ns 2>/dev/null
+    sudo jq '
+      .linux.namespaces |= (map(select(.type != "user")) + [{"type": "user"}])
+      | .linux.uidMappings = [{"containerID": 0, "hostID": 200000, "size": 65536}]
+      | .linux.gidMappings = [{"containerID": 0, "hostID": 200000, "size": 65536}]
+    ' config.json | sudo tee config.new >/dev/null && sudo mv config.new config.json
+    sudo python3 - <<'EOF'
+    import os
+    for d, dirs, files in os.walk("/srv/kl-ns/rootfs"):
+        for p in [d] + [os.path.join(d, n) for n in files + [x for x in dirs if os.path.islink(os.path.join(d, x))]]:
+            st = os.lstat(p)
+            if st.st_uid < 200000:
+                os.lchown(p, st.st_uid + 200000, st.st_gid + 200000)
+    EOF
+    sudo chown -R 200000:200000 /srv/kl-ns-data
+    sudo bash -c 'runc run -d kl-ns > /srv/kl-ns.log 2>&1 < /dev/null'
+    sleep 3
+
+- id: linux-055
+  title: One capability for the service, and no more
+  difficulty: 3
+  kind: fix
+  tags: [capabilities, systemd, ambient, setcap, hardening]
+  tutorial: |
+    **Concept.** Root's power is split into about forty **capabilities**: `CAP_NET_BIND_SERVICE` to bind ports below 1024, `CAP_NET_RAW` for raw sockets, `CAP_SYS_ADMIN` for nearly everything else. A process has several sets: **effective** (what it can do now), **permitted** (what it may turn on), **bounding** (the ceiling for anything it executes later) and **ambient** (what survives `execve` into a normal program, for a non-root user).
+
+    There are two ways to give a program a capability, and one is much worse:
+
+    - **File capabilities** (`setcap cap_net_bind_service+ep /usr/bin/python3.12`) attach the capability to the *binary*. Every user who runs that binary gets it, for any script. On an interpreter that is a hole: any user can now run code with the capability.
+    - **Ambient capabilities** attach it to *one service*. In systemd, `User=` plus `AmbientCapabilities=` runs the service as a plain user holding only those capabilities, and `CapabilityBoundingSet=` caps everything it starts. `NoNewPrivileges=yes` stops it regaining anything through setuid or file-capability binaries.
+
+    **Read up on:**
+    - `man 7 capabilities`: the sets and how they change across `execve`
+    - `getcap`, `setcap -r`, and `getcap -r / 2>/dev/null` to find file capabilities
+    - `man systemd.exec`: `User=`, `AmbientCapabilities=`, `CapabilityBoundingSet=`, `NoNewPrivileges=`
+    - `grep Cap /proc/PID/status` and `capsh --decode=HEX`
+  scenario: |
+    **`kl-probe.service`** is a health prober: it serves its results over HTTP on
+    **127.0.0.1:443** (a privileged port) and pings `127.0.0.1` with a raw ICMP socket.
+    It runs as root. To "get it off root", someone added `User=kl-probe` and, when that broke
+    it, gave the Python interpreter itself capabilities with `setcap`.
+
+    ## Part 1: Close the hole
+
+    No file capabilities may be left on any Python binary on the host. Anyone could use them.
+
+    ## Part 2: Give the service exactly what it needs
+
+    `kl-probe` must run as the user **`kl-probe`**, and work: `curl -s 127.0.0.1:443` returns
+    `ping ok`. Its process must hold **exactly** `CAP_NET_BIND_SERVICE` and `CAP_NET_RAW` as
+    effective capabilities, have a bounding set of just those two, and be unable to gain
+    privileges. Keep the settings in the unit, so they survive a restart. Don't change
+    `/opt/kl-probe/probe.py`.
+  hints:
+    - "`getcap -r /usr 2>/dev/null` lists every file with capabilities. `setcap -r FILE` removes them."
+    - "`systemctl cat kl-probe` shows the unit, and `journalctl -u kl-probe -n 20` why it fails once the file capabilities are gone."
+    - "A drop-in is the tidy place: `sudo systemctl edit kl-probe` and add `AmbientCapabilities=`, `CapabilityBoundingSet=` and `NoNewPrivileges=yes` under `[Service]`."
+    - "`grep Cap /proc/$(systemctl show -p MainPID --value kl-probe)/status`: the two capabilities are bits 10 and 13, so the mask is `0000000000002400`."
+  solution: |
+    ```bash
+    getcap -r /usr 2>/dev/null
+    sudo setcap -r /usr/bin/python3.12
+    sudo mkdir -p /etc/systemd/system/kl-probe.service.d
+    sudo tee /etc/systemd/system/kl-probe.service.d/caps.conf >/dev/null <<'EOF'
+    [Service]
+    AmbientCapabilities=CAP_NET_BIND_SERVICE CAP_NET_RAW
+    CapabilityBoundingSet=CAP_NET_BIND_SERVICE CAP_NET_RAW
+    NoNewPrivileges=yes
+    EOF
+    sudo systemctl daemon-reload
+    sudo systemctl restart kl-probe
+    curl -s 127.0.0.1:443
+    grep Cap /proc/$(systemctl show -p MainPID --value kl-probe)/status
+    ```
+
+    The capabilities now belong to this one service, not to every Python script anyone runs.
+  setup: |
+    on_reset 'systemctl stop kl-probe 2>/dev/null; rm -rf /etc/systemd/system/kl-probe.service /etc/systemd/system/kl-probe.service.d /opt/kl-probe; for f in /usr/bin/python3*; do setcap -r "$f" 2>/dev/null; done; userdel kl-probe 2>/dev/null; systemctl daemon-reload; true'
+    # ports below 1024 must really need the capability
+    on_reset "sysctl -qw net.ipv4.ip_unprivileged_port_start=$(sysctl -n net.ipv4.ip_unprivileged_port_start)"
+    sysctl -qw net.ipv4.ip_unprivileged_port_start=1024
+    id kl-probe >/dev/null 2>&1 || useradd -r -s /usr/sbin/nologin kl-probe
+    mkdir -p /opt/kl-probe
+    cat > /opt/kl-probe/probe.py <<'EOF'
+    import http.server, os, socket, struct, time
+
+    def ping(host="127.0.0.1"):
+        s = socket.socket(socket.AF_INET, socket.SOCK_RAW, socket.IPPROTO_ICMP)
+        s.settimeout(2)
+        def csum(b):
+            if len(b) % 2:
+                b += b"\0"
+            t = sum(struct.unpack("!%dH" % (len(b) // 2), b))
+            t = (t >> 16) + (t & 0xFFFF)
+            return ~(t + (t >> 16)) & 0xFFFF
+        ident = os.getpid() & 0xFFFF
+        hdr = struct.pack("!BBHHH", 8, 0, 0, ident, 1)
+        pkt = struct.pack("!BBHHH", 8, 0, csum(hdr + b"kl"), ident, 1) + b"kl"
+        s.sendto(pkt, (host, 0))
+        while True:
+            data, _ = s.recvfrom(1024)
+            if data[20] == 0 and struct.unpack("!H", data[24:26])[0] == ident:
+                return True
+
+    class H(http.server.BaseHTTPRequestHandler):
+        def do_GET(self):
+            try:
+                ping()
+                msg = b"ping ok\n"
+            except Exception as e:
+                msg = ("ping failed: %s\n" % e).encode()
+            self.send_response(200)
+            self.end_headers()
+            self.wfile.write(msg)
+
+        def log_message(self, *a):
+            pass
+
+    ping()
+    http.server.HTTPServer(("127.0.0.1", 443), H).serve_forever()
+    EOF
+    chmod 644 /opt/kl-probe/probe.py
+    cat > /etc/systemd/system/kl-probe.service <<'EOF'
+    [Unit]
+    Description=KL health prober
+    [Service]
+    User=kl-probe
+    ExecStart=/usr/bin/python3 /opt/kl-probe/probe.py
+    Restart=on-failure
+    RestartSec=2
+    [Install]
+    WantedBy=multi-user.target
+    EOF
+    setcap cap_net_bind_service,cap_net_raw,cap_sys_admin,cap_dac_override+ep "$(readlink -f /usr/bin/python3)"
+    systemctl daemon-reload
+    systemctl restart kl-probe
+  check: |
+    info "Part 1: Close the hole"
+    caps=$(getcap /usr/bin/python3* /usr/local/bin/python3* "$(readlink -f /usr/bin/python3)" 2>/dev/null | sort -u)
+    check_eq "no Python binary has file capabilities" "$caps" ""
+    check_not "an ordinary user can't bind a privileged port with Python" "sudo -u nobody python3 -c 'import socket; socket.socket().bind((\"127.0.0.1\", 444))'"
+
+    info "Part 2: Give the service exactly what it needs"
+    systemctl restart kl-probe >/dev/null 2>&1
+    eventually 15 "curl -s -m 3 127.0.0.1:443 | grep -q 'ping ok'"
+    check_eq "curl 127.0.0.1:443 returns ping ok" "$(curl -s -m 3 127.0.0.1:443)" "ping ok"
+    pid=$(systemctl show -p MainPID --value kl-probe)
+    st=/proc/$pid/status
+    check_eq "it runs as the user kl-probe" "$(ps -o user= -p "$pid" 2>/dev/null)" kl-probe
+    check_eq "its effective capabilities are exactly the two" "$(awk '/^CapEff/{print $2}' $st 2>/dev/null)" 0000000000002400
+    check_eq "its bounding set is just those two" "$(awk '/^CapBnd/{print $2}' $st 2>/dev/null)" 0000000000002400
+    check_eq "it can't gain privileges" "$(awk '/^NoNewPrivs/{print $2}' $st 2>/dev/null)" 1
+    check "the settings live in the unit" "systemctl show -p AmbientCapabilities --value kl-probe | grep -q cap_net_raw && systemctl show -p NoNewPrivileges --value kl-probe | grep -qx yes"
+    check "probe.py is unchanged" "grep -q 'HTTPServer((\"127.0.0.1\", 443)' /opt/kl-probe/probe.py && grep -q SOCK_RAW /opt/kl-probe/probe.py"
+  solve: |
+    sudo setcap -r "$(readlink -f /usr/bin/python3)"
+    sudo mkdir -p /etc/systemd/system/kl-probe.service.d
+    sudo tee /etc/systemd/system/kl-probe.service.d/caps.conf >/dev/null <<'EOF'
+    [Service]
+    AmbientCapabilities=CAP_NET_BIND_SERVICE CAP_NET_RAW
+    CapabilityBoundingSet=CAP_NET_BIND_SERVICE CAP_NET_RAW
+    NoNewPrivileges=yes
+    EOF
+    sudo systemctl daemon-reload
+    sudo systemctl restart kl-probe
+
+- id: linux-056
+  title: Debug a container that has no shell
+  difficulty: 4
+  kind: fix
+  tags: [debugging, strace, nsenter, distroless, containers]
+  tutorial: |
+    **Concept.** Minimal images ship no shell, no `ls`, no `ps`, so `docker exec -it app sh` gets you nowhere. You don't need them: the container is a process on the host, and the host has every tool.
+
+    - **`strace -f -p PID`** on the container's host PID shows every system call: `open` and `openat` reveal which files it looks for, and `connect` which addresses it calls.
+    - **`/proc/PID/root`** is the container's root filesystem, readable from the host. **`/proc/PID/environ`** and **`/proc/PID/cmdline`** show how it was started.
+    - **`nsenter -t PID -n`** runs a host tool (`ss`, `ip`, `curl`) inside its network namespace.
+    - **A sidecar** sharing its namespaces (`docker run --network container:NAME`, `--pid container:NAME`) brings your tools along without touching the image.
+    - **`docker cp`** copies files in and out with no shell in the container at all.
+
+    `docker inspect -f '{{.State.Pid}}' NAME` gives the host PID.
+
+    **Read up on:**
+    - `man strace`: `-f`, `-p`, `-e trace=%file,connect` (musl calls `open`, glibc `openat`; `%file` catches both), `-s`
+    - `man 5 proc`: `/proc/PID/root`, `/proc/PID/environ`
+    - `docker run --network container:NAME` and what a shared network namespace means for `127.0.0.1`
+    - `docker cp` into a running container
+  scenario: |
+    The container **`kl-report`** runs the report service, published on
+    **127.0.0.1:18056**. Every request fails with `500 configuration error`, and its log
+    says nothing more. The image has no shell or tools of any kind, and its code is
+    compiled, so reading the source isn't an option.
+
+    ## Part 1: What is it looking for?
+
+    Find the full path of the configuration file the service fails to open, and write it
+    to **`/lab/config-path.txt`**. The team's settings for it are in
+    `/lab/settings.ini`.
+
+    ## Part 2: Who does it call?
+
+    With a configuration in place, the service calls a backend. Find the address it
+    connects to and write it as `HOST:PORT` to **`/lab/backend.txt`**.
+
+    ## Part 3: Fix it, without touching the container
+
+    Make `curl 127.0.0.1:18056` return the report, with status 200. Don't recreate,
+    restart or rebuild **`kl-report`**: put the configuration in place inside it, and run
+    the backend it expects as a separate container, **`kl-backend`**, using the
+    `python:3.12-alpine` image. Any HTTP server that answers will do.
+  hints:
+    - "`docker exec kl-report sh` fails. Work from the host: `P=$(docker inspect -f '{{.State.Pid}}' kl-report)`."
+    - "`sudo strace -f -p $P -e trace=%file,connect` in one terminal, `curl 127.0.0.1:18056` in another. Watch for `ENOENT`."
+    - "`sudo ls -l /proc/$P/root/etc/report` shows what's actually in the image. The file that's there is a decoy."
+    - "`docker cp /lab/settings.ini kl-report:PATH` works on a running container with no shell."
+    - "The backend address is `127.0.0.1`: *the container's own* loopback. A container on its network namespace (`--network container:kl-report`) shares that loopback."
+  solution: |
+    ```bash
+    P=$(docker inspect -f '{{.State.Pid}}' kl-report)
+    sudo timeout 5 strace -f -p "$P" -e trace=%file,connect 2>&1 | grep -E 'open|connect' &
+    sleep 1; curl -s 127.0.0.1:18056; wait
+    # open("/etc/report/conf.d/settings-v2.ini", O_RDONLY|...) = -1 ENOENT
+    echo /etc/report/conf.d/settings-v2.ini > /lab/config-path.txt
+    docker cp /lab/settings.ini kl-report:/etc/report/conf.d/settings-v2.ini
+
+    sudo timeout 5 strace -f -p "$P" -e trace=connect 2>&1 | grep connect &
+    sleep 1; curl -s 127.0.0.1:18056; wait
+    # connect(..., {sin_port=htons(7056), sin_addr=inet_addr("127.0.0.1")}, ...) = -1 ECONNREFUSED
+    echo 127.0.0.1:7056 > /lab/backend.txt
+    docker run -d --name kl-backend --network container:kl-report python:3.12-alpine python3 -m http.server 7056
+    curl -s 127.0.0.1:18056
+    ```
+  setup: |
+    W=$(mktemp -d)
+    mkdir -p $W/app
+    cat > $W/app/report.py <<'EOF'
+    import base64, http.server, os, socket
+
+    def where():
+        k = 0x5A
+        parts = [bytes(b ^ k for b in base64.b64decode(x)).decode() for x in ("Py45", "KD8qNSgu", "OTU0PHQ+", "KT8uLjM0PSl3LGg=")]
+        return "/" + "/".join(parts[:3]) + "/" + parts[3] + ".ini"
+
+    def backend():
+        return ("127.0.0.1", 7000 + int("38", 16))
+
+    class H(http.server.BaseHTTPRequestHandler):
+        def do_GET(self):
+            try:
+                with open(where()) as f:
+                    conf = dict(l.strip().split("=", 1) for l in f if "=" in l)
+                region = conf["region"]
+            except Exception:
+                return self.reply(500, b"configuration error\n")
+            try:
+                s = socket.create_connection(backend(), timeout=3)
+                s.sendall(b"GET / HTTP/1.0\r\n\r\n")
+                head = s.recv(64).split(b"\r\n")[0].decode()
+                s.close()
+            except OSError:
+                return self.reply(502, b"backend unavailable\n")
+            self.reply(200, ("report for %s: backend said %s\n" % (region, head)).encode())
+
+        def reply(self, code, body):
+            self.send_response(code)
+            self.end_headers()
+            self.wfile.write(body)
+
+        def log_message(self, fmt, *a):
+            print("request", a[1] if len(a) > 1 else "", flush=True)
+
+    http.server.HTTPServer(("0.0.0.0", 8080), H).serve_forever()
+    EOF
+    cat > $W/Dockerfile <<'EOF'
+    FROM python:3.12-alpine
+    COPY app /app
+    RUN python3 -m compileall -b -q /app && rm /app/*.py \
+     && mkdir -p /etc/report/conf.d \
+     && printf 'region=us-test\n' > /etc/report/settings.ini \
+     && adduser -D -u 1000 app \
+     && rm -rf /sbin /usr/sbin /usr/bin/[!p]* /bin
+    USER app
+    CMD ["python3", "/app/report.pyc"]
+    EOF
+    docker build -q -t kl/report:1 $W >/dev/null
+    rm -rf "$W"
+    docker run -d --name kl-report -p 127.0.0.1:18056:8080 kl/report:1 >/dev/null
+    docker inspect -f '{{.Id}} {{.State.StartedAt}}' kl-report > $KL_STATE/kl-report.id
+    lab_file /lab/settings.ini <<'EOF'
+    # report service settings
+    region=eu-central
+    EOF
+  check: |
+    info "Part 1: What is it looking for?"
+    check_eq "/lab/config-path.txt has the file it opens" "$(cat /lab/config-path.txt 2>/dev/null | tr -d '[:space:]')" /etc/report/conf.d/settings-v2.ini
+
+    info "Part 2: Who does it call?"
+    check_match "/lab/backend.txt has the backend address" "$(cat /lab/backend.txt 2>/dev/null | tr -d '[:space:]')" '^(127\.0\.0\.1|localhost):7056$'
+
+    info "Part 3: Fix it, without touching the container"
+    check_eq "kl-report is the same container, never restarted" "$(docker inspect -f '{{.Id}} {{.State.StartedAt}}' kl-report 2>/dev/null)" "$(cat $KL_STATE/kl-report.id)"
+    check "kl-report is running" "c_running kl-report"
+    check "the image still has no shell" "! docker exec kl-report sh -c true"
+    check "kl-backend runs on kl-report's network namespace" "c_running kl-backend && [[ \"\$(c_get kl-backend '{{.HostConfig.NetworkMode}}')\" == container:* ]]"
+    code=$(curl -s -o /tmp/kl-rep -w '%{http_code}' -m 8 127.0.0.1:18056)
+    check_eq "the service returns 200" "$code" 200
+    check "the report uses the team's settings" "grep -q '^report for eu-central: backend said HTTP/1.[01] [0-9]' /tmp/kl-rep"
+    rm -f /tmp/kl-rep
+  solve: |
+    echo /etc/report/conf.d/settings-v2.ini > /lab/config-path.txt
+    echo 127.0.0.1:7056 > /lab/backend.txt
+    docker cp /lab/settings.ini kl-report:/etc/report/conf.d/settings-v2.ini
+    docker run -d --name kl-backend --network container:kl-report python:3.12-alpine python3 -m http.server 7056
+    sleep 3
+
+- id: linux-057
+  title: The disk the container never sees
+  difficulty: 4
+  kind: fix
+  tags: [mounts, propagation, bind-mounts, docker, rslave, rshared]
+  tutorial: |
+    **Concept.** A bind mount copies a directory into a container's mount namespace, but what happens to mounts made *later*, under that directory, depends on its **propagation**:
+
+    - **private** (Docker's default, `rprivate`): no mount events cross in either direction. A disk mounted on the host after the container started is an empty directory inside.
+    - **slave** (`rslave`): mounts on the host propagate *into* the container, but nothing the container mounts comes back out.
+    - **shared** (`rshared`): mounts propagate both ways. Needed when a container, such as a storage driver, mounts things the host must see.
+
+    Propagation is fixed when the mount is created, so a running container can't be switched: it has to be recreated with `--mount type=bind,src=...,dst=...,bind-propagation=rslave` (or `-v SRC:DST:rslave`). The *source* side must allow it: for `rshared` and `rslave` the host mount the source lives on must itself be shared, which `findmnt -o TARGET,PROPAGATION` shows.
+
+    **Read up on:**
+    - The kernel's "Shared Subtrees" documentation, and `man 7 mount_namespaces`
+    - `findmnt -o TARGET,SOURCE,PROPAGATION`
+    - Docker's bind mount docs: "Configure bind propagation"
+    - `docker inspect -f '{{json .Mounts}}' NAME`, and its `Propagation` field
+  scenario: |
+    Disks for the media library are mounted on this host under **`/srv/kl-media`**, one
+    directory per disk, and new disks get mounted while everything is running.
+
+    **`kl-indexer`** lists every file on every disk, and serves the list on
+    **127.0.0.1:18057**. It started with `disk1` mounted. `disk2` was mounted later, and the
+    indexer still shows `disk2` as empty. **`kl-mounter`** is a privileged helper that
+    mounts a scratch cache at `/media/cache` for the other services; on the host,
+    `/srv/kl-media/cache` stays empty.
+
+    `docker inspect` shows how both were started. Recreate them, with the same names,
+    images, commands and options otherwise.
+
+    ## Part 1: The indexer sees every disk
+
+    `kl-indexer` must see disks mounted on the host at any time, including ones mounted
+    after it started, and must not be able to push any mount back to the host. It keeps
+    its read-only access.
+
+    ## Part 2: The cache reaches the host
+
+    The cache `kl-mounter` mounts must appear on the host at `/srv/kl-media/cache`, with the
+    `ready` file it writes.
+  hints:
+    - "`docker inspect -f '{{json .Mounts}}' kl-indexer | jq` shows `\"Propagation\": \"rprivate\"`. `docker inspect -f '{{.Config.Image}} {{json .Config.Cmd}}' kl-indexer` gives you what to recreate it with."
+    - "One direction only, host to container, is `rslave`. Both directions is `rshared`."
+    - "`-v /srv/kl-media:/media:ro,rslave` keeps it read-only. Don't forget the published port."
+    - "After recreating `kl-mounter`, check on the host: `findmnt /srv/kl-media/cache`."
+  solution: |
+    ```bash
+    docker inspect -f '{{.Config.Image}} {{json .Config.Cmd}} {{json .HostConfig.PortBindings}}' kl-indexer kl-mounter
+    docker rm -f kl-indexer kl-mounter
+    docker run -d --name kl-indexer -p 127.0.0.1:18057:8000 \
+      -v /srv/kl-media:/media:ro,rslave -v /opt/kl-media/indexer.py:/indexer.py:ro \
+      python:3.12-alpine python3 /indexer.py
+    docker run -d --name kl-mounter --privileged \
+      --mount type=bind,src=/srv/kl-media,dst=/media,bind-propagation=rshared \
+      alpine:3.22 sh -c 'mount -t tmpfs -o size=16m tmpfs /media/cache && echo ready > /media/cache/ready && exec sleep infinity'
+    curl -s 127.0.0.1:18057
+    findmnt /srv/kl-media/cache
+    ```
+  setup: |
+    on_reset 'docker rm -f kl-indexer kl-mounter >/dev/null 2>&1; umount -R -l /srv/kl-media 2>/dev/null; for i in 1 2 3; do losetup -j /var/tmp/kl-disk$i.img -O NAME -n 2>/dev/null | xargs -r -n1 losetup -d; done; rm -rf /srv/kl-media /opt/kl-media /var/tmp/kl-disk*.img'
+    mkdir -p /srv/kl-media/disk1 /srv/kl-media/disk2 /srv/kl-media/disk3 /srv/kl-media/cache /opt/kl-media
+    for i in 1 2 3; do
+      truncate -s 16M /var/tmp/kl-disk$i.img
+      mkfs.ext4 -q -F /var/tmp/kl-disk$i.img
+      mkdir -p /tmp/kl-d$i && mount -o loop /var/tmp/kl-disk$i.img /tmp/kl-d$i
+      for n in 1 2 3; do echo "film $n on disk $i" > /tmp/kl-d$i/film-$i-$n.mkv; done
+      rmdir /tmp/kl-d$i/lost+found 2>/dev/null; rm -rf /tmp/kl-d$i/lost+found
+      umount /tmp/kl-d$i && rmdir /tmp/kl-d$i
+    done
+    mount -o loop /var/tmp/kl-disk1.img /srv/kl-media/disk1
+    cat > /opt/kl-media/indexer.py <<'EOF'
+    import http.server, os
+
+    class H(http.server.BaseHTTPRequestHandler):
+        def do_GET(self):
+            out = []
+            for d in sorted(os.listdir("/media")):
+                p = os.path.join("/media", d)
+                if os.path.isdir(p):
+                    out += [d + "/" + f for f in sorted(os.listdir(p)) if f != "lost+found"]
+            body = ("\n".join(out) + "\n").encode()
+            self.send_response(200)
+            self.end_headers()
+            self.wfile.write(body)
+
+        def log_message(self, *a):
+            pass
+
+    http.server.HTTPServer(("0.0.0.0", 8000), H).serve_forever()
+    EOF
+    chmod 644 /opt/kl-media/indexer.py
+    docker run -d --name kl-indexer -p 127.0.0.1:18057:8000 \
+      -v /srv/kl-media:/media:ro -v /opt/kl-media/indexer.py:/indexer.py:ro \
+      python:3.12-alpine python3 /indexer.py >/dev/null
+    docker run -d --name kl-mounter --privileged -v /srv/kl-media:/media \
+      alpine:3.22 sh -c 'mount -t tmpfs -o size=16m tmpfs /media/cache && echo ready > /media/cache/ready && exec sleep infinity' >/dev/null
+    sleep 2
+    mount -o loop /var/tmp/kl-disk2.img /srv/kl-media/disk2
+  check: |
+    prop() { docker inspect -f '{{range .Mounts}}{{if eq .Destination "/media"}}{{.Propagation}} {{.RW}}{{end}}{{end}}' "$1" 2>/dev/null; }
+    idx() { curl -s -m 5 127.0.0.1:18057; }
+    info "Part 1: The indexer sees every disk"
+    check "kl-indexer is running" "c_running kl-indexer"
+    check_eq "its /media mount is rslave and read-only" "$(prop kl-indexer)" "rslave false"
+    eventually 10 "idx | grep -q '^disk1/film-1-1.mkv'"
+    check "it lists disk1" "idx | grep -q '^disk1/film-1-1.mkv'"
+    check "it lists disk2, mounted before it was recreated" "idx | grep -q '^disk2/film-2-3.mkv'"
+    if c_running kl-indexer && ! mountpoint -q /srv/kl-media/disk3; then
+      mount -o loop /var/tmp/kl-disk3.img /srv/kl-media/disk3
+      eventually 10 "idx | grep -q '^disk3/film-3-2.mkv'"
+      check "a disk mounted on the host now shows up in it" "idx | grep -q '^disk3/film-3-2.mkv'"
+      umount -l /srv/kl-media/disk3; losetup -j /var/tmp/kl-disk3.img -O NAME -n | xargs -r -n1 losetup -d
+    else
+      fail "a disk mounted on the host now shows up in it"
+    fi
+    check "it still runs indexer.py from python:3.12-alpine" "[ \"\$(c_get kl-indexer '{{.Config.Image}}')\" = python:3.12-alpine ] && c_get kl-indexer '{{json .Config.Cmd}}' | grep -q indexer.py"
+
+    info "Part 2: The cache reaches the host"
+    check "kl-mounter is running" "c_running kl-mounter"
+    check_eq "its /media mount is rshared" "$(prop kl-mounter | cut -d' ' -f1)" rshared
+    check "the host sees the cache as a tmpfs" "findmnt -no FSTYPE /srv/kl-media/cache | grep -qx tmpfs"
+    check "and the ready file in it" "grep -qx ready /srv/kl-media/cache/ready"
+  solve: |
+    docker rm -f kl-indexer kl-mounter
+    docker run -d --name kl-indexer -p 127.0.0.1:18057:8000 \
+      -v /srv/kl-media:/media:ro,rslave -v /opt/kl-media/indexer.py:/indexer.py:ro \
+      python:3.12-alpine python3 /indexer.py
+    docker run -d --name kl-mounter --privileged \
+      --mount type=bind,src=/srv/kl-media,dst=/media,bind-propagation=rshared \
+      alpine:3.22 sh -c 'mount -t tmpfs -o size=16m tmpfs /media/cache && echo ready > /media/cache/ready && exec sleep infinity'
+    sleep 3
+
+- id: linux-058
+  title: The noisy neighbour on the disk
+  difficulty: 4
+  kind: fix
+  tags: [cgroups, io, psi, systemd, io.max, performance]
+  tutorial: |
+    **Concept.** CPU and memory have obvious tools, but when a host is slow because of the disk, `top` shows little: processes waiting on I/O just sit there. cgroup v2 has the answers:
+
+    - **PSI** (pressure stall information): `io.pressure` in a cgroup says what share of time its tasks were stalled waiting for I/O (`some avg10=...`). `/proc/pressure/io` is the same for the whole host.
+    - **`io.stat`**: per-device counters for each cgroup, `rbytes`, `wbytes`, `rios`, `wios`. Read it twice and subtract to get a rate.
+    - **`io.max`**: a hard limit per device, `MAJ:MIN rbps=... wbps=... riops=... wiops=...`.
+
+    systemd puts each service in its own cgroup under `system.slice`, and sets `io.max` for you with `IOReadBandwidthMax=`, `IOWriteBandwidthMax=`, `IOReadIOPSMax=` and `IOWriteIOPSMax=`, given a device or a file on it. `systemctl set-property` applies a property at once and saves it as a drop-in (with `--runtime`, only until reboot).
+
+    **Read up on:**
+    - The kernel's PSI documentation (`Documentation/accounting/psi.rst`)
+    - The cgroup v2 documentation: the IO controller, `io.stat` and `io.max`
+    - `man systemd.resource-control`: `IOReadBandwidthMax=` and friends
+    - `systemctl set-property`, and where it stores what it sets
+    - `lsblk -o NAME,MAJ:MIN` and `findmnt -T PATH`
+  scenario: |
+    The ingest service on this host has become sluggish. Three services of ours run here:
+    **`kl-ingest`**, **`kl-backup`** and **`kl-report`**. Find the one hogging the disk and
+    rein it in.
+
+    ## Part 1: Find it
+
+    Write the unit name of the service that is saturating the disk to
+    **`/lab/culprit.txt`**. Note that the service using the most CPU isn't necessarily the
+    one you want.
+
+    ## Part 2: Limit it
+
+    Limit the culprit's reads from the disk it reads from to **10 MB/s** (either 10,000,000
+    or 10,485,760 bytes per second is fine). The limit must apply now, survive a reboot, and the service must keep
+    running and keep making progress. Don't change its `ExecStart=` or its script, and
+    leave the other two services as they are.
+  hints:
+    - "Each service's cgroup is `/sys/fs/cgroup/system.slice/NAME.service`. Compare `io.pressure` and `cpu.stat` across the three."
+    - "`cat io.stat`, wait five seconds, `cat` again: the `rbytes` that grows fastest is your culprit, and the `MAJ:MIN` at the start of the line is the device."
+    - "`systemctl set-property UNIT IOReadBandwidthMax='/dev/vda 10M'` applies and persists it; check with `cat .../io.max`."
+  solution: |
+    ```bash
+    for s in kl-ingest kl-backup kl-report; do
+      echo "== $s"; cat /sys/fs/cgroup/system.slice/$s.service/io.pressure
+      grep -h . /sys/fs/cgroup/system.slice/$s.service/io.stat
+    done
+    echo kl-backup.service > /lab/culprit.txt
+    findmnt -T /var/tmp -no SOURCE         # the disk it reads from
+    sudo systemctl set-property kl-backup.service IOReadBandwidthMax='/dev/vda 10M'
+    cat /sys/fs/cgroup/system.slice/kl-backup.service/io.max
+    ```
+
+    `set-property` without `--runtime` writes a drop-in under
+    `/etc/systemd/system.control/kl-backup.service.d/`, so the limit survives a reboot.
+  setup: |
+    on_reset 'systemctl stop kl-ingest kl-backup kl-report 2>/dev/null; rm -rf /etc/systemd/system/kl-ingest.service /etc/systemd/system/kl-backup.service /etc/systemd/system/kl-report.service /etc/systemd/system/kl-backup.service.d /etc/systemd/system.control/kl-backup.service.d /run/systemd/system.control/kl-backup.service.d /opt/kl-io /var/tmp/kl-archive.img; systemctl daemon-reload; true'
+    mkdir -p /opt/kl-io
+    dd if=/dev/urandom of=/var/tmp/kl-archive.img bs=1M count=192 status=none
+    sync
+    cat > /opt/kl-io/backup.sh <<'EOF'
+    #!/bin/bash
+    # re-reads the archive to verify it, over and over
+    while true; do
+      dd if=/var/tmp/kl-archive.img of=/dev/null bs=1M iflag=direct status=none
+    done
+    EOF
+    cat > /opt/kl-io/report.py <<'EOF'
+    import time
+    while True:
+        t = time.time()
+        while time.time() - t < 0.6:
+            pass
+        time.sleep(0.4)
+    EOF
+    cat > /opt/kl-io/ingest.sh <<'EOF'
+    #!/bin/bash
+    while true; do
+      dd if=/var/tmp/kl-archive.img of=/dev/null bs=4k count=1 skip=$((RANDOM * 1)) iflag=direct status=none
+      sleep 0.2
+    done
+    EOF
+    chmod 755 /opt/kl-io/*.sh
+    for s in backup ingest; do
+      printf '[Unit]\nDescription=KL %s\n[Service]\nExecStart=/opt/kl-io/%s.sh\n' "$s" "$s" > /etc/systemd/system/kl-$s.service
+    done
+    printf '[Unit]\nDescription=KL report\n[Service]\nExecStart=/usr/bin/python3 /opt/kl-io/report.py\n' > /etc/systemd/system/kl-report.service
+    systemctl daemon-reload
+    systemctl start kl-backup kl-ingest kl-report
+  check: |
+    C=/sys/fs/cgroup/system.slice/kl-backup.service
+    disk=$(lsblk -no PKNAME "$(findmnt -T /var/tmp/kl-archive.img -no SOURCE | head -1)" | head -1)
+    dev=$(lsblk -dno MAJ:MIN "/dev/${disk:-vda}" | tr -d ' ')
+    info "Part 1: Find it"
+    check_eq "/lab/culprit.txt names the culprit" "$(cat /lab/culprit.txt 2>/dev/null | tr -d '[:space:]' | sed 's/\.service$//')" kl-backup
+
+    info "Part 2: Limit it"
+    rb() { awk -v d="$dev" '$1==d {for(i=2;i<=NF;i++) if($i ~ /^rbytes=/){sub("rbytes=","",$i); print $i}}' $C/io.stat 2>/dev/null; }
+    check "kl-backup is running" "systemctl is-active -q kl-backup"
+    lim=$(grep -o "^$dev rbps=[0-9]*" $C/io.max 2>/dev/null | cut -d= -f2)
+    check "its io.max limits reads from $dev to 10 MB/s (rbps=${lim:-max})" "[ -n '$lim' ] && [ '$lim' -ge 10000000 ] && [ '$lim' -le 10485760 ]"
+    a=$(rb); sleep 5; b=$(rb)
+    r=$(( (${b:-0} - ${a:-0}) / 5 ))
+    check "it reads at most about 10 MB/s ($r B/s)" "[ -n '$a' ] && [ $r -le 12582912 ]"
+    check "and still makes progress" "[ $r -ge 2097152 ]"
+    check "the limit is saved for the next boot" "systemctl show -p DropInPaths --value kl-backup | tr ' ' '\n' | grep -v '^/run/' | xargs -r grep -l IOReadBandwidthMax | grep -q ."
+    check "ExecStart is unchanged" "systemctl show -p ExecStart --value kl-backup | grep -q 'path=/opt/kl-io/backup.sh'"
+    check "the other two are running, without limits" "systemctl is-active -q kl-ingest kl-report && [ -z \"\$(systemctl show -p IOReadBandwidthMax --value kl-ingest kl-report | tr -d '[:space:]')\" ]"
+  solve: |
+    echo kl-backup.service > /lab/culprit.txt
+    sudo systemctl set-property kl-backup.service IOReadBandwidthMax="$(findmnt -T /var/tmp -no SOURCE) 10M"
+
+- id: linux-059
+  title: Write the PID 1 your container is missing
+  difficulty: 4
+  kind: build
+  tags: [pid1, init, signals, zombies, namespaces, docker]
+  tutorial: |
+    **Concept.** PID 1 of a PID namespace has two jobs no other process has:
+
+    - **It adopts orphans.** When a process dies, its children are reparented to PID 1. When they exit, they stay as **zombies** until someone `wait()`s for them, and only PID 1 can. An init must reap *every* child, not only the one it started: `waitpid(-1, ...)` in a loop.
+    - **The kernel protects it from signals.** A signal with no handler installed is simply *ignored* when sent to PID 1, `SIGTERM` included. That's why `docker stop` on an app running as PID 1 often waits the full ten seconds and then sends `SIGKILL`, and the app never gets to clean up. An init installs handlers and **forwards** the signals to its child.
+
+    Finally, an init must **exit with its child's status**, so the exit code a supervisor sees is the app's: the same code if the child exited, `128 + N` if signal `N` killed it, the shell convention.
+
+    Tiny inits such as `tini` (`docker run --init`) do exactly this. Writing one makes the rules stick.
+
+    **Read up on:**
+    - `man 7 pid_namespaces`: "The namespace init process"
+    - `man 2 waitpid`: `-1`, `WNOHANG`; and `os.waitstatus_to_exitcode` in Python
+    - Python's `signal.signal`, `os.kill`, `subprocess.Popen`
+    - `unshare --pid --fork --mount-proc`, to test your init as a real PID 1 without Docker
+  scenario: |
+    **`/opt/kl-pid1/app.py`** is a worker that hands jobs to short-lived background processes
+    and doesn't wait for them, and that flushes its buffer to a file when it gets `SIGTERM`.
+    Run as PID 1 it fills up with zombies, and `docker stop` takes ten seconds and loses the
+    buffer.
+
+    ## Part 1: An init
+
+    Write **`/lab/init.py`**, run as `python3 /lab/init.py COMMAND [ARGS...]`. It must:
+
+    - start `COMMAND` and reap **every** process that ends up as its child, so no zombie
+      lasts more than a second
+    - forward `SIGTERM`, `SIGINT`, `SIGHUP`, `SIGQUIT`, `SIGUSR1` and `SIGUSR2` to the command
+    - exit when the command exits, with its exit code, or `128 + N` if signal `N` killed it
+
+    It must work as PID 1 of a new PID namespace. The standard library is enough.
+
+    ## Part 2: In the container
+
+    Run the worker in a container **`kl-worker`** from `python:3.12-alpine`, with your init
+    as its PID 1 (not Docker's `--init`), and the host directory **`/srv/kl-worker`**
+    mounted at `/out`, running `app.py /out/flushed`. `docker stop kl-worker` must finish in
+    a few seconds with the buffer flushed. Leave it running.
+  hints:
+    - "Start the child with `subprocess.Popen(sys.argv[1:])`. For each signal to forward: `signal.signal(sig, lambda s, f: os.kill(child.pid, s))`."
+    - "Ignore `SIGCHLD`? No: you need the children to stay waitable. Instead loop on `os.waitpid(-1, 0)`; each return is one reaped child, and when the pid is your main child, it's time to exit."
+    - "`os.waitpid` raises `InterruptedError` only on old Pythons; modern ones retry after a signal handler runs. `ChildProcessError` means no children are left."
+    - "`os.waitstatus_to_exitcode(status)` returns the exit code, or `-N` for a signal."
+    - "Test it as a real PID 1: `sudo unshare --pid --fork --mount-proc python3 /lab/init.py python3 /opt/kl-pid1/app.py /tmp/flushed`, then `ps -o pid,stat,cmd --ppid ...` from another terminal."
+    - "In Docker: `-v /lab/init.py:/init.py:ro -v /opt/kl-pid1/app.py:/app.py:ro` and the command `python3 /init.py python3 /app.py /out/flushed`."
+  solution: |
+    ```python
+    # /lab/init.py
+    import os, signal, subprocess, sys
+
+    child = subprocess.Popen(sys.argv[1:])
+    for s in (signal.SIGTERM, signal.SIGINT, signal.SIGHUP, signal.SIGQUIT, signal.SIGUSR1, signal.SIGUSR2):
+        signal.signal(s, lambda sig, frame: os.kill(child.pid, sig))
+
+    code = 0
+    while True:
+        try:
+            pid, status = os.waitpid(-1, 0)
+        except ChildProcessError:
+            break
+        if pid == child.pid:
+            rc = os.waitstatus_to_exitcode(status)
+            code = rc if rc >= 0 else 128 - rc
+            child.returncode = rc
+            break
+    # reap whatever is left, then leave with the child's status
+    try:
+        while os.waitpid(-1, os.WNOHANG)[0]:
+            pass
+    except ChildProcessError:
+        pass
+    sys.exit(code)
+    ```
+
+    ```bash
+    sudo mkdir -p /srv/kl-worker
+    docker run -d --name kl-worker -v /lab/init.py:/init.py:ro -v /opt/kl-pid1/app.py:/app.py:ro \
+      -v /srv/kl-worker:/out python:3.12-alpine python3 /init.py python3 /app.py /out/flushed
+    ```
+
+    The init reaps with `waitpid(-1)`, so orphans the worker's jobs leave behind are
+    collected too, and forwarding `SIGTERM` lets the worker run its own handler.
+  setup: |
+    on_reset 'rm -rf /opt/kl-pid1 /srv/kl-worker'
+    mkdir -p /opt/kl-pid1 /srv/kl-worker
+    chmod 777 /srv/kl-worker
+    cat > /opt/kl-pid1/app.py <<'EOF'
+    import os, signal, sys, time
+
+    out = sys.argv[1] if len(sys.argv) > 1 else "/tmp/flushed"
+    buf = []
+
+    def flush(sig, frame):
+        with open(out, "w") as f:
+            f.write("flushed %d jobs\n" % len(buf))
+        sys.exit(0)
+
+    signal.signal(signal.SIGTERM, flush)
+    while True:
+        # hand a job to a background process and forget it: the job's own process
+        # outlives the one that started it, so it is orphaned and reparented to PID 1
+        pid = os.fork()
+        if pid == 0:
+            if os.fork() == 0:
+                time.sleep(0.1)
+                os._exit(0)
+            os._exit(0)
+        os.waitpid(pid, 0)
+        buf.append(pid)
+        time.sleep(0.2)
+    EOF
+    chmod 644 /opt/kl-pid1/app.py
+    lab_file /lab/init.py <<'EOF'
+    # python3 /lab/init.py COMMAND [ARGS...]
+    import sys
+    sys.exit("not written yet")
+    EOF
+  check: |
+    zombies() { ps -o stat= --ppid "$1" 2>/dev/null | grep -c '^Z'; }
+    info "Part 1: An init"
+    rm -f /tmp/kl-flush1
+    unshare --pid --fork --mount-proc python3 /lab/init.py python3 /opt/kl-pid1/app.py /tmp/kl-flush1 </dev/null >/dev/null 2>&1 &
+    u=$!
+    sleep 4
+    ip=$(pgrep -P "$u" | head -1)
+    check "it runs the command as its child" "[ -n '$ip' ] && pgrep -P '$ip' -f kl-pid1/app.py"
+    z=0; for i in 1 2 3; do n=$(zombies "${ip:-0}"); [ "$n" -gt "$z" ] && z=$n; sleep 0.7; done
+    check_eq "orphans are reaped, no zombies pile up (most seen: $z)" "$([ -n "$ip" ] && [ "$z" -le 1 ] && echo ok)" ok
+    [ -n "$ip" ] && kill -TERM "$ip" 2>/dev/null
+    t0=$SECONDS; wait "$u" 2>/dev/null; rc=$?
+    check "SIGTERM to PID 1 reaches the app, which flushes" "[ -n '$ip' ] && grep -q '^flushed [0-9]* jobs' /tmp/kl-flush1"
+    check "and it exits within 2 seconds, with status 0 (got $rc)" "[ -n '$ip' ] && [ $((SECONDS - t0)) -le 2 ] && [ $rc = 0 ]"
+    rm -f /tmp/kl-flush1
+    timeout 10 unshare --pid --fork --mount-proc python3 /lab/init.py sh -c 'exit 7' </dev/null >/dev/null 2>&1
+    check_eq "it exits with the command's exit code" "$?" 7
+    timeout 10 unshare --pid --fork --mount-proc python3 /lab/init.py sh -c 'kill -9 $$' </dev/null >/dev/null 2>&1
+    check_eq "a command killed by signal 9 gives 137" "$?" 137
+    unshare --pid --fork --mount-proc python3 /lab/init.py python3 -c 'import signal,sys,time; signal.signal(signal.SIGUSR1, lambda *a: sys.exit(42)); time.sleep(30)' </dev/null >/dev/null 2>&1 &
+    u=$!; sleep 1.5; ip=$(pgrep -P "$u" | head -1)
+    [ -n "$ip" ] && kill -USR1 "$ip" 2>/dev/null
+    ( sleep 5; kill -9 "$u" 2>/dev/null ) & k=$!
+    wait "$u" 2>/dev/null; rc=$?; kill "$k" 2>/dev/null
+    check_eq "SIGUSR1 is forwarded too" "$rc" 42
+
+    info "Part 2: In the container"
+    check "kl-worker is running" "c_running kl-worker"
+    check "its PID 1 is your init" "docker exec kl-worker cat /proc/1/cmdline | tr '\0' ' ' | grep -q 'init.py .*app.py'"
+    check_not "it doesn't use Docker's --init" "[ \"\$(c_get kl-worker '{{.HostConfig.Init}}')\" = true ]"
+    if c_running kl-worker; then
+      hp=$(c_get kl-worker '{{.State.Pid}}')
+      sleep 2
+      check_eq "no zombies in the container" "$(zombies "$hp")" 0
+      rm -f /srv/kl-worker/flushed
+      t0=$SECONDS; docker stop -t 10 kl-worker >/dev/null; dt=$((SECONDS - t0))
+      check "docker stop finishes in a few seconds (${dt}s)" "[ $dt -le 4 ]"
+      check "with the buffer flushed to /srv/kl-worker/flushed" "grep -q '^flushed' /srv/kl-worker/flushed"
+      check_eq "and the container's exit code is the app's" "$(c_get kl-worker '{{.State.ExitCode}}')" 0
+      docker start kl-worker >/dev/null
+    else
+      fail "no zombies in the container"; fail "docker stop finishes in a few seconds"; fail "with the buffer flushed to /srv/kl-worker/flushed"
+    fi
+  solve: |
+    cat > /lab/init.py <<'EOF'
+    import os, signal, subprocess, sys
+
+    child = subprocess.Popen(sys.argv[1:])
+    for s in (signal.SIGTERM, signal.SIGINT, signal.SIGHUP, signal.SIGQUIT, signal.SIGUSR1, signal.SIGUSR2):
+        signal.signal(s, lambda sig, frame: os.kill(child.pid, sig))
+
+    code = 0
+    while True:
+        try:
+            pid, status = os.waitpid(-1, 0)
+        except ChildProcessError:
+            break
+        if pid == child.pid:
+            rc = os.waitstatus_to_exitcode(status)
+            code = rc if rc >= 0 else 128 - rc
+            child.returncode = rc
+            break
+    try:
+        while os.waitpid(-1, os.WNOHANG)[0]:
+            pass
+    except ChildProcessError:
+        pass
+    sys.exit(code)
+    EOF
+    docker run -d --name kl-worker -v /lab/init.py:/init.py:ro -v /opt/kl-pid1/app.py:/app.py:ro \
+      -v /srv/kl-worker:/out python:3.12-alpine python3 /init.py python3 /app.py /out/flushed
+    sleep 2

@@ -8,14 +8,14 @@ what to consolidate. The target doesn't lower the bar: a lab should carry a real
 scenario and teach a concept. The parts of this list that the existing exercises don't cover
 are not started.
 
-Exercise counts as of v0.13.0:
+Exercise counts as of v0.14.0:
 
 | Topic | Exercises | Target | Track | Module files |
 |---|---|---|---|---|
 | Docker | 149 | 250 | `docker` | `exercises/docker/` |
 | Kubernetes | 234 | 250 | `kubernetes` | `exercises/kubernetes/` |
 | Offensive security | 45 | 250 | `offsec` | `exercises/offsec/` |
-| Linux & systems | 34 | 250 | `linux` | `exercises/linux/` |
+| Linux & systems | 44 | 250 | `linux` | `exercises/linux/` |
 | Networking | 42 | 250 | `networking` | `exercises/networking/` |
 | Cloud & platform | 47 | 250 | `cloud` | `exercises/cloud/` |
 | Data | 37 | 250 | `data` | `exercises/data/` |
@@ -44,7 +44,7 @@ Exercise counts as of v0.13.0:
 3. **TLS & PKI**, before OpenVPN and the mail TLS exercises.
 4. **Degraded networks and VPN creation.**
 5. **DNS & email**, with DNS first, because MX records, SPF, DKIM and DMARC are all DNS.
-6. **Everything else**, in any order. Container internals is the most valuable of these.
+6. **Everything else**, in any order.
 
 ## Shared lab foundations
 
@@ -100,7 +100,7 @@ For Networking, Degraded networks, VPN creation and DNS & email.
 | **Shell & text processing** | Bash scripting, `awk`, `sed`, `jq`, log parsing, fixing buggy scripts | Any VM; very easy to check |
 | **Git** | Done in `exercises/linux/06-git.yaml`: merge and rebase conflicts, recovering lost work, hooks, cleaning secrets out of history; `bisect` in `linux-015` | Any VM; very easy to check |
 | **Performance debugging** | `strace`, `perf`, `bpftrace`, memory leaks, I/O bottlenecks, CPU throttling | Docker VM; checks are harder to write |
-| **Container internals** | Namespaces and cgroups by hand, building a container from scratch, `runc`, `ctr` and `crictl`, overlayfs | Docker VM or k8s nodes |
+| **Container internals** | Done in `exercises/linux/07-container-internals.yaml`: namespaces, cgroups, overlay layers, `runc`, user namespaces, capabilities, mount propagation, PID 1. Still to do: `ctr` and `crictl` against containerd | Docker VM or k8s nodes |
 | **QEMU & virtualization** | See below | Docker VM or a dedicated VM; needs nested KVM |
 
 Linux admin relies on other tracks for two topics: routing, DNS and firewalls are in
