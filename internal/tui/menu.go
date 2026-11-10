@@ -24,8 +24,6 @@ import (
 	tea "github.com/charmbracelet/bubbletea"
 	"github.com/charmbracelet/lipgloss"
 	"github.com/charmbracelet/x/ansi"
-
-	"awesome_labs/internal/exercise"
 )
 
 var (
@@ -105,47 +103,6 @@ func (m *model) press(k string) tea.Cmd {
 	return c
 }
 
-// target is the exercise the Exercise menu acts on.
-func (m *model) target() *exercise.Exercise {
-	switch m.screen {
-	case scrDetail:
-		return m.cur
-	case scrBrowse:
-		if len(m.visible) > 0 {
-			return m.visible[m.cursor]
-		}
-	case scrStarted:
-		if m.startedCursor < len(m.started) {
-			return m.started[m.startedCursor]
-		}
-	case scrExam:
-		if m.exam != nil && m.examCursor < len(m.exam.Questions) {
-			return m.cat.Get(m.exam.Questions[m.examCursor].ID)
-		}
-	case scrExamResult:
-		if m.finished != nil && m.examCursor < len(m.finished.Questions) {
-			return m.cat.Get(m.finished.Questions[m.examCursor].ID)
-		}
-	}
-	return nil
-}
-
-// onExercise runs key k on the exercise screen of the target exercise,
-// opening it first when another screen is showing.
-func (m *model) onExercise(k string) func() tea.Cmd {
-	return func() tea.Cmd {
-		if m.screen != scrDetail {
-			ex := m.target()
-			if ex == nil {
-				return nil
-			}
-			m.openDetail(ex, m.screen)
-		}
-		_, c := m.updateDetail(keyMsg(k))
-		return c
-	}
-}
-
 // leaveTo moves to screen s, through leave when on the exercise screen.
 func (m *model) leaveTo(s screen) func() tea.Cmd {
 	return func() tea.Cmd { return m.leave(func() tea.Cmd { m.goTo(s); return nil }) }
@@ -173,14 +130,15 @@ func (m *model) onEnv(k string) func() tea.Cmd {
 // sense on another screen are hidden rather than greyed out, and a menu left
 // with nothing to offer is dropped from the bar. Greyed-out items say why
 // when clicked.
+//
+// The exercise screen has no menus: its buttons and tabs do everything there,
+// and the keys that work everywhere (a, S, e, Q, F1) still do.
 func (m *model) menus() []menu {
-	ex := m.target()
-	noEx := ex == nil
-	locked := m.examLocked(ex)
-	onBrowse, onDetail, onEnv := m.screen == scrBrowse, m.screen == scrDetail, m.screen == scrEnv
-	onStarted, onExam, onResult := m.screen == scrStarted, m.screen == scrExam, m.screen == scrExamResult
-	const lockedWhy = "locked during this exam"
-	const inExamWhy = "progress can't be reset during an exam on this question"
+	if m.screen == scrDetail {
+		return nil
+	}
+	onBrowse, onEnv := m.screen == scrBrowse, m.screen == scrEnv
+	onExam, onResult := m.screen == scrExam, m.screen == scrExamResult
 
 	// a key is shown next to an item only where pressing it does the same thing
 	on := func(cond bool, k string) string {
@@ -189,102 +147,19 @@ func (m *model) menus() []menu {
 		}
 		return ""
 	}
-	exKey := func(k string) string { return on(onDetail, k) } // lab keys work on the exercise screen
 	press := func(k string) func() tea.Cmd { return func() tea.Cmd { return m.press(k) } }
-	// esc leads to the exercise list, except from the exercise and environments
-	// screens, which go back where they were opened from
-	backKey := on(!onDetail && !onEnv || onDetail && m.back == scrBrowse || onEnv && m.envBack == scrBrowse, "esc")
-	openKey := "enter"
-	if onResult {
-		openKey = "o"
-	}
 	quitKey := "Q" // q is taken off the exercise list
 	if onBrowse {
 		quitKey = "q"
 	}
-	file := menu{"File", 'f', []menuItem{
-		{label: "Exercise list", key: backKey, hidden: onBrowse, run: func() tea.Cmd {
-			if backKey != "" { // esc gets there, with whatever it says on the way
-				return m.press("esc")
-			}
-			return m.leaveTo(scrBrowse)()
-		}},
-		// only when there is one, and it is not the one already open
-		{label: "Go to the active exercise", key: "a", hidden: !m.hasActive || onDetail && m.isActive(m.cur),
-			run: func() tea.Cmd { m.goActive(); return nil }},
-		{label: "Started labs", key: "S", hidden: onStarted, run: m.leaveTo(scrStarted)},
-		sep(),
-		{label: "Quit and stop all VMs", key: quitKey, run: m.quitAndStop},
+	program := menu{"Program", 'p', []menuItem{
+		{label: "Exit", key: quitKey, run: m.quitAndStop},
 	}}
 
-	// the Exercise menu acts on the selected or open exercise
-	exm := menu{"Exercise", 'e', nil}
-	// on the list it stays, greyed out, when the filter leaves nothing selected
-	if onBrowse || !noEx && (onDetail || onStarted || onExam || onResult) {
-		var hasHints bool
-		if ex != nil {
-			hasHints = len(ex.Hints) > 0
-		}
-		active := m.isActive(ex)
-		startLabel := "Start the lab"
-		switch {
-		case active || m.wasStarted(ex):
-			startLabel = "Set the lab up again…"
-		case m.hasActive && m.exam == nil:
-			startLabel = "Start the lab…" // asks first: it replaces the active exercise
-		}
-		// Terminals and checks need the lab set up, and only the active exercise
-		// has it (every start resets the environment, in an exam too). Elsewhere
-		// they are offered only for it; on the exercise screen they say why not.
-		const notReady = "the lab isn't set up for it — start it first (s)"
-		labOnly := !active && !onDetail
-		noun := "exercise"
-		if onDetail {
-			noun = m.siblingNoun()
-		}
-		exm.items = []menuItem{
-			menuItem{label: "Open", key: openKey, hidden: onDetail, run: func() tea.Cmd { m.openDetail(ex, m.screen); return nil }}.
-				off(noEx, "nothing is selected"),
-			head("Lab", ""),
-			menuItem{label: startLabel, key: exKey("s"), run: m.onExercise("s")}.off(noEx, "nothing is selected"),
-			menuItem{label: "Open a terminal", key: exKey("t"), hidden: noEx || labOnly, run: m.onExercise("t")}.off(!active, notReady),
-			menuItem{label: "Terminal on node01", key: exKey("w"), hidden: noEx || labOnly || ex.Profile != exercise.ProfileK8s, run: m.onExercise("w")}.
-				off(!active, notReady),
-			menuItem{label: "Check my work", key: exKey("c"), hidden: noEx || labOnly, run: m.onExercise("c")}.off(!active, notReady),
-			// hints and the solution belong to the open exercise, not to a list
-			{label: "Help with it", sep: true, hidden: !onDetail},
-			menuItem{label: "Show the next hint", key: "h", hidden: !onDetail, run: m.onExercise("h")}.
-				off(noEx, "nothing is selected").off(locked, "hints are "+lockedWhy).off(!hasHints, "this exercise has no hints"),
-			menuItem{label: "Reveal the solution…", key: "v", hidden: !onDetail, run: m.onExercise("v")}.
-				off(noEx, "nothing is selected").off(locked, "the solution is "+lockedWhy),
-			sep(),
-			// nothing to reset on an exercise never tried
-			menuItem{label: "Reset my progress…", key: exKey("R"), hidden: onStarted || !m.hasProgress(ex), run: m.onExercise("R")}.
-				off(m.inExam(ex), inExamWhy),
-			// the started-labs list resets in place, with its own key
-			menuItem{label: "Reset my progress…", key: "r", hidden: !onStarted, run: press("r")}.off(m.inExam(ex), inExamWhy),
-			menuItem{label: "Reset all started labs…", key: "A", hidden: !onStarted, run: press("A")}.
-				off(len(m.started) == 0, "no labs are started"),
-			sep(),
-			{label: "Next " + noun, key: "n", hidden: !onDetail, run: m.onExercise("n")},
-			{label: "Previous " + noun, key: "N", hidden: !onDetail, run: m.onExercise("N")},
-		}
-	}
-
-	// View shapes the exercise list, or picks the tab of the exercise screen
+	// View and Tracks shape the exercise list
 	view := menu{"View", 'v', nil}
 	tracks := menu{title: "Tracks", acc: 't'}
-	switch {
-	case onDetail:
-		view.items = []menuItem{head("Tab", "tab")}
-		for i, name := range tabNames {
-			it := menuItem{label: name, key: fmt.Sprint(i + 1), checked: m.tab == tab(i), run: press(fmt.Sprint(i + 1))}
-			if tab(i) == tabSolution {
-				it = it.off(locked, "the solution is "+lockedWhy)
-			}
-			view.items = append(view.items, it)
-		}
-	case onBrowse:
+	if onBrowse {
 		view.items = []menuItem{
 			{label: "Filter…", key: "/", run: func() tea.Cmd {
 				m.filterOn = true
@@ -364,7 +239,7 @@ func (m *model) menus() []menu {
 	}}
 
 	var out []menu
-	for _, mn := range []menu{file, exm, view, tracks, envs, exams, help} {
+	for _, mn := range []menu{program, view, tracks, envs, exams, help} {
 		if mn.items = visibleItems(mn.items); len(mn.items) > 0 {
 			out = append(out, mn)
 		}
@@ -420,20 +295,20 @@ func visibleItems(items []menuItem) []menuItem {
 	return out
 }
 
-// quitAndStop is every way out of the app: it stops all lab VMs, then quits.
-// While an operation is running it refuses; ctrl+c then quits at once and
-// leaves the VMs running.
+// quitAndStop is every way out of the app: it deletes every lab VM, running
+// or stopped (none should be left by then), then quits. While an operation is
+// running it refuses; ctrl+c then quits at once and leaves the VMs as they are.
 func (m *model) quitAndStop() tea.Cmd {
 	if m.quitting {
 		return nil
 	}
 	if m.op != "" {
-		m.flash = "busy: " + m.op + " — ctrl+c quits now, leaving the VMs running"
+		m.flash = "busy: " + m.op + " — ctrl+c exits now, leaving the VMs as they are"
 		return nil
 	}
 	m.quitting = true
-	m.flash = "stopping all lab VMs…"
-	return func() tea.Msg { return stoppedMsg{m.mgr.StopAll(context.Background(), io.Discard)} }
+	m.flash = "deleting all lab VMs…"
+	return func() tea.Msg { return stoppedMsg{m.deleteVMs(context.Background(), io.Discard)} }
 }
 
 // goActive opens the exercise set up on the VMs. It goes back to the exam
@@ -614,7 +489,9 @@ func (m *model) globalKey(k string) (tea.Cmd, bool) {
 	}
 	switch k {
 	case "f10":
-		m.openMenu(0)
+		if len(m.menus()) > 0 { // the exercise screen has none
+			m.openMenu(0)
+		}
 		return nil, true
 	case "f1":
 		m.modal = shortcutsText
@@ -627,9 +504,8 @@ func (m *model) globalKey(k string) (tea.Cmd, bool) {
 	return m.navKey(k)
 }
 
-// navKey handles the File and VMs menu keys that work on every screen: a
-// (active exercise), S (started labs), e (environments) and Q (quit and stop
-// the VMs). Not while typing a filter, and not on a screen that gives the key
+// navKey handles the keys that work on every screen: a (active exercise),
+// S (started labs), e (environments) and Q (exit, deleting the VMs). Not while typing a filter, and not on a screen that gives the key
 // its own meaning (S and e lead back from their own screens). These are the
 // screen handlers' only copies of these keys.
 func (m *model) navKey(k string) (tea.Cmd, bool) {
@@ -1101,9 +977,9 @@ func formatLeft(d time.Duration) string {
 
 const shortcutsText = `Keyboard shortcuts
 
-Everywhere      F10 menu bar · alt+f/e/v/t/m/x/h open a menu · F1 this help
+Everywhere      F10 menu bar (not on the exercise screen) · alt+f/v/t/m/x/h open a menu · F1 this help
                 a active exercise · S started labs · e environments & VMs
-                Q (q on the list) quit and stop all VMs · ctrl+c the same; while busy or stopping, quit at once
+                Q (q on the list) exit and delete all lab VMs · ctrl+c the same; while busy or deleting, exit at once
 
 Exercise list   ↑↓ move · enter open · / filter · esc clear filter
                 tab next track · n/p next/previous module
@@ -1137,7 +1013,8 @@ const mouseText = `Using the mouse
 • Click the tabs and buttons on the exercise screen.
 • The wheel scrolls lists and text.
 • Click Yes or No in a confirmation.
-• A greyed-out menu item or a dimmed button says why when you click it.
+• A greyed-out menu item or a dimmed button says why when you click it;
+  buttons are lit only when they can act.
 
 Most terminals select text with shift+drag while the mouse is in use.`
 

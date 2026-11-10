@@ -81,6 +81,7 @@ func newTestModel(t *testing.T) *model {
 	m := newModel(Deps{Catalog: cat, Manager: &lab.Manager{StateDir: dir}, Progress: prog, Exams: exam.NewStore(dir)}, "dark")
 	m.Update(tea.WindowSizeMsg{Width: 150, Height: 50})
 	m.endLab = func(context.Context, *exercise.Exercise, io.Writer) error { return nil } // never the real VMs
+	m.deleteVMs = func(context.Context, io.Writer) error { return nil }
 	m.op = busyOp
 	return m
 }
@@ -340,18 +341,10 @@ func buildEnding(t *testing.T) (*model, chan string) {
 
 func TestLeavingTheActiveExerciseStopsIt(t *testing.T) {
 	ways := map[string]func(t *testing.T, m *model){
-		"esc":                  func(t *testing.T, m *model) { m.Update(keyMsg("esc")) },
-		"q":                    func(t *testing.T, m *model) { m.Update(keyMsg("q")) },
-		"S":                    func(t *testing.T, m *model) { m.Update(keyMsg("S")) },
-		"n":                    func(t *testing.T, m *model) { m.Update(keyMsg("n")) },
-		"File → Exercise list": func(t *testing.T, m *model) { m.choose(t, "File", "Exercise list") },
-		"File → Started labs":  func(t *testing.T, m *model) { m.choose(t, "File", "Started labs") },
-		"Exam → New exam…":     func(t *testing.T, m *model) { m.choose(t, "Exam", "New exam…") },
-		"Exercise → Next":      func(t *testing.T, m *model) { m.choose(t, "Exercise", "Next exercise") },
-		"Exam → Last result": func(t *testing.T, m *model) {
-			m.finished = &exam.Exam{Finished: time.Now()}
-			m.choose(t, "Exam", "Last result")
-		},
+		"esc":                      func(t *testing.T, m *model) { m.Update(keyMsg("esc")) },
+		"q":                        func(t *testing.T, m *model) { m.Update(keyMsg("q")) },
+		"S":                        func(t *testing.T, m *model) { m.Update(keyMsg("S")) },
+		"n":                        func(t *testing.T, m *model) { m.Update(keyMsg("n")) },
 		"mouse on the Back button": func(t *testing.T, m *model) { m.press("esc") },
 	}
 	for name, do := range ways {
@@ -376,6 +369,23 @@ func TestLeavingTheActiveExerciseStopsIt(t *testing.T) {
 	m.Update(keyMsg("esc"))
 	if m.screen != scrBrowse || !strings.Contains(m.flash, "busy") {
 		t.Errorf("busy: screen %v, flash %q", m.screen, m.flash)
+	}
+}
+
+// The exercise screen has no menus: its buttons do everything there.
+func TestExerciseScreenHasNoMenus(t *testing.T) {
+	m := build(t, named("exercise set up on the VMs"), false)
+	if mns := m.menus(); len(mns) != 0 {
+		t.Fatalf("the exercise screen has %d menus", len(mns))
+	}
+	for _, k := range []tea.KeyMsg{{Type: tea.KeyF10}, {Type: tea.KeyRunes, Runes: []rune("f"), Alt: true}} {
+		m.Update(k)
+		if m.menuOpen >= 0 || m.screen != scrDetail {
+			t.Errorf("%s: menu %d, screen %v", k, m.menuOpen, m.screen)
+		}
+	}
+	if out := m.View(); !strings.Contains(out, "awesome_labs") {
+		t.Error("no title bar on the exercise screen")
 	}
 }
 
@@ -469,9 +479,6 @@ func TestNextWalksTheListItCameFrom(t *testing.T) {
 	m = newTestModel(t)
 	m.runningExam("d-2", "k-1")
 	m.openDetail(m.ex(t, "d-2"), scrExam)
-	if _, ok := m.item("Exercise", "Next question"); !ok {
-		t.Error("an exam question offers no Next question")
-	}
 	m.Update(keyMsg("n"))
 	if m.cur.ID != "k-1" || m.examCursor != 1 || m.back != scrExam {
 		t.Errorf("exam: on %s, exam cursor %d, back %v", m.cur.ID, m.examCursor, m.back)
@@ -482,21 +489,45 @@ func TestNextWalksTheListItCameFrom(t *testing.T) {
 // is open.
 func TestMenuHighlightFollowsItsItem(t *testing.T) {
 	m := newTestModel(t)
-	m.openDetail(m.ex(t, "d-1"), scrBrowse)
 	for i, mn := range m.menus() {
-		if mn.title == "Exercise" {
+		if mn.title == "View" {
 			m.openMenu(i)
 		}
 	}
-	m.menuSel = "Next exercise"
-	m.prog.MarkStarted("d-1") // brings "Reset my progress…" in above it
-	if _, ok := m.item("Exercise", "Reset my progress…"); !ok {
-		t.Fatal("no Reset item after starting")
+	m.menuSel = "Choose a learning path…"
+	m.filter.SetValue("zzz") // brings "Clear the filter" in above it
+	if _, ok := m.item("View", "Clear the filter"); !ok {
+		t.Fatal("no clear-filter item with a filter set")
 	}
 	m.Update(keyMsg("enter"))
-	if m.confirm != "" || m.cur.ID != "d-2" {
-		t.Errorf("enter ran the wrong item: on %s, confirm %q", m.cur.ID, m.confirm)
+	if m.screen != scrPaths {
+		t.Errorf("enter ran the wrong item: screen %v", m.screen)
 	}
+}
+
+// The Program menu holds only Exit, and exiting deletes the VMs.
+func TestProgramMenuIsOnlyExit(t *testing.T) {
+	m := build(t, named("list"), false)
+	mn := m.menus()[0]
+	if mn.title != "Program" || len(mn.items) != 1 || mn.items[0].label != "Exit" {
+		t.Fatalf("first menu %q has %d items", mn.title, len(mn.items))
+	}
+	mn.items[0].run()
+	if !m.quitting || !strings.Contains(m.flash, "deleting") {
+		t.Errorf("exit: quitting %v, flash %q", m.quitting, m.flash)
+	}
+}
+
+// btn finds the button labelled label among bs.
+func btn(t *testing.T, bs []button, label string) button {
+	t.Helper()
+	for _, b := range bs {
+		if b.label == label {
+			return b
+		}
+	}
+	t.Fatalf("no %q button", label)
+	return button{}
 }
 
 // Every start resets the environment, so only the active exercise has its lab,
@@ -506,20 +537,13 @@ func TestLabActionsNeedTheActiveExercise(t *testing.T) {
 	m.runningExam("d-1", "d-2")
 	m.prog.MarkStarted("d-2") // started earlier in the exam…
 	m.activate(t, "d-1")      // …then replaced by d-1
-	m.screen = scrExam
-	m.examCursor = 1
-	if _, ok := m.item("Exercise", "Check my work"); ok {
-		t.Error("the exam screen offers a check for a question whose lab was reset")
-	}
-	m.examCursor = 0
-	if _, ok := m.item("Exercise", "Check my work"); !ok {
-		t.Error("the exam screen offers no check for the active question")
-	}
-
-	m.openDetail(m.ex(t, "d-2"), scrExam)
 	m.op = ""
-	if it, _ := m.item("Exercise", "Check my work"); !it.disabled {
-		t.Error("Check my work is enabled for a question whose lab was reset")
+	if btn(t, m.detailButtons(m.ex(t, "d-1")), "✔ Check").off {
+		t.Error("Check is dimmed for the active question")
+	}
+	m.openDetail(m.ex(t, "d-2"), scrExam)
+	if !btn(t, m.detailButtons(m.cur), "✔ Check").off {
+		t.Error("Check is lit for a question whose lab was reset")
 	}
 	m.Update(keyMsg("c"))
 	if m.op != "" || !strings.Contains(m.flash, "isn't set up") {
@@ -556,8 +580,58 @@ func TestStartedLabsResetChecks(t *testing.T) {
 	m.runningExam("d-1")
 	m.prog.MarkStarted("d-1")
 	m.openStarted()
-	if it, _ := m.item("Exercise", "Reset my progress…"); !it.disabled {
-		t.Error("Reset is enabled for a question of the running exam")
+	if !btn(t, m.startedButtons(), "Reset selected").off {
+		t.Error("Reset selected is lit for a question of the running exam")
+	}
+}
+
+// A button is lit only when pressing it can act now.
+func TestButtonsLitOnlyWhenTheyApply(t *testing.T) {
+	lit := func(bs []button) string {
+		var out []string
+		for _, b := range bs {
+			if !b.off {
+				out = append(out, b.label)
+			}
+		}
+		return strings.Join(out, ",")
+	}
+	cases := []struct {
+		scenario string
+		busy     bool
+		want     string
+	}{
+		{"exercise never started", false, "▶ Start,Hint,Solution,Back"},
+		{"exercise set up on the VMs", false, "↻ Restart,Terminal,✔ Check,Hint,Solution,Reset,Back"},
+		{"exercise set up on the VMs", true, "Hint,Solution,Back"},
+		{"exercise while another is set up", false, "▶ Start,Solution,Back"}, // d-2 has no hints
+		{"kubernetes exercise set up", false, "↻ Restart,Terminal,node01,✔ Check,Hint,Solution,Reset,Back"},
+		{"exam question", false, "↻ Restart,Terminal,✔ Check,Back"},
+	}
+	for _, c := range cases {
+		m := build(t, named(c.scenario), c.busy)
+		if got := lit(m.detailButtons(m.cur)); got != c.want {
+			t.Errorf("%s (busy %v): lit %q, want %q", c.scenario, c.busy, got, c.want)
+		}
+	}
+	m := build(t, named("started labs"), false)
+	if got := lit(m.startedButtons()); got != "Open,Reset selected,Reset all,Back" {
+		t.Errorf("started labs: lit %q", got)
+	}
+	m.started = nil
+	if got := lit(m.startedButtons()); got != "Back" {
+		t.Errorf("no started labs: lit %q", got)
+	}
+}
+
+func TestShellReturnTurnsTheMouseBackOn(t *testing.T) {
+	m := newTestModel(t)
+	_, c := m.Update(shellDoneMsg{})
+	if c == nil {
+		t.Fatal("no command after the shell")
+	}
+	if msg := c(); msg != tea.EnableMouseAllMotion() {
+		t.Errorf("after the shell: %T, want the mouse turned back on", msg)
 	}
 }
 
@@ -595,5 +669,30 @@ func TestQuitStopsTheVMs(t *testing.T) {
 	}
 	if _, c := m.Update(keyMsg("ctrl+c")); c == nil {
 		t.Error("ctrl+c while busy did not quit")
+	}
+}
+
+// Starting the app deletes the lab VMs left over from an earlier run and
+// forgets the exercise that was set up on them.
+func TestStartDeletesLeftoverVMs(t *testing.T) {
+	m := newTestModel(t)
+	m.op = ""
+	m.activate(t, "d-1")
+	deleted := make(chan struct{}, 1)
+	m.deleteVMs = func(context.Context, io.Writer) error { deleted <- struct{}{}; return nil }
+	m.Init()
+	if m.op == "" {
+		t.Fatal("start did not begin deleting the VMs")
+	}
+	select {
+	case <-deleted:
+	case <-time.After(2 * time.Second):
+		t.Fatal("start never deleted the VMs")
+	}
+	for msg := range m.opCh {
+		m.Update(msg)
+	}
+	if m.op != "" || m.hasActive {
+		t.Errorf("after the cleanup: op %q, active %v", m.op, m.hasActive)
 	}
 }

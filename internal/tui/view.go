@@ -297,34 +297,42 @@ func (m *model) viewDetail() string {
 		x += lipgloss.Width(t)
 	}
 	tabRow := strings.Join(tabs, "")
-	// terminals and checks need the lab set up, which only the active
-	// exercise has: dimmed otherwise, they say why when pressed
-	active := m.isActive(e)
-	start := "▶ Start"
-	if active {
-		start = "↻ Restart"
-	}
-	bs := []button{{label: start, key: "s"}, {label: "Terminal", key: "t", off: !active}}
-	if e.Profile == exercise.ProfileK8s {
-		bs = append(bs, button{label: "node01", key: "w", off: !active})
-	}
-	bs = append(bs, button{label: "✔ Check", key: "c", off: !active})
-	if !m.examLocked(e) {
-		bs = append(bs, button{label: "Hint", key: "h"}, button{label: "Solution", key: "v"})
-	}
-	bs = append(bs, button{label: "Back", key: "esc"})
+	bs := m.detailButtons(e)
 	if bare, bw, ok := fitButtons(m.w-x-2, bs); ok {
 		gap := m.w - x - bw
 		tabRow += strings.Repeat(" ", gap) + m.buttons(x+gap, 1, bare, bs...)
 	}
 	box := sBorder.Width(m.w - 2).Render(m.vp.View())
-	// the buttons above and the menus cover the actions; list only the rest
+	// the buttons above cover the actions; list only the rest
 	back := map[screen]string{scrStarted: "started labs", scrExam: "exam", scrExamResult: "exam result"}[m.back]
 	if back == "" {
 		back = "list"
 	}
-	help := "←→ switch tab · n/N next/previous " + m.siblingNoun() + " · esc back to the " + back + " · F10 menu · F1 keys"
+	help := "←→ switch tab · n/N next/previous " + m.siblingNoun() + " · esc back to the " + back + " · F1 keys"
 	return lipgloss.JoinVertical(lipgloss.Left, title, tabRow, box, m.statusLine(help))
+}
+
+// detailButtons are the buttons of the exercise screen. A button is lit only
+// when pressing it can act now; dimmed, it says why when pressed. Terminals and
+// checks need the lab set up, which only the active exercise has.
+func (m *model) detailButtons(e *exercise.Exercise) []button {
+	active := m.isActive(e)
+	busy := m.op != ""
+	locked := m.examLocked(e)
+	start := "▶ Start"
+	if active {
+		start = "↻ Restart"
+	}
+	bs := []button{{label: start, key: "s", off: busy}, {label: "Terminal", key: "t", off: !active || busy}}
+	if e.Profile == exercise.ProfileK8s {
+		bs = append(bs, button{label: "node01", key: "w", off: !active || busy})
+	}
+	bs = append(bs, button{label: "✔ Check", key: "c", off: !active || busy},
+		button{label: "Hint", key: "h", off: locked || len(e.Hints) == 0},
+		button{label: "Solution", key: "v", off: locked},
+		button{label: "Reset", key: "R", off: m.forgetBlocked(e) != ""},
+		button{label: "Back", key: "esc"})
+	return bs
 }
 
 func (m *model) refreshViewport(follow bool) {
@@ -386,9 +394,18 @@ func (m *model) refreshViewport(follow bool) {
 	}
 }
 
+// startedButtons are the buttons of the started-labs screen, lit only when
+// they can act.
+func (m *model) startedButtons() []button {
+	none := len(m.started) == 0
+	selOff := none || m.forgetBlocked(m.started[min(m.startedCursor, len(m.started)-1)]) != ""
+	return []button{{label: "Open", key: "enter", off: none}, {label: "Reset selected", key: "r", off: selOff},
+		{label: "Reset all", key: "A", off: none || m.op != ""}, {label: "Back", key: "esc"}}
+}
+
 func (m *model) viewStarted() string {
 	title := sTitle.Render(" Your labs ") + sMuted.Render("one exercise is set up on the VMs at a time") + "   "
-	title = m.titleButtons(title, 0, button{label: "Open", key: "enter"}, button{label: "Reset selected", key: "r"}, button{label: "Reset all", key: "A"}, button{label: "Back", key: "esc"})
+	title = m.titleButtons(title, 0, m.startedButtons()...)
 	if len(m.started) == 0 {
 		return lipgloss.JoinVertical(lipgloss.Left, title, "",
 			sMuted.Render("  No started labs. Start a lab with s on an exercise."),
@@ -445,8 +462,10 @@ func (m *model) viewEnv() string {
 	var b strings.Builder
 	b.WriteString("\n")
 	t := sTitle.Render(" Lab environments & VMs") + "   "
-	b.WriteString(m.titleButtons(t, 1, button{label: "Start", key: "u"}, button{label: "Stop", key: "x"}, button{label: "Reset", key: "R"},
-		button{label: "Rebuild", key: "B"}, button{label: "Delete", key: "D"}, button{label: "Stop all", key: "X"}, button{label: "Delete all", key: "K"}, button{label: "Refresh", key: "r"}, button{label: "Back", key: "esc"}) + "\n\n")
+	busy := m.op != "" // every VM action waits for the running one
+	b.WriteString(m.titleButtons(t, 1, button{label: "Start", key: "u", off: busy}, button{label: "Stop", key: "x", off: busy}, button{label: "Reset", key: "R", off: busy},
+		button{label: "Rebuild", key: "B", off: busy}, button{label: "Delete", key: "D", off: busy}, button{label: "Stop all", key: "X", off: busy},
+		button{label: "Delete all", key: "K", off: busy}, button{label: "Refresh", key: "r"}, button{label: "Back", key: "esc"}) + "\n\n")
 	for i, env := range lab.AllEnvs() {
 		st, ok := m.envStatus[env.Profile]
 		if !ok {

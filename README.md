@@ -10,7 +10,7 @@ exercise has a scenario, progressive hints and a full solution you can reveal, a
 have a short tutorial on the concepts and commands to read first.
 
 ```text
- awesome_labs  File  Exercise  View  Tracks  VMs  Exam  Help     ✔ 37/726 solved  ● 2 started, unsolved
+ awesome_labs  Program  View  Tracks  VMs  Exam  Help            ✔ 37/726 solved  ● 2 started, unsolved
  All  Docker  Kubernetes  Offensive Sec  Linux  Networking  Cloud  Data  Defensive Sec  Programming  Data Science
 ╭──────────────────────────────────────────────╮╭───────────────────────────────────────────────╮
 │▸ Kubernetes · Troubleshooting the cluster     ││k8s-245 — The API server is gone               │
@@ -117,22 +117,25 @@ builds one for Linux and macOS on x86-64 and ARM into `dist/`, with checksums.
 
 ### Menus and the mouse
 
-Everything is also reachable from the **menu bar** at the top: click a menu, press
-`F10`, or `alt` + the underlined letter (`alt+f` File, `alt+e` Exercise, `alt+v` View,
+Away from the exercise screen, everything is also reachable from the **menu bar** at the top: click a menu, press
+`F10`, or `alt` + the underlined letter (`alt+f` File, `alt+v` View,
 `alt+t` Tracks, `alt+m` VMs, `alt+x` Exam, `alt+h` Help). Menu items show their
 keyboard shortcut only on the screens where pressing that key does the same thing, so a
 shown key works with the menu open or closed. `a` (active exercise), `S` (started labs),
 `e` (environments & VMs) and `Q` (quit) work on every screen.
 
-Menus only offer what applies to the current screen. **Exercise** acts on the selected
-exercise on the list, the exercise screen, Started labs and the exam screens; hints and the
-solution appear only once the exercise is open. Opening a terminal and checking your work
-need the lab set up, and only the active exercise has it (every start resets the
-environment, in an exam too). Away from the exercise screen they are offered only for that
-exercise; on it they are greyed out, like the Terminal and Check buttons. Resetting
-progress is offered only for an exercise you have tried. **File** moves between the
-exercise screens. **View** and **Tracks** shape the list: View also holds learning paths,
-and picks the tab on the exercise screen. **VMs** holds everything about the lab
+Menus only offer what applies to the current screen. What you do with an exercise lives
+on the exercise screen itself, as the buttons along its tab row (Start, Terminal, Check,
+Hint, Solution, Reset, Back). A button is lit only when pressing it can act now and is
+dimmed otherwise, saying why when you press it: Terminal and Check need the lab set up,
+and only the active exercise has it (every start resets the environment, in an exam too);
+nothing that touches the lab runs while another operation is busy; Hint needs hints and
+Reset needs progress to reset; hints, the solution and resetting are locked during an
+exam. The Started labs and environments screens dim their buttons the same way.
+
+The exercise screen itself has no menus: its buttons and tabs do everything there, and the
+keys that work on every screen still do. Elsewhere, **File** moves between the screens.
+**View** and **Tracks** shape the list: View also holds learning paths. **VMs** holds everything about the lab
 environments. **View → Show** filters the list by progress: all, solved, in progress
 (started, not solved) or no progress. **Tracks** shows how many exercises of each track you
 have solved. A greyed-out item says why when you pick it.
@@ -158,7 +161,7 @@ shortcut. While the mouse is in use, most terminals select text with `shift`+dra
 | `a` | jump to the exercise you're **working on** (shown as `▶` in the header and list) |
 | `S` | your labs: the active exercise, then others started earlier and not solved |
 | `e` | environments & VMs: live state of every VM; create, stop, reset, rebuild, delete — `X` stops all, `K` deletes all |
-| `Q` (`q` on the list, `ctrl+c`) | quit — always **powers off all lab VMs** first (`ctrl+c` while busy or stopping quits at once and leaves them running) |
+| `Q` (`q` on the list, `ctrl+c`, Program → Exit) | exit — always **deletes every lab VM**, running or stopped, first, and starting the app deletes any left over (`ctrl+c` while busy or deleting exits at once and leaves them as they are) |
 
 ### In an exercise
 
@@ -218,7 +221,7 @@ awesome_labs exam history    # past results
 
 Only one environment needs to run at a time. With `auto_stop: true` (the default),
 starting a Docker exercise stops the Kubernetes VMs and vice versa, and solving an exercise
-stops its VMs (except during an exam); quitting always powers off every lab VM. Settings live in `~/.awesome_labs/config.yaml`:
+stops its VMs (except during an exam); exiting always deletes every lab VM, running or stopped, and starting deletes any left over. Settings live in `~/.awesome_labs/config.yaml`:
 
 ```yaml
 auto_stop: true

@@ -110,6 +110,8 @@ type model struct {
 	envBack   screen // where the environments screen returns to
 	// endLab ends the active exercise and stops its VMs; tests replace it
 	endLab func(ctx context.Context, ex *exercise.Exercise, w io.Writer) error
+	// deleteVMs deletes every lab VM, on start and on exit; tests replace it
+	deleteVMs func(ctx context.Context, w io.Writer) error
 
 	// the one exercise set up on the VMs right now
 	active    lab.Active
@@ -200,6 +202,7 @@ func newModel(d Deps, style string) *model {
 		paths: d.Paths, exams: d.Exams, setupCount: 1, setupMins: 1, menuOpen: -1,
 	}
 	m.endLab = mgr.EndExercise
+	m.deleteVMs = mgr.DeleteAll
 	m.exam = d.Exams.Current()
 	if m.exam != nil && m.exam.Over() {
 		m.finishExam()
@@ -221,7 +224,19 @@ func (m *model) isActive(ex *exercise.Exercise) bool {
 	return ex != nil && m.hasActive && m.active.ID == ex.ID
 }
 
-func (m *model) Init() tea.Cmd { return tea.Batch(m.spin.Tick, tick()) }
+// Init starts by deleting every lab VM left over from an earlier run,
+// running or stopped: exiting deletes them, so any still there were left by a
+// crash or a ctrl+c while busy. No exercise is set up on the VMs after it.
+func (m *model) Init() tea.Cmd {
+	cleanup := m.startOp("cleanup", "Deleting leftover lab VMs", "env", func(ctx context.Context, w io.Writer) (bool, error) {
+		if err := m.deleteVMs(ctx, w); err != nil {
+			return false, err
+		}
+		m.mgr.ClearActive("")
+		return false, nil
+	})
+	return tea.Batch(m.spin.Tick, tick(), cleanup)
+}
 
 func tick() tea.Cmd {
 	return tea.Tick(time.Second, func(t time.Time) tea.Msg { return tickMsg(t) })
@@ -551,6 +566,8 @@ func (m *model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 			}
 		case msg.kind == "stop":
 			m.flash = msg.id + " ended — its VMs are stopped"
+		case msg.kind == "cleanup":
+			m.flash = "no lab VMs left over"
 		case msg.kind == "env":
 			if msg.err == nil {
 				m.flash = "done"
@@ -579,7 +596,10 @@ func (m *model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		if msg.err != nil {
 			m.flash = "shell: " + msg.err.Error()
 		}
-		return m, nil
+		// bubbletea turns the mouse off while the shell has the terminal and
+		// doesn't turn it back on: without this the menus and buttons stop
+		// answering clicks
+		return m, tea.EnableMouseAllMotion
 
 	case tea.MouseMsg:
 		return m.mouse(msg)
@@ -1085,7 +1105,13 @@ func (m *model) updateStarted(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 }
 
 func (m *model) updateEnv(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
-	switch msg.String() {
+	k := msg.String()
+	// the VM actions wait for the running one: refuse before asking
+	if m.op != "" && strings.Contains("uxRBDXK", k) && len(k) == 1 {
+		m.flash = "busy: " + m.op
+		return m, nil
+	}
+	switch k {
 	case "esc", "q", "e":
 		m.goTo(m.envBack)
 	case "up", "k":
