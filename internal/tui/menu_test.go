@@ -1,7 +1,9 @@
 package tui
 
 import (
+	"context"
 	"encoding/json"
+	"io"
 	"os"
 	"path/filepath"
 	"strings"
@@ -78,6 +80,7 @@ func newTestModel(t *testing.T) *model {
 	}
 	m := newModel(Deps{Catalog: cat, Manager: &lab.Manager{StateDir: dir}, Progress: prog, Exams: exam.NewStore(dir)}, "dark")
 	m.Update(tea.WindowSizeMsg{Width: 150, Height: 50})
+	m.endLab = func(context.Context, *exercise.Exercise, io.Writer) error { return nil } // never the real VMs
 	m.op = busyOp
 	return m
 }
@@ -326,28 +329,19 @@ func TestEveryScreenRenders(t *testing.T) {
 	}
 }
 
-func TestLeavingTheActiveExerciseAsks(t *testing.T) {
-	m := build(t, named("exercise set up on the VMs"), false) // exercise set up on the VMs
-	m.Update(keyMsg("esc"))
-	if m.confirm == "" || m.screen != scrDetail {
-		t.Fatalf("esc left without asking: screen %v, confirm %q", m.screen, m.confirm)
-	}
-	m.answer(false)
-	if m.screen != scrBrowse || !m.hasActive || m.op != "" {
-		t.Fatalf("No should leave the lab running: screen %v, active %v, op %q", m.screen, m.hasActive, m.op)
-	}
-
-	m = build(t, named("exercise set up on the VMs"), false)
-	m.Update(keyMsg("q"))
-	m.op = busyOp // keep the stop from reaching the VMs
-	m.answer(true)
-	if m.screen != scrBrowse || !strings.Contains(m.flash, "busy") {
-		t.Fatalf("Yes should go back and try to stop the lab: screen %v, flash %q", m.screen, m.flash)
-	}
+// buildEnding is build for the exercise set up on the VMs, with ending the lab
+// recorded instead of reaching the VMs.
+func buildEnding(t *testing.T) (*model, chan string) {
+	m := build(t, named("exercise set up on the VMs"), false)
+	ended := make(chan string, 1)
+	m.endLab = func(_ context.Context, ex *exercise.Exercise, _ io.Writer) error { ended <- ex.ID; return nil }
+	return m, ended
 }
 
-func TestEveryWayOffTheActiveExerciseAsks(t *testing.T) {
+func TestLeavingTheActiveExerciseStopsIt(t *testing.T) {
 	ways := map[string]func(t *testing.T, m *model){
+		"esc":                  func(t *testing.T, m *model) { m.Update(keyMsg("esc")) },
+		"q":                    func(t *testing.T, m *model) { m.Update(keyMsg("q")) },
 		"S":                    func(t *testing.T, m *model) { m.Update(keyMsg("S")) },
 		"n":                    func(t *testing.T, m *model) { m.Update(keyMsg("n")) },
 		"File → Exercise list": func(t *testing.T, m *model) { m.choose(t, "File", "Exercise list") },
@@ -361,15 +355,31 @@ func TestEveryWayOffTheActiveExerciseAsks(t *testing.T) {
 		"mouse on the Back button": func(t *testing.T, m *model) { m.press("esc") },
 	}
 	for name, do := range ways {
-		m := build(t, named("exercise set up on the VMs"), false)
+		m, ended := buildEnding(t)
 		do(t, m)
-		if m.confirm == "" || m.screen != scrDetail || m.cur.ID != "d-1" {
-			t.Errorf("%s left without asking: screen %v, confirm %q", name, m.screen, m.confirm)
+		if m.confirm != "" || m.screen == scrDetail && m.cur.ID == "d-1" {
+			t.Errorf("%s: did not leave straight away: screen %v, confirm %q", name, m.screen, m.confirm)
+			continue
 		}
+		select {
+		case id := <-ended:
+			if id != "d-1" {
+				t.Errorf("%s: ended %s, want d-1", name, id)
+			}
+		case <-time.After(2 * time.Second):
+			t.Errorf("%s: left without stopping the lab", name)
+		}
+	}
+
+	// busy: it goes back and says the lab was left running
+	m := build(t, named("exercise set up on the VMs"), true)
+	m.Update(keyMsg("esc"))
+	if m.screen != scrBrowse || !strings.Contains(m.flash, "busy") {
+		t.Errorf("busy: screen %v, flash %q", m.screen, m.flash)
 	}
 }
 
-func TestLeavingWithoutAsking(t *testing.T) {
+func TestLeavingWithoutStopping(t *testing.T) {
 	// not the active exercise: nothing to stop
 	m := build(t, named("exercise while another is set up"), false)
 	m.Update(keyMsg("esc"))
@@ -566,5 +576,24 @@ func TestVisibleItems(t *testing.T) {
 	}
 	if s := strings.Join(labels, " "); s != "a ─H b" {
 		t.Errorf("got %q, want %q", s, "a ─H b")
+	}
+}
+
+func TestQuitStopsTheVMs(t *testing.T) {
+	for _, k := range []string{"q", "Q", "ctrl+c"} {
+		m := build(t, named("list"), false)
+		m.Update(keyMsg(k)) // the stop itself is the returned command, not run here
+		if !m.quitting {
+			t.Errorf("%s: quit without stopping the VMs", k)
+		}
+	}
+	// busy: q refuses, ctrl+c still gets out
+	m := build(t, named("list"), true)
+	m.Update(keyMsg("q"))
+	if m.quitting || !strings.Contains(m.flash, "busy") {
+		t.Errorf("q while busy: quitting %v, flash %q", m.quitting, m.flash)
+	}
+	if _, c := m.Update(keyMsg("ctrl+c")); c == nil {
+		t.Error("ctrl+c while busy did not quit")
 	}
 }

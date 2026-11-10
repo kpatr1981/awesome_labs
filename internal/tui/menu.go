@@ -198,6 +198,10 @@ func (m *model) menus() []menu {
 	if onResult {
 		openKey = "o"
 	}
+	quitKey := "Q" // q is taken off the exercise list
+	if onBrowse {
+		quitKey = "q"
+	}
 	file := menu{"File", 'f', []menuItem{
 		{label: "Exercise list", key: backKey, hidden: onBrowse, run: func() tea.Cmd {
 			if backKey != "" { // esc gets there, with whatever it says on the way
@@ -210,8 +214,7 @@ func (m *model) menus() []menu {
 			run: func() tea.Cmd { m.goActive(); return nil }},
 		{label: "Started labs", key: "S", hidden: onStarted, run: m.leaveTo(scrStarted)},
 		sep(),
-		{label: "Quit", key: on(onBrowse, "q"), run: func() tea.Cmd { return tea.Quit }},
-		{label: "Quit and stop all VMs", key: "Q", run: m.quitAndStop},
+		{label: "Quit and stop all VMs", key: quitKey, run: m.quitAndStop},
 	}}
 
 	// the Exercise menu acts on the selected or open exercise
@@ -417,9 +420,15 @@ func visibleItems(items []menuItem) []menuItem {
 	return out
 }
 
+// quitAndStop is every way out of the app: it stops all lab VMs, then quits.
+// While an operation is running it refuses; ctrl+c then quits at once and
+// leaves the VMs running.
 func (m *model) quitAndStop() tea.Cmd {
+	if m.quitting {
+		return nil
+	}
 	if m.op != "" {
-		m.flash = "busy: " + m.op
+		m.flash = "busy: " + m.op + " — ctrl+c quits now, leaving the VMs running"
 		return nil
 	}
 	m.quitting = true
@@ -1094,7 +1103,7 @@ const shortcutsText = `Keyboard shortcuts
 
 Everywhere      F10 menu bar · alt+f/e/v/t/m/x/h open a menu · F1 this help
                 a active exercise · S started labs · e environments & VMs
-                Q quit and stop VMs · ctrl+c quit
+                Q (q on the list) quit and stop all VMs · ctrl+c the same; while busy or stopping, quit at once
 
 Exercise list   ↑↓ move · enter open · / filter · esc clear filter
                 tab next track · n/p next/previous module
@@ -1104,7 +1113,7 @@ Exercise list   ↑↓ move · enter open · / filter · esc clear filter
 Exercise        s start the lab · t terminal · w node01 terminal (Kubernetes)
                 c check · h next hint · v solution · R reset progress
                 ←→, tab or 1–5 switch tabs · n/N next/previous in the list it came from
-                esc/q back — leaving the lab that is set up asks whether to stop its VMs
+                esc/q back — leaving the lab that is set up stops its VMs
 
 Started labs    ↑↓ move · enter open · r reset selected · A reset all · esc back
 Learning paths  ↑↓ move · enter apply · esc back

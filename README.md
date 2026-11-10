@@ -122,7 +122,7 @@ Everything is also reachable from the **menu bar** at the top: click a menu, pre
 `alt+t` Tracks, `alt+m` VMs, `alt+x` Exam, `alt+h` Help). Menu items show their
 keyboard shortcut only on the screens where pressing that key does the same thing, so a
 shown key works with the menu open or closed. `a` (active exercise), `S` (started labs),
-`e` (environments & VMs) and `Q` (quit and stop the VMs) work on every screen.
+`e` (environments & VMs) and `Q` (quit) work on every screen.
 
 Menus only offer what applies to the current screen. **Exercise** acts on the selected
 exercise on the list, the exercise screen, Started labs and the exam screens; hints and the
@@ -158,7 +158,7 @@ shortcut. While the mouse is in use, most terminals select text with `shift`+dra
 | `a` | jump to the exercise you're **working on** (shown as `▶` in the header and list) |
 | `S` | your labs: the active exercise, then others started earlier and not solved |
 | `e` | environments & VMs: live state of every VM; create, stop, reset, rebuild, delete — `X` stops all, `K` deletes all |
-| `Q` | quit **and stop all lab VMs** |
+| `Q` (`q` on the list, `ctrl+c`) | quit — always **powers off all lab VMs** first (`ctrl+c` while busy or stopping quits at once and leaves them running) |
 
 ### In an exercise
 
@@ -176,9 +176,10 @@ shortcut. While the mouse is in use, most terminals select text with `shift`+dra
 | `esc` / `q` | back to where you opened it from |
 
 Leaving the exercise that is set up on the VMs, by any route except the environments
-screen, asks whether to end it: **Yes** stops its VMs, **No** leaves them running (`a`
-brings you back to it). During an exam nothing is asked, since the VMs carry on to the
-next question. The environments screen goes back to the exercise you came from.
+screen, always ends it and powers off its VMs (a full shutdown, not a pause; the
+containers inside go down with them). During an exam the VMs
+keep running, since they carry on to the next question. The environments screen goes
+back to the exercise you came from.
 
 Inside the VMs the scenario is also in **`/lab/TASK.md`**; `/lab` is your working
 directory. On the control plane `kubectl` (alias `k`, with completion) is configured
@@ -217,7 +218,7 @@ awesome_labs exam history    # past results
 
 Only one environment needs to run at a time. With `auto_stop: true` (the default),
 starting a Docker exercise stops the Kubernetes VMs and vice versa, and solving an exercise
-stops its VMs (except during an exam); `Q` in the browser quits and stops everything. Settings live in `~/.awesome_labs/config.yaml`:
+stops its VMs (except during an exam); quitting always powers off every lab VM. Settings live in `~/.awesome_labs/config.yaml`:
 
 ```yaml
 auto_stop: true

@@ -108,6 +108,8 @@ type model struct {
 	vmInfo    map[string]lab.VMInfo
 	envCursor int
 	envBack   screen // where the environments screen returns to
+	// endLab ends the active exercise and stops its VMs; tests replace it
+	endLab func(ctx context.Context, ex *exercise.Exercise, w io.Writer) error
 
 	// the one exercise set up on the VMs right now
 	active    lab.Active
@@ -197,6 +199,7 @@ func newModel(d Deps, style string) *model {
 		mdCache: map[string]string{}, envStatus: map[exercise.Profile]string{},
 		paths: d.Paths, exams: d.Exams, setupCount: 1, setupMins: 1, menuOpen: -1,
 	}
+	m.endLab = mgr.EndExercise
 	m.exam = d.Exams.Current()
 	if m.exam != nil && m.exam.Over() {
 		m.finishExam()
@@ -583,7 +586,10 @@ func (m *model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 
 	case tea.KeyMsg:
 		if msg.String() == "ctrl+c" {
-			return m, tea.Quit
+			if m.op != "" || m.quitting { // nothing else gets out while busy
+				return m, tea.Quit
+			}
+			return m, m.quitAndStop()
 		}
 		if c, ok := m.globalKey(msg.String()); ok {
 			return m, c
@@ -638,7 +644,7 @@ func (m *model) updateBrowse(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 	m.flash = ""
 	switch msg.String() {
 	case "q":
-		return m, tea.Quit
+		return m, m.quitAndStop()
 	case "/":
 		m.filterOn = true
 		m.filter.Focus()
@@ -833,9 +839,9 @@ func (m *model) goTo(s screen) {
 }
 
 // leave runs then, which moves off the exercise screen. Every way off it goes
-// through here. Leaving the exercise set up on the VMs asks whether to end it:
-// yes clears it and stops its VMs, no leaves them running. Inside an exam the
-// VMs carry on to the next question, so nothing is asked.
+// through here. Leaving the exercise set up on the VMs always ends it: it is
+// cleared and its VMs are stopped. Inside an exam the VMs carry on to the next
+// question, so they are left alone.
 func (m *model) leave(then func() tea.Cmd) tea.Cmd {
 	ex := m.cur
 	if m.screen != scrDetail || m.exam != nil || !m.isActive(ex) {
@@ -846,16 +852,12 @@ func (m *model) leave(then func() tea.Cmd) tea.Cmd {
 		m.flash = "lab left running — busy: " + m.op
 		return c
 	}
-	m.ask("You're leaving "+ex.ID+". End the lab and stop its VMs? No leaves them running.",
-		func() tea.Cmd {
-			// start the stop first: then may open another exercise, whose
-			// Output tab the stop must not take over
-			end := m.startOp("stop", "Ending "+ex.ID+" and stopping its VMs", ex.ID, func(ctx context.Context, w io.Writer) (bool, error) {
-				return false, m.mgr.EndExercise(ctx, ex, w)
-			})
-			return tea.Batch(end, then())
-		}, then)
-	return nil
+	// start the stop first: then may open another exercise, whose Output tab
+	// the stop must not take over
+	end := m.startOp("stop", "Ending "+ex.ID+" and stopping its VMs", ex.ID, func(ctx context.Context, w io.Writer) (bool, error) {
+		return false, m.endLab(ctx, ex, w)
+	})
+	return tea.Batch(end, then())
 }
 
 // siblings is the list the open exercise was picked from, which n/N walk, and
