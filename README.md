@@ -19,7 +19,7 @@ have a short tutorial on the concepts and commands to read first.
 │   k8s-245   ●●●○○ fix   The API server is gone││  kubectl get pods → The connection to the     │
 │   ...                                         ││  server controlplane:6443 was refused …       │
 ╰──────────────────────────────────────────────╯╰───────────────────────────────────────────────╯
- ↑↓ move · enter open · / filter · tab track · u unsolved · a active · S started · e VMs · F10 menu · F1 keys · q quit
+ ↑↓ move · enter open · / filter · tab track · u progress · a active · S started · e VMs · F10 menu · F1 keys · q quit
 ```
 
 ## What you get
@@ -120,7 +120,10 @@ builds one for Linux and macOS on x86-64 and ARM into `dist/`, with checksums.
 Everything is also reachable from the **menu bar** at the top: click a menu, press
 `F10`, or `alt` + the underlined letter (`alt+f` File, `alt+e` Exercise, `alt+v` View,
 `alt+t` Tracks, `alt+m` VMs, `alt+x` Exam, `alt+h` Help). Menu items show their
-keyboard shortcut, and items that don't apply on the current screen are greyed out.
+keyboard shortcut. Menus only offer what applies to the current screen: Exercise appears
+on the list and the exercise screen, View and Tracks on the list, and the per-VM actions
+on the environments screen. **View → Show** filters the list by progress: all, unsolved,
+in progress (started, not solved) or no progress.
 
 The mouse works throughout: pick a track from the **Tracks** menu, click a row to select
 it and double-click to open it, click the tabs and the buttons (Start, Terminal, Check,
@@ -136,7 +139,7 @@ shortcut. While the mouse is in use, most terminals select text with `shift`+dra
 | `↑↓` / `j k` | move · `n`/`p` next/previous module |
 | `/` | filter by id, title, tag, module or difficulty |
 | `tab` | switch track |
-| `u` | show only unsolved |
+| `u` | cycle the progress filter: all · unsolved · in progress (started, not solved) · no progress |
 | `enter` | open an exercise |
 | `L` | **learning paths** — focus the list on a curated path, with progress |
 | `X` | **exam mode** — start a timed exam, or return to the running one |

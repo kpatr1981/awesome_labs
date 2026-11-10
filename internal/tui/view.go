@@ -107,6 +107,9 @@ func (m *model) View() string {
 		lines = lines[:m.h]
 	}
 	out := m.menuBar() + "\n" + strings.Join(lines, "\n")
+	if m.menuOpen >= len(m.menus()) { // the screen changed under an open menu
+		m.closeMenu()
+	}
 	if m.menuOpen >= 0 {
 		box, x := m.dropdown()
 		out = overlay(out, box, x, 1)
@@ -147,14 +150,14 @@ func (m *model) statusLine(help string) string {
 
 func (m *model) viewBrowse() string {
 	// the track is picked from the Track menu (or tab); this line only shows
-	// the active path, the unsolved filter and the search box when in use
+	// the active path, the progress filter and the search box when in use
 	var bar string
 	if m.path != nil {
 		ps, pt := m.pathProgress(m.path)
 		bar += sWarn.Render("path: "+m.path.Title) + sMuted.Render(fmt.Sprintf(" %d/%d  ", ps, pt))
 	}
-	if m.unsolved {
-		bar += sWarn.Render("[unsolved only]  ")
+	if m.progFilter != progAll {
+		bar += sWarn.Render("[" + strings.ToLower(progFilterNames[m.progFilter]) + "]  ")
 	}
 	if m.filterOn || m.filter.Value() != "" {
 		m.addZone("filter", lipgloss.Width(bar), 0, m.w, 1)

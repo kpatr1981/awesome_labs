@@ -74,14 +74,14 @@ type model struct {
 	screen screen
 
 	// browse
-	tracks   []string // "" = all
-	trackIdx int
-	unsolved bool
-	filter   textinput.Model
-	filterOn bool
-	visible  []*exercise.Exercise
-	cursor   int
-	offset   int
+	tracks     []string // "" = all
+	trackIdx   int
+	progFilter progFilter
+	filter     textinput.Model
+	filterOn   bool
+	visible    []*exercise.Exercise
+	cursor     int
+	offset     int
 
 	// detail
 	cur       *exercise.Exercise
@@ -208,6 +208,38 @@ func tick() tea.Cmd {
 
 // ---- filtering ----
 
+// progFilter narrows the exercise list by recorded progress.
+type progFilter int
+
+const (
+	progAll        progFilter = iota
+	progUnsolved              // anything not solved yet
+	progInProgress            // started, not solved (● in the list)
+	progNone                  // not started, not solved
+	progFilterCount
+)
+
+var progFilterNames = []string{"All exercises", "Unsolved", "In progress", "No progress"}
+
+func (f progFilter) keep(p progress.Entry) bool {
+	solved, started := !p.Solved.IsZero(), !p.Started.IsZero()
+	switch f {
+	case progUnsolved:
+		return !solved
+	case progInProgress:
+		return started && !solved
+	case progNone:
+		return !started && !solved
+	}
+	return true
+}
+
+func (m *model) setProgFilter(f progFilter) {
+	m.progFilter = f
+	m.cursor, m.offset = 0, 0
+	m.refilter()
+}
+
 func (m *model) refilter() {
 	q := strings.ToLower(strings.TrimSpace(m.filter.Value()))
 	track := m.tracks[m.trackIdx]
@@ -220,7 +252,7 @@ func (m *model) refilter() {
 		if track != "" && e.Track != track {
 			continue
 		}
-		if m.unsolved && !m.prog.Get(e.ID).Solved.IsZero() {
+		if !m.progFilter.keep(m.prog.Get(e.ID)) {
 			continue
 		}
 		if q != "" {
@@ -253,7 +285,7 @@ func (m *model) listHeight() int {
 
 // hasBrowseBar reports whether the browse screen shows its info line above the list.
 func (m *model) hasBrowseBar() bool {
-	return m.path != nil || m.unsolved || m.filterOn || m.filter.Value() != ""
+	return m.path != nil || m.progFilter != progAll || m.filterOn || m.filter.Value() != ""
 }
 
 func (m *model) clampOffset() {
@@ -637,8 +669,7 @@ func (m *model) updateBrowse(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 		m.cursor, m.offset = 0, 0
 		m.refilter()
 	case "u":
-		m.unsolved = !m.unsolved
-		m.refilter()
+		m.setProgFilter((m.progFilter + 1) % progFilterCount)
 	case "e":
 		m.screen = scrEnv
 		return m, m.cmdEnvStatus()
