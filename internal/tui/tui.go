@@ -82,6 +82,7 @@ type model struct {
 	visible    []*exercise.Exercise
 	cursor     int
 	offset     int
+	saved      uiState // the list state last written to ui.json
 
 	// detail
 	cur       *exercise.Exercise
@@ -214,6 +215,7 @@ func newModel(d Deps, style string) *model {
 	}
 	m.refreshActive()
 	m.refilter()
+	m.loadUI()
 	return m
 }
 
@@ -507,7 +509,15 @@ func (m *model) envAction(action string) tea.Cmd {
 
 // ---- update ----
 
+// Update handles msg, then saves the list state if it changed, so a crash or
+// ctrl+c doesn't lose it either.
 func (m *model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
+	r, c := m.update(msg)
+	m.saveUI()
+	return r, c
+}
+
+func (m *model) update(msg tea.Msg) (tea.Model, tea.Cmd) {
 	switch msg := msg.(type) {
 	case tea.WindowSizeMsg:
 		// m.h is the height below the menu bar
@@ -544,11 +554,11 @@ func (m *model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 			m.flash = "failed: " + msg.err.Error()
 		case msg.kind == "start":
 			m.prog.MarkStarted(msg.id)
-			m.refilter()
+			m.refilterKeep()
 			m.flash = "lab ready — press t to open a terminal"
 		case msg.kind == "check":
 			m.prog.RecordCheck(msg.id, msg.passed)
-			m.refilter()
+			m.refilterKeep()
 			if m.exam != nil && m.exam.Record(msg.id, msg.passed) {
 				_ = m.exams.Save(m.exam)
 			}
@@ -643,7 +653,7 @@ func (m *model) updateBrowse(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 			m.filterOn = false
 			m.filter.Blur()
 			m.filter.SetValue("")
-			m.refilter()
+			m.refilterKeep()
 			return m, nil
 		case "enter", "down", "up":
 			m.filterOn = false
@@ -667,7 +677,7 @@ func (m *model) updateBrowse(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 	case "esc":
 		if m.filter.Value() != "" {
 			m.filter.SetValue("")
-			m.refilter()
+			m.refilterKeep()
 		}
 	case "up", "k":
 		m.move(-1)
@@ -1013,7 +1023,7 @@ func (m *model) askForget(ex *exercise.Exercise, q string, done func()) {
 	m.ask(q, func() tea.Cmd {
 		m.prog.Reset(ex.ID)
 		delete(m.result, ex.ID)
-		m.refilter() // the progress filter may no longer keep ex
+		m.refilterKeep() // the progress filter may no longer keep ex
 		done()
 		return nil
 	}, nil)
@@ -1093,7 +1103,7 @@ func (m *model) updateStarted(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 				m.prog.Reset(e.ID)
 				delete(m.result, e.ID)
 			}
-			m.refilter()
+			m.refilterKeep()
 			m.resetStarted()
 			m.flash = "reset started labs"
 			return nil

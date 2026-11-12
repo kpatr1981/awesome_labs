@@ -67,7 +67,12 @@ const busyOp = "test operation"
 
 func newTestModel(t *testing.T) *model {
 	t.Helper()
-	dir := t.TempDir()
+	return newTestModelIn(t, t.TempDir())
+}
+
+// newTestModelIn opens the app on the state kept in dir, as a launch does.
+func newTestModelIn(t *testing.T, dir string) *model {
+	t.Helper()
 	cat, err := exercise.Load(fstest.MapFS{
 		"ex/docker.yaml": {Data: []byte(dockerModule)},
 		"ex/k8s.yaml":    {Data: []byte(k8sModule)},
