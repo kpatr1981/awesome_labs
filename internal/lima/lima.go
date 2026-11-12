@@ -90,6 +90,12 @@ func Stop(ctx context.Context, name string, log io.Writer) error {
 	return run(ctx, log, "stop", name)
 }
 
+// Clone copies the stopped instance from into a new, stopped instance to. On
+// APFS the disks are copy-on-write clones, so it takes well under a second.
+func Clone(ctx context.Context, from, to string, log io.Writer) error {
+	return run(ctx, log, "clone", "--tty=false", from, to)
+}
+
 // Delete removes an instance (forcefully).
 func Delete(ctx context.Context, name string, log io.Writer) error {
 	return run(ctx, log, "delete", "--force", name)
@@ -114,6 +120,7 @@ type Script struct {
 	Workdir string            // default "/"
 	Env     map[string]string // exported before Body
 	Stdin   io.Reader         // optional extra data; when set Body is passed via -c
+	Stderr  io.Writer         // optional; default: stderr goes to out with stdout
 }
 
 // Run executes a script inside the instance and returns its exit code.
@@ -154,6 +161,9 @@ func Run(ctx context.Context, name string, s Script, out io.Writer) (int, error)
 		out = io.Discard
 	}
 	cmd.Stdout, cmd.Stderr = out, out
+	if s.Stderr != nil {
+		cmd.Stderr = s.Stderr // keep a binary stdout (an image stream) clean
+	}
 	err := cmd.Run()
 	var ee *exec.ExitError
 	if errors.As(err, &ee) {

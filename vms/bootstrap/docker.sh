@@ -21,9 +21,12 @@ count=$(mktemp)
 echo 0 >"$count"
 export count total
 pull() {
-  for i in 1 2 3; do docker pull -q "$1" && break || sleep 5; done
-  local st="could not pull"
-  docker image inspect "$1" >/dev/null 2>&1 && st="pulled"
+  local st="from cache"
+  if ! docker image inspect "$1" >/dev/null 2>&1; then
+    for i in 1 2 3; do docker pull -q "$1" && break || sleep 5; done
+    st="could not pull"
+    docker image inspect "$1" >/dev/null 2>&1 && st="pulled"
+  fi
   flock "$count" bash -c 'n=$(($(cat "$count") + 1)); echo $n >"$count"; echo "==> image $n/$total $2 $1"' _ "$1" "$st"
 }
 export -f pull

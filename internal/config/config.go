@@ -36,6 +36,8 @@ const template = `# awesome_labs configuration
 # Stop an exercise's environment once you solve it with "awesome_labs check".
 # The app always keeps only the environment of the exercise you start: the
 # others are deleted, and exiting or starting the app deletes every lab VM.
+# After its first build each environment keeps a stopped copy (klbase-* in
+# "limactl list"), so it comes back in seconds; "env rebuild" replaces it.
 auto_stop: true
 
 # VM sizes. Changes apply when a VM is created: run

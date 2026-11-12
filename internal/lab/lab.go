@@ -225,6 +225,16 @@ func (m *Manager) ensure(ctx context.Context, env Env, log io.Writer) error {
 	if err != nil {
 		return err
 	}
+	// A whole environment created now is cloned from its saved bases when
+	// they are up to date, or else built from scratch and its bases saved.
+	missing := 0
+	for _, vm := range env.VMs {
+		if all[vm.Name].Status == "" {
+			missing++
+		}
+	}
+	fromBase := missing == len(env.VMs) && m.usableBases(ctx, env, all, log)
+	fresh := missing == len(env.VMs) && !fromBase
 	// Create + start every VM in parallel (image download / apt install dominate).
 	var wg sync.WaitGroup
 	errs := make([]error, len(env.VMs))
@@ -238,6 +248,13 @@ func (m *Manager) ensure(ctx context.Context, env Env, log io.Writer) error {
 		go func(i int, vm VM, st string) {
 			defer wg.Done()
 			pw := prefixWriter(m.detail(log), vm.Hostname)
+			if st == "" && fromBase {
+				fmt.Fprintf(log, "==> starting VM %s from its saved copy\n", vm.Name)
+				if errs[i] = lima.Clone(ctx, baseName(vm), vm.Name, pw); errs[i] == nil {
+					errs[i] = lima.Start(ctx, vm.Name, pw)
+				}
+				return
+			}
 			if st == "" {
 				fmt.Fprintf(log, "==> creating VM %s (%s)\n", vm.Name, vm.Hostname)
 				tmpl, err := m.template(env, vm)
@@ -259,6 +276,16 @@ func (m *Manager) ensure(ctx context.Context, env Env, log io.Writer) error {
 			return e
 		}
 	}
+	if fromBase && !m.basesMatch(ctx, env) {
+		fmt.Fprintf(log, "==> the copy of %s came up on a different address — building it from scratch\n", env.Title)
+		for _, vm := range env.VMs {
+			if err := lima.Delete(ctx, vm.Name, m.detail(log)); err != nil {
+				return err
+			}
+			m.dropBase(ctx, vm, nil, m.detail(log))
+		}
+		return m.ensure(ctx, env, log)
+	}
 	if err := m.pushKit(ctx, env, log); err != nil {
 		return err
 	}
@@ -270,6 +297,14 @@ func (m *Manager) ensure(ctx context.Context, env Env, log io.Writer) error {
 	if m.ready(ctx, env.Primary()) {
 		return nil
 	}
+	// Images cached on this computer by an earlier build go in first, so the
+	// bootstrap only pulls what's missing.
+	var lw sync.WaitGroup
+	for _, vm := range env.VMs {
+		lw.Add(1)
+		go func(vm VM) { defer lw.Done(); m.loadCachedImages(ctx, vm, log) }(vm)
+	}
+	lw.Wait()
 	fmt.Fprintf(log, "==> bootstrapping %s\n", env.Title)
 	switch env.Profile {
 	case exercise.ProfileDocker:
@@ -289,6 +324,12 @@ func (m *Manager) ensure(ctx context.Context, env Env, log io.Writer) error {
 		}
 	}
 	m.SetTainted(env, false)
+	m.saveEnvImages(ctx, env, log)
+	if fresh {
+		if err := m.saveBases(ctx, env, log); err != nil {
+			return err
+		}
+	}
 	fmt.Fprintf(log, "==> %s is ready\n", env.Title)
 	return nil
 }
@@ -742,11 +783,13 @@ func (m *Manager) Destroy(ctx context.Context, env Env, log io.Writer) error {
 	return nil
 }
 
-// Rebuild destroys then re-creates the environment.
+// Rebuild destroys then re-creates the environment from scratch, replacing
+// its saved copy too.
 func (m *Manager) Rebuild(ctx context.Context, env Env, log io.Writer) error {
 	if err := m.Destroy(ctx, env, log); err != nil {
 		return err
 	}
+	m.DropBases(ctx, env, m.detail(log))
 	return m.Ensure(ctx, env, log)
 }
 

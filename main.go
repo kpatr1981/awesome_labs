@@ -43,7 +43,7 @@ usage:
   awesome_labs check <id>              check your work
   awesome_labs forget <id>             erase your progress on an exercise
   awesome_labs shell [docker|k8s|node01|offsec]  open a shell in a lab VM
-  awesome_labs env status|up|stop|destroy|rebuild|reset [docker|k8s|offsec]
+  awesome_labs env status|up|stop|destroy|rebuild|reset|cache [docker|k8s|offsec]
   awesome_labs vms [stop|delete <name|all>]  list lab VMs, or stop/delete them
   awesome_labs verify [-from id] [ids or prefixes...]
                                   author tool: setup -> check fails -> solve -> check passes
@@ -373,6 +373,11 @@ func envCmd(ctx context.Context, mgr *lab.Manager, args []string) error {
 		}
 	}
 	mgr.Verbose = os.Getenv("AWESOME_LABS_VERBOSE") != ""
+	if args[0] == "cache" && len(args) == 1 {
+		fmt.Print(mgr.CacheSummary())
+		fmt.Println("fill it with: awesome_labs env cache docker|k8s|offsec")
+		return nil
+	}
 	for _, env := range envs {
 		var err error
 		switch args[0] {
@@ -388,6 +393,8 @@ func envCmd(ctx context.Context, mgr *lab.Manager, args []string) error {
 			err = mgr.Rebuild(ctx, env, os.Stdout)
 		case "reset":
 			err = mgr.Reset(ctx, env, os.Stdout)
+		case "cache":
+			err = mgr.CacheEnv(ctx, env, os.Stdout)
 		default:
 			return fmt.Errorf("unknown env action %q", args[0])
 		}
