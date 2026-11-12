@@ -281,7 +281,11 @@ func (m *model) viewDetail() string {
 			label += " 🔒"
 		}
 		if tab(i) == tabOutput && m.op != "" && m.opID == e.ID {
-			label += " " + m.spin.View()
+			// The spinner's own style would be split rune by rune by the
+			// underline of the selected tab and print as raw escape codes.
+			sp := m.spin
+			sp.Style = lipgloss.NewStyle()
+			label += " " + sp.View()
 		}
 		st := sTabOff
 		if tab(i) == m.tab {

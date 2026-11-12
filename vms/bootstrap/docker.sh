@@ -1,5 +1,6 @@
 #!/bin/bash
 # Docker host bootstrap (as root): pre-pull images and take the pristine snapshot.
+# Lines starting with "==> " are shown in the app's Output tab as progress.
 set -euxo pipefail
 export DEBIAN_FRONTEND=noninteractive
 # Tools for the Linux and Networking tracks. dnsmasq-base has no service, so it can't
@@ -7,19 +8,36 @@ export DEBIAN_FRONTEND=noninteractive
 PKGS=(strace lsof lvm2 dnsmasq-base wireguard-tools traceroute acl)
 missing=$(for p in "${PKGS[@]}"; do dpkg -s "$p" >/dev/null 2>&1 || echo "$p"; done)
 if [ -n "$missing" ]; then
+  echo "==> installing packages: "$missing
   apt-get update
   apt-get install -y $missing
 fi
-for img in $(grep -v '^#' /opt/kubelab/images.txt | awk '$2 ~ /d/ {print $1}'); do
-  for i in 1 2 3; do docker pull -q "$img" && break || sleep 5; done
-done
+# Pull 4 images at a time; an image that still fails after 3 tries is left for
+# the exercise that uses it to pull.
+imgs=$(grep -v '^#' /opt/kubelab/images.txt | awk '$2 ~ /d/ {print $1}')
+total=$(echo "$imgs" | wc -l)
+echo "==> pulling $total images, 4 at a time"
+count=$(mktemp)
+echo 0 >"$count"
+export count total
+pull() {
+  for i in 1 2 3; do docker pull -q "$1" && break || sleep 5; done
+  local st="could not pull"
+  docker image inspect "$1" >/dev/null 2>&1 && st="pulled"
+  flock "$count" bash -c 'n=$(($(cat "$count") + 1)); echo $n >"$count"; echo "==> image $n/$total $2 $1"' _ "$1" "$st"
+}
+export -f pull
+echo "$imgs" | xargs -P4 -n1 bash -c 'pull "$1"' _
+rm -f "$count"
 # Python with the data-science libraries, for the Data Science track.
 if ! docker image inspect kl-datascience:1 >/dev/null 2>&1; then
+  echo "==> building the data-science image (numpy, pandas, scipy, scikit-learn)"
   docker build -q -t kl-datascience:1 - <<'DOCKERFILE'
 FROM python:3.12-slim
 RUN pip install --no-cache-dir numpy==2.2.6 pandas==2.2.3 scipy==1.15.3 scikit-learn==1.6.1 joblib==1.5.1
 DOCKERFILE
 fi
+echo "==> taking the pristine snapshot"
 mkdir -p /var/lib/kubelab/pristine
 /opt/kubelab/state.sh snapshot docker
 docker images -q --no-trunc | sort -u >/var/lib/kubelab/pristine/images.txt

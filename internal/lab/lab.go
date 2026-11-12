@@ -370,12 +370,17 @@ func (m *Manager) bootstrapScript(name string) (string, error) {
 
 // root runs a script as root on vm, failing on non-zero exit.
 func (m *Manager) root(ctx context.Context, vm VM, body string, env map[string]string, log io.Writer) (string, error) {
-	var out bytes.Buffer
-	ws := []io.Writer{&out, prefixWriter(m.logFile, vm.Hostname)}
+	extra := io.Discard
 	if log != nil && log != m.logFile && log != io.Discard {
-		ws = append(ws, prefixWriter(log, vm.Hostname))
+		extra = prefixWriter(log, vm.Hostname)
 	}
-	w := io.MultiWriter(ws...)
+	return m.rootTo(ctx, vm, body, env, extra)
+}
+
+// rootTo is root with the output copied, unprefixed, to extra besides the log file.
+func (m *Manager) rootTo(ctx context.Context, vm VM, body string, env map[string]string, extra io.Writer) (string, error) {
+	var out bytes.Buffer
+	w := io.MultiWriter(&out, prefixWriter(m.logFile, vm.Hostname), extra)
 	code, err := lima.Run(ctx, vm.Name, lima.Script{AsRoot: true, Body: body, Env: env}, w)
 	if err != nil {
 		return out.String(), err
@@ -396,7 +401,14 @@ func (m *Manager) runBootstrap(ctx context.Context, vm VM, script string, env ma
 	}
 	env["LAB_USER"] = m.User
 	fmt.Fprintf(log, "==> [%s] %s\n", vm.Hostname, script)
-	_, err = m.root(ctx, vm, body, env, io.Discard)
+	// The full output goes to the log file only; the "==> " step lines the
+	// script prints also reach the operation log, so a long first boot shows
+	// where it is instead of looking stuck.
+	steps := io.Discard
+	if log != m.logFile {
+		steps = stepWriter(log, vm.Hostname)
+	}
+	_, err = m.rootTo(ctx, vm, body, env, steps)
 	return err
 }
 
@@ -940,6 +952,40 @@ func resetSSHMux(name string) {
 func lastLine(s string) string {
 	lines := strings.Split(strings.TrimSpace(s), "\n")
 	return lines[len(lines)-1]
+}
+
+// stepWriter forwards only the "==> " step lines of a script's output to w,
+// tagged with the VM's hostname.
+func stepWriter(w io.Writer, host string) io.Writer {
+	if w == nil || w == io.Discard {
+		return io.Discard
+	}
+	return &steps{w: w, host: host}
+}
+
+type steps struct {
+	w    io.Writer
+	host string
+	buf  []byte
+	mu   sync.Mutex
+}
+
+func (s *steps) Write(b []byte) (int, error) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	s.buf = append(s.buf, b...)
+	for {
+		i := bytes.IndexByte(s.buf, '\n')
+		if i < 0 {
+			break
+		}
+		line := string(s.buf[:i])
+		s.buf = s.buf[i+1:]
+		if rest, ok := strings.CutPrefix(line, "==> "); ok {
+			fmt.Fprintf(s.w, "==> [%s] %s\n", s.host, rest)
+		}
+	}
+	return len(b), nil
 }
 
 type prefixed struct {
