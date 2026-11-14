@@ -1,7 +1,7 @@
 # awesome_labs
 
 **Hands-on labs on your own machine** for Docker, Kubernetes, Linux, networking, cloud,
-databases, security, programming and data science — real VMs, real breakage, automatic grading.
+databases, security, programming, data science and Git — real VMs, real breakage, automatic grading.
 
 awesome_labs creates [Lima](https://lima-vm.io) virtual machines, puts each exercise's
 scenario in place (a broken deployment, a crashed daemon, a half-finished compose
@@ -35,8 +35,9 @@ have a short tutorial on the concepts and commands to read first.
 | **Defensive Security** | incident response and hardening · packet-capture forensics with tshark · AppArmor, seccomp, SSH certificates and WAF tuning *(growing)* | 40 |
 | **Programming** | Python and Go *(growing)* | 45 |
 | **Data Science** | pandas, statistics and machine learning *(growing)* | 43 |
+| **Git** | the basics · branching & merging · inspecting history · undoing changes · rebasing & rewriting · stashing & tagging · remotes & collaboration · recovery & detective work (reflog, bisect, fsck) · plumbing & power tools · real-world workflows | 100 |
 
-That's 726 exercises so far, with a target of 250 per track; ideas for what comes next are
+That's 826 exercises so far, with a target of 250 per track; ideas for what comes next are
 in [docs/PENDING.md](docs/PENDING.md).
 
 Difficulty rises through each module (1 = beginner … 5 = expert), mixing **build** tasks
