@@ -947,9 +947,9 @@ Exercise list   ↑↓ move · enter open · / filter · esc clear filter
                 L learning paths · X exam · q quit
 
 Exercise        s start the lab · t terminal · w node01 terminal (Kubernetes)
-                c check · h next hint · v solution · R reset progress
+                c check · h next hint · v solution · x end the exercise (cleans its VMs) · R reset progress
                 ←→, tab or 1–5 switch tabs · n/N next/previous in the list it came from
-                esc/q back — leaving the lab that is set up cleans its VMs for the next one
+                esc/q back — the lab that is set up keeps running; a goes back to it
 
 Started labs    ↑↓ move · enter open · r reset selected · A reset all · esc back
 Learning paths  ↑↓ move · enter apply · esc back

@@ -436,7 +436,7 @@ func (m *model) cmdCheck() tea.Cmd {
 	ex := m.cur
 	return m.startOp("check", "Checking "+ex.ID, ex.ID, func(ctx context.Context, w io.Writer) (bool, error) {
 		fmt.Fprintf(w, "Checking %s — %s\n\n", ex.ID, ex.Title)
-		// the VMs stay up after a pass: leaving the exercise cleans them for the next one
+		// the VMs stay up after a pass: ending the exercise (x) cleans them for the next one
 		return m.mgr.Check(ctx, ex, w)
 	})
 }
@@ -811,6 +811,8 @@ func (m *model) updateDetail(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 		return m, m.revealHint()
 	case "v":
 		return m, m.askSolution()
+	case "x":
+		return m, m.endActive()
 	case "R":
 		m.askForget(ex, "Forget all progress on this exercise, including solved status?", func() {
 			m.solShow, m.hintsShow = false, 0
@@ -864,26 +866,41 @@ func (m *model) goTo(s screen) {
 }
 
 // leave runs then, which moves off the exercise screen. Every way off it goes
-// through here. Leaving the exercise set up on the VMs always ends it: it is
-// cleared and its environment is reset in place, so the VMs are clean and
-// ready for the next exercise. Inside an exam the VMs carry on to the next
-// question, so they are left alone.
+// through here. Leaving keeps the lab of the exercise set up on the VMs as it
+// is, so opening it again (a) picks the work up where it was left; only
+// ending it (x), starting another exercise or exiting cleans its VMs.
 func (m *model) leave(then func() tea.Cmd) tea.Cmd {
 	ex := m.cur
-	if m.screen != scrDetail || m.exam != nil || !m.isActive(ex) {
-		return then()
+	c := then()
+	if m.screen != scrDetail && m.exam == nil && m.isActive(ex) && m.flash == "" {
+		m.flash = ex.ID + " is still set up — a goes back to it, x on it ends it"
 	}
-	if m.op != "" {
-		c := then()
-		m.flash = "lab left running — busy: " + m.op
-		return c
+	return c
+}
+
+// endActive ends the exercise set up on the VMs, after asking: it is cleared
+// and its environment reset, ready for the next exercise.
+func (m *model) endActive() tea.Cmd {
+	ex := m.cur
+	switch {
+	case m.op != "":
+		m.flash = "busy: " + m.op
+		return nil
+	case m.exam != nil:
+		// exam VMs carry on to the next question; ending them mid-exam would
+		// destroy the environment the exam relies on.
+		m.flash = "during an exam the lab carries on to the next question — it can't be ended here"
+		return nil
+	case !m.isActive(ex):
+		m.flash = "the lab isn't set up for " + ex.ID + " — nothing to end"
+		return nil
 	}
-	// start the cleanup first: then may open another exercise, whose Output tab
-	// the cleanup must not take over
-	end := m.startOp("stop", "Ending "+ex.ID+" and cleaning its VMs", ex.ID, func(ctx context.Context, w io.Writer) (bool, error) {
-		return false, m.endLab(ctx, ex, w)
-	})
-	return tea.Batch(end, then())
+	m.ask("End "+ex.ID+"? Your work in the VMs is lost and they are cleaned for the next exercise.", func() tea.Cmd {
+		return m.startOp("stop", "Ending "+ex.ID+" and cleaning its VMs", ex.ID, func(ctx context.Context, w io.Writer) (bool, error) {
+			return false, m.endLab(ctx, ex, w)
+		})
+	}, nil)
+	return nil
 }
 
 // siblings is the list the open exercise was picked from, which n/N walk, and

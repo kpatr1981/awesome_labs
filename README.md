@@ -174,18 +174,21 @@ shortcut. While the mouse is in use, most terminals select text with `shift`+dra
 | `c` | **check** your work |
 | `h` | reveal the next **hint** |
 | `v` | reveal the **solution** (asks first) |
+| `x` | **end** the exercise: forget its lab and clean its VMs for the next one (asks first) |
 | `R` | **reset progress** on this exercise (asks first) |
 | `1`–`5` / `tab` / `←→` | Scenario · Learn · Hints · Solution · Output |
 | `n` / `N` | next / previous in the list you opened it from: the filtered list, Started labs, or the exam's questions |
 | `esc` / `q` | back to where you opened it from |
 
-Leaving the exercise that is set up on the VMs, by any route except the environments
-screen, always ends it and **cleans its VMs**: the environment is reset to pristine in
-place and stays running, so the next exercise on it starts without building or booting
-anything (and skips its own reset). An exercise that breaks its environment beyond a
-reset has its VMs deleted instead. Starting an exercise **deletes the VMs of every
-other environment**, running or stopped, since that exercise doesn't need them. During
-an exam the VMs keep running, since they carry on to the next question. The environments screen goes
+Leaving the exercise that is set up on the VMs **keeps its lab**: your files and
+containers stay in the VMs, and `a` (or opening it again) takes you back to carry on
+where you left off. The lab is cleaned only when you **end** the exercise (`x`), start
+another one (asks first), or exit the app. Ending it resets the environment to pristine
+in place and leaves it running, so the next exercise on it starts without building or
+booting anything (and skips its own reset). An exercise that breaks its environment
+beyond a reset has its VMs deleted instead. Starting an exercise **deletes the VMs of
+every other environment**, running or stopped, since that exercise doesn't need them.
+During an exam the VMs keep running, since they carry on to the next question. The environments screen goes
 back to the exercise you came from.
 
 Inside the VMs the scenario is also in **`/lab/TASK.md`**; `/lab` is your working

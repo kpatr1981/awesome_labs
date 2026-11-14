@@ -345,7 +345,9 @@ func buildEnding(t *testing.T) (*model, chan string) {
 	return m, ended
 }
 
-func TestLeavingTheActiveExerciseStopsIt(t *testing.T) {
+// Leaving the exercise set up on the VMs keeps its lab: the work in the VMs
+// stays, and opening it again picks up where it was left.
+func TestLeavingTheActiveExerciseKeepsItsLab(t *testing.T) {
 	ways := map[string]func(t *testing.T, m *model){
 		"esc":                      func(t *testing.T, m *model) { m.Update(keyMsg("esc")) },
 		"q":                        func(t *testing.T, m *model) { m.Update(keyMsg("q")) },
@@ -362,19 +364,72 @@ func TestLeavingTheActiveExerciseStopsIt(t *testing.T) {
 		}
 		select {
 		case id := <-ended:
-			if id != "d-1" {
-				t.Errorf("%s: ended %s, want d-1", name, id)
-			}
-		case <-time.After(2 * time.Second):
-			t.Errorf("%s: left without ending the lab", name)
+			t.Errorf("%s: leaving ended %s", name, id)
+			continue
+		case <-time.After(200 * time.Millisecond):
+		}
+		if !m.hasActive || m.active.ID != "d-1" || m.op != "" {
+			t.Errorf("%s: active %v %q, op %q; want d-1 still set up", name, m.hasActive, m.active.ID, m.op)
+		}
+		// back on it, the lab is still there to work in
+		m.Update(keyMsg("a"))
+		if m.screen != scrDetail || m.cur.ID != "d-1" || !m.isActive(m.cur) {
+			t.Errorf("%s: a: screen %v, cur %v; want d-1 set up", name, m.screen, m.cur)
 		}
 	}
+}
 
-	// busy: it goes back and says the lab was left running
-	m := build(t, named("exercise set up on the VMs"), true)
-	m.Update(keyMsg("esc"))
-	if m.screen != scrBrowse || !strings.Contains(m.flash, "busy") {
-		t.Errorf("busy: screen %v, flash %q", m.screen, m.flash)
+// x on the exercise set up on the VMs ends it, after asking.
+func TestEndingTheActiveExercise(t *testing.T) {
+	m, ended := buildEnding(t)
+	m.Update(keyMsg("x"))
+	if m.confirm == "" {
+		t.Fatal("x did not ask before ending the exercise")
+	}
+	m.Update(keyMsg("n"))
+	select {
+	case id := <-ended:
+		t.Fatalf("no: ended %s", id)
+	case <-time.After(200 * time.Millisecond):
+	}
+	m.Update(keyMsg("x"))
+	m.Update(keyMsg("y"))
+	select {
+	case id := <-ended:
+		if id != "d-1" {
+			t.Errorf("ended %s, want d-1", id)
+		}
+	case <-time.After(2 * time.Second):
+		t.Fatal("yes did not end the exercise")
+	}
+	if m.screen != scrDetail || m.cur.ID != "d-1" {
+		t.Errorf("ending moved off the exercise: screen %v", m.screen)
+	}
+
+	// nothing to end: not the exercise set up on the VMs
+	m = build(t, named("exercise while another is set up"), false)
+	m.Update(keyMsg("x"))
+	if m.confirm != "" || !strings.Contains(m.flash, "isn't set up") {
+		t.Errorf("inactive: confirm %q, flash %q", m.confirm, m.flash)
+	}
+	// busy: wait for the running operation
+	m = build(t, named("exercise set up on the VMs"), true)
+	m.Update(keyMsg("x"))
+	if m.confirm != "" || !strings.Contains(m.flash, "busy") {
+		t.Errorf("busy: confirm %q, flash %q", m.confirm, m.flash)
+	}
+	// during an exam, x must not end the question: its VMs carry on to the
+	// next one, so ending here would destroy the environment the exam needs.
+	m, ended = buildEnding(t)
+	m.runningExam("d-1", "d-2")
+	m.Update(keyMsg("x"))
+	if m.confirm != "" || !strings.Contains(m.flash, "exam") {
+		t.Errorf("exam: confirm %q, flash %q", m.confirm, m.flash)
+	}
+	select {
+	case id := <-ended:
+		t.Fatalf("exam: x ended %s", id)
+	case <-time.After(200 * time.Millisecond):
 	}
 }
 
@@ -610,11 +665,11 @@ func TestButtonsLitOnlyWhenTheyApply(t *testing.T) {
 		want     string
 	}{
 		{"exercise never started", false, "▶ Start,Hint,Solution,Back"},
-		{"exercise set up on the VMs", false, "↻ Restart,Terminal,✔ Check,Hint,Solution,Reset,Back"},
+		{"exercise set up on the VMs", false, "↻ Restart,Terminal,✔ Check,Hint,Solution,End,Reset,Back"},
 		{"exercise set up on the VMs", true, "Hint,Solution,Back"},
 		{"exercise while another is set up", false, "▶ Start,Solution,Back"}, // d-2 has no hints
-		{"kubernetes exercise set up", false, "↻ Restart,Terminal,node01,✔ Check,Hint,Solution,Reset,Back"},
-		{"exam question", false, "↻ Restart,Terminal,✔ Check,Back"},
+		{"kubernetes exercise set up", false, "↻ Restart,Terminal,node01,✔ Check,Hint,Solution,End,Reset,Back"},
+		{"exam question", false, "↻ Restart,Terminal,✔ Check,Back"}, // no End: exam VMs carry to the next question
 	}
 	for _, c := range cases {
 		m := build(t, named(c.scenario), c.busy)

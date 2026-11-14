@@ -334,6 +334,7 @@ func (m *model) detailButtons(e *exercise.Exercise) []button {
 	bs = append(bs, button{label: "✔ Check", key: "c", off: !active || busy},
 		button{label: "Hint", key: "h", off: locked || len(e.Hints) == 0},
 		button{label: "Solution", key: "v", off: locked},
+		button{label: "End", key: "x", off: !active || busy || m.exam != nil},
 		button{label: "Reset", key: "R", off: m.forgetBlocked(e) != ""},
 		button{label: "Back", key: "esc"})
 	return bs
