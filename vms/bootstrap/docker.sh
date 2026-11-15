@@ -40,6 +40,24 @@ FROM python:3.12-slim
 RUN pip install --no-cache-dir numpy==2.2.6 pandas==2.2.3 scipy==1.15.3 scikit-learn==1.6.1 joblib==1.5.1
 DOCKERFILE
 fi
+# Terraform with its providers in a local mirror, for the Terraform track: `terraform
+# init` then works offline and never hits the registry's rate limits.
+if ! docker image inspect kl-terraform:1 >/dev/null 2>&1; then
+  echo "==> building the Terraform image (terraform 1.16.7 and a provider mirror)"
+  docker build -q -t kl-terraform:1 - <<'DOCKERFILE'
+FROM hashicorp/terraform:1.16.7
+RUN set -e; m=/usr/share/terraform/providers; \
+    mkdir -p /tmp/a /tmp/b; \
+    printf 'terraform {\n  required_providers {\n    local    = { source = "hashicorp/local", version = "2.9.1" }\n    random   = { source = "hashicorp/random", version = "3.9.1" }\n    null     = { source = "hashicorp/null", version = "3.3.2" }\n    tls      = { source = "hashicorp/tls", version = "4.4.2" }\n    time     = { source = "hashicorp/time", version = "0.14.2" }\n    external = { source = "hashicorp/external", version = "2.4.2" }\n    archive  = { source = "hashicorp/archive", version = "2.8.1" }\n    docker   = { source = "kreuzwerker/docker", version = "4.7.0" }\n  }\n}\n' > /tmp/a/main.tf; \
+    printf 'terraform {\n  required_providers {\n    local  = { source = "hashicorp/local", version = "2.8.0" }\n    random = { source = "hashicorp/random", version = "3.8.1" }\n  }\n}\n' > /tmp/b/main.tf; \
+    cd /tmp/a && terraform providers mirror "$m"; \
+    cd /tmp/b && terraform providers mirror "$m"; \
+    rm -rf /tmp/a /tmp/b; \
+    printf 'provider_installation {\n  filesystem_mirror {\n    path    = "/usr/share/terraform/providers"\n    include = ["*/*/*"]\n  }\n}\n' > /etc/terraform.rc; \
+    chmod -R a+rX "$m" /etc/terraform.rc
+ENV TF_CLI_CONFIG_FILE=/etc/terraform.rc CHECKPOINT_DISABLE=1
+DOCKERFILE
+fi
 echo "==> taking the pristine snapshot"
 mkdir -p /var/lib/kubelab/pristine
 /opt/kubelab/state.sh snapshot docker

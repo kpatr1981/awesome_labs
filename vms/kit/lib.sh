@@ -318,6 +318,56 @@ moto_denied() {
   aws --profile "$p" "$@" 2>&1 | grep -qE 'AccessDenied|\(403\)'
 }
 
+# ---------- Terraform helpers ----------
+# tf_start -> install a `terraform` command. It runs the pinned kl-terraform image,
+# which installs providers only from a local mirror (no registry access), sees /lab
+# and the Docker socket, and runs as the calling user so files stay theirs.
+tf_start() {
+  cat >/usr/local/bin/terraform <<'WRAP'
+#!/bin/bash
+# Lab Terraform: the kl-terraform image (providers from a local mirror). It sees /lab
+# and the Docker socket; outside /lab it starts in /lab (use -chdir=...).
+wd=$PWD
+case "$wd/" in /lab/*) ;; *) wd=/lab ;; esac
+envs=()
+while IFS= read -r v; do envs+=(-e "$v"); done < <(compgen -e | grep -E '^(TF_|AWS_)' | grep -vx TF_CLI_CONFIG_FILE)
+tty=()
+[ -t 0 ] && [ -t 1 ] && tty=(-t)
+exec docker run --rm -i "${tty[@]}" --network host --init \
+  -u "$(id -u):$(id -g)" --group-add "$(stat -c %g /var/run/docker.sock)" \
+  -e HOME=/tmp "${envs[@]}" \
+  -v /lab:/lab -v /var/run/docker.sock:/var/run/docker.sock \
+  -w "$wd" kl-terraform:1 "$@"
+WRAP
+  chmod 755 /usr/local/bin/terraform
+  on_reset 'rm -f /usr/local/bin/terraform'
+}
+# tf_as_user DIR CMD... -> run terraform as the lab user in DIR (for setups)
+tf_as_user() { local d=$1; shift; sudo -u "$(lab_user)" -H bash -c 'cd "$1" && shift && terraform "$@"' _ "$d" "$@"; }
+# Checks read the local state file directly (fast, and works before `init`).
+# STATE is a state file or a directory holding terraform.tfstate.
+_tf_state() { if [ -d "$1" ]; then echo "$1/terraform.tfstate"; else echo "$1"; fi; }
+_TF_JQ='def inst: .resources[]? as $r | $r.instances[]? | {
+    address: ((if $r.module then $r.module + "." else "" end)
+      + (if $r.mode == "data" then "data." else "" end) + $r.type + "." + $r.name
+      + (if has("index_key") then (if (.index_key | type) == "number" then "[\(.index_key)]" else "[\"\(.index_key)\"]" end) else "" end)),
+    mode: $r.mode, attributes: .attributes };'
+# tf_addrs STATE -> managed resource addresses in the state, sorted
+tf_addrs() { jq -r "$_TF_JQ"' [inst | select(.mode == "managed") | .address] | sort | .[]' "$(_tf_state "$1")" 2>/dev/null; }
+# tf_has STATE ADDRESS -> the state holds that resource instance
+tf_has() { tf_addrs "$1" | grep -qxF "$2"; }
+# tf_get STATE ADDRESS ATTR -> an attribute (strings raw, anything else as JSON)
+tf_get() {
+  jq -r --arg a "$2" --arg k "$3" "$_TF_JQ"' [inst | select(.address == $a)][0].attributes[$k]
+    | if . == null then empty elif type == "string" then . else tojson end' "$(_tf_state "$1")" 2>/dev/null
+}
+# tf_output STATE NAME -> a root output (strings raw, anything else as JSON)
+tf_output() {
+  jq -r --arg n "$2" '.outputs[$n].value | if . == null then empty elif type == "string" then . else tojson end' "$(_tf_state "$1")" 2>/dev/null
+}
+# tf_clean DIR -> `terraform plan` in DIR proposes no changes (needs an initialized DIR)
+tf_clean() { (cd "$1" && terraform plan -detailed-exitcode -lock=false -input=false -no-color) >/dev/null 2>&1; }
+
 # ---------- data-science helper ----------
 # ds_start -> install `dspy`, which runs Python with pandas and scikit-learn in /lab.
 # The container can only see /lab and runs as the calling user.
