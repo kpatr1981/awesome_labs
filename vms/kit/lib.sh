@@ -368,6 +368,94 @@ tf_output() {
 # tf_clean DIR -> `terraform plan` in DIR proposes no changes (needs an initialized DIR)
 tf_clean() { (cd "$1" && terraform plan -detailed-exitcode -lock=false -input=false -no-color) >/dev/null 2>&1; }
 
+# ---------- Ansible helpers ----------
+# ans_start [NODE...] -> install the ansible commands and start managed nodes.
+# The commands run the pinned kl-ansible image as the calling user on the
+# kl-ansible-net network, where nodes are reachable by name. Nodes are kl-node
+# containers (Debian, sshd, python3, user `ansible` with passwordless sudo) that
+# trust the key /lab/.ssh/ansible. /etc/ansible/ansible.cfg in the image sets
+# remote_user=ansible, that key, and host_key_checking=False; a project's own
+# ansible.cfg replaces those defaults entirely.
+ANS_TOOLS="ansible ansible-playbook ansible-inventory ansible-vault ansible-galaxy ansible-doc ansible-config ansible-console ansible-lint"
+ans_start() {
+  local u g t
+  u=$(lab_user); g=$(id -gn "$u")
+  for t in kl-ansible:1 kl-node:1; do
+    docker image inspect "$t" >/dev/null 2>&1 || { echo "ans_start: image $t is missing; rebuild the Docker environment (awesome_labs env rebuild docker)" >&2; return 1; }
+  done
+  docker network inspect kl-ansible-net >/dev/null 2>&1 || docker network create kl-ansible-net >/dev/null
+  install -d -m 700 -o "$u" -g "$g" /lab/.ssh
+  [ -f /lab/.ssh/ansible ] || ssh-keygen -q -t ed25519 -N '' -C ansible@lab -f /lab/.ssh/ansible
+  chown "$u:$g" /lab/.ssh/ansible /lab/.ssh/ansible.pub; chmod 600 /lab/.ssh/ansible
+  cat >/usr/local/bin/kl-ansible <<'WRAP'
+#!/bin/bash
+# Lab Ansible: runs the kl-ansible image on the kl-ansible-net network, where the
+# managed nodes live. It sees /lab only; outside /lab it starts in /lab.
+tool=$(basename "$0")
+if [ "$tool" = kl-ansible ]; then tool=$1; shift; fi
+wd=$PWD
+case "$wd/" in /lab/*) ;; *) wd=/lab ;; esac
+envs=()
+while IFS= read -r v; do envs+=(-e "$v"); done < <(compgen -e | grep -E '^ANSIBLE_')
+tty=()
+[ -t 0 ] && [ -t 1 ] && tty=(-t)
+exec docker run --rm -i "${tty[@]}" --network kl-ansible-net \
+  -u "$(id -u):$(id -g)" -e HOME=/tmp "${envs[@]}" \
+  -v /lab:/lab -w "$wd" kl-ansible:1 "$tool" "$@"
+WRAP
+  chmod 755 /usr/local/bin/kl-ansible
+  for t in $ANS_TOOLS; do ln -sf kl-ansible "/usr/local/bin/$t"; done
+  on_reset "cd /usr/local/bin && rm -f kl-ansible $ANS_TOOLS"
+  for t in "$@"; do ans_node "$t"; done
+}
+# ans_node NAME [DOCKER-RUN-ARGS...] -> (re)start a managed node trusting /lab/.ssh/ansible
+ans_node() {
+  local n=$1; shift
+  docker rm -f "$n" >/dev/null 2>&1 || true
+  docker run -d --name "$n" --hostname "$n" --network kl-ansible-net --init --label kl-ansible=node "$@" kl-node:1 >/dev/null
+  docker exec -i "$n" sh -c 'cat >/home/ansible/.ssh/authorized_keys && chown ansible: /home/ansible/.ssh/authorized_keys && chmod 600 /home/ansible/.ssh/authorized_keys' </lab/.ssh/ansible.pub
+  eventually 20 "docker exec $n sh -c 'pgrep -x sshd >/dev/null'"
+}
+# ans_project DIR -> a project with the lab's standard ansible.cfg and an inventory
+# of web1, web2 (group web) and db1 (group db)
+ans_project() {
+  lab_file "$1/ansible.cfg" <<'EOF'
+[defaults]
+inventory = inventory.ini
+remote_user = ansible
+private_key_file = /lab/.ssh/ansible
+host_key_checking = False
+interpreter_python = auto_silent
+retry_files_enabled = False
+
+[ssh_connection]
+pipelining = True
+EOF
+  lab_file "$1/inventory.ini" <<'EOF'
+[web]
+web1
+web2
+
+[db]
+db1
+EOF
+}
+# ans_play DIR PLAYBOOK-ARGS... -> run ansible-playbook in DIR as the lab user (for setups)
+ans_play() { local d=$1; shift; ans_as_user "$d" ansible-playbook "$@"; }
+# ans_on NODE CMD... -> run a shell command on a node, as root
+ans_on() { local n=$1; shift; docker exec "$n" sh -c "$*"; }
+# ans_get NODE URL -> fetch URL from inside NODE (the nodes have no curl)
+ans_get() { docker exec "$1" python3 -c 'import sys, urllib.request as u; sys.stdout.write(u.urlopen(sys.argv[1], timeout=3).read().decode())' "$2" 2>/dev/null; }
+# ans_as_user DIR CMD... -> run a command as the lab user in DIR (for setups)
+ans_as_user() { local d=$1; shift; sudo -u "$(lab_user)" -H env ANSIBLE_NOCOLOR=1 bash -c 'cd "$1" && shift && "$@"' _ "$d" "$@"; }
+# ans_idempotent DIR PLAYBOOK-ARGS... -> re-running ansible-playbook in DIR as the
+# lab user succeeds and reports no changes on any host
+ans_idempotent() {
+  local d=$1 out; shift
+  out=$(ans_as_user "$d" ansible-playbook "$@" 2>&1) || return 1
+  grep -q 'ok=' <<<"$out" && ! grep -Eq '(changed|failed|unreachable)=[1-9]' <<<"$out"
+}
+
 # ---------- data-science helper ----------
 # ds_start -> install `dspy`, which runs Python with pandas and scikit-learn in /lab.
 # The container can only see /lab and runs as the calling user.

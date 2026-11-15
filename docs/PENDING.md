@@ -24,6 +24,7 @@ Exercise counts as of v0.14.0:
 | Data science | 43 | 250 | `datascience` | `exercises/datascience/` |
 | Git | 200 | 250 | `git` | `exercises/git/` |
 | Terraform | 50 | 250 | `terraform` | `exercises/terraform/` |
+| Ansible | 50 | 250 | `ansible` | `exercises/ansible/` |
 
 - [Suggested order](#suggested-order)
 - [Shared lab foundations](#shared-lab-foundations)
@@ -237,7 +238,7 @@ Email:
 | Track | What you'd practise | Runs on |
 |---|---|---|
 | **AWS CLI** | CLI fluency, S3, IAM policy documents, `--query` filtering, DynamoDB, SQS and SNS, CloudFormation | Docker VM; moto server in a container |
-| **Infrastructure as code** | Terraform started in `exercises/terraform/` (basics, expressions, state, modules, Docker). Still to do: Ansible against the lab VMs; the AWS provider against moto (the provider is ~600 MB, so it needs its own mirror image); CI/plan review workflows | Existing VMs; light |
+| **Infrastructure as code** | Terraform started in `exercises/terraform/` (basics, expressions, state, modules, Docker). Ansible started in `exercises/ansible/` (inventory, playbooks, templates & vault, roles, operations) against kl-node containers. Still to do: Ansible against the real lab VMs and k8s nodes, Molecule-style role testing; the AWS provider against moto (the provider is ~600 MB, so it needs its own mirror image); CI/plan review workflows | Existing VMs; light |
 | **Observability** | Prometheus queries and alerts, Grafana, Loki, finding why a metric or alert is missing | k8s lab; may need more memory |
 | **CI/CD & GitOps** | Gitea and a runner, broken pipelines, Argo CD drift and sync failures | k8s lab; memory-heavy |
 

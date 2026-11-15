@@ -58,6 +58,38 @@ RUN set -e; m=/usr/share/terraform/providers; \
 ENV TF_CLI_CONFIG_FILE=/etc/terraform.rc CHECKPOINT_DISABLE=1
 DOCKERFILE
 fi
+# Ansible for the Ansible track: the controller image (ansible-core, ansible-lint and
+# collections) and the managed-node image (Debian with sshd; nginx, tree, jq and cron
+# are pre-downloaded so the apt module works offline).
+if ! docker image inspect kl-ansible:1 >/dev/null 2>&1; then
+  echo "==> building the Ansible image (ansible-core 2.21.6, ansible-lint, collections)"
+  docker build -q -t kl-ansible:1 - <<'DOCKERFILE'
+FROM python:3.12-slim
+RUN set -e; apt-get update; apt-get install -y --no-install-recommends openssh-client sshpass git; rm -rf /var/lib/apt/lists/*; \
+    pip install --no-cache-dir ansible-core==2.21.6 ansible-lint==26.10.1; \
+    ansible-galaxy collection install -p /usr/share/ansible/collections ansible.posix:2.2.2 community.general:14.0.1; \
+    mkdir -p /etc/ansible; \
+    printf '[defaults]\nhost_key_checking = False\nprivate_key_file = /lab/.ssh/ansible\nremote_user = ansible\ninterpreter_python = auto_silent\nretry_files_enabled = False\nnocows = 1\n\n[ssh_connection]\npipelining = True\n' > /etc/ansible/ansible.cfg; \
+    printf '#!/bin/sh\n# give the calling uid a passwd entry: ssh refuses to run without one\nif ! getent passwd "$(id -u)" >/dev/null 2>&1; then echo "lab:x:$(id -u):$(id -g):lab:/tmp:/bin/sh" >> /etc/passwd; fi\nexec "$@"\n' > /usr/local/bin/kl-entry; \
+    chmod 755 /usr/local/bin/kl-entry; chmod 666 /etc/passwd
+ENV ANSIBLE_COLLECTIONS_PATH=/usr/share/ansible/collections
+ENTRYPOINT ["/usr/local/bin/kl-entry"]
+DOCKERFILE
+fi
+if ! docker image inspect kl-node:1 >/dev/null 2>&1; then
+  echo "==> building the Ansible managed-node image"
+  docker build -q -t kl-node:1 - <<'DOCKERFILE'
+FROM debian:bookworm-slim
+RUN set -e; apt-get update; \
+    apt-get install -y --no-install-recommends openssh-server python3 python3-apt sudo init-system-helpers procps iproute2 iputils-ping; \
+    apt-get install -y --download-only --no-install-recommends nginx tree jq cron; \
+    useradd -m -s /bin/bash ansible; echo 'ansible ALL=(ALL) NOPASSWD:ALL' > /etc/sudoers.d/ansible; chmod 440 /etc/sudoers.d/ansible; \
+    install -d -m 700 -o ansible -g ansible /home/ansible/.ssh; mkdir -p /run/sshd; \
+    sed -i 's/^#\?PasswordAuthentication.*/PasswordAuthentication no/' /etc/ssh/sshd_config; \
+    rm -f /etc/ssh/ssh_host_*; ssh-keygen -A
+CMD ["/usr/sbin/sshd", "-D", "-e"]
+DOCKERFILE
+fi
 echo "==> taking the pristine snapshot"
 mkdir -p /var/lib/kubelab/pristine
 /opt/kubelab/state.sh snapshot docker

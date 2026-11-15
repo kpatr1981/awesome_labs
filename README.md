@@ -37,8 +37,9 @@ have a short tutorial on the concepts and commands to read first.
 | **Data Science** | pandas, statistics and machine learning *(growing)* | 43 |
 | **Git** | the basics · branching & merging · inspecting history · undoing changes · rebasing & rewriting · stashing & tagging · remotes & collaboration · recovery & detective work (reflog, bisect, fsck) · plumbing & power tools · real-world workflows · config & aliases · ignore rules & attributes · hooks · submodules & subtrees · advanced merging (strategies, rerere, merge-tree) · searching & comparing · large repositories (shallow, partial, sparse) · repository troubleshooting · identity, SSH signing & trailers · multi-problem incidents | 200 |
 | **Terraform** | the basics (init, plan, apply, outputs, provider versions) · variables, expressions & meta-arguments (`count`, `for_each`, templates, validation) · working with state (moved, removed, import, workspaces, backends, recovery) · modules (local, Git-pinned, refactoring into modules) · real Docker infrastructure with the `kreuzwerker/docker` provider *(growing)* | 50 |
+| **Ansible** | inventories & ad-hoc commands · playbooks (handlers, loops, conditionals, idempotence) · templates, files & variables (Jinja2, precedence, Vault) · roles & reuse (role design, dependencies, Galaxy from Git, ansible-lint) · operations & incidents (check mode, validate, block/rescue, become, constructed inventories) against SSH-managed nodes *(growing)* | 50 |
 
-That's 976 exercises so far, with a target of 250 per track; ideas for what comes next are
+That's 1026 exercises so far, with a target of 250 per track; ideas for what comes next are
 in [docs/PENDING.md](docs/PENDING.md).
 
 Difficulty rises through each module (1 = beginner … 5 = expert), mixing **build** tasks
@@ -56,7 +57,7 @@ techniques on systems you own or are explicitly authorized to test.
 
 | Environment | VMs | What's inside |
 |-------------|-----|---------------|
-| **Docker host** | `kl-docker` (2 CPU, 3 GiB) | Ubuntu 24.04, Docker Engine + Compose + Buildx, common images pre-pulled, networking and diagnostic tools, a Python data-science image, Terraform 1.16 with an offline provider mirror |
+| **Docker host** | `kl-docker` (2 CPU, 3 GiB) | Ubuntu 24.04, Docker Engine + Compose + Buildx, common images pre-pulled, networking and diagnostic tools, a Python data-science image, Terraform 1.16 with an offline provider mirror, Ansible (ansible-core 2.21) with SSH-managed node containers |
 | **Kubernetes cluster** | `kl-cp` → `controlplane` (2 CPU, 3 GiB)<br>`kl-worker` → `node01` (2 CPU, 2.5 GiB) | kubeadm **v1.36**, containerd 2, Calico (enforces NetworkPolicies), metrics-server, local-path storage (default StorageClass), Traefik ingress + Gateway API (NodePorts 30080/30443), Helm |
 | **Offensive security lab** | `kl-offsec` (2 CPU, 3 GiB) | Ubuntu 24.04, Docker (hosts the vulnerable targets), attacker tooling (nmap, ncat, hydra, john, …) and wordlists under `/usr/share/kl`. Attacker and targets are the same isolated box |
 
