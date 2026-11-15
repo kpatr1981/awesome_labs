@@ -477,7 +477,7 @@ func (m *model) viewEnv() string {
 	t := sTitle.Render(" Lab environments & VMs") + "   "
 	busy := m.op != "" // every VM action waits for the running one
 	b.WriteString(m.titleButtons(t, 1, button{label: "Start", key: "u", off: busy}, button{label: "Stop", key: "x", off: busy}, button{label: "Reset", key: "R", off: busy},
-		button{label: "Rebuild", key: "B", off: busy}, button{label: "Delete", key: "D", off: busy}, button{label: "Stop all", key: "X", off: busy},
+		button{label: "Prepare", key: "P", off: busy}, button{label: "Rebuild", key: "B", off: busy}, button{label: "Delete", key: "D", off: busy}, button{label: "Stop all", key: "X", off: busy},
 		button{label: "Delete all", key: "K", off: busy}, button{label: "Refresh", key: "r"}, button{label: "Back", key: "esc"}) + "\n\n")
 	for i, env := range lab.AllEnvs() {
 		st, ok := m.envStatus[env.Profile]

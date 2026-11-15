@@ -43,7 +43,7 @@ usage:
   awesome_labs check <id>              check your work
   awesome_labs forget <id>             erase your progress on an exercise
   awesome_labs shell [docker|k8s|node01|offsec]  open a shell in a lab VM
-  awesome_labs env status|up|stop|destroy|rebuild|reset|cache [docker|k8s|offsec]
+  awesome_labs env status|up|prepare|stop|destroy|rebuild|reset|cache [docker|k8s|offsec]
   awesome_labs vms [stop|delete <name|all>]  list lab VMs, or stop/delete them
   awesome_labs verify [-from id] [ids or prefixes...]
                                   author tool: setup -> check fails -> solve -> check passes
@@ -391,6 +391,8 @@ func envCmd(ctx context.Context, mgr *lab.Manager, args []string) error {
 			err = mgr.Destroy(ctx, env, os.Stdout)
 		case "rebuild":
 			err = mgr.Rebuild(ctx, env, os.Stdout)
+		case "prepare":
+			err = mgr.Prepare(ctx, env, os.Stdout)
 		case "reset":
 			err = mgr.Reset(ctx, env, os.Stdout)
 		case "cache":

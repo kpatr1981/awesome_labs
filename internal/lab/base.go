@@ -233,3 +233,52 @@ func (m *Manager) startAll(ctx context.Context, env Env, log io.Writer) error {
 	}
 	return first
 }
+
+// HasBase reports whether every VM of env has an up-to-date saved copy, so the
+// environment starts in seconds. It only looks; it never deletes anything.
+func (m *Manager) HasBase(ctx context.Context, env Env) bool {
+	if m.Assets == nil {
+		return false
+	}
+	all, err := lima.List(ctx)
+	if err != nil {
+		return false
+	}
+	for _, vm := range env.VMs {
+		bi, has := m.readBase(vm)
+		key, err := m.baseKey(env, vm)
+		if !has || err != nil || bi.Key != key || all[baseName(vm)].Status != "Stopped" {
+			return false
+		}
+	}
+	return true
+}
+
+// Prepare builds env ahead of time and keeps only its saved copy: the next
+// exercise that needs it then starts in seconds. An environment that already
+// has an up-to-date copy is left alone. Its running VMs are deleted
+// afterwards, so preparing several environments one after another never needs
+// more memory than the largest of them.
+func (m *Manager) Prepare(ctx context.Context, env Env, log io.Writer) error {
+	if m.HasBase(ctx, env) {
+		fmt.Fprintf(log, "==> %s already has a saved copy — nothing to build\n", env.Title)
+		return nil
+	}
+	// A copy is only saved by a build from scratch, so VMs left from an
+	// earlier build without one go first.
+	if err := m.Destroy(ctx, env, log); err != nil {
+		return err
+	}
+	fmt.Fprintf(log, "==> building %s (the first build takes several minutes)\n", env.Title)
+	if err := m.Ensure(ctx, env, log); err != nil {
+		return err
+	}
+	if !m.HasBase(ctx, env) {
+		fmt.Fprintf(log, "==> %s is built, but its copy could not be saved: its first exercise builds it again\n", env.Title)
+	}
+	if err := m.Destroy(ctx, env, log); err != nil {
+		return err
+	}
+	fmt.Fprintf(log, "==> %s is prepared: its exercises now start in seconds\n", env.Title)
+	return nil
+}

@@ -65,7 +65,10 @@ The cluster deliberately runs one minor release behind the newest Kubernetes, so
 upgrade exercise has something to upgrade to.
 
 VMs are created **on first use** (5–15 minutes, mostly package installs and image
-pulls) and reused afterwards. Before every exercise awesome_labs **resets** the environment
+pulls) and reused afterwards. On its first launch the app offers to build each
+environment right away instead, one question per environment, so later exercises start
+in seconds; `awesome_labs env prepare [docker|k8s|offsec]` (or **P** on the environments
+screen) does the same at any time. Before every exercise awesome_labs **resets** the environment
 to a pristine snapshot: it removes leftover containers, namespaces and cluster-scoped
 objects, restores changed config files (daemon.json, kubelet config, static pod
 manifests, …) and restarts what needs restarting — usually in a few seconds.

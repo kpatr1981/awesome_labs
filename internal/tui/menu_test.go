@@ -3,6 +3,7 @@ package tui
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"io"
 	"os"
 	"path/filepath"
@@ -88,6 +89,8 @@ func newTestModelIn(t *testing.T, dir string) *model {
 	m.Update(tea.WindowSizeMsg{Width: 150, Height: 50})
 	m.endLab = func(context.Context, *exercise.Exercise, io.Writer) error { return nil } // never the real VMs
 	m.deleteVMs = func(context.Context, io.Writer) error { return nil }
+	m.unprepared = nil // never look at the real VMs
+	m.prepare = func(context.Context, lab.Env, io.Writer) error { return errors.New("tests never build VMs") }
 	m.op = busyOp
 	return m
 }
@@ -774,5 +777,55 @@ func TestResetProgressRefilters(t *testing.T) {
 	m.onYes()
 	if shown() {
 		t.Fatal("d-2 still listed under In progress after its progress was reset")
+	}
+}
+
+// On the first launch the app offers to build each environment that has no
+// saved copy, one question at a time, builds only the chosen ones, and never
+// asks again.
+func TestFirstLaunchOffersToPrepare(t *testing.T) {
+	dir := t.TempDir()
+	m := newTestModelIn(t, dir)
+	m.op = ""
+	m.unprepared = func(context.Context) []lab.Env { return []lab.Env{lab.DockerEnv, lab.K8sEnv} }
+	built := make(chan string, 4)
+	m.prepare = func(_ context.Context, env lab.Env, _ io.Writer) error { built <- env.Title; return nil }
+	m.Init()
+	for msg := range m.opCh {
+		m.Update(msg)
+	}
+	if !strings.Contains(m.confirm, lab.DockerEnv.Title) {
+		t.Fatalf("first question = %q, want one about %s", m.confirm, lab.DockerEnv.Title)
+	}
+	if c := m.answer(false); c != nil {
+		t.Fatal("declining the first environment started something")
+	}
+	if !strings.Contains(m.confirm, lab.K8sEnv.Title) {
+		t.Fatalf("second question = %q, want one about %s", m.confirm, lab.K8sEnv.Title)
+	}
+	m.answer(true)
+	if m.op == "" || m.screen != scrEnv {
+		t.Fatalf("accepting did not start preparing on the environments screen (op %q)", m.op)
+	}
+	for msg := range m.opCh {
+		m.Update(msg)
+	}
+	close(built)
+	var got []string
+	for b := range built {
+		got = append(got, b)
+	}
+	if len(got) != 1 || got[0] != lab.K8sEnv.Title {
+		t.Errorf("built %v, want only %s", got, lab.K8sEnv.Title)
+	}
+	m2 := newTestModelIn(t, dir)
+	m2.op = ""
+	m2.unprepared = m.unprepared
+	m2.Init()
+	for msg := range m2.opCh {
+		m2.Update(msg)
+	}
+	if m2.confirm != "" {
+		t.Errorf("the second launch asked again: %q", m2.confirm)
 	}
 }

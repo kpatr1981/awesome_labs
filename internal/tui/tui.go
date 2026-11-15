@@ -5,6 +5,8 @@ import (
 	"context"
 	"fmt"
 	"io"
+	"os"
+	"path/filepath"
 	"slices"
 	"strings"
 	"sync"
@@ -114,6 +116,12 @@ type model struct {
 	endLab func(ctx context.Context, ex *exercise.Exercise, w io.Writer) error
 	// deleteVMs deletes every lab VM, on start and on exit; tests replace it
 	deleteVMs func(ctx context.Context, w io.Writer) error
+	// unprepared lists the environments with no saved copy yet, for the
+	// first-launch offer to build them; tests replace it
+	unprepared func(ctx context.Context) []lab.Env
+	prepOffer  []lab.Env // set by the start-up cleanup: environments to offer building
+	// prepare builds an environment and keeps its saved copy; tests replace it
+	prepare func(ctx context.Context, env lab.Env, w io.Writer) error
 
 	// the one exercise set up on the VMs right now
 	active    lab.Active
@@ -205,6 +213,16 @@ func newModel(d Deps, style string) *model {
 	}
 	m.endLab = mgr.EndExercise
 	m.deleteVMs = mgr.DeleteAll
+	m.prepare = mgr.Prepare
+	m.unprepared = func(ctx context.Context) []lab.Env {
+		var out []lab.Env
+		for _, env := range lab.AllEnvs() {
+			if !mgr.HasBase(ctx, env) {
+				out = append(out, env)
+			}
+		}
+		return out
+	}
 	m.exam = d.Exams.Current()
 	if m.exam != nil && m.exam.Over() {
 		m.finishExam()
@@ -239,6 +257,9 @@ func (m *model) Init() tea.Cmd {
 			return false, err
 		}
 		m.mgr.ClearActive("")
+		if !m.prepareOffered() && m.unprepared != nil {
+			m.prepOffer = m.unprepared(ctx) // read by Update once this op is done
+		}
 		return false, nil
 	})
 	return tea.Batch(m.spin.Tick, tick(), cleanup)
@@ -499,6 +520,8 @@ func (m *model) envAction(action string) tea.Cmd {
 		return run(func(ctx context.Context, w io.Writer) error { return m.mgr.Destroy(ctx, env, w) })
 	case "rebuild":
 		return run(func(ctx context.Context, w io.Writer) error { return m.mgr.Rebuild(ctx, env, w) })
+	case "prepare":
+		return m.cmdPrepare([]lab.Env{env})
 	case "stop-all":
 		return m.startOp("env", "Stopping all lab VMs", "env", func(ctx context.Context, w io.Writer) (bool, error) {
 			return false, m.mgr.StopAll(ctx, w)
@@ -577,6 +600,13 @@ func (m *model) update(msg tea.Msg) (tea.Model, tea.Cmd) {
 			m.flash = msg.id + " ended — its VMs are cleaned for the next exercise"
 		case msg.kind == "cleanup":
 			m.flash = "no lab VMs left over"
+			if len(m.prepOffer) > 0 {
+				offer := m.prepOffer
+				m.prepOffer = nil
+				m.markPrepareOffered()
+				m.refreshViewport(true)
+				return m, m.offerPrepare(offer, nil)
+			}
 		case msg.kind == "env":
 			if msg.err == nil {
 				m.flash = "done"
@@ -1136,7 +1166,7 @@ func (m *model) updateStarted(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 func (m *model) updateEnv(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 	k := msg.String()
 	// the VM actions wait for the running one: refuse before asking
-	if m.op != "" && strings.Contains("uxRBDXK", k) && len(k) == 1 {
+	if m.op != "" && strings.Contains("uxRBDXKP", k) && len(k) == 1 {
 		m.flash = "busy: " + m.op
 		return m, nil
 	}
@@ -1163,6 +1193,8 @@ func (m *model) updateEnv(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 		m.ask("Delete the VMs of this environment?", func() tea.Cmd { return m.envAction("destroy") }, nil)
 	case "B":
 		m.ask("Destroy and rebuild this environment from scratch (takes minutes)?", func() tea.Cmd { return m.envAction("rebuild") }, nil)
+	case "P":
+		m.ask("Build this environment now and keep a saved copy, so its exercises start in seconds? Its running VMs are deleted when it's done.", func() tea.Cmd { return m.envAction("prepare") }, nil)
 	case "X":
 		return m, m.envAction("stop-all")
 	case "K":
@@ -1176,4 +1208,71 @@ func (m *model) showingOutputOf(id string) bool {
 		return true
 	}
 	return m.screen == scrEnv && id == "env"
+}
+
+// ---- preparing environments ahead of time ----
+
+func (m *model) prepareMarker() string { return filepath.Join(m.mgr.StateDir, "prepare-offered") }
+
+// prepareOffered reports whether the first-launch offer was already made.
+func (m *model) prepareOffered() bool {
+	_, err := os.Stat(m.prepareMarker())
+	return err == nil
+}
+
+func (m *model) markPrepareOffered() { _ = os.WriteFile(m.prepareMarker(), []byte("1\n"), 0o644) }
+
+// envTracks names the tracks whose exercises run in env.
+func (m *model) envTracks(env lab.Env) string {
+	seen := map[string]bool{}
+	var names []string
+	for _, e := range m.cat.Exercises {
+		if lab.EnvFor(e.Profile).Profile == env.Profile && !seen[e.Track] {
+			seen[e.Track] = true
+			names = append(names, trackLabel(e.Track))
+		}
+	}
+	return strings.Join(names, ", ")
+}
+
+// offerPrepare asks, one environment at a time, whether to build it now, then
+// builds the chosen ones.
+func (m *model) offerPrepare(rest, chosen []lab.Env) tea.Cmd {
+	if len(rest) == 0 {
+		if len(chosen) == 0 {
+			m.flash = "the lab VMs are built on first use (or press P on the environments screen)"
+			return nil
+		}
+		return m.cmdPrepare(chosen)
+	}
+	env := rest[0]
+	mins := "about 5–15 minutes"
+	if env.Profile == exercise.ProfileK8s {
+		mins = "about 10–20 minutes"
+	}
+	q := fmt.Sprintf("First launch: build the %s now (%s)? Afterwards its exercises start in seconds instead of building it then. Used by: %s.",
+		env.Title, mins, m.envTracks(env))
+	next := append([]lab.Env(nil), rest[1:]...)
+	m.ask(q,
+		func() tea.Cmd { return m.offerPrepare(next, append(append([]lab.Env(nil), chosen...), env)) },
+		func() tea.Cmd { return m.offerPrepare(next, chosen) })
+	return nil
+}
+
+// cmdPrepare builds envs one after another and keeps only their saved copies.
+func (m *model) cmdPrepare(envs []lab.Env) tea.Cmd {
+	var names []string
+	for _, e := range envs {
+		names = append(names, e.Title)
+	}
+	m.envBack = m.screen
+	m.screen = scrEnv
+	return m.startOp("env", "Preparing "+strings.Join(names, ", "), "env", func(ctx context.Context, w io.Writer) (bool, error) {
+		for _, env := range envs {
+			if err := m.prepare(ctx, env, w); err != nil {
+				return false, err
+			}
+		}
+		return false, nil
+	})
 }

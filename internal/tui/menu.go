@@ -957,7 +957,7 @@ Exam            setup: ↑↓ field · ←→ change · enter start
                 running: ↑↓ move · enter open question · F finish · esc list (timer runs)
                 result: ↑↓ move · o open question (solutions unlocked) · esc list
 
-Environments    ↑↓ select · u start · x stop · R reset VMs · B rebuild · D delete
+Environments    ↑↓ select · u start · x stop · R reset VMs · P prepare · B rebuild · D delete
                 X stop all · K delete all · r refresh · esc back
 
 Menus           ←→ switch menu · ↑↓ move · enter choose · esc close
