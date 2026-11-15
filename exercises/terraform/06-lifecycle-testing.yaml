@@ -1,0 +1,1598 @@
+track: terraform
+module: Functions, lifecycle & testing
+profile: docker
+order: 6
+exercises:
+
+- id: tf-051
+  title: "Unsupported Terraform Core version"
+  difficulty: 1
+  kind: fix
+  tags: [terraform, required_version, versions]
+  tutorial: |
+    **Concept.** `required_version` in the `terraform {}` block states which
+    Terraform releases may run a configuration. `~> 1.5.0` means "1.5.x
+    only" (the last number may grow), while `>= 1.5` means "1.5 or anything
+    newer". When the running binary is outside the range, `init`, `plan` and
+    `apply` all stop with *Unsupported Terraform Core version*.
+
+    **Read up on:**
+    - Version constraint syntax: `=`, `>=`, `~>`, ranges with commas
+    - `terraform version`
+  scenario: |
+    **`/lab/pin`** was written years ago and now refuses to run on the lab's
+    Terraform. Loosen the constraint so it runs on the current release but
+    still **requires at least 1.5**, then apply it so that **`motd.txt`** is
+    created.
+  hints:
+    - "`terraform version` shows what you have."
+    - "`~> 1.5.0` only allows 1.5.x. `>= 1.5` allows newer releases too."
+  solution: |
+    ```bash
+    cd /lab/pin
+    terraform version
+    sed -i 's/required_version = .*/required_version = ">= 1.5"/' versions.tf
+    terraform init && terraform apply -auto-approve
+    ```
+  setup: |
+    tf_start
+    rm -rf /lab/pin
+    lab_file /lab/pin/versions.tf <<'EOF'
+    terraform {
+      required_version = "~> 1.5.0"
+      required_providers {
+        local = {
+          source  = "hashicorp/local"
+          version = "~> 2.0"
+        }
+      }
+    }
+    EOF
+    lab_file /lab/pin/main.tf <<'EOF'
+    resource "local_file" "motd" {
+      filename = "${path.module}/motd.txt"
+      content  = "Welcome to the lab\n"
+    }
+    EOF
+  check: |
+    check "motd.txt was created by Terraform" 'tf_has /lab/pin local_file.motd && [ -f /lab/pin/motd.txt ]'
+    req=$(grep -E '^\s*required_version' /lab/pin/versions.tf 2>/dev/null)
+    check "required_version is still set" '[ -n "$req" ]'
+    check_not "the old 1.5.x-only pin is gone" 'grep -q "~> *1.5.0" <<<"$req"'
+    check_match "it still requires 1.5 or newer" "$req" '(>=|~>) *1\.([5-9]|1[0-6])'
+  solve: |
+    cd /lab/pin
+    sed -i 's/required_version = .*/required_version = ">= 1.5"/' versions.tf
+    terraform init -input=false -no-color
+    terraform apply -auto-approve -input=false -no-color
+
+- id: tf-052
+  title: Ask terraform console
+  difficulty: 1
+  kind: build
+  tags: [terraform, console, expressions, functions]
+  tutorial: |
+    **Concept.** `terraform console` evaluates expressions against a
+    configuration: its variables, locals and functions. It's the quickest way
+    to find out what `lookup`, `cidrsubnet` or a `for` expression really
+    returns. It also reads from a pipe: `echo 'local.x' | terraform console`.
+
+    **Read up on:**
+    - `terraform console`
+    - `lookup`, `cidrsubnet`, `for` expressions
+  scenario: |
+    **`/lab/console/main.tf`** defines a few locals that nobody can explain.
+    Write their values into **`/lab/answer.txt`**, one per line, in this
+    order and without quotes:
+
+    1. `local.size`
+    2. `local.names[2]`
+    3. `local.cidr`
+  hints:
+    - "`cd /lab/console && echo 'local.size' | terraform console`."
+    - "Values come back quoted. Strip the quotes with `tr -d '\"'`."
+  solution: |
+    ```bash
+    cd /lab/console
+    for e in 'local.size' 'local.names[2]' 'local.cidr'; do
+      echo "$e" | terraform console | tr -d '"'
+    done > /lab/answer.txt
+    ```
+  setup: |
+    tf_start
+    rm -rf /lab/console /lab/answer.txt
+    envs=(dev staging prod); env=${envs[$((RANDOM % 3))]}
+    net=$((RANDOM % 200 + 10)); idx=$((RANDOM % 15 + 1))
+    lab_file /lab/console/main.tf <<EOF
+    variable "env" {
+      default = "$env"
+    }
+
+    locals {
+      sizes = { dev = "small", staging = "medium", prod = "large" }
+      size  = lookup(local.sizes, var.env, "tiny")
+      zones = ["a", "b", "c"]
+      names = [for z in local.zones : "\${var.env}-\${z}"]
+      cidr  = cidrsubnet("10.$net.0.0/16", 4, $idx)
+    }
+    EOF
+    case $env in dev) size=small ;; staging) size=medium ;; prod) size=large ;; esac
+    printf '%s\n%s\n%s\n' "$size" "$env-c" "10.$net.$((idx * 16)).0/20" > "$KL_STATE/answer"
+  check: |
+    check_eq "the three values" "$(tr -d '" \r' < /lab/answer.txt 2>/dev/null)" "$(cat "$KL_STATE/answer")"
+  solve: |
+    cd /lab/console
+    for e in 'local.size' 'local.names[2]' 'local.cidr'; do
+      echo "$e" | terraform console | tr -d '"'
+    done > /lab/answer.txt
+
+- id: tf-053
+  title: Carve a network into subnets
+  difficulty: 2
+  kind: build
+  tags: [terraform, cidrsubnet, for, outputs]
+  tutorial: |
+    **Concept.** `cidrsubnet(prefix, newbits, netnum)` cuts a larger network
+    into equal pieces. `cidrsubnet("10.0.0.0/16", 8, 3)` adds 8 bits to the
+    prefix (a /24) and picks piece number 3: `10.0.3.0/24`. Combined with a
+    `for` expression over a list (`for i, z in var.zones`), it builds a whole
+    subnet plan from one variable.
+
+    **Read up on:**
+    - `cidrsubnet`, `cidrhost`
+    - `for i, v in list : key => value`
+  scenario: |
+    **`/lab/net`** has a `vpc_cidr` (a /16) and a list of `zones`. Add an
+    output **`subnets`**: a **map from zone name to a /24**, where the zone at
+    list index *i* gets the /24 with **network number *i* + 1**. The first
+    zone gets the `.1.0/24`, the next `.2.0/24`, and so on.
+
+    Apply, so the output is in the state.
+  hints:
+    - "`{ for i, z in var.zones : z => cidrsubnet(var.vpc_cidr, 8, i + 1) }`."
+  solution: |
+    ```bash
+    cd /lab/net
+    cat >> main.tf <<'EOF'
+
+    output "subnets" {
+      value = { for i, z in var.zones : z => cidrsubnet(var.vpc_cidr, 8, i + 1) }
+    }
+    EOF
+    terraform init && terraform apply -auto-approve
+    terraform output subnets
+    ```
+  setup: |
+    tf_start
+    rm -rf /lab/net
+    n=$((RANDOM % 200 + 20))
+    lab_file /lab/net/main.tf <<'EOF'
+    variable "vpc_cidr" {
+      type = string
+    }
+
+    variable "zones" {
+      type = list(string)
+    }
+    EOF
+    lab_file /lab/net/terraform.tfvars <<EOF
+    vpc_cidr = "10.$n.0.0/16"
+    zones    = ["eu-north", "eu-south", "eu-west"]
+    EOF
+    printf '{"eu-north":"10.%s.1.0/24","eu-south":"10.%s.2.0/24","eu-west":"10.%s.3.0/24"}' $n $n $n | jq -S -c . > "$KL_STATE/answer"
+  check: |
+    got=$(tf_output /lab/net subnets | jq -S -c . 2>/dev/null)
+    check_eq "output subnets" "$got" "$(cat "$KL_STATE/answer")"
+  solve: |
+    cd /lab/net
+    cat >> main.tf <<'EOF'
+
+    output "subnets" {
+      value = { for i, z in var.zones : z => cidrsubnet(var.vpc_cidr, 8, i + 1) }
+    }
+    EOF
+    terraform init -input=false -no-color
+    terraform apply -auto-approve -input=false -no-color
+
+- id: tf-054
+  title: One file per user from a YAML list
+  difficulty: 2
+  kind: build
+  tags: [terraform, yamldecode, file, for_each]
+  tutorial: |
+    **Concept.** Data often lives outside Terraform in YAML or JSON.
+    `yamldecode(file("users.yaml"))` turns a file into a Terraform value, and
+    a `for` expression reshapes a list into the map that `for_each` needs:
+    `{ for u in local.users : u.name => u }`. Adding someone to the YAML file
+    then adds one resource, and nothing else changes.
+
+    **Read up on:**
+    - `file`, `yamldecode`, `jsondecode`
+    - `for_each` with a map, `each.key`, `each.value`
+  scenario: |
+    **`/lab/users/users.yaml`** lists the team's accounts. In **`/lab/users`**,
+    create one **`local_file.home`** instance per user, **keyed by the user's
+    name** (`local_file.home["alice"]`, …), each writing
+    **`homes/<name>.txt`** with exactly this content:
+
+    ```
+    shell=<the user's shell>
+    ```
+
+    (followed by a newline). Read the list from the YAML file; don't copy it
+    into the configuration. Apply.
+  hints:
+    - "`locals { users = yamldecode(file(\"${path.module}/users.yaml\")).users }`."
+    - "`for_each = { for u in local.users : u.name => u }`."
+    - "`content = \"shell=${each.value.shell}\\n\"`."
+  solution: |
+    ```bash
+    cd /lab/users
+    cat > main.tf <<'EOF'
+    locals {
+      users = yamldecode(file("${path.module}/users.yaml")).users
+    }
+
+    resource "local_file" "home" {
+      for_each = { for u in local.users : u.name => u }
+      filename = "${path.module}/homes/${each.key}.txt"
+      content  = "shell=${each.value.shell}\n"
+    }
+    EOF
+    terraform init && terraform apply -auto-approve
+    ```
+  setup: |
+    tf_start
+    rm -rf /lab/users
+    lab_file /lab/users/users.yaml <<'EOF'
+    users:
+      - name: alice
+        shell: /bin/bash
+      - name: bruno
+        shell: /bin/zsh
+      - name: chen
+        shell: /usr/bin/fish
+      - name: dana
+        shell: /bin/sh
+    EOF
+  check: |
+    for u in alice:/bin/bash bruno:/bin/zsh chen:/usr/bin/fish dana:/bin/sh; do
+      n=${u%%:*}; s=${u#*:}
+      check "local_file.home[\"$n\"] is managed" "tf_has /lab/users 'local_file.home[\"$n\"]'"
+      check_eq "homes/$n.txt" "$(cat /lab/users/homes/$n.txt 2>/dev/null)" "shell=$s"
+    done
+    check_eq "exactly four instances" "$(tf_addrs /lab/users | grep -c '^local_file.home\[')" 4
+    check_not "the names are not copied into the .tf files" 'grep -q chen /lab/users/*.tf'
+  solve: |
+    cd /lab/users
+    cat > main.tf <<'EOF'
+    locals {
+      users = yamldecode(file("${path.module}/users.yaml")).users
+    }
+
+    resource "local_file" "home" {
+      for_each = { for u in local.users : u.name => u }
+      filename = "${path.module}/homes/${each.key}.txt"
+      content  = "shell=${each.value.shell}\n"
+    }
+    EOF
+    terraform init -input=false -no-color
+    terraform apply -auto-approve -input=false -no-color
+
+- id: tf-055
+  title: Published ports from a dynamic block
+  difficulty: 2
+  kind: build
+  tags: [terraform, dynamic, docker, ports]
+  tutorial: |
+    **Concept.** Some arguments are *nested blocks* (`ports { ... }`) rather
+    than lists, so you can't hand them a variable directly. A **`dynamic`**
+    block generates one nested block per element:
+
+    ```hcl
+    dynamic "ports" {
+      for_each = var.ports
+      content {
+        internal = ports.value.internal
+        external = ports.value.external
+      }
+    }
+    ```
+
+    **Read up on:**
+    - `dynamic` blocks, the iterator name, `content`
+  scenario: |
+    **`/lab/dyn`** runs container **`tf-dyn`** with one hard-coded `ports`
+    block. The variable **`ports`** already lists every mapping the service
+    needs.
+
+    Replace the hard-coded block with a **`dynamic "ports"`** block driven by
+    `var.ports`, and apply so that every mapping in the variable is published.
+  hints:
+    - "Delete the static `ports { ... }` block and add `dynamic \"ports\" { for_each = var.ports  content { ... } }`."
+    - "Inside `content`, the element is `ports.value`."
+  solution: |
+    ```bash
+    cd /lab/dyn
+    python3 - <<'PY'
+    import re
+    p = "main.tf"; s = open(p).read()
+    s = re.sub(r'  ports \{[^}]*\}\n', '''  dynamic "ports" {
+        for_each = var.ports
+        content {
+          internal = ports.value.internal
+          external = ports.value.external
+        }
+      }
+    ''', s)
+    open(p, "w").write(s)
+    PY
+    terraform apply -auto-approve
+    docker port tf-dyn
+    ```
+  setup: |
+    tf_start
+    rm -rf /lab/dyn
+    a=$((8100 + RANDOM % 50)); b=$((a + 100))
+    lab_file /lab/dyn/main.tf <<EOF
+    terraform {
+      required_providers {
+        docker = {
+          source = "kreuzwerker/docker"
+        }
+      }
+    }
+
+    provider "docker" {}
+
+    variable "ports" {
+      type = list(object({ internal = number, external = number }))
+      default = [
+        { internal = 80, external = $a },
+        { internal = 8080, external = $b },
+      ]
+    }
+
+    resource "docker_image" "nginx" {
+      name         = "nginx:1.27-alpine"
+      keep_locally = true
+    }
+
+    resource "docker_container" "dyn" {
+      name  = "tf-dyn"
+      image = docker_image.nginx.image_id
+      ports {
+        internal = 80
+        external = $a
+      }
+    }
+    EOF
+    echo "$a $b" > "$KL_STATE/ports"
+    on_reset 'docker rm -f tf-dyn >/dev/null 2>&1; true'
+    tf_as_user /lab/dyn init -input=false -no-color >/dev/null
+    tf_as_user /lab/dyn apply -auto-approve -input=false -no-color >/dev/null
+  check: |
+    read -r a b < "$KL_STATE/ports"
+    check "the config uses dynamic \"ports\"" 'grep -q "dynamic \"ports\"" /lab/dyn/main.tf'
+    check_eq "port 80 is published on $a" "$(docker inspect -f '{{(index (index .NetworkSettings.Ports "80/tcp") 0).HostPort}}' tf-dyn 2>/dev/null)" "$a"
+    check_eq "port 8080 is published on $b" "$(docker inspect -f '{{(index (index .NetworkSettings.Ports "8080/tcp") 0).HostPort}}' tf-dyn 2>/dev/null)" "$b"
+    check "the plan is empty" 'tf_clean /lab/dyn'
+  solve: |
+    cd /lab/dyn
+    python3 - <<'PY'
+    import re
+    p = "main.tf"; s = open(p).read()
+    s = re.sub(r'  ports \{[^}]*\}\n', '''  dynamic "ports" {
+        for_each = var.ports
+        content {
+          internal = ports.value.internal
+          external = ports.value.external
+        }
+      }
+    ''', s)
+    open(p, "w").write(s)
+    PY
+    terraform apply -auto-approve -input=false -no-color
+
+- id: tf-056
+  title: The build ID that changes on every plan
+  difficulty: 2
+  kind: fix
+  tags: [terraform, lifecycle, ignore_changes, keepers]
+  tutorial: |
+    **Concept.** `timestamp()` returns a new value on every run. When it feeds
+    an argument that forces replacement, such as `keepers` on a `random_*`
+    resource, every plan wants to destroy and re-create that resource.
+    `lifecycle { ignore_changes = [attr] }` tells Terraform to keep the value
+    it stored at creation and stop proposing changes for that argument.
+
+    **Read up on:**
+    - `lifecycle { ignore_changes = [...] }`
+    - `random_id` `keepers`
+  scenario: |
+    In **`/lab/build`**, every `terraform plan` wants to replace
+    **`random_id.build`**, which would break every artifact that embeds the ID.
+
+    Make the plan **empty** while keeping the **current ID**. The `keepers`
+    argument must stay in the configuration, because the release tooling reads
+    it.
+  hints:
+    - "`terraform plan` says *forces replacement* on `keepers`."
+    - "Add `lifecycle { ignore_changes = [keepers] }` to `random_id.build`."
+  solution: |
+    ```bash
+    cd /lab/build
+    python3 - <<'PY'
+    p = "main.tf"; s = open(p).read()
+    s = s.replace("  byte_length = 4\n", "  byte_length = 4\n\n  lifecycle {\n    ignore_changes = [keepers]\n  }\n", 1)
+    open(p, "w").write(s)
+    PY
+    terraform plan
+    ```
+  setup: |
+    tf_start
+    rm -rf /lab/build
+    lab_file /lab/build/main.tf <<'EOF'
+    resource "random_id" "build" {
+      keepers = {
+        created = timestamp()
+      }
+      byte_length = 4
+    }
+
+    output "build_id" {
+      value = random_id.build.hex
+    }
+    EOF
+    tf_as_user /lab/build init -input=false -no-color >/dev/null
+    tf_as_user /lab/build apply -auto-approve -input=false -no-color >/dev/null
+    tf_get /lab/build random_id.build hex > "$KL_STATE/id"
+  check: |
+    check_eq "the build ID is unchanged" "$(tf_get /lab/build random_id.build hex)" "$(cat "$KL_STATE/id")"
+    check "keepers is still in the config" 'grep -q keepers /lab/build/main.tf'
+    check "the plan is empty" 'tf_clean /lab/build'
+  solve: |
+    cd /lab/build
+    python3 - <<'PY'
+    p = "main.tf"; s = open(p).read()
+    s = s.replace("  byte_length = 4\n", "  byte_length = 4\n\n  lifecycle {\n    ignore_changes = [keepers]\n  }\n", 1)
+    open(p, "w").write(s)
+    PY
+
+- id: tf-057
+  title: The migration that never runs again
+  difficulty: 2
+  kind: fix
+  tags: [terraform, terraform_data, provisioner, triggers_replace]
+  tutorial: |
+    **Concept.** Provisioners such as `local-exec` run only when their
+    resource is **created**. The built-in **`terraform_data`** resource has a
+    `triggers_replace` argument: whenever its value changes, the resource is
+    replaced, and its create-time provisioners run again. It replaces the old
+    `null_resource` + `triggers` pattern, and needs no provider.
+
+    **Read up on:**
+    - `terraform_data` (`input`, `triggers_replace`)
+    - `provisioner "local-exec"`
+  scenario: |
+    **`/lab/migrate`** runs a schema migration with a `local-exec` provisioner,
+    which records the version it applied in **`applied.txt`**.
+    `terraform.tfvars` was bumped to `schema_version = 2`, yet `terraform
+    apply` says *No changes* and `applied.txt` still says 1.
+
+    Make the migration **run again whenever `schema_version` changes**, then
+    apply so that `applied.txt` says **2**.
+  hints:
+    - "A provisioner runs only on create, and nothing tells Terraform to re-create the resource."
+    - "Add `triggers_replace = var.schema_version` to `terraform_data.migrate`."
+  solution: |
+    ```bash
+    cd /lab/migrate
+    sed -i 's/^resource "terraform_data" "migrate" {/&\n  triggers_replace = var.schema_version\n/' main.tf
+    terraform apply -auto-approve
+    cat applied.txt
+    ```
+  setup: |
+    tf_start
+    rm -rf /lab/migrate
+    lab_file /lab/migrate/main.tf <<'EOF'
+    variable "schema_version" {
+      type = number
+    }
+
+    resource "terraform_data" "migrate" {
+      provisioner "local-exec" {
+        command = "echo ${var.schema_version} > ${path.module}/applied.txt"
+      }
+    }
+    EOF
+    echo 'schema_version = 1' | lab_file /lab/migrate/terraform.tfvars
+    tf_as_user /lab/migrate init -input=false -no-color >/dev/null
+    tf_as_user /lab/migrate apply -auto-approve -input=false -no-color >/dev/null
+    echo 'schema_version = 2' | lab_file /lab/migrate/terraform.tfvars
+  check: |
+    check_eq "applied.txt" "$(tr -d ' \n' < /lab/migrate/applied.txt 2>/dev/null)" 2
+    check "triggers_replace is set" '[ -n "$(tf_get /lab/migrate terraform_data.migrate triggers_replace)" ]'
+    check "the plan is empty" 'tf_clean /lab/migrate'
+    check "a version bump would re-run it" '(cd /lab/migrate && terraform plan -var schema_version=3 -lock=false -input=false -no-color) | grep -qE "terraform_data.migrate must be replaced"'
+  solve: |
+    cd /lab/migrate
+    sed -i 's/^resource "terraform_data" "migrate" {/&\n  triggers_replace = var.schema_version\n/' main.tf
+    terraform apply -auto-approve -input=false -no-color
+
+- id: tf-058
+  title: Zip the site and record its checksum
+  difficulty: 2
+  kind: build
+  tags: [terraform, archive_file, data-source, sha256]
+  tutorial: |
+    **Concept.** The `archive` provider's **`archive_file`** data source zips
+    a file or directory when Terraform reads it, and exposes checksums of the
+    result such as `output_sha256` and `output_base64sha256`. A Lambda
+    function or a deploy manifest can use the checksum, so a change in the
+    source changes the artifact.
+
+    **Read up on:**
+    - `data "archive_file"` (`type`, `source_dir`, `output_path`)
+    - `output_sha256`
+  scenario: |
+    In **`/lab/site`**, the folder **`public/`** holds the website. Write a
+    configuration that:
+
+    - zips `public/` into **`dist/site.zip`** with an `archive_file` data
+      source,
+    - writes **`dist/manifest.txt`** with a `local_file` resource containing
+      exactly `sha256=<hex SHA-256 of site.zip>` and a newline.
+
+    Apply it.
+  hints:
+    - "`data \"archive_file\" \"site\" { type = \"zip\"  source_dir = \"${path.module}/public\"  output_path = \"${path.module}/dist/site.zip\" }` (one argument per line)."
+    - "`content = \"sha256=${data.archive_file.site.output_sha256}\\n\"`."
+  solution: |
+    ```bash
+    cd /lab/site
+    cat > main.tf <<'EOF'
+    data "archive_file" "site" {
+      type        = "zip"
+      source_dir  = "${path.module}/public"
+      output_path = "${path.module}/dist/site.zip"
+    }
+
+    resource "local_file" "manifest" {
+      filename = "${path.module}/dist/manifest.txt"
+      content  = "sha256=${data.archive_file.site.output_sha256}\n"
+    }
+    EOF
+    terraform init && terraform apply -auto-approve
+    sha256sum dist/site.zip; cat dist/manifest.txt
+    ```
+  setup: |
+    tf_start
+    rm -rf /lab/site
+    lab_file /lab/site/public/index.html <<'EOF'
+    <h1>Status: all systems normal</h1>
+    EOF
+    lab_file /lab/site/public/css/style.css <<'EOF'
+    h1 { color: green; }
+    EOF
+  check: |
+    check "dist/site.zip exists" '[ -s /lab/site/dist/site.zip ]'
+    names=$(python3 -c 'import sys,zipfile; print(" ".join(sorted(zipfile.ZipFile(sys.argv[1]).namelist())))' /lab/site/dist/site.zip 2>/dev/null)
+    check_eq "the zip holds the site" "$names" "css/style.css index.html"
+    check_eq "manifest.txt" "$(cat /lab/site/dist/manifest.txt 2>/dev/null)" "sha256=$(sha256sum /lab/site/dist/site.zip 2>/dev/null | cut -d' ' -f1)"
+    check "local_file.manifest is managed" 'tf_has /lab/site local_file.manifest'
+  solve: |
+    cd /lab/site
+    cat > main.tf <<'EOF'
+    data "archive_file" "site" {
+      type        = "zip"
+      source_dir  = "${path.module}/public"
+      output_path = "${path.module}/dist/site.zip"
+    }
+
+    resource "local_file" "manifest" {
+      filename = "${path.module}/dist/manifest.txt"
+      content  = "sha256=${data.archive_file.site.output_sha256}\n"
+    }
+    EOF
+    terraform init -input=false -no-color
+    terraform apply -auto-approve -input=false -no-color
+
+- id: tf-059
+  title: Ship the hotfix, hold the rest
+  difficulty: 2
+  kind: build
+  tags: [terraform, target, apply, plan]
+  tutorial: |
+    **Concept.** `terraform apply -target=ADDRESS` limits a run to one
+    resource and whatever it depends on. It's an emergency tool: the rest of
+    the configuration stays unapplied, so the next full plan still shows those
+    changes. Terraform prints a warning to remind you of that.
+
+    **Read up on:**
+    - `-target` on `plan` and `apply`
+    - Why routine use of `-target` is discouraged
+  scenario: |
+    **`/lab/hotfix`** contains two pending changes: a new
+    **`local_file.hotfix`**, which must go out **now**, and a rewrite of the
+    existing **`local_file.banner`**, which marketing hasn't approved yet.
+
+    Apply **only the hotfix**. `banner.txt` must keep its current text.
+  hints:
+    - "`terraform plan` shows both changes."
+    - "`terraform apply -target=local_file.hotfix`."
+  solution: |
+    ```bash
+    cd /lab/hotfix
+    terraform plan
+    terraform apply -target=local_file.hotfix -auto-approve
+    cat banner.txt
+    ```
+  setup: |
+    tf_start
+    rm -rf /lab/hotfix
+    lab_file /lab/hotfix/main.tf <<'EOF'
+    resource "local_file" "banner" {
+      filename = "${path.module}/banner.txt"
+      content  = "Spring sale: 10% off\n"
+    }
+    EOF
+    tf_as_user /lab/hotfix init -input=false -no-color >/dev/null
+    tf_as_user /lab/hotfix apply -auto-approve -input=false -no-color >/dev/null
+    lab_file /lab/hotfix/main.tf <<'EOF'
+    resource "local_file" "banner" {
+      filename = "${path.module}/banner.txt"
+      content  = "MEGA SALE: 70% off everything!!!\n"
+    }
+
+    resource "local_file" "hotfix" {
+      filename = "${path.module}/hotfix.conf"
+      content  = "max_upload_mb = 25\n"
+    }
+    EOF
+  check: |
+    check "local_file.hotfix is managed" 'tf_has /lab/hotfix local_file.hotfix'
+    check_eq "hotfix.conf" "$(cat /lab/hotfix/hotfix.conf 2>/dev/null)" "max_upload_mb = 25"
+    check_eq "banner.txt kept its text" "$(cat /lab/hotfix/banner.txt 2>/dev/null)" "Spring sale: 10% off"
+    check_eq "the configuration still holds the new banner" "$(grep -c 'MEGA SALE' /lab/hotfix/main.tf)" 1
+  solve: |
+    cd /lab/hotfix
+    terraform apply -target=local_file.hotfix -auto-approve -input=false -no-color
+
+- id: tf-060
+  title: Read the file after it is written
+  difficulty: 3
+  kind: fix
+  tags: [terraform, depends_on, data-source, ordering]
+  tutorial: |
+    **Concept.** Terraform orders work by the references between blocks. A
+    data source with no unknown inputs is read **during the plan**, before
+    anything is created. When it reads something a resource produces as a
+    side effect, like a file written by a provisioner, there's no reference
+    for Terraform to follow. **`depends_on`** declares the hidden dependency,
+    and the read is then deferred until that resource exists.
+
+    **Read up on:**
+    - `depends_on` on resources and data sources
+    - When data sources are read: plan vs apply
+  scenario: |
+    In **`/lab/gen`**, `terraform_data.render` generates **`out/settings.json`**
+    with a provisioner, and `data.local_file.settings` reads it so that
+    `local_file.summary` can copy the content. `terraform apply` fails with
+    *no such file or directory*.
+
+    Fix the configuration so a single `terraform apply` works, producing
+    **`summary.txt`**. Keep the generator, the data source and the summary
+    resource.
+  hints:
+    - "The data source has no reference to `terraform_data.render`, so it is read during the plan."
+    - "Add `depends_on = [terraform_data.render]` to `data \"local_file\" \"settings\"`."
+  solution: |
+    ```bash
+    cd /lab/gen
+    sed -i 's|^data "local_file" "settings" {|&\n  depends_on = [terraform_data.render]|' main.tf
+    terraform apply -auto-approve
+    cat summary.txt
+    ```
+  setup: |
+    tf_start
+    rm -rf /lab/gen
+    lab_file /lab/gen/main.tf <<'EOF'
+    resource "terraform_data" "render" {
+      provisioner "local-exec" {
+        command = "mkdir -p ${path.module}/out && printf '{\"workers\": 6, \"region\": \"eu\"}' > ${path.module}/out/settings.json"
+      }
+    }
+
+    data "local_file" "settings" {
+      filename = "${path.module}/out/settings.json"
+    }
+
+    resource "local_file" "summary" {
+      filename = "${path.module}/summary.txt"
+      content  = "workers=${jsondecode(data.local_file.settings.content).workers}\n"
+    }
+    EOF
+    tf_as_user /lab/gen init -input=false -no-color >/dev/null
+  check: |
+    check "local_file.summary is managed" 'tf_has /lab/gen local_file.summary'
+    check_eq "summary.txt" "$(cat /lab/gen/summary.txt 2>/dev/null)" "workers=6"
+    check "terraform_data.render is still managed" 'tf_has /lab/gen terraform_data.render'
+    check "data.local_file.settings is still used" 'grep -q "data \"local_file\" \"settings\"" /lab/gen/main.tf'
+  solve: |
+    cd /lab/gen
+    sed -i 's|^data "local_file" "settings" {|&\n  depends_on = [terraform_data.render]|' main.tf
+    terraform apply -auto-approve -input=false -no-color
+
+- id: tf-061
+  title: "Error: Cycle"
+  difficulty: 3
+  kind: fix
+  tags: [terraform, cycle, locals, graph]
+  tutorial: |
+    **Concept.** Terraform builds a dependency graph from references. If A
+    refers to B and B refers to A, there's no order to create them in, and
+    every command fails with **`Error: Cycle`**. Usually the resources only
+    need a value that is known up front, like a file name or a resource name.
+    Move that value into a `local`, and let both resources refer to the local
+    instead of to each other.
+
+    **Read up on:**
+    - `Error: Cycle`
+    - `terraform graph`
+    - `locals`
+  scenario: |
+    **`/lab/peers`** writes two config files, **`a.txt`** and **`b.txt`**.
+    Each one names the other one's file. `terraform plan` fails with
+    `Error: Cycle`.
+
+    Break the cycle so it applies, with the same file contents:
+    `a.txt` contains `peer=./b.txt`, and `b.txt` contains `peer=./a.txt`
+    (each followed by a newline).
+  hints:
+    - "Each resource reads the other's `filename`, but the file names are known before anything is created."
+    - "`locals { a = \"${path.module}/a.txt\"  b = \"${path.module}/b.txt\" }` (on separate lines), then refer to `local.a` / `local.b`."
+  solution: |
+    ```bash
+    cd /lab/peers
+    cat > main.tf <<'EOF'
+    locals {
+      a = "${path.module}/a.txt"
+      b = "${path.module}/b.txt"
+    }
+
+    resource "local_file" "a" {
+      filename = local.a
+      content  = "peer=${local.b}\n"
+    }
+
+    resource "local_file" "b" {
+      filename = local.b
+      content  = "peer=${local.a}\n"
+    }
+    EOF
+    terraform apply -auto-approve
+    ```
+  setup: |
+    tf_start
+    rm -rf /lab/peers
+    lab_file /lab/peers/main.tf <<'EOF'
+    resource "local_file" "a" {
+      filename = "${path.module}/a.txt"
+      content  = "peer=${local_file.b.filename}\n"
+    }
+
+    resource "local_file" "b" {
+      filename = "${path.module}/b.txt"
+      content  = "peer=${local_file.a.filename}\n"
+    }
+    EOF
+    tf_as_user /lab/peers init -input=false -no-color >/dev/null
+  check: |
+    check "both files are managed" 'tf_has /lab/peers local_file.a && tf_has /lab/peers local_file.b'
+    check_eq "a.txt" "$(cat /lab/peers/a.txt 2>/dev/null)" "peer=./b.txt"
+    check_eq "b.txt" "$(cat /lab/peers/b.txt 2>/dev/null)" "peer=./a.txt"
+    check "the plan is empty" 'tf_clean /lab/peers'
+  solve: |
+    cd /lab/peers
+    cat > main.tf <<'EOF'
+    locals {
+      a = "${path.module}/a.txt"
+      b = "${path.module}/b.txt"
+    }
+
+    resource "local_file" "a" {
+      filename = local.a
+      content  = "peer=${local.b}\n"
+    }
+
+    resource "local_file" "b" {
+      filename = local.b
+      content  = "peer=${local.a}\n"
+    }
+    EOF
+    terraform apply -auto-approve -input=false -no-color
+
+- id: tf-062
+  title: "Invalid for_each argument"
+  difficulty: 3
+  kind: fix
+  tags: [terraform, for_each, unknown, keys]
+  tutorial: |
+    **Concept.** `for_each` keys become part of resource addresses, so
+    Terraform must know them **during the plan**. A map whose keys come from
+    something generated at apply time, such as a random name or an ID, fails
+    with *Invalid for_each argument … keys … cannot be determined until
+    apply*. Key the map by something you choose up front, and put the
+    generated values in the map's values.
+
+    **Read up on:**
+    - `for_each` with resources (`for_each = random_pet.name`)
+    - Known vs unknown values in a plan
+  scenario: |
+    **`/lab/dns`** gives each role (`web`, `api`, `db`) a random hostname and
+    then writes one DNS record file per host. The plan fails with *Invalid
+    for_each argument*.
+
+    Fix it so that **`local_file.dns`** is keyed **by role**
+    (`local_file.dns["web"]`, …). Each instance writes **`dns/<role>.txt`**
+    containing `<that role's random name>.example.test` and a newline. Apply.
+  hints:
+    - "The map's keys are `p.id`, which is unknown until apply."
+    - "`for_each = random_pet.name` gives you `each.key` = role and `each.value.id` = the name."
+  solution: |
+    ```bash
+    cd /lab/dns
+    python3 - <<'PY'
+    p = "main.tf"; s = open(p).read()
+    s = s.replace("for_each = { for role, p in random_pet.name : p.id => role }", "for_each = random_pet.name")
+    s = s.replace("dns/${each.value}.txt", "dns/${each.key}.txt")
+    s = s.replace('"${each.key}.example.test\\n"', '"${each.value.id}.example.test\\n"')
+    open(p, "w").write(s)
+    PY
+    terraform apply -auto-approve
+    ```
+  setup: |
+    tf_start
+    rm -rf /lab/dns
+    lab_file /lab/dns/main.tf <<'EOF'
+    resource "random_pet" "name" {
+      for_each = toset(["web", "api", "db"])
+    }
+
+    resource "local_file" "dns" {
+      for_each = { for role, p in random_pet.name : p.id => role }
+      filename = "${path.module}/dns/${each.value}.txt"
+      content  = "${each.key}.example.test\n"
+    }
+    EOF
+    tf_as_user /lab/dns init -input=false -no-color >/dev/null
+  check: |
+    for r in web api db; do
+      check "local_file.dns[\"$r\"] is managed" "tf_has /lab/dns 'local_file.dns[\"$r\"]'"
+      pet=$(tf_get /lab/dns "random_pet.name[\"$r\"]" id)
+      check_eq "dns/$r.txt" "$(cat /lab/dns/dns/$r.txt 2>/dev/null)" "${pet:-?}.example.test"
+    done
+    check "the plan is empty" 'tf_clean /lab/dns'
+  solve: |
+    cd /lab/dns
+    python3 - <<'PY'
+    p = "main.tf"; s = open(p).read()
+    s = s.replace("for_each = { for role, p in random_pet.name : p.id => role }", "for_each = random_pet.name")
+    s = s.replace("dns/${each.value}.txt", "dns/${each.key}.txt")
+    s = s.replace('"${each.key}.example.test\\n"', '"${each.value.id}.example.test\\n"')
+    open(p, "w").write(s)
+    PY
+    terraform apply -auto-approve -input=false -no-color
+
+- id: tf-063
+  title: Optional attributes with defaults
+  difficulty: 3
+  kind: fix
+  tags: [terraform, variables, optional, object]
+  tutorial: |
+    **Concept.** An `object({...})` type makes every attribute **required**.
+    A caller that leaves one out gets *attribute "x" is required*. Mark an
+    attribute **`optional(type, default)`** and Terraform fills in the default
+    when it's missing, so callers only spell out what differs.
+
+    **Read up on:**
+    - `optional()` in type constraints, with and without a default
+    - `map(object({...}))`
+  scenario: |
+    In **`/lab/svc`**, `terraform.tfvars` describes some services in full and
+    others with just a `port`. The plan fails with *attribute "replicas" is
+    required*.
+
+    Change **only the variable's type** so that `replicas` defaults to **1**
+    and `public` defaults to **false**. Don't touch `terraform.tfvars`.
+    Apply, so that the output **`summary`** is in the state.
+  hints:
+    - "`replicas = optional(number, 1)`."
+    - "`public = optional(bool, false)`."
+  solution: |
+    ```bash
+    cd /lab/svc
+    sed -i 's/replicas = number/replicas = optional(number, 1)/; s/public   = bool/public   = optional(bool, false)/' main.tf
+    terraform apply -auto-approve
+    terraform output summary
+    ```
+  setup: |
+    tf_start
+    rm -rf /lab/svc
+    lab_file /lab/svc/main.tf <<'EOF'
+    variable "services" {
+      type = map(object({
+        port     = number
+        replicas = number
+        public   = bool
+      }))
+    }
+
+    output "summary" {
+      value = { for name, s in var.services : name => "${s.port}/${s.replicas}/${s.public}" }
+    }
+    EOF
+    lab_file /lab/svc/terraform.tfvars <<'EOF'
+    services = {
+      web = { port = 80, replicas = 3, public = true }
+      api = { port = 8080, replicas = 2 }
+      jobs = { port = 9000 }
+    }
+    EOF
+    sha1sum /lab/svc/terraform.tfvars > "$KL_STATE/tfvars"
+  check: |
+    got=$(tf_output /lab/svc summary | jq -S -c . 2>/dev/null)
+    check_eq "output summary" "$got" '{"api":"8080/2/false","jobs":"9000/1/false","web":"80/3/true"}'
+    check "terraform.tfvars is unchanged" 'sha1sum -c --status "$KL_STATE/tfvars"'
+  solve: |
+    cd /lab/svc
+    sed -i 's/replicas = number/replicas = optional(number, 1)/; s/public   = bool/public   = optional(bool, false)/' main.tf
+    terraform init -input=false -no-color
+    terraform apply -auto-approve -input=false -no-color
+
+- id: tf-064
+  title: Restart the worker when its config changes
+  difficulty: 3
+  kind: build
+  tags: [terraform, lifecycle, replace_triggered_by]
+  tutorial: |
+    **Concept.** Sometimes a resource must be re-created when **another**
+    resource changes. A worker, for example, may read its config only at
+    start-up. `lifecycle { replace_triggered_by = [local_file.config] }`
+    replaces the resource whenever the referenced resource is updated or
+    replaced, even though the worker itself has no changed arguments.
+
+    **Read up on:**
+    - `lifecycle { replace_triggered_by = [...] }`
+    - Referencing a whole resource vs one attribute
+  scenario: |
+    In **`/lab/worker`**, **`terraform_data.worker`** stands in for a process
+    that reads **`config.ini`** (`local_file.config`) only when it starts.
+
+    Make Terraform **replace `terraform_data.worker` whenever
+    `local_file.config` changes**. Leave the configuration applied, with an
+    empty plan.
+  hints:
+    - "Add a `lifecycle` block to `terraform_data.worker`."
+    - "`replace_triggered_by = [local_file.config]`."
+    - "Try it: `terraform plan -var config_version=99` should say the worker will be replaced."
+  solution: |
+    ```bash
+    cd /lab/worker
+    python3 - <<'PY'
+    p = "main.tf"; s = open(p).read()
+    s = s.replace('  input = "worker-1"\n', '  input = "worker-1"\n\n  lifecycle {\n    replace_triggered_by = [local_file.config]\n  }\n')
+    open(p, "w").write(s)
+    PY
+    terraform apply -auto-approve
+    terraform plan -var config_version=99
+    ```
+  setup: |
+    tf_start
+    rm -rf /lab/worker
+    lab_file /lab/worker/main.tf <<'EOF'
+    variable "config_version" {
+      type    = number
+      default = 1
+    }
+
+    resource "local_file" "config" {
+      filename = "${path.module}/config.ini"
+      content  = "version=${var.config_version}\n"
+    }
+
+    resource "terraform_data" "worker" {
+      input = "worker-1"
+    }
+    EOF
+    tf_as_user /lab/worker init -input=false -no-color >/dev/null
+    tf_as_user /lab/worker apply -auto-approve -input=false -no-color >/dev/null
+  check: |
+    check "the plan is empty" 'tf_clean /lab/worker'
+    out=$(cd /lab/worker && terraform plan -var config_version=99 -lock=false -input=false -no-color 2>&1)
+    check "a config change replaces the worker" 'grep -qE "terraform_data.worker (will|must) be replaced" <<<"$out"'
+    check "both resources are still managed" 'tf_has /lab/worker local_file.config && tf_has /lab/worker terraform_data.worker'
+  solve: |
+    cd /lab/worker
+    python3 - <<'PY'
+    p = "main.tf"; s = open(p).read()
+    s = s.replace('  input = "worker-1"\n', '  input = "worker-1"\n\n  lifecycle {\n    replace_triggered_by = [local_file.config]\n  }\n')
+    open(p, "w").write(s)
+    PY
+    terraform apply -auto-approve -input=false -no-color
+
+- id: tf-065
+  title: A health check that runs on every plan
+  difficulty: 3
+  kind: build
+  tags: [terraform, check, assert, validation]
+  tutorial: |
+    **Concept.** A top-level **`check`** block holds one or more `assert`
+    conditions that Terraform evaluates at the end of every plan and apply.
+    Unlike a `precondition`, a failing check only **warns**. It doesn't block
+    the run. It suits "is the thing we built still healthy?" questions, and
+    its result is recorded in the state.
+
+    **Read up on:**
+    - `check "name" { assert { condition = ...  error_message = ... } }`
+    - `can()` and `jsondecode()`
+  scenario: |
+    **`/lab/health`** renders **`app.json`** from a template. Add a check
+    block named **`config_is_json`** with an assertion that the rendered
+    content is **valid JSON** and has a **`port` greater than 1024**.
+
+    Apply, so the check runs and passes.
+  hints:
+    - "`check \"config_is_json\" { assert { ... } }`."
+    - "`condition = can(jsondecode(local_file.app.content)) && try(jsondecode(local_file.app.content).port > 1024, false)`."
+  solution: |
+    ```bash
+    cd /lab/health
+    cat >> main.tf <<'EOF'
+
+    check "config_is_json" {
+      assert {
+        condition     = can(jsondecode(local_file.app.content)) && try(jsondecode(local_file.app.content).port > 1024, false)
+        error_message = "app.json must be valid JSON with a port above 1024."
+      }
+    }
+    EOF
+    terraform apply -auto-approve
+    ```
+  setup: |
+    tf_start
+    rm -rf /lab/health
+    lab_file /lab/health/main.tf <<'EOF'
+    variable "port" {
+      type    = number
+      default = 8443
+    }
+
+    resource "local_file" "app" {
+      filename = "${path.module}/app.json"
+      content  = templatefile("${path.module}/app.json.tftpl", { port = var.port })
+    }
+    EOF
+    lab_file /lab/health/app.json.tftpl <<'EOF'
+    {"name": "api", "port": ${port}}
+    EOF
+    tf_as_user /lab/health init -input=false -no-color >/dev/null
+    tf_as_user /lab/health apply -auto-approve -input=false -no-color >/dev/null
+  check: |
+    st=$(jq -r '.check_results[]? | select(.config_addr == "check.config_is_json") | .status' /lab/health/terraform.tfstate 2>/dev/null)
+    check_eq "check.config_is_json ran and passed" "$st" "pass"
+    out=$(cd /lab/health && terraform plan -var port=80 -lock=false -input=false -no-color 2>&1)
+    check "it warns about a low port" 'grep -q "config_is_json" <<<"$out"'
+  solve: |
+    cd /lab/health
+    cat >> main.tf <<'EOF'
+
+    check "config_is_json" {
+      assert {
+        condition     = can(jsondecode(local_file.app.content)) && try(jsondecode(local_file.app.content).port > 1024, false)
+        error_message = "app.json must be valid JSON with a port above 1024."
+      }
+    }
+    EOF
+    terraform apply -auto-approve -input=false -no-color
+
+- id: tf-066
+  title: The external program that returns the wrong JSON
+  difficulty: 3
+  kind: fix
+  tags: [terraform, external, data-source, json]
+  tutorial: |
+    **Concept.** The `external` data source runs a program, sends it the
+    `query` map as JSON on stdin, and expects a **flat JSON object of string
+    values** on stdout, and nothing else. Numbers, nested objects, or a stray
+    log line on stdout all make the read fail. Diagnostics belong on stderr.
+
+    **Read up on:**
+    - `data "external"` (`program`, `query`, `result`)
+    - The external program protocol
+  scenario: |
+    **`/lab/meta`** asks the script **`lookup.sh`** for region settings via
+    `data "external" "meta"`. Every plan fails with *Unexpected External
+    Program Results*.
+
+    Fix **`lookup.sh`** (not the Terraform code) so the plan works, then
+    apply. For `env = "prod"` the outputs must be `region = "eu-west"` and
+    `replicas = "3"`.
+  hints:
+    - "Run the script by hand: `echo '{\"env\":\"prod\"}' | sh lookup.sh`."
+    - "Only JSON may reach stdout. Send the progress message to stderr (`>&2`)."
+    - "Every value must be a string: `\"replicas\": \"3\"`."
+  solution: |
+    ```bash
+    cd /lab/meta
+    echo '{"env":"prod"}' | sh lookup.sh
+    sed -i 's/\(echo "looking up[^"]*"\)$/\1 >\&2/' lookup.sh
+    sed -i 's/"replicas": \([0-9]*\)/"replicas": "\1"/' lookup.sh
+    echo '{"env":"prod"}' | sh lookup.sh
+    terraform apply -auto-approve
+    ```
+  setup: |
+    tf_start
+    rm -rf /lab/meta
+    lab_file /lab/meta/main.tf <<'EOF'
+    variable "env" {
+      default = "prod"
+    }
+
+    data "external" "meta" {
+      program = ["sh", "${path.module}/lookup.sh"]
+      query   = { env = var.env }
+    }
+
+    output "region" {
+      value = data.external.meta.result.region
+    }
+
+    output "replicas" {
+      value = data.external.meta.result.replicas
+    }
+    EOF
+    lab_file /lab/meta/lookup.sh <<'EOF'
+    #!/bin/sh
+    # reads {"env": "..."} on stdin, prints the settings for that env
+    env=$(sed -n 's/.*"env" *: *"\([^"]*\)".*/\1/p')
+    echo "looking up settings for $env"
+    case "$env" in
+      prod) printf '{"region": "eu-west", "replicas": 3}\n' ;;
+      *)    printf '{"region": "eu-north", "replicas": 1}\n' ;;
+    esac
+    EOF
+    tf_as_user /lab/meta init -input=false -no-color >/dev/null
+  check: |
+    check_eq "output region" "$(tf_output /lab/meta region)" "eu-west"
+    check_eq "output replicas" "$(tf_output /lab/meta replicas)" "3"
+    out=$(echo '{"env":"dev"}' | sh /lab/meta/lookup.sh 2>/dev/null)
+    check_eq "lookup.sh prints clean JSON for other envs too" "$(jq -c . <<<"$out" 2>/dev/null)" '{"region":"eu-north","replicas":"1"}'
+    check "main.tf still uses the script" 'grep -q lookup.sh /lab/meta/main.tf'
+  solve: |
+    cd /lab/meta
+    sed -i 's/\(echo "looking up[^"]*"\)$/\1 >\&2/' lookup.sh
+    sed -i 's/"replicas": \([0-9]*\)/"replicas": "\1"/' lookup.sh
+    terraform apply -auto-approve -input=false -no-color
+
+- id: tf-067
+  title: A self-signed certificate from Terraform
+  difficulty: 3
+  kind: build
+  tags: [terraform, tls, certificate, local_sensitive_file]
+  tutorial: |
+    **Concept.** The `tls` provider generates keys and certificates inside
+    Terraform. `tls_private_key` makes a key, and `tls_self_signed_cert` signs
+    a certificate with it, taking a `subject` block, `dns_names`, a validity
+    period and `allowed_uses`. Write the private key with
+    **`local_sensitive_file`**, which hides the content in plans and lets you
+    set `file_permission`. Remember that the key is still stored in the state.
+
+    **Read up on:**
+    - `tls_private_key` (`algorithm`, `ecdsa_curve`)
+    - `tls_self_signed_cert` (`subject`, `dns_names`, `validity_period_hours`, `allowed_uses`)
+    - `local_sensitive_file` (`file_permission`)
+  scenario: |
+    In **`/lab/cert`**, write a configuration that produces:
+
+    - **`key.pem`**: an **ECDSA P-256** private key, file mode **0600**
+    - **`cert.pem`**: a self-signed certificate for that key, with common
+      name **`lab.internal`**, DNS names **`lab.internal`** and
+      **`www.lab.internal`**, valid for **30 days** (720 hours), usable for
+      **server authentication**
+
+    Apply it.
+  hints:
+    - "`tls_private_key` with `algorithm = \"ECDSA\"` and `ecdsa_curve = \"P256\"`."
+    - "`allowed_uses = [\"key_encipherment\", \"digital_signature\", \"server_auth\"]`."
+    - "`local_sensitive_file` with `content = tls_private_key.k.private_key_pem` and `file_permission = \"0600\"`."
+  solution: |
+    ```bash
+    cd /lab/cert
+    cat > main.tf <<'EOF'
+    resource "tls_private_key" "k" {
+      algorithm   = "ECDSA"
+      ecdsa_curve = "P256"
+    }
+
+    resource "tls_self_signed_cert" "c" {
+      private_key_pem       = tls_private_key.k.private_key_pem
+      dns_names             = ["lab.internal", "www.lab.internal"]
+      validity_period_hours = 720
+      allowed_uses          = ["key_encipherment", "digital_signature", "server_auth"]
+
+      subject {
+        common_name = "lab.internal"
+      }
+    }
+
+    resource "local_sensitive_file" "key" {
+      filename        = "${path.module}/key.pem"
+      content         = tls_private_key.k.private_key_pem
+      file_permission = "0600"
+    }
+
+    resource "local_file" "cert" {
+      filename = "${path.module}/cert.pem"
+      content  = tls_self_signed_cert.c.cert_pem
+    }
+    EOF
+    terraform init && terraform apply -auto-approve
+    openssl x509 -in cert.pem -noout -subject -ext subjectAltName,extendedKeyUsage
+    ```
+  setup: |
+    tf_start
+    rm -rf /lab/cert
+    mkdir -p /lab/cert; chown "$(lab_user):" /lab/cert
+  check: |
+    c=/lab/cert/cert.pem k=/lab/cert/key.pem
+    check "cert.pem and key.pem exist" '[ -s $c ] && [ -s $k ]'
+    check_eq "key.pem mode" "$(stat -c %a $k 2>/dev/null)" 600
+    check_match "the key is ECDSA P-256" "$(openssl pkey -in $k -noout -text 2>/dev/null | grep -E 'NIST CURVE|ASN1 OID')" 'prime256v1|P-256'
+    check_match "common name" "$(openssl x509 -in $c -noout -subject 2>/dev/null)" 'CN ?= ?lab\.internal'
+    san=$(openssl x509 -in $c -noout -ext subjectAltName 2>/dev/null)
+    check "SANs include both names" 'grep -q "DNS:lab.internal" <<<"$san" && grep -q "DNS:www.lab.internal" <<<"$san"'
+    check_match "usable for server auth" "$(openssl x509 -in $c -noout -ext extendedKeyUsage 2>/dev/null)" 'TLS Web Server Authentication'
+    days=$(( ( $(date -d "$(openssl x509 -in $c -noout -enddate 2>/dev/null | cut -d= -f2)" +%s 2>/dev/null || echo 0) - $(date -d "$(openssl x509 -in $c -noout -startdate 2>/dev/null | cut -d= -f2)" +%s 2>/dev/null || echo 0) ) / 86400 ))
+    check_eq "valid for 30 days" "$days" 30
+    check_eq "the certificate matches the key" "$(openssl x509 -in $c -noout -pubkey 2>/dev/null | sha1sum)" "$(openssl pkey -in $k -pubout 2>/dev/null | sha1sum)"
+  solve: |
+    cd /lab/cert
+    cat > main.tf <<'EOF'
+    resource "tls_private_key" "k" {
+      algorithm   = "ECDSA"
+      ecdsa_curve = "P256"
+    }
+
+    resource "tls_self_signed_cert" "c" {
+      private_key_pem       = tls_private_key.k.private_key_pem
+      dns_names             = ["lab.internal", "www.lab.internal"]
+      validity_period_hours = 720
+      allowed_uses          = ["key_encipherment", "digital_signature", "server_auth"]
+
+      subject {
+        common_name = "lab.internal"
+      }
+    }
+
+    resource "local_sensitive_file" "key" {
+      filename        = "${path.module}/key.pem"
+      content         = tls_private_key.k.private_key_pem
+      file_permission = "0600"
+    }
+
+    resource "local_file" "cert" {
+      filename = "${path.module}/cert.pem"
+      content  = tls_self_signed_cert.c.cert_pem
+    }
+    EOF
+    terraform init -input=false -no-color
+    terraform apply -auto-approve -input=false -no-color
+
+- id: tf-068
+  title: Import a network and generate its configuration
+  difficulty: 3
+  kind: build
+  tags: [terraform, import, generate-config-out, docker]
+  tutorial: |
+    **Concept.** An **`import` block** (`import { to = ADDRESS  id = ID }`)
+    makes importing part of a normal, reviewable plan. If the resource block
+    doesn't exist yet, `terraform plan -generate-config-out=generated.tf`
+    writes one for you from the real object's attributes. Review it, trim it
+    if needed, and apply. Afterwards the plan should be empty.
+
+    **Read up on:**
+    - `import { to = ...  id = ... }`
+    - `terraform plan -generate-config-out=FILE`
+  scenario: |
+    Someone created the Docker network **`legacy-net`** by hand, and now it
+    must be managed by **`/lab/legacy`** as **`docker_network.legacy`**,
+    **without being re-created** (containers depend on its ID).
+
+    Import it, keep a resource block for it in the configuration, apply, and
+    leave the plan **empty**.
+  hints:
+    - "`docker network inspect -f '{{.Id}}' legacy-net` gives the import ID."
+    - "`import { to = docker_network.legacy  id = \"<id>\" }` (on separate lines) in a .tf file."
+    - "`terraform plan -generate-config-out=generated.tf`, then `terraform apply`."
+  solution: |
+    ```bash
+    cd /lab/legacy
+    id=$(docker network inspect -f '{{.Id}}' legacy-net)
+    cat > import.tf <<EOF
+    import {
+      to = docker_network.legacy
+      id = "$id"
+    }
+    EOF
+    terraform init
+    terraform plan -generate-config-out=generated.tf
+    terraform apply -auto-approve
+    terraform plan        # No changes
+    ```
+  setup: |
+    tf_start
+    rm -rf /lab/legacy
+    on_reset 'docker network rm legacy-net >/dev/null 2>&1; true'
+    docker network create --subnet 172.31.240.0/24 --label team=payments legacy-net >/dev/null
+    docker network inspect -f '{{.Id}}' legacy-net > "$KL_STATE/id"
+    lab_file /lab/legacy/versions.tf <<'EOF'
+    terraform {
+      required_providers {
+        docker = {
+          source = "kreuzwerker/docker"
+        }
+      }
+    }
+
+    provider "docker" {}
+    EOF
+  check: |
+    check "docker_network.legacy is managed" 'tf_has /lab/legacy docker_network.legacy'
+    check_eq "the network was not re-created" "$(docker network inspect -f '{{.Id}}' legacy-net 2>/dev/null)" "$(cat "$KL_STATE/id")"
+    check "a resource block exists for it" 'grep -qs "resource \"docker_network\" \"legacy\"" /lab/legacy/*.tf'
+    check "the plan is empty" 'tf_clean /lab/legacy'
+  solve: |
+    cd /lab/legacy
+    id=$(docker network inspect -f '{{.Id}}' legacy-net)
+    cat > import.tf <<EOF
+    import {
+      to = docker_network.legacy
+      id = "$id"
+    }
+    EOF
+    terraform init -input=false -no-color
+    terraform plan -generate-config-out=generated.tf -input=false -no-color
+    terraform apply -auto-approve -input=false -no-color
+
+- id: tf-069
+  title: Write tests for a naming module
+  difficulty: 3
+  kind: build
+  tags: [terraform, test, tftest, expect_failures]
+  tutorial: |
+    **Concept.** `terraform test` runs `*.tftest.hcl` files from the
+    configuration directory or `tests/`. Each `run` block sets `variables`,
+    executes a `command` (`plan` or `apply`), and checks `assert {
+    condition, error_message }`. A run can also expect a validation to fail
+    with `expect_failures = [var.name]`, which is how you test that bad input
+    is rejected.
+
+    **Read up on:**
+    - `terraform test`, `run` blocks, `command = plan`
+    - `assert`, `expect_failures`
+  scenario: |
+    **`/lab/naming`** is a small module that builds resource names from
+    `env` and `app`, and only accepts the environments `dev`, `stage` and
+    `prod`. Write **`/lab/naming/tests/naming.tftest.hcl`** with at least
+    two `run` blocks:
+
+    1. with `env = "dev"` and `app = "shop"`, assert that the output
+       **`name`** is **`dev-shop`**
+    2. with `env = "qa"`, expect the **validation of `var.env`** to fail
+
+    `terraform test` must pass, and your tests must catch a module that
+    builds names the wrong way round.
+  hints:
+    - "`run \"name_format\" { command = plan  variables { env = \"dev\"  app = \"shop\" }  assert { condition = output.name == \"dev-shop\"  error_message = \"...\" } }`."
+    - "`run \"rejects_qa\" { command = plan  variables { env = \"qa\"  app = \"shop\" }  expect_failures = [var.env] }`."
+    - "Run `terraform init` once, then `terraform test`."
+  solution: |
+    ```bash
+    cd /lab/naming
+    mkdir -p tests
+    cat > tests/naming.tftest.hcl <<'EOF'
+    run "name_format" {
+      command = plan
+      variables {
+        env = "dev"
+        app = "shop"
+      }
+      assert {
+        condition     = output.name == "dev-shop"
+        error_message = "name must be <env>-<app>"
+      }
+    }
+
+    run "rejects_qa" {
+      command = plan
+      variables {
+        env = "qa"
+        app = "shop"
+      }
+      expect_failures = [var.env]
+    }
+    EOF
+    terraform init && terraform test
+    ```
+  setup: |
+    tf_start
+    rm -rf /lab/naming
+    lab_file /lab/naming/main.tf <<'EOF'
+    variable "env" {
+      type = string
+      validation {
+        condition     = contains(["dev", "stage", "prod"], var.env)
+        error_message = "env must be dev, stage or prod."
+      }
+    }
+
+    variable "app" {
+      type = string
+    }
+
+    output "name" {
+      value = "${var.env}-${var.app}"
+    }
+    EOF
+  check: |
+    f=/lab/naming/tests/naming.tftest.hcl
+    check "tests/naming.tftest.hcl exists" '[ -s $f ]'
+    check "it expects a validation failure" 'grep -q "expect_failures" $f'
+    tf_as_user /lab/naming init -input=false -no-color >/dev/null 2>&1
+    out=$(tf_as_user /lab/naming test -no-color 2>&1)
+    check_match "terraform test passes with two or more runs" "$(grep -E 'passed, ' <<<"$out" | tail -1)" 'Success! ([2-9]|[1-9][0-9]+) passed, 0 failed'
+    m=/lab/.kl-mutant
+    rm -rf $m; mkdir -p $m; cp -r /lab/naming/main.tf /lab/naming/tests $m/; chown -R "$(lab_user):" $m
+    sed -i 's/"${var.env}-${var.app}"/"${var.app}-${var.env}"/' $m/main.tf
+    tf_as_user $m init -input=false -no-color >/dev/null 2>&1
+    mut=$(tf_as_user $m test -no-color 2>&1)
+    check "the tests catch names built the wrong way round" 'grep -qE "Failure! .*[1-9][0-9]* failed" <<<"$mut"'
+    rm -rf $m
+  solve: |
+    cd /lab/naming
+    mkdir -p tests
+    cat > tests/naming.tftest.hcl <<'EOF'
+    run "name_format" {
+      command = plan
+      variables {
+        env = "dev"
+        app = "shop"
+      }
+      assert {
+        condition     = output.name == "dev-shop"
+        error_message = "name must be <env>-<app>"
+      }
+    }
+
+    run "rejects_qa" {
+      command = plan
+      variables {
+        env = "qa"
+        app = "shop"
+      }
+      expect_failures = [var.env]
+    }
+    EOF
+    terraform init -input=false -no-color
+    terraform test -no-color
+
+- id: tf-070
+  title: "Incident: the status page that will not plan"
+  difficulty: 4
+  kind: fix
+  tags: [terraform, incident, versions, for_each, sensitive, troubleshooting]
+  tutorial: |
+    **Concept.** A broken configuration usually fails in stages: `init`
+    first (providers and versions), then `validate` (references and types),
+    then `plan` (values). Fix one layer, rerun, and read the next error.
+    Don't paper over a problem by deleting the thing that reports it.
+
+    **Read up on:**
+    - `terraform init`, `terraform validate`, `terraform plan`
+    - Provider version constraints, `for_each` types, `sensitive` outputs
+  scenario: |
+    Someone "tidied up" **`/lab/status`** on a Friday afternoon, and nothing
+    works any more. Get it applying again. When you're done:
+
+    - **`pages/index.html`**, **`pages/incidents.html`** and
+      **`pages/about.html`** exist, each managed as
+      `local_file.page["<name>"]`
+    - **`pages/sitemap.txt`** lists the three page file names
+    - the output **`admin_token`** still exists, and the token stays out of
+      plain output
+    - the `local` provider is still pinned to a **2.x** version
+    - the plan is empty
+
+    The lab's provider mirror is offline and offers `hashicorp/local`
+    **2.8.0** and **2.9.1** only.
+  hints:
+    - "Start with `terraform init` and read each error in turn."
+    - "`~> 2.5.0` means 2.5.x only. `~> 2.8` accepts 2.8 and 2.9."
+    - "`for_each` wants a map or a **set** of strings: `toset(var.pages)`."
+    - "`local_file` exports `content`, not `contents`."
+    - "An output built from a sensitive value needs `sensitive = true`."
+  solution: |
+    ```bash
+    cd /lab/status
+    sed -i 's/version = "~> 2.5.0"/version = "~> 2.8"/' versions.tf
+    sed -i 's/for_each = var.pages/for_each = toset(var.pages)/' main.tf
+    sed -i 's/\.contents/.content/' main.tf
+    sed -i 's/^  value = "token:${var.admin_token}"/&\n  sensitive = true/' main.tf
+    terraform init && terraform apply -auto-approve && terraform plan
+    ```
+  setup: |
+    tf_start
+    rm -rf /lab/status
+    lab_file /lab/status/versions.tf <<'EOF'
+    terraform {
+      required_providers {
+        local = {
+          source  = "hashicorp/local"
+          version = "~> 2.5.0"
+        }
+      }
+    }
+    EOF
+    lab_file /lab/status/main.tf <<'EOF'
+    variable "pages" {
+      type    = list(string)
+      default = ["index", "incidents", "about"]
+    }
+
+    variable "admin_token" {
+      type      = string
+      sensitive = true
+      default   = "s3cr3t-token"
+    }
+
+    resource "local_file" "page" {
+      for_each = var.pages
+      filename = "${path.module}/pages/${each.key}.html"
+      content  = "<h1>${each.key}</h1>\n"
+    }
+
+    resource "local_file" "sitemap" {
+      filename = "${path.module}/pages/sitemap.txt"
+      content  = join("\n", [for p in local_file.page : basename(p.filename)])
+    }
+
+    output "sitemap_preview" {
+      value = local_file.sitemap.contents
+    }
+
+    output "admin_token" {
+      value = "token:${var.admin_token}"
+    }
+    EOF
+  check: |
+    d=/lab/status
+    for p in index incidents about; do
+      check "local_file.page[\"$p\"] is managed" "tf_has $d 'local_file.page[\"$p\"]'"
+      check_eq "pages/$p.html" "$(cat $d/pages/$p.html 2>/dev/null)" "<h1>$p</h1>"
+    done
+    check_eq "sitemap lists the pages" "$(sort $d/pages/sitemap.txt 2>/dev/null | tr '\n' ' ')" "about.html incidents.html index.html "
+    check "output admin_token exists" '[ -n "$(tf_output $d admin_token)" ]'
+    check_eq "admin_token is marked sensitive" "$(jq -r '.outputs.admin_token.sensitive' $d/terraform.tfstate 2>/dev/null)" true
+    check_match "the local provider is pinned to 2.x" "$(grep -E '^\s*version' $d/versions.tf 2>/dev/null)" '"[~>=<, ]*2(\.[0-9]+)*'
+    check_match "the installed provider is 2.x" "$(grep -A1 'registry.terraform.io/hashicorp/local' $d/.terraform.lock.hcl 2>/dev/null | grep version)" '"2\.'
+    check "the plan is empty" 'tf_clean /lab/status'
+  solve: |
+    cd /lab/status
+    sed -i 's/version = "~> 2.5.0"/version = "~> 2.8"/' versions.tf
+    sed -i 's/for_each = var.pages/for_each = toset(var.pages)/' main.tf
+    sed -i 's/\.contents/.content/' main.tf
+    sed -i 's/^  value = "token:${var.admin_token}"/&\n  sensitive = true/' main.tf
+    terraform init -input=false -no-color
+    terraform apply -auto-approve -input=false -no-color
