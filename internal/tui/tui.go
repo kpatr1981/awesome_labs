@@ -5,6 +5,7 @@ import (
 	"context"
 	"fmt"
 	"io"
+	"slices"
 	"strings"
 	"sync"
 	"time"
@@ -196,7 +197,7 @@ func newModel(d Deps, style string) *model {
 	sp.Style = lipgloss.NewStyle().Foreground(colAccent)
 	m := &model{
 		cat: cat, mgr: mgr, prog: prog,
-		tracks: []string{"", "docker", "kubernetes", "offsec", "linux", "networking", "cloud", "data", "defensive", "programming", "datascience"},
+		tracks: []string{"", "docker", "kubernetes", "offsec", "linux", "networking", "cloud", "data", "defensive", "programming", "datascience", "git", "terraform", "ansible", "algorithms"},
 		filter: ti, spin: sp, style: style,
 		output: map[string]*strings.Builder{}, result: map[string]string{},
 		mdCache: map[string]string{}, envStatus: map[exercise.Profile]string{},
@@ -210,6 +211,9 @@ func newModel(d Deps, style string) *model {
 	}
 	m.trackIDs = map[string][]string{}
 	for _, e := range cat.Exercises {
+		if _, ok := m.trackIDs[e.Track]; !ok && !slices.Contains(m.tracks, e.Track) {
+			m.tracks = append(m.tracks, e.Track) // tracks beyond the built-in order, as they appear
+		}
 		m.trackIDs[e.Track] = append(m.trackIDs[e.Track], e.ID)
 		m.trackIDs[""] = append(m.trackIDs[""], e.ID)
 	}

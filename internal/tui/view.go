@@ -70,6 +70,14 @@ func trackLabel(t string) string {
 		return "Programming"
 	case "datascience":
 		return "Data Science"
+	case "git":
+		return "Git"
+	case "terraform":
+		return "Terraform"
+	case "ansible":
+		return "Ansible"
+	case "algorithms":
+		return "Algorithms"
 	}
 	return t
 }

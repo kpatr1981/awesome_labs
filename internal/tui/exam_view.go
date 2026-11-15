@@ -124,6 +124,15 @@ func (m *model) examSources() []examSource {
 		{"Programming — everything", all["programming"]},
 		{"Data Science — everything", all["datascience"]},
 	}
+	for _, t := range m.tracks {
+		switch t {
+		case "", "kubernetes", "docker", "offsec", "linux", "networking", "cloud", "data", "defensive", "programming", "datascience":
+			continue
+		}
+		if len(all[t]) > 0 {
+			src = append(src, examSource{trackLabel(t) + " — everything", all[t]})
+		}
+	}
 	for _, p := range m.paths {
 		g := byProfile(p.Exercises)
 		if len(g) == 1 {
