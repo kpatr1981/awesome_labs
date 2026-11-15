@@ -485,6 +485,33 @@ go_test() {
   return "$rc"
 }
 
+# ---------- algorithms helper ----------
+# algo_check <<'EOF' ... EOF -> stdin holds hidden Python tests, a line "---GO---", then
+# hidden Go tests. They run against /lab/solution.py and /lab/solution.go; the check
+# passes when either language's tests pass, so learners pick the language they like.
+algo_check() {
+  local all py gosrc d prc=9 grc=9 pout="" gout=""
+  all=$(cat)
+  py=${all%%---GO---*}
+  gosrc=${all#*---GO---}
+  if [ -f /lab/solution.py ]; then
+    d=$(mktemp -d)
+    printf '%s\n' "$py" >"$d/t.py"
+    pout=$(cd /lab && PYTHONPATH=/lab timeout 120 python3 -B "$d/t.py" 2>&1); prc=$?
+    rm -rf "$d"
+  fi
+  if [ -f /lab/solution.go ]; then
+    gout=$(printf '%s\n' "$gosrc" | go_test); grc=$?
+  fi
+  if [ "$prc" = 0 ]; then info "Python (/lab/solution.py): hidden tests pass"; else info "Python (/lab/solution.py): not passing yet"; fi
+  if [ "$grc" = 0 ]; then info "Go (/lab/solution.go): hidden tests pass"; else info "Go (/lab/solution.go): not passing yet"; fi
+  if [ "$prc" != 0 ] && [ "$grc" != 0 ]; then
+    [ -n "$pout" ] && { echo "  --- Python test output (last lines) ---"; tail -12 <<<"$pout" | sed 's/^/  /'; }
+    [ -n "$gout" ] && { echo "  --- Go test output (last lines) ---"; tail -12 <<<"$gout" | sed 's/^/  /'; }
+  fi
+  check "hidden tests pass in Python or Go" '[ "$prc" = 0 ] || [ "$grc" = 0 ]'
+}
+
 # ---------- PostgreSQL replication and PgBouncer helpers ----------
 PGB_IMAGE=edoburu/pgbouncer:v1.24.1-p1
 # pgb_image -> make sure the PgBouncer image exists and survives resets, also on VMs built

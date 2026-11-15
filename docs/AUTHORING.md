@@ -3,7 +3,7 @@
 Exercises live in `exercises/<track>/NN-<module>.yaml`. One file is one module:
 
 ```yaml
-track: kubernetes          # docker | kubernetes | offsec | linux | networking | cloud | data | defensive | programming | datascience | git | terraform | ansible
+track: kubernetes          # docker | kubernetes | offsec | linux | networking | cloud | data | defensive | programming | datascience | git | terraform | ansible | algorithms
 module: Services & DNS     # module title
 profile: k8s               # docker | k8s | offsec — which lab environment
 order: 3                   # module order within the track
@@ -81,6 +81,7 @@ control plane, `KUBECONFIG` is `/etc/kubernetes/admin.conf`; the lab user has it
 | `moto_start_iam`, `moto_user NAME...`, `moto_denied PROFILE ARGS...` | the emulator with IAM enforced: `aws` is the administrator and `aws --profile NAME` another user; true only if IAM refused the call |
 | `ds_start` | install `dspy`, which runs Python with pandas and scikit-learn in `/lab` |
 | `go_test <<'GO'` | run a hidden Go test file against the learner's `/lab/*.go` |
+| `algo_check <<'EOF'` | hidden Python tests, a `---GO---` line, then hidden Go tests, run against `/lab/solution.py` and `/lab/solution.go`; passes when either language passes (algorithms) |
 | `pg_start`, `pg_sql 'SQL'` | PostgreSQL in container `kl-pg`, and run SQL from a script |
 | `pg_primary NAME NET [flags]`, `pg_standby NAME NET PRIMARY [APP] [SLOT]`, `pg_x NAME 'SQL'`, `c_veth NAME`, `pgb_image` | Replicating PostgreSQL containers on a network, SQL on a named one, a container's host veth for `tc`, the PgBouncer image kept across resets (docker host) |
 | `kr_up`, `kr_guard_calico`, `kr_conf <<EOF`, `kr_json 'show ...'`, `kr_ip`, `kr_nodes` | an FRR router outside the pod network, Pod `router` in `edge`, reachable from both k8s nodes; `kr_guard_calico` restores Calico's BGP settings on reset |
