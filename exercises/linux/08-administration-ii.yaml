@@ -1,0 +1,1294 @@
+track: linux
+module: Files, services & recovery
+profile: docker
+order: 8
+exercises:
+
+- id: linux-060
+  title: Clear out the old, oversized logs
+  difficulty: 1
+  kind: build
+  tags: [find, mtime, size, cleanup]
+  tutorial: |
+    **Concept.** `find` selects files by any combination of tests, ANDed
+    together by default: `-name`, `-type f`, `-mtime +N` (modified more than N
+    whole days ago), `-size +NM` (bigger than N MiB). It can then act on them
+    with `-delete` or `-exec`. Always run the same expression with `-print`
+    first, and only then replace it with `-delete`.
+
+    **Read up on:**
+    - `man find`: `-mtime`, `-size`, `-name`, `-delete`
+    - How `find` rounds `-size` and `-mtime`
+  scenario: |
+    **`/srv/kl-logs`** is filling the disk. Delete every **`.log`** file under
+    it, in any subdirectory, that is **older than 7 days** *and* **larger
+    than 1 MiB**.
+
+    Keep everything else: recent logs, small old logs, and the compressed
+    `.gz` archives, however old or large they are.
+  hints:
+    - "The files belong to root: use `sudo`."
+    - "`sudo find /srv/kl-logs -type f -name '*.log' -mtime +7 -size +1M -print` first."
+    - "Then swap `-print` for `-delete`."
+  solution: |
+    ```bash
+    sudo find /srv/kl-logs -type f -name '*.log' -mtime +7 -size +1M -print
+    sudo find /srv/kl-logs -type f -name '*.log' -mtime +7 -size +1M -delete
+    ```
+  setup: |
+    on_reset 'rm -rf /srv/kl-logs'
+    rm -rf /srv/kl-logs
+    mk() { # path KiB age-days
+      mkdir -p "$(dirname "$1")"; head -c $(($2 * 1024)) /dev/zero > "$1"; touch -d "$3 days ago" "$1"
+    }
+    : > "$KL_STATE/keep"; : > "$KL_STATE/gone"
+    for app in api web worker billing; do
+      for i in 1 2 3; do
+        age=$(( RANDOM % 2 ? 10 + RANDOM % 20 : RANDOM % 5 ))
+        kib=$(( RANDOM % 2 ? 2048 + RANDOM % 4096 : 50 + RANDOM % 400 ))
+        f=/srv/kl-logs/$app/$app-$i.log
+        mk "$f" $kib $age
+        if [ $age -gt 7 ] && [ $kib -gt 1024 ]; then echo "$f" >> "$KL_STATE/gone"; else echo "$f" >> "$KL_STATE/keep"; fi
+      done
+      mk /srv/kl-logs/$app/archive/$app-old.log.gz 3072 40; echo /srv/kl-logs/$app/archive/$app-old.log.gz >> "$KL_STATE/keep"
+    done
+    mk /srv/kl-logs/web/web-x.log 5000 30; echo /srv/kl-logs/web/web-x.log >> "$KL_STATE/gone"
+    mk /srv/kl-logs/api/api-y.log 5000 1; echo /srv/kl-logs/api/api-y.log >> "$KL_STATE/keep"
+  check: |
+    missing=0; for f in $(cat "$KL_STATE/keep"); do [ -f "$f" ] || missing=$((missing + 1)); done
+    left=0; for f in $(cat "$KL_STATE/gone"); do [ -e "$f" ] && left=$((left + 1)); done
+    check_eq "old, large .log files still present" "$left" 0
+    check_eq "files that should have been kept but are gone" "$missing" 0
+  solve: |
+    sudo find /srv/kl-logs -type f -name '*.log' -mtime +7 -size +1M -delete
+
+- id: linux-061
+  title: A drop folder nobody can vandalise
+  difficulty: 2
+  kind: build
+  tags: [permissions, sticky, setgid, groups]
+  tutorial: |
+    **Concept.** Two special bits shape shared directories. **setgid** on a
+    directory (`g+s`, the `2` in `2770`) makes new files inherit the
+    directory's **group** instead of the creator's primary group. The
+    **sticky bit** (`+t`, the `1`) means only a file's owner (or root) may
+    delete or rename it, even when others can write to the directory.
+    `/tmp` is `1777` for that reason.
+
+    **Read up on:**
+    - `chmod 3770`, `chmod g+s,+t`
+    - `ls -ld` output: the `s` and `t` letters
+  scenario: |
+    Create the shared directory **`/srv/drop`** for the group **`drop`**,
+    whose members are `alice` and `bob`:
+
+    - owner `root`, group `drop`
+    - members of `drop` may create files in it, and nobody else may enter it
+    - every new file automatically belongs to the group `drop`
+    - a member can't delete or rename **another** member's files
+  hints:
+    - "`sudo mkdir /srv/drop && sudo chown root:drop /srv/drop`."
+    - "rwx for the owner and group, nothing for others, plus setgid (2) and sticky (1): `chmod 3770`."
+  solution: |
+    ```bash
+    sudo mkdir -p /srv/drop
+    sudo chown root:drop /srv/drop
+    sudo chmod 3770 /srv/drop
+    ls -ld /srv/drop       # drwxrws--T
+    ```
+  setup: |
+    on_reset 'rm -rf /srv/drop; userdel -r alice 2>/dev/null; userdel -r bob 2>/dev/null; userdel -r carol 2>/dev/null; groupdel drop 2>/dev/null; true'
+    rm -rf /srv/drop
+    groupadd -f drop
+    for u in alice bob carol; do id $u >/dev/null 2>&1 || useradd -m -s /bin/bash $u; done
+    usermod -aG drop alice; usermod -aG drop bob
+  check: |
+    d=/srv/drop
+    check_eq "owner and group" "$(stat -c %U:%G $d 2>/dev/null)" root:drop
+    check_eq "mode" "$(stat -c %a $d 2>/dev/null)" 3770
+    rm -f $d/kl-*
+    check "alice can create a file" 'sudo -u alice sh -c "echo a > $d/kl-alice"'
+    check_eq "the new file belongs to group drop" "$(stat -c %G $d/kl-alice 2>/dev/null)" drop
+    check_not "bob can't delete alice's file" 'sudo -u bob rm -f $d/kl-alice && [ ! -e $d/kl-alice ]'
+    check_not "bob can't rename alice's file" 'sudo -u bob mv $d/kl-alice $d/kl-bob-owns-this'
+    check "bob can create his own file" 'sudo -u bob sh -c "echo b > $d/kl-bob"'
+    check_not "carol (not in drop) can't list it" 'sudo -u carol ls $d'
+    rm -f $d/kl-*
+  solve: |
+    sudo mkdir -p /srv/drop
+    sudo chown root:drop /srv/drop
+    sudo chmod 3770 /srv/drop
+
+- id: linux-062
+  title: The file even root can't change
+  difficulty: 2
+  kind: fix
+  tags: [chattr, lsattr, immutable, append-only]
+  tutorial: |
+    **Concept.** Besides permissions, Linux filesystems keep **attributes**,
+    listed with `lsattr` and changed with `chattr`. **`i` (immutable)** blocks
+    every change to a file, including deletion, rename and new hard links,
+    even for root. **`a` (append-only)** allows only appending, which suits
+    audit logs. Root has to clear the attribute before changing the file.
+
+    **Read up on:**
+    - `lsattr`, `chattr +i / -i / +a`
+    - Why `sudo vi` reports "Operation not permitted"
+  scenario: |
+    The maintenance window has started. Set **`/etc/kl-app/app.conf`** to
+    exactly one line, `mode=maintenance`. Your editor says *Operation not
+    permitted*, even with `sudo`.
+
+    Once it's changed, make sure it's **protected again** in the same way.
+    The audit log **`/var/log/kl-app/audit.log`** must keep its current
+    protection and contents.
+  hints:
+    - "`lsattr /etc/kl-app/app.conf`."
+    - "`sudo chattr -i`, edit, then `sudo chattr +i`."
+  solution: |
+    ```bash
+    lsattr /etc/kl-app/app.conf /var/log/kl-app/audit.log
+    sudo chattr -i /etc/kl-app/app.conf
+    echo mode=maintenance | sudo tee /etc/kl-app/app.conf
+    sudo chattr +i /etc/kl-app/app.conf
+    ```
+  setup: |
+    on_reset 'chattr -i -a /etc/kl-app/app.conf /var/log/kl-app/audit.log 2>/dev/null; rm -rf /etc/kl-app /var/log/kl-app; true'
+    mkdir -p /etc/kl-app /var/log/kl-app
+    printf 'mode=normal\nworkers=4\n' > /etc/kl-app/app.conf
+    printf '2026-03-01 login admin\n2026-03-02 change workers\n' > /var/log/kl-app/audit.log
+    sha1sum /var/log/kl-app/audit.log > "$KL_STATE/audit"
+    chattr +i /etc/kl-app/app.conf
+    chattr +a /var/log/kl-app/audit.log
+  check: |
+    check_eq "app.conf" "$(cat /etc/kl-app/app.conf 2>/dev/null)" "mode=maintenance"
+    check_match "app.conf is immutable again" "$(lsattr /etc/kl-app/app.conf 2>/dev/null | cut -d' ' -f1)" 'i'
+    check_match "audit.log is still append-only" "$(lsattr /var/log/kl-app/audit.log 2>/dev/null | cut -d' ' -f1)" 'a'
+    check "audit.log is unchanged" 'sha1sum -c --status "$KL_STATE/audit"'
+  solve: |
+    sudo chattr -i /etc/kl-app/app.conf
+    echo mode=maintenance | sudo tee /etc/kl-app/app.conf >/dev/null
+    sudo chattr +i /etc/kl-app/app.conf
+
+- id: linux-063
+  title: Kernel settings that survive a reboot
+  difficulty: 2
+  kind: build
+  tags: [sysctl, sysctl.d, kernel, tuning]
+  tutorial: |
+    **Concept.** `sysctl -w key=value` changes a kernel parameter **now**, and
+    it's gone at the next boot. To make it permanent, put `key = value` lines
+    in a file under **`/etc/sysctl.d/`**, which `systemd-sysctl` applies at
+    boot. `sysctl --system` (or `sysctl -p FILE`) loads the files immediately,
+    so one command does both.
+
+    **Read up on:**
+    - `sysctl -w`, `sysctl -p FILE`, `sysctl --system`
+    - `man sysctl.d`, and how files are ordered by name
+  scenario: |
+    The file-watching service needs more inotify watches, and the database
+    host should avoid swapping. Set both **now and persistently**, in
+    **`/etc/sysctl.d/90-kl-tuning.conf`**:
+
+    - `fs.inotify.max_user_watches` = **524288**
+    - `vm.swappiness` = **10**
+  hints:
+    - "Write both `key = value` lines to the file with `sudo tee`."
+    - "`sudo sysctl -p /etc/sysctl.d/90-kl-tuning.conf` applies them now."
+  solution: |
+    ```bash
+    printf 'fs.inotify.max_user_watches = 524288\nvm.swappiness = 10\n' | sudo tee /etc/sysctl.d/90-kl-tuning.conf
+    sudo sysctl -p /etc/sysctl.d/90-kl-tuning.conf
+    sysctl fs.inotify.max_user_watches vm.swappiness
+    ```
+  setup: |
+    w=$(sysctl -n fs.inotify.max_user_watches); s=$(sysctl -n vm.swappiness)
+    on_reset "sysctl -qw fs.inotify.max_user_watches=$w vm.swappiness=$s; rm -f /etc/sysctl.d/90-kl-tuning.conf"
+    sysctl -qw fs.inotify.max_user_watches=8192 vm.swappiness=60
+  check: |
+    f=/etc/sysctl.d/90-kl-tuning.conf
+    check_eq "live max_user_watches" "$(sysctl -n fs.inotify.max_user_watches)" 524288
+    check_eq "live swappiness" "$(sysctl -n vm.swappiness)" 10
+    check "the file sets max_user_watches" 'grep -Eq "^\s*fs\.inotify\.max_user_watches\s*=\s*524288\s*$" $f'
+    check "the file sets swappiness" 'grep -Eq "^\s*vm\.swappiness\s*=\s*10\s*$" $f'
+  solve: |
+    printf 'fs.inotify.max_user_watches = 524288\nvm.swappiness = 10\n' | sudo tee /etc/sysctl.d/90-kl-tuning.conf >/dev/null
+    sudo sysctl -p /etc/sysctl.d/90-kl-tuning.conf
+
+- id: linux-064
+  title: Count the errors in the journal
+  difficulty: 2
+  kind: build
+  tags: [journalctl, priority, syslog-identifier, logs]
+  tutorial: |
+    **Concept.** The systemd journal stores structured fields with each
+    message, so you can filter precisely instead of grepping. `-t ID` selects
+    a syslog identifier, `-u UNIT` a unit, and `-p err` keeps priority `err`
+    **and more severe** (`crit`, `alert`, `emerg`). `-o cat` prints only the
+    message text and `-q` hides informational lines, which makes counting
+    easy.
+
+    **Read up on:**
+    - `journalctl -t`, `-u`, `-p`, `--since`, `-o cat`, `-q`
+    - Syslog priorities 0 (emerg) to 7 (debug)
+  scenario: |
+    The payment importer logs to the journal under the identifier written in
+    **`/lab/ident.txt`**. It logs at several priorities.
+
+    Write the **number of messages it logged at priority `err` or more
+    severe** into **`/lab/answer.txt`**.
+  hints:
+    - "`journalctl -t \"$(cat /lab/ident.txt)\"` shows all of them."
+    - "`-p err` includes crit, alert and emerg."
+    - "`journalctl -q -t ID -p err -o cat | wc -l`."
+  solution: |
+    ```bash
+    id=$(cat /lab/ident.txt)
+    journalctl -t "$id" -o short-precise
+    journalctl -q -t "$id" -p err -o cat | wc -l > /lab/answer.txt
+    ```
+  setup: |
+    id="kl-payimport-$RANDOM$RANDOM"
+    echo "$id" > /lab/ident.txt; chown "$(lab_user):" /lab/ident.txt
+    n=0
+    for i in $(seq 1 40); do
+      case $((RANDOM % 6)) in
+        0) p=info ;; 1) p=warning ;; 2) p=notice ;; 3) p=err ;; 4) p=crit ;; 5) p=debug ;;
+      esac
+      case $p in err|crit) n=$((n + 1)) ;; esac
+      echo "batch $i finished with level $p" | systemd-cat -t "$id" -p $p
+    done
+    echo $n > "$KL_STATE/answer"
+    journalctl --flush 2>/dev/null
+    eventually 20 "[ \$(journalctl -q -t $id -o cat | wc -l) -ge 40 ]"
+  check: |
+    check_eq "errors and worse" "$(tr -d ' \n' < /lab/answer.txt 2>/dev/null)" "$(cat "$KL_STATE/answer")"
+  solve: |
+    journalctl -q -t "$(cat /lab/ident.txt)" -p err -o cat | wc -l > /lab/answer.txt
+
+- id: linux-065
+  title: Directories that systemd recreates for you
+  difficulty: 2
+  kind: build
+  tags: [systemd-tmpfiles, tmpfiles.d, run, cleanup]
+  tutorial: |
+    **Concept.** `/run` is a tmpfs that's empty at every boot, so a service
+    that needs `/run/myapp` must get it recreated. **`tmpfiles.d`** handles
+    that declaratively. A line such as `d /run/myapp 0750 daemon daemon -`
+    creates the directory with that mode and owner. The last column is an
+    **age**: `systemd-tmpfiles --clean` deletes files older than it.
+
+    **Read up on:**
+    - `man tmpfiles.d` (types `d`, `D`, `f`, `L`; the age field)
+    - `systemd-tmpfiles --create`, `--clean`
+  scenario: |
+    Write **`/etc/tmpfiles.d/kl-cache.conf`** so that systemd manages:
+
+    - **`/run/kl-cache`**: a directory, mode **0750**, owner **daemon**,
+      group **daemon**
+    - **`/var/tmp/kl-scratch`**: a directory, mode **1777**, owner root,
+      group root, whose files are **cleaned up after 10 days**
+
+    Then create both directories with `systemd-tmpfiles`.
+  hints:
+    - "`d /run/kl-cache 0750 daemon daemon -`"
+    - "`d /var/tmp/kl-scratch 1777 root root 10d`"
+    - "`sudo systemd-tmpfiles --create /etc/tmpfiles.d/kl-cache.conf`."
+  solution: |
+    ```bash
+    sudo tee /etc/tmpfiles.d/kl-cache.conf <<'EOF'
+    d /run/kl-cache       0750 daemon daemon -
+    d /var/tmp/kl-scratch 1777 root   root   10d
+    EOF
+    sudo systemd-tmpfiles --create /etc/tmpfiles.d/kl-cache.conf
+    ls -ld /run/kl-cache /var/tmp/kl-scratch
+    ```
+  setup: |
+    on_reset 'rm -rf /etc/tmpfiles.d/kl-cache.conf /run/kl-cache /var/tmp/kl-scratch'
+    rm -rf /etc/tmpfiles.d/kl-cache.conf /run/kl-cache /var/tmp/kl-scratch
+  check: |
+    f=/etc/tmpfiles.d/kl-cache.conf
+    check "the config exists" '[ -s $f ]'
+    check_eq "/run/kl-cache now" "$(stat -c '%a %U %G' /run/kl-cache 2>/dev/null)" "750 daemon daemon"
+    check_eq "/var/tmp/kl-scratch now" "$(stat -c '%a %U %G' /var/tmp/kl-scratch 2>/dev/null)" "1777 root root"
+    rm -rf /run/kl-cache
+    systemd-tmpfiles --create $f >/dev/null 2>&1
+    check_eq "the config recreates /run/kl-cache" "$(stat -c '%a %U %G' /run/kl-cache 2>/dev/null)" "750 daemon daemon"
+    # the kernel won't let us fake an old ctime, so read the age from the config itself
+    age=$(systemd-tmpfiles --cat-config 2>/dev/null | awk '$2 == "/var/tmp/kl-scratch" {print $6}' | tail -1)
+    check_eq "files in kl-scratch are cleaned after 10 days" "$age" 10d
+  solve: |
+    printf 'd /run/kl-cache 0750 daemon daemon -\nd /var/tmp/kl-scratch 1777 root root 10d\n' | sudo tee /etc/tmpfiles.d/kl-cache.conf >/dev/null
+    sudo systemd-tmpfiles --create /etc/tmpfiles.d/kl-cache.conf
+
+- id: linux-066
+  title: One file, many names
+  difficulty: 2
+  kind: build
+  tags: [hard-links, inode, find, samefile]
+  tutorial: |
+    **Concept.** A file's data and metadata live in an **inode**, and a
+    directory entry is just a name pointing at one. A **hard link** is a
+    second name for the same inode, so editing through either name changes
+    the same data. `ls -li` shows the inode number and the **link count**.
+    `find -samefile PATH` (or `-inum N`) finds every name of an inode on that
+    filesystem.
+
+    **Read up on:**
+    - `ls -li`, `stat -c '%i %h'`
+    - `find / -xdev -samefile PATH`
+  scenario: |
+    Under **`/srv/kl-links`**, the file **`/srv/kl-links/config/current.cfg`**
+    is hard-linked from a few other places, and someone keeps editing the
+    "wrong copy".
+
+    Write the **full paths of all the other names of that file** (not
+    `current.cfg` itself), sorted, one per line, into **`/lab/answer.txt`**.
+    Lookalike copies with the same content don't count.
+  hints:
+    - "`ls -li /srv/kl-links/config/current.cfg` shows its link count."
+    - "`find /srv/kl-links -samefile /srv/kl-links/config/current.cfg`."
+  solution: |
+    ```bash
+    f=/srv/kl-links/config/current.cfg
+    find /srv/kl-links -samefile "$f" ! -path "$f" | sort > /lab/answer.txt
+    ```
+  setup: |
+    on_reset 'rm -rf /srv/kl-links'
+    rm -rf /srv/kl-links
+    mkdir -p /srv/kl-links/{config,backup,releases/v1,releases/v2,tmp}
+    f=/srv/kl-links/config/current.cfg
+    printf 'listen=8080\nworkers=4\n' > $f
+    : > "$KL_STATE/answer.tmp"
+    for p in backup/current.cfg.bak releases/v2/app.cfg tmp/.cfg-$RANDOM releases/v1/live.cfg; do
+      if [ $((RANDOM % 4)) != 0 ] || [ ! -s "$KL_STATE/answer.tmp" ]; then ln $f /srv/kl-links/$p; echo /srv/kl-links/$p >> "$KL_STATE/answer.tmp"
+      else cp $f /srv/kl-links/$p; fi
+    done
+    cp $f /srv/kl-links/config/current.cfg.copy
+    sort "$KL_STATE/answer.tmp" > "$KL_STATE/answer"
+  check: |
+    check_eq "the other names" "$(sed '/^$/d' /lab/answer.txt 2>/dev/null)" "$(cat "$KL_STATE/answer")"
+  solve: |
+    f=/srv/kl-links/config/current.cfg
+    find /srv/kl-links -samefile "$f" ! -path "$f" | sort > /lab/answer.txt
+
+- id: linux-067
+  title: Which downloads are corrupt?
+  difficulty: 2
+  kind: build
+  tags: [sha256sum, checksums, integrity]
+  tutorial: |
+    **Concept.** A checksum manifest (`SHA256SUMS`) lists `hash  filename`
+    pairs. `sha256sum -c MANIFEST` recomputes each file and reports `OK` or
+    `FAILED`. `--quiet` prints only the failures, and a missing file is
+    reported as well. Run it from the directory the names are relative to.
+
+    **Read up on:**
+    - `sha256sum -c`, `--quiet`, `--ignore-missing`
+  scenario: |
+    **`/srv/kl-release`** holds a release and its **`SHA256SUMS`**. Some
+    files were damaged in transit. Write the **names of the files that fail
+    verification** (as written in the manifest), sorted, one per line, into
+    **`/lab/answer.txt`**.
+  hints:
+    - "`cd /srv/kl-release && sha256sum -c SHA256SUMS`."
+    - "`sha256sum -c --quiet SHA256SUMS 2>/dev/null | cut -d: -f1 | sort`."
+  solution: |
+    ```bash
+    cd /srv/kl-release
+    sha256sum -c --quiet SHA256SUMS 2>/dev/null | cut -d: -f1 | sort > /lab/answer.txt
+    ```
+  setup: |
+    on_reset 'rm -rf /srv/kl-release'
+    rm -rf /srv/kl-release; mkdir -p /srv/kl-release/bin /srv/kl-release/share
+    cd /srv/kl-release
+    for f in bin/app bin/app-cli bin/migrate share/schema.sql share/README.txt share/logo.png lib.tar; do
+      head -c $((2000 + RANDOM)) /dev/urandom > $f
+    done
+    sha256sum bin/* share/* lib.tar > SHA256SUMS
+    files=(bin/app bin/app-cli bin/migrate share/schema.sql share/README.txt share/logo.png lib.tar)
+    : > "$KL_STATE/answer.tmp"
+    for i in 1 2 3; do
+      f=${files[$((RANDOM % ${#files[@]}))]}
+      printf 'X' | dd of=$f bs=1 seek=$((RANDOM % 1000)) conv=notrunc status=none
+      echo $f >> "$KL_STATE/answer.tmp"
+    done
+    sort -u "$KL_STATE/answer.tmp" > "$KL_STATE/answer"
+    # a byte that happened to be X already would not corrupt the file: recompute the truth
+    sha256sum -c --quiet SHA256SUMS 2>/dev/null | cut -d: -f1 | sort > "$KL_STATE/answer"
+    if [ ! -s "$KL_STATE/answer" ]; then printf 'junk' >> share/logo.png; echo share/logo.png > "$KL_STATE/answer"; fi
+  check: |
+    check_eq "the corrupt files" "$(sed '/^$/d' /lab/answer.txt 2>/dev/null)" "$(cat "$KL_STATE/answer")"
+  solve: |
+    cd /srv/kl-release
+    sha256sum -c --quiet SHA256SUMS 2>/dev/null | cut -d: -f1 | sort > /lab/answer.txt
+
+- id: linux-068
+  title: A mirror that matches exactly
+  difficulty: 2
+  kind: build
+  tags: [rsync, mirror, delete, exclude]
+  tutorial: |
+    **Concept.** `rsync -a` copies a tree and preserves permissions, times and
+    links. Only changed files are transferred. **`--delete`** removes files
+    from the destination that no longer exist in the source, which turns a
+    copy into a true mirror. **`--exclude`** leaves patterns out entirely. A
+    trailing slash on the source (`src/`) means "the contents of src". Use
+    `-n` (dry run) to preview.
+
+    **Read up on:**
+    - `rsync -a`, `--delete`, `--exclude`, `-n`, `-v`
+    - Trailing slashes on the source
+  scenario: |
+    Make **`/srv/kl-mirror`** an exact mirror of **`/srv/kl-src`**, except:
+
+    - files ending in **`.tmp`** and the directory **`cache/`** must not be in
+      the mirror
+    - anything in the mirror that no longer exists in the source must go
+
+    Modification times must match the source.
+  hints:
+    - "`sudo rsync -a --delete --exclude '*.tmp' --exclude 'cache/' /srv/kl-src/ /srv/kl-mirror/`."
+    - "Preview with `-n -v` first."
+    - "Excluded files that are already in the mirror must go too. `--delete-excluded` removes them."
+  solution: |
+    ```bash
+    sudo rsync -a -n -v --delete --delete-excluded --exclude '*.tmp' --exclude 'cache/' /srv/kl-src/ /srv/kl-mirror/
+    sudo rsync -a --delete --delete-excluded --exclude '*.tmp' --exclude 'cache/' /srv/kl-src/ /srv/kl-mirror/
+    ```
+  setup: |
+    on_reset 'rm -rf /srv/kl-src /srv/kl-mirror'
+    rm -rf /srv/kl-src /srv/kl-mirror
+    mkdir -p /srv/kl-src/{docs,img,cache,data/2026}
+    for f in docs/a.md docs/b.md img/logo.svg data/2026/jan.csv data/2026/feb.csv index.html; do
+      echo "content of $f $RANDOM" > /srv/kl-src/$f; touch -d "$((RANDOM % 30 + 1)) days ago" /srv/kl-src/$f
+    done
+    echo junk > /srv/kl-src/cache/thumb.bin; echo t > /srv/kl-src/upload.tmp; echo t > /srv/kl-src/docs/edit.tmp
+    mkdir -p /srv/kl-mirror/docs /srv/kl-mirror/old /srv/kl-mirror/cache
+    echo stale > /srv/kl-mirror/old/removed.md; echo stale > /srv/kl-mirror/docs/a.md
+    echo stale > /srv/kl-mirror/cache/x.bin; echo stale > /srv/kl-mirror/leftover.tmp
+  check: |
+    s=/srv/kl-src m=/srv/kl-mirror
+    want=$(cd $s && find . -type f ! -name '*.tmp' ! -path './cache/*' | sort)
+    got=$(cd $m 2>/dev/null && find . -type f | sort)
+    check_eq "the mirror has exactly the right files" "$got" "$want"
+    bad=0
+    for f in $want; do cmp -s $s/$f $m/$f || bad=$((bad + 1)); [ "$(stat -c %Y $s/$f)" = "$(stat -c %Y $m/$f 2>/dev/null)" ] || bad=$((bad + 1)); done
+    check_eq "files with different content or times" "$bad" 0
+    check "the source is untouched" '[ -f $s/upload.tmp ] && [ -f $s/cache/thumb.bin ]'
+  solve: |
+    sudo rsync -a --delete --delete-excluded --exclude '*.tmp' --exclude 'cache/' /srv/kl-src/ /srv/kl-mirror/
+
+- id: linux-069
+  title: Accounts that expire on schedule
+  difficulty: 2
+  kind: build
+  tags: [chage, passwd, accounts, lock]
+  tutorial: |
+    **Concept.** `/etc/shadow` stores password-ageing data per account:
+    maximum days between changes, warning days, and an **account expiry
+    date** after which the account can't log in at all. `chage` edits it, and
+    `chage -l USER` reads it. `usermod -L` / `passwd -l` **locks** the
+    password (prefixing `!` to the hash) without deleting the account.
+
+    **Read up on:**
+    - `chage -M`, `-W`, `-E`, `-l`
+    - `usermod -L`, `passwd -S`
+  scenario: |
+    Apply the access policy:
+
+    - **`contractor`**: the account **expires on 2026-12-31**, the password
+      must be changed at least every **90 days**, with a **14-day** warning
+    - **`leaver`**: **lock** the account's password (keep the account and its
+      home directory)
+  hints:
+    - "`sudo chage -E 2026-12-31 -M 90 -W 14 contractor`."
+    - "`sudo usermod -L leaver`, then check with `sudo passwd -S leaver`."
+  solution: |
+    ```bash
+    sudo chage -E 2026-12-31 -M 90 -W 14 contractor
+    sudo chage -l contractor
+    sudo usermod -L leaver
+    sudo passwd -S leaver      # L = locked
+    ```
+  setup: |
+    on_reset 'userdel -r contractor 2>/dev/null; userdel -r leaver 2>/dev/null; true'
+    for u in contractor leaver; do id $u >/dev/null 2>&1 || useradd -m -s /bin/bash $u; echo "$u:Lab-$RANDOM-pw" | chpasswd; done
+  check: |
+    sh=$(getent shadow contractor)
+    exp=$(cut -d: -f8 <<<"$sh")
+    check_eq "contractor expires on 2026-12-31" "$( [ -n "$exp" ] && date -u -d "@$((exp * 86400))" +%F)" 2026-12-31
+    check_eq "contractor max days" "$(cut -d: -f5 <<<"$sh")" 90
+    check_eq "contractor warning days" "$(cut -d: -f6 <<<"$sh")" 14
+    check_eq "leaver is locked" "$(passwd -S leaver 2>/dev/null | awk '{print $2}')" L
+    check "leaver still exists with a home" 'id leaver && [ -d /home/leaver ]'
+  solve: |
+    sudo chage -E 2026-12-31 -M 90 -W 14 contractor
+    sudo usermod -L leaver
+
+- id: linux-070
+  title: "Too many open files"
+  difficulty: 3
+  kind: fix
+  tags: [systemd, limits, nofile, drop-in]
+  tutorial: |
+    **Concept.** Each process has resource limits (`ulimit`), and one of them
+    caps open file descriptors. For services, systemd sets the limits, not
+    `/etc/security/limits.conf` (that only applies to PAM logins). By default a
+    service's soft `nofile` limit is 1024. Raise it with **`LimitNOFILE=`** in
+    a **drop-in** (`systemctl edit UNIT`), which leaves the vendor unit file
+    untouched.
+
+    **Read up on:**
+    - `man systemd.exec`: `LimitNOFILE=`
+    - `systemctl edit`, `/etc/systemd/system/UNIT.d/*.conf`
+    - `/proc/PID/limits`
+  scenario: |
+    **`kl-fdhog.service`** keeps thousands of connections open and dies at
+    start with *Too many open files*.
+
+    Raise its open-files limit to **8192** with a **drop-in**, without editing
+    `/etc/systemd/system/kl-fdhog.service` itself, and get the service
+    running.
+  hints:
+    - "`journalctl -u kl-fdhog` shows the error."
+    - "`sudo systemctl edit kl-fdhog`, add `[Service]` and `LimitNOFILE=8192`."
+    - "Then `sudo systemctl restart kl-fdhog`."
+  solution: |
+    ```bash
+    journalctl -u kl-fdhog -n 5
+    sudo mkdir -p /etc/systemd/system/kl-fdhog.service.d
+    printf '[Service]\nLimitNOFILE=8192\n' | sudo tee /etc/systemd/system/kl-fdhog.service.d/limits.conf
+    sudo systemctl daemon-reload
+    sudo systemctl restart kl-fdhog
+    grep 'open files' /proc/$(systemctl show -p MainPID --value kl-fdhog)/limits
+    ```
+  setup: |
+    on_reset 'systemctl stop kl-fdhog 2>/dev/null; rm -rf /etc/systemd/system/kl-fdhog.service /etc/systemd/system/kl-fdhog.service.d /opt/kl-fdhog; systemctl daemon-reload; systemctl reset-failed kl-fdhog 2>/dev/null; true'
+    mkdir -p /opt/kl-fdhog
+    cat > /opt/kl-fdhog/fdhog.py <<'EOF'
+    import time
+    fds = [open('/dev/null') for _ in range(3000)]
+    print("holding %d descriptors" % len(fds), flush=True)
+    time.sleep(10**7)
+    EOF
+    cat > /etc/systemd/system/kl-fdhog.service <<'EOF'
+    [Unit]
+    Description=Lab connection holder
+
+    [Service]
+    ExecStart=/usr/bin/python3 /opt/kl-fdhog/fdhog.py
+    EOF
+    sha1sum /etc/systemd/system/kl-fdhog.service > "$KL_STATE/unit"
+    systemctl daemon-reload
+    systemctl start kl-fdhog
+    eventually 10 '[ "$(systemctl is-active kl-fdhog)" != activating ]'
+  check: |
+    check "the unit file is unchanged" 'sha1sum -c --status "$KL_STATE/unit"'
+    check "a drop-in sets LimitNOFILE" 'grep -rqs "^LimitNOFILE=8192" /etc/systemd/system/kl-fdhog.service.d/'
+    check "kl-fdhog is running" 'eventually 6 "systemctl is-active -q kl-fdhog"'
+    pid=$(systemctl show -p MainPID --value kl-fdhog)
+    check_match "its soft limit is 8192" "$(grep 'Max open files' /proc/$pid/limits 2>/dev/null)" 'Max open files +8192 '
+  solve: |
+    sudo mkdir -p /etc/systemd/system/kl-fdhog.service.d
+    printf '[Service]\nLimitNOFILE=8192\n' | sudo tee /etc/systemd/system/kl-fdhog.service.d/limits.conf >/dev/null
+    sudo systemctl daemon-reload
+    sudo systemctl restart kl-fdhog
+
+- id: linux-071
+  title: Run the import when a file arrives
+  difficulty: 3
+  kind: build
+  tags: [systemd, path-unit, inotify, automation]
+  tutorial: |
+    **Concept.** A systemd **`.path` unit** watches the filesystem through
+    inotify and starts a service when something appears or changes.
+    `PathExistsGlob=/dir/*.csv` triggers while matching files exist, and
+    `PathChanged=` triggers when a file is closed after writing. By default it
+    starts the service with the same name (`foo.path` → `foo.service`). Enable
+    and start the **path** unit, not the service.
+
+    **Read up on:**
+    - `man systemd.path`: `PathExistsGlob=`, `PathChanged=`, `Unit=`
+    - `systemctl enable --now foo.path`
+  scenario: |
+    **`kl-import.service`** already exists. It moves every CSV from
+    **`/srv/kl-inbox`** to **`/srv/kl-done`**. Right now someone has to start
+    it by hand.
+
+    Create **`/etc/systemd/system/kl-import.path`** so that the import runs
+    automatically whenever **`.csv` files appear in `/srv/kl-inbox`**. Enable
+    it so it's active now and after a reboot.
+  hints:
+    - "`[Path]` with `PathExistsGlob=/srv/kl-inbox/*.csv`."
+    - "`[Install]` with `WantedBy=multi-user.target` (paths.target works too)."
+    - "`sudo systemctl daemon-reload && sudo systemctl enable --now kl-import.path`."
+  solution: |
+    ```bash
+    sudo tee /etc/systemd/system/kl-import.path <<'EOF'
+    [Unit]
+    Description=Watch the import inbox
+
+    [Path]
+    PathExistsGlob=/srv/kl-inbox/*.csv
+
+    [Install]
+    WantedBy=multi-user.target
+    EOF
+    sudo systemctl daemon-reload
+    sudo systemctl enable --now kl-import.path
+    sudo touch /srv/kl-inbox/test.csv; sleep 2; ls /srv/kl-done
+    ```
+  setup: |
+    on_reset 'systemctl disable --now kl-import.path 2>/dev/null; systemctl stop kl-import.service 2>/dev/null; rm -f /etc/systemd/system/kl-import.path /etc/systemd/system/kl-import.service /usr/local/bin/kl-import; rm -rf /srv/kl-inbox /srv/kl-done; systemctl daemon-reload; true'
+    mkdir -p /srv/kl-inbox /srv/kl-done
+    cat > /usr/local/bin/kl-import <<'EOF'
+    #!/bin/sh
+    for f in /srv/kl-inbox/*.csv; do
+      [ -e "$f" ] || continue
+      mv "$f" /srv/kl-done/
+    done
+    EOF
+    chmod 755 /usr/local/bin/kl-import
+    cat > /etc/systemd/system/kl-import.service <<'EOF'
+    [Unit]
+    Description=Import CSV files from the inbox
+
+    [Service]
+    Type=oneshot
+    ExecStart=/usr/local/bin/kl-import
+    EOF
+    systemctl daemon-reload
+  check: |
+    check "kl-import.path is enabled" 'systemctl is-enabled -q kl-import.path'
+    check "kl-import.path is active" 'systemctl is-active -q kl-import.path'
+    rm -f /srv/kl-done/kl-check-*.csv
+    n="kl-check-$RANDOM.csv"
+    echo a,b > /srv/kl-inbox/$n
+    check "a new CSV is imported automatically" 'eventually 15 "[ -f /srv/kl-done/$n ] && [ ! -e /srv/kl-inbox/$n ]"'
+    rm -f /srv/kl-done/kl-check-*.csv /srv/kl-inbox/kl-check-*.csv
+  solve: |
+    printf '[Unit]\nDescription=Watch the import inbox\n\n[Path]\nPathExistsGlob=/srv/kl-inbox/*.csv\n\n[Install]\nWantedBy=multi-user.target\n' | sudo tee /etc/systemd/system/kl-import.path >/dev/null
+    sudo systemctl daemon-reload
+    sudo systemctl enable --now kl-import.path
+
+- id: linux-072
+  title: Restart it when it crashes, but not forever
+  difficulty: 3
+  kind: fix
+  tags: [systemd, restart, start-limit, drop-in]
+  tutorial: |
+    **Concept.** `Restart=on-failure` makes systemd restart a service after a
+    crash or a non-zero exit, but not after a clean stop. `RestartSec=` waits
+    between attempts. A start-rate limit stops a crash loop:
+    **`StartLimitBurst=N`** starts within **`StartLimitIntervalSec=`** are
+    allowed, and then the unit is left `failed`. The limit settings belong in
+    the `[Unit]` section.
+
+    **Read up on:**
+    - `man systemd.service`: `Restart=`, `RestartSec=`
+    - `man systemd.unit`: `StartLimitBurst=`, `StartLimitIntervalSec=`
+    - `systemctl show -p NRestarts`
+  scenario: |
+    **`kl-flaky.service`** crashes every few hours and stays down until
+    someone notices. Using a **drop-in**, make systemd:
+
+    - restart it **only when it fails** (not after a clean stop)
+    - wait **3 seconds** before each restart
+    - give up if it has to start **5 times within 2 minutes**
+
+    The service must be running when you're done.
+  hints:
+    - "`Restart=on-failure` and `RestartSec=3` go under `[Service]`."
+    - "`StartLimitBurst=5` and `StartLimitIntervalSec=120` go under `[Unit]`."
+    - "`sudo systemctl edit kl-flaky`, then `sudo systemctl start kl-flaky`."
+  solution: |
+    ```bash
+    sudo mkdir -p /etc/systemd/system/kl-flaky.service.d
+    sudo tee /etc/systemd/system/kl-flaky.service.d/restart.conf <<'EOF'
+    [Unit]
+    StartLimitBurst=5
+    StartLimitIntervalSec=120
+
+    [Service]
+    Restart=on-failure
+    RestartSec=3
+    EOF
+    sudo systemctl daemon-reload
+    sudo systemctl start kl-flaky
+    ```
+  setup: |
+    on_reset 'systemctl stop kl-flaky 2>/dev/null; rm -rf /etc/systemd/system/kl-flaky.service /etc/systemd/system/kl-flaky.service.d; systemctl daemon-reload; systemctl reset-failed kl-flaky 2>/dev/null; true'
+    cat > /etc/systemd/system/kl-flaky.service <<'EOF'
+    [Unit]
+    Description=Lab flaky worker
+
+    [Service]
+    ExecStart=/bin/sh -c 'while :; do sleep 1; done'
+    EOF
+    sha1sum /etc/systemd/system/kl-flaky.service > "$KL_STATE/unit"
+    systemctl daemon-reload
+    systemctl start kl-flaky
+    sleep 1
+    systemctl kill -s KILL kl-flaky
+  check: |
+    show() { systemctl show -p "$1" --value kl-flaky; }
+    check "the unit file is unchanged" 'sha1sum -c --status "$KL_STATE/unit"'
+    check_eq "Restart" "$(show Restart)" on-failure
+    check_eq "RestartUSec" "$(show RestartUSec)" 3s
+    check_eq "StartLimitBurst" "$(show StartLimitBurst)" 5
+    check_eq "StartLimitIntervalUSec" "$(show StartLimitIntervalUSec)" 2min
+    check "kl-flaky is running" 'systemctl is-active -q kl-flaky'
+    if systemctl is-active -q kl-flaky && [ "$(show Restart)" = on-failure ]; then
+      before=$(show NRestarts)
+      systemctl kill -s KILL kl-flaky
+      check "a crash is followed by a restart" 'eventually 12 "[ \"\$(systemctl show -p NRestarts --value kl-flaky)\" -gt $before ] && systemctl is-active -q kl-flaky"'
+    else
+      fail "a crash is followed by a restart"
+    fi
+  solve: |
+    sudo mkdir -p /etc/systemd/system/kl-flaky.service.d
+    printf '[Unit]\nStartLimitBurst=5\nStartLimitIntervalSec=120\n\n[Service]\nRestart=on-failure\nRestartSec=3\n' | sudo tee /etc/systemd/system/kl-flaky.service.d/restart.conf >/dev/null
+    sudo systemctl daemon-reload
+    sudo systemctl reset-failed kl-flaky
+    sudo systemctl start kl-flaky
+
+- id: linux-073
+  title: Cap the leaky service
+  difficulty: 3
+  kind: fix
+  tags: [systemd, cgroups, memorymax, oom]
+  tutorial: |
+    **Concept.** systemd puts each service in its own cgroup, so you can cap
+    its resources with directives such as **`MemoryMax=`**. When the service
+    goes over the cap, the kernel's OOM killer kills it **inside its cgroup**,
+    and the rest of the host keeps running. Pair the cap with
+    `Restart=on-failure` and a leaking service is recycled instead of taking
+    the machine down. `systemctl status` then reports
+    `Result: oom-kill`.
+
+    **Read up on:**
+    - `man systemd.resource-control`: `MemoryMax=`, `MemorySwapMax=`
+    - `systemctl show -p MemoryMax,NRestarts,Result`
+  scenario: |
+    **`kl-leaky.service`** has a memory leak: it grows until the whole host
+    is short of memory. Until the developers fix it, use a **drop-in** to:
+
+    - cap it at **96 MiB** of memory (and **no swap**)
+    - restart it automatically when it's killed for exceeding the cap
+
+    Leave it running.
+  hints:
+    - "`[Service]` with `MemoryMax=96M`, `MemorySwapMax=0` and `Restart=on-failure`."
+    - "`sudo systemctl daemon-reload && sudo systemctl restart kl-leaky`."
+    - "After a few seconds, `systemctl show -p NRestarts kl-leaky` should count up."
+  solution: |
+    ```bash
+    sudo mkdir -p /etc/systemd/system/kl-leaky.service.d
+    sudo tee /etc/systemd/system/kl-leaky.service.d/memory.conf <<'EOF'
+    [Service]
+    MemoryMax=96M
+    MemorySwapMax=0
+    Restart=on-failure
+    EOF
+    sudo systemctl daemon-reload
+    sudo systemctl restart kl-leaky
+    journalctl -u kl-leaky -n 20 | grep -i oom
+    ```
+  setup: |
+    on_reset 'systemctl stop kl-leaky 2>/dev/null; rm -rf /etc/systemd/system/kl-leaky.service /etc/systemd/system/kl-leaky.service.d /opt/kl-leaky; systemctl daemon-reload; systemctl reset-failed kl-leaky 2>/dev/null; true'
+    mkdir -p /opt/kl-leaky
+    cat > /opt/kl-leaky/leak.py <<'EOF'
+    import time
+    hoard = []
+    while True:
+        if len(hoard) < 40:
+            hoard.append(bytearray(8 * 1024 * 1024))
+        time.sleep(0.25)
+    EOF
+    cat > /etc/systemd/system/kl-leaky.service <<'EOF'
+    [Unit]
+    Description=Lab leaky service
+
+    [Service]
+    ExecStart=/usr/bin/python3 /opt/kl-leaky/leak.py
+    EOF
+    sha1sum /etc/systemd/system/kl-leaky.service > "$KL_STATE/unit"
+    systemctl daemon-reload
+    systemctl start kl-leaky
+  check: |
+    show() { systemctl show -p "$1" --value kl-leaky; }
+    check "the unit file is unchanged" 'sha1sum -c --status "$KL_STATE/unit"'
+    check_eq "MemoryMax" "$(show MemoryMax)" $((96 * 1024 * 1024))
+    check_eq "MemorySwapMax" "$(show MemorySwapMax)" 0
+    check_eq "Restart" "$(show Restart)" on-failure
+    check "it is recycled after hitting the cap" 'eventually 40 "[ \"\$(systemctl show -p NRestarts --value kl-leaky)\" -ge 1 ]"'
+    check "it is running again" 'eventually 10 "systemctl is-active -q kl-leaky"'
+    check "it never got past the cap" '[ "$(cat /sys/fs/cgroup/system.slice/kl-leaky.service/memory.peak 2>/dev/null || echo 0)" -le $((100 * 1024 * 1024)) ]'
+  solve: |
+    sudo mkdir -p /etc/systemd/system/kl-leaky.service.d
+    printf '[Service]\nMemoryMax=96M\nMemorySwapMax=0\nRestart=on-failure\n' | sudo tee /etc/systemd/system/kl-leaky.service.d/memory.conf >/dev/null
+    sudo systemctl daemon-reload
+    sudo systemctl restart kl-leaky
+
+- id: linux-074
+  title: The backup that always says OK
+  difficulty: 3
+  kind: fix
+  tags: [bash, pipefail, error-handling, backup]
+  tutorial: |
+    **Concept.** By default a shell script carries on after a failed command,
+    and a **pipeline's exit status is that of its last command**. So `tar ... |
+    gzip > file` "succeeds" whenever gzip does, even if tar failed. `set -e`
+    stops at the first failing command, **`set -o pipefail`** makes a
+    pipeline fail if any part fails, and `set -u` catches unset variables. A
+    `trap` cleans up partial output.
+
+    **Read up on:**
+    - `set -euo pipefail`
+    - `trap 'cmd' ERR` / `EXIT`
+    - `PIPESTATUS`
+  scenario: |
+    **`/usr/local/bin/kl-backup`** archives a directory (default
+    `/srv/kl-data`, or `$KL_SRC` if set) into
+    **`/var/backups/kl/data.tgz`** and prints `backup OK`. When the source
+    is missing it still prints `backup OK`, exits 0, and leaves a useless
+    archive behind, so the monitoring never alerts.
+
+    Fix the script so that:
+
+    - when **any** step fails, it exits **non-zero**, does **not** print
+      `backup OK`, and leaves **no archive** behind
+    - when everything works, it behaves as before (exit 0, prints `backup OK`,
+      valid archive)
+  hints:
+    - "Try it: `sudo KL_SRC=/nope /usr/local/bin/kl-backup; echo $?`."
+    - "Add `set -euo pipefail` near the top."
+    - "Remove the partial archive in a `trap '…' ERR`, or write to a temp file and `mv` it at the end."
+  solution: |
+    ```bash
+    sudo tee /usr/local/bin/kl-backup <<'EOF'
+    #!/bin/bash
+    set -euo pipefail
+    src=${KL_SRC:-/srv/kl-data}
+    out=/var/backups/kl/data.tgz
+    mkdir -p "$(dirname "$out")"
+    tmp=$(mktemp "$out.XXXXXX")
+    trap 'rm -f "$tmp"' EXIT
+    tar -C "$src" -cf - . | gzip > "$tmp"
+    mv "$tmp" "$out"
+    echo "backup OK"
+    EOF
+    sudo KL_SRC=/nope kl-backup; echo $?
+    ```
+  setup: |
+    on_reset 'rm -rf /usr/local/bin/kl-backup /srv/kl-data /var/backups/kl'
+    rm -rf /var/backups/kl; mkdir -p /srv/kl-data/db
+    for i in 1 2 3; do echo "record $i" > /srv/kl-data/db/part$i.dat; done
+    cat > /usr/local/bin/kl-backup <<'EOF'
+    #!/bin/bash
+    src=${KL_SRC:-/srv/kl-data}
+    out=/var/backups/kl/data.tgz
+    mkdir -p "$(dirname "$out")"
+    tar -C "$src" -cf - . | gzip > "$out"
+    echo "backup OK"
+    EOF
+    chmod 755 /usr/local/bin/kl-backup
+  check: |
+    b=/usr/local/bin/kl-backup out=/var/backups/kl/data.tgz
+    rm -f $out
+    o=$(KL_SRC=/srv/kl-missing-$RANDOM $b 2>/dev/null); rc=$?
+    check "a missing source exits non-zero" '[ $rc != 0 ]'
+    check_not "a missing source doesn't print backup OK" 'grep -q "backup OK" <<<"$o"'
+    check_not "a missing source leaves no archive" '[ -e $out ]'
+    mkdir -p /srv/kl-unreadable; echo x > /srv/kl-unreadable/x; chmod 000 /srv/kl-unreadable/x
+    o=$(sudo -u "$(lab_user)" env KL_SRC=/srv/kl-unreadable $b 2>/dev/null); rc=$?
+    check "an unreadable file makes it fail" '[ $rc != 0 ] && ! grep -q "backup OK" <<<"$o"'
+    rm -rf /srv/kl-unreadable
+    o=$($b 2>/dev/null); rc=$?
+    check "a good run exits 0 and prints backup OK" '[ $rc = 0 ] && grep -q "backup OK" <<<"$o"'
+    check "the archive holds the data" 'tar -tzf $out 2>/dev/null | grep -q "db/part3.dat"'
+  solve: |
+    sudo tee /usr/local/bin/kl-backup >/dev/null <<'EOF'
+    #!/bin/bash
+    set -euo pipefail
+    src=${KL_SRC:-/srv/kl-data}
+    out=/var/backups/kl/data.tgz
+    mkdir -p "$(dirname "$out")" 2>/dev/null || true
+    tmp=$(mktemp "${TMPDIR:-/tmp}/kl-backup.XXXXXX")
+    trap 'rm -f "$tmp"' EXIT
+    tar -C "$src" -cf - . | gzip > "$tmp"
+    mv "$tmp" "$out"
+    echo "backup OK"
+    EOF
+
+- id: linux-075
+  title: Where is it looking for its config?
+  difficulty: 3
+  kind: fix
+  tags: [strace, syscalls, debugging, openat]
+  tutorial: |
+    **Concept.** When a program fails with an unhelpful message, **`strace`**
+    shows the system calls it makes. `strace -f -e trace=file CMD` lists every
+    path it tries to open or stat, including the ones that fail with
+    `ENOENT`. That answers "which file is it looking for?" without reading the
+    source.
+
+    **Read up on:**
+    - `strace -f`, `-e trace=file` / `openat`, `-o FILE`
+    - Reading `= -1 ENOENT (No such file or directory)`
+  scenario: |
+    **`kl-report`** fails with *error: no configuration found* and doesn't
+    say where it looked. The vendor's documentation is long gone.
+
+    Find out **which file it is looking for** and create it with this content:
+
+    ```
+    [report]
+    format=csv
+    ```
+
+    so that `kl-report`, run as your user, prints `report ok`.
+  hints:
+    - "`strace -f -e trace=file kl-report 2>&1 | grep ENOENT`."
+    - "Ignore the Python library lookups. Look for a `.ini` file."
+    - "You may need `sudo` to create the directory."
+  solution: |
+    ```bash
+    strace -f -e trace=openat,newfstatat,stat kl-report 2>&1 | grep -i 'ini'
+    # e.g. openat(AT_FDCWD, "/etc/kl-report-xxxx/settings.ini", O_RDONLY) = -1 ENOENT
+    sudo mkdir -p /etc/kl-report-xxxx
+    printf '[report]\nformat=csv\n' | sudo tee /etc/kl-report-xxxx/settings.ini
+    kl-report
+    ```
+  setup: |
+    on_reset 'rm -rf /usr/local/bin/kl-report /usr/local/lib/kl-report.pyz /etc/kl-report-*; true'
+    rm -rf /etc/kl-report-*
+    d="/etc/kl-report-$(tr -dc a-z0-9 </dev/urandom | head -c 6)"
+    echo "$d/settings.ini" > "$KL_STATE/path"
+    w=$(mktemp -d)
+    cat > $w/__main__.py <<EOF
+    import base64, configparser, os, sys
+    p = base64.b64decode("$(printf '%s' "$d/settings.ini" | base64 -w0)").decode()
+    for c in (os.path.expanduser("~/.kl-report.conf"), "/etc/kl-report.conf", p):
+        try:
+            with open(c) as f:
+                cfg = configparser.ConfigParser(); cfg.read_file(f)
+        except OSError:
+            continue
+        if cfg.get("report", "format", fallback="") == "csv":
+            print("report ok"); sys.exit(0)
+        print("error: bad configuration"); sys.exit(4)
+    print("error: no configuration found"); sys.exit(3)
+    EOF
+    python3 -m zipapp $w -o /usr/local/lib/kl-report.pyz -c
+    rm -rf $w
+    printf '#!/bin/sh\nexec python3 /usr/local/lib/kl-report.pyz "$@"\n' > /usr/local/bin/kl-report
+    chmod 755 /usr/local/bin/kl-report; chmod 644 /usr/local/lib/kl-report.pyz
+  check: |
+    check_eq "kl-report runs as you" "$(sudo -u "$(lab_user)" -H kl-report 2>&1)" "report ok"
+    check "the right file was created" '[ -f "$(cat "$KL_STATE/path")" ]'
+  solve: |
+    p=$(strace -f -e trace=openat kl-report 2>&1 | grep -o '"/etc/kl-report-[^"]*\.ini"' | tr -d '"' | head -1)
+    sudo mkdir -p "$(dirname "$p")"
+    printf '[report]\nformat=csv\n' | sudo tee "$p" >/dev/null
+
+- id: linux-076
+  title: Who is hammering the disk?
+  difficulty: 3
+  kind: build
+  tags: [proc, io, pidstat, disk, performance]
+  tutorial: |
+    **Concept.** The kernel counts I/O per process in **`/proc/PID/io`**:
+    `write_bytes` is what the process caused to be written to storage, and
+    `wchar` counts all bytes passed to `write()`. Sample twice and subtract
+    to get a rate, or let `pidstat -d 1` do it for you. These files are
+    readable only by the process owner or root.
+
+    **Read up on:**
+    - `man 5 proc`: `/proc/PID/io`
+    - `pidstat -d INTERVAL COUNT`
+  scenario: |
+    Several identical-looking **`kl-writer`** processes are running, and one
+    of them is writing far more than the rest. Find it and write **its PID**
+    into **`/lab/answer.txt`**. Don't kill anything.
+  hints:
+    - "`pgrep -a kl-writer` lists them all."
+    - "`sudo pidstat -d 2 1 -C kl-writer` shows the write rate per PID."
+    - "Or sample `wchar` from `/proc/PID/io` twice, a few seconds apart."
+  solution: |
+    ```bash
+    sudo pidstat -d 2 3 -C kl-writer
+    # or by hand:
+    for p in $(pgrep -x kl-writer); do echo "$p $(sudo awk '/^wchar/{print $2}' /proc/$p/io)"; done > /tmp/a
+    sleep 3
+    for p in $(pgrep -x kl-writer); do echo "$p $(sudo awk '/^wchar/{print $2}' /proc/$p/io)"; done > /tmp/b
+    join /tmp/a /tmp/b | awk '{print $3-$2, $1}' | sort -n | tail -1 | cut -d' ' -f2 > /lab/answer.txt
+    ```
+  setup: |
+    on_reset 'pkill -KILL -x kl-writer 2>/dev/null; rm -rf /opt/kl-writer /srv/kl-io; true'
+    mkdir -p /opt/kl-writer /srv/kl-io
+    cat > /opt/kl-writer/kl-writer <<'EOF'
+    #!/usr/bin/python3
+    import os, sys, time
+    size, out = int(sys.argv[1]), sys.argv[2]
+    buf = b"x" * size
+    while True:
+        with open(out, "wb") as f:
+            f.write(buf); f.flush(); os.fsync(f.fileno())
+        time.sleep(0.5)
+    EOF
+    chmod 755 /opt/kl-writer/kl-writer
+    heavy=$((RANDOM % 5))
+    for i in 0 1 2 3 4; do
+      sz=$((4096 + RANDOM % 4096)); [ $i = $heavy ] && sz=$((3 * 1024 * 1024))
+      setsid /opt/kl-writer/kl-writer $sz /srv/kl-io/out-$i.dat </dev/null >/dev/null 2>&1 &
+      [ $i = $heavy ] && echo $! > "$KL_STATE/answer"
+    done
+    eventually 10 '[ "$(pgrep -cx kl-writer)" = 5 ]'
+  check: |
+    want=$(cat "$KL_STATE/answer")
+    check_eq "the heavy writer's PID" "$(tr -d ' \n' < /lab/answer.txt 2>/dev/null)" "$want"
+    check_eq "all writers still running" "$(pgrep -cx kl-writer)" 5
+  solve: |
+    for p in $(pgrep -x kl-writer); do echo "$p $(sudo awk '/^wchar/{print $2}' /proc/$p/io)"; done | sort > /tmp/kl-a
+    sleep 3
+    for p in $(pgrep -x kl-writer); do echo "$p $(sudo awk '/^wchar/{print $2}' /proc/$p/io)"; done | sort > /tmp/kl-b
+    join /tmp/kl-a /tmp/kl-b | awk '{print $3-$2, $1}' | sort -n | tail -1 | cut -d' ' -f2 > /lab/answer.txt
+    rm -f /tmp/kl-a /tmp/kl-b
+
+- id: linux-077
+  title: "Dependency failed for the web service"
+  difficulty: 3
+  kind: fix
+  tags: [systemd, requires, wants, dependencies]
+  tutorial: |
+    **Concept.** systemd dependencies have strengths. **`Requires=B`** means A
+    can't run without B: if B fails to start, A isn't started either
+    (*Dependency failed*). **`Wants=B`** pulls B in as well, but A starts
+    whether or not B succeeds. **`After=`** is separate and only sets the
+    order. Optional helpers like metrics agents belong under `Wants=`.
+
+    **Read up on:**
+    - `man systemd.unit`: `Requires=`, `Wants=`, `After=`, `BindsTo=`
+    - `systemctl list-dependencies`
+  scenario: |
+    **`kl-web.service`** won't start. `systemctl status` says *Dependency
+    failed*, because the optional metrics agent **`kl-metrics.service`** is
+    broken (its binary is missing, and that's another team's problem).
+
+    Change **`kl-web.service`** so that it still **pulls in** `kl-metrics`
+    and starts **after** it, but **runs even when `kl-metrics` fails**. Start
+    `kl-web`. Leave `kl-metrics` as it is.
+  hints:
+    - "`systemctl show -p Requires,Wants,After kl-web`."
+    - "Change `Requires=kl-metrics.service` to `Wants=kl-metrics.service` in the unit file, keeping `After=`."
+    - "`sudo systemctl daemon-reload && sudo systemctl start kl-web`."
+  solution: |
+    ```bash
+    sudo sed -i 's/^Requires=kl-metrics.service/Wants=kl-metrics.service/' /etc/systemd/system/kl-web.service
+    sudo systemctl daemon-reload
+    sudo systemctl start kl-web
+    systemctl is-active kl-web kl-metrics
+    ```
+  setup: |
+    on_reset 'systemctl stop kl-web kl-metrics 2>/dev/null; rm -rf /etc/systemd/system/kl-web.service* /etc/systemd/system/kl-metrics.service*; systemctl daemon-reload; systemctl reset-failed kl-web kl-metrics 2>/dev/null; true'
+    cat > /etc/systemd/system/kl-metrics.service <<'EOF'
+    [Unit]
+    Description=Lab metrics agent
+
+    [Service]
+    ExecStart=/opt/kl-metrics/agent
+    EOF
+    cat > /etc/systemd/system/kl-web.service <<'EOF'
+    [Unit]
+    Description=Lab web service
+    Requires=kl-metrics.service
+    After=kl-metrics.service
+
+    [Service]
+    ExecStart=/bin/sh -c 'while :; do sleep 5; done'
+    EOF
+    systemctl daemon-reload
+    systemctl start kl-web 2>/dev/null || true
+  check: |
+    show() { systemctl show -p "$1" --value kl-web; }
+    check "kl-web is running" 'eventually 6 "systemctl is-active -q kl-web"'
+    check_not "kl-web no longer requires kl-metrics" 'show Requires | grep -qw kl-metrics.service'
+    check "kl-web still pulls in kl-metrics" 'show Wants | grep -qw kl-metrics.service'
+    check "kl-web still starts after kl-metrics" 'show After | grep -qw kl-metrics.service'
+    check "kl-metrics still points at the missing agent" 'grep -q "^ExecStart=/opt/kl-metrics/agent" /etc/systemd/system/kl-metrics.service'
+  solve: |
+    sudo sed -i 's/^Requires=kl-metrics.service/Wants=kl-metrics.service/' /etc/systemd/system/kl-web.service
+    sudo systemctl daemon-reload
+    sudo systemctl start kl-web
+
+- id: linux-078
+  title: The filesystem with no superblock
+  difficulty: 4
+  kind: fix
+  tags: [ext4, e2fsck, superblock, recovery, loop]
+  tutorial: |
+    **Concept.** ext4 keeps its **superblock**, the map of the whole
+    filesystem, at the start of the device, and stores **backup copies** in
+    later block groups (for 4 KiB blocks, the first backup is at block 32768).
+    If the primary is destroyed, `mount` and a plain `e2fsck` give up, but
+    `e2fsck -b BACKUP -B BLOCKSIZE` repairs the filesystem from a backup.
+    `dumpe2fs` and `mke2fs -n` (dry run only, **never** without `-n`) show
+    where the backups are.
+
+    **Read up on:**
+    - `e2fsck -b`, `-B`, `-y`
+    - `mke2fs -n` — print the layout without writing
+    - `losetup`, `mount -o loop`
+  scenario: |
+    The disk image **`/srv/kl-disk.img`** won't mount: *wrong fs type, bad
+    option, bad superblock*. The planning notes on it are needed today.
+
+    Repair the filesystem in the image **in place** so that it mounts again,
+    and copy the file **`notes/plan.txt`** from it to **`/lab/recovered.txt`**.
+  hints:
+    - "`sudo file -s /srv/kl-disk.img` and `sudo e2fsck -n /srv/kl-disk.img` show the damage."
+    - "It was made with 4 KiB blocks: `sudo mke2fs -n -b 4096 /srv/kl-disk.img` lists the backup superblocks without writing anything."
+    - "`sudo e2fsck -y -b 32768 -B 4096 /srv/kl-disk.img`."
+    - "Then `sudo mount -o loop,ro /srv/kl-disk.img /mnt` and copy the file."
+  solution: |
+    ```bash
+    sudo e2fsck -n /srv/kl-disk.img             # bad magic number in super-block
+    sudo mke2fs -n -b 4096 /srv/kl-disk.img     # dry run: backups at 32768, 98304, ...
+    sudo e2fsck -y -b 32768 -B 4096 /srv/kl-disk.img
+    sudo mount -o loop,ro /srv/kl-disk.img /mnt
+    cp /mnt/notes/plan.txt /lab/recovered.txt
+    sudo umount /mnt
+    ```
+  setup: |
+    on_reset 'umount /mnt/kl-disk 2>/dev/null; for l in $(losetup -j /srv/kl-disk.img -O NAME -n 2>/dev/null); do umount $l 2>/dev/null; losetup -d $l; done; rm -rf /srv/kl-disk.img /mnt/kl-disk; true'
+    rm -f /srv/kl-disk.img /lab/recovered.txt
+    truncate -s 256M /srv/kl-disk.img
+    mkfs.ext4 -q -F -b 4096 -L klnotes /srv/kl-disk.img
+    mkdir -p /mnt/kl-disk; mount -o loop /srv/kl-disk.img /mnt/kl-disk
+    mkdir -p /mnt/kl-disk/notes
+    secret="Q$((RANDOM % 4 + 1)) launch: project $(tr -dc A-Z </dev/urandom | head -c 6), budget $((RANDOM * 10))"
+    echo "$secret" > /mnt/kl-disk/notes/plan.txt; echo "$secret" > "$KL_STATE/answer"
+    for i in $(seq 20); do head -c 20000 /dev/urandom > /mnt/kl-disk/notes/blob-$i.bin; done
+    umount /mnt/kl-disk; rmdir /mnt/kl-disk
+    dd if=/dev/zero of=/srv/kl-disk.img bs=1024 seek=1 count=3 conv=notrunc status=none
+  check: |
+    check_eq "recovered.txt" "$(cat /lab/recovered.txt 2>/dev/null)" "$(cat "$KL_STATE/answer")"
+    m=$(mktemp -d)
+    check "the image mounts again" 'mount -o loop,ro /srv/kl-disk.img $m'
+    check_eq "plan.txt in the image" "$(cat $m/notes/plan.txt 2>/dev/null)" "$(cat "$KL_STATE/answer")"
+    umount $m 2>/dev/null; rmdir $m
+  solve: |
+    sudo e2fsck -y -b 32768 -B 4096 /srv/kl-disk.img || true
+    m=$(mktemp -d)
+    sudo mount -o loop,ro /srv/kl-disk.img $m
+    cp $m/notes/plan.txt /lab/recovered.txt
+    sudo umount $m; rmdir $m
+
+- id: linux-079
+  title: "Incident: the report generator is down"
+  difficulty: 4
+  kind: fix
+  tags: [incident, systemd, permissions, disk-full, timer]
+  tutorial: |
+    **Concept.** Real outages rarely have a single cause. Work from the
+    evidence: `systemctl status`, then `journalctl -u`, then the resources the
+    service touches (disk, permissions, its timer). Fix each cause properly,
+    and confirm the service recovers on its own.
+
+    **Read up on:**
+    - `systemctl status`, `journalctl -u UNIT -n 50`
+    - `df -h`, `du -sh`, `ls -l`, `namei -l PATH`
+    - `systemctl list-timers`
+  scenario: |
+    The nightly reports stopped. **`kl-reportd.service`** runs as the user
+    **`kl-report`**, reads **`/etc/kl-reportd/reportd.conf`**, and writes
+    **`/var/lib/kl-reportd/out/latest.txt`**. **`kl-reportd.timer`** is supposed
+    to run it every minute.
+
+    Get it working again:
+
+    - `kl-reportd.service` runs successfully and writes `latest.txt`
+    - the config stays **unreadable for other users** (it contains a
+      password), but the service can read it
+    - `/var/lib/kl-reportd` has room again: remove the runaway
+      **`cache/dump.tmp`**, but keep the archived reports in `archive/`
+    - the timer is **enabled and active**
+  hints:
+    - "`systemctl status kl-reportd`, then `journalctl -u kl-reportd -n 20`."
+    - "`df -h /var/lib/kl-reportd`: it's a small, separate filesystem."
+    - "`ls -l /etc/kl-reportd/`: who owns the config, and with what mode? `chgrp kl-report` + `chmod 640` keeps it private."
+    - "`systemctl is-enabled kl-reportd.timer`."
+  solution: |
+    ```bash
+    systemctl status kl-reportd; journalctl -u kl-reportd -n 20
+    df -h /var/lib/kl-reportd
+    sudo rm /var/lib/kl-reportd/cache/dump.tmp
+    sudo chgrp kl-report /etc/kl-reportd/reportd.conf
+    sudo chmod 640 /etc/kl-reportd/reportd.conf
+    sudo systemctl enable --now kl-reportd.timer
+    sudo systemctl start kl-reportd
+    cat /var/lib/kl-reportd/out/latest.txt
+    ```
+  setup: |
+    on_reset 'systemctl disable --now kl-reportd.timer 2>/dev/null; systemctl stop kl-reportd 2>/dev/null; umount /var/lib/kl-reportd 2>/dev/null; rm -rf /var/lib/kl-reportd /etc/kl-reportd /usr/local/bin/kl-reportd /etc/systemd/system/kl-reportd.*; systemctl daemon-reload; systemctl reset-failed kl-reportd 2>/dev/null; userdel kl-report 2>/dev/null; true'
+    id kl-report >/dev/null 2>&1 || useradd -r -M -s /usr/sbin/nologin kl-report
+    mkdir -p /var/lib/kl-reportd
+    mount -t tmpfs -o size=8m,mode=0755 kl-reportd /var/lib/kl-reportd
+    mkdir -p /var/lib/kl-reportd/{out,cache,archive}
+    for m in 01 02 03; do echo "report for 2026-$m" > /var/lib/kl-reportd/archive/2026-$m.txt; done
+    chown -R kl-report: /var/lib/kl-reportd
+    head -c 7800k /dev/zero > /var/lib/kl-reportd/cache/dump.tmp 2>/dev/null; chown kl-report: /var/lib/kl-reportd/cache/dump.tmp
+    mkdir -p /etc/kl-reportd
+    printf 'db_user=reports\ndb_password=Rp-%s\n' $RANDOM > /etc/kl-reportd/reportd.conf
+    chown root:root /etc/kl-reportd/reportd.conf; chmod 600 /etc/kl-reportd/reportd.conf
+    cat > /usr/local/bin/kl-reportd <<'EOF'
+    #!/bin/sh
+    set -e
+    grep -q '^db_password=' /etc/kl-reportd/reportd.conf
+    head -c 300000 /dev/urandom | base64 > /var/lib/kl-reportd/cache/work.tmp
+    echo "report generated $(date -Is)" > /var/lib/kl-reportd/out/latest.txt
+    rm -f /var/lib/kl-reportd/cache/work.tmp
+    EOF
+    chmod 755 /usr/local/bin/kl-reportd
+    cat > /etc/systemd/system/kl-reportd.service <<'EOF'
+    [Unit]
+    Description=Lab report generator
+
+    [Service]
+    Type=oneshot
+    User=kl-report
+    ExecStart=/usr/local/bin/kl-reportd
+    EOF
+    cat > /etc/systemd/system/kl-reportd.timer <<'EOF'
+    [Unit]
+    Description=Run the lab report generator every minute
+
+    [Timer]
+    OnCalendar=*-*-* *:*:00
+    AccuracySec=1s
+
+    [Install]
+    WantedBy=timers.target
+    EOF
+    systemctl daemon-reload
+    systemctl start kl-reportd 2>/dev/null || true
+  check: |
+    c=/etc/kl-reportd/reportd.conf
+    check "the timer is enabled" 'systemctl is-enabled -q kl-reportd.timer'
+    check "the timer is active" 'systemctl is-active -q kl-reportd.timer'
+    check_not "the runaway dump is gone" '[ -e /var/lib/kl-reportd/cache/dump.tmp ]'
+    check_eq "the archive is intact" "$(ls /var/lib/kl-reportd/archive 2>/dev/null | tr '\n' ' ')" "2026-01.txt 2026-02.txt 2026-03.txt "
+    check_eq "the config is not world-readable" "$(( 0$(stat -c %a $c) & 4 ))" 0
+    check "the service user can read the config" 'sudo -u kl-report cat $c >/dev/null'
+    rm -f /var/lib/kl-reportd/out/latest.txt
+    systemctl start kl-reportd >/dev/null 2>&1
+    check "a run succeeds" '[ "$(systemctl show -p Result --value kl-reportd)" = success ]'
+    check "latest.txt is written" 'grep -q "report generated" /var/lib/kl-reportd/out/latest.txt'
+  solve: |
+    sudo rm -f /var/lib/kl-reportd/cache/dump.tmp
+    sudo chgrp kl-report /etc/kl-reportd/reportd.conf
+    sudo chmod 640 /etc/kl-reportd/reportd.conf
+    sudo systemctl enable --now kl-reportd.timer
+    sudo systemctl start kl-reportd
