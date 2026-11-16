@@ -43,6 +43,8 @@ usage:
   awesome_labs check <id>              check your work
   awesome_labs forget <id>             erase your progress on an exercise
   awesome_labs shell [docker|k8s|node01|offsec]  open a shell in a lab VM
+  awesome_labs code [docker|k8s|node01|offsec]   work on the lab's /lab in your own VS Code
+  awesome_labs sync [docker|k8s|node01|offsec]   mirror a lab VM's /lab into a local folder (VS Code runs this)
   awesome_labs env status|up|prepare|stop|destroy|rebuild|reset|cache [docker|k8s|offsec]
   awesome_labs vms [stop|delete <name|all>]  list lab VMs, or stop/delete them
   awesome_labs verify [-from id] [ids or prefixes...]
@@ -82,13 +84,14 @@ func run(args []string) error {
 		return err
 	}
 	// only one awesome_labs changes the VMs and the progress at a time; the
-	// read-only commands may run beside it
+	// read-only commands may run beside it, and so may a shell and the VS Code
+	// sync, which only work inside /lab of a running VM
 	cmd := ""
 	if len(args) > 0 {
 		cmd = args[0]
 	}
 	switch cmd {
-	case "-h", "--help", "help", "lint", "list", "show", "status", "paths":
+	case "-h", "--help", "help", "lint", "list", "show", "status", "paths", "shell", "code", "sync":
 	default:
 		release, err := mgr.LockApp()
 		if err != nil {
@@ -234,6 +237,31 @@ func run(args []string) error {
 		}
 		c := mgr.ShellCommand(env, worker)
 		return c.Run()
+	case "code", "sync":
+		name := ""
+		if len(rest) > 0 {
+			name = rest[0]
+		} else if a, ok := mgr.Active(); ok { // default: where the exercise you're on runs
+			name = lab.CodeTargetOf(lab.EnvFor(a.Profile)).Name
+		}
+		t, err := lab.CodeTargetFor(name)
+		if err != nil {
+			return err
+		}
+		if cmd == "sync" {
+			return mgr.SyncLab(ctx, t, os.Stdout)
+		}
+		ws, err := mgr.OpenInCode(t)
+		if err != nil {
+			return err
+		}
+		fmt.Printf("opened %s in VS Code\n", ws)
+		fmt.Printf("  %s mirrors %s:/lab both ways while the window is open (task \"awesome_labs: sync /lab\";\n", mgr.CodeDir(t), t.VM.Hostname)
+		fmt.Printf("  allow it if VS Code asks), and its terminal opens in the VM.\n")
+		if !mgr.VMRunning(t.Env, t.Worker) {
+			fmt.Printf("  %s isn't running yet: the folder fills in once it is (awesome_labs start <id>).\n", t.VM.Hostname)
+		}
+		return nil
 	case "status":
 		return statusCmd(ctx, cat, mgr, prog)
 	case "vms":

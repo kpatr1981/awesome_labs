@@ -181,6 +181,7 @@ shortcut. While the mouse is in use, most terminals select text with `shift`+dra
 | `s` | **start** — prepare the lab (creates the VMs the first time) |
 | `t` | open a **terminal** in the docker host / control plane (`exit` to come back) |
 | `w` | open a terminal on **node01** (Kubernetes only) |
+| `o` | work on the lab in your own **VS Code** (see below) |
 | `c` | **check** your work |
 | `h` | reveal the next **hint** |
 | `v` | reveal the **solution** (asks first) |
@@ -204,6 +205,34 @@ back to the exercise you came from.
 Inside the VMs the scenario is also in **`/lab/TASK.md`**; `/lab` is your working
 directory. On the control plane `kubectl` (alias `k`, with completion) is configured
 for you, and `ssh node01` gets you onto the worker.
+
+### In VS Code
+
+`o` on the exercise screen (or `awesome_labs code [docker|k8s|node01|offsec]`, which
+defaults to the exercise you're on) opens the lab in **your own VS Code**. Nothing is
+installed in the VMs: no VS Code server, no extension, no mount.
+
+- **Files:** the workspace folder `~/.awesome_labs/vscode/<lab>/` mirrors the VM's `/lab`
+  both ways while the window is open. A task in the workspace, *awesome_labs: sync /lab*,
+  runs `awesome_labs sync` over the VM's existing SSH connection. VS Code starts it when
+  the window opens; allow automatic tasks if it asks. Saving a file writes it into the VM
+  within a second, and anything created or changed in the VM shows up in the editor.
+  Files are written into the VM in place, so a file bind-mounted into a container keeps
+  working. New files belong to the lab user. `.git` folders, symlinks and files over
+  16 MiB are not mirrored.
+- **Terminal:** the workspace's terminal opens a shell in the VM (`awesome_labs shell`),
+  with a node01 profile in the Kubernetes lab. `awesome_labs shell`, `code` and `sync` run
+  beside the app.
+- **The VM wins:** when the sync (re)connects, and when a file changed on both sides, the
+  VM's version is kept. A reset or a new exercise empties the folder along with `/lab`.
+  Any of your edits that the VM never got are copied to `~/.awesome_labs/vscode/backups/`
+  first.
+
+`code` must be on your PATH (in VS Code: *Shell Command: Install 'code' command in
+PATH*); on macOS the app in `/Applications` is found without it. Set
+`AWESOME_LABS_CODE=codium` (or `cursor`, …) to use another editor of the same family.
+Files outside `/lab` (`/etc`, the cluster's manifests…) are still edited from the
+terminal.
 
 ### Learning paths
 
@@ -262,6 +291,8 @@ awesome_labs paths [path-id]            # learning paths and progress
 awesome_labs show k8s-101 [--solution]
 awesome_labs start docker-042           # prepare the lab
 awesome_labs shell docker|k8s|node01|offsec    # open a shell
+awesome_labs code [docker|k8s|node01|offsec]   # open the lab's /lab in VS Code
+awesome_labs sync [docker|k8s|node01|offsec]   # mirror /lab into ~/.awesome_labs/vscode/<lab> (VS Code runs it)
 awesome_labs check docker-042           # grade (exit code 0 = solved)
 awesome_labs forget docker-042          # erase progress on one exercise
 awesome_labs env status|up|stop|reset|rebuild|destroy [docker|k8s|offsec]
@@ -278,7 +309,8 @@ you solve it, or when its environment is reset, rebuilt or deleted.
 Only **one awesome_labs runs at a time**: the app and every command that changes the
 VMs or your progress take a lock on `~/.awesome_labs/app.lock`, and a second one exits with
 *another awesome_labs is already running*. The lock goes away with the process, even after
-a crash. The read-only `list`, `show`, `status`, `paths` and `lint` still run beside it.
+a crash. The read-only `list`, `show`, `status`, `paths` and `lint` still run beside it,
+and so do `shell`, `code` and `sync`, which only work inside a running VM.
 
 Progress is stored in `~/.awesome_labs/progress.json`, logs in `~/.awesome_labs/logs/`.
 
@@ -302,7 +334,7 @@ to work on exercise files without rebuilding.
 ```text
 main.go                    CLI entry point, verify runner
 internal/exercise          exercise model + loader/validator
-internal/lab               environments: create/bootstrap/reset VMs, run setup/check/solve
+internal/lab               environments: create/bootstrap/reset VMs, run setup/check/solve, VS Code sync
 internal/lima              thin limactl wrapper
 internal/install           OS detection and the install command
 internal/tui               Bubble Tea interface

@@ -841,6 +841,18 @@ func (m *model) updateDetail(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 			return m, m.cmdShell(k == "w")
 		}
 		return m, nil
+	case "o":
+		if !m.isActive(ex) {
+			m.flash = "the lab isn't set up for " + ex.ID + " — press s to start it"
+			return m, nil
+		}
+		t := lab.CodeTargetOf(lab.EnvFor(ex.Profile))
+		if _, err := m.mgr.OpenInCode(t); err != nil {
+			m.flash = err.Error()
+			return m, nil
+		}
+		m.flash = "opened VS Code on " + t.VM.Hostname + ":/lab — its files sync while the window is open, and its terminal opens in the VM"
+		return m, nil
 	case "h", "H":
 		return m, m.revealHint()
 	case "v":

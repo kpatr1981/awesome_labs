@@ -339,6 +339,8 @@ func (m *model) detailButtons(e *exercise.Exercise) []button {
 	if e.Profile == exercise.ProfileK8s {
 		bs = append(bs, button{label: "node01", key: "w", off: !active || busy})
 	}
+	// opening VS Code doesn't touch the VMs, so it works while busy too
+	bs = append(bs, button{label: "VS Code", key: "o", off: !active})
 	bs = append(bs, button{label: "✔ Check", key: "c", off: !active || busy},
 		button{label: "Hint", key: "h", off: locked || len(e.Hints) == 0},
 		button{label: "Solution", key: "v", off: locked},
@@ -360,7 +362,7 @@ func (m *model) refreshViewport(follow bool) {
 	case m.screen == scrEnv:
 		return
 	case m.tab == tabScenario:
-		intro := sMuted.Render("Press s to prepare the lab, then t to open a terminal. The task is also in /lab/TASK.md.")
+		intro := sMuted.Render("Press s to prepare the lab, then t to open a terminal (or o to work in VS Code). The task is also in /lab/TASK.md.")
 		content = intro + "\n" + m.markdown("sc:"+m.cur.ID, m.cur.Scenario, w)
 	case m.tab == tabLearn && m.examLocked(m.cur):
 		content = sMuted.Render("\n  🔒 Tutorials are locked during the exam.")

@@ -946,7 +946,7 @@ Exercise list   ↑↓ move · enter open · / filter · esc clear filter
                 u cycle all / solved / in progress / no progress
                 L learning paths · X exam · q quit
 
-Exercise        s start the lab · t terminal · w node01 terminal (Kubernetes)
+Exercise        s start the lab · t terminal · w node01 terminal (Kubernetes) · o open in VS Code
                 c check · h next hint · v solution · x end the exercise (cleans its VMs) · R reset progress
                 ←→, tab or 1–5 switch tabs · n/N next/previous in the list it came from
                 esc/q back — the lab that is set up keeps running; a goes back to it

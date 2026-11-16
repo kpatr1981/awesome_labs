@@ -668,11 +668,11 @@ func TestButtonsLitOnlyWhenTheyApply(t *testing.T) {
 		want     string
 	}{
 		{"exercise never started", false, "▶ Start,Hint,Solution,Back"},
-		{"exercise set up on the VMs", false, "↻ Restart,Terminal,✔ Check,Hint,Solution,End,Reset,Back"},
-		{"exercise set up on the VMs", true, "Hint,Solution,Back"},
+		{"exercise set up on the VMs", false, "↻ Restart,Terminal,VS Code,✔ Check,Hint,Solution,End,Reset,Back"},
+		{"exercise set up on the VMs", true, "VS Code,Hint,Solution,Back"},
 		{"exercise while another is set up", false, "▶ Start,Solution,Back"}, // d-2 has no hints
-		{"kubernetes exercise set up", false, "↻ Restart,Terminal,node01,✔ Check,Hint,Solution,End,Reset,Back"},
-		{"exam question", false, "↻ Restart,Terminal,✔ Check,Back"}, // no End: exam VMs carry to the next question
+		{"kubernetes exercise set up", false, "↻ Restart,Terminal,node01,VS Code,✔ Check,Hint,Solution,End,Reset,Back"},
+		{"exam question", false, "↻ Restart,Terminal,VS Code,✔ Check,Back"}, // no End: exam VMs carry to the next question
 	}
 	for _, c := range cases {
 		m := build(t, named(c.scenario), c.busy)
