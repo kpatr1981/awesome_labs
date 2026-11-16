@@ -1,7 +1,8 @@
 # awesome_labs
 
 **Hands-on labs on your own machine** for Docker, Kubernetes, Linux, networking, cloud,
-databases, security, programming, data science and Git — real VMs, real breakage, automatic grading.
+databases, security, programming, algorithms, data science, Git, Terraform and Ansible — real VMs,
+real breakage, automatic grading.
 
 awesome_labs creates [Lima](https://lima-vm.io) virtual machines, puts each exercise's
 scenario in place (a broken deployment, a crashed daemon, a half-finished compose
@@ -10,7 +11,7 @@ exercise has a scenario, progressive hints and a full solution you can reveal, a
 have a short tutorial on the concepts and commands to read first.
 
 ```text
- awesome_labs  Program  View  Tracks  Help                        ✔ 37/726 solved  ● 2 started, unsolved
+ awesome_labs  Program  View  Tracks  Help                        ✔ 37/1336 solved  ● 2 started, unsolved
 ╭──────────────────────────────────────────────╮╭───────────────────────────────────────────────╮
 │▸ Kubernetes · Troubleshooting the cluster     ││k8s-245 — The API server is gone               │
 │ ✔ k8s-241   ●●○○○ fix   node01 is NotReady    ││●●●○○ Medium · Fix something · Kubernetes      │
@@ -66,7 +67,10 @@ The cluster deliberately runs one minor release behind the newest Kubernetes, so
 upgrade exercise has something to upgrade to.
 
 VMs are created **on first use** (5–15 minutes, mostly package installs and image
-pulls) and reused afterwards. On its first launch the app offers to build each
+pulls). A freshly built environment is kept as a **saved copy**, so later starts clone it
+in seconds instead of building again, and pulled images go into a local cache
+(`~/.awesome_labs/cache/images/`) that is loaded into new VMs, which keeps rebuilds off
+Docker Hub's pull limits (images come through `mirror.gcr.io` first). On its first launch the app offers to build each
 environment right away instead, one question per environment, so later exercises start
 in seconds; `awesome_labs env prepare [docker|k8s|offsec]` (or **P** on the environments
 screen) does the same at any time. Before every exercise awesome_labs **resets** the environment
@@ -141,11 +145,11 @@ Reset needs progress to reset; hints, the solution and resetting are locked duri
 exam. The Started labs and environments screens dim their buttons the same way.
 
 The exercise screen itself has no menus: its buttons and tabs do everything there, and the
-keys that work on every screen still do. Elsewhere, **File** moves between the screens.
-**View** and **Tracks** shape the list: View also holds learning paths. **VMs** holds everything about the lab
-environments. **View → Show** filters the list by progress: all, solved, in progress
-(started, not solved) or no progress. **Tracks** shows how many exercises of each track you
-have solved. A greyed-out item says why when you pick it.
+keys that work on every screen still do. Elsewhere, **Program** holds Exit. **View** and
+**Tracks** shape the list: View also holds learning paths, and **View → Show** filters the
+list by progress: all, solved, in progress (started, not solved) or no progress. **Tracks**
+lists every track in the catalogue (including Git, Terraform, Ansible and Algorithms) with
+how many of its exercises you have solved. A greyed-out item says why when you pick it.
 
 The mouse works throughout: pick a track from the **Tracks** menu, click a row to select
 it and double-click to open it, click the tabs and the buttons (Start, Terminal, Check,
@@ -167,7 +171,7 @@ shortcut. While the mouse is in use, most terminals select text with `shift`+dra
 | `X` | **exam mode** — start a timed exam, or return to the running one |
 | `a` | jump to the exercise you're **working on** (shown as `▶` in the header and list) |
 | `S` | your labs: the active exercise, then others started earlier and not solved |
-| `e` | environments & VMs: live state of every VM; create, stop, reset, rebuild, delete — `X` stops all, `K` deletes all |
+| `e` | environments & VMs: live state of every VM; create, stop, reset, rebuild, delete, **P** prepare (build and keep a saved copy) — `X` stops all, `K` deletes all |
 | `Q` (`q` on the list, `ctrl+c`, Program → Exit) | exit — always **deletes every lab VM**, running or stopped, first, and starting the app deletes any left over (`ctrl+c` while busy or deleting exits at once and leaves them as they are) |
 
 ### In an exercise
@@ -210,6 +214,9 @@ for you, and `ssh node01` gets you onto the worker.
 | Kubernetes for developers (CKAD-style) | workloads, config, services, probes, ingress, policies, Helm/Kustomize |
 | Kubernetes administration (CKA-style) | scheduling, storage, networking, RBAC, cluster troubleshooting, upgrades, etcd |
 | Kubernetes security | RBAC, pod security, network policies, secrets, audit, encryption |
+| Web exploitation | injection, access control, SSRF, XXE and more against vulnerable web apps, then the patch |
+| Terraform fundamentals | plan & apply, variables and expressions, state, modules, Docker infrastructure (difficulty ≤ 3) |
+| Ansible fundamentals | inventories, playbooks, templates, variables, Vault and roles (difficulty ≤ 3) |
 | Troubleshooting only | every *fix* exercise |
 | Incident drills | the multi-problem incidents at the end of each module |
 
@@ -258,6 +265,8 @@ awesome_labs shell docker|k8s|node01|offsec    # open a shell
 awesome_labs check docker-042           # grade (exit code 0 = solved)
 awesome_labs forget docker-042          # erase progress on one exercise
 awesome_labs env status|up|stop|reset|rebuild|destroy [docker|k8s|offsec]
+awesome_labs env prepare [docker|k8s|offsec]   # build now and keep a saved copy (VMs deleted after)
+awesome_labs env cache [docker|k8s|offsec]     # fill the local image cache (no env: show it)
 awesome_labs vms                        # every lab VM with status, CPU and memory
 awesome_labs vms stop|delete <name|all> # e.g. vms delete kl-offsec · vms stop all
 ```
