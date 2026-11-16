@@ -167,6 +167,8 @@ shortcut. While the mouse is in use, most terminals select text with `shift`+dra
 | `tab` | switch track |
 | `u` | cycle the progress filter: all · solved · in progress (started, not solved) · no progress |
 | `enter` | open an exercise |
+| `space` / `*` | mark or unmark the highlighted exercise / mark every exercise shown (again: clear) · `esc` clears the marks |
+| `R` | **reset progress** of the marked exercises, or the highlighted one when none is marked (asks first; notes are kept). View → *Reset progress of all shown* resets the whole filtered list — e.g. `u` to *in progress*, then reset them all |
 | `L` | **learning paths** — focus the list on a curated path, with progress |
 | `W` | **weak spots** — the modules where you needed the most hints, solutions and checks, and the exercises worth redoing |
 | `X` | **exam mode** — start a timed exam, or return to the running one |

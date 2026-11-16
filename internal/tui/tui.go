@@ -88,7 +88,8 @@ type model struct {
 	visible    []*exercise.Exercise
 	cursor     int
 	offset     int
-	saved      uiState // the list state last written to ui.json
+	marked     map[string]bool // exercises picked with space for a reset
+	saved      uiState         // the list state last written to ui.json
 
 	// detail
 	cur       *exercise.Exercise
@@ -396,6 +397,7 @@ func (m *model) refilter() {
 		}
 		m.visible = append(m.visible, e)
 	}
+	m.pruneMarks()
 	if m.cursor >= len(m.visible) {
 		m.cursor = max(0, len(m.visible)-1)
 	}
@@ -431,7 +433,7 @@ func (m *model) listHeight() int {
 
 // hasBrowseBar reports whether the browse screen shows its info line above the list.
 func (m *model) hasBrowseBar() bool {
-	return m.path != nil || m.tracks[m.trackIdx] != "" || m.progFilter != progAll || m.filterOn || m.filter.Value() != ""
+	return m.path != nil || m.tracks[m.trackIdx] != "" || m.progFilter != progAll || m.filterOn || m.filter.Value() != "" || len(m.marked) > 0
 }
 
 func (m *model) clampOffset() {
@@ -858,14 +860,23 @@ func (m *model) updateBrowse(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 		if m.filter.Value() != "" {
 			m.filter.SetValue("")
 			m.refilterKeep()
+		} else if len(m.marked) > 0 {
+			m.marked = nil
+			m.flash = "marks cleared"
 		}
+	case " ":
+		m.toggleMark()
+	case "*":
+		m.markAllShown()
+	case "R":
+		m.askResetList()
 	case "up", "k":
 		m.move(-1)
 	case "down", "j":
 		m.move(1)
 	case "pgup", "ctrl+u":
 		m.move(-m.listHeight() / 2)
-	case "pgdown", "ctrl+d", " ":
+	case "pgdown", "ctrl+d":
 		m.move(m.listHeight() / 2)
 	case "home", "g":
 		m.cursor, m.offset = 0, 0
@@ -1361,14 +1372,7 @@ func (m *model) updateStarted(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 			return m, nil
 		}
 		m.ask(fmt.Sprintf("Reset progress on all %d started labs?", len(m.started)), func() tea.Cmd {
-			for _, e := range m.started {
-				if m.inExam(e) {
-					continue
-				}
-				m.prog.Reset(e.ID)
-				delete(m.result, e.ID)
-			}
-			m.refilterKeep()
+			m.forgetAll(m.started)
 			m.resetStarted()
 			m.flash = "reset started labs"
 			return nil

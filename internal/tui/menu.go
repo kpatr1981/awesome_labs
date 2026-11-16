@@ -85,6 +85,8 @@ func keyMsg(k string) tea.KeyMsg {
 		return tea.KeyMsg{Type: tea.KeyF1}
 	case "tab":
 		return tea.KeyMsg{Type: tea.KeyTab}
+	case "space":
+		return tea.KeyMsg{Type: tea.KeySpace, Runes: []rune{' '}}
 	case "up":
 		return tea.KeyMsg{Type: tea.KeyUp}
 	case "down":
@@ -169,6 +171,11 @@ func (m *model) menus() []menu {
 			menuItem{label: "Previous module", key: "p", run: press("p")},
 			head("Your progress", ""),
 			menuItem{label: "Weak spots…", key: "W", run: press("W")},
+			menuItem{label: "Mark / unmark for reset", key: "space", run: press("space")}.off(len(m.visible) == 0, "the list is empty"),
+			menuItem{label: "Mark all shown", key: "*", run: press("*")}.off(len(m.visible) == 0, "the list is empty"),
+			menuItem{label: m.resetItemLabel(), key: "R", run: press("R")}.off(len(m.visible) == 0, "the list is empty"),
+			menuItem{label: "Reset progress of all shown…", run: m.askResetShown}.off(len(m.visible) == 0, "the list is empty"),
+			menuItem{label: "Clear the marks", key: "esc", hidden: len(m.marked) == 0 || m.filter.Value() != "", run: func() tea.Cmd { m.marked = nil; return nil }},
 			head("Learning path", ""),
 			menuItem{label: "Choose a learning path…", key: "L", run: func() tea.Cmd { m.screen = scrPaths; return nil }},
 			menuItem{label: "Clear the learning path", hidden: m.path == nil, run: func() tea.Cmd {
@@ -961,6 +968,8 @@ Everywhere      F10 menu bar (not on the exercise screen) · alt+p/v/t/h open a 
 Exercise list   ↑↓ move · enter open · / filter (ctrl+t: search the full text) · esc clear filter
                 tab next track · A all tracks · n/p next/previous module
                 u cycle all / solved / in progress / no progress
+                space mark/unmark · * mark all shown (again: clear) · esc clear marks
+                R reset progress of the marked exercises (none marked: the highlighted one)
                 L learning paths · X exam · W weak spots · q quit
 
 Exercise        s start the lab · t terminal · w node01 terminal (Kubernetes) · o open in VS Code (o again stops its sync)
@@ -1016,4 +1025,12 @@ func (m *model) aboutText() string {
 		s += "\n\n" + m.newRelease
 	}
 	return s
+}
+
+// resetItemLabel names what R on the exercise list would reset.
+func (m *model) resetItemLabel() string {
+	if n := len(m.marked); n > 0 {
+		return fmt.Sprintf("Reset progress of %d marked…", n)
+	}
+	return "Reset progress of this one…"
 }

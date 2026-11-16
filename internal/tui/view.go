@@ -173,6 +173,9 @@ func (m *model) viewBrowse() string {
 	if m.progFilter != progAll {
 		bar += sWarn.Render("[" + strings.ToLower(progFilterNames[m.progFilter]) + "]  ")
 	}
+	if n := len(m.marked); n > 0 {
+		bar += sTitle.Render(fmt.Sprintf("[%d marked]", n)) + sMuted.Render(" R resets · esc clears  ")
+	}
 	if m.filterOn || m.filter.Value() != "" {
 		m.addZone("filter", lipgloss.Width(bar), 0, m.w, 1)
 		bar += m.filter.View()
@@ -213,7 +216,11 @@ func (m *model) viewBrowse() string {
 			kind = sBad.Render("fix  ")
 		}
 		titleW := listW - 2 - 2 - 10 - 6 - 6 - 2
-		line := fmt.Sprintf(" %s %-9s %s %s %s", mark, e.ID, stars(e.Difficulty), kind, trunc(e.Title, titleW))
+		pick := " "
+		if m.marked[e.ID] {
+			pick = sTitle.Render("*")
+		}
+		line := fmt.Sprintf("%s%s %-9s %s %s %s", pick, mark, e.ID, stars(e.Difficulty), kind, trunc(e.Title, titleW))
 		if i == m.cursor {
 			line = sSel.Render(padRight(line, listW-2))
 		}
@@ -241,7 +248,7 @@ func (m *model) viewBrowse() string {
 	prevBox := sBorder.Width(prevW - 2).Height(lh).Render(prev)
 	m.addZone("preview", listW, top, prevW, lh+2)
 
-	help := "↑↓ move · enter open · / filter · tab next track · W weak spots · F10 menu · F1 keys · q quit"
+	help := "↑↓ move · enter open · / filter · tab next track · space mark · R reset · F10 menu · F1 keys · q quit"
 	if m.newRelease != "" {
 		help = sWarn.Render(m.newRelease) + " · " + help
 	}
