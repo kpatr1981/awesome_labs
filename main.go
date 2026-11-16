@@ -17,13 +17,18 @@ import (
 	"time"
 
 	"awesome_labs/internal/config"
+	"awesome_labs/internal/doctor"
 	"awesome_labs/internal/exam"
 	"awesome_labs/internal/exercise"
 	"awesome_labs/internal/install"
 	"awesome_labs/internal/lab"
 	"awesome_labs/internal/progress"
 	"awesome_labs/internal/tui"
+	"awesome_labs/internal/update"
 )
+
+// version is set at build time (make build / make release); "dev" otherwise.
+var version = "dev"
 
 //go:embed all:vms all:exercises learning-paths.yaml
 var assets embed.FS
@@ -51,6 +56,8 @@ usage:
   awesome_labs verify [-from id] [ids or prefixes...]
                                   author tool: setup -> check fails -> solve -> check passes
   awesome_labs lint                    validate all exercise files
+  awesome_labs doctor [--fix]          check this machine and awesome_labs for the usual trouble
+  awesome_labs version [--check]       this build's version (--check: is a newer release out?)
 
 environment:
   AWESOME_LABS_EXERCISES=dir           load exercises from disk instead of the built-in set
@@ -92,7 +99,7 @@ func run(args []string) error {
 		cmd = args[0]
 	}
 	switch cmd {
-	case "-h", "--help", "help", "lint", "list", "show", "status", "paths", "shell", "code", "sync":
+	case "-h", "--help", "help", "lint", "list", "show", "status", "paths", "shell", "code", "sync", "doctor", "version":
 	default:
 		release, err := mgr.LockApp()
 		if err != nil {
@@ -105,7 +112,7 @@ func run(args []string) error {
 		return err
 	}
 	cfg, err := config.Load(mgr.StateDir)
-	if err != nil {
+	if err != nil && cmd != "doctor" { // doctor reports it
 		return err
 	}
 	lab.ApplySizes([2]string{itoa(cfg.Docker.CPUs), cfg.Docker.Memory},
@@ -142,6 +149,32 @@ func run(args []string) error {
 	switch cmd {
 	case "-h", "--help", "help":
 		usage()
+	case "version":
+		fmt.Println("awesome_labs " + version)
+		if len(rest) > 0 && rest[0] == "--check" {
+			r, err := update.Latest(ctx)
+			if err != nil {
+				return fmt.Errorf("checking for a newer release: %w", err)
+			}
+			if update.Newer(version, r.Tag) {
+				fmt.Printf("%s is out: %s\n", r.Tag, r.URL)
+			} else {
+				fmt.Printf("up to date (latest release: %s)\n", r.Tag)
+			}
+		}
+	case "doctor":
+		if len(rest) > 0 && rest[0] == "--fix" {
+			mgr.ClearStaleBusy()
+		}
+		fmt.Printf("awesome_labs %s — checking this machine\n", version)
+		fs := doctor.Check(ctx, mgr, doctor.System(mgr), version)
+		if _, err := config.Load(mgr.StateDir); err != nil {
+			fs = append(fs, doctor.Finding{Level: doctor.Bad, Title: "the config file has a problem", Detail: err.Error(), Fix: "edit " + config.Path(mgr.StateDir)})
+		}
+		fmt.Printf("  · logs: %s\n", mgr.LogPath())
+		if doctor.Print(os.Stdout, fs) == doctor.Bad {
+			return fmt.Errorf("found problems that stop the labs from working")
+		}
 	case "lint":
 		fmt.Printf("%d exercises OK\n", len(cat.Exercises))
 		counts := map[string]int{}

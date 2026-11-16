@@ -7,6 +7,7 @@ import (
 
 	"github.com/charmbracelet/glamour"
 	"github.com/charmbracelet/lipgloss"
+	"github.com/charmbracelet/x/ansi"
 
 	"awesome_labs/internal/exercise"
 	"awesome_labs/internal/lab"
@@ -138,6 +139,10 @@ func (m *model) statusLine(help string) string {
 	var s string
 	if m.op != "" {
 		s = " " + m.spin.View() + " " + sWarn.Render(m.op+"…") + "  "
+		if p := m.runStatus(); p != "" {
+			// the progress takes the line: help is in F1 meanwhile
+			return ansi.Truncate(s+sMuted.Render(p), max(10, m.w), "…")
+		}
 	} else if m.flash != "" {
 		st := sMuted
 		switch {

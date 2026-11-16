@@ -106,6 +106,8 @@ type model struct {
 	result map[string]string           // last check result per id
 	spin   spinner.Model
 	flash  string
+	run    opRun            // progress of the running operation
+	now    func() time.Time // the clock; tests replace it
 
 	// env screen
 	envStatus map[exercise.Profile]string
@@ -210,6 +212,7 @@ func newModel(d Deps, style string) *model {
 		output: map[string]*strings.Builder{}, result: map[string]string{},
 		mdCache: map[string]string{}, envStatus: map[exercise.Profile]string{},
 		paths: d.Paths, exams: d.Exams, setupCount: 1, setupMins: 1, menuOpen: -1,
+		now: time.Now,
 	}
 	m.endLab = mgr.EndExercise
 	m.deleteVMs = mgr.DeleteAll
@@ -432,6 +435,13 @@ func (m *model) startOp(kind, label, id string, f func(ctx context.Context, w io
 		return nil
 	}
 	m.op, m.opID = label, id
+	what := id
+	if ex := m.cat.Get(id); ex != nil {
+		what = string(ex.Profile) // an exercise's start runs its environment
+	} else if id == "env" {
+		what = label
+	}
+	m.beginRun(kind + ":" + what)
 	ch := make(chan tea.Msg, 512)
 	m.opCh = ch
 	b := m.out(id)
@@ -563,6 +573,7 @@ func (m *model) update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		return m, c
 
 	case opLineMsg:
+		m.runLine(string(msg))
 		b := m.out(m.opID)
 		b.WriteString(string(msg))
 		b.WriteByte('\n')
@@ -573,6 +584,7 @@ func (m *model) update(msg tea.Msg) (tea.Model, tea.Cmd) {
 
 	case opDoneMsg:
 		m.op = ""
+		m.endRun(msg.err == nil)
 		m.refreshActive()
 		b := m.out(msg.id)
 		switch {

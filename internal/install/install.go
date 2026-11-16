@@ -507,3 +507,23 @@ func Run(args []string, in io.Reader, out io.Writer) error {
 	fmt.Fprintln(out, "\nDone. Start with: awesome_labs")
 	return nil
 }
+
+// InstalledLima is the installed `limactl --version` line and its major
+// version; ok is false when limactl isn't on the PATH.
+func InstalledLima() (line string, major int, ok bool) {
+	out, err := exec.Command("limactl", "--version").Output()
+	if err != nil {
+		return "", 0, false
+	}
+	line = strings.TrimSpace(string(out))
+	return line, limaMajor(line), true
+}
+
+// MinLimaMajor is the oldest Lima major version awesome_labs works with.
+const MinLimaMajor = minLimaMajor
+
+// QEMUReady reports whether QEMU and its firmware are installed (Linux runs
+// the VMs with QEMU; macOS uses its own virtualization).
+func QEMUReady(s System) bool {
+	return found(qemuBinary(s)) && firmwareFound(s.Arch)
+}
