@@ -203,6 +203,7 @@ func (m *Manager) DeleteVM(ctx context.Context, name string, log io.Writer) erro
 
 // DeleteAll deletes every lab VM, including stray kl-* instances.
 func (m *Manager) DeleteAll(ctx context.Context, log io.Writer) error {
+	m.StopAllCode() // with no VMs left there's nothing to sync
 	vms, err := m.VMs(ctx)
 	if err != nil {
 		return err

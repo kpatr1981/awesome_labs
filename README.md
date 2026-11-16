@@ -181,7 +181,7 @@ shortcut. While the mouse is in use, most terminals select text with `shift`+dra
 | `s` | **start** — prepare the lab (creates the VMs the first time) |
 | `t` | open a **terminal** in the docker host / control plane (`exit` to come back) |
 | `w` | open a terminal on **node01** (Kubernetes only) |
-| `o` | work on the lab in your own **VS Code** (see below) |
+| `o` | work on the lab in your own **VS Code** (see below); while its sync runs, `o` (**■ Stop VS Code**) stops it |
 | `c` | **check** your work |
 | `h` | reveal the next **hint** |
 | `v` | reveal the **solution** (asks first) |
@@ -227,6 +227,11 @@ installed in the VMs: no VS Code server, no extension, no mount.
   VM's version is kept. A reset or a new exercise empties the folder along with `/lab`.
   Any of your edits that the VM never got are copied to `~/.awesome_labs/vscode/backups/`
   first.
+
+**Stopping:** press `o` again on the exercise screen (the button reads **■ Stop VS Code**
+while a sync runs), or close the window. Exiting awesome_labs, or deleting all VMs, stops
+every sync too. Stopping leaves the VS Code window open, since VS Code can't be told from
+outside to close one window. Its edits just stop reaching the VM.
 
 `code` must be on your PATH (in VS Code: *Shell Command: Install 'code' command in
 PATH*); on macOS the app in `/Applications` is found without it. Set

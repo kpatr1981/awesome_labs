@@ -842,6 +842,10 @@ func (m *model) updateDetail(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 		}
 		return m, nil
 	case "o":
+		if t := lab.CodeTargetOf(lab.EnvFor(ex.Profile)); m.mgr.StopCode(t) {
+			m.flash = "VS Code sync for " + t.VM.Hostname + ":/lab stopped — close its window when you're done"
+			return m, nil
+		}
 		if !m.isActive(ex) {
 			m.flash = "the lab isn't set up for " + ex.ID + " — press s to start it"
 			return m, nil

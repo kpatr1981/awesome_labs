@@ -339,8 +339,13 @@ func (m *model) detailButtons(e *exercise.Exercise) []button {
 	if e.Profile == exercise.ProfileK8s {
 		bs = append(bs, button{label: "node01", key: "w", off: !active || busy})
 	}
-	// opening VS Code doesn't touch the VMs, so it works while busy too
-	bs = append(bs, button{label: "VS Code", key: "o", off: !active})
+	// opening VS Code doesn't touch the VMs, so it works while busy too; while
+	// its sync runs, the same button stops it
+	if m.mgr != nil && m.mgr.CodeSyncPID(lab.CodeTargetOf(lab.EnvFor(e.Profile))) > 0 {
+		bs = append(bs, button{label: "■ Stop VS Code", key: "o"})
+	} else {
+		bs = append(bs, button{label: "VS Code", key: "o", off: !active})
+	}
 	bs = append(bs, button{label: "✔ Check", key: "c", off: !active || busy},
 		button{label: "Hint", key: "h", off: locked || len(e.Hints) == 0},
 		button{label: "Solution", key: "v", off: locked},

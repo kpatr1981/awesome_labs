@@ -187,7 +187,7 @@ func (m *Manager) SyncLab(ctx context.Context, t CodeTarget, out io.Writer) erro
 	if err := os.MkdirAll(m.CodeDir(t), 0o755); err != nil {
 		return err
 	}
-	lp := filepath.Join(m.codeBase(), t.Name+".sync.lock")
+	lp := m.syncLock(t)
 	f, err := os.OpenFile(lp, os.O_RDWR|os.O_CREATE, 0o644)
 	if err != nil {
 		return err
@@ -212,7 +212,7 @@ func (m *Manager) SyncLab(ctx context.Context, t CodeTarget, out io.Writer) erro
 			err = s.round(ctx)
 		}
 		if ctx.Err() != nil {
-			return nil
+			return stopped(out)
 		}
 		delay := time.Second
 		switch {
@@ -231,9 +231,62 @@ func (m *Manager) SyncLab(ctx context.Context, t CodeTarget, out io.Writer) erro
 		}
 		select {
 		case <-ctx.Done():
-			return nil
+			return stopped(out)
 		case <-time.After(delay):
 		}
+	}
+}
+
+func stopped(out io.Writer) error {
+	fmt.Fprintln(out, "sync stopped: edits in this window no longer reach the VM — close it when you're done")
+	return nil
+}
+
+func (m *Manager) syncLock(t CodeTarget) string {
+	return filepath.Join(m.codeBase(), t.Name+".sync.lock")
+}
+
+// CodeSyncPID is the process syncing the target's /lab, or 0 when none is.
+func (m *Manager) CodeSyncPID(t CodeTarget) int {
+	f, err := os.OpenFile(m.syncLock(t), os.O_RDWR, 0)
+	if err != nil {
+		return 0
+	}
+	defer f.Close()
+	if syscall.Flock(int(f.Fd()), syscall.LOCK_EX|syscall.LOCK_NB) == nil {
+		_ = syscall.Flock(int(f.Fd()), syscall.LOCK_UN)
+		return 0 // nobody holds it
+	}
+	b, _ := os.ReadFile(m.syncLock(t))
+	pid, _ := strconv.Atoi(strings.TrimSpace(string(b)))
+	return pid
+}
+
+// StopCode stops the target's sync, if one runs. The VS Code window stays
+// open (VS Code can't be told to close one window), but its files no longer
+// reach the VM.
+func (m *Manager) StopCode(t CodeTarget) bool {
+	pid := m.CodeSyncPID(t)
+	if pid <= 0 || pid == os.Getpid() {
+		return false
+	}
+	if syscall.Kill(pid, syscall.SIGTERM) != nil {
+		return false
+	}
+	for range 30 { // it lets go of the lock as it exits
+		if m.CodeSyncPID(t) == 0 {
+			break
+		}
+		time.Sleep(100 * time.Millisecond)
+	}
+	return true
+}
+
+// StopAllCode stops every VS Code sync.
+func (m *Manager) StopAllCode() {
+	for _, n := range []string{"docker", "k8s", "node01", "offsec"} {
+		t, _ := CodeTargetFor(n)
+		m.StopCode(t)
 	}
 }
 

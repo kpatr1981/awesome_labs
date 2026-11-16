@@ -13,6 +13,7 @@ import (
 	"path/filepath"
 	"sort"
 	"strings"
+	"syscall"
 	"time"
 
 	"awesome_labs/internal/config"
@@ -249,7 +250,9 @@ func run(args []string) error {
 			return err
 		}
 		if cmd == "sync" {
-			return mgr.SyncLab(ctx, t, os.Stdout)
+			sctx, stop := signal.NotifyContext(ctx, syscall.SIGTERM) // the app's Stop VS Code
+			defer stop()
+			return mgr.SyncLab(sctx, t, os.Stdout)
 		}
 		ws, err := mgr.OpenInCode(t)
 		if err != nil {
