@@ -1,0 +1,1170 @@
+track: data
+module: SQL in depth & Redis data structures
+profile: docker
+order: 7
+exercises:
+
+- id: data-056
+  title: Customers who keep coming back
+  difficulty: 1
+  kind: build
+  tags: [postgres, group-by, having, aggregates]
+  tutorial: |
+    **Concept.** `WHERE` filters **rows** before grouping, and `HAVING`
+    filters **groups** after aggregation. So "customers with more than three
+    orders this year" is `WHERE` on the date, `GROUP BY customer`, then
+    `HAVING count(*) > 3`.
+
+    **Read up on:**
+    - `GROUP BY`, `HAVING`, `count(*)`
+    - Date ranges: `>= '2026-01-01' AND < '2027-01-01'`
+  scenario: |
+    PostgreSQL runs in **`kl-pg`** (`docker exec -it kl-pg psql -U lab -d lab`).
+    The table **`orders`** has `id`, `customer_id`, `placed_at` (timestamp) and
+    `total`.
+
+    How many customers placed **more than three orders in 2026**? Write the
+    number to **`/lab/answer.txt`**.
+  hints:
+    - "`SELECT customer_id FROM orders WHERE placed_at >= '2026-01-01' AND placed_at < '2027-01-01' GROUP BY customer_id HAVING count(*) > 3`."
+    - "Wrap it: `SELECT count(*) FROM (...) s`."
+  solution: |
+    ```sql
+    SELECT count(*) FROM (
+      SELECT customer_id FROM orders
+      WHERE placed_at >= '2026-01-01' AND placed_at < '2027-01-01'
+      GROUP BY customer_id HAVING count(*) > 3
+    ) s;
+    ```
+  setup: |
+    pg_start
+    pg_sql "create table orders(id serial primary key, customer_id int not null, placed_at timestamp not null, total numeric(10,2) not null);
+            insert into orders(customer_id, placed_at, total)
+              select (random()*300)::int, timestamp '2025-06-01' + random() * interval '400 days', round((random()*200)::numeric, 2)
+              from generate_series(1, 4000);"
+    pg_sql "select count(*) from (select customer_id from orders where placed_at >= '2026-01-01' and placed_at < '2027-01-01' group by customer_id having count(*) > 3) s" > "$KL_STATE/answer"
+  check: |
+    check_eq "customers with more than three 2026 orders" "$(tr -d '[:space:]' < /lab/answer.txt 2>/dev/null)" "$(cat "$KL_STATE/answer")"
+  solve: |
+    docker exec -i kl-pg psql -h 127.0.0.1 -U lab -d lab -qAt -c "SELECT count(*) FROM (SELECT customer_id FROM orders WHERE placed_at >= '2026-01-01' AND placed_at < '2027-01-01' GROUP BY customer_id HAVING count(*) > 3) s" > /lab/answer.txt
+
+- id: data-057
+  title: Query inside the JSON payloads
+  difficulty: 2
+  kind: build
+  tags: [postgres, jsonb, operators, gin-index]
+  tutorial: |
+    **Concept.** `jsonb` columns store JSON in a binary form you can query.
+    `payload->'customer'` returns JSON, `payload->>'plan'` returns **text**, and
+    `payload @> '{"plan": "pro"}'` tests containment. A **GIN index** on the
+    column (`USING gin (payload)`) makes `@>` queries fast.
+
+    **Read up on:**
+    - PostgreSQL JSON functions and operators: `->`, `->>`, `@>`, `#>>`
+    - `CREATE INDEX ... USING gin`
+  scenario: |
+    The table **`events`** has an `id` and a `jsonb` column **`payload`**, for
+    example `{"type": "upgrade", "plan": "pro", "customer": {"country": "GR"}}`.
+
+    1. Count the **`upgrade`** events to the **`pro`** plan by customers in
+       **`DE`**. Write the number to **`/lab/answer.txt`**.
+    2. Create a **GIN index** on `payload` so containment queries like
+       `payload @> '{"type":"upgrade"}'` can use it.
+  hints:
+    - "`WHERE payload->>'type' = 'upgrade' AND payload->>'plan' = 'pro' AND payload#>>'{customer,country}' = 'DE'`."
+    - "Or `WHERE payload @> '{\"type\":\"upgrade\",\"plan\":\"pro\",\"customer\":{\"country\":\"DE\"}}'`."
+    - "`CREATE INDEX events_payload_gin ON events USING gin (payload);`"
+  solution: |
+    ```sql
+    SELECT count(*) FROM events
+    WHERE payload @> '{"type": "upgrade", "plan": "pro", "customer": {"country": "DE"}}';
+    CREATE INDEX events_payload_gin ON events USING gin (payload);
+    ```
+  setup: |
+    pg_start
+    pg_sql "create table events(id serial primary key, payload jsonb not null);
+            insert into events(payload)
+              select jsonb_build_object('type', (array['signup','upgrade','downgrade','cancel'])[1 + (random()*3)::int],
+                                        'plan', (array['free','pro','team'])[1 + (random()*2)::int],
+                                        'customer', jsonb_build_object('country', (array['GR','DE','FR','ES','DE'])[1 + (random()*4)::int], 'id', g))
+              from generate_series(1, 20000) g;"
+    pg_sql "select count(*) from events where payload->>'type' = 'upgrade' and payload->>'plan' = 'pro' and payload#>>'{customer,country}' = 'DE'" > "$KL_STATE/answer"
+  check: |
+    check_eq "upgrades to pro in DE" "$(tr -d '[:space:]' < /lab/answer.txt 2>/dev/null)" "$(cat "$KL_STATE/answer")"
+    check "a GIN index covers payload" '[ "$(pg_sql "select count(*) from pg_indexes where tablename = '"'"'events'"'"' and indexdef ilike '"'"'%using gin%payload%'"'"'")" -ge 1 ]'
+  solve: |
+    docker exec -i kl-pg psql -h 127.0.0.1 -U lab -d lab -qAt -c "SELECT count(*) FROM events WHERE payload @> '{\"type\": \"upgrade\", \"plan\": \"pro\", \"customer\": {\"country\": \"DE\"}}'" > /lab/answer.txt
+    docker exec -i kl-pg psql -h 127.0.0.1 -U lab -d lab -qAt -c "CREATE INDEX events_payload_gin ON events USING gin (payload)"
+
+- id: data-058
+  title: An import you can run twice
+  difficulty: 2
+  kind: fix
+  tags: [postgres, upsert, on-conflict, idempotence]
+  tutorial: |
+    **Concept.** `INSERT ... ON CONFLICT (key) DO UPDATE SET col =
+    EXCLUDED.col` is an **upsert**: it inserts new rows and updates the
+    existing ones in one atomic statement. `EXCLUDED` is the row that was
+    proposed for insertion. An import written this way is **idempotent**:
+    running it again leaves the same result.
+
+    **Read up on:**
+    - `INSERT ... ON CONFLICT ... DO UPDATE` / `DO NOTHING`
+    - The `EXCLUDED` pseudo-table
+  scenario: |
+    The nightly stock import **`/lab/import.sql`** loads
+    **`/lab/stock.csv`** into the table **`stock(sku PRIMARY KEY, qty,
+    updated_at)`**. It works on an empty table, but tonight it fails with
+    *duplicate key value violates unique constraint*, because most SKUs already
+    exist.
+
+    Rewrite `import.sql` so it **inserts new SKUs and updates `qty` and
+    `updated_at` for existing ones**, and can be run any number of times. Run it
+    with `docker exec -i kl-pg psql -U lab -d lab < /lab/import.sql`.
+  hints:
+    - "Load the CSV into a temporary table first, then `INSERT INTO stock SELECT ... FROM tmp`."
+    - "`ON CONFLICT (sku) DO UPDATE SET qty = EXCLUDED.qty, updated_at = EXCLUDED.updated_at`."
+    - "`COPY` reads files on the server, and the CSV is on your side: keep the `\\copy ... FROM STDIN` style the script already uses, or paste the rows."
+  solution: |
+    ```sql
+    CREATE TEMP TABLE incoming (LIKE stock);
+    \copy incoming FROM '/lab/stock.csv' WITH (FORMAT csv, HEADER true)
+    INSERT INTO stock SELECT * FROM incoming
+    ON CONFLICT (sku) DO UPDATE SET qty = EXCLUDED.qty, updated_at = EXCLUDED.updated_at;
+    ```
+  setup: |
+    pg_start
+    pg_sql "create table stock(sku text primary key, qty int not null, updated_at date not null);
+            insert into stock select 'SKU-' || lpad(g::text, 4, '0'), (random()*50)::int, date '2026-03-01' from generate_series(1, 300) g;"
+    python3 - <<'PY'
+    import random
+    rows = ["sku,qty,updated_at"]
+    for g in random.sample(range(1, 301), 200) + list(range(301, 341)):
+        rows.append(f"SKU-{g:04d},{random.randint(0, 500)},2026-03-15")
+    open("/lab/stock.csv", "w").write("\n".join(rows) + "\n")
+    PY
+    docker cp /lab/stock.csv kl-pg:/lab-stock.csv
+    lab_file /lab/import.sql <<'EOF'
+    \copy stock FROM '/lab-stock.csv' WITH (FORMAT csv, HEADER true)
+    EOF
+    pg_sql "select sku || '=' || qty from stock order by sku" > "$KL_STATE/before"
+    chown -R "$(lab_user):" /lab
+  check: |
+    run() { docker exec -i kl-pg psql -h 127.0.0.1 -U lab -d lab -v ON_ERROR_STOP=1 -q < /lab/import.sql >/dev/null 2>&1; }
+    check "import.sql runs" 'run'
+    check "import.sql runs a second time" 'run'
+    want=$(python3 - "$KL_STATE/before" /lab/stock.csv <<'PY'
+    import sys
+    cur = dict(l.strip().split("=") for l in open(sys.argv[1]) if l.strip())
+    for l in open(sys.argv[2]).read().splitlines()[1:]:
+        s, q, _ = l.split(","); cur[s] = q
+    print(len(cur)); print(sum(int(v) for v in cur.values()))
+    PY
+    )
+    got=$(pg_sql "select count(*) from stock"; pg_sql "select sum(qty) from stock")
+    check_eq "row count and total quantity" "$(echo $got)" "$(echo $want)"
+    check_eq "updated rows carry the new date" "$(pg_sql "select count(*) from stock where updated_at = '2026-03-15'")" 240
+  solve: |
+    cat > /lab/import.sql <<'SQL'
+    CREATE TEMP TABLE incoming (LIKE stock);
+    \copy incoming FROM '/lab-stock.csv' WITH (FORMAT csv, HEADER true)
+    INSERT INTO stock SELECT * FROM incoming
+    ON CONFLICT (sku) DO UPDATE SET qty = EXCLUDED.qty, updated_at = EXCLUDED.updated_at;
+    SQL
+    docker exec -i kl-pg psql -h 127.0.0.1 -U lab -d lab -q < /lab/import.sql
+
+- id: data-059
+  title: A reporting role that can only read
+  difficulty: 2
+  kind: build
+  tags: [postgres, roles, grants, default-privileges, security]
+  tutorial: |
+    **Concept.** Privileges in PostgreSQL work at several levels. A role
+    needs `CONNECT` on the database and `USAGE` on the schema before `SELECT`
+    on a table is any use. `GRANT SELECT ON ALL TABLES IN SCHEMA` covers the
+    tables that exist **now**. **`ALTER DEFAULT PRIVILEGES`** covers tables
+    created **later** (by the role that creates them).
+
+    **Read up on:**
+    - `CREATE ROLE ... LOGIN PASSWORD`
+    - `GRANT USAGE ON SCHEMA`, `GRANT SELECT ON ALL TABLES IN SCHEMA`
+    - `ALTER DEFAULT PRIVILEGES IN SCHEMA ... GRANT SELECT ON TABLES TO ...`
+  scenario: |
+    The application's tables live in the schema **`app`** (owned by `lab`).
+    Create a login role **`reporting`** with password **`r3ports`** that:
+
+    - can **read every table** in `app`, including tables **created later**
+      by `lab`
+    - can't insert, update, delete or create anything
+  hints:
+    - "`CREATE ROLE reporting LOGIN PASSWORD 'r3ports';`"
+    - "`GRANT USAGE ON SCHEMA app TO reporting; GRANT SELECT ON ALL TABLES IN SCHEMA app TO reporting;`"
+    - "`ALTER DEFAULT PRIVILEGES FOR ROLE lab IN SCHEMA app GRANT SELECT ON TABLES TO reporting;`"
+  solution: |
+    ```sql
+    CREATE ROLE reporting LOGIN PASSWORD 'r3ports';
+    GRANT CONNECT ON DATABASE lab TO reporting;
+    GRANT USAGE ON SCHEMA app TO reporting;
+    GRANT SELECT ON ALL TABLES IN SCHEMA app TO reporting;
+    ALTER DEFAULT PRIVILEGES FOR ROLE lab IN SCHEMA app GRANT SELECT ON TABLES TO reporting;
+    ```
+  setup: |
+    pg_start
+    pg_sql "create schema app;
+            create table app.customers(id serial primary key, name text);
+            create table app.invoices(id serial primary key, customer_id int, amount numeric);
+            insert into app.customers(name) values ('Ana'), ('Bo');
+            insert into app.invoices(customer_id, amount) values (1, 10), (2, 20);"
+  check: |
+    as_rep() { docker exec -i -e PGPASSWORD=r3ports kl-pg psql -h 127.0.0.1 -U reporting -d lab -v ON_ERROR_STOP=1 -qAt -c "$1" 2>/dev/null; }
+    check "reporting can log in with its password" 'as_rep "select 1"'
+    check "reporting has a password set" '[ "$(pg_sql "select rolpassword like '"'"'SCRAM-SHA-256%'"'"' from pg_authid where rolname = '"'"'reporting'"'"'")" = t ]'
+    check_eq "reporting reads app.invoices" "$(as_rep 'select count(*) from app.invoices')" 2
+    pg_sql "drop table if exists app.kl_later; create table app.kl_later(x int); insert into app.kl_later values (1)" >/dev/null
+    check_eq "reporting reads a table created later" "$(as_rep 'select count(*) from app.kl_later')" 1
+    check_not "reporting can't insert" 'as_rep "insert into app.customers(name) values ('"'"'x'"'"')"'
+    check_not "reporting can't delete" 'as_rep "delete from app.invoices"'
+    check_not "reporting can't create tables in app" 'as_rep "create table app.kl_evil(x int)"'
+    check_eq "reporting is not a superuser" "$(pg_sql "select rolsuper from pg_roles where rolname = 'reporting'")" f
+  solve: |
+    docker exec -i kl-pg psql -h 127.0.0.1 -U lab -d lab -v ON_ERROR_STOP=1 -q <<'SQL'
+    CREATE ROLE reporting LOGIN PASSWORD 'r3ports';
+    GRANT CONNECT ON DATABASE lab TO reporting;
+    GRANT USAGE ON SCHEMA app TO reporting;
+    GRANT SELECT ON ALL TABLES IN SCHEMA app TO reporting;
+    ALTER DEFAULT PRIVILEGES FOR ROLE lab IN SCHEMA app GRANT SELECT ON TABLES TO reporting;
+    SQL
+
+- id: data-060
+  title: One active subscription per customer
+  difficulty: 2
+  kind: build
+  tags: [postgres, partial-index, unique, constraints]
+  tutorial: |
+    **Concept.** A **partial unique index** enforces uniqueness only over the
+    rows matching its `WHERE` clause. `CREATE UNIQUE INDEX ... ON subs
+    (customer_id) WHERE status = 'active'` allows any number of cancelled
+    subscriptions per customer, but only **one active** one. A plain `UNIQUE`
+    constraint can't express that.
+
+    **Read up on:**
+    - Partial indexes
+    - `CREATE UNIQUE INDEX ... WHERE ...`
+  scenario: |
+    The table **`subscriptions`** (`id`, `customer_id`, `status`) has a bug:
+    some customers ended up with **two active subscriptions**. Clean that up
+    by **cancelling** (setting `status = 'cancelled'`) every duplicate active
+    subscription **except the one with the highest `id`** per customer. Then
+    make the database **reject** a second active subscription for the same
+    customer from now on, while still allowing many cancelled ones.
+  hints:
+    - "Find duplicates with `GROUP BY customer_id HAVING count(*) > 1` among the active rows."
+    - "`UPDATE subscriptions s SET status = 'cancelled' WHERE status = 'active' AND id < (SELECT max(id) FROM subscriptions t WHERE t.customer_id = s.customer_id AND t.status = 'active')`."
+    - "`CREATE UNIQUE INDEX one_active_sub ON subscriptions (customer_id) WHERE status = 'active';`"
+  solution: |
+    ```sql
+    UPDATE subscriptions s SET status = 'cancelled'
+    WHERE status = 'active'
+      AND id < (SELECT max(id) FROM subscriptions t WHERE t.customer_id = s.customer_id AND t.status = 'active');
+    CREATE UNIQUE INDEX one_active_sub ON subscriptions (customer_id) WHERE status = 'active';
+    ```
+  setup: |
+    pg_start
+    pg_sql "create table subscriptions(id serial primary key, customer_id int not null, status text not null check (status in ('active','cancelled')));
+            insert into subscriptions(customer_id, status) select g, 'active' from generate_series(1, 200) g;
+            insert into subscriptions(customer_id, status) select (random()*199)::int + 1, (array['active','cancelled'])[1 + (random())::int] from generate_series(1, 150);
+            insert into subscriptions(customer_id, status) select (random()*199)::int + 1, 'cancelled' from generate_series(1, 50);"
+    pg_sql "select customer_id || ':' || max(id) from subscriptions where status = 'active' group by customer_id order by 1" > "$KL_STATE/keep"
+    pg_sql "select count(*) from subscriptions" > "$KL_STATE/rows"
+  check: |
+    check_eq "every customer keeps exactly its newest active subscription" "$(pg_sql "select customer_id || ':' || max(id) from subscriptions where status = 'active' group by customer_id having count(*) = 1 order by 1")" "$(cat "$KL_STATE/keep")"
+    check_eq "no rows were deleted" "$(pg_sql 'select count(*) from subscriptions')" "$(cat "$KL_STATE/rows")"
+    check_not "a second active subscription is rejected" 'pg_sql "begin; insert into subscriptions(customer_id, status) values (1, '"'"'active'"'"'); rollback;"'
+    check "more cancelled subscriptions are still allowed" 'pg_sql "begin; insert into subscriptions(customer_id, status) values (1, '"'"'cancelled'"'"'), (1, '"'"'cancelled'"'"'); rollback;"'
+  solve: |
+    docker exec -i kl-pg psql -h 127.0.0.1 -U lab -d lab -v ON_ERROR_STOP=1 -q <<'SQL'
+    UPDATE subscriptions s SET status = 'cancelled'
+    WHERE status = 'active'
+      AND id < (SELECT max(id) FROM subscriptions t WHERE t.customer_id = s.customer_id AND t.status = 'active');
+    CREATE UNIQUE INDEX one_active_sub ON subscriptions (customer_id) WHERE status = 'active';
+    SQL
+
+- id: data-061
+  title: Everyone who reports to the CTO
+  difficulty: 3
+  kind: build
+  tags: [postgres, recursive-cte, hierarchy, tree]
+  tutorial: |
+    **Concept.** Hierarchies stored as `manager_id` pointers need
+    **recursion** to answer "everyone below X". `WITH RECURSIVE` starts from
+    an *anchor* query (X's direct reports) and repeatedly joins the previous
+    result back to the table (their reports) until no new rows appear. Track
+    the **depth** in a column to answer "how many levels down".
+
+    **Read up on:**
+    - `WITH RECURSIVE ... UNION ALL ...`
+    - Guarding against cycles
+  scenario: |
+    The table **`employees`** has `id`, `name`, `title` and `manager_id`. Write
+    two lines to **`/lab/answer.txt`**:
+
+    1. how many people are **anywhere below** the employee whose title is
+       **`CTO`** (direct and indirect reports, not the CTO)
+    2. the **deepest level** below the CTO (direct reports are level 1)
+  hints:
+    - "Anchor: `SELECT id, 1 AS depth FROM employees WHERE manager_id = (SELECT id FROM employees WHERE title = 'CTO')`."
+    - "Recursive part: `SELECT e.id, t.depth + 1 FROM employees e JOIN tree t ON e.manager_id = t.id`."
+    - "`SELECT count(*), max(depth) FROM tree`."
+  solution: |
+    ```sql
+    WITH RECURSIVE tree AS (
+      SELECT id, 1 AS depth FROM employees WHERE manager_id = (SELECT id FROM employees WHERE title = 'CTO')
+      UNION ALL
+      SELECT e.id, t.depth + 1 FROM employees e JOIN tree t ON e.manager_id = t.id
+    )
+    SELECT count(*) || E'\n' || max(depth) FROM tree;
+    ```
+  setup: |
+    pg_start
+    pg_sql "create table employees(id int primary key, name text, title text, manager_id int references employees(id))"
+    python3 - > /tmp/kl-emp.sql <<'PY'
+    import random
+    rows = [(1, "Maya", "CEO", "NULL"), (2, "Theo", "CTO", 1), (3, "Iris", "CFO", 1), (4, "Noah", "COO", 1)]
+    nid = 5
+    frontier = {2: 0, 3: 0, 4: 0}
+    for _ in range(400):
+        parent = random.choice(list(frontier))
+        depth = frontier[parent] + 1
+        if depth > random.randint(3, 8):
+            continue
+        rows.append((nid, f"emp{nid}", "engineer", parent))
+        frontier[nid] = depth
+        nid += 1
+    print("insert into employees values " + ",".join(f"({i}, '{n}', '{t}', {m})" for i, n, t, m in rows) + ";")
+    PY
+    pg_sql < /tmp/kl-emp.sql; rm -f /tmp/kl-emp.sql
+    pg_sql "with recursive t as (select id, 1 d from employees where manager_id = 2 union all select e.id, t.d + 1 from employees e join t on e.manager_id = t.id) select count(*) from t; with recursive t as (select id, 1 d from employees where manager_id = 2 union all select e.id, t.d + 1 from employees e join t on e.manager_id = t.id) select max(d) from t" > "$KL_STATE/answer"
+  check: |
+    check_eq "people below the CTO / deepest level" "$(sed 's/[[:space:]]*$//; /^$/d' /lab/answer.txt 2>/dev/null)" "$(cat "$KL_STATE/answer")"
+  solve: |
+    docker exec -i kl-pg psql -h 127.0.0.1 -U lab -d lab -qAt > /lab/answer.txt <<'SQL'
+    WITH RECURSIVE tree AS (
+      SELECT id, 1 AS depth FROM employees WHERE manager_id = (SELECT id FROM employees WHERE title = 'CTO')
+      UNION ALL
+      SELECT e.id, t.depth + 1 FROM employees e JOIN tree t ON e.manager_id = t.id
+    )
+    SELECT count(*) || E'\n' || max(depth) FROM tree;
+    SQL
+
+- id: data-062
+  title: Search the knowledge base properly
+  difficulty: 3
+  kind: build
+  tags: [postgres, full-text-search, tsvector, gin, ranking]
+  tutorial: |
+    **Concept.** `LIKE '%term%'` can't use a normal index and doesn't know
+    that "restarting" matches "restart". PostgreSQL's **full-text search**
+    turns text into a `tsvector` of normalised lexemes (`to_tsvector('english',
+    body)`) and queries into a `tsquery` (`websearch_to_tsquery`). `@@`
+    matches them, `ts_rank` scores them, and a **GIN index** on a
+    **generated `tsvector` column** keeps it fast.
+
+    **Read up on:**
+    - `to_tsvector`, `websearch_to_tsquery`, `@@`, `ts_rank`
+    - `GENERATED ALWAYS AS (...) STORED` columns
+  scenario: |
+    The table **`articles`** has `id`, `title` and `body`.
+
+    1. Add a generated column **`search`** of type `tsvector`, built from
+       `title || ' ' || body` with the **`english`** configuration, and a
+       **GIN index** on it.
+    2. Find the article that best matches the query **`restart database
+       replica`** (use `websearch_to_tsquery('english', ...)`, rank with
+       `ts_rank`, highest first). Write its **`id`** to
+       **`/lab/answer.txt`**.
+  hints:
+    - "`ALTER TABLE articles ADD COLUMN search tsvector GENERATED ALWAYS AS (to_tsvector('english', title || ' ' || body)) STORED;`"
+    - "`CREATE INDEX articles_search ON articles USING gin (search);`"
+    - "`SELECT id FROM articles, websearch_to_tsquery('english', 'restart database replica') q WHERE search @@ q ORDER BY ts_rank(search, q) DESC LIMIT 1;`"
+  solution: |
+    ```sql
+    ALTER TABLE articles ADD COLUMN search tsvector
+      GENERATED ALWAYS AS (to_tsvector('english', title || ' ' || body)) STORED;
+    CREATE INDEX articles_search ON articles USING gin (search);
+    SELECT id FROM articles, websearch_to_tsquery('english', 'restart database replica') q
+    WHERE search @@ q ORDER BY ts_rank(search, q) DESC, id LIMIT 1;
+    ```
+  setup: |
+    pg_start
+    python3 - > /tmp/kl-art.sql <<'PY'
+    import random
+    words = "cache network backup disk memory latency deploy rollout login password kernel upgrade certificate queue worker".split()
+    rows = []
+    for i in range(1, 301):
+        body = " ".join(random.choice(words) for _ in range(40))
+        rows.append((i, f"note {i}", body))
+    best = random.randint(1, 300)
+    rows[best - 1] = (best, "Restarting a database replica safely",
+                      "When the replica lags, restart the replica service after checking the primary. Restarting the database replica clears the stuck replay. " + rows[best - 1][2])
+    for j in random.sample(range(1, 301), 5):
+        if j != best:
+            rows[j - 1] = (j, f"note {j}", "database " + rows[j - 1][2])
+    print("insert into articles values " + ",".join(f"({i}, '{t}', '{b}')" for i, t, b in rows) + ";")
+    open("/tmp/kl-best", "w").write(str(best))
+    PY
+    pg_sql "create table articles(id int primary key, title text not null, body text not null)"
+    pg_sql < /tmp/kl-art.sql
+    mv /tmp/kl-best "$KL_STATE/answer"; rm -f /tmp/kl-art.sql
+  check: |
+    check_eq "best matching article" "$(tr -d '[:space:]' < /lab/answer.txt 2>/dev/null)" "$(cat "$KL_STATE/answer")"
+    check_eq "search is a generated tsvector column" "$(pg_sql "select data_type || ':' || is_generated from information_schema.columns where table_name = 'articles' and column_name = 'search'")" "tsvector:ALWAYS"
+    check "a GIN index covers search" '[ "$(pg_sql "select count(*) from pg_indexes where tablename = '"'"'articles'"'"' and indexdef ilike '"'"'%gin%(search)%'"'"'")" -ge 1 ]'
+  solve: |
+    docker exec -i kl-pg psql -h 127.0.0.1 -U lab -d lab -v ON_ERROR_STOP=1 -q <<'SQL'
+    ALTER TABLE articles ADD COLUMN search tsvector
+      GENERATED ALWAYS AS (to_tsvector('english', title || ' ' || body)) STORED;
+    CREATE INDEX articles_search ON articles USING gin (search);
+    SQL
+    docker exec -i kl-pg psql -h 127.0.0.1 -U lab -d lab -qAt -c "SELECT id FROM articles, websearch_to_tsquery('english', 'restart database replica') q WHERE search @@ q ORDER BY ts_rank(search, q) DESC, id LIMIT 1" > /lab/answer.txt
+
+- id: data-063
+  title: The login lookup that scans every row
+  difficulty: 3
+  kind: fix
+  tags: [postgres, expression-index, explain, case-insensitive]
+  tutorial: |
+    **Concept.** An index on `email` can't serve `WHERE lower(email) = ...`:
+    the planner sees a **function** of the column, not the column itself. An
+    **expression index** (`CREATE INDEX ON users (lower(email))`) stores the
+    function's result and lets that query use an index scan. Make it `UNIQUE`
+    and it also stops `Ana@x` and `ana@x` from both registering.
+
+    **Read up on:**
+    - Indexes on expressions
+    - `EXPLAIN` / `EXPLAIN ANALYZE`: `Seq Scan` vs `Index Scan`
+  scenario: |
+    Logins run `SELECT id FROM users WHERE lower(email) = lower($1)`, and with
+    half a million users each one does a sequential scan. Make that query
+    use an **index**, and make the database **reject** a new user whose email
+    differs from an existing one **only in letter case**. Existing data has no
+    such duplicates.
+  hints:
+    - "`EXPLAIN SELECT id FROM users WHERE lower(email) = 'someone@example.test';`"
+    - "`CREATE UNIQUE INDEX users_email_lower ON users (lower(email));` then `ANALYZE users;`."
+  solution: |
+    ```sql
+    CREATE UNIQUE INDEX users_email_lower ON users (lower(email));
+    ANALYZE users;
+    EXPLAIN SELECT id FROM users WHERE lower(email) = 'user42@example.test';
+    ```
+  setup: |
+    pg_start
+    pg_sql "create table users(id serial primary key, email text not null unique, created_at timestamptz default now());
+            insert into users(email) select 'User' || g || '@Example.test' from generate_series(1, 500000) g;
+            analyze users;"
+  check: |
+    plan=$(pg_sql "explain select id from users where lower(email) = 'user4242@example.test'")
+    check "the login query uses an index" 'grep -qE "Index (Only )?Scan|Bitmap Index Scan" <<<"$plan"'
+    check_not "a case-only duplicate is rejected" 'pg_sql "begin; insert into users(email) values ('"'"'USER77@EXAMPLE.TEST'"'"'); rollback;"'
+    check "a genuinely new email is accepted" 'pg_sql "begin; insert into users(email) values ('"'"'new.person@example.test'"'"'); rollback;"'
+  solve: |
+    docker exec -i kl-pg psql -h 127.0.0.1 -U lab -d lab -v ON_ERROR_STOP=1 -q -c "CREATE UNIQUE INDEX users_email_lower ON users (lower(email))" -c "ANALYZE users"
+
+- id: data-064
+  title: Ship one table to the analytics database
+  difficulty: 2
+  kind: build
+  tags: [postgres, pg_dump, pg_restore, custom-format]
+  tutorial: |
+    **Concept.** `pg_dump -Fc` writes a **custom-format** archive, which is
+    compressed and can be restored selectively with `pg_restore`. `-t TABLE`
+    dumps a single table with its indexes and constraints. `pg_restore -d DB`
+    loads it into another database, and `--no-owner` skips ownership commands
+    when the target has different roles.
+
+    **Read up on:**
+    - `pg_dump -Fc -t`, `pg_restore -d --no-owner`, `pg_restore -l`
+  scenario: |
+    Copy the table **`public.invoices`** (structure, data and indexes) from
+    the database **`lab`** to the existing, empty database **`analytics`** in
+    the same server **`kl-pg`**, using a **custom-format dump** saved as
+    **`/lab/invoices.dump`** on the Docker host. Don't touch any other table.
+  hints:
+    - "`docker exec kl-pg pg_dump -U lab -Fc -t public.invoices lab > /lab/invoices.dump`."
+    - "`docker exec -i kl-pg pg_restore -U lab -d analytics --no-owner < /lab/invoices.dump`."
+  solution: |
+    ```bash
+    docker exec kl-pg pg_dump -h 127.0.0.1 -U lab -Fc -t public.invoices lab > /lab/invoices.dump
+    docker exec -i kl-pg pg_restore -h 127.0.0.1 -U lab -d analytics --no-owner < /lab/invoices.dump
+    ```
+  setup: |
+    pg_start
+    pg_sql "create database analytics"
+    pg_sql "create table invoices(id serial primary key, customer text not null, amount numeric(10,2) not null, issued date not null);
+            create index invoices_issued on invoices(issued);
+            insert into invoices(customer, amount, issued) select 'c' || (random()*100)::int, round((random()*900)::numeric, 2), date '2026-01-01' + (random()*90)::int from generate_series(1, 5000);
+            create table secrets(id int, token text); insert into secrets values (1, 'do-not-copy');"
+    pg_sql "select count(*) || ':' || sum(amount) from invoices" > "$KL_STATE/answer"
+  check: |
+    ax() { docker exec -i kl-pg psql -h 127.0.0.1 -U lab -d analytics -qAt -c "$1" 2>/dev/null; }
+    check "/lab/invoices.dump is a custom-format archive" 'head -c 5 /lab/invoices.dump 2>/dev/null | grep -q PGDMP'
+    check_eq "analytics.invoices has the data" "$(ax "select count(*) || ':' || sum(amount) from invoices")" "$(cat "$KL_STATE/answer")"
+    check "the index came along" '[ "$(ax "select count(*) from pg_indexes where indexname = '"'"'invoices_issued'"'"'")" = 1 ]'
+    check_eq "no other table was copied" "$(ax "select count(*) from pg_tables where schemaname = 'public'")" 1
+  solve: |
+    docker exec kl-pg pg_dump -h 127.0.0.1 -U lab -Fc -t public.invoices lab > /lab/invoices.dump
+    docker exec -i kl-pg pg_restore -h 127.0.0.1 -U lab -d analytics --no-owner < /lab/invoices.dump
+
+- id: data-065
+  title: Each tenant sees only its own rows
+  difficulty: 4
+  kind: build
+  tags: [postgres, row-level-security, policies, multi-tenant]
+  tutorial: |
+    **Concept.** **Row-level security** adds a `WHERE` clause that PostgreSQL
+    applies to every query on a table, so tenants can't see each other's data
+    even through a buggy query. `ALTER TABLE ... ENABLE ROW LEVEL SECURITY`
+    turns it on. A **policy** (`CREATE POLICY ... USING (...) WITH CHECK
+    (...)`) defines which rows are visible (`USING`) and which may be written
+    (`WITH CHECK`). A session setting such as `current_setting('app.tenant')`
+    tells the policy who is asking. Table owners and superusers bypass
+    policies unless you `FORCE` them.
+
+    **Read up on:**
+    - `ALTER TABLE ... ENABLE ROW LEVEL SECURITY`, `CREATE POLICY`
+    - `current_setting(name, missing_ok)`, `SET app.tenant = '...'`
+  scenario: |
+    The table **`documents`** (`id`, `tenant`, `title`) holds data for several
+    customers, and the application connects as the role **`webapp`** (already
+    created, with `SELECT, INSERT, UPDATE, DELETE` on the table). Before each
+    request it runs `SET app.tenant = '<tenant>'`.
+
+    Make the database enforce that `webapp`:
+
+    - **sees** only rows where `tenant` equals `app.tenant`
+    - can't **insert or update** a row into another tenant
+    - sees **nothing** when `app.tenant` isn't set
+  hints:
+    - "`ALTER TABLE documents ENABLE ROW LEVEL SECURITY;`"
+    - "`CREATE POLICY tenant_isolation ON documents USING (tenant = current_setting('app.tenant', true)) WITH CHECK (tenant = current_setting('app.tenant', true));`"
+    - "`current_setting(..., true)` returns NULL instead of an error when unset, and NULL never equals anything."
+  solution: |
+    ```sql
+    ALTER TABLE documents ENABLE ROW LEVEL SECURITY;
+    CREATE POLICY tenant_isolation ON documents
+      USING (tenant = current_setting('app.tenant', true))
+      WITH CHECK (tenant = current_setting('app.tenant', true));
+    ```
+  setup: |
+    pg_start
+    pg_sql "create table documents(id serial primary key, tenant text not null, title text not null);
+            insert into documents(tenant, title) select (array['acme','globex','initech'])[1 + (random()*2)::int], 'doc ' || g from generate_series(1, 300) g;
+            create role webapp login password 'w3b';
+            grant select, insert, update, delete on documents to webapp;
+            grant usage on sequence documents_id_seq to webapp;"
+    pg_sql "select count(*) from documents where tenant = 'acme'" > "$KL_STATE/acme"
+  check: |
+    as_web() { docker exec -i -e PGPASSWORD=w3b kl-pg psql -h 127.0.0.1 -U webapp -d lab -v ON_ERROR_STOP=1 -qAt 2>/dev/null; }
+    check_eq "acme sees only its rows" "$(printf "set app.tenant = 'acme';\nselect count(*) || ':' || count(*) filter (where tenant = 'acme') from documents;\n" | as_web)" "$(cat "$KL_STATE/acme"):$(cat "$KL_STATE/acme")"
+    check_eq "no tenant set: nothing visible" "$(echo "select count(*) from documents;" | as_web)" 0
+    check_not "acme can't insert a globex row" "printf \"set app.tenant = 'acme';\nbegin;\ninsert into documents(tenant, title) values ('globex', 'x');\nrollback;\n\" | as_web"
+    check_not "acme can't move its row to globex" "printf \"set app.tenant = 'acme';\nbegin;\nupdate documents set tenant = 'globex' where id = (select min(id) from documents where tenant = 'acme');\nrollback;\n\" | as_web"
+    check "acme can still insert its own row" "printf \"set app.tenant = 'acme';\nbegin; insert into documents(tenant, title) values ('acme', 'ok'); rollback;\n\" | as_web"
+  solve: |
+    docker exec -i kl-pg psql -h 127.0.0.1 -U lab -d lab -v ON_ERROR_STOP=1 -q <<'SQL'
+    ALTER TABLE documents ENABLE ROW LEVEL SECURITY;
+    CREATE POLICY tenant_isolation ON documents
+      USING (tenant = current_setting('app.tenant', true))
+      WITH CHECK (tenant = current_setting('app.tenant', true));
+    SQL
+
+- id: data-066
+  title: "duplicate key value violates unique constraint \"orders_pkey\""
+  difficulty: 2
+  kind: fix
+  tags: [postgres, sequences, setval, serial, migration]
+  tutorial: |
+    **Concept.** A `serial` / identity column draws its values from a
+    **sequence**. When rows are loaded **with explicit IDs** (a migration, a
+    restore), the sequence doesn't move, so the next normal insert reuses an
+    ID that already exists. Fix it by moving the sequence past the current
+    maximum: `SELECT setval(pg_get_serial_sequence('orders', 'id'),
+    (SELECT max(id) FROM orders))`.
+
+    **Read up on:**
+    - `pg_get_serial_sequence`, `setval`, `nextval`, `currval`
+  scenario: |
+    After last night's migration copied old orders into **`orders`** with
+    their original IDs, the application can't create new orders: *duplicate
+    key value violates unique constraint "orders_pkey"*.
+
+    Fix it so that `INSERT INTO orders(customer, total) VALUES (...)` works
+    again, **without** changing or deleting any existing order.
+  hints:
+    - "`SELECT max(id) FROM orders;` and `SELECT last_value FROM orders_id_seq;`."
+    - "`SELECT setval(pg_get_serial_sequence('orders', 'id'), (SELECT max(id) FROM orders));`"
+  solution: |
+    ```sql
+    SELECT setval(pg_get_serial_sequence('orders', 'id'), (SELECT max(id) FROM orders));
+    INSERT INTO orders(customer, total) VALUES ('test', 1) RETURNING id;   -- works again
+    ```
+  setup: |
+    pg_start
+    pg_sql "create table orders(id serial primary key, customer text not null, total numeric(10,2) not null);
+            insert into orders(customer, total) values ('new1', 10), ('new2', 20);
+            insert into orders(id, customer, total) select g, 'legacy' || g, g from generate_series(3, 4000) g;"
+    pg_sql "select count(*) || ':' || sum(total) from orders" > "$KL_STATE/answer"
+  check: |
+    check_eq "existing orders untouched" "$(pg_sql "select count(*) || ':' || sum(total) from orders where customer not like 'kl-check%'")" "$(cat "$KL_STATE/answer")"
+    check "new orders can be inserted" 'pg_sql "insert into orders(customer, total) values ('"'"'kl-check-1'"'"', 1), ('"'"'kl-check-2'"'"', 2)" && pg_sql "insert into orders(customer, total) values ('"'"'kl-check-3'"'"', 3)"'
+    pg_sql "delete from orders where customer like 'kl-check%'" >/dev/null
+  solve: |
+    docker exec -i kl-pg psql -h 127.0.0.1 -U lab -d lab -qAt -c "SELECT setval(pg_get_serial_sequence('orders', 'id'), (SELECT max(id) FROM orders))"
+
+- id: data-067
+  title: The two latest orders of every customer
+  difficulty: 3
+  kind: build
+  tags: [postgres, lateral, top-n-per-group, window]
+  tutorial: |
+    **Concept.** "The latest N rows per group" is a classic. One way uses a
+    window function: `row_number() OVER (PARTITION BY customer ORDER BY
+    placed_at DESC)` and keep `rn <= 2`. Another is **`LATERAL`**: for each
+    customer row, a subquery that may refer to it (`ORDER BY placed_at DESC
+    LIMIT 2`). With an index on `(customer_id, placed_at)` that subquery is a
+    tiny index scan per customer.
+
+    **Read up on:**
+    - `JOIN LATERAL (...) ON true`
+    - `row_number() OVER (PARTITION BY ... ORDER BY ...)`
+  scenario: |
+    Create a view **`latest_orders`** with columns **`customer_id, order_id,
+    placed_at`** listing the **two most recent orders** of every customer in
+    **`customers`** (customers with fewer orders show what they have, and
+    customers with none don't appear). Break ties on `placed_at` by the higher
+    order `id`.
+  hints:
+    - "`CREATE VIEW latest_orders AS SELECT c.id AS customer_id, o.id AS order_id, o.placed_at FROM customers c JOIN LATERAL (SELECT id, placed_at FROM orders WHERE customer_id = c.id ORDER BY placed_at DESC, id DESC LIMIT 2) o ON true;`"
+  solution: |
+    ```sql
+    CREATE VIEW latest_orders AS
+    SELECT c.id AS customer_id, o.id AS order_id, o.placed_at
+    FROM customers c
+    JOIN LATERAL (
+      SELECT id, placed_at FROM orders
+      WHERE customer_id = c.id
+      ORDER BY placed_at DESC, id DESC LIMIT 2
+    ) o ON true;
+    ```
+  setup: |
+    pg_start
+    pg_sql "create table customers(id int primary key, name text);
+            insert into customers select g, 'c' || g from generate_series(1, 500) g;
+            create table orders(id serial primary key, customer_id int references customers(id), placed_at timestamp not null);
+            insert into orders(customer_id, placed_at) select 1 + (random()*400)::int, date '2026-01-01' + (random()*60)::int from generate_series(1, 5000);
+            create index on orders(customer_id, placed_at);"
+  check: |
+    want=$(pg_sql "select customer_id, id, placed_at from (select customer_id, id, placed_at, row_number() over (partition by customer_id order by placed_at desc, id desc) rn from orders) s where rn <= 2 order by 1, 2")
+    got=$(pg_sql "select customer_id, order_id, placed_at from latest_orders order by 1, 2" 2>/dev/null)
+    check "the view latest_orders exists" '[ "$(pg_sql "select count(*) from pg_views where viewname = '"'"'latest_orders'"'"'")" = 1 ]'
+    check_eq "its rows" "$(sha1sum <<<"$got")" "$(sha1sum <<<"$want")"
+  solve: |
+    docker exec -i kl-pg psql -h 127.0.0.1 -U lab -d lab -v ON_ERROR_STOP=1 -q <<'SQL'
+    CREATE VIEW latest_orders AS
+    SELECT c.id AS customer_id, o.id AS order_id, o.placed_at
+    FROM customers c
+    JOIN LATERAL (
+      SELECT id, placed_at FROM orders
+      WHERE customer_id = c.id
+      ORDER BY placed_at DESC, id DESC LIMIT 2
+    ) o ON true;
+    SQL
+
+- id: data-068
+  title: Load the supplier CSV, blanks and all
+  difficulty: 2
+  kind: build
+  tags: [postgres, copy, csv, null-handling]
+  tutorial: |
+    **Concept.** `COPY ... FROM` loads CSV at full speed. Its options decide
+    how the file is read: `HEADER` skips the first line, `DELIMITER` sets the
+    separator, `NULL 'NA'` says which text means NULL, and `FORCE_NULL (col)`
+    turns empty quoted strings into NULL. The client-side **`\copy`** in psql
+    reads files on **your** machine, while `COPY` reads files on the
+    **server**.
+
+    **Read up on:**
+    - `COPY ... WITH (FORMAT csv, HEADER, DELIMITER, NULL, FORCE_NULL)`
+    - psql `\copy` vs SQL `COPY`
+  scenario: |
+    The supplier sends **`/lab/products.csv`**: semicolon-separated, with a
+    header line, and missing prices written as **`NA`**. Load it into the
+    existing table **`products(sku, name, price, stock)`** so that every row
+    is imported and missing prices are **NULL** (not 0, not an error).
+  hints:
+    - "Copy the file into the container first (`docker cp /lab/products.csv kl-pg:/tmp/`), or pipe it into `\\copy ... FROM STDIN`."
+    - "`COPY products FROM '/tmp/products.csv' WITH (FORMAT csv, HEADER true, DELIMITER ';', NULL 'NA');`"
+  solution: |
+    ```bash
+    docker exec -i kl-pg psql -U lab -d lab \
+      -c "\copy products FROM STDIN WITH (FORMAT csv, HEADER true, DELIMITER ';', NULL 'NA')" < /lab/products.csv
+    ```
+  setup: |
+    pg_start
+    pg_sql "create table products(sku text primary key, name text not null, price numeric(10,2), stock int not null)"
+    python3 - <<'PY'
+    import random
+    lines = ["sku;name;price;stock"]
+    nulls = 0
+    for i in range(1, 801):
+        price = "NA" if random.random() < 0.1 else f"{random.uniform(1, 300):.2f}"
+        nulls += price == "NA"
+        lines.append(f"P{i:04d};\"Widget, model {i}\";{price};{random.randint(0, 99)}")
+    open("/lab/products.csv", "w").write("\n".join(lines) + "\n")
+    open("/var/lib/kubelab/nulls", "w").write(str(nulls))
+    PY
+    chown -R "$(lab_user):" /lab
+  check: |
+    check_eq "all rows imported" "$(pg_sql 'select count(*) from products')" 800
+    check_eq "missing prices are NULL" "$(pg_sql 'select count(*) from products where price is null')" "$(cat "$KL_STATE/nulls")"
+    check_eq "names with commas survived" "$(pg_sql "select name from products where sku = 'P0042'")" "Widget, model 42"
+  solve: |
+    docker exec -i kl-pg psql -h 127.0.0.1 -U lab -d lab -c "\copy products FROM STDIN WITH (FORMAT csv, HEADER true, DELIMITER ';', NULL 'NA')" < /lab/products.csv
+
+- id: data-069
+  title: A leaderboard in a sorted set
+  difficulty: 2
+  kind: build
+  tags: [redis, sorted-set, zadd, zrevrank, leaderboard]
+  tutorial: |
+    **Concept.** A Redis **sorted set** keeps members ordered by a numeric
+    score. `ZINCRBY` adds points, `ZREVRANGE key 0 2 WITHSCORES` returns the
+    top three, and `ZREVRANK` gives a member's 0-based position from the top.
+    Every operation is O(log n), which is why leaderboards live in sorted sets.
+
+    **Read up on:**
+    - `ZADD`, `ZINCRBY`, `ZREVRANGE ... WITHSCORES`, `ZREVRANK`, `ZSCORE`
+  scenario: |
+    Redis runs in **`kl-redis`** (`docker exec -it kl-redis redis-cli`). Today's
+    match results are in **`/lab/results.txt`**, one `player points` pair per
+    line, and a player can appear many times. The leaderboard key
+    **`lb:today`** already holds this morning's points.
+
+    1. **Add** every result's points to that player's score in `lb:today`.
+    2. Write the **top three players** (highest score first), one per line,
+       to **`/lab/top3.txt`**.
+    3. Write player **`nova`**'s **1-based rank** to **`/lab/nova.txt`**.
+  hints:
+    - "`while read p n; do docker exec kl-redis redis-cli ZINCRBY lb:today \"$n\" \"$p\"; done < /lab/results.txt`."
+    - "`ZREVRANGE lb:today 0 2`."
+    - "`ZREVRANK lb:today nova` is 0-based."
+  solution: |
+    ```bash
+    while read -r p n; do docker exec kl-redis redis-cli ZINCRBY lb:today "$n" "$p" >/dev/null; done < /lab/results.txt
+    docker exec kl-redis redis-cli ZREVRANGE lb:today 0 2 > /lab/top3.txt
+    echo $(( $(docker exec kl-redis redis-cli ZREVRANK lb:today nova) + 1 )) > /lab/nova.txt
+    ```
+  setup: |
+    docker rm -f kl-redis >/dev/null 2>&1
+    docker run -d --name kl-redis redis:7.4-alpine >/dev/null
+    on_reset 'docker rm -f kl-redis >/dev/null 2>&1; true'
+    eventually 20 '[ "$(docker exec kl-redis redis-cli ping)" = PONG ]'
+    python3 - > /tmp/kl-lb <<'PY'
+    import random
+    players = ["nova", "zed", "kai", "luna", "orion", "pixel", "rex", "sky", "vega", "wren", "yuki", "ash"]
+    morning = {p: random.randint(0, 500) for p in players}
+    results = [(p, random.randint(1, 120)) for p in random.choices(players, k=200)]
+    print(" ".join(f"{s} {p}" for p, s in morning.items()))
+    print("\n".join(f"{p} {n}" for p, n in results))
+    PY
+    docker exec kl-redis redis-cli ZADD lb:today $(head -1 /tmp/kl-lb) >/dev/null
+    tail -n +2 /tmp/kl-lb > /lab/results.txt; rm -f /tmp/kl-lb
+    docker exec kl-redis redis-cli ZRANGE lb:today 0 -1 WITHSCORES > "$KL_STATE/morning"
+    chown -R "$(lab_user):" /lab
+  check: |
+    want=$(python3 - "$KL_STATE/morning" /lab/results.txt <<'PY'
+    import sys
+    m = open(sys.argv[1]).read().split()
+    sc = {m[i]: float(m[i + 1]) for i in range(0, len(m), 2)}
+    for l in open(sys.argv[2]):
+        p, n = l.split(); sc[p] += int(n)
+    order = sorted(sc, key=lambda p: (-sc[p], [-ord(c) for c in p]))
+    print("\n".join(order[:3])); print(order.index("nova") + 1); print(int(sum(sc.values())))
+    PY
+    )
+    total=$(docker exec kl-redis redis-cli ZRANGE lb:today 0 -1 WITHSCORES | awk 'NR % 2 == 0 {s += $1} END {print s}')
+    check_eq "lb:today includes every result" "$total" "$(sed -n 5p <<<"$want")"
+    check_eq "top3.txt" "$(sed '/^$/d' /lab/top3.txt 2>/dev/null)" "$(sed -n 1,3p <<<"$want")"
+    check_eq "nova.txt" "$(tr -d '[:space:]' < /lab/nova.txt 2>/dev/null)" "$(sed -n 4p <<<"$want")"
+  solve: |
+    while read -r p n; do docker exec kl-redis redis-cli ZINCRBY lb:today "$n" "$p" >/dev/null; done < /lab/results.txt
+    docker exec kl-redis redis-cli ZREVRANGE lb:today 0 2 > /lab/top3.txt
+    echo $(( $(docker exec kl-redis redis-cli ZREVRANK lb:today nova) + 1 )) > /lab/nova.txt
+
+- id: data-070
+  title: Which key is eating the memory?
+  difficulty: 2
+  kind: build
+  tags: [redis, memory, bigkeys, memory-usage, scan]
+  tutorial: |
+    **Concept.** When Redis memory grows, find the **big keys**.
+    `redis-cli --bigkeys` samples the keyspace with `SCAN` and reports the
+    largest key of each type by element count. `redis-cli --memkeys` (or
+    `MEMORY USAGE key` per key) reports **bytes**, which is what really
+    matters. Never use `KEYS *` on a busy server: it blocks while it walks
+    everything. Use `SCAN`.
+
+    **Read up on:**
+    - `redis-cli --bigkeys`, `--memkeys`
+    - `MEMORY USAGE`, `SCAN ... MATCH ... COUNT`
+  scenario: |
+    The Redis in **`kl-redis`** has thousands of keys, and memory has doubled
+    this week. Write the name of the **single key using the most memory**
+    (by `MEMORY USAGE`) to **`/lab/answer.txt`**, then **delete** that key
+    without blocking the server (use `UNLINK`).
+  hints:
+    - "`docker exec kl-redis redis-cli --memkeys` prints the biggest key per type, in bytes."
+    - "`UNLINK key` frees the memory in the background."
+  solution: |
+    ```bash
+    docker exec kl-redis redis-cli --memkeys
+    # the key with the most bytes, e.g. cache:report:2026-03
+    echo cache:report:2026-03 > /lab/answer.txt
+    docker exec kl-redis redis-cli UNLINK "$(cat /lab/answer.txt)"
+    ```
+  setup: |
+    docker rm -f kl-redis >/dev/null 2>&1
+    docker run -d --name kl-redis redis:7.4-alpine >/dev/null
+    on_reset 'docker rm -f kl-redis >/dev/null 2>&1; true'
+    eventually 20 '[ "$(docker exec kl-redis redis-cli ping)" = PONG ]'
+    python3 - > /tmp/kl-redis.txt <<'PY'
+    import random
+    out = []
+    for i in range(3000):
+        out.append(f"SET session:{i:05d} {'x' * random.randint(20, 200)}")
+    for i in range(200):
+        out.append("RPUSH queue:jobs:%d %s" % (i, " ".join(f"job{j}" for j in range(random.randint(1, 40)))))
+    for i in range(100):
+        out.append("HSET user:%d %s" % (i, " ".join(f"f{j} v{j}" for j in range(30))))
+    # many small members versus one large value
+    out.append("RPUSH events:log " + " ".join(f"e{j}" for j in range(20000)))
+    month = random.choice(["2026-01", "2026-02", "2026-03"])
+    out.append(f"SET cache:report:{month} " + "R" * 600000)
+    open("/var/lib/kubelab/answer", "w").write(f"cache:report:{month}\n")
+    print("\n".join(out))
+    PY
+    docker exec -i kl-redis redis-cli < /tmp/kl-redis.txt >/dev/null; rm -f /tmp/kl-redis.txt
+  check: |
+    k=$(cat "$KL_STATE/answer")
+    check_eq "the biggest key" "$(tr -d '[:space:]' < /lab/answer.txt 2>/dev/null)" "$k"
+    check_eq "it was deleted" "$(docker exec kl-redis redis-cli EXISTS "$k")" 0
+    check_eq "nothing else was deleted" "$(docker exec kl-redis redis-cli DBSIZE)" 3301
+  solve: |
+    keys=$(docker exec kl-redis redis-cli --scan)
+    k=$(paste <(printf 'MEMORY USAGE %s\n' $keys | docker exec -i kl-redis redis-cli) <(printf '%s\n' $keys) | sort -n | tail -1 | cut -f2)
+    echo "$k" > /lab/answer.txt
+    docker exec kl-redis redis-cli UNLINK "$k" >/dev/null
+
+- id: data-071
+  title: A Redis user that can only read reports
+  difficulty: 3
+  kind: build
+  tags: [redis, acl, security, permissions]
+  tutorial: |
+    **Concept.** Redis **ACLs** give each user its own password, allowed
+    **commands** and allowed **key patterns**. `ACL SETUSER reports on >pw
+    ~report:* +@read` creates an enabled user who may run read commands, and
+    only on keys starting with `report:`. `-@all` removes everything first, so
+    you only grant what you list. Test it with `AUTH` or `redis-cli --user`.
+
+    **Read up on:**
+    - `ACL SETUSER` rules: `on`, `>password`, `~pattern`, `+@category`, `-@all`, `resetkeys`
+    - `ACL CAT`, `ACL WHOAMI`, `ACL DRYRUN`
+  scenario: |
+    In **`kl-redis`**, create a user **`reports`** with password
+    **`r3ad-only`** that can:
+
+    - **read** keys matching **`report:*`** (`GET`, `HGETALL`, `LRANGE` and
+      other read commands)
+    - do **nothing else**: no writes, no other keys, no admin commands such as
+      `CONFIG` or `FLUSHALL`
+  hints:
+    - "`ACL SETUSER reports on >r3ad-only resetkeys ~report:* -@all +@read`."
+    - "Test: `redis-cli --user reports --pass r3ad-only GET report:daily`."
+  solution: |
+    ```bash
+    docker exec kl-redis redis-cli ACL SETUSER reports on '>r3ad-only' resetkeys '~report:*' -@all +@read
+    docker exec kl-redis redis-cli --user reports --pass r3ad-only GET report:daily
+    ```
+  setup: |
+    docker rm -f kl-redis >/dev/null 2>&1
+    docker run -d --name kl-redis redis:7.4-alpine >/dev/null
+    on_reset 'docker rm -f kl-redis >/dev/null 2>&1; true'
+    eventually 20 '[ "$(docker exec kl-redis redis-cli ping)" = PONG ]'
+    docker exec kl-redis redis-cli SET report:daily "revenue=1234" >/dev/null
+    docker exec kl-redis redis-cli HSET report:weekly mon 1 tue 2 >/dev/null
+    docker exec kl-redis redis-cli SET secret:api-key "s3cr3t" >/dev/null
+  check: |
+    # never run commands *as* reports: a failed AUTH makes redis-cli carry on as the default user
+    dry() { docker exec kl-redis redis-cli ACL DRYRUN reports "$@" 2>&1; }
+    u=$(docker exec kl-redis redis-cli ACL GETUSER reports 2>/dev/null)
+    pw=$(printf %s r3ad-only | sha256sum | cut -d' ' -f1)
+    check "user reports exists and is enabled" 'grep -qx on <<<"$u"'
+    check "its password is r3ad-only" 'grep -qx "$pw" <<<"$u"'
+    check_eq "reports may GET report:daily" "$(dry GET report:daily)" OK
+    check_eq "reports may HGET report:weekly" "$(dry HGET report:weekly tue)" OK
+    check_match "reports can't read other keys" "$(dry GET secret:api-key)" 'no permissions'
+    check_match "reports can't write" "$(dry SET report:daily hacked)" 'no permissions'
+    check_match "reports can't run CONFIG" "$(dry CONFIG GET maxmemory)" 'no permissions'
+    check_match "reports can't FLUSHALL" "$(dry FLUSHALL)" 'no permissions'
+    check_eq "the data is intact" "$(docker exec kl-redis redis-cli GET report:daily)" "revenue=1234"
+  solve: |
+    docker exec kl-redis redis-cli ACL SETUSER reports on '>r3ad-only' resetkeys '~report:*' -@all +@read >/dev/null
+
+- id: data-072
+  title: The three nearest stores
+  difficulty: 2
+  kind: build
+  tags: [redis, geo, geosearch, geospatial]
+  tutorial: |
+    **Concept.** Redis **geo** commands store longitude/latitude pairs in a
+    sorted set (encoded as geohashes). `GEOADD key lon lat member` adds a
+    location, and `GEOSEARCH key FROMLONLAT lon lat BYRADIUS 5 km ASC COUNT
+    3` returns the nearest members within a radius. `WITHDIST` adds the
+    distance. Note that **longitude comes first**.
+
+    **Read up on:**
+    - `GEOADD`, `GEOSEARCH`, `GEODIST`, `GEOPOS`
+  scenario: |
+    **`/lab/stores.csv`** lists stores as `name,lat,lon` (note the order).
+    Load them into the geo key **`stores`** in **`kl-redis`**, then write the
+    **three stores nearest** to the customer at **latitude 37.9838,
+    longitude 23.7275** that are **within 10 km**, nearest first, one per line,
+    to **`/lab/nearest.txt`**.
+  hints:
+    - "`GEOADD stores <lon> <lat> <name>`: swap the CSV's columns."
+    - "`GEOSEARCH stores FROMLONLAT 23.7275 37.9838 BYRADIUS 10 km ASC COUNT 3`."
+  solution: |
+    ```bash
+    tail -n +2 /lab/stores.csv | while IFS=, read -r name lat lon; do
+      docker exec kl-redis redis-cli GEOADD stores "$lon" "$lat" "$name" >/dev/null
+    done
+    docker exec kl-redis redis-cli GEOSEARCH stores FROMLONLAT 23.7275 37.9838 BYRADIUS 10 km ASC COUNT 3 > /lab/nearest.txt
+    ```
+  setup: |
+    docker rm -f kl-redis >/dev/null 2>&1
+    docker run -d --name kl-redis redis:7.4-alpine >/dev/null
+    on_reset 'docker rm -f kl-redis >/dev/null 2>&1; true'
+    eventually 20 '[ "$(docker exec kl-redis redis-cli ping)" = PONG ]'
+    python3 - <<'PY'
+    import math, random
+    lat0, lon0 = 37.9838, 23.7275
+    rows = ["name,lat,lon"]; dist = []
+    for i in range(60):
+        r = random.uniform(0.5, 40) * 1000
+        a = random.uniform(0, 2 * math.pi)
+        lat = lat0 + (r * math.cos(a)) / 111320
+        lon = lon0 + (r * math.sin(a)) / (111320 * math.cos(math.radians(lat0)))
+        name = f"store-{i:02d}"
+        rows.append(f"{name},{lat:.6f},{lon:.6f}")
+    open("/lab/stores.csv", "w").write("\n".join(rows) + "\n")
+    PY
+    chown -R "$(lab_user):" /lab
+  check: |
+    tmp=kl-check-$RANDOM
+    tail -n +2 /lab/stores.csv | while IFS=, read -r name lat lon; do docker exec kl-redis redis-cli GEOADD $tmp "$lon" "$lat" "$name" >/dev/null; done
+    want=$(docker exec kl-redis redis-cli GEOSEARCH $tmp FROMLONLAT 23.7275 37.9838 BYRADIUS 10 km ASC COUNT 3)
+    docker exec kl-redis redis-cli DEL $tmp >/dev/null
+    check_eq "stores is loaded" "$(docker exec kl-redis redis-cli ZCARD stores)" 60
+    check_eq "nearest.txt" "$(sed '/^$/d' /lab/nearest.txt 2>/dev/null)" "$want"
+  solve: |
+    tail -n +2 /lab/stores.csv | while IFS=, read -r name lat lon; do
+      docker exec kl-redis redis-cli GEOADD stores "$lon" "$lat" "$name" >/dev/null
+    done
+    docker exec kl-redis redis-cli GEOSEARCH stores FROMLONLAT 23.7275 37.9838 BYRADIUS 10 km ASC COUNT 3 > /lab/nearest.txt
+
+- id: data-073
+  title: A dashboard that never blocks the readers
+  difficulty: 3
+  kind: build
+  tags: [postgres, materialized-view, refresh-concurrently, unique-index]
+  tutorial: |
+    **Concept.** A **materialized view** stores a query's result like a
+    table, so dashboards read it instantly. `REFRESH MATERIALIZED VIEW`
+    recomputes it but takes an exclusive lock that **blocks readers**.
+    `REFRESH ... CONCURRENTLY` builds the new result alongside the old one and
+    swaps in the differences, so readers carry on. It requires a **unique
+    index** on the view.
+
+    **Read up on:**
+    - `CREATE MATERIALIZED VIEW`, `REFRESH MATERIALIZED VIEW CONCURRENTLY`
+    - Why `CONCURRENTLY` needs a unique index
+  scenario: |
+    The dashboard reads daily revenue per region from **`orders`** (`id`,
+    `region`, `placed_at`, `total`). Create a materialized view
+    **`daily_revenue`** with columns **`day` (date), `region`, `revenue`**
+    (sum of `total`), set it up so it **can be refreshed concurrently**, and
+    refresh it that way once new orders have arrived. Setup is already
+    inserting them: run your refresh after creating the view.
+  hints:
+    - "`CREATE MATERIALIZED VIEW daily_revenue AS SELECT placed_at::date AS day, region, sum(total) AS revenue FROM orders GROUP BY 1, 2;`"
+    - "`CREATE UNIQUE INDEX ON daily_revenue (day, region);`"
+    - "`REFRESH MATERIALIZED VIEW CONCURRENTLY daily_revenue;`"
+  solution: |
+    ```sql
+    CREATE MATERIALIZED VIEW daily_revenue AS
+      SELECT placed_at::date AS day, region, sum(total) AS revenue FROM orders GROUP BY 1, 2;
+    CREATE UNIQUE INDEX daily_revenue_key ON daily_revenue (day, region);
+    REFRESH MATERIALIZED VIEW CONCURRENTLY daily_revenue;
+    ```
+  setup: |
+    pg_start
+    pg_sql "create table orders(id serial primary key, region text not null, placed_at timestamp not null, total numeric(10,2) not null);
+            insert into orders(region, placed_at, total) select (array['north','south','east'])[1 + (random()*2)::int], date '2026-03-01' + random() * interval '20 days', round((random()*100)::numeric, 2) from generate_series(1, 20000);"
+  check: |
+    check_eq "daily_revenue is a materialized view" "$(pg_sql "select count(*) from pg_matviews where matviewname = 'daily_revenue'")" 1
+    check "it has a unique index" '[ "$(pg_sql "select count(*) from pg_indexes where tablename = '"'"'daily_revenue'"'"' and indexdef ilike '"'"'create unique%'"'"'")" -ge 1 ]'
+    pg_sql "insert into orders(region, placed_at, total) values ('north', '2026-04-01 10:00', 123.45)" >/dev/null
+    check "it refreshes concurrently" 'pg_sql "refresh materialized view concurrently daily_revenue"'
+    check_eq "its data matches orders" "$(pg_sql "select md5(string_agg(day || region || revenue, ',' order by day, region)) from daily_revenue")" "$(pg_sql "select md5(string_agg(d || region || r, ',' order by d, region)) from (select placed_at::date d, region, sum(total) r from orders group by 1, 2) s")"
+    pg_sql "delete from orders where placed_at = '2026-04-01 10:00'" >/dev/null
+  solve: |
+    docker exec -i kl-pg psql -h 127.0.0.1 -U lab -d lab -v ON_ERROR_STOP=1 -q <<'SQL'
+    CREATE MATERIALIZED VIEW daily_revenue AS
+      SELECT placed_at::date AS day, region, sum(total) AS revenue FROM orders GROUP BY 1, 2;
+    CREATE UNIQUE INDEX daily_revenue_key ON daily_revenue (day, region);
+    REFRESH MATERIALIZED VIEW CONCURRENTLY daily_revenue;
+    SQL
+
+- id: data-074
+  title: The longest login streak
+  difficulty: 4
+  kind: build
+  tags: [postgres, gaps-and-islands, window, dates]
+  tutorial: |
+    **Concept.** "Gaps and islands" finds runs of consecutive values. For
+    consecutive dates the trick is: `day - row_number() OVER (PARTITION BY
+    user ORDER BY day)` is **constant within a streak**, because both rise by
+    one each day, and it changes after a gap. Group by that difference to get
+    each streak's length. Remove duplicate days first.
+
+    **Read up on:**
+    - The gaps-and-islands pattern
+    - `date - integer` arithmetic, `DISTINCT`
+  scenario: |
+    The table **`logins`** has `user_id` and `at` (timestamp), with several
+    logins per day for some users. A **streak** is a run of **consecutive
+    calendar days** with at least one login. Write two lines to
+    **`/lab/answer.txt`**:
+
+    1. the **longest streak** of any user, in days
+    2. the **user_id** who has it (the smallest user_id on a tie)
+  hints:
+    - "`SELECT DISTINCT user_id, at::date AS day FROM logins` first."
+    - "`day - (row_number() OVER (PARTITION BY user_id ORDER BY day))::int AS grp`."
+    - "`GROUP BY user_id, grp` and `count(*)` gives each streak's length."
+  solution: |
+    ```sql
+    WITH d AS (SELECT DISTINCT user_id, at::date AS day FROM logins),
+    g AS (SELECT user_id, day - (row_number() OVER (PARTITION BY user_id ORDER BY day))::int AS grp FROM d),
+    s AS (SELECT user_id, count(*) AS len FROM g GROUP BY user_id, grp)
+    SELECT len || E'\n' || user_id FROM s ORDER BY len DESC, user_id LIMIT 1;
+    ```
+  setup: |
+    pg_start
+    pg_sql "create table logins(user_id int not null, at timestamp not null)"
+    python3 - > /tmp/kl-logins.sql <<'PY'
+    import random, datetime
+    rows = []
+    for u in range(1, 81):
+        d = datetime.date(2026, 1, 1) + datetime.timedelta(days=random.randint(0, 20))
+        while d < datetime.date(2026, 4, 1):
+            run = random.randint(1, 9)
+            for k in range(run):
+                for _ in range(random.randint(1, 3)):
+                    rows.append((u, f"{d + datetime.timedelta(days=k)} {random.randint(0, 23):02d}:{random.randint(0, 59):02d}"))
+            d += datetime.timedelta(days=run + random.randint(1, 6))
+    champ = random.randint(1, 80)
+    start = datetime.date(2026, 4, 5)
+    for k in range(random.randint(14, 25)):
+        rows.append((champ, f"{start + datetime.timedelta(days=k)} 08:00"))
+    print("insert into logins values " + ",".join(f"({u}, '{t}')" for u, t in rows) + ";")
+    PY
+    pg_sql < /tmp/kl-logins.sql; rm -f /tmp/kl-logins.sql
+    pg_sql "with d as (select distinct user_id, at::date as day from logins), g as (select user_id, day - (row_number() over (partition by user_id order by day))::int as grp from d), s as (select user_id, count(*) len from g group by user_id, grp) select len || E'\n' || user_id from s order by len desc, user_id limit 1" > "$KL_STATE/answer"
+  check: |
+    check_eq "longest streak / user" "$(sed 's/[[:space:]]*$//; /^$/d' /lab/answer.txt 2>/dev/null)" "$(cat "$KL_STATE/answer")"
+  solve: |
+    docker exec -i kl-pg psql -h 127.0.0.1 -U lab -d lab -qAt > /lab/answer.txt <<'SQL'
+    WITH d AS (SELECT DISTINCT user_id, at::date AS day FROM logins),
+    g AS (SELECT user_id, day - (row_number() OVER (PARTITION BY user_id ORDER BY day))::int AS grp FROM d),
+    s AS (SELECT user_id, count(*) AS len FROM g GROUP BY user_id, grp)
+    SELECT len || E'\n' || user_id FROM s ORDER BY len DESC, user_id LIMIT 1;
+    SQL
+
+- id: data-075
+  title: "Incident: the checkout service can't write"
+  difficulty: 4
+  kind: fix
+  tags: [incident, postgres, locks, roles, sequences, troubleshooting]
+  tutorial: |
+    **Concept.** When an application "can't write", check the layers in
+    order: can it **log in** (`pg_roles`: `rolcanlogin`, `rolvaliduntil`)?
+    Is something **blocking** it (`pg_stat_activity`, `pg_blocking_pids`, and
+    sessions `idle in transaction`)? Does the write itself **fail**
+    (constraints, sequences)? Fix the cause, and terminate a blocker only once
+    you know what it is.
+
+    **Read up on:**
+    - `pg_stat_activity`, `pg_blocking_pids(pid)`, `pg_terminate_backend`
+    - `ALTER ROLE ... LOGIN`, `idle_in_transaction_session_timeout`
+  scenario: |
+    The checkout service connects to **`kl-pg`** as **`checkout`** (password
+    **`ch3ckout`**) and inserts into **`payments`**. Since this morning nothing
+    works. Get it working again so that, as `checkout`:
+
+    - logging in works
+    - `INSERT INTO payments(order_id, amount) VALUES (...)` succeeds within
+      a couple of seconds
+
+    While you're at it, make sure a forgotten session that's **idle in
+    transaction** can never block writes for more than **60 seconds** again
+    (for the `checkout` role or database-wide). Don't delete any payment.
+  hints:
+    - "Log in as checkout: `docker exec -it -e PGPASSWORD=ch3ckout kl-pg psql -h 127.0.0.1 -U checkout -d lab`."
+    - "`SELECT rolname, rolcanlogin FROM pg_roles WHERE rolname = 'checkout';`"
+    - "`SELECT pid, state, query FROM pg_stat_activity WHERE state LIKE 'idle in%';` then `pg_terminate_backend(pid)`."
+    - "Compare `max(id)` with the sequence. `ALTER DATABASE lab SET idle_in_transaction_session_timeout = '60s';`"
+  solution: |
+    ```sql
+    ALTER ROLE checkout LOGIN;
+    SELECT pg_terminate_backend(pid) FROM pg_stat_activity
+      WHERE state = 'idle in transaction' AND pid <> pg_backend_pid();
+    SELECT setval(pg_get_serial_sequence('payments', 'id'), (SELECT max(id) FROM payments));
+    ALTER DATABASE lab SET idle_in_transaction_session_timeout = '60s';
+    ```
+  setup: |
+    pg_start
+    pg_sql "create table payments(id serial primary key, order_id int not null, amount numeric(10,2) not null);
+            insert into payments(order_id, amount) values (1, 10);
+            insert into payments(id, order_id, amount) select g, g, g from generate_series(2, 500) g;
+            create role checkout nologin password 'ch3ckout';
+            grant insert, select on payments to checkout; grant usage on sequence payments_id_seq to checkout;"
+    pg_sql "select count(*) from payments" > "$KL_STATE/rows"
+    docker exec -d kl-pg sh -c "(printf 'begin;\nlock table payments in share mode;\n'; sleep 100000) | psql -h 127.0.0.1 -U lab -d lab >/dev/null 2>&1"
+    eventually 20 '[ "$(pg_sql "select count(*) from pg_stat_activity where state = '"'"'idle in transaction'"'"'")" -ge 1 ]'
+  check: |
+    as_co() { timeout 8 docker exec -i -e PGPASSWORD=ch3ckout kl-pg psql -h 127.0.0.1 -U checkout -d lab -v ON_ERROR_STOP=1 -qAt -c "$1" 2>/dev/null; }
+    check "checkout can log in" 'as_co "select 1"'
+    check "checkout can insert a payment quickly" 'as_co "set statement_timeout = '"'"'3s'"'"'; insert into payments(order_id, amount) values (99999, 1)"'
+    check_eq "no payment was deleted" "$(pg_sql "select count(*) from payments where order_id <> 99999")" "$(cat "$KL_STATE/rows")"
+    t=$(pg_sql "select coalesce((select setting from pg_db_role_setting s cross join lateral unnest(s.setconfig) as setting where setting like 'idle_in_transaction_session_timeout=%' limit 1), '')")
+    check_match "idle in transaction sessions time out within 60s" "$t" '^idle_in_transaction_session_timeout=(60s|1min|60000|[1-5]?[0-9]s|[0-9]+ms)$'
+    pg_sql "set lock_timeout = '2s'; delete from payments where order_id = 99999" >/dev/null 2>&1
+  solve: |
+    docker exec -i kl-pg psql -h 127.0.0.1 -U lab -d lab -v ON_ERROR_STOP=1 -q <<'SQL'
+    ALTER ROLE checkout LOGIN;
+    SELECT pg_terminate_backend(pid) FROM pg_stat_activity WHERE pid <> pg_backend_pid() AND datname = 'lab' AND usename = 'lab' AND state = 'idle in transaction';
+    SELECT setval(pg_get_serial_sequence('payments', 'id'), (SELECT max(id) FROM payments));
+    ALTER DATABASE lab SET idle_in_transaction_session_timeout = '60s';
+    SQL
