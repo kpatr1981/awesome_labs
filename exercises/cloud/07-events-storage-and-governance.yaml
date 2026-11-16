@@ -1,0 +1,1120 @@
+track: cloud
+module: Events, storage & governance
+profile: docker
+order: 7
+exercises:
+
+- id: cloud-051
+  title: A download link that expires
+  difficulty: 1
+  kind: build
+  tags: [aws, s3, presigned-url]
+  tutorial: |
+    **Concept.** A **presigned URL** grants temporary access to one S3 object
+    without sharing credentials. The URL carries a signature made with your
+    keys and an expiry (`X-Amz-Expires`, in seconds). Anyone holding it can
+    `GET` the object until it expires, and the bucket itself stays private.
+
+    **Read up on:**
+    - `aws s3 presign s3://bucket/key --expires-in SECONDS`
+  scenario: |
+    The `aws` command talks to a local emulator. Finance needs to download
+    **`s3://kl-finance/reports/q1.pdf`** without an AWS account. Write a
+    presigned **GET** URL for it, valid for **exactly one hour**, to
+    **`/lab/url.txt`**.
+  hints:
+    - "`aws s3 presign s3://kl-finance/reports/q1.pdf --expires-in 3600 > /lab/url.txt`."
+  solution: |
+    ```bash
+    aws s3 presign s3://kl-finance/reports/q1.pdf --expires-in 3600 > /lab/url.txt
+    curl -s "$(cat /lab/url.txt)" | head -c 40
+    ```
+  setup: |
+    moto_start
+    rm -f /lab/url.txt
+    aws s3api create-bucket --bucket kl-finance >/dev/null
+    echo "Q1 report $RANDOM" > /lab/.q1.pdf
+    aws s3 cp /lab/.q1.pdf s3://kl-finance/reports/q1.pdf >/dev/null
+    cp /lab/.q1.pdf "$KL_STATE/q1"; rm -f /lab/.q1.pdf
+  check: |
+    u=$(head -1 /lab/url.txt 2>/dev/null)
+    check_match "it is a presigned URL for reports/q1.pdf" "$u" 'kl-finance.*reports/q1\.pdf\?.*X-Amz-Signature='
+    check_match "it expires after one hour" "$u" 'X-Amz-Expires=3600(&|$)'
+    check_eq "it downloads the report" "$(curl -fsS -m 5 "$u" 2>/dev/null)" "$(cat "$KL_STATE/q1")"
+  solve: |
+    aws s3 presign s3://kl-finance/reports/q1.pdf --expires-in 3600 > /lab/url.txt
+
+- id: cloud-052
+  title: Host the status page from a bucket
+  difficulty: 1
+  kind: build
+  tags: [aws, s3, static-website]
+  tutorial: |
+    **Concept.** S3 can serve a bucket as a **static website**. The website
+    configuration names the **index document** served for directory requests,
+    and the **error document** served for missing keys. `aws s3 website` sets
+    both, `aws s3 sync` uploads the files, and `get-bucket-website` shows the
+    configuration.
+
+    **Read up on:**
+    - `aws s3 website`, `aws s3api get-bucket-website`
+    - `aws s3 sync`
+  scenario: |
+    **`/lab/site/`** contains the status page (`index.html`, `404.html` and a
+    `css/` folder). Publish it on the existing bucket **`kl-status`**:
+
+    - upload everything in `/lab/site/` to the **root** of the bucket
+    - configure the bucket as a website with **`index.html`** as the index
+      document and **`404.html`** as the error document
+  hints:
+    - "`aws s3 sync /lab/site/ s3://kl-status/`."
+    - "`aws s3 website s3://kl-status/ --index-document index.html --error-document 404.html`."
+  solution: |
+    ```bash
+    aws s3 sync /lab/site/ s3://kl-status/
+    aws s3 website s3://kl-status/ --index-document index.html --error-document 404.html
+    aws s3api get-bucket-website --bucket kl-status
+    ```
+  setup: |
+    moto_start
+    aws s3api create-bucket --bucket kl-status >/dev/null
+    lab_file /lab/site/index.html <<<'<h1>All systems operational</h1>'
+    lab_file /lab/site/404.html <<<'<h1>Not here</h1>'
+    lab_file /lab/site/css/main.css <<<'h1 { color: green }'
+  check: |
+    w=$(aws s3api get-bucket-website --bucket kl-status --output json 2>/dev/null)
+    check_eq "index document" "$(jq -r '.IndexDocument.Suffix // empty' <<<"$w")" index.html
+    check_eq "error document" "$(jq -r '.ErrorDocument.Key // empty' <<<"$w")" 404.html
+    check_eq "uploaded files" "$(aws s3 ls s3://kl-status/ --recursive 2>/dev/null | awk '{print $4}' | sort | tr '\n' ' ')" "404.html css/main.css index.html "
+  solve: |
+    aws s3 sync /lab/site/ s3://kl-status/
+    aws s3 website s3://kl-status/ --index-document index.html --error-document 404.html
+
+- id: cloud-053
+  title: Public images, private everything else
+  difficulty: 2
+  kind: build
+  tags: [aws, s3, bucket-policy, least-privilege]
+  tutorial: |
+    **Concept.** A **bucket policy** is a resource policy attached to a
+    bucket. To make only part of a bucket public, allow `s3:GetObject` to the
+    principal `"*"` on a **prefix ARN** (`arn:aws:s3:::bucket/public/*`), not
+    on the whole bucket. Listing (`s3:ListBucket`) and writes stay private
+    unless you grant them too.
+
+    **Read up on:**
+    - `aws s3api put-bucket-policy`, `get-bucket-policy`
+    - Bucket ARN vs object ARN (`arn:aws:s3:::b` vs `arn:aws:s3:::b/*`)
+  scenario: |
+    The bucket **`kl-assets`** holds the website's images under
+    **`public/`** and invoices under `private/`. Attach a bucket policy that
+    lets **anyone read objects under `public/`**, and nothing more: no
+    listing, no writes, and nothing outside `public/`.
+  hints:
+    - "One statement: `Effect Allow`, `Principal \"*\"`, `Action s3:GetObject`, `Resource arn:aws:s3:::kl-assets/public/*`."
+    - "Write the JSON to `/lab/policy.json` and run `aws s3api put-bucket-policy --bucket kl-assets --policy file:///lab/policy.json`."
+  solution: |
+    ```bash
+    cat > /lab/policy.json <<'EOF'
+    {
+      "Version": "2012-10-17",
+      "Statement": [{
+        "Sid": "PublicReadImages",
+        "Effect": "Allow",
+        "Principal": "*",
+        "Action": "s3:GetObject",
+        "Resource": "arn:aws:s3:::kl-assets/public/*"
+      }]
+    }
+    EOF
+    aws s3api put-bucket-policy --bucket kl-assets --policy file:///lab/policy.json
+    ```
+  setup: |
+    moto_start
+    aws s3api create-bucket --bucket kl-assets >/dev/null
+    echo x > /lab/.f; aws s3 cp /lab/.f s3://kl-assets/public/logo.png >/dev/null; aws s3 cp /lab/.f s3://kl-assets/private/invoice.pdf >/dev/null; rm -f /lab/.f
+  check: |
+    p=$(aws s3api get-bucket-policy --bucket kl-assets --query Policy --output text 2>/dev/null)
+    allow=$(jq -c '[.Statement[] | select(.Effect == "Allow") | {p: (.Principal | if type == "object" then (.AWS // .) else . end), a: ([.Action] | flatten), r: ([.Resource] | flatten)}]' <<<"$p" 2>/dev/null)
+    check "the policy lets anyone GetObject under public/" 'jq -e "any(.[]; (.p == \"*\" or .p == [\"*\"]) and (.a | index(\"s3:GetObject\")) and (.r | index(\"arn:aws:s3:::kl-assets/public/*\")))" <<<"$allow" >/dev/null'
+    check_not "no other actions are allowed" 'jq -e "any(.[]; .a | any(. != \"s3:GetObject\"))" <<<"$allow" >/dev/null'
+    check_not "nothing outside public/ is allowed" 'jq -e "any(.[]; .r | any(. != \"arn:aws:s3:::kl-assets/public/*\"))" <<<"$allow" >/dev/null'
+  solve: |
+    cat > /lab/policy.json <<'EOF'
+    {"Version": "2012-10-17", "Statement": [{"Sid": "PublicReadImages", "Effect": "Allow", "Principal": "*",
+      "Action": "s3:GetObject", "Resource": "arn:aws:s3:::kl-assets/public/*"}]}
+    EOF
+    aws s3api put-bucket-policy --bucket kl-assets --policy file:///lab/policy.json
+
+- id: cloud-054
+  title: Let the web app fetch from the bucket
+  difficulty: 2
+  kind: build
+  tags: [aws, s3, cors, browser]
+  tutorial: |
+    **Concept.** Browsers block JavaScript from reading responses from
+    another origin unless the server allows it with **CORS** headers. For S3,
+    a bucket **CORS configuration** lists the allowed origins, methods and
+    headers, and how long browsers may cache the preflight result
+    (`MaxAgeSeconds`).
+
+    **Read up on:**
+    - `aws s3api put-bucket-cors`, `get-bucket-cors`
+    - Preflight (`OPTIONS`) requests
+  scenario: |
+    The single-page app at **`https://app.example.test`** loads JSON files
+    from the bucket **`kl-data`** with `fetch()`, and the browser blocks
+    it. Configure CORS on `kl-data` with **one rule** that allows:
+
+    - origin **`https://app.example.test`** only
+    - methods **`GET`** and **`HEAD`**
+    - any request header (`*`)
+    - preflight caching for **3000** seconds
+  hints:
+    - "`{\"CORSRules\": [{\"AllowedOrigins\": [...], \"AllowedMethods\": [\"GET\", \"HEAD\"], \"AllowedHeaders\": [\"*\"], \"MaxAgeSeconds\": 3000}]}`."
+    - "`aws s3api put-bucket-cors --bucket kl-data --cors-configuration file:///lab/cors.json`."
+  solution: |
+    ```bash
+    cat > /lab/cors.json <<'EOF'
+    {"CORSRules": [{"AllowedOrigins": ["https://app.example.test"], "AllowedMethods": ["GET", "HEAD"],
+                    "AllowedHeaders": ["*"], "MaxAgeSeconds": 3000}]}
+    EOF
+    aws s3api put-bucket-cors --bucket kl-data --cors-configuration file:///lab/cors.json
+    ```
+  setup: |
+    moto_start
+    aws s3api create-bucket --bucket kl-data >/dev/null
+  check: |
+    c=$(aws s3api get-bucket-cors --bucket kl-data --output json 2>/dev/null)
+    check_eq "one CORS rule" "$(jq '.CORSRules | length' <<<"$c" 2>/dev/null)" 1
+    check_eq "allowed origin" "$(jq -c '.CORSRules[0].AllowedOrigins' <<<"$c" 2>/dev/null)" '["https://app.example.test"]'
+    check_eq "allowed methods" "$(jq -c '.CORSRules[0].AllowedMethods | sort' <<<"$c" 2>/dev/null)" '["GET","HEAD"]'
+    check_eq "allowed headers" "$(jq -c '.CORSRules[0].AllowedHeaders' <<<"$c" 2>/dev/null)" '["*"]'
+    check_eq "max age" "$(jq '.CORSRules[0].MaxAgeSeconds' <<<"$c" 2>/dev/null)" 3000
+  solve: |
+    cat > /lab/cors.json <<'EOF'
+    {"CORSRules": [{"AllowedOrigins": ["https://app.example.test"], "AllowedMethods": ["GET", "HEAD"], "AllowedHeaders": ["*"], "MaxAgeSeconds": 3000}]}
+    EOF
+    aws s3api put-bucket-cors --bucket kl-data --cors-configuration file:///lab/cors.json
+
+- id: cloud-055
+  title: Orders in order, and only once
+  difficulty: 2
+  kind: build
+  tags: [aws, sqs, fifo, deduplication, message-group]
+  tutorial: |
+    **Concept.** A standard SQS queue may deliver out of order and more than
+    once. A **FIFO** queue (its name must end in `.fifo`) delivers messages
+    **in order within a message group**, and drops duplicates sent within 5
+    minutes, judged by a `MessageDeduplicationId` or, with
+    **content-based deduplication**, by a hash of the body.
+
+    **Read up on:**
+    - `aws sqs create-queue --attributes FifoQueue=true,ContentBasedDeduplication=true`
+    - `--message-group-id`, `--message-deduplication-id`
+  scenario: |
+    Create a FIFO queue **`orders.fifo`** with **content-based
+    deduplication**. Then send these three events for order 42, in this
+    order, with message group **`order-42`**: `created`, `paid`, `shipped`.
+    The payment service retries, so **send `paid` twice**: only one copy may
+    end up in the queue.
+  hints:
+    - "`aws sqs create-queue --queue-name orders.fifo --attributes FifoQueue=true,ContentBasedDeduplication=true`."
+    - "`aws sqs send-message --queue-url URL --message-group-id order-42 --message-body paid`."
+  solution: |
+    ```bash
+    url=$(aws sqs create-queue --queue-name orders.fifo \
+      --attributes FifoQueue=true,ContentBasedDeduplication=true --query QueueUrl --output text)
+    for m in created paid paid shipped; do
+      aws sqs send-message --queue-url "$url" --message-group-id order-42 --message-body "$m"
+    done
+    ```
+  setup: |
+    moto_start
+  check: |
+    url=$(aws sqs get-queue-url --queue-name orders.fifo --query QueueUrl --output text 2>/dev/null)
+    a=$(aws sqs get-queue-attributes --queue-url "$url" --attribute-names All --output json 2>/dev/null)
+    check_eq "orders.fifo is a FIFO queue" "$(jq -r '.Attributes.FifoQueue // empty' <<<"$a")" true
+    check_eq "content-based deduplication" "$(jq -r '.Attributes.ContentBasedDeduplication // empty' <<<"$a")" true
+    msgs=$(aws sqs receive-message --queue-url "$url" --max-number-of-messages 10 --visibility-timeout 0 --attribute-names MessageGroupId --output json 2>/dev/null)
+    check_eq "the queue holds created, paid, shipped in order" "$(jq -r '[.Messages[]?.Body] | join(",")' <<<"$msgs")" "created,paid,shipped"
+    check_eq "all in group order-42" "$(jq -r '[.Messages[]?.Attributes.MessageGroupId] | unique | join(",")' <<<"$msgs")" "order-42"
+  solve: |
+    url=$(aws sqs create-queue --queue-name orders.fifo --attributes FifoQueue=true,ContentBasedDeduplication=true --query QueueUrl --output text)
+    for m in created paid paid shipped; do
+      aws sqs send-message --queue-url "$url" --message-group-id order-42 --message-body "$m" >/dev/null
+    done
+
+- id: cloud-056
+  title: Wake on-call only for critical alerts
+  difficulty: 2
+  kind: build
+  tags: [aws, sns, sqs, filter-policy, fan-out]
+  tutorial: |
+    **Concept.** An SNS topic delivers every message to every subscriber,
+    unless a subscription has a **filter policy**. That's a JSON document
+    matched against the message's **attributes** (`{"severity":
+    ["critical"]}`). Non-matching messages are simply not delivered to that
+    subscriber, while other subscribers still get them.
+
+    **Read up on:**
+    - `aws sns subscribe`, `aws sns set-subscription-attributes --attribute-name FilterPolicy`
+    - Message attributes in `aws sns publish`
+  scenario: |
+    The topic **`alerts`** already fans out to the queue `all-alerts`. Subscribe
+    the SQS queue **`oncall`** to the same topic so that it receives **only
+    messages whose attribute `severity` is `critical`**. The `all-alerts`
+    subscription must keep receiving everything.
+  hints:
+    - "Get the queue ARN: `aws sqs get-queue-attributes --queue-url URL --attribute-names QueueArn`."
+    - "`aws sns subscribe --topic-arn ARN --protocol sqs --notification-endpoint QUEUE_ARN --attributes '{\"FilterPolicy\":\"{\\\"severity\\\":[\\\"critical\\\"]}\"}'`."
+    - "Or subscribe first, then `aws sns set-subscription-attributes --attribute-name FilterPolicy --attribute-value '{\"severity\":[\"critical\"]}'`."
+  solution: |
+    ```bash
+    topic=$(aws sns list-topics --query "Topics[?ends_with(TopicArn, ':alerts')].TopicArn" --output text)
+    q=$(aws sqs get-queue-url --queue-name oncall --query QueueUrl --output text)
+    qa=$(aws sqs get-queue-attributes --queue-url "$q" --attribute-names QueueArn --query Attributes.QueueArn --output text)
+    sub=$(aws sns subscribe --topic-arn "$topic" --protocol sqs --notification-endpoint "$qa" --query SubscriptionArn --output text)
+    aws sns set-subscription-attributes --subscription-arn "$sub" --attribute-name FilterPolicy \
+      --attribute-value '{"severity":["critical"]}'
+    ```
+  setup: |
+    moto_start
+    t=$(aws sns create-topic --name alerts --query TopicArn --output text)
+    all=$(aws sqs create-queue --queue-name all-alerts --query QueueUrl --output text)
+    aws sqs create-queue --queue-name oncall >/dev/null
+    alla=$(aws sqs get-queue-attributes --queue-url "$all" --attribute-names QueueArn --query Attributes.QueueArn --output text)
+    aws sns subscribe --topic-arn "$t" --protocol sqs --notification-endpoint "$alla" >/dev/null
+  check: |
+    t=$(aws sns list-topics --query "Topics[?ends_with(TopicArn, ':alerts')].TopicArn" --output text)
+    on=$(aws sqs get-queue-url --queue-name oncall --query QueueUrl --output text); all=$(aws sqs get-queue-url --queue-name all-alerts --query QueueUrl --output text)
+    aws sqs purge-queue --queue-url "$on" >/dev/null 2>&1; aws sqs purge-queue --queue-url "$all" >/dev/null 2>&1
+    for s in info critical warning critical; do
+      aws sns publish --topic-arn "$t" --message "kl-$s" --message-attributes "{\"severity\":{\"DataType\":\"String\",\"StringValue\":\"$s\"}}" >/dev/null
+    done
+    got() { aws sqs receive-message --queue-url "$1" --max-number-of-messages 10 --output json 2>/dev/null | jq -r '[.Messages[]?.Body | fromjson | .Message] | sort | join(",")'; }
+    check_eq "oncall receives only the critical alerts" "$(got "$on")" "kl-critical,kl-critical"
+    check_eq "all-alerts still receives everything" "$(got "$all")" "kl-critical,kl-critical,kl-info,kl-warning"
+  solve: |
+    topic=$(aws sns list-topics --query "Topics[?ends_with(TopicArn, ':alerts')].TopicArn" --output text)
+    q=$(aws sqs get-queue-url --queue-name oncall --query QueueUrl --output text)
+    qa=$(aws sqs get-queue-attributes --queue-url "$q" --attribute-names QueueArn --query Attributes.QueueArn --output text)
+    sub=$(aws sns subscribe --topic-arn "$topic" --protocol sqs --notification-endpoint "$qa" --query SubscriptionArn --output text)
+    aws sns set-subscription-attributes --subscription-arn "$sub" --attribute-name FilterPolicy --attribute-value '{"severity":["critical"]}'
+
+- id: cloud-057
+  title: Every job runs twice
+  difficulty: 2
+  kind: fix
+  tags: [aws, sqs, visibility-timeout, long-polling]
+  tutorial: |
+    **Concept.** When a consumer receives an SQS message, the message is
+    hidden for the queue's **visibility timeout**. If processing takes longer
+    than that, the message reappears and **another worker takes it too**.
+    Set the timeout comfortably above the processing time. With
+    **long polling** (`ReceiveMessageWaitTimeSeconds` up to 20), an empty
+    queue answers only when a message arrives or the wait ends, instead of
+    returning instantly and costing a request each time.
+
+    **Read up on:**
+    - `VisibilityTimeout`, `ReceiveMessageWaitTimeSeconds`
+    - `aws sqs set-queue-attributes`
+  scenario: |
+    Workers on the queue **`render-jobs`** take up to **90 seconds** per
+    job, and every job is rendered twice. The workers also poll in a tight
+    loop and run up the request bill.
+
+    Change the queue's attributes so that a received job stays hidden for
+    **5 minutes**, and receives **wait up to 20 seconds** for a message.
+    Keep the messages already in the queue.
+  hints:
+    - "`aws sqs get-queue-attributes --queue-url URL --attribute-names All`."
+    - "`aws sqs set-queue-attributes --queue-url URL --attributes VisibilityTimeout=300,ReceiveMessageWaitTimeSeconds=20`."
+  solution: |
+    ```bash
+    url=$(aws sqs get-queue-url --queue-name render-jobs --query QueueUrl --output text)
+    aws sqs set-queue-attributes --queue-url "$url" --attributes VisibilityTimeout=300,ReceiveMessageWaitTimeSeconds=20
+    ```
+  setup: |
+    moto_start
+    url=$(aws sqs create-queue --queue-name render-jobs --attributes VisibilityTimeout=30 --query QueueUrl --output text)
+    for i in 1 2 3 4 5; do aws sqs send-message --queue-url "$url" --message-body "job-$i" >/dev/null; done
+  check: |
+    url=$(aws sqs get-queue-url --queue-name render-jobs --query QueueUrl --output text 2>/dev/null)
+    a=$(aws sqs get-queue-attributes --queue-url "$url" --attribute-names All --output json 2>/dev/null)
+    check_eq "visibility timeout" "$(jq -r '.Attributes.VisibilityTimeout' <<<"$a")" 300
+    check_eq "long polling" "$(jq -r '.Attributes.ReceiveMessageWaitTimeSeconds' <<<"$a")" 20
+    check_eq "the jobs are still queued" "$(jq -r '.Attributes.ApproximateNumberOfMessages' <<<"$a")" 5
+  solve: |
+    url=$(aws sqs get-queue-url --queue-name render-jobs --query QueueUrl --output text)
+    aws sqs set-queue-attributes --queue-url "$url" --attributes VisibilityTimeout=300,ReceiveMessageWaitTimeSeconds=20
+
+- id: cloud-058
+  title: One customer's orders for one month
+  difficulty: 2
+  kind: build
+  tags: [aws, dynamodb, query, sort-key, begins_with]
+  tutorial: |
+    **Concept.** In DynamoDB, a **Query** reads items sharing one partition
+    key and can narrow the **sort key** with `=`, `<`, `BETWEEN` or
+    **`begins_with`**. Single-table designs put a type and a date in the sort
+    key (`ORDER#2026-03-14#9812`) so `begins_with(sk, 'ORDER#2026-03')` returns
+    one month's orders without scanning the table.
+
+    **Read up on:**
+    - `aws dynamodb query --key-condition-expression`
+    - `--expression-attribute-values`, `--select COUNT`
+  scenario: |
+    The table **`shop`** has partition key **`pk`** (for example
+    `CUSTOMER#c42`) and sort key **`sk`**. Orders have sort keys like
+    `ORDER#2026-03-14#9812`, and the same partition also holds the
+    customer's profile and addresses.
+
+    Using a **Query** (not a scan), count customer **`c42`**'s orders placed
+    in **March 2026**, and write the number to **`/lab/answer.txt`**.
+  hints:
+    - "`--key-condition-expression 'pk = :p AND begins_with(sk, :m)'`."
+    - "`--expression-attribute-values '{\":p\":{\"S\":\"CUSTOMER#c42\"},\":m\":{\"S\":\"ORDER#2026-03\"}}' --select COUNT --query Count`."
+  solution: |
+    ```bash
+    aws dynamodb query --table-name shop \
+      --key-condition-expression 'pk = :p AND begins_with(sk, :m)' \
+      --expression-attribute-values '{":p":{"S":"CUSTOMER#c42"},":m":{"S":"ORDER#2026-03"}}' \
+      --select COUNT --query Count --output text > /lab/answer.txt
+    ```
+  setup: |
+    moto_start
+    aws dynamodb create-table --table-name shop --billing-mode PAY_PER_REQUEST \
+      --attribute-definitions AttributeName=pk,AttributeType=S AttributeName=sk,AttributeType=S \
+      --key-schema AttributeName=pk,KeyType=HASH AttributeName=sk,KeyType=RANGE >/dev/null
+    python3 - > /lab/.items.json <<'PY'
+    import json, random
+    items, n = [], 0
+    for c in ("c41", "c42", "c43"):
+        items.append({"pk": {"S": f"CUSTOMER#{c}"}, "sk": {"S": "PROFILE"}, "name": {"S": c}})
+        items.append({"pk": {"S": f"CUSTOMER#{c}"}, "sk": {"S": "ADDRESS#home"}, "city": {"S": "Athens"}})
+        for i in range(random.randint(15, 24)):
+            m = random.choice(["2026-02", "2026-03", "2026-03", "2026-04"])
+            d = f"{m}-{random.randint(1, 28):02d}"
+            items.append({"pk": {"S": f"CUSTOMER#{c}"}, "sk": {"S": f"ORDER#{d}#{random.randint(1000, 9999)}"}, "total": {"N": str(random.randint(5, 300))}})
+            if c == "c42" and m == "2026-03":
+                n += 1
+    print(json.dumps({"shop": [{"PutRequest": {"Item": it}} for it in items]}))
+    open("/var/lib/kubelab/answer", "w").write(str(n))
+    PY
+    python3 - <<'PY'
+    import json
+    d = json.load(open("/lab/.items.json"))["shop"]
+    for i in range(0, len(d), 25):
+        json.dump({"shop": d[i:i + 25]}, open(f"/lab/.batch{i // 25}.json", "w"))
+    PY
+    for f in /lab/.batch*.json; do aws dynamodb batch-write-item --request-items "file://$f" >/dev/null; done
+    rm -f /lab/.items.json /lab/.batch*.json
+  check: |
+    check_eq "c42's March orders" "$(tr -d '[:space:]' < /lab/answer.txt 2>/dev/null)" "$(cat "$KL_STATE/answer")"
+  solve: |
+    aws dynamodb query --table-name shop \
+      --key-condition-expression 'pk = :p AND begins_with(sk, :m)' \
+      --expression-attribute-values '{":p":{"S":"CUSTOMER#c42"},":m":{"S":"ORDER#2026-03"}}' \
+      --select COUNT --query Count --output text > /lab/answer.txt
+
+- id: cloud-059
+  title: How many errors did the API log?
+  difficulty: 2
+  kind: build
+  tags: [aws, cloudwatch-logs, filter-pattern, logs]
+  tutorial: |
+    **Concept.** CloudWatch Logs organises events into **log groups** and
+    **streams**. `filter-log-events` searches every stream of a group, and a
+    **filter pattern** selects events. A plain term like `ERROR` matches
+    events containing that word, and `"status=500"` (in quotes) matches an
+    exact phrase. `--start-time` and `--end-time` (milliseconds since the
+    epoch) bound the search.
+
+    **Read up on:**
+    - `aws logs filter-log-events --filter-pattern`
+    - Filter pattern syntax
+  scenario: |
+    The log group **`/kl/api`** has several streams, one per server. Count
+    the log events that contain the term **`ERROR`** across **all** streams,
+    and write the number to **`/lab/answer.txt`**.
+  hints:
+    - "`aws logs filter-log-events --log-group-name /kl/api --filter-pattern ERROR --query 'events[].eventId' --output text`."
+    - "The CLI follows the pagination for you. Count the results with `jq length` or `wc -w`."
+  solution: |
+    ```bash
+    aws logs filter-log-events --log-group-name /kl/api --filter-pattern ERROR \
+      --output json | jq '.events | length' > /lab/answer.txt
+    ```
+  setup: |
+    moto_start
+    aws logs create-log-group --log-group-name /kl/api
+    now=$(( $(date +%s) * 1000 - 3600000 ))
+    n=0
+    for s in api-1 api-2 api-3; do
+      aws logs create-log-stream --log-group-name /kl/api --log-stream-name $s
+      ev="["
+      for i in $(seq 1 40); do
+        case $((RANDOM % 5)) in 0) lvl=ERROR; n=$((n + 1)) ;; 1) lvl=WARN ;; *) lvl=INFO ;; esac
+        ev="$ev{\"timestamp\":$((now + i * 1000)),\"message\":\"$lvl request $RANDOM took $((RANDOM % 900))ms\"},"
+      done
+      echo "${ev%,}]" > /lab/.ev.json
+      aws logs put-log-events --log-group-name /kl/api --log-stream-name $s --log-events file:///lab/.ev.json >/dev/null
+    done
+    rm -f /lab/.ev.json
+    echo $n > "$KL_STATE/answer"
+  check: |
+    check_eq "ERROR events" "$(tr -d '[:space:]' < /lab/answer.txt 2>/dev/null)" "$(cat "$KL_STATE/answer")"
+  solve: |
+    aws logs filter-log-events --log-group-name /kl/api --filter-pattern ERROR --output json | jq '.events | length' > /lab/answer.txt
+
+- id: cloud-060
+  title: Turn 500s in the log into a metric
+  difficulty: 2
+  kind: build
+  tags: [aws, cloudwatch-logs, metric-filter, metrics]
+  tutorial: |
+    **Concept.** A **metric filter** watches a log group and turns matching
+    events into a CloudWatch **metric**: each match adds `metricValue` (often
+    `1`) to `metricNamespace/metricName`. Alarms can then fire on that metric.
+    Log lines become something you can alert on.
+
+    **Read up on:**
+    - `aws logs put-metric-filter --metric-transformations`
+    - `aws logs describe-metric-filters`
+  scenario: |
+    Create a metric filter **`http-5xx`** on the log group **`/kl/web`** that
+    counts log events containing the exact phrase **`status=500`** into the
+    metric **`Http5xx`** in the namespace **`KL/Web`**, adding **1** per
+    matching event (and 0 when nothing matches).
+  hints:
+    - "`--filter-pattern '\"status=500\"'` (the quotes make it a phrase)."
+    - "`--metric-transformations metricName=Http5xx,metricNamespace=KL/Web,metricValue=1,defaultValue=0`."
+  solution: |
+    ```bash
+    aws logs put-metric-filter --log-group-name /kl/web --filter-name http-5xx \
+      --filter-pattern '"status=500"' \
+      --metric-transformations metricName=Http5xx,metricNamespace=KL/Web,metricValue=1,defaultValue=0
+    ```
+  setup: |
+    moto_start
+    aws logs create-log-group --log-group-name /kl/web
+  check: |
+    f=$(aws logs describe-metric-filters --log-group-name /kl/web --output json 2>/dev/null | jq '.metricFilters[] | select(.filterName == "http-5xx")')
+    check "the filter http-5xx exists" '[ -n "$f" ]'
+    check_match "it matches the phrase status=500" "$(jq -r .filterPattern <<<"$f" 2>/dev/null)" '^"status=500"$'
+    t=$(jq -c '.metricTransformations[0]' <<<"$f" 2>/dev/null)
+    check_eq "metric KL/Web Http5xx" "$(jq -r '.metricNamespace + " " + .metricName' <<<"$t" 2>/dev/null)" "KL/Web Http5xx"
+    check_eq "value 1 per match" "$(jq -r .metricValue <<<"$t" 2>/dev/null)" 1
+    check_match "default value 0" "$(jq -r .defaultValue <<<"$t" 2>/dev/null)" '^0(\.0)?$'
+  solve: |
+    aws logs put-metric-filter --log-group-name /kl/web --filter-name http-5xx --filter-pattern '"status=500"' \
+      --metric-transformations metricName=Http5xx,metricNamespace=KL/Web,metricValue=1,defaultValue=0
+
+- id: cloud-061
+  title: Encrypt everything in the bucket by default
+  difficulty: 2
+  kind: build
+  tags: [aws, s3, kms, encryption, bucket-key]
+  tutorial: |
+    **Concept.** S3 **default encryption** applies to every new object
+    that doesn't ask for something else. `SSE-KMS` encrypts with a KMS key
+    you control (and whose use is logged and can be restricted by policy).
+    An **S3 Bucket Key** lets S3 reuse a data key and cuts KMS request costs.
+    Refer to the key by **alias** so it can be rotated behind the name.
+
+    **Read up on:**
+    - `aws s3api put-bucket-encryption`
+    - `aws kms create-key`, `create-alias`
+  scenario: |
+    The compliance team wants every new object in the bucket **`kl-records`**
+    encrypted with the customer-managed KMS key **`alias/kl-records`** (it
+    already exists). Configure the bucket's **default encryption** as
+    **SSE-KMS** with that alias and with **Bucket Key** enabled.
+  hints:
+    - "`{\"Rules\":[{\"ApplyServerSideEncryptionByDefault\":{\"SSEAlgorithm\":\"aws:kms\",\"KMSMasterKeyID\":\"alias/kl-records\"},\"BucketKeyEnabled\":true}]}`."
+    - "`aws s3api put-bucket-encryption --bucket kl-records --server-side-encryption-configuration file:///lab/enc.json`."
+  solution: |
+    ```bash
+    cat > /lab/enc.json <<'EOF'
+    {"Rules": [{"ApplyServerSideEncryptionByDefault": {"SSEAlgorithm": "aws:kms", "KMSMasterKeyID": "alias/kl-records"},
+                "BucketKeyEnabled": true}]}
+    EOF
+    aws s3api put-bucket-encryption --bucket kl-records --server-side-encryption-configuration file:///lab/enc.json
+    ```
+  setup: |
+    moto_start
+    aws s3api create-bucket --bucket kl-records >/dev/null
+    k=$(aws kms create-key --description records --query KeyMetadata.KeyId --output text)
+    aws kms create-alias --alias-name alias/kl-records --target-key-id "$k"
+    echo "$k" > "$KL_STATE/key"
+  check: |
+    e=$(aws s3api get-bucket-encryption --bucket kl-records --output json 2>/dev/null | jq -c '.ServerSideEncryptionConfiguration.Rules[0]')
+    check_eq "SSE-KMS" "$(jq -r '.ApplyServerSideEncryptionByDefault.SSEAlgorithm' <<<"$e" 2>/dev/null)" "aws:kms"
+    check_match "with the kl-records key" "$(jq -r '.ApplyServerSideEncryptionByDefault.KMSMasterKeyID' <<<"$e" 2>/dev/null)" "alias/kl-records|$(cat "$KL_STATE/key")"
+    check_eq "Bucket Key enabled" "$(jq -r '.BucketKeyEnabled' <<<"$e" 2>/dev/null)" true
+  solve: |
+    cat > /lab/enc.json <<'EOF'
+    {"Rules": [{"ApplyServerSideEncryptionByDefault": {"SSEAlgorithm": "aws:kms", "KMSMasterKeyID": "alias/kl-records"}, "BucketKeyEnabled": true}]}
+    EOF
+    aws s3api put-bucket-encryption --bucket kl-records --server-side-encryption-configuration file:///lab/enc.json
+
+- id: cloud-062
+  title: The database password, encrypted in Parameter Store
+  difficulty: 2
+  kind: fix
+  tags: [aws, ssm, parameter-store, securestring, kms]
+  tutorial: |
+    **Concept.** SSM Parameter Store has `String`, `StringList` and
+    **`SecureString`** parameters. A SecureString is encrypted with a KMS key
+    (the AWS-managed one, or your own via `--key-id`), and reading the plain
+    value needs **`--with-decryption`** and permission to use the key. A
+    password stored as a plain `String` is readable by anyone with
+    `ssm:GetParameter`.
+
+    **Read up on:**
+    - `aws ssm put-parameter --type SecureString --key-id --overwrite`
+    - `aws ssm get-parameter --with-decryption`
+  scenario: |
+    Someone stored the production database password as a plain **`String`**
+    at **`/kl/prod/db/password`**. Replace it with a **`SecureString`**
+    encrypted with the customer-managed key **`alias/kl-app`**, keeping the
+    **same value**. Parameters can't change type in place, so think about the
+    order of operations.
+  hints:
+    - "Read the value first: `aws ssm get-parameter --name /kl/prod/db/password --query Parameter.Value --output text`."
+    - "`aws ssm delete-parameter`, then `aws ssm put-parameter --type SecureString --key-id alias/kl-app --value ...`."
+  solution: |
+    ```bash
+    v=$(aws ssm get-parameter --name /kl/prod/db/password --query Parameter.Value --output text)
+    aws ssm delete-parameter --name /kl/prod/db/password
+    aws ssm put-parameter --name /kl/prod/db/password --type SecureString --key-id alias/kl-app --value "$v"
+    ```
+  setup: |
+    moto_start
+    k=$(aws kms create-key --query KeyMetadata.KeyId --output text)
+    aws kms create-alias --alias-name alias/kl-app --target-key-id "$k"
+    pw="Pg-$RANDOM-$RANDOM-x"; echo "$pw" > "$KL_STATE/pw"; echo "$k" > "$KL_STATE/key"
+    aws ssm put-parameter --name /kl/prod/db/password --type String --value "$pw" >/dev/null
+  check: |
+    d=$(aws ssm describe-parameters --parameter-filters Key=Name,Values=/kl/prod/db/password --output json 2>/dev/null | jq -c '.Parameters[0]')
+    check_eq "it is a SecureString" "$(jq -r .Type <<<"$d" 2>/dev/null)" SecureString
+    check_match "encrypted with alias/kl-app" "$(jq -r .KeyId <<<"$d" 2>/dev/null)" "alias/kl-app|$(cat "$KL_STATE/key")"
+    check_eq "the value is unchanged" "$(aws ssm get-parameter --name /kl/prod/db/password --with-decryption --query Parameter.Value --output text 2>/dev/null)" "$(cat "$KL_STATE/pw")"
+  solve: |
+    v=$(aws ssm get-parameter --name /kl/prod/db/password --query Parameter.Value --output text)
+    aws ssm delete-parameter --name /kl/prod/db/password
+    aws ssm put-parameter --name /kl/prod/db/password --type SecureString --key-id alias/kl-app --value "$v" >/dev/null
+
+- id: cloud-063
+  title: Move credits in one transaction
+  difficulty: 3
+  kind: build
+  tags: [aws, dynamodb, transactions, condition-expression]
+  tutorial: |
+    **Concept.** `transact-write-items` applies up to 100 writes
+    **atomically**: all succeed or none do. Each `Update` can carry a
+    **`ConditionExpression`**, and if any condition fails the whole
+    transaction is cancelled (`TransactionCanceledException`). That's how you
+    move value between items without ever creating or losing it.
+
+    **Read up on:**
+    - `aws dynamodb transact-write-items`
+    - `UpdateExpression`, `ConditionExpression`, `ExpressionAttributeValues`
+  scenario: |
+    The table **`wallets`** (key `id`) holds numeric `credits`. Write a small
+    script **`/lab/transfer.sh FROM TO AMOUNT`** that moves `AMOUNT` credits
+    from wallet `FROM` to wallet `TO` with **one** `transact-write-items`
+    call. The transfer must **fail and change nothing** if `FROM` has fewer
+    than `AMOUNT` credits or if `TO` doesn't exist. The script exits non-zero
+    when the transfer fails.
+
+    Then move **30** credits from **`alice`** to **`bob`**.
+  hints:
+    - "Two `Update` actions: `SET credits = credits - :a` with `ConditionExpression credits >= :a`, and `SET credits = credits + :a` with `ConditionExpression attribute_exists(id)`."
+    - "Build the JSON in the script with the arguments, and pass it with `--transact-items`."
+  solution: |
+    ```bash
+    cat > /lab/transfer.sh <<'EOF'
+    #!/bin/bash
+    from=$1 to=$2 amt=$3
+    aws dynamodb transact-write-items --transact-items "[
+      {\"Update\": {\"TableName\": \"wallets\", \"Key\": {\"id\": {\"S\": \"$from\"}},
+        \"UpdateExpression\": \"SET credits = credits - :a\", \"ConditionExpression\": \"credits >= :a\",
+        \"ExpressionAttributeValues\": {\":a\": {\"N\": \"$amt\"}}}},
+      {\"Update\": {\"TableName\": \"wallets\", \"Key\": {\"id\": {\"S\": \"$to\"}},
+        \"UpdateExpression\": \"SET credits = credits + :a\", \"ConditionExpression\": \"attribute_exists(id)\",
+        \"ExpressionAttributeValues\": {\":a\": {\"N\": \"$amt\"}}}}]"
+    EOF
+    chmod +x /lab/transfer.sh
+    /lab/transfer.sh alice bob 30
+    ```
+  setup: |
+    moto_start
+    rm -f /lab/transfer.sh
+    aws dynamodb create-table --table-name wallets --billing-mode PAY_PER_REQUEST \
+      --attribute-definitions AttributeName=id,AttributeType=S --key-schema AttributeName=id,KeyType=HASH >/dev/null
+    for w in alice:100 bob:20 carol:5; do
+      aws dynamodb put-item --table-name wallets --item "{\"id\":{\"S\":\"${w%%:*}\"},\"credits\":{\"N\":\"${w#*:}\"}}"
+    done
+  check: |
+    c() { aws dynamodb get-item --table-name wallets --key "{\"id\":{\"S\":\"$1\"}}" --query Item.credits.N --output text 2>/dev/null; }
+    check_eq "alice after the transfer" "$(c alice)" 70
+    check_eq "bob after the transfer" "$(c bob)" 50
+    t() { sudo -u "$(lab_user)" -H bash /lab/transfer.sh "$@" >/dev/null 2>&1; }
+    if [ -x /lab/transfer.sh ] || [ -f /lab/transfer.sh ]; then
+      check_not "carol can't send 6 credits she doesn't have" 't carol bob 6'
+      check_eq "a failed transfer changes nothing" "$(c carol):$(c bob)" "5:50"
+      check_not "a transfer to a missing wallet fails" 't alice nobody 10'
+      check_eq "and leaves alice alone" "$(c alice)" 70
+      check "a valid transfer works" 't bob carol 10'
+      check_eq "bob and carol after it" "$(c bob):$(c carol)" "40:15"
+      aws dynamodb put-item --table-name wallets --item '{"id":{"S":"bob"},"credits":{"N":"50"}}'
+      aws dynamodb put-item --table-name wallets --item '{"id":{"S":"carol"},"credits":{"N":"5"}}'
+    else
+      fail "/lab/transfer.sh exists"
+    fi
+  solve: |
+    cat > /lab/transfer.sh <<'EOF'
+    #!/bin/bash
+    from=$1 to=$2 amt=$3
+    aws dynamodb transact-write-items --transact-items "[
+      {\"Update\": {\"TableName\": \"wallets\", \"Key\": {\"id\": {\"S\": \"$from\"}},
+        \"UpdateExpression\": \"SET credits = credits - :a\", \"ConditionExpression\": \"credits >= :a\",
+        \"ExpressionAttributeValues\": {\":a\": {\"N\": \"$amt\"}}}},
+      {\"Update\": {\"TableName\": \"wallets\", \"Key\": {\"id\": {\"S\": \"$to\"}},
+        \"UpdateExpression\": \"SET credits = credits + :a\", \"ConditionExpression\": \"attribute_exists(id)\",
+        \"ExpressionAttributeValues\": {\":a\": {\"N\": \"$amt\"}}}}]"
+    EOF
+    chmod +x /lab/transfer.sh
+    /lab/transfer.sh alice bob 30
+
+- id: cloud-064
+  title: Route the big orders to their own queue
+  difficulty: 3
+  kind: build
+  tags: [aws, eventbridge, event-pattern, sqs, routing]
+  tutorial: |
+    **Concept.** **EventBridge** routes JSON events using **rules**. A rule's
+    **event pattern** matches fields of the event: `source`, `detail-type`
+    and anything inside `detail`. Each pattern value is a list of allowed
+    values. Matching events go to the rule's **targets**, such as an SQS
+    queue, a Lambda function or another bus. Events that match no rule are
+    simply dropped.
+
+    **Read up on:**
+    - `aws events put-rule --event-pattern`, `aws events put-targets`
+    - Event pattern syntax
+  scenario: |
+    The shop publishes events with source **`kl.shop`** and detail-type
+    **`OrderPlaced`** on the default event bus. Their `detail` has a field
+    **`tier`** (`standard` or `vip`). Create a rule **`vip-orders`** that sends
+    **only VIP `OrderPlaced` events from `kl.shop`** to the SQS queue
+    **`vip-orders`**.
+  hints:
+    - "`--event-pattern '{\"source\":[\"kl.shop\"],\"detail-type\":[\"OrderPlaced\"],\"detail\":{\"tier\":[\"vip\"]}}'`."
+    - "`aws events put-targets --rule vip-orders --targets Id=q,Arn=QUEUE_ARN`."
+  solution: |
+    ```bash
+    q=$(aws sqs get-queue-url --queue-name vip-orders --query QueueUrl --output text)
+    qa=$(aws sqs get-queue-attributes --queue-url "$q" --attribute-names QueueArn --query Attributes.QueueArn --output text)
+    aws events put-rule --name vip-orders \
+      --event-pattern '{"source":["kl.shop"],"detail-type":["OrderPlaced"],"detail":{"tier":["vip"]}}'
+    aws events put-targets --rule vip-orders --targets "Id=q,Arn=$qa"
+    ```
+  setup: |
+    moto_start
+    aws sqs create-queue --queue-name vip-orders >/dev/null
+  check: |
+    q=$(aws sqs get-queue-url --queue-name vip-orders --query QueueUrl --output text)
+    aws sqs purge-queue --queue-url "$q" >/dev/null 2>&1
+    ev() { printf '{"Source":"%s","DetailType":"%s","Detail":"{\\"tier\\":\\"%s\\",\\"id\\":\\"%s\\"}"}' "$@"; }
+    entries="[$(ev kl.shop OrderPlaced vip kl-1),$(ev kl.shop OrderPlaced standard kl-2),$(ev kl.shop OrderShipped vip kl-3),$(ev kl.other OrderPlaced vip kl-4),$(ev kl.shop OrderPlaced vip kl-5)]"
+    aws events put-events --entries "$entries" >/dev/null
+    got=$(aws sqs receive-message --queue-url "$q" --max-number-of-messages 10 --output json 2>/dev/null | jq -r '[.Messages[]?.Body | fromjson | .detail.id] | sort | join(",")')
+    check_eq "only VIP OrderPlaced events from kl.shop reach the queue" "$got" "kl-1,kl-5"
+  solve: |
+    q=$(aws sqs get-queue-url --queue-name vip-orders --query QueueUrl --output text)
+    qa=$(aws sqs get-queue-attributes --queue-url "$q" --attribute-names QueueArn --query Attributes.QueueArn --output text)
+    aws events put-rule --name vip-orders --event-pattern '{"source":["kl.shop"],"detail-type":["OrderPlaced"],"detail":{"tier":["vip"]}}' >/dev/null
+    aws events put-targets --rule vip-orders --targets "Id=q,Arn=$qa" >/dev/null
+
+- id: cloud-065
+  title: Tell the queue about new uploads
+  difficulty: 3
+  kind: build
+  tags: [aws, s3, event-notifications, sqs, prefix-filter]
+  tutorial: |
+    **Concept.** S3 **event notifications** send a message when something
+    happens in a bucket (`s3:ObjectCreated:*`, `s3:ObjectRemoved:*`, …) to SQS,
+    SNS or Lambda. **Filter rules** on the key's `prefix` and `suffix` limit
+    which objects trigger it. The notification configuration replaces the
+    bucket's previous one completely, so include everything you want to keep.
+
+    **Read up on:**
+    - `aws s3api put-bucket-notification-configuration`
+    - `QueueConfigurations`, `Filter.Key.FilterRules`
+  scenario: |
+    Uploads land in the bucket **`kl-ingest`**. The importer reads the SQS
+    queue **`ingest-jobs`**. Configure the bucket so that **every object
+    created under `incoming/` with the suffix `.csv`** produces a message on
+    `ingest-jobs`, and nothing else does (other prefixes, other file types).
+  hints:
+    - "`{\"QueueConfigurations\": [{\"QueueArn\": \"...\", \"Events\": [\"s3:ObjectCreated:*\"], \"Filter\": {\"Key\": {\"FilterRules\": [{\"Name\": \"prefix\", \"Value\": \"incoming/\"}, {\"Name\": \"suffix\", \"Value\": \".csv\"}]}}}]}`."
+  solution: |
+    ```bash
+    q=$(aws sqs get-queue-url --queue-name ingest-jobs --query QueueUrl --output text)
+    qa=$(aws sqs get-queue-attributes --queue-url "$q" --attribute-names QueueArn --query Attributes.QueueArn --output text)
+    cat > /lab/notify.json <<EOF
+    {"QueueConfigurations": [{"QueueArn": "$qa", "Events": ["s3:ObjectCreated:*"],
+      "Filter": {"Key": {"FilterRules": [{"Name": "prefix", "Value": "incoming/"}, {"Name": "suffix", "Value": ".csv"}]}}}]}
+    EOF
+    aws s3api put-bucket-notification-configuration --bucket kl-ingest --notification-configuration file:///lab/notify.json
+    ```
+  setup: |
+    moto_start
+    aws s3api create-bucket --bucket kl-ingest >/dev/null
+    aws sqs create-queue --queue-name ingest-jobs >/dev/null
+  check: |
+    q=$(aws sqs get-queue-url --queue-name ingest-jobs --query QueueUrl --output text)
+    aws sqs purge-queue --queue-url "$q" >/dev/null 2>&1
+    echo a,b > /lab/.kl.csv
+    for k in incoming/kl-1.csv incoming/kl-2.txt other/kl-3.csv incoming/sub/kl-4.csv; do aws s3 cp /lab/.kl.csv "s3://kl-ingest/$k" >/dev/null; done
+    rm -f /lab/.kl.csv
+    got=$(aws sqs receive-message --queue-url "$q" --max-number-of-messages 10 --output json 2>/dev/null | jq -r '[.Messages[]?.Body | fromjson | .Records[]?.s3.object.key | gsub("%2F"; "/")] | sort | join(",")')
+    check_eq "only CSVs under incoming/ notify the queue" "$got" "incoming/kl-1.csv,incoming/sub/kl-4.csv"
+    for k in incoming/kl-1.csv incoming/kl-2.txt other/kl-3.csv incoming/sub/kl-4.csv; do aws s3 rm "s3://kl-ingest/$k" >/dev/null 2>&1; done
+  solve: |
+    q=$(aws sqs get-queue-url --queue-name ingest-jobs --query QueueUrl --output text)
+    qa=$(aws sqs get-queue-attributes --queue-url "$q" --attribute-names QueueArn --query Attributes.QueueArn --output text)
+    cat > /lab/notify.json <<EOF
+    {"QueueConfigurations": [{"QueueArn": "$qa", "Events": ["s3:ObjectCreated:*"],
+      "Filter": {"Key": {"FilterRules": [{"Name": "prefix", "Value": "incoming/"}, {"Name": "suffix", "Value": ".csv"}]}}}]}
+    EOF
+    aws s3api put-bucket-notification-configuration --bucket kl-ingest --notification-configuration file:///lab/notify.json
+
+- id: cloud-066
+  title: Copy the critical data to the DR bucket
+  difficulty: 3
+  kind: build
+  tags: [aws, s3, replication, versioning, disaster-recovery]
+  tutorial: |
+    **Concept.** S3 **replication** copies new objects from a source bucket
+    to a destination, possibly in another region or account. It requires
+    **versioning on both buckets** and an IAM **role** that S3 assumes to do
+    the copying. Each rule has a `Status`, a filter (such as a prefix), a
+    destination bucket ARN and a priority.
+
+    **Read up on:**
+    - `aws s3api put-bucket-versioning`, `put-bucket-replication`
+    - Replication rule fields: `Filter.Prefix`, `Destination.Bucket`, `DeleteMarkerReplication`
+  scenario: |
+    Set up replication from **`kl-prod-data`** to **`kl-dr-data`** for
+    objects under **`critical/`** only, using the role
+    **`arn:aws:iam::123456789012:role/kl-s3-replication`** (it exists). The
+    rule must be **enabled**, and both buckets need whatever replication
+    requires.
+
+    Keep the replication configuration you apply in
+    **`/lab/replication.json`**, since it goes into version control. (The
+    lab's emulator doesn't echo the rule's prefix back, so that file is
+    where the check reads it.)
+  hints:
+    - "S3 refuses a replication configuration until versioning is `Enabled` on the source, and on the destination too."
+    - "`aws s3api put-bucket-versioning --bucket B --versioning-configuration Status=Enabled`."
+    - "Rule: `{\"ID\": \"critical\", \"Status\": \"Enabled\", \"Priority\": 1, \"Filter\": {\"Prefix\": \"critical/\"}, \"DeleteMarkerReplication\": {\"Status\": \"Disabled\"}, \"Destination\": {\"Bucket\": \"arn:aws:s3:::kl-dr-data\"}}`."
+  solution: |
+    ```bash
+    for b in kl-prod-data kl-dr-data; do
+      aws s3api put-bucket-versioning --bucket $b --versioning-configuration Status=Enabled
+    done
+    cat > /lab/replication.json <<'EOF'
+    {"Role": "arn:aws:iam::123456789012:role/kl-s3-replication",
+     "Rules": [{"ID": "critical", "Status": "Enabled", "Priority": 1, "Filter": {"Prefix": "critical/"},
+                "DeleteMarkerReplication": {"Status": "Disabled"},
+                "Destination": {"Bucket": "arn:aws:s3:::kl-dr-data"}}]}
+    EOF
+    aws s3api put-bucket-replication --bucket kl-prod-data --replication-configuration file:///lab/replication.json
+    ```
+  setup: |
+    moto_start
+    aws s3api create-bucket --bucket kl-prod-data >/dev/null
+    aws s3api create-bucket --bucket kl-dr-data >/dev/null
+    aws iam create-role --role-name kl-s3-replication --assume-role-policy-document '{"Version":"2012-10-17","Statement":[{"Effect":"Allow","Principal":{"Service":"s3.amazonaws.com"},"Action":"sts:AssumeRole"}]}' >/dev/null
+  check: |
+    for b in kl-prod-data kl-dr-data; do
+      check_eq "versioning on $b" "$(aws s3api get-bucket-versioning --bucket $b --query Status --output text 2>/dev/null)" Enabled
+    done
+    r=$(aws s3api get-bucket-replication --bucket kl-prod-data --output json 2>/dev/null | jq -c .ReplicationConfiguration)
+    check_eq "the replication role" "$(jq -r .Role <<<"$r" 2>/dev/null)" "arn:aws:iam::123456789012:role/kl-s3-replication"
+    rule=$(jq -c '.Rules[0]' <<<"$r" 2>/dev/null)
+    check_eq "the rule is enabled" "$(jq -r .Status <<<"$rule" 2>/dev/null)" Enabled
+    f=$(jq -c '.Rules[0]' /lab/replication.json 2>/dev/null)
+    check_eq "/lab/replication.json covers critical/ only" "$(jq -r '.Filter.Prefix // .Prefix // empty' <<<"$f" 2>/dev/null)" "critical/"
+    check_eq "/lab/replication.json is what was applied" "$(jq -r '"\(.Role) \(.Rules[0].Destination.Bucket)"' /lab/replication.json 2>/dev/null)" "$(jq -r '"\(.Role) \(.Rules[0].Destination.Bucket)"' <<<"$r" 2>/dev/null)"
+    check_eq "it targets kl-dr-data" "$(jq -r .Destination.Bucket <<<"$rule" 2>/dev/null)" "arn:aws:s3:::kl-dr-data"
+  solve: |
+    for b in kl-prod-data kl-dr-data; do
+      aws s3api put-bucket-versioning --bucket $b --versioning-configuration Status=Enabled
+    done
+    cat > /lab/replication.json <<'EOF'
+    {"Role": "arn:aws:iam::123456789012:role/kl-s3-replication",
+     "Rules": [{"ID": "critical", "Status": "Enabled", "Priority": 1, "Filter": {"Prefix": "critical/"},
+                "DeleteMarkerReplication": {"Status": "Disabled"}, "Destination": {"Bucket": "arn:aws:s3:::kl-dr-data"}}]}
+    EOF
+    aws s3api put-bucket-replication --bucket kl-prod-data --replication-configuration file:///lab/replication.json
+
+- id: cloud-067
+  title: Fail over to the standby site
+  difficulty: 3
+  kind: build
+  tags: [aws, route53, failover, health-check, dns]
+  tutorial: |
+    **Concept.** Route 53 **failover routing** answers with the **PRIMARY**
+    record while its **health check** passes, and with the **SECONDARY** record
+    when it doesn't. Both records share a name and type, each has a
+    `SetIdentifier`, and the primary references a health check that probes the
+    primary site. TTLs should be short so clients follow the switch quickly.
+
+    **Read up on:**
+    - `aws route53 create-health-check`
+    - `change-resource-record-sets` with `Failover`, `SetIdentifier`, `HealthCheckId`
+  scenario: |
+    In the hosted zone **`kl.example`**, make **`www.kl.example`** (type
+    `A`, TTL **60**) answer:
+
+    - **`10.0.1.10`** as the **PRIMARY**, guarded by an HTTP health check on
+      `10.0.1.10` port **80**, path **`/health`**
+    - **`10.0.2.10`** as the **SECONDARY**
+
+    Remove the existing simple `A` record for `www` first, because a simple
+    record can't share its name with failover records.
+  hints:
+    - "`aws route53 create-health-check --caller-reference $(date +%s) --health-check-config IPAddress=10.0.1.10,Port=80,Type=HTTP,ResourcePath=/health`."
+    - "One change batch: `DELETE` the old record, `CREATE` two records with `SetIdentifier`, `Failover: PRIMARY|SECONDARY`, and `HealthCheckId` on the primary."
+  solution: |
+    ```bash
+    zone=$(aws route53 list-hosted-zones-by-name --dns-name kl.example --query 'HostedZones[0].Id' --output text)
+    hc=$(aws route53 create-health-check --caller-reference "www-$(date +%s)" \
+      --health-check-config IPAddress=10.0.1.10,Port=80,Type=HTTP,ResourcePath=/health --query HealthCheck.Id --output text)
+    cat > /lab/failover.json <<EOF
+    {"Changes": [
+      {"Action": "DELETE", "ResourceRecordSet": {"Name": "www.kl.example.", "Type": "A", "TTL": 300, "ResourceRecords": [{"Value": "10.0.1.10"}]}},
+      {"Action": "CREATE", "ResourceRecordSet": {"Name": "www.kl.example.", "Type": "A", "TTL": 60, "SetIdentifier": "primary",
+        "Failover": "PRIMARY", "HealthCheckId": "$hc", "ResourceRecords": [{"Value": "10.0.1.10"}]}},
+      {"Action": "CREATE", "ResourceRecordSet": {"Name": "www.kl.example.", "Type": "A", "TTL": 60, "SetIdentifier": "secondary",
+        "Failover": "SECONDARY", "ResourceRecords": [{"Value": "10.0.2.10"}]}}]}
+    EOF
+    aws route53 change-resource-record-sets --hosted-zone-id "$zone" --change-batch file:///lab/failover.json
+    ```
+  setup: |
+    moto_start
+    zone=$(aws route53 create-hosted-zone --name kl.example --caller-reference "kl-$RANDOM" --query HostedZone.Id --output text)
+    aws route53 change-resource-record-sets --hosted-zone-id "$zone" --change-batch '{"Changes":[{"Action":"CREATE","ResourceRecordSet":{"Name":"www.kl.example.","Type":"A","TTL":300,"ResourceRecords":[{"Value":"10.0.1.10"}]}}]}' >/dev/null
+  check: |
+    zone=$(aws route53 list-hosted-zones-by-name --dns-name kl.example --query 'HostedZones[0].Id' --output text)
+    rr=$(aws route53 list-resource-record-sets --hosted-zone-id "$zone" --output json 2>/dev/null | jq -c '[.ResourceRecordSets[] | select(.Name == "www.kl.example." and .Type == "A")]')
+    p=$(jq -c '.[] | select(.Failover == "PRIMARY")' <<<"$rr"); s=$(jq -c '.[] | select(.Failover == "SECONDARY")' <<<"$rr")
+    check_eq "exactly two www A records" "$(jq length <<<"$rr")" 2
+    check_eq "the primary answers 10.0.1.10" "$(jq -r '.ResourceRecords[0].Value' <<<"$p" 2>/dev/null)" 10.0.1.10
+    check_eq "the secondary answers 10.0.2.10" "$(jq -r '.ResourceRecords[0].Value' <<<"$s" 2>/dev/null)" 10.0.2.10
+    check_eq "TTL 60 on both" "$(jq -r '[.[].TTL] | unique | join(",")' <<<"$rr")" 60
+    hc=$(jq -r '.HealthCheckId // empty' <<<"$p" 2>/dev/null)
+    c=$(aws route53 get-health-check --health-check-id "$hc" --output json 2>/dev/null | jq -c .HealthCheck.HealthCheckConfig)
+    check_eq "the primary's health check probes 10.0.1.10:80/health over HTTP" "$(jq -r '"\(.Type) \(.IPAddress):\(.Port)\(.ResourcePath)"' <<<"$c" 2>/dev/null)" "HTTP 10.0.1.10:80/health"
+  solve: |
+    zone=$(aws route53 list-hosted-zones-by-name --dns-name kl.example --query 'HostedZones[0].Id' --output text)
+    hc=$(aws route53 create-health-check --caller-reference "www-$(date +%s)" --health-check-config IPAddress=10.0.1.10,Port=80,Type=HTTP,ResourcePath=/health --query HealthCheck.Id --output text)
+    cat > /lab/failover.json <<EOF
+    {"Changes": [
+      {"Action": "DELETE", "ResourceRecordSet": {"Name": "www.kl.example.", "Type": "A", "TTL": 300, "ResourceRecords": [{"Value": "10.0.1.10"}]}},
+      {"Action": "CREATE", "ResourceRecordSet": {"Name": "www.kl.example.", "Type": "A", "TTL": 60, "SetIdentifier": "primary", "Failover": "PRIMARY", "HealthCheckId": "$hc", "ResourceRecords": [{"Value": "10.0.1.10"}]}},
+      {"Action": "CREATE", "ResourceRecordSet": {"Name": "www.kl.example.", "Type": "A", "TTL": 60, "SetIdentifier": "secondary", "Failover": "SECONDARY", "ResourceRecords": [{"Value": "10.0.2.10"}]}}]}
+    EOF
+    aws route53 change-resource-record-sets --hosted-zone-id "$zone" --change-batch file:///lab/failover.json >/dev/null
+
+- id: cloud-068
+  title: A password policy the auditors accept
+  difficulty: 2
+  kind: build
+  tags: [aws, iam, password-policy, compliance]
+  tutorial: |
+    **Concept.** The **account password policy** governs IAM users'
+    console passwords: minimum length, required character classes, maximum
+    age, and how many previous passwords may not be reused. It's one setting
+    per account. `update-account-password-policy` **replaces** it entirely,
+    so every option you leave out goes back to its default.
+
+    **Read up on:**
+    - `aws iam update-account-password-policy`, `get-account-password-policy`
+  scenario: |
+    The audit requires this IAM password policy:
+
+    - at least **14** characters
+    - at least one **uppercase** letter, one **lowercase** letter, one
+      **number** and one **symbol**
+    - passwords expire after **90** days
+    - the last **24** passwords can't be reused
+    - users may **change their own** password
+  hints:
+    - "`aws iam update-account-password-policy --minimum-password-length 14 --require-uppercase-characters --require-lowercase-characters --require-numbers --require-symbols --max-password-age 90 --password-reuse-prevention 24 --allow-users-to-change-password`."
+  solution: |
+    ```bash
+    aws iam update-account-password-policy --minimum-password-length 14 \
+      --require-uppercase-characters --require-lowercase-characters --require-numbers --require-symbols \
+      --max-password-age 90 --password-reuse-prevention 24 --allow-users-to-change-password
+    aws iam get-account-password-policy
+    ```
+  setup: |
+    moto_start
+    aws iam update-account-password-policy --minimum-password-length 8 --require-numbers >/dev/null
+  check: |
+    p=$(aws iam get-account-password-policy --output json 2>/dev/null | jq -c .PasswordPolicy)
+    check_eq "minimum length" "$(jq -r .MinimumPasswordLength <<<"$p")" 14
+    check_eq "character classes" "$(jq -r '[.RequireUppercaseCharacters, .RequireLowercaseCharacters, .RequireNumbers, .RequireSymbols] | join(",")' <<<"$p")" "true,true,true,true"
+    check_eq "maximum age" "$(jq -r .MaxPasswordAge <<<"$p")" 90
+    check_eq "reuse prevention" "$(jq -r .PasswordReusePrevention <<<"$p")" 24
+    check_eq "users may change their password" "$(jq -r .AllowUsersToChangePassword <<<"$p")" true
+  solve: |
+    aws iam update-account-password-policy --minimum-password-length 14 \
+      --require-uppercase-characters --require-lowercase-characters --require-numbers --require-symbols \
+      --max-password-age 90 --password-reuse-prevention 24 --allow-users-to-change-password
+
+- id: cloud-069
+  title: Stop your own team's servers, and nobody else's
+  difficulty: 3
+  kind: build
+  tags: [aws, iam, abac, conditions, tags]
+  tutorial: |
+    **Concept.** **Attribute-based access control** (ABAC) writes one policy
+    for everybody and uses **tags** to decide. The condition
+    `"StringEquals": {"aws:ResourceTag/team": "${aws:PrincipalTag/team}"}`
+    allows an action only on resources whose `team` tag matches the caller's
+    own `team` tag. New teams and new servers need no policy changes, only
+    tags.
+
+    **Read up on:**
+    - IAM condition keys `aws:ResourceTag/...`, `aws:PrincipalTag/...`
+    - Policy variables `${...}`
+  scenario: |
+    Create a customer-managed policy **`kl-team-ec2`** that allows
+    **`ec2:StartInstances`** and **`ec2:StopInstances`** on **any instance**
+    (`arn:aws:ec2:*:*:instance/*`), but **only when** the instance's tag
+    `team` equals the calling user's tag `team`. Attach it to the group
+    **`engineers`**.
+  hints:
+    - "`\"Condition\": {\"StringEquals\": {\"aws:ResourceTag/team\": \"${aws:PrincipalTag/team}\"}}`."
+    - "`aws iam create-policy --policy-name kl-team-ec2 --policy-document file:///lab/abac.json`, then `aws iam attach-group-policy`."
+  solution: |
+    ```bash
+    cat > /lab/abac.json <<'EOF'
+    {"Version": "2012-10-17", "Statement": [{
+      "Effect": "Allow",
+      "Action": ["ec2:StartInstances", "ec2:StopInstances"],
+      "Resource": "arn:aws:ec2:*:*:instance/*",
+      "Condition": {"StringEquals": {"aws:ResourceTag/team": "${aws:PrincipalTag/team}"}}}]}
+    EOF
+    arn=$(aws iam create-policy --policy-name kl-team-ec2 --policy-document file:///lab/abac.json --query Policy.Arn --output text)
+    aws iam attach-group-policy --group-name engineers --policy-arn "$arn"
+    ```
+  setup: |
+    moto_start
+    aws iam create-group --group-name engineers >/dev/null
+  check: |
+    arn=$(aws iam list-policies --scope Local --query "Policies[?PolicyName=='kl-team-ec2'].Arn" --output text 2>/dev/null)
+    check "the policy kl-team-ec2 exists" '[ -n "$arn" ]'
+    v=$(aws iam get-policy --policy-arn "$arn" --query Policy.DefaultVersionId --output text 2>/dev/null)
+    doc=$(aws iam get-policy-version --policy-arn "$arn" --version-id "$v" --output json 2>/dev/null | jq -c '.PolicyVersion.Document | if type == "string" then fromjson else . end')
+    st=$(jq -c '[.Statement] | flatten | map(select(.Effect == "Allow"))' <<<"$doc" 2>/dev/null)
+    check_eq "it allows exactly start and stop" "$(jq -r '[.[].Action] | flatten | sort | join(",")' <<<"$st" 2>/dev/null)" "ec2:StartInstances,ec2:StopInstances"
+    check_eq "on instances" "$(jq -r '[.[].Resource] | flatten | unique | join(",")' <<<"$st" 2>/dev/null)" "arn:aws:ec2:*:*:instance/*"
+    check_eq "only when the team tags match" "$(jq -r '[.[].Condition.StringEquals["aws:ResourceTag/team"]] | unique | join(",")' <<<"$st" 2>/dev/null)" '${aws:PrincipalTag/team}'
+    check_match "it is attached to engineers" "$(aws iam list-attached-group-policies --group-name engineers --query 'AttachedPolicies[].PolicyName' --output text 2>/dev/null)" 'kl-team-ec2'
+  solve: |
+    cat > /lab/abac.json <<'EOF'
+    {"Version": "2012-10-17", "Statement": [{"Effect": "Allow", "Action": ["ec2:StartInstances", "ec2:StopInstances"],
+      "Resource": "arn:aws:ec2:*:*:instance/*", "Condition": {"StringEquals": {"aws:ResourceTag/team": "${aws:PrincipalTag/team}"}}}]}
+    EOF
+    arn=$(aws iam create-policy --policy-name kl-team-ec2 --policy-document file:///lab/abac.json --query Policy.Arn --output text)
+    aws iam attach-group-policy --group-name engineers --policy-arn "$arn"
+
+- id: cloud-070
+  title: "Incident: the upload pipeline went quiet"
+  difficulty: 4
+  kind: fix
+  tags: [incident, aws, s3, sqs, sns, troubleshooting]
+  tutorial: |
+    **Concept.** Event pipelines fail silently: nothing errors, messages just
+    never arrive. Follow the event hop by hop. Does the bucket's notification
+    point at the right queue, and does its filter match the keys you upload?
+    Does the topic's subscription filter match the attributes you publish? Do
+    messages stay in the queue long enough to be read? Prove each fix with a
+    test event.
+
+    **Read up on:**
+    - `get-bucket-notification-configuration`, `get-queue-attributes`
+    - `sns list-subscriptions-by-topic`, `get-subscription-attributes`
+  scenario: |
+    Since a "small cleanup" last week, the nightly importer finds its queue
+    empty and on-call no longer gets paged. The pipeline should work like this:
+
+    1. objects uploaded to **`s3://kl-uploads/inbox/`** produce a message on
+       the queue **`imports`**
+    2. messages on `imports` must survive until the nightly run, so keep them
+       for **4 days** (345600 seconds)
+    3. alerts published to the topic **`pipeline-alerts`** with attribute
+       **`severity=critical`** reach the queue **`pager`**
+
+    Fix whatever is broken so all three hold. Don't recreate the bucket, the
+    queues or the topic.
+  hints:
+    - "`aws s3api get-bucket-notification-configuration --bucket kl-uploads`: which queue and which prefix?"
+    - "`aws sqs get-queue-attributes --queue-url ... --attribute-names MessageRetentionPeriod`."
+    - "`aws sns list-subscriptions-by-topic`, then `get-subscription-attributes` on the pager subscription. Read the filter policy letter by letter."
+  solution: |
+    ```bash
+    imp=$(aws sqs get-queue-url --queue-name imports --query QueueUrl --output text)
+    impa=$(aws sqs get-queue-attributes --queue-url $imp --attribute-names QueueArn --query Attributes.QueueArn --output text)
+    aws s3api put-bucket-notification-configuration --bucket kl-uploads --notification-configuration \
+      "{\"QueueConfigurations\":[{\"QueueArn\":\"$impa\",\"Events\":[\"s3:ObjectCreated:*\"],\"Filter\":{\"Key\":{\"FilterRules\":[{\"Name\":\"prefix\",\"Value\":\"inbox/\"}]}}}]}"
+    aws sqs set-queue-attributes --queue-url $imp --attributes MessageRetentionPeriod=345600
+    t=$(aws sns list-topics --query "Topics[?ends_with(TopicArn, ':pipeline-alerts')].TopicArn" --output text)
+    sub=$(aws sns list-subscriptions-by-topic --topic-arn $t --query "Subscriptions[?ends_with(Endpoint, ':pager')].SubscriptionArn" --output text)
+    aws sns set-subscription-attributes --subscription-arn $sub --attribute-name FilterPolicy --attribute-value '{"severity":["critical"]}'
+    ```
+  setup: |
+    moto_start
+    aws s3api create-bucket --bucket kl-uploads >/dev/null
+    imp=$(aws sqs create-queue --queue-name imports --attributes MessageRetentionPeriod=60 --query QueueUrl --output text)
+    old=$(aws sqs create-queue --queue-name imports-staging --query QueueUrl --output text)
+    pager=$(aws sqs create-queue --queue-name pager --query QueueUrl --output text)
+    arn() { aws sqs get-queue-attributes --queue-url "$1" --attribute-names QueueArn --query Attributes.QueueArn --output text; }
+    olda=$(arn "$old"); pagera=$(arn "$pager")
+    aws s3api put-bucket-notification-configuration --bucket kl-uploads --notification-configuration \
+      "{\"QueueConfigurations\":[{\"QueueArn\":\"$olda\",\"Events\":[\"s3:ObjectCreated:*\"],\"Filter\":{\"Key\":{\"FilterRules\":[{\"Name\":\"prefix\",\"Value\":\"inbox\/\"}]}}}]}"
+    t=$(aws sns create-topic --name pipeline-alerts --query TopicArn --output text)
+    sub=$(aws sns subscribe --topic-arn "$t" --protocol sqs --notification-endpoint "$pagera" --query SubscriptionArn --output text)
+    aws sns set-subscription-attributes --subscription-arn "$sub" --attribute-name FilterPolicy --attribute-value '{"severity":["crtical"]}'
+  check: |
+    imp=$(aws sqs get-queue-url --queue-name imports --query QueueUrl --output text 2>/dev/null)
+    pager=$(aws sqs get-queue-url --queue-name pager --query QueueUrl --output text 2>/dev/null)
+    check_eq "imports keeps messages for 4 days" "$(aws sqs get-queue-attributes --queue-url "$imp" --attribute-names MessageRetentionPeriod --query Attributes.MessageRetentionPeriod --output text 2>/dev/null)" 345600
+    aws sqs purge-queue --queue-url "$imp" >/dev/null 2>&1; aws sqs purge-queue --queue-url "$pager" >/dev/null 2>&1
+    echo x > /lab/.kl; aws s3 cp /lab/.kl s3://kl-uploads/inbox/kl-check.csv >/dev/null; aws s3 cp /lab/.kl s3://kl-uploads/archive/kl-old.csv >/dev/null; rm -f /lab/.kl
+    got=$(aws sqs receive-message --queue-url "$imp" --max-number-of-messages 10 --output json 2>/dev/null | jq -r '[.Messages[]?.Body | fromjson | .Records[]?.s3.object.key | gsub("%2F"; "/")] | sort | join(",")')
+    check_eq "an upload to inbox/ reaches imports" "$got" "inbox/kl-check.csv"
+    t=$(aws sns list-topics --query "Topics[?ends_with(TopicArn, ':pipeline-alerts')].TopicArn" --output text)
+    for s in warning critical; do aws sns publish --topic-arn "$t" --message "kl-$s" --message-attributes "{\"severity\":{\"DataType\":\"String\",\"StringValue\":\"$s\"}}" >/dev/null; done
+    got=$(aws sqs receive-message --queue-url "$pager" --max-number-of-messages 10 --output json 2>/dev/null | jq -r '[.Messages[]?.Body | fromjson | .Message] | sort | join(",")')
+    check_eq "a critical alert pages, a warning doesn't" "$got" "kl-critical"
+    check_eq "the queues were not recreated" "$(aws sqs list-queues --query 'length(QueueUrls)' --output text)" 3
+    aws s3 rm s3://kl-uploads/inbox/kl-check.csv >/dev/null 2>&1; aws s3 rm s3://kl-uploads/archive/kl-old.csv >/dev/null 2>&1
+  solve: |
+    imp=$(aws sqs get-queue-url --queue-name imports --query QueueUrl --output text)
+    impa=$(aws sqs get-queue-attributes --queue-url $imp --attribute-names QueueArn --query Attributes.QueueArn --output text)
+    aws s3api put-bucket-notification-configuration --bucket kl-uploads --notification-configuration \
+      "{\"QueueConfigurations\":[{\"QueueArn\":\"$impa\",\"Events\":[\"s3:ObjectCreated:*\"],\"Filter\":{\"Key\":{\"FilterRules\":[{\"Name\":\"prefix\",\"Value\":\"inbox/\"}]}}}]}"
+    aws sqs set-queue-attributes --queue-url $imp --attributes MessageRetentionPeriod=345600
+    t=$(aws sns list-topics --query "Topics[?ends_with(TopicArn, ':pipeline-alerts')].TopicArn" --output text)
+    sub=$(aws sns list-subscriptions-by-topic --topic-arn $t --query "Subscriptions[?ends_with(Endpoint, ':pager')].SubscriptionArn" --output text)
+    aws sns set-subscription-attributes --subscription-arn $sub --attribute-name FilterPolicy --attribute-value '{"severity":["critical"]}'
