@@ -634,6 +634,8 @@ func (m *model) mouse(msg tea.MouseMsg) (tea.Model, tea.Cmd) {
 		return m, m.clickRow(n, double)
 	case id == "filter":
 		return m, m.press("/")
+	case id == "alltracks":
+		m.allTracks()
 	}
 	return m, nil
 }
@@ -957,7 +959,7 @@ Everywhere      F10 menu bar (not on the exercise screen) · alt+p/v/t/h open a 
                 Q (q on the list) exit and delete all lab VMs · ctrl+c the same; while busy or deleting, exit at once
 
 Exercise list   ↑↓ move · enter open · / filter (ctrl+t: search the full text) · esc clear filter
-                tab next track · n/p next/previous module
+                tab next track · A all tracks · n/p next/previous module
                 u cycle all / solved / in progress / no progress
                 L learning paths · X exam · W weak spots · q quit
 

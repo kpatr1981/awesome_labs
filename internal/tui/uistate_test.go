@@ -1,7 +1,11 @@
 package tui
 
 import (
+	"slices"
+	"strings"
 	"testing"
+
+	"github.com/charmbracelet/x/ansi"
 
 	tea "github.com/charmbracelet/bubbletea"
 )
@@ -73,5 +77,27 @@ func TestCursorStaysOnTheExerciseWhenTheListChanges(t *testing.T) {
 	keys(m, "esc")
 	if got := m.visible[m.cursor].ID; got != "k-1" {
 		t.Errorf("cursor on %s after the list changed, want k-1", got)
+	}
+}
+
+// A track restored from the last run must show on screen: otherwise an empty
+// "in progress" list looks broken while the header counts every track.
+func TestEmptyListSaysTheTrackHidesMatches(t *testing.T) {
+	m := newTestModel(t)
+	m.prog.MarkStarted("k-1")
+	m.trackIdx = slices.Index(m.tracks, "docker")
+	m.setProgFilter(progInProgress)
+	if len(m.visible) != 0 {
+		t.Fatalf("setup: %v", m.visible)
+	}
+	out := ansi.Strip(m.View())
+	for _, want := range []string{"[Docker]", "1 in other tracks"} {
+		if !strings.Contains(out, want) {
+			t.Errorf("browse screen lacks %q:\n%s", want, out)
+		}
+	}
+	keys(m, "A")
+	if m.tracks[m.trackIdx] != "" || len(m.visible) != 1 || m.visible[0].ID != "k-1" {
+		t.Errorf("A did not switch to all tracks: %q %v", m.tracks[m.trackIdx], m.visible)
 	}
 }

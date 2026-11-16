@@ -209,3 +209,39 @@ func TestSolutionShowsYourCommands(t *testing.T) {
 		t.Errorf("y can't copy your commands: %q", b)
 	}
 }
+
+// The offer is made by the message under the screen: once another message
+// replaces it, enter must not jump to an exercise nothing mentions any more.
+func TestNextUpOfferEndsWithItsMessage(t *testing.T) {
+	m := build(t, named("exercise set up on the VMs"), false)
+	m.Update(opDoneMsg{kind: "check", id: "d-1", passed: true})
+	if m.suggest == nil {
+		t.Fatal("setup: no suggestion")
+	}
+	m.flash = "copied" // any later message, a copy say
+	m.Update(keyMsg("enter"))
+	if m.cur.ID != "d-1" {
+		t.Errorf("enter opened %s after the offer was gone from the screen", m.cur.ID)
+	}
+}
+
+// Solving an exercise drops it out of the "in progress" list: next up and n
+// must still go on in that list, not in the whole catalog.
+func TestNextStaysInAListTheExerciseLeft(t *testing.T) {
+	m := newTestModel(t)
+	m.prog.MarkStarted("d-1")
+	m.prog.MarkStarted("k-1") // d-2 isn't started: not in the list
+	m.setProgFilter(progInProgress)
+	keys(m, "enter")
+	if m.cur == nil || m.cur.ID != "d-1" {
+		t.Fatalf("setup: opened %v", m.cur)
+	}
+	m.Update(opDoneMsg{kind: "check", id: "d-1", passed: true})
+	if m.suggest == nil || m.suggest.ID != "k-1" {
+		t.Errorf("next up = %v, want k-1 (the next in progress), not the next in the catalog", m.suggest)
+	}
+	m.Update(keyMsg("n"))
+	if m.cur.ID != "k-1" {
+		t.Errorf("n opened %s, want k-1", m.cur.ID)
+	}
+}

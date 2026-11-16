@@ -163,6 +163,9 @@ func (m *model) viewBrowse() string {
 	// the track is picked from the Track menu (or tab); this line only shows
 	// the active path, the progress filter and the search box when in use
 	var bar string
+	if t := m.tracks[m.trackIdx]; t != "" {
+		bar += sWarn.Render("["+trackName(t)+"]") + sMuted.Render("  ")
+	}
 	if m.path != nil {
 		ps, pt := m.pathProgress(m.path)
 		bar += sWarn.Render("path: "+m.path.Title) + sMuted.Render(fmt.Sprintf(" %d/%d  ", ps, pt))
@@ -219,6 +222,10 @@ func (m *model) viewBrowse() string {
 	}
 	if len(m.visible) == 0 {
 		rows = append(rows, sMuted.Render("  no exercises match"))
+		if n := m.hiddenByTrack(); n > 0 {
+			m.addZone("alltracks", 0, top+1+len(rows), listW, 1)
+			rows = append(rows, "", sWarn.Render(trunc(fmt.Sprintf("  %d in other tracks: A shows all tracks", n), listW-2)))
+		}
 	}
 	for len(rows) < lh {
 		rows = append(rows, "")

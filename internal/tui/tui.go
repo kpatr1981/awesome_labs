@@ -123,6 +123,7 @@ type model struct {
 	copyIdx      int
 	fetchHistory func(*exercise.Exercise)
 	suggest      *exercise.Exercise // offered after a pass: enter opens it
+	suggestFlash string             // the flash that offers it: once another replaces it, enter no longer jumps
 	fullText     bool               // the filter searches scenarios and tutorials too
 	textIndex    map[string]string
 
@@ -401,6 +402,26 @@ func (m *model) refilter() {
 	m.clampOffset()
 }
 
+// allTracks drops the track filter, keeping the others.
+func (m *model) allTracks() {
+	m.trackIdx, m.cursor, m.offset = 0, 0, 0
+	m.refilter()
+}
+
+// hiddenByTrack counts the exercises the current filters would show if no
+// track were picked: what an empty list is hiding in the other tracks.
+func (m *model) hiddenByTrack() int {
+	if m.tracks[m.trackIdx] == "" {
+		return 0
+	}
+	idx, vis, cur, off := m.trackIdx, m.visible, m.cursor, m.offset
+	m.trackIdx, m.visible = 0, nil
+	m.refilter()
+	n := len(m.visible)
+	m.trackIdx, m.visible, m.cursor, m.offset = idx, vis, cur, off
+	return n - len(vis)
+}
+
 func (m *model) listHeight() int {
 	if m.hasBrowseBar() {
 		return max(3, m.h-6)
@@ -410,7 +431,7 @@ func (m *model) listHeight() int {
 
 // hasBrowseBar reports whether the browse screen shows its info line above the list.
 func (m *model) hasBrowseBar() bool {
-	return m.path != nil || m.progFilter != progAll || m.filterOn || m.filter.Value() != ""
+	return m.path != nil || m.tracks[m.trackIdx] != "" || m.progFilter != progAll || m.filterOn || m.filter.Value() != ""
 }
 
 func (m *model) clampOffset() {
@@ -693,6 +714,7 @@ func (m *model) update(msg tea.Msg) (tea.Model, tea.Cmd) {
 			if m.autoRun {
 				m.flash = "auto-check · " + m.flash
 			}
+			m.suggestFlash = m.flash
 		case msg.kind == "stop":
 			m.flash = msg.id + " ended — its VMs are cleaned for the next exercise"
 		case msg.kind == "cleanup":
@@ -879,6 +901,8 @@ func (m *model) updateBrowse(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 		m.refilter()
 	case "u":
 		m.setProgFilter((m.progFilter + 1) % progFilterCount)
+	case "A": // all tracks: the way out of a list that a track has emptied
+		m.allTracks()
 	case "L":
 		m.screen = scrPaths
 	case "W":
@@ -946,7 +970,7 @@ func (m *model) updateDetail(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 		if m.tab == tabNotes {
 			return m, m.editNote()
 		}
-		if next := m.suggest; next != nil {
+		if next := m.suggest; next != nil && m.flash == m.suggestFlash {
 			m.suggest = nil
 			return m, m.leave(func() tea.Cmd { m.openDetail(next, m.back); return nil })
 		}
@@ -1130,6 +1154,32 @@ func (m *model) siblings() ([]*exercise.Exercise, *int) {
 	for _, e := range list {
 		if e == m.cur {
 			return list, cur
+		}
+	}
+	// solving or resetting it can drop the open exercise out of the list
+	// (the "in progress" filter, the started labs): put it back where it
+	// was, so next and previous stay in that list instead of the catalog
+	if cur != nil && len(list) > 0 && m.cur != nil {
+		order := m.cat.Exercises // both lists keep the order they are drawn from
+		if m.back == scrBrowse && m.path != nil {
+			order = m.path.Exercises
+		}
+		rank := make(map[*exercise.Exercise]int, len(order))
+		for i, e := range order {
+			rank[e] = i
+		}
+		if r, ok := rank[m.cur]; ok {
+			at := len(list)
+			for i, e := range list {
+				if m.back == scrStarted && i == 0 && m.isActive(e) {
+					continue // the active lab heads that list, out of order
+				}
+				if rank[e] > r {
+					at = i
+					break
+				}
+			}
+			return slices.Insert(slices.Clone(list), at, m.cur), nil
 		}
 	}
 	return m.cat.Exercises, nil

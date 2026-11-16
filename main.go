@@ -230,6 +230,12 @@ func run(args []string) error {
 		if err != nil {
 			return err
 		}
+		// every start resets the VMs, so they hold the lab of the exercise set
+		// up last: checking another one grades the wrong lab, and a pass
+		// would mark it solved without it ever being done
+		if err := checkable(mgr, ex); err != nil {
+			return err
+		}
 		ok, err := mgr.Check(ctx, ex, os.Stdout)
 		if err != nil {
 			return err
@@ -319,6 +325,18 @@ func run(args []string) error {
 	default:
 		usage()
 		return fmt.Errorf("unknown command %q", cmd)
+	}
+	return nil
+}
+
+// checkable refuses a check of an exercise whose lab is not the one set up.
+func checkable(mgr *lab.Manager, ex *exercise.Exercise) error {
+	a, ok := mgr.Active()
+	switch {
+	case !ok:
+		return fmt.Errorf("no lab is set up — run: awesome_labs start %s", ex.ID)
+	case a.ID != ex.ID:
+		return fmt.Errorf("the VMs hold the lab of %s, not %s — check %s, or run: awesome_labs start %s", a.ID, ex.ID, a.ID, ex.ID)
 	}
 	return nil
 }

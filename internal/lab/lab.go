@@ -868,7 +868,7 @@ func (m *Manager) Check(ctx context.Context, ex *exercise.Exercise, log io.Write
 	}
 	for _, vm := range env.VMs {
 		if all[vm.Name].Status != "Running" {
-			return false, fmt.Errorf("%s is not running: open the exercise (enter) to set the lab up again", vm.Hostname)
+			return false, fmt.Errorf("%s is not running: start the exercise again to set its lab up", vm.Hostname)
 		}
 	}
 	ok := true
