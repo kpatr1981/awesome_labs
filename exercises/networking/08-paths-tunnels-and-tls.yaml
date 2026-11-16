@@ -1,0 +1,1206 @@
+track: networking
+module: Paths, tunnels & TLS
+profile: docker
+order: 8
+exercises:
+
+- id: net-059
+  title: Work out the subnets
+  difficulty: 1
+  kind: build
+  tags: [ipv4, cidr, subnetting, broadcast]
+  tutorial: |
+    **Concept.** A CIDR prefix such as `10.4.37.0/22` splits an address into
+    a **network part** (the first 22 bits) and a **host part**. Set the host
+    bits to 0 and you get the **network address**. Set them to 1 and you get
+    the **broadcast address**. The usable hosts are everything in between:
+    `2^(32 - prefix) - 2`. An address given with a prefix needn't be the
+    network address itself.
+
+    **Read up on:**
+    - CIDR notation and netmasks
+    - Python's `ipaddress.ip_interface(...).network`, or `ipcalc`
+  scenario: |
+    **`/lab/subnets.txt`** lists one address with its prefix per line, as
+    written in the network plan (for example `10.4.37.9/22`). Write
+    **`/lab/answer.csv`** with the header `cidr,network,broadcast,usable` and one
+    line per input, in the same order, for example:
+
+    `10.4.37.9/22,10.4.36.0,10.4.39.255,1022`
+  hints:
+    - "`python3 -c 'import ipaddress; n = ipaddress.ip_interface(\"10.4.37.9/22\").network; print(n.network_address, n.broadcast_address, n.num_addresses - 2)'`."
+  solution: |
+    ```bash
+    python3 - <<'PY' > /lab/answer.csv
+    import ipaddress
+    print("cidr,network,broadcast,usable")
+    for line in open("/lab/subnets.txt"):
+        c = line.strip()
+        if c:
+            n = ipaddress.ip_interface(c).network
+            print(f"{c},{n.network_address},{n.broadcast_address},{n.num_addresses - 2}")
+    PY
+    ```
+  setup: |
+    python3 - > /lab/subnets.txt <<'PY'
+    import random
+    for _ in range(6):
+        p = random.randint(19, 30)
+        print(f"10.{random.randint(0, 255)}.{random.randint(0, 255)}.{random.randint(0, 255)}/{p}")
+    PY
+    chown "$(lab_user):" /lab/subnets.txt
+  check: |
+    want=$(python3 - <<'PY'
+    import ipaddress
+    print("cidr,network,broadcast,usable")
+    for line in open("/lab/subnets.txt"):
+        c = line.strip()
+        if c:
+            n = ipaddress.ip_interface(c).network
+            print(f"{c},{n.network_address},{n.broadcast_address},{n.num_addresses - 2}")
+    PY
+    )
+    check_eq "answer.csv" "$(sed 's/[[:space:]]*$//; /^$/d' /lab/answer.csv 2>/dev/null)" "$want"
+  solve: |
+    python3 - > /lab/answer.csv <<'PY'
+    import ipaddress
+    print("cidr,network,broadcast,usable")
+    for line in open("/lab/subnets.txt"):
+        c = line.strip()
+        if c:
+            n = ipaddress.ip_interface(c).network
+            print(f"{c},{n.network_address},{n.broadcast_address},{n.num_addresses - 2}")
+    PY
+
+- id: net-060
+  title: Same cable, different subnets
+  difficulty: 1
+  kind: fix
+  tags: [ipv4, netmask, connectivity, netns]
+  tutorial: |
+    **Concept.** Two hosts on the same cable talk directly only if each one
+    believes the other is **in its own subnet**. Otherwise it looks for a
+    gateway. A wrong prefix length on one side (a `/28` where the plan says
+    `/24`) leaves that host with no route back, and pings fail in one
+    direction or both. `ip -br addr` and `ip route` on each side show it.
+
+    **Read up on:**
+    - `ip addr add` / `ip addr del`, `ip -br addr`
+    - `ip netns exec NS CMD`
+  scenario: |
+    Two hosts share a cable. Each is a network namespace: **`desk`**
+    (`10.60.0.10`) and **`printer`** (`10.60.0.200`). The plan puts both in
+    **`10.60.0.0/24`**, but `desk` can't reach the printer.
+
+    Fix the addressing so that `sudo ip netns exec desk ping 10.60.0.200`
+    works. Each host keeps its address, and each ends up with only its correct
+    `/24`.
+  hints:
+    - "`sudo ip netns exec printer ip -br addr` and `sudo ip netns exec printer ip route`."
+    - "Delete the wrong address and add `10.60.0.200/24` on `eth0`."
+  solution: |
+    ```bash
+    sudo ip netns exec printer ip -br addr
+    sudo ip -n printer addr del 10.60.0.200/28 dev eth0
+    sudo ip -n printer addr add 10.60.0.200/24 dev eth0
+    sudo ip netns exec desk ping -c2 10.60.0.200
+    ```
+  setup: |
+    on_reset 'for n in desk printer; do ip netns pids $n 2>/dev/null | xargs -r kill -9; done'
+    netns_new desk printer
+    netns_link desk eth0 printer eth0
+    ip -n desk addr add 10.60.0.10/24 dev eth0
+    ip -n printer addr add 10.60.0.200/28 dev eth0
+  check: |
+    check "desk reaches the printer" 'ip netns exec desk ping -c1 -W1 10.60.0.200'
+    check_eq "printer's addresses" "$(ip -n printer -4 -o addr show dev eth0 | awk '{print $4}' | tr '\n' ' ')" "10.60.0.200/24 "
+    check_eq "desk's addresses" "$(ip -n desk -4 -o addr show dev eth0 | awk '{print $4}' | tr '\n' ' ')" "10.60.0.10/24 "
+  solve: |
+    sudo ip -n printer addr del 10.60.0.200/28 dev eth0
+    sudo ip -n printer addr add 10.60.0.200/24 dev eth0
+
+- id: net-061
+  title: The branch office can't leave its subnet
+  difficulty: 2
+  kind: fix
+  tags: [routing, default-gateway, ip-forward, netns]
+  tutorial: |
+    **Concept.** To reach another subnet, a host sends packets to its
+    **default gateway**. The router must **forward** between its interfaces
+    (`net.ipv4.ip_forward=1`). The far side needs a route **back**, either a
+    default route via the same router or a specific one. Any missing piece
+    breaks the round trip, so check each hop in both directions.
+
+    **Read up on:**
+    - `ip route add default via GW`
+    - `sysctl net.ipv4.ip_forward`
+    - `ip route get ADDRESS`
+  scenario: |
+    The branch office has three machines, each a network namespace:
+
+    - **`branch`** `10.61.1.10/24`
+    - **`router`** `10.61.1.1/24` (towards branch) and `10.61.2.1/24` (towards HQ)
+    - **`hq`** `10.61.2.20/24`
+
+    `branch` can ping the router but not `hq`. Make
+    `sudo ip netns exec branch ping 10.61.2.20` work by fixing the routing,
+    not by changing any address.
+  hints:
+    - "`sudo ip netns exec branch ip route`: is there a way out of 10.61.1.0/24?"
+    - "`sudo ip netns exec router sysctl net.ipv4.ip_forward`."
+    - "`sudo ip netns exec hq ip route`: can hq answer?"
+  solution: |
+    ```bash
+    sudo ip -n branch route add default via 10.61.1.1
+    sudo ip netns exec router sysctl -w net.ipv4.ip_forward=1
+    sudo ip -n hq route add default via 10.61.2.1
+    sudo ip netns exec branch ping -c2 10.61.2.20
+    ```
+  setup: |
+    on_reset 'for n in branch router hq; do ip netns pids $n 2>/dev/null | xargs -r kill -9; done'
+    netns_new branch router hq
+    netns_link branch eth0 router eth1
+    netns_link router eth2 hq eth0
+    ip -n branch addr add 10.61.1.10/24 dev eth0
+    ip -n router addr add 10.61.1.1/24 dev eth1
+    ip -n router addr add 10.61.2.1/24 dev eth2
+    ip -n hq addr add 10.61.2.20/24 dev eth0
+    ip netns exec router sysctl -qw net.ipv4.ip_forward=0
+  check: |
+    check "branch reaches hq" 'ip netns exec branch ping -c1 -W1 10.61.2.20'
+    check_eq "addresses unchanged" "$(for n in branch router hq; do ip -n $n -4 -o addr show | awk '$2 != "lo" {print $4}'; done | tr '\n' ' ')" "10.61.1.10/24 10.61.1.1/24 10.61.2.1/24 10.61.2.20/24 "
+  solve: |
+    sudo ip -n branch route add default via 10.61.1.1
+    sudo ip netns exec router sysctl -qw net.ipv4.ip_forward=1
+    sudo ip -n hq route add default via 10.61.2.1
+
+- id: net-062
+  title: Which way does each packet go?
+  difficulty: 2
+  kind: build
+  tags: [routing, longest-prefix-match, ip-route-get]
+  tutorial: |
+    **Concept.** When several routes cover a destination, the **most
+    specific one wins** (longest prefix match): a `/25` beats a `/24`, which
+    beats a `/16`, which beats the default route. `ip route get ADDR` asks the
+    kernel which route it would actually use, so you don't have to work it out
+    by hand.
+
+    **Read up on:**
+    - Longest prefix match
+    - `ip route show`, `ip route get`
+  scenario: |
+    The namespace **`edge`** is a router with several overlapping routes.
+    For each destination in **`/lab/dests.txt`**, write the **next-hop
+    address** the router would use, one per line in the same order, to
+    **`/lab/answer.txt`**.
+  hints:
+    - "`sudo ip netns exec edge ip route` shows the table."
+    - "`sudo ip netns exec edge ip route get 10.20.5.200` prints `via NEXT-HOP`."
+  solution: |
+    ```bash
+    while read -r d; do
+      sudo ip netns exec edge ip route get "$d" | grep -o 'via [0-9.]*' | cut -d' ' -f2
+    done < /lab/dests.txt > /lab/answer.txt
+    ```
+  setup: |
+    on_reset 'ip netns pids edge 2>/dev/null | xargs -r kill -9'
+    netns_new edge
+    for i in 0 1 2 3; do
+      ip -n edge link add d$i type dummy; ip -n edge link set d$i up
+      ip -n edge addr add 10.62.$i.1/24 dev d$i
+    done
+    ip -n edge route add default via 10.62.0.2
+    ip -n edge route add 10.20.0.0/16 via 10.62.1.2
+    ip -n edge route add 10.20.5.0/24 via 10.62.2.2
+    ip -n edge route add 10.20.5.128/25 via 10.62.3.2
+    ip -n edge route add 10.20.9.0/24 via 10.62.3.2
+    python3 - > /lab/dests.txt <<'PY'
+    import random
+    pool = [f"10.20.5.{random.randint(129, 254)}", f"10.20.5.{random.randint(1, 126)}", f"10.20.{random.randint(10, 250)}.{random.randint(1, 254)}",
+            f"10.20.9.{random.randint(1, 254)}", f"10.{random.randint(30, 99)}.0.{random.randint(1, 254)}", f"10.20.{random.choice([0, 4, 6])}.{random.randint(1, 254)}"]
+    random.shuffle(pool)
+    print("\n".join(pool))
+    PY
+    chown "$(lab_user):" /lab/dests.txt
+  check: |
+    want=$(while read -r d; do ip netns exec edge ip route get "$d" | grep -o 'via [0-9.]*' | cut -d' ' -f2; done < /lab/dests.txt)
+    check_eq "next hops" "$(sed 's/[[:space:]]*$//; /^$/d' /lab/answer.txt 2>/dev/null)" "$want"
+  solve: |
+    while read -r d; do
+      sudo ip netns exec edge ip route get "$d" | grep -o 'via [0-9.]*' | cut -d' ' -f2
+    done < /lab/dests.txt > /lab/answer.txt
+
+- id: net-063
+  title: Find the path MTU
+  difficulty: 2
+  kind: build
+  tags: [mtu, pmtud, ping, tracepath, fragmentation]
+  tutorial: |
+    **Concept.** The **path MTU** is the largest IP packet that crosses every
+    link without fragmentation, which is the smallest MTU along the way. Send
+    pings with **Don't Fragment** set (`ping -M do -s SIZE`): the IP packet is
+    `SIZE + 28` bytes (20 IP + 8 ICMP), and anything too big is refused with
+    *Frag needed*. `tracepath` discovers it hop by hop.
+
+    **Read up on:**
+    - `ping -M do -s`, `tracepath -n`
+    - ICMP "fragmentation needed" and PMTU black holes
+  scenario: |
+    Traffic from **`office`** to **`dc`** (`10.63.3.10`) crosses two routers.
+    Large transfers stall. Find the **path MTU** between them, the largest
+    IP packet size in bytes that gets through unfragmented, and write it to
+    **`/lab/answer.txt`**.
+  hints:
+    - "`sudo ip netns exec office tracepath -n 10.63.3.10` reports `pmtu`."
+    - "Or bisect: `sudo ip netns exec office ping -c1 -M do -s 1400 10.63.3.10`, then add 28 to the largest size that works."
+  solution: |
+    ```bash
+    sudo ip netns exec office tracepath -n 10.63.3.10
+    # or: largest working -s value + 28
+    ```
+  setup: |
+    on_reset 'for n in office r1 r2 dc; do ip netns pids $n 2>/dev/null | xargs -r kill -9; done'
+    netns_new office r1 r2 dc
+    netns_link office eth0 r1 eth0; netns_link r1 eth1 r2 eth0; netns_link r2 eth1 dc eth0
+    ip -n office addr add 10.63.0.10/24 dev eth0; ip -n office route add default via 10.63.0.1
+    ip -n r1 addr add 10.63.0.1/24 dev eth0; ip -n r1 addr add 10.63.1.1/24 dev eth1; ip -n r1 route add default via 10.63.1.2
+    ip -n r2 addr add 10.63.1.2/24 dev eth0; ip -n r2 addr add 10.63.3.1/24 dev eth1; ip -n r2 route add 10.63.0.0/24 via 10.63.1.1
+    ip -n dc addr add 10.63.3.10/24 dev eth0; ip -n dc route add default via 10.63.3.1
+    for r in r1 r2; do ip netns exec $r sysctl -qw net.ipv4.ip_forward=1; done
+    mtu=$((1280 + 20 * (RANDOM % 9)))
+    ip -n r1 link set eth1 mtu $mtu; ip -n r2 link set eth0 mtu $mtu
+    echo $mtu > "$KL_STATE/answer"
+  check: |
+    check_eq "path MTU" "$(tr -d '[:space:]' < /lab/answer.txt 2>/dev/null)" "$(cat "$KL_STATE/answer")"
+  solve: |
+    sudo ip netns exec office tracepath -n 10.63.3.10 | grep -o 'pmtu [0-9]*' | tail -1 | cut -d' ' -f2 > /lab/answer.txt
+
+- id: net-064
+  title: Who else answers for that address?
+  difficulty: 3
+  kind: build
+  tags: [arp, duplicate-ip, tcpdump, layer2]
+  tutorial: |
+    **Concept.** When two machines are configured with the **same IP
+    address**, both answer ARP requests for it, and neighbours flip between
+    their MAC addresses, so connections break at random. Capture ARP with
+    link-layer headers (`tcpdump -e -n arp`) while forcing a fresh lookup
+    (flush the neighbour cache, then ping): you'll see **two replies** with
+    different MACs.
+
+    **Read up on:**
+    - `tcpdump -e -n arp`
+    - `ip neigh flush`, `ip neigh show`
+  scenario: |
+    On the LAN, the file server `10.64.0.20` keeps "disappearing". Its real
+    MAC address is in **`/lab/server-mac.txt`**. From the namespace
+    **`desk`**, find the **MAC address of the other machine** that also claims
+    `10.64.0.20`, and write it to **`/lab/answer.txt`** (lowercase,
+    colon-separated).
+  hints:
+    - "In one terminal: `sudo ip netns exec desk tcpdump -e -n -i eth0 arp`."
+    - "In another: `sudo ip netns exec desk ip neigh flush dev eth0; sudo ip netns exec desk ping -c1 10.64.0.20`."
+    - "Two `is-at` replies arrive. The one that isn't in server-mac.txt is the impostor."
+  solution: |
+    ```bash
+    sudo ip netns exec desk timeout 5 tcpdump -e -n -l -i eth0 arp > /tmp/arp.txt 2>/dev/null &
+    sleep 1; sudo ip netns exec desk ip neigh flush dev eth0; sudo ip netns exec desk ping -c1 -W1 10.64.0.20; wait
+    grep 'is-at' /tmp/arp.txt | grep -o 'is-at [0-9a-f:]*' | cut -d' ' -f2 | grep -v "$(cat /lab/server-mac.txt)" | head -1 > /lab/answer.txt
+    ```
+  setup: |
+    on_reset 'for n in desk files rogue kl-lan; do ip netns pids $n 2>/dev/null | xargs -r kill -9; done'
+    lan_up desk=10.64.0.5/24 files=10.64.0.20/24 rogue=10.64.0.20/24
+    for n in files rogue; do ip netns exec $n sysctl -qw net.ipv4.conf.all.arp_ignore=0; done
+    ip -n files link show eth0 | awk '/link\/ether/ {print $2}' > /lab/server-mac.txt
+    ip -n rogue link show eth0 | awk '/link\/ether/ {print $2}' > "$KL_STATE/answer"
+    chown "$(lab_user):" /lab/server-mac.txt
+  check: |
+    check_eq "the impostor's MAC" "$(tr -d '[:space:]' < /lab/answer.txt 2>/dev/null | tr A-F a-f)" "$(cat "$KL_STATE/answer")"
+  solve: |
+    sudo ip netns exec desk timeout 5 tcpdump -e -n -l -i eth0 arp > /tmp/kl-arp.txt 2>/dev/null &
+    sleep 1; sudo ip netns exec desk ip neigh flush dev eth0; sudo ip netns exec desk ping -c1 -W1 10.64.0.20 >/dev/null; wait
+    grep -o 'is-at [0-9a-f:]*' /tmp/kl-arp.txt | cut -d' ' -f2 | grep -v "$(cat /lab/server-mac.txt)" | head -1 > /lab/answer.txt
+    rm -f /tmp/kl-arp.txt
+
+- id: net-065
+  title: A blocklist the firewall reads from a set
+  difficulty: 2
+  kind: build
+  tags: [nftables, sets, timeout, firewall]
+  tutorial: |
+    **Concept.** nftables **sets** hold many addresses for a single rule to
+    look up, much faster and tidier than one rule per address. A set with
+    `flags timeout` lets each element expire on its own, which suits temporary
+    bans: `add element inet t blocklist { 10.0.0.5 timeout 1h }`. A rule such as
+    `ip saddr @blocklist drop` refers to it.
+
+    **Read up on:**
+    - `nft add set`, `nft add element`, `nft list set`
+    - Set flags (`timeout`, `interval`) and anonymous vs named sets
+  scenario: |
+    The namespace **`web`** (`10.65.0.80`) serves HTTP on port 8080 to the
+    LAN. A scanner at **`10.65.0.66`** is hammering it. In `web`'s nftables,
+    create:
+
+    - a table **`inet guard`** with a named set **`blocklist`** of IPv4
+      addresses that supports **timeouts**
+    - a rule on incoming traffic that **drops** packets from addresses in the
+      set
+    - an element **`10.65.0.66`** that expires after **1 hour**
+
+    The other clients (such as `10.65.0.10`) must still reach the site.
+  hints:
+    - "`sudo ip netns exec web nft add table inet guard`."
+    - "`nft add set inet guard blocklist '{ type ipv4_addr; flags timeout; }'`."
+    - "`nft add chain inet guard input '{ type filter hook input priority 0; }'`, then `nft add rule inet guard input ip saddr @blocklist drop` and `nft add element inet guard blocklist '{ 10.65.0.66 timeout 1h }'`."
+  solution: |
+    ```bash
+    sudo ip netns exec web nft -f - <<'EOF'
+    table inet guard {
+      set blocklist { type ipv4_addr; flags timeout; }
+      chain input {
+        type filter hook input priority 0; policy accept;
+        ip saddr @blocklist drop
+      }
+    }
+    EOF
+    sudo ip netns exec web nft add element inet guard blocklist '{ 10.65.0.66 timeout 1h }'
+    ```
+  setup: |
+    on_reset 'for n in web client scanner kl-lan; do ip netns pids $n 2>/dev/null | xargs -r kill -9; done'
+    lan_up web=10.65.0.80/24 client=10.65.0.10/24 scanner=10.65.0.66/24
+    mkdir -p /srv/kl-web65; echo "<h1>ok</h1>" > /srv/kl-web65/index.html
+    on_reset 'rm -rf /srv/kl-web65'
+    ip netns exec web setsid python3 -m http.server 8080 --bind 10.65.0.80 --directory /srv/kl-web65 </dev/null >/dev/null 2>&1 &
+    eventually 10 "ip netns exec client curl -fsS -m 2 http://10.65.0.80:8080/"
+  check: |
+    s=$(ip netns exec web nft -j list set inet guard blocklist 2>/dev/null)
+    check "the set guard/blocklist supports timeouts" 'jq -e ".nftables[] | select(.set) | .set | (.type == \"ipv4_addr\") and ((.flags // []) | index(\"timeout\"))" <<<"$s" >/dev/null'
+    check "10.65.0.66 is in the set with a timeout of about an hour" 'jq -e ".nftables[] | select(.set) | .set.elem[] | select(.elem.val == \"10.65.0.66\") | .elem.timeout >= 3500 and .elem.timeout <= 3600" <<<"$s" >/dev/null'
+    check_not "the scanner is blocked" 'ip netns exec scanner curl -fsS -m 2 http://10.65.0.80:8080/'
+    check "other clients still get the site" 'ip netns exec client curl -fsS -m 2 http://10.65.0.80:8080/ | grep -q ok'
+  solve: |
+    sudo ip netns exec web nft -f - <<'EOF'
+    table inet guard {
+      set blocklist { type ipv4_addr; flags timeout; }
+      chain input {
+        type filter hook input priority 0; policy accept;
+        ip saddr @blocklist drop
+      }
+    }
+    EOF
+    sudo ip netns exec web nft add element inet guard blocklist '{ 10.65.0.66 timeout 1h }'
+
+- id: net-066
+  title: Where does the directory service live?
+  difficulty: 2
+  kind: build
+  tags: [dns, srv-records, dig, service-discovery]
+  tutorial: |
+    **Concept.** **SRV records** (`_service._proto.domain`) tell clients which
+    host and port offer a service, with a **priority** (lower is preferred)
+    and a **weight** (load sharing among equal priorities). LDAP, SIP, XMPP
+    and Kerberos clients find their servers this way. `dig SRV name` shows
+    `priority weight port target`.
+
+    **Read up on:**
+    - `dig @SERVER SRV _ldap._tcp.corp.test +short`
+    - RFC 2782 priority and weight
+  scenario: |
+    The name server at **`10.66.0.53`** (reachable from the namespace
+    **`ws`**) publishes SRV records for **`_ldap._tcp.corp.test`**. Write the
+    **preferred** server, the target with the **lowest priority** (and on a
+    tie, the highest weight), as **`host:port`** (without the trailing dot) to
+    **`/lab/answer.txt`**.
+  hints:
+    - "`sudo ip netns exec ws dig @10.66.0.53 SRV _ldap._tcp.corp.test +short`."
+    - "Sort by the first field numerically, then by the second in reverse."
+  solution: |
+    ```bash
+    sudo ip netns exec ws dig @10.66.0.53 SRV _ldap._tcp.corp.test +short \
+      | sort -k1,1n -k2,2nr | head -1 | awk '{sub(/\.$/, "", $4); print $4 ":" $3}' > /lab/answer.txt
+    ```
+  setup: |
+    on_reset 'for n in ws dns kl-lan; do ip netns pids $n 2>/dev/null | xargs -r kill -9; done; rm -rf /etc/kl-dns66'
+    lan_up ws=10.66.0.10/24 dns=10.66.0.53/24
+    mkdir -p /etc/kl-dns66
+    python3 - > /etc/kl-dns66/dns.conf <<'PY'
+    import random
+    hosts = [f"ldap{i}.corp.test" for i in range(1, 6)]
+    random.shuffle(hosts)
+    lines = ["no-resolv", "no-hosts", "listen-address=10.66.0.53", "bind-interfaces"]
+    best = None
+    for h in hosts:
+        prio, weight, port = random.choice([10, 20, 20, 30]), random.randint(1, 100), random.choice([389, 3389, 1389, 636])
+        lines.append(f"srv-host=_ldap._tcp.corp.test,{h},{port},{prio},{weight}")
+        key = (prio, -weight)
+        if best is None or key < best[0]:
+            best = (key, f"{h}:{port}")
+    lines.append("srv-host=_kerberos._udp.corp.test,kdc.corp.test,88,1,1")
+    print("\n".join(lines))
+    open("/var/lib/kubelab/answer", "w").write(best[1])
+    PY
+    ip netns exec dns setsid dnsmasq -k -C /etc/kl-dns66/dns.conf --pid-file=/etc/kl-dns66/pid </dev/null >/dev/null 2>&1 &
+    eventually 10 "ip netns exec ws dig +time=1 +tries=1 @10.66.0.53 SRV _ldap._tcp.corp.test +short | grep -q corp"
+  check: |
+    check_eq "preferred LDAP server" "$(tr -d '[:space:]' < /lab/answer.txt 2>/dev/null | sed 's/\.:/:/')" "$(cat "$KL_STATE/answer")"
+  solve: |
+    sudo ip netns exec ws dig @10.66.0.53 SRV _ldap._tcp.corp.test +short \
+      | sort -k1,1n -k2,2nr | head -1 | awk '{sub(/\.$/, "", $4); print $4 ":" $3}' > /lab/answer.txt
+
+- id: net-067
+  title: "unable to get local issuer certificate"
+  difficulty: 3
+  kind: fix
+  tags: [tls, certificate-chain, intermediate, openssl]
+  tutorial: |
+    **Concept.** Clients trust a few **root** CAs, but servers are signed by
+    **intermediate** CAs. So a server must send its **leaf certificate
+    followed by the intermediates**, the *chain*, in that order. With only the
+    leaf, browsers that happen to cache the intermediate work, while `curl`,
+    `openssl` and mobile apps fail with *unable to get local issuer
+    certificate*. Never put the root in the chain: clients have it already.
+
+    **Read up on:**
+    - `openssl s_client -connect HOST:PORT -servername NAME -CAfile ROOT -showcerts`
+    - `openssl x509 -noout -subject -issuer`
+  scenario: |
+    The API server loads its certificate chain from
+    **`/lab/tls/server-chain.pem`** and its key from `/lab/tls/server.key`.
+    Clients that trust **`/lab/tls/root.pem`** reject it. The directory also
+    has the files **`leaf.pem`**, **`intermediate.pem`** and **`root.pem`**.
+
+    Rebuild **`server-chain.pem`** so that a client trusting only `root.pem`
+    verifies the server as **`api.lab.test`**. The check starts a server with
+    your file.
+  hints:
+    - "`openssl x509 -in /lab/tls/server-chain.pem -noout -subject -issuer`: what's in the file now?"
+    - "The chain is the leaf, then the intermediate that signed it: `cat leaf.pem intermediate.pem > server-chain.pem`."
+  solution: |
+    ```bash
+    cd /lab/tls
+    for f in leaf.pem intermediate.pem root.pem; do echo "$f"; openssl x509 -in $f -noout -subject -issuer; done
+    cat leaf.pem intermediate.pem > server-chain.pem
+    ```
+  setup: |
+    d=/lab/tls; rm -rf $d; mkdir -p $d; cd $d
+    openssl req -x509 -newkey ec -pkeyopt ec_paramgen_curve:P-256 -nodes -keyout root.key -out root.pem -days 3650 -subj "/CN=Lab Root CA" -addext basicConstraints=critical,CA:TRUE -addext keyUsage=critical,keyCertSign,cRLSign 2>/dev/null
+    openssl req -newkey ec -pkeyopt ec_paramgen_curve:P-256 -nodes -keyout int.key -out int.csr -subj "/CN=Lab Issuing CA 2" 2>/dev/null
+    printf 'basicConstraints=critical,CA:TRUE,pathlen:0\nkeyUsage=critical,keyCertSign,cRLSign\n' > int.ext
+    openssl x509 -req -in int.csr -CA root.pem -CAkey root.key -CAcreateserial -out intermediate.pem -days 1825 -extfile int.ext 2>/dev/null
+    openssl req -newkey ec -pkeyopt ec_paramgen_curve:P-256 -nodes -keyout server.key -out leaf.csr -subj "/CN=api.lab.test" 2>/dev/null
+    printf 'subjectAltName=DNS:api.lab.test\nextendedKeyUsage=serverAuth\n' > leaf.ext
+    openssl x509 -req -in leaf.csr -CA intermediate.pem -CAkey int.key -CAcreateserial -out leaf.pem -days 365 -extfile leaf.ext 2>/dev/null
+    cp leaf.pem server-chain.pem
+    mv root.key int.key "$KL_STATE/"; rm -f *.csr *.ext *.srl
+    chown -R "$(lab_user):" $d
+  check: |
+    port=$((20000 + RANDOM % 20000))
+    python3 - "$port" <<'PY' &
+    import socket, ssl, sys
+    ctx = ssl.SSLContext(ssl.PROTOCOL_TLS_SERVER)
+    try:
+        ctx.load_cert_chain("/lab/tls/server-chain.pem", "/lab/tls/server.key")
+    except Exception:
+        sys.exit(1)
+    s = socket.socket(); s.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+    s.bind(("127.0.0.1", int(sys.argv[1]))); s.listen(1); s.settimeout(15)
+    try:
+        c, _ = s.accept()
+        with ctx.wrap_socket(c, server_side=True) as t:
+            t.sendall(b"ok\n")
+    except Exception:
+        pass
+    PY
+    srv=$!
+    sleep 1
+    out=$(echo | timeout 10 openssl s_client -connect 127.0.0.1:$port -servername api.lab.test -verify_hostname api.lab.test -CAfile /lab/tls/root.pem -verify_return_error 2>&1)
+    wait $srv 2>/dev/null
+    check_match "a client trusting root.pem verifies the server" "$out" 'Verify return code: 0 \(ok\)'
+    check_eq "the chain starts with the leaf" "$(openssl x509 -in /lab/tls/server-chain.pem -noout -subject 2>/dev/null | grep -o 'CN *= *[^,]*' | sed 's/ //g')" "CN=api.lab.test"
+    check_eq "the root is not in the chain" "$(grep -c 'BEGIN CERTIFICATE' /lab/tls/server-chain.pem 2>/dev/null)" 2
+  solve: |
+    cd /lab/tls
+    cat leaf.pem intermediate.pem > server-chain.pem
+
+- id: net-068
+  title: Which certificate expires first?
+  difficulty: 1
+  kind: build
+  tags: [tls, certificates, expiry, openssl]
+  tutorial: |
+    **Concept.** Expired certificates cause some of the most avoidable
+    outages. `openssl x509 -noout -enddate` prints `notAfter`, and `-checkend
+    SECONDS` returns failure if the certificate expires within that time,
+    which is handy for monitoring scripts.
+
+    **Read up on:**
+    - `openssl x509 -noout -enddate -subject`
+    - `openssl x509 -checkend`
+  scenario: |
+    **`/lab/certs/`** holds the certificates of all public services. Write
+    two lines to **`/lab/answer.txt`**:
+
+    1. the **file name** of the certificate that **expires first**
+    2. its expiry date as **`YYYY-MM-DD`**
+  hints:
+    - "`for f in /lab/certs/*.pem; do echo \"$(openssl x509 -in $f -noout -enddate | cut -d= -f2) $f\"; done`."
+    - "`date -d \"$enddate\" +%F` converts the date, and `+%s` makes it sortable."
+  solution: |
+    ```bash
+    for f in /lab/certs/*.pem; do
+      e=$(openssl x509 -in "$f" -noout -enddate | cut -d= -f2)
+      echo "$(date -d "$e" +%s) $(basename "$f") $(date -u -d "$e" +%F)"
+    done | sort -n | head -1 | awk '{print $2; print $3}' > /lab/answer.txt
+    ```
+  setup: |
+    rm -rf /lab/certs; mkdir -p /lab/certs
+    for n in shop api mail vpn status grafana sso ci; do
+      openssl req -x509 -newkey ec -pkeyopt ec_paramgen_curve:P-256 -nodes -keyout /dev/null -out /lab/certs/$n.pem \
+        -days $((20 + RANDOM % 700)) -subj "/CN=$n.example.test" 2>/dev/null
+    done
+    for f in /lab/certs/*.pem; do e=$(openssl x509 -in "$f" -noout -enddate | cut -d= -f2); echo "$(date -d "$e" +%s) $(basename "$f") $(date -u -d "$e" +%F)"; done | sort -n | head -1 | awk '{print $2; print $3}' > "$KL_STATE/answer"
+    chown -R "$(lab_user):" /lab/certs
+  check: |
+    check_eq "first to expire" "$(sed 's/[[:space:]]*$//; /^$/d' /lab/answer.txt 2>/dev/null)" "$(cat "$KL_STATE/answer")"
+  solve: |
+    for f in /lab/certs/*.pem; do
+      e=$(openssl x509 -in "$f" -noout -enddate | cut -d= -f2)
+      echo "$(date -d "$e" +%s) $(basename "$f") $(date -u -d "$e" +%F)"
+    done | sort -n | head -1 | awk '{print $2; print $3}' > /lab/answer.txt
+
+- id: net-069
+  title: Talk to the right virtual host before DNS exists
+  difficulty: 2
+  kind: build
+  tags: [http, virtual-hosts, host-header, curl]
+  tutorial: |
+    **Concept.** One web server often hosts many sites on one IP, and it
+    picks the site from the HTTP **`Host`** header (and, for HTTPS, from SNI).
+    Before DNS is set up, test a site with `curl --resolve
+    name:port:address`, which connects to the address but sends the real
+    name. Requesting the bare IP gets the default site.
+
+    **Read up on:**
+    - `curl --resolve`, `curl -H 'Host: ...'`
+    - Name-based virtual hosting
+  scenario: |
+    The new server **`10.69.0.80`** (port 80, reachable from the namespace
+    **`laptop`**) will host several sites, but DNS isn't live yet. The
+    status site **`status.internal.test`** has a health endpoint
+    **`/health`** that returns a token. Write that token to
+    **`/lab/answer.txt`**.
+  hints:
+    - "`sudo ip netns exec laptop curl -s http://10.69.0.80/health` returns the default site's answer."
+    - "`sudo ip netns exec laptop curl -s --resolve status.internal.test:80:10.69.0.80 http://status.internal.test/health`."
+  solution: |
+    ```bash
+    sudo ip netns exec laptop curl -s --resolve status.internal.test:80:10.69.0.80 \
+      http://status.internal.test/health > /lab/answer.txt
+    ```
+  setup: |
+    on_reset 'for n in laptop vhosts kl-lan; do ip netns pids $n 2>/dev/null | xargs -r kill -9; done; rm -rf /opt/kl-vhost69'
+    lan_up laptop=10.69.0.10/24 vhosts=10.69.0.80/24
+    mkdir -p /opt/kl-vhost69
+    tok="st-$(tr -dc a-z0-9 </dev/urandom | head -c 10)"; echo "$tok" > "$KL_STATE/answer"
+    cat > /opt/kl-vhost69/srv.py <<EOF
+    from http.server import BaseHTTPRequestHandler, HTTPServer
+    class H(BaseHTTPRequestHandler):
+        def do_GET(self):
+            host = (self.headers.get("Host") or "").split(":")[0]
+            body = {"status.internal.test": {"/health": "$tok"}, "shop.internal.test": {"/health": "shop-ok"}}.get(host, {}).get(self.path, "default site")
+            self.send_response(200); self.end_headers(); self.wfile.write(body.encode() + b"\n")
+        def log_message(self, *a): pass
+    HTTPServer(("10.69.0.80", 80), H).serve_forever()
+    EOF
+    ip netns exec vhosts setsid python3 /opt/kl-vhost69/srv.py </dev/null >/dev/null 2>&1 &
+    eventually 10 "ip netns exec laptop curl -fsS -m 2 http://10.69.0.80/"
+  check: |
+    check_eq "status health token" "$(tr -d '[:space:]' < /lab/answer.txt 2>/dev/null)" "$(cat "$KL_STATE/answer")"
+  solve: |
+    sudo ip netns exec laptop curl -s --resolve status.internal.test:80:10.69.0.80 http://status.internal.test/health > /lab/answer.txt
+
+- id: net-070
+  title: Capture only the new HTTPS connections
+  difficulty: 3
+  kind: build
+  tags: [tcpdump, bpf, capture-filter, tcp-flags]
+  tutorial: |
+    **Concept.** A **capture filter** (BPF) decides what `tcpdump` writes,
+    so a busy link doesn't fill the disk. Besides hosts and ports, it can test
+    **TCP flags**. `tcp[tcpflags] & (tcp-syn|tcp-ack) == tcp-syn` matches the
+    first packet of every new connection (SYN without ACK) and nothing else.
+    `-w FILE` writes a pcap, and `-c N` stops after N packets.
+
+    **Read up on:**
+    - `man pcap-filter`: `tcp[tcpflags]`, `tcp-syn`, `tcp-ack`, `dst port`
+    - `tcpdump -i IF -w FILE -c N`
+  scenario: |
+    The namespace **`gw`** sees mixed traffic on **`eth0`**: web, HTTPS,
+    SSH and DNS, all the time. Write a capture **`/lab/new443.pcap`** that
+    contains **only connection attempts to port 443**, the initial SYN
+    packets without ACK, and **at least 10** of them. Nothing else may be in
+    the file.
+  hints:
+    - "`sudo ip netns exec gw tcpdump -i eth0 -c 10 -w /lab/new443.pcap 'tcp dst port 443 and tcp[tcpflags] & (tcp-syn|tcp-ack) == tcp-syn'`."
+    - "Check with `tcpdump -nr /lab/new443.pcap`."
+  solution: |
+    ```bash
+    sudo ip netns exec gw tcpdump -i eth0 -c 10 -w /lab/new443.pcap \
+      'tcp dst port 443 and tcp[tcpflags] & (tcp-syn|tcp-ack) == tcp-syn'
+    tcpdump -nr /lab/new443.pcap
+    ```
+  setup: |
+    on_reset 'for n in gw clients kl-lan; do ip netns pids $n 2>/dev/null | xargs -r kill -9; done; rm -rf /opt/kl-traffic70'
+    lan_up gw=10.70.0.1/24 clients=10.70.0.50/24
+    ip -n clients addr add 10.70.0.51/24 dev eth0; ip -n clients addr add 10.70.0.52/24 dev eth0
+    mkdir -p /opt/kl-traffic70
+    cat > /opt/kl-traffic70/srv.py <<'EOF'
+    import socket, threading
+    def serve(p):
+        s = socket.socket(); s.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1); s.bind(("10.70.0.1", p)); s.listen(64)
+        while True:
+            c, _ = s.accept(); c.sendall(b"hi\n"); c.close()
+    for p in (80, 443, 22):
+        threading.Thread(target=serve, args=(p,), daemon=True).start()
+    u = socket.socket(socket.AF_INET, socket.SOCK_DGRAM); u.bind(("10.70.0.1", 53))
+    while True:
+        d, a = u.recvfrom(512); u.sendto(d, a)
+    EOF
+    cat > /opt/kl-traffic70/gen.sh <<'EOF'
+    #!/bin/bash
+    while :; do
+      for src in 10.70.0.50 10.70.0.51 10.70.0.52; do
+        for p in 80 443 22 443 80; do timeout 1 bash -c "exec 3<>/dev/tcp/10.70.0.1/$p; head -c3 <&3" >/dev/null 2>&1; done
+        echo q | timeout 1 nc -u -w1 -s $src 10.70.0.1 53 >/dev/null 2>&1
+      done
+      sleep 0.3
+    done
+    EOF
+    chmod 755 /opt/kl-traffic70/gen.sh
+    ip netns exec gw setsid python3 /opt/kl-traffic70/srv.py </dev/null >/dev/null 2>&1 &
+    sleep 1
+    ip netns exec clients setsid /opt/kl-traffic70/gen.sh </dev/null >/dev/null 2>&1 &
+    rm -f /lab/new443.pcap
+  check: |
+    f=/lab/new443.pcap
+    total=$(tcpdump -nr $f 2>/dev/null | wc -l)
+    good=$(tcpdump -nr $f 'tcp dst port 443 and tcp[tcpflags] & (tcp-syn|tcp-ack) == tcp-syn' 2>/dev/null | wc -l)
+    check "the capture has at least 10 packets" '[ "$total" -ge 10 ]'
+    check_eq "every packet is a new connection to port 443" "$good" "$total"
+  solve: |
+    sudo ip netns exec gw timeout 60 tcpdump -i eth0 -c 10 -w /lab/new443.pcap 'tcp dst port 443 and tcp[tcpflags] & (tcp-syn|tcp-ack) == tcp-syn' 2>/dev/null
+
+- id: net-071
+  title: Which switch port is that laptop on?
+  difficulty: 2
+  kind: build
+  tags: [bridge, fdb, mac-address, layer2]
+  tutorial: |
+    **Concept.** A switch (or a Linux **bridge**) learns which port each MAC
+    address lives behind, from the source address of every frame, and keeps
+    it in its **forwarding database** (FDB). `bridge fdb show br BR` lists the
+    entries, and the `dev` column is the port. That's how you find where a
+    misbehaving machine is plugged in.
+
+    **Read up on:**
+    - `bridge fdb show`, `bridge link`
+    - MAC learning and ageing
+  scenario: |
+    The namespace **`sw`** is a switch: bridge **`br0`** with ports `port1` …
+    `port6`. A laptop with the MAC address in **`/lab/mac.txt`** is flooding
+    the network. Write the **name of the bridge port** it's connected to
+    (for example `port3`) to **`/lab/answer.txt`**.
+  hints:
+    - "`sudo ip netns exec sw bridge fdb show br br0`."
+    - "`grep -i \"$(cat /lab/mac.txt)\"` and read the `dev` field."
+  solution: |
+    ```bash
+    sudo ip netns exec sw bridge fdb show br br0 | grep -i "$(cat /lab/mac.txt)" | awk '{print $3}' > /lab/answer.txt
+    ```
+  setup: |
+    on_reset 'for n in sw h1 h2 h3 h4 h5 h6; do ip netns pids $n 2>/dev/null | xargs -r kill -9; done'
+    netns_new sw h1 h2 h3 h4 h5 h6
+    ip -n sw link add br0 type bridge; ip -n sw link set br0 up
+    for i in 1 2 3 4 5 6; do
+      netns_link sw port$i h$i eth0
+      ip -n sw link set port$i master br0
+      ip -n h$i addr add 10.71.0.$i/24 dev eth0
+    done
+    for i in 1 2 3 4 5 6; do ip netns exec h$i ping -c1 -W1 10.71.0.$(( i % 6 + 1 )) >/dev/null 2>&1; done
+    pick=$((1 + RANDOM % 6))
+    ip -n h$pick link show eth0 | awk '/link\/ether/ {print $2}' > /lab/mac.txt
+    echo port$pick > "$KL_STATE/answer"
+    chown "$(lab_user):" /lab/mac.txt
+  check: |
+    check_eq "the laptop's port" "$(tr -d '[:space:]' < /lab/answer.txt 2>/dev/null)" "$(cat "$KL_STATE/answer")"
+  solve: |
+    sudo ip netns exec sw bridge fdb show br br0 | grep -i "$(cat /lab/mac.txt)" | awk '{print $3}' | head -1 > /lab/answer.txt
+
+- id: net-072
+  title: A GRE tunnel between two sites
+  difficulty: 3
+  kind: build
+  tags: [gre, tunnel, routing, overlay]
+  tutorial: |
+    **Concept.** **GRE** wraps IP packets inside other IP packets, so two
+    sites can join private networks across a routed path that knows nothing
+    about them. Each end has a tunnel interface (`ip link add gre1 type gre
+    local A remote B`) with an address on a small transit subnet, and routes
+    send the remote site's prefix into the tunnel. GRE doesn't encrypt
+    anything: use WireGuard or IPsec for that.
+
+    **Read up on:**
+    - `ip link add NAME type gre local ... remote ... ttl 64`
+    - Routing a prefix into a tunnel
+  scenario: |
+    Two sites are connected over a provider network that only routes their
+    public addresses:
+
+    - **`siteA`** public **`198.51.100.2`**, private LAN `192.168.10.0/24`
+      (its own address `192.168.10.1`)
+    - **`siteB`** public **`203.0.113.2`**, private LAN `192.168.20.0/24`
+      (its own address `192.168.20.1`)
+
+    Build a **GRE tunnel `gre1`** between them, with the transit addresses
+    **`10.72.0.1/30`** (siteA) and **`10.72.0.2/30`** (siteB), and routes so
+    that `sudo ip netns exec siteA ping -I 192.168.10.1 192.168.20.1` works
+    **through the tunnel**.
+  hints:
+    - "siteA: `ip link add gre1 type gre local 198.51.100.2 remote 203.0.113.2 ttl 64`, `ip addr add 10.72.0.1/30 dev gre1`, `ip link set gre1 up`."
+    - "siteA: `ip route add 192.168.20.0/24 via 10.72.0.2` (and the mirror image on siteB)."
+  solution: |
+    ```bash
+    sudo ip -n siteA link add gre1 type gre local 198.51.100.2 remote 203.0.113.2 ttl 64
+    sudo ip -n siteA addr add 10.72.0.1/30 dev gre1; sudo ip -n siteA link set gre1 up
+    sudo ip -n siteA route add 192.168.20.0/24 via 10.72.0.2
+    sudo ip -n siteB link add gre1 type gre local 203.0.113.2 remote 198.51.100.2 ttl 64
+    sudo ip -n siteB addr add 10.72.0.2/30 dev gre1; sudo ip -n siteB link set gre1 up
+    sudo ip -n siteB route add 192.168.10.0/24 via 10.72.0.1
+    sudo ip netns exec siteA ping -c2 -I 192.168.10.1 192.168.20.1
+    ```
+  setup: |
+    on_reset 'for n in siteA isp siteB; do ip netns pids $n 2>/dev/null | xargs -r kill -9; done'
+    netns_new siteA isp siteB
+    netns_link siteA wan isp eth0; netns_link isp eth1 siteB wan
+    ip -n siteA addr add 198.51.100.2/24 dev wan; ip -n siteA route add default via 198.51.100.1
+    ip -n isp addr add 198.51.100.1/24 dev eth0; ip -n isp addr add 203.0.113.1/24 dev eth1
+    ip -n siteB addr add 203.0.113.2/24 dev wan; ip -n siteB route add default via 203.0.113.1
+    ip netns exec isp sysctl -qw net.ipv4.ip_forward=1
+    for s in A:10 B:20; do
+      n=site${s%%:*}; ip -n $n link add lan type dummy; ip -n $n link set lan up; ip -n $n addr add 192.168.${s#*:}.1/24 dev lan
+    done
+  check: |
+    check_eq "siteA has a GRE interface gre1" "$(ip -n siteA -d link show gre1 2>/dev/null | grep -o 'gre remote [0-9.]* local [0-9.]*')" "gre remote 203.0.113.2 local 198.51.100.2"
+    check_eq "siteB has a GRE interface gre1" "$(ip -n siteB -d link show gre1 2>/dev/null | grep -o 'gre remote [0-9.]* local [0-9.]*')" "gre remote 198.51.100.2 local 203.0.113.2"
+    check "the LANs reach each other" 'ip netns exec siteA ping -c1 -W1 -I 192.168.10.1 192.168.20.1'
+    check_match "siteA routes siteB's LAN into the tunnel" "$(ip -n siteA route get 192.168.20.1 2>/dev/null)" 'dev gre1'
+    check_not "the provider can't route the private LANs" 'ip -n isp route get 192.168.20.1 2>/dev/null | grep -q "dev eth1"'
+  solve: |
+    sudo ip -n siteA link add gre1 type gre local 198.51.100.2 remote 203.0.113.2 ttl 64
+    sudo ip -n siteA addr add 10.72.0.1/30 dev gre1; sudo ip -n siteA link set gre1 up
+    sudo ip -n siteA route add 192.168.20.0/24 via 10.72.0.2
+    sudo ip -n siteB link add gre1 type gre local 203.0.113.2 remote 198.51.100.2 ttl 64
+    sudo ip -n siteB addr add 10.72.0.2/30 dev gre1; sudo ip -n siteB link set gre1 up
+    sudo ip -n siteB route add 192.168.10.0/24 via 10.72.0.1
+
+- id: net-073
+  title: A layer-2 overlay with VXLAN
+  difficulty: 3
+  kind: build
+  tags: [vxlan, overlay, layer2, tunnel]
+  tutorial: |
+    **Concept.** **VXLAN** carries Ethernet frames inside UDP (port **4789**),
+    so hosts on different IP networks can share one virtual **layer-2
+    segment**, identified by a 24-bit **VNI**. Container and cloud networks are
+    built on it. With a fixed peer you give each end `remote PEER`. For many
+    peers you'd use multicast or a control plane instead.
+
+    **Read up on:**
+    - `ip link add NAME type vxlan id VNI local ... remote ... dstport 4789 dev UNDERLAY`
+  scenario: |
+    The hosts **`h1`** (`10.73.0.1`) and **`h2`** (`10.73.0.2`) share an
+    underlay network. Give them a shared overlay segment:
+
+    - an interface **`vx42`** on each, VXLAN **VNI 42**, UDP port **4789**,
+      with the other host as the remote
+    - overlay addresses **`172.16.42.1/24`** (h1) and **`172.16.42.2/24`** (h2)
+
+    so that `sudo ip netns exec h1 ping 172.16.42.2` works over VXLAN.
+  hints:
+    - "h1: `ip link add vx42 type vxlan id 42 local 10.73.0.1 remote 10.73.0.2 dstport 4789 dev eth0`."
+    - "Then `ip addr add 172.16.42.1/24 dev vx42` and `ip link set vx42 up`. Mirror it on h2."
+  solution: |
+    ```bash
+    for p in "h1 10.73.0.1 10.73.0.2 172.16.42.1" "h2 10.73.0.2 10.73.0.1 172.16.42.2"; do
+      set -- $p
+      sudo ip -n $1 link add vx42 type vxlan id 42 local $2 remote $3 dstport 4789 dev eth0
+      sudo ip -n $1 addr add $4/24 dev vx42
+      sudo ip -n $1 link set vx42 up
+    done
+    sudo ip netns exec h1 ping -c2 172.16.42.2
+    ```
+  setup: |
+    on_reset 'for n in h1 h2; do ip netns pids $n 2>/dev/null | xargs -r kill -9; done'
+    netns_new h1 h2
+    netns_link h1 eth0 h2 eth0
+    ip -n h1 addr add 10.73.0.1/24 dev eth0; ip -n h2 addr add 10.73.0.2/24 dev eth0
+  check: |
+    for h in h1 h2; do
+      check_match "$h has vx42 with VNI 42 on port 4789" "$(ip -n $h -d link show vx42 2>/dev/null)" 'vxlan id 42 .*dstport 4789'
+    done
+    check "h1 reaches h2 on the overlay" 'ip netns exec h1 ping -c1 -W1 172.16.42.2'
+    check_match "the overlay address is on vx42" "$(ip -n h1 route get 172.16.42.2 2>/dev/null)" 'dev vx42'
+  solve: |
+    for p in "h1 10.73.0.1 10.73.0.2 172.16.42.1" "h2 10.73.0.2 10.73.0.1 172.16.42.2"; do
+      set -- $p
+      sudo ip -n $1 link add vx42 type vxlan id 42 local $2 remote $3 dstport 4789 dev eth0
+      sudo ip -n $1 addr add $4/24 dev vx42
+      sudo ip -n $1 link set vx42 up
+    done
+
+- id: net-074
+  title: The second interface that drops everything
+  difficulty: 3
+  kind: fix
+  tags: [rp_filter, asymmetric-routing, multihoming, sysctl]
+  tutorial: |
+    **Concept.** **Reverse path filtering** (`rp_filter`) drops an incoming
+    packet if the route **back** to its source would leave through a
+    different interface. In **strict** mode (1) that's anti-spoofing. On a
+    host with two interfaces and one default route, it also silently drops
+    legitimate traffic that arrives on the "other" interface. **Loose** mode
+    (2) only requires that some route back exists. Policy routing, which sends
+    replies out the interface they came in on, is the cleaner alternative.
+
+    **Read up on:**
+    - `net.ipv4.conf.*.rp_filter` (0, 1, 2), and that the effective value is the maximum of `all` and the interface's own
+    - `ip rule add from ADDR table N`
+  scenario: |
+    The server **`db`** has two interfaces: `eth0` `10.74.1.10` (its
+    default route) and `eth1` `10.74.2.10` (the storage network). Clients
+    behind the router reach `10.74.1.10` fine, but nothing ever arrives at
+    `10.74.2.10`. A capture on `db`'s `eth1` shows the pings arriving.
+
+    Make `sudo ip netns exec client ping 10.74.2.10` work. **Don't switch
+    reverse path filtering off completely.** Loose mode or policy routing are
+    both fine.
+  hints:
+    - "`sudo ip netns exec db sysctl net.ipv4.conf.all.rp_filter net.ipv4.conf.eth1.rp_filter`."
+    - "`sudo ip netns exec db sysctl -w net.ipv4.conf.all.rp_filter=2 net.ipv4.conf.eth1.rp_filter=2`."
+    - "Or: `ip -n db rule add from 10.74.2.10 table 100` and `ip -n db route add default via 10.74.2.1 table 100`."
+  solution: |
+    ```bash
+    sudo ip netns exec db sysctl -w net.ipv4.conf.all.rp_filter=2 net.ipv4.conf.eth1.rp_filter=2
+    sudo ip netns exec client ping -c2 10.74.2.10
+    ```
+  setup: |
+    on_reset 'for n in client rtr db; do ip netns pids $n 2>/dev/null | xargs -r kill -9; done'
+    netns_new client rtr db
+    netns_link client eth0 rtr eth0; netns_link rtr eth1 db eth0; netns_link rtr eth2 db eth1
+    ip -n client addr add 10.74.9.2/24 dev eth0; ip -n client route add default via 10.74.9.1
+    ip -n rtr addr add 10.74.9.1/24 dev eth0; ip -n rtr addr add 10.74.1.1/24 dev eth1; ip -n rtr addr add 10.74.2.1/24 dev eth2
+    ip netns exec rtr sysctl -qw net.ipv4.ip_forward=1
+    ip -n db addr add 10.74.1.10/24 dev eth0; ip -n db addr add 10.74.2.10/24 dev eth1
+    ip -n db route add default via 10.74.1.1
+    ip netns exec db sysctl -qw net.ipv4.conf.all.rp_filter=1 net.ipv4.conf.default.rp_filter=1 net.ipv4.conf.eth0.rp_filter=1 net.ipv4.conf.eth1.rp_filter=1
+  check: |
+    check "the client reaches 10.74.2.10" 'ip netns exec client ping -c1 -W1 10.74.2.10'
+    check "the client still reaches 10.74.1.10" 'ip netns exec client ping -c1 -W1 10.74.1.10'
+    eff=$(ip netns exec db sh -c 'a=$(sysctl -n net.ipv4.conf.all.rp_filter); e=$(sysctl -n net.ipv4.conf.eth1.rp_filter); [ $a -gt $e ] && echo $a || echo $e')
+    check "reverse path filtering is still on for eth1" '[ "$eff" != 0 ]'
+  solve: |
+    sudo ip netns exec db sysctl -qw net.ipv4.conf.all.rp_filter=2 net.ipv4.conf.eth1.rp_filter=2
+
+- id: net-075
+  title: Which router is eating the packets?
+  difficulty: 2
+  kind: build
+  tags: [traceroute, troubleshooting, routing, firewall]
+  tutorial: |
+    **Concept.** `traceroute` sends probes with increasing TTL. Each router
+    that decrements the TTL to zero answers with *time exceeded*, which
+    reveals the path hop by hop. If a router **forwards nothing** past itself
+    (a firewall rule, a missing route), the last hop that answers is the
+    router where things stop. `-n` skips DNS lookups and keeps it fast.
+
+    **Read up on:**
+    - `traceroute -n`, `tracepath -n`
+    - Why a silent hop isn't always the broken one
+  scenario: |
+    From **`client`**, the server **`192.0.2.10`** is unreachable. The path
+    crosses four routers, whose names and addresses are listed in
+    **`/lab/routers.txt`**. Find the router **where traffic stops** (the last
+    one that still answers) and write its **name** to **`/lab/answer.txt`**.
+  hints:
+    - "`sudo ip netns exec client traceroute -n -w1 -q1 192.0.2.10`."
+    - "Match the last answering address against `/lab/routers.txt`."
+  solution: |
+    ```bash
+    last=$(sudo ip netns exec client traceroute -n -w1 -q1 -m 8 192.0.2.10 | awk '$2 ~ /^[0-9]/ {ip=$2} END {print ip}')
+    grep -w "$last" /lab/routers.txt | awk '{print $1}' > /lab/answer.txt
+    ```
+  setup: |
+    on_reset 'for n in client r1 r2 r3 r4 server; do ip netns pids $n 2>/dev/null | xargs -r kill -9; done'
+    netns_new client r1 r2 r3 r4 server
+    chain=(client r1 r2 r3 r4 server)
+    for i in 0 1 2 3 4; do netns_link ${chain[$i]} right ${chain[$((i + 1))]} left; done
+    for i in 0 1 2 3 4; do
+      ip -n ${chain[$i]} addr add 10.75.$i.1/24 dev right
+      ip -n ${chain[$((i + 1))]} addr add 10.75.$i.2/24 dev left
+    done
+    ip -n server addr add 192.0.2.10/32 dev left
+    ip -n client route add default via 10.75.0.2
+    for i in 1 2 3 4; do
+      r=${chain[$i]}; ip netns exec $r sysctl -qw net.ipv4.ip_forward=1
+      ip -n $r route add default via 10.75.$i.2 2>/dev/null
+      ip -n $r route add 10.75.0.0/16 via 10.75.$((i - 1)).1 2>/dev/null
+    done
+    ip -n r4 route replace 192.0.2.10/32 via 10.75.4.2
+    ip -n server route add default via 10.75.4.1
+    : > /lab/routers.txt
+    for i in 1 2 3 4; do echo "r$i 10.75.$((i - 1)).2" >> /lab/routers.txt; done
+    bad=$((1 + RANDOM % 4))
+    ip netns exec r$bad nft -f - <<'EOF'
+    table ip klblock {
+      chain forward {
+        type filter hook forward priority 0; policy accept;
+        ip daddr 192.0.2.10 drop
+      }
+    }
+    EOF
+    echo r$bad > "$KL_STATE/answer"
+    chown "$(lab_user):" /lab/routers.txt
+  check: |
+    check_eq "the router where traffic stops" "$(tr -d '[:space:]' < /lab/answer.txt 2>/dev/null)" "$(cat "$KL_STATE/answer")"
+  solve: |
+    last=$(sudo ip netns exec client traceroute -n -w1 -q1 -m 8 192.0.2.10 | awk '$2 ~ /^[0-9]/ {ip=$2} END {print ip}')
+    grep -w "$last" /lab/routers.txt | awk '{print $1}' > /lab/answer.txt
+
+- id: net-076
+  title: Two cables, one address, no outage
+  difficulty: 3
+  kind: build
+  tags: [bonding, active-backup, failover, miimon]
+  tutorial: |
+    **Concept.** **Bonding** joins several network interfaces into one
+    logical interface. In **active-backup** mode only one slave carries
+    traffic, and when its link drops (detected by **MII monitoring**, for
+    example `miimon 100` ms) the bond switches to another slave, keeping the
+    same IP and MAC. Slaves must be **down** when you enslave them.
+
+    **Read up on:**
+    - `ip link add bond0 type bond mode active-backup miimon 100`
+    - `ip link set eth0 master bond0`, `cat /proc/net/bonding/bond0`
+  scenario: |
+    The server **`nas`** is cabled twice to the switch, with interfaces `eth0`
+    and `eth1`, and has no address yet. Build **`bond0`** in **active-backup**
+    mode with **link monitoring every 100 ms** from both interfaces, and give it
+    **`10.76.0.10/24`**.
+
+    The client **`10.76.0.20`** must reach the NAS, and keep reaching it when
+    **either** cable is pulled.
+  hints:
+    - "`sudo ip -n nas link add bond0 type bond mode active-backup miimon 100`."
+    - "`sudo ip -n nas link set eth0 down; sudo ip -n nas link set eth0 master bond0` (same for eth1)."
+    - "`sudo ip -n nas addr add 10.76.0.10/24 dev bond0; sudo ip -n nas link set bond0 up`."
+  solution: |
+    ```bash
+    sudo ip -n nas link add bond0 type bond mode active-backup miimon 100
+    for i in eth0 eth1; do sudo ip -n nas link set $i down; sudo ip -n nas link set $i master bond0; done
+    sudo ip -n nas addr add 10.76.0.10/24 dev bond0
+    sudo ip -n nas link set bond0 up
+    sudo ip netns exec nas cat /proc/net/bonding/bond0
+    ```
+  setup: |
+    on_reset 'for n in nas sw client; do ip netns pids $n 2>/dev/null | xargs -r kill -9; done'
+    netns_new nas sw client
+    ip -n sw link add br0 type bridge; ip -n sw link set br0 up
+    netns_link nas eth0 sw p0; netns_link nas eth1 sw p1; netns_link client eth0 sw p2
+    for p in p0 p1 p2; do ip -n sw link set $p master br0; done
+    ip -n client addr add 10.76.0.20/24 dev eth0
+  check: |
+    b=$(ip netns exec nas cat /proc/net/bonding/bond0 2>/dev/null)
+    check_match "bond0 is active-backup" "$b" 'Bonding Mode: fault-tolerance \(active-backup\)'
+    check_match "MII monitoring every 100 ms" "$b" 'MII Polling Interval \(ms\): 100'
+    check "both cables are slaves" 'grep -q "Slave Interface: eth0" <<<"$b" && grep -q "Slave Interface: eth1" <<<"$b"'
+    check_eq "bond0's address" "$(ip -n nas -4 -o addr show dev bond0 2>/dev/null | awk '{print $4}')" 10.76.0.10/24
+    check "the client reaches the NAS" 'ip netns exec client ping -c1 -W1 10.76.0.10'
+    act=$(awk '/Currently Active Slave/ {print $4}' <<<"$b")
+    if [ -n "$act" ]; then
+      peer=p${act#eth}
+      ip -n sw link set $peer down
+      check "the NAS stays reachable when $act's cable is pulled" 'eventually 8 "ip netns exec client ping -c1 -W1 10.76.0.10"'
+      ip -n sw link set $peer up
+    else
+      fail "the NAS stays reachable when a cable is pulled"
+    fi
+  solve: |
+    sudo ip -n nas link add bond0 type bond mode active-backup miimon 100
+    for i in eth0 eth1; do sudo ip -n nas link set $i down; sudo ip -n nas link set $i master bond0; done
+    sudo ip -n nas addr add 10.76.0.10/24 dev bond0
+    sudo ip -n nas link set bond0 up
+
+- id: net-077
+  title: Traffic from the guest Wi-Fi stays out of the office
+  difficulty: 3
+  kind: build
+  tags: [nftables, forward, segmentation, firewall, router]
+  tutorial: |
+    **Concept.** A router's **forward** chain decides which networks may
+    talk to which. A safe guest network may reach the **internet** but not
+    the **office LAN**, and replies to connections the office started must
+    still come back. Match on input and output interfaces (`iifname`,
+    `oifname`) and on **connection state** (`ct state established,related`),
+    with a default **drop**.
+
+    **Read up on:**
+    - nftables `hook forward`, `iifname`, `oifname`, `ct state`
+    - Default-deny policies
+  scenario: |
+    The namespace **`gw`** routes between three networks:
+
+    - `office` behind `gw`'s interface **`lan`** (`10.77.1.0/24`)
+    - `guest` behind **`guest`** (`10.77.2.0/24`)
+    - `internet` behind **`wan`** (`203.0.113.0/24`, test host
+      `203.0.113.80`)
+
+    Today everything can reach everything. In `gw`, create a table **`inet
+    zones`** with a **forward** chain whose policy is **drop**, so that:
+
+    - office → internet and office → guest are allowed
+    - guest → internet is allowed
+    - **guest → office is blocked**
+    - replies to allowed connections get through
+  hints:
+    - "`chain forward { type filter hook forward priority 0; policy drop; ct state established,related accept; ... }`."
+    - "`iifname \"lan\" accept` and `iifname \"guest\" oifname \"wan\" accept`."
+  solution: |
+    ```bash
+    sudo ip netns exec gw nft -f - <<'EOF'
+    table inet zones {
+      chain forward {
+        type filter hook forward priority 0; policy drop;
+        ct state established,related accept
+        iifname "lan" accept
+        iifname "guest" oifname "wan" accept
+      }
+    }
+    EOF
+    ```
+  setup: |
+    on_reset 'for n in office guestpc gw net; do ip netns pids $n 2>/dev/null | xargs -r kill -9; done'
+    netns_new office guestpc gw net
+    netns_link office eth0 gw lan; netns_link guestpc eth0 gw guest; netns_link net eth0 gw wan
+    ip -n gw addr add 10.77.1.1/24 dev lan; ip -n gw addr add 10.77.2.1/24 dev guest; ip -n gw addr add 203.0.113.1/24 dev wan
+    ip -n office addr add 10.77.1.10/24 dev eth0; ip -n office route add default via 10.77.1.1
+    ip -n guestpc addr add 10.77.2.10/24 dev eth0; ip -n guestpc route add default via 10.77.2.1
+    ip -n net addr add 203.0.113.80/24 dev eth0; ip -n net route add 10.77.0.0/16 via 203.0.113.1
+    ip netns exec gw sysctl -qw net.ipv4.ip_forward=1
+  check: |
+    p() { ip netns exec "$1" ping -c1 -W1 "$2" >/dev/null 2>&1; }
+    c=$(ip netns exec gw nft -j list chain inet zones forward 2>/dev/null)
+    check_eq "inet zones forward chain has policy drop" "$(jq -r '.nftables[] | select(.chain) | .chain.policy' <<<"$c" 2>/dev/null)" drop
+    check "office reaches the internet" 'p office 203.0.113.80'
+    check "office reaches the guest network" 'p office 10.77.2.10'
+    check "guests reach the internet" 'p guestpc 203.0.113.80'
+    check_not "guests can't reach the office" 'p guestpc 10.77.1.10'
+    check_not "the internet can't start connections inside" 'p net 10.77.1.10 || p net 10.77.2.10'
+  solve: |
+    sudo ip netns exec gw nft -f - <<'EOF'
+    table inet zones {
+      chain forward {
+        type filter hook forward priority 0; policy drop;
+        ct state established,related accept
+        iifname "lan" accept
+        iifname "guest" oifname "wan" accept
+      }
+    }
+    EOF
+
+- id: net-078
+  title: "Incident: the intranet is down for the branch"
+  difficulty: 4
+  kind: fix
+  tags: [incident, routing, firewall, listen-address, troubleshooting]
+  tutorial: |
+    **Concept.** Work through the layers in order: does the client have the
+    right **address and gateway**? Does the router **forward**? Does its
+    **firewall** allow the flow? Is the server **listening on the right
+    address**? `ping` answers the first two, and `curl -v`, `nft list
+    ruleset` and `ss -ltnp` answer the rest. Fix what's wrong without opening
+    up more than needed.
+
+    **Read up on:**
+    - `ip route`, `sysctl net.ipv4.ip_forward`, `nft list ruleset`
+    - `ss -ltnp`
+  scenario: |
+    Branch users in **`branch`** (`10.78.1.10`) can't open the intranet at
+    **`http://10.78.2.10/`**, served by **`intranet`** through the router
+    **`core`**. Several things changed during a maintenance window.
+
+    Get `sudo ip netns exec branch curl http://10.78.2.10/` returning the
+    page, and keep `core`'s firewall: its forward chain must stay
+    **default-drop**, and may only additionally allow what's needed. The web
+    server runs from **`/usr/local/bin/kl-intranet`** (`start`/`stop`) and reads
+    **`/etc/kl-intranet.conf`**.
+  hints:
+    - "`sudo ip netns exec branch ip route`: is that gateway the router?"
+    - "`sudo ip netns exec core sysctl net.ipv4.ip_forward` and `sudo ip netns exec core nft list ruleset`."
+    - "`sudo ip netns exec intranet ss -ltnp`: which address is it listening on?"
+  solution: |
+    ```bash
+    sudo ip -n branch route replace default via 10.78.1.1
+    sudo ip netns exec core sysctl -w net.ipv4.ip_forward=1
+    sudo ip netns exec core nft add rule inet core forward ip daddr 10.78.2.10 tcp dport 80 accept
+    sudo sed -i 's/^bind=.*/bind=10.78.2.10/' /etc/kl-intranet.conf
+    sudo /usr/local/bin/kl-intranet stop; sudo /usr/local/bin/kl-intranet start
+    sudo ip netns exec branch curl -s http://10.78.2.10/
+    ```
+  setup: |
+    on_reset 'for n in branch core intranet; do ip netns pids $n 2>/dev/null | xargs -r kill -9; done; rm -rf /usr/local/bin/kl-intranet /etc/kl-intranet.conf /srv/kl-intranet'
+    netns_new branch core intranet
+    netns_link branch eth0 core eth0; netns_link core eth1 intranet eth0
+    ip -n branch addr add 10.78.1.10/24 dev eth0; ip -n branch route add default via 10.78.1.254
+    ip -n core addr add 10.78.1.1/24 dev eth0; ip -n core addr add 10.78.2.1/24 dev eth1
+    ip -n intranet addr add 10.78.2.10/24 dev eth0; ip -n intranet route add default via 10.78.2.1
+    ip netns exec core sysctl -qw net.ipv4.ip_forward=0
+    ip netns exec core nft -f - <<'EOF'
+    table inet core {
+      chain forward {
+        type filter hook forward priority 0; policy drop;
+        ct state established,related accept
+        icmp type echo-request accept
+        tcp dport 22 accept
+      }
+    }
+    EOF
+    mkdir -p /srv/kl-intranet; echo "<h1>Intranet home</h1>" > /srv/kl-intranet/index.html
+    printf 'bind=127.0.0.1\nport=80\n' > /etc/kl-intranet.conf
+    cat > /usr/local/bin/kl-intranet <<'EOF'
+    #!/bin/bash
+    . /etc/kl-intranet.conf
+    case "$1" in
+      start) ip netns exec intranet setsid python3 -m http.server "$port" --bind "$bind" --directory /srv/kl-intranet </dev/null >/dev/null 2>&1 & ;;
+      stop) pkill -f 'http.server.*--directory /srv/kl-intranet' ;;
+      *) echo "usage: $0 start|stop"; exit 2 ;;
+    esac
+    EOF
+    chmod 755 /usr/local/bin/kl-intranet
+    /usr/local/bin/kl-intranet start
+    eventually 10 'ip netns exec intranet ss -ltn | grep -q 127.0.0.1:80'
+  check: |
+    check "branch opens the intranet" 'eventually 4 "ip netns exec branch curl -fsS -m 2 http://10.78.2.10/ | grep -q Intranet"'
+    c=$(ip netns exec core nft -j list chain inet core forward 2>/dev/null)
+    check_eq "core's forward chain is still default-drop" "$(jq -r '.nftables[] | select(.chain) | .chain.policy' <<<"$c" 2>/dev/null)" drop
+    ip netns exec intranet setsid python3 -c "import socket, time; s = socket.socket(); s.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1); s.bind(('10.78.2.10', 8099)); s.listen(1); time.sleep(6)" </dev/null >/dev/null 2>&1 &
+    sleep 1
+    ip netns exec branch curl -s -m 2 http://10.78.2.10:8099/ >/dev/null 2>&1; rc=$?
+    check_eq "core still blocks other ports (a probe of :8099 times out)" "$rc" 28
+  solve: |
+    sudo ip -n branch route replace default via 10.78.1.1
+    sudo ip netns exec core sysctl -qw net.ipv4.ip_forward=1
+    sudo ip netns exec core nft add rule inet core forward ip daddr 10.78.2.10 tcp dport 80 accept
+    sudo sed -i 's/^bind=.*/bind=10.78.2.10/' /etc/kl-intranet.conf
+    sudo /usr/local/bin/kl-intranet stop; sleep 1; sudo /usr/local/bin/kl-intranet start
