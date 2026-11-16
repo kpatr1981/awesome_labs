@@ -163,11 +163,12 @@ shortcut. While the mouse is in use, most terminals select text with `shift`+dra
 | Key | Action |
 |-----|--------|
 | `↑↓` / `j k` | move · `n`/`p` next/previous module |
-| `/` | filter by id, title, tag, module or difficulty |
+| `/` | filter by id, title, tag, module or difficulty · `ctrl+t` while filtering also searches the scenarios, tutorials and hints |
 | `tab` | switch track |
 | `u` | cycle the progress filter: all · solved · in progress (started, not solved) · no progress |
 | `enter` | open an exercise |
 | `L` | **learning paths** — focus the list on a curated path, with progress |
+| `W` | **weak spots** — the modules where you needed the most hints, solutions and checks, and the exercises worth redoing |
 | `X` | **exam mode** — start a timed exam, or return to the running one |
 | `a` | jump to the exercise you're **working on** (shown as `▶` in the header and list) |
 | `S` | your labs: the active exercise, then others started earlier and not solved |
@@ -187,7 +188,10 @@ shortcut. While the mouse is in use, most terminals select text with `shift`+dra
 | `v` | reveal the **solution** (asks first) |
 | `x` | **end** the exercise: forget its lab and clean its VMs for the next one (asks first) |
 | `R` | **reset progress** on this exercise (asks first) |
-| `1`–`5` / `tab` / `←→` | Scenario · Learn · Hints · Solution · Output |
+| `A` | **auto-check** on/off: check whenever you leave the terminal or save in VS Code |
+| `y` | **copy** a code block of the tab you're on; `y` again copies the next one |
+| `enter` | after a pass, open the suggested next exercise (the next unsolved one in the list) |
+| `1`–`6` / `tab` / `←→` | Scenario · Learn · Hints · Solution · Output · Notes |
 | `n` / `N` | next / previous in the list you opened it from: the filtered list, Started labs, or the exam's questions |
 | `esc` / `q` | back to where you opened it from |
 
@@ -201,6 +205,17 @@ beyond a reset has its VMs deleted instead. Starting an exercise **deletes the V
 every other environment**, running or stopped, since that exercise doesn't need them.
 During an exam the VMs keep running, since they carry on to the next question. The environments screen goes
 back to the exercise you came from.
+
+**Notes** (tab 6, `enter` to edit, `esc` saves) are yours per exercise, kept in
+`~/.awesome_labs/notes.json`; resetting progress keeps them. **Your commands:** shells
+opened from awesome_labs (`t`, `w`, or VS Code's terminal) keep a history per exercise,
+which each check copies to `~/.awesome_labs/history/`. Once you reveal the solution, the
+Solution tab lists your commands under it, to compare. **Copying** uses the system
+clipboard (`pbcopy`, `wl-copy`, `xclip`…) and falls back to the terminal (OSC 52), which
+also works over SSH.
+
+While an environment builds or boots, the status line shows the step it's on, the time
+so far and, from the last run of the same kind, an estimate with a progress bar.
 
 Inside the VMs the scenario is also in **`/lab/TASK.md`**; `/lab` is your working
 directory. On the control plane `kubectl` (alias `k`, with completion) is configured
@@ -271,16 +286,23 @@ awesome_labs exam status     # the running exam
 awesome_labs exam history    # past results
 ```
 
-### Saving memory
+### Saving memory, and other settings
 
 Only one environment runs at a time: starting a Docker exercise deletes the Kubernetes
 VMs and vice versa, while the environment you're using stays up and is cleaned between
-exercises. Exiting always deletes every lab VM, running or stopped, and starting the app
-deletes any left over. With `auto_stop: true` (the default), solving an exercise with
-`awesome_labs check` stops its VMs. Settings live in `~/.awesome_labs/config.yaml`:
+exercises. By default exiting deletes every lab VM, running or stopped, and starting the
+app deletes any left over. With `on_exit: stop` they are stopped instead (their memory is
+freed, their disks kept), and with `keep` left running: either way the exercise you were
+on is still set up next time, and `t` or `c` starts its VMs again without a reset. With
+`auto_stop: true` (the default), solving an exercise with `awesome_labs check` stops its
+VMs. Settings live in `~/.awesome_labs/config.yaml`:
 
 ```yaml
 auto_stop: true
+on_exit: delete        # delete · stop · keep
+auto_check: false      # start with auto-check on (A toggles it)
+check_updates: false   # look for a newer release once a day; nothing about you is sent
+theme: auto            # auto · dark · light (NO_COLOR=1 turns colours off)
 docker:       {cpus: 2, memory: 3GiB}       # applied when a VM is (re)created:
 controlplane: {cpus: 2, memory: 3GiB}       #   awesome_labs env rebuild docker|k8s
 worker:       {cpus: 2, memory: 2560MiB}
@@ -305,6 +327,8 @@ awesome_labs env prepare [docker|k8s|offsec]   # build now and keep a saved copy
 awesome_labs env cache [docker|k8s|offsec]     # fill the local image cache (no env: show it)
 awesome_labs vms                        # every lab VM with status, CPU and memory
 awesome_labs vms stop|delete <name|all> # e.g. vms delete kl-offsec · vms stop all
+awesome_labs doctor [--fix]             # check this machine and awesome_labs for the usual trouble
+awesome_labs version [--check]          # this build's version; --check: is a newer release out?
 ```
 
 You work on **one exercise at a time**: starting one resets its environment, so it
@@ -318,6 +342,11 @@ a crash. The read-only `list`, `show`, `status`, `paths` and `lint` still run be
 and so do `shell`, `code` and `sync`, which only work inside a running VM.
 
 Progress is stored in `~/.awesome_labs/progress.json`, logs in `~/.awesome_labs/logs/`.
+When something seems stuck or broken, `awesome_labs doctor` is the first thing to run:
+it checks Lima (and QEMU on Linux), free disk and RAM, whether the `awesome_labs` on your
+PATH is a different build from the one you're running, environments left marked busy by
+a crashed run (`--fix` clears them), stray VMs and missing saved copies, and says how to
+fix each one.
 
 ## Writing exercises
 
@@ -343,7 +372,9 @@ internal/lab               environments: create/bootstrap/reset VMs, run setup/c
 internal/lima              thin limactl wrapper
 internal/install           OS detection and the install command
 internal/tui               Bubble Tea interface
-internal/progress          ~/.awesome_labs/progress.json
+internal/progress          ~/.awesome_labs/progress.json and notes.json
+internal/doctor            awesome_labs doctor
+internal/update            the newer-release check
 internal/exam              timed exams
 internal/config            ~/.awesome_labs/config.yaml
 learning-paths.yaml        curated paths

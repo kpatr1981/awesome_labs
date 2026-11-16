@@ -59,6 +59,7 @@ func (m *Manager) ClearActive(id string) {
 // start to boot and reset. An environment that a verify run is using is left
 // alone.
 func (m *Manager) EndExercise(ctx context.Context, ex *exercise.Exercise, log io.Writer) error {
+	m.FetchHistory(ctx, ex) // before the reset; home survives it, but the VMs may not
 	m.ClearActive(ex.ID)
 	env := EnvFor(ex.Profile)
 	if m.busy(env) {

@@ -89,7 +89,13 @@ func newTestModelIn(t *testing.T, dir string) *model {
 	m.Update(tea.WindowSizeMsg{Width: 150, Height: 50})
 	m.endLab = func(context.Context, *exercise.Exercise, io.Writer) error { return nil } // never the real VMs
 	m.deleteVMs = func(context.Context, io.Writer) error { return nil }
-	m.unprepared = nil // never look at the real VMs
+	m.stopVMs = func(context.Context, io.Writer) error { return nil }
+	m.check = func(context.Context, *exercise.Exercise, io.Writer) (bool, error) {
+		return false, errors.New("tests never check on VMs")
+	}
+	m.clip = func(string) error { return nil }
+	m.fetchHistory = nil // never the real VMs
+	m.unprepared = nil   // never look at the real VMs
 	m.prepare = func(context.Context, lab.Env, io.Writer) error { return errors.New("tests never build VMs") }
 	m.op = busyOp
 	return m
@@ -481,7 +487,7 @@ func TestLeavingWithoutStopping(t *testing.T) {
 func TestLeftArrowSwitchesTabs(t *testing.T) {
 	m := build(t, named("exercise set up on the VMs"), false)
 	m.Update(keyMsg("left"))
-	if m.screen != scrDetail || m.tab != tabOutput || m.confirm != "" {
+	if m.screen != scrDetail || m.tab != tabNotes || m.confirm != "" {
 		t.Errorf("left: screen %v, tab %v, confirm %q; want the previous tab", m.screen, m.tab, m.confirm)
 	}
 	m.Update(keyMsg("right"))

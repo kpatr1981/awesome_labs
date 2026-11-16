@@ -892,6 +892,9 @@ func (m *Manager) Check(ctx context.Context, ex *exercise.Exercise, log io.Write
 			return false, err
 		}
 	}
+	if !m.HoldEnvs {
+		m.FetchHistory(ctx, ex) // your commands, to compare with the solution
+	}
 	if ok && !m.HoldEnvs {
 		m.ClearActive(ex.ID) // solved: no longer being worked on
 	}
@@ -938,7 +941,11 @@ func (m *Manager) ShellCommand(env Env, worker bool) *exec.Cmd {
 		}
 	}
 	m.setClean(env, false) // a shell can change anything
-	return lima.ShellCommand(vm.Name, "/lab")
+	hist := ""
+	if a, ok := m.Active(); ok && EnvFor(a.Profile).Profile == env.Profile {
+		hist = historyName(a.ID)
+	}
+	return lima.ShellCommand(vm.Name, "/lab", hist)
 }
 
 // ---- tainted environments (destructive exercises) ----

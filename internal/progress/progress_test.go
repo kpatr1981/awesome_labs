@@ -39,3 +39,25 @@ func TestResetRemovesEntryFromDisk(t *testing.T) {
 		t.Errorf("Counts = %d solved, %d started; want 1, 0", solved, started)
 	}
 }
+
+func TestNotesSurviveAProgressReset(t *testing.T) {
+	dir := t.TempDir()
+	s, _ := Open(dir)
+	n, err := OpenNotes(dir)
+	if err != nil {
+		t.Fatal(err)
+	}
+	s.MarkStarted("a")
+	if err := n.Set("a", "use -o wide"); err != nil {
+		t.Fatal(err)
+	}
+	s.Reset("a")
+	r, _ := OpenNotes(dir)
+	if got := r.Get("a"); got != "use -o wide" {
+		t.Errorf("note after reset = %q", got)
+	}
+	_ = r.Set("a", "  ")
+	if r.Has("a") {
+		t.Error("an empty note was kept")
+	}
+}

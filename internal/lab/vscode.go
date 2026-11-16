@@ -201,7 +201,10 @@ func (m *Manager) SyncLab(ctx context.Context, t CodeTarget, out io.Writer) erro
 	_, _ = f.WriteAt([]byte(strconv.Itoa(os.Getpid())+"\n"), 0)
 
 	s := newLabSync(m.CodeDir(t), m.codeBackups(t), &vmRemote{vm: t.VM.Name}, out)
-	s.onPush = func() { m.setClean(t.Env, false) } // the lab isn't pristine any more
+	s.onPush = func() {
+		m.setClean(t.Env, false) // the lab isn't pristine any more
+		_ = os.WriteFile(m.pushedFile(t), nil, 0o644)
+	}
 	fmt.Fprintf(out, "syncing %s:/lab ↔ %s (ctrl+c stops)\n", t.VM.Hostname, m.CodeDir(t))
 	waiting := ""
 	for {
@@ -240,6 +243,20 @@ func (m *Manager) SyncLab(ctx context.Context, t CodeTarget, out io.Writer) erro
 func stopped(out io.Writer) error {
 	fmt.Fprintln(out, "sync stopped: edits in this window no longer reach the VM — close it when you're done")
 	return nil
+}
+
+func (m *Manager) pushedFile(t CodeTarget) string {
+	return filepath.Join(m.codeBase(), t.Name+".pushed")
+}
+
+// CodePushed is when the VS Code sync last wrote into the target's /lab (the
+// zero time if never): the app's auto-check watches it.
+func (m *Manager) CodePushed(t CodeTarget) time.Time {
+	fi, err := os.Stat(m.pushedFile(t))
+	if err != nil {
+		return time.Time{}
+	}
+	return fi.ModTime()
 }
 
 func (m *Manager) syncLock(t CodeTarget) string {

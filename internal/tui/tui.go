@@ -13,6 +13,7 @@ import (
 	"time"
 
 	"github.com/charmbracelet/bubbles/spinner"
+	"github.com/charmbracelet/bubbles/textarea"
 	"github.com/charmbracelet/bubbles/textinput"
 	"github.com/charmbracelet/bubbles/viewport"
 	tea "github.com/charmbracelet/bubbletea"
@@ -45,9 +46,10 @@ const (
 	tabHints
 	tabSolution
 	tabOutput
+	tabNotes
 )
 
-var tabNames = []string{"Scenario", "Learn", "Hints", "Solution", "Output"}
+var tabNames = []string{"Scenario", "Learn", "Hints", "Solution", "Output", "Notes"}
 
 // ---- messages ----
 
@@ -63,6 +65,7 @@ type envStatusMsg struct {
 	vms    map[string]lab.VMInfo
 }
 type shellDoneMsg struct{ err error }
+type updateMsg struct{ tag, url string }
 type tickMsg time.Time
 type stoppedMsg struct{ err error }
 
@@ -99,15 +102,38 @@ type model struct {
 	onNo      func() tea.Cmd
 
 	// operations
-	op     string // running operation label, "" = idle
-	opID   string
-	opCh   chan tea.Msg
-	output map[string]*strings.Builder // per exercise id / "env"
-	result map[string]string           // last check result per id
-	spin   spinner.Model
-	flash  string
-	run    opRun            // progress of the running operation
-	now    func() time.Time // the clock; tests replace it
+	op      string // running operation label, "" = idle
+	opID    string
+	opCh    chan tea.Msg
+	output  map[string]*strings.Builder // per exercise id / "env"
+	result  map[string]string           // last check result per id
+	spin    spinner.Model
+	flash   string
+	run     opRun            // progress of the running operation
+	now     func() time.Time // the clock; tests replace it
+	quiet   bool             // the next operation doesn't switch to the Output tab
+	autoRun bool             // the running check was started by auto-check
+
+	// notes, copying, history, suggestions
+	notes        *progress.Notes
+	note         textarea.Model
+	noteEdit     bool
+	clip         func(string) error // the clipboard; tests replace it
+	copyKey      string
+	copyIdx      int
+	fetchHistory func(*exercise.Exercise)
+	suggest      *exercise.Exercise // offered after a pass: enter opens it
+	fullText     bool               // the filter searches scenarios and tutorials too
+	textIndex    map[string]string
+
+	// settings
+	onExit       string // delete, stop or keep
+	autoCheck    bool
+	pushSeen     time.Time // the last VS Code save auto-check saw
+	checkDue     time.Time // when the pending auto-check runs
+	checkUpdates bool
+	version      string
+	newRelease   string // "v0.19.0 is out: <url>", once known
 
 	// env screen
 	envStatus map[exercise.Profile]string
@@ -118,6 +144,10 @@ type model struct {
 	endLab func(ctx context.Context, ex *exercise.Exercise, w io.Writer) error
 	// deleteVMs deletes every lab VM, on start and on exit; tests replace it
 	deleteVMs func(ctx context.Context, w io.Writer) error
+	// stopVMs stops every lab VM, on exit with on_exit: stop; tests replace it
+	stopVMs func(ctx context.Context, w io.Writer) error
+	// check grades an exercise on its VMs; tests replace it
+	check func(ctx context.Context, ex *exercise.Exercise, w io.Writer) (bool, error)
 	// unprepared lists the environments with no saved copy yet, for the
 	// first-launch offer to build them; tests replace it
 	unprepared func(ctx context.Context) []lab.Env
@@ -184,14 +214,18 @@ type Deps struct {
 	Progress *progress.Store
 	Paths    []*exercise.Path
 	Exams    *exam.Store
+	Notes    *progress.Notes
+
+	OnExit       string // delete (default), stop or keep
+	AutoCheck    bool
+	CheckUpdates bool
+	Theme        string // auto, dark or light
+	Version      string
 }
 
 // Run starts the TUI.
 func Run(d Deps) error {
-	style := "dark"
-	if !lipgloss.HasDarkBackground() {
-		style = "light"
-	}
+	style := applyTheme(d.Theme)
 	m := newModel(d, style)
 	_, err := tea.NewProgram(m, tea.WithAltScreen(), tea.WithMouseAllMotion()).Run()
 	return err
@@ -212,10 +246,23 @@ func newModel(d Deps, style string) *model {
 		output: map[string]*strings.Builder{}, result: map[string]string{},
 		mdCache: map[string]string{}, envStatus: map[exercise.Profile]string{},
 		paths: d.Paths, exams: d.Exams, setupCount: 1, setupMins: 1, menuOpen: -1,
-		now: time.Now,
+		now: time.Now, notes: d.Notes, note: newNoteArea(), clip: copyToClipboard,
+		textIndex: map[string]string{}, onExit: d.OnExit, autoCheck: d.AutoCheck,
+		checkUpdates: d.CheckUpdates, version: d.Version,
 	}
+	if m.notes == nil {
+		m.notes, _ = progress.OpenNotes(mgr.StateDir)
+	}
+	if m.onExit == "" {
+		m.onExit = "delete"
+	}
+	m.fetchHistory = func(ex *exercise.Exercise) { mgr.FetchHistory(context.Background(), ex) }
+	m.pushSeen = time.Now() // auto-check reacts to saves made from now on
+	m.filter.Placeholder = m.filterPlaceholder()
 	m.endLab = mgr.EndExercise
 	m.deleteVMs = mgr.DeleteAll
+	m.stopVMs = mgr.StopAll
+	m.check = mgr.Check
 	m.prepare = mgr.Prepare
 	m.unprepared = func(ctx context.Context) []lab.Env {
 		var out []lab.Env
@@ -254,18 +301,27 @@ func (m *model) isActive(ex *exercise.Exercise) bool {
 // Init starts by deleting every lab VM left over from an earlier run,
 // running or stopped: exiting deletes them, so any still there were left by a
 // crash or a ctrl+c while busy. No exercise is set up on the VMs after it.
+//
+// With on_exit set to stop or keep, the VMs were left on purpose: nothing is
+// deleted and the exercise you were on is still set up.
 func (m *model) Init() tea.Cmd {
-	cleanup := m.startOp("cleanup", "Deleting leftover lab VMs", "env", func(ctx context.Context, w io.Writer) (bool, error) {
-		if err := m.deleteVMs(ctx, w); err != nil {
-			return false, err
+	label := "Deleting leftover lab VMs"
+	if m.onExit != "delete" {
+		label = "Looking at the lab VMs"
+	}
+	cleanup := m.startOp("cleanup", label, "env", func(ctx context.Context, w io.Writer) (bool, error) {
+		if m.onExit == "delete" {
+			if err := m.deleteVMs(ctx, w); err != nil {
+				return false, err
+			}
+			m.mgr.ClearActive("")
 		}
-		m.mgr.ClearActive("")
 		if !m.prepareOffered() && m.unprepared != nil {
 			m.prepOffer = m.unprepared(ctx) // read by Update once this op is done
 		}
 		return false, nil
 	})
-	return tea.Batch(m.spin.Tick, tick(), cleanup)
+	return tea.Batch(m.spin.Tick, tick(), cleanup, m.cmdCheckUpdates())
 }
 
 func tick() tea.Cmd {
@@ -323,6 +379,9 @@ func (m *model) refilter() {
 		}
 		if q != "" {
 			hay := strings.ToLower(e.ID + " " + e.Title + " " + e.Module + " " + e.Kind + " " + strings.Join(e.Tags, " ") + " " + exercise.DifficultyLabel(e.Difficulty))
+			if m.fullText {
+				hay += " " + m.fullTextOf(e)
+			}
 			ok := true
 			for _, w := range strings.Fields(q) {
 				if !strings.Contains(hay, w) {
@@ -432,6 +491,7 @@ func (m *model) out(id string) *strings.Builder {
 func (m *model) startOp(kind, label, id string, f func(ctx context.Context, w io.Writer) (bool, error)) tea.Cmd {
 	if m.op != "" {
 		m.flash = "busy: " + m.op
+		m.quiet, m.autoRun = false, false
 		return nil
 	}
 	m.op, m.opID = label, id
@@ -446,9 +506,10 @@ func (m *model) startOp(kind, label, id string, f func(ctx context.Context, w io
 	m.opCh = ch
 	b := m.out(id)
 	b.Reset()
-	if m.screen == scrDetail {
+	if m.screen == scrDetail && !m.quiet && !m.noteEdit {
 		m.tab = tabOutput
 	}
+	m.quiet = false
 	m.refreshViewport(true)
 	go func() {
 		w := &chanWriter{ch: ch}
@@ -467,20 +528,20 @@ func (m *model) cmdStart() tea.Cmd {
 	})
 }
 
-func (m *model) cmdCheck() tea.Cmd {
-	ex := m.cur
+func (m *model) cmdCheck() tea.Cmd { return m.cmdCheckEx(m.cur) }
+
+func (m *model) cmdCheckEx(ex *exercise.Exercise) tea.Cmd {
 	return m.startOp("check", "Checking "+ex.ID, ex.ID, func(ctx context.Context, w io.Writer) (bool, error) {
 		fmt.Fprintf(w, "Checking %s — %s\n\n", ex.ID, ex.Title)
 		// the VMs stay up after a pass: ending the exercise (x) cleans them for the next one
-		return m.mgr.Check(ctx, ex, w)
+		return m.check(ctx, ex, w)
 	})
 }
 
 func (m *model) cmdShell(worker bool) tea.Cmd {
 	env := lab.EnvFor(m.cur.Profile)
 	if !m.mgr.VMRunning(env, worker) {
-		m.flash = "the " + env.Title + " is not running — press s to prepare the lab first"
-		return nil
+		return m.cmdBoot(m.cur)
 	}
 	c := m.mgr.ShellCommand(env, worker)
 	c.Stdin, c.Stdout, c.Stderr = nil, nil, nil
@@ -490,6 +551,19 @@ func (m *model) cmdShell(worker bool) tea.Cmd {
 	}
 	m.flash = "returned from " + where + " shell — press c to check your work"
 	return tea.ExecProcess(c, func(err error) tea.Msg { return shellDoneMsg{err} })
+}
+
+// cmdBoot starts the stopped VMs of the active exercise again, keeping its
+// lab as it was (they were stopped by on_exit: stop, or by hand).
+func (m *model) cmdBoot(ex *exercise.Exercise) tea.Cmd {
+	env := lab.EnvFor(ex.Profile)
+	if !m.isActive(ex) {
+		m.flash = "the " + env.Title + " is not running — press s to prepare the lab first"
+		return nil
+	}
+	return m.startOp("boot", "Starting the "+env.Title+" again (your lab is kept)", ex.ID, func(ctx context.Context, w io.Writer) (bool, error) {
+		return false, m.mgr.Ensure(ctx, env, w)
+	})
 }
 
 func (m *model) cmdEnvStatus() tea.Cmd {
@@ -559,7 +633,7 @@ func (m *model) update(msg tea.Msg) (tea.Model, tea.Cmd) {
 	case tea.WindowSizeMsg:
 		// m.h is the height below the menu bar
 		m.w, m.h = msg.Width, max(1, msg.Height-1)
-		m.vp.Width, m.vp.Height = m.w-2, max(3, m.h-7)
+		m.vp.Width, m.vp.Height = m.w-2, max(3, m.h-8)
 		m.clampOffset()
 		m.refreshViewport(false)
 		return m, nil
@@ -584,6 +658,7 @@ func (m *model) update(msg tea.Msg) (tea.Model, tea.Cmd) {
 
 	case opDoneMsg:
 		m.op = ""
+		defer func() { m.autoRun = false }()
 		m.endRun(msg.err == nil)
 		m.refreshActive()
 		b := m.out(msg.id)
@@ -604,9 +679,19 @@ func (m *model) update(msg tea.Msg) (tea.Model, tea.Cmd) {
 			if msg.passed {
 				m.result[msg.id] = "passed"
 				m.flash = "✔ solved! great work"
+				m.suggest = nil
+				if m.cur != nil && m.cur.ID == msg.id && m.exam == nil {
+					if next := m.nextUnsolved(); next != nil {
+						m.suggest = next
+						m.flash = "✔ solved! next up: " + next.ID + " — " + trunc(next.Title, 40) + " · enter opens it"
+					}
+				}
 			} else {
 				m.result[msg.id] = "failed"
 				m.flash = "not yet — read the failing checks in Output"
+			}
+			if m.autoRun {
+				m.flash = "auto-check · " + m.flash
 			}
 		case msg.kind == "stop":
 			m.flash = msg.id + " ended — its VMs are cleaned for the next exercise"
@@ -634,6 +719,9 @@ func (m *model) update(msg tea.Msg) (tea.Model, tea.Cmd) {
 
 	case tickMsg:
 		m.refreshActive()
+		if c := m.autoCheckTick(); c != nil {
+			return m, tea.Batch(tick(), c)
+		}
 		if m.exam != nil && m.exam.Over() && m.op == "" {
 			m.finishExam()
 			m.screen = scrExamResult
@@ -650,12 +738,30 @@ func (m *model) update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		// bubbletea turns the mouse off while the shell has the terminal and
 		// doesn't turn it back on: without this the menus and buttons stop
 		// answering clicks
-		return m, tea.EnableMouseAllMotion
+		cmds := []tea.Cmd{tea.EnableMouseAllMotion, m.cmdFetchHistory(m.cur)}
+		if m.autoCheck && m.isActive(m.cur) && m.op == "" {
+			m.quiet = true
+			cmds = append(cmds, m.cmdCheck())
+		}
+		return m, tea.Batch(cmds...)
+
+	case historyMsg:
+		if m.screen == scrDetail && m.cur != nil && m.cur.ID == msg.id && m.tab == tabSolution {
+			m.refreshViewport(false)
+		}
+		return m, nil
+
+	case updateMsg:
+		m.newRelease = msg.tag + " is out: " + msg.url
+		return m, nil
 
 	case tea.MouseMsg:
 		return m.mouse(msg)
 
 	case tea.KeyMsg:
+		if m.noteEdit && m.screen == scrDetail && m.confirm == "" && m.modal == "" && msg.String() != "ctrl+c" {
+			return m, m.noteKey(msg)
+		}
 		if msg.String() == "ctrl+c" {
 			if m.op != "" || m.quitting { // nothing else gets out while busy
 				return m, tea.Quit
@@ -695,6 +801,12 @@ func (m *model) move(d int) {
 func (m *model) updateBrowse(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 	if m.filterOn {
 		switch msg.String() {
+		case "ctrl+t":
+			m.fullText = !m.fullText
+			m.filter.Placeholder = m.filterPlaceholder()
+			m.cursor, m.offset = 0, 0
+			m.refilter()
+			return m, nil
 		case "esc":
 			m.filterOn = false
 			m.filter.Blur()
@@ -769,6 +881,8 @@ func (m *model) updateBrowse(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 		m.setProgFilter((m.progFilter + 1) % progFilterCount)
 	case "L":
 		m.screen = scrPaths
+	case "W":
+		m.modal = m.weakSpotsText()
 	case "X":
 		if m.exam != nil {
 			m.screen = scrExam
@@ -790,6 +904,7 @@ func (m *model) openDetail(ex *exercise.Exercise, back screen) {
 	m.back = back
 	m.screen = scrDetail
 	m.tab = tabScenario
+	m.noteEdit, m.suggest, m.copyKey = false, nil, ""
 	m.solShow = m.prog.Get(ex.ID).SawSolution
 	m.hintsShow = m.prog.Get(ex.ID).HintsUsed
 	if m.examLocked(ex) {
@@ -814,10 +929,28 @@ func (m *model) updateDetail(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 		m.flash = ""
 		return m, m.leave(func() tea.Cmd { m.goTo(m.back); return nil })
 	case "tab", "right", "l":
-		m.setTab((m.tab + 1) % 5)
+		m.setTab((m.tab + 1) % tab(len(tabNames)))
 	case "shift+tab", "left":
-		m.setTab((m.tab + 4) % 5)
-	case "1", "2", "3", "4", "5":
+		m.setTab((m.tab + tab(len(tabNames)) - 1) % tab(len(tabNames)))
+	case "y":
+		return m, m.copyNext()
+	case "A":
+		m.autoCheck = !m.autoCheck
+		if m.autoCheck {
+			m.pushSeen = m.now() // only saves from now on
+			m.flash = "auto-check on: the exercise is checked when you leave the terminal or save in VS Code"
+		} else {
+			m.flash = "auto-check off"
+		}
+	case "enter":
+		if m.tab == tabNotes {
+			return m, m.editNote()
+		}
+		if next := m.suggest; next != nil {
+			m.suggest = nil
+			return m, m.leave(func() tea.Cmd { m.openDetail(next, m.back); return nil })
+		}
+	case "1", "2", "3", "4", "5", "6":
 		t := tab(k[0] - '1')
 		if t == tabSolution && !m.solShow {
 			return m, m.askSolution()
@@ -847,6 +980,8 @@ func (m *model) updateDetail(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 			// every start resets the environment, so the VMs hold another
 			// exercise's lab, or none: a check would grade the wrong thing
 			m.flash = "the lab isn't set up for " + ex.ID + " — press s to start it"
+		case !m.mgr.VMRunning(lab.EnvFor(ex.Profile), k == "w"):
+			return m, m.cmdBoot(ex) // stopped with its lab kept: bring it back first
 		case k == "c":
 			return m, m.cmdCheck()
 		default:
@@ -1101,6 +1236,7 @@ func (m *model) askForget(ex *exercise.Exercise, q string, done func()) {
 	}
 	m.ask(q, func() tea.Cmd {
 		m.prog.Reset(ex.ID)
+		m.mgr.ForgetHistory(ex.ID)
 		delete(m.result, ex.ID)
 		m.refilterKeep() // the progress filter may no longer keep ex
 		done()

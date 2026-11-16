@@ -133,7 +133,12 @@ func run(args []string) error {
 
 	if len(args) == 0 {
 		mgr.AutoStop = cfg.AutoStopEnabled()
-		return tui.Run(tui.Deps{Catalog: cat, Manager: mgr, Progress: prog, Paths: paths, Exams: exams})
+		notes, err := progress.OpenNotes(mgr.StateDir)
+		if err != nil {
+			return fmt.Errorf("notes: %w", err)
+		}
+		return tui.Run(tui.Deps{Catalog: cat, Manager: mgr, Progress: prog, Paths: paths, Exams: exams, Notes: notes,
+			OnExit: cfg.ExitAction(), AutoCheck: cfg.AutoCheck, CheckUpdates: cfg.CheckUpdates, Theme: cfg.Theme, Version: version})
 	}
 	cmd, rest := args[0], args[1:]
 	get := func() (*exercise.Exercise, error) {
@@ -247,6 +252,7 @@ func run(args []string) error {
 			return nil
 		}
 		prog.Reset(ex.ID)
+		mgr.ForgetHistory(ex.ID)
 		fmt.Printf("forgot progress on %s\n", ex.ID)
 	case "solve":
 		ex, err := get()

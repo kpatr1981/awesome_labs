@@ -176,11 +176,18 @@ func Run(ctx context.Context, name string, s Script, out io.Writer) (int, error)
 }
 
 // ShellCommand returns an interactive login shell command for the instance.
-func ShellCommand(name, workdir string) *exec.Cmd {
+// With histName set, the shell keeps its history in ~/<histName> and writes
+// each command as it runs, so it can be read while the shell is open.
+func ShellCommand(name, workdir, histName string) *exec.Cmd {
 	if workdir == "" {
 		workdir = "/lab"
 	}
-	cmd := exec.Command(Binary, "shell", "--workdir", workdir, name, "--", "bash", "-l")
+	args := []string{"shell", "--workdir", workdir, name, "--", "bash", "-l"}
+	if histName != "" {
+		args = []string{"shell", "--workdir", workdir, name, "--", "bash", "-c",
+			`export HISTFILE="$HOME/"` + shellQuote(histName) + `; export PROMPT_COMMAND="history -a${PROMPT_COMMAND:+; $PROMPT_COMMAND}"; exec bash -l`}
+	}
+	cmd := exec.Command(Binary, args...)
 	cmd.Stdin, cmd.Stdout, cmd.Stderr = os.Stdin, os.Stdout, os.Stderr
 	return cmd
 }

@@ -2,6 +2,7 @@ package tui
 
 import (
 	"fmt"
+	"slices"
 	"sort"
 	"strings"
 
@@ -153,7 +154,7 @@ func (m *model) statusLine(help string) string {
 		}
 		s = " " + st.Render(m.flash) + "  "
 	}
-	return s + sMuted.Render(help)
+	return ansi.Truncate(s+sMuted.Render(help), max(10, m.w), "…")
 }
 
 // ---- browse ----
@@ -233,7 +234,10 @@ func (m *model) viewBrowse() string {
 	prevBox := sBorder.Width(prevW - 2).Height(lh).Render(prev)
 	m.addZone("preview", listW, top, prevW, lh+2)
 
-	help := "↑↓ move · enter open · / filter · tab next track · F10 menu · F1 keys · q quit"
+	help := "↑↓ move · enter open · / filter · tab next track · W weak spots · F10 menu · F1 keys · q quit"
+	if m.newRelease != "" {
+		help = sWarn.Render(m.newRelease) + " · " + help
+	}
 	body := lipgloss.JoinHorizontal(lipgloss.Top, list, prevBox)
 	if top > 0 {
 		body = lipgloss.JoinVertical(lipgloss.Left, bar, body)
@@ -284,6 +288,9 @@ func (m *model) viewDetail() string {
 	} else if r == "failed" {
 		title += "  " + sBad.Render("✘ not yet")
 	}
+	if m.autoCheck {
+		title += "  " + sTitle.Render("⟳ auto-check")
+	}
 	var tabs []string
 	for i, n := range tabNames {
 		label := fmt.Sprintf("%d %s", i+1, n)
@@ -292,6 +299,9 @@ func (m *model) viewDetail() string {
 		}
 		if tab(i) == tabSolution && !m.solShow {
 			label += " 🔒"
+		}
+		if tab(i) == tabNotes && m.notes.Has(e.ID) {
+			label += " ✎"
 		}
 		if tab(i) == tabOutput && m.op != "" && m.opID == e.ID {
 			// The spinner's own style would be split rune by rune by the
@@ -308,25 +318,41 @@ func (m *model) viewDetail() string {
 		}
 		tabs = append(tabs, st.Render(label))
 	}
+	// the buttons have a row of their own: beside the tabs they ran out of
+	// room on all but the widest terminals
+	// room on all but the widest terminals. When even this row is short,
+	// Back (esc) and Reset (R) go first.
+	btnRow := sMuted.Render(" (widen the window for the buttons · F1 lists the keys)")
+	bs := m.detailButtons(e)
+	for _, drop := range [][]string{nil, {"esc"}, {"esc", "R"}} {
+		kept := slices.DeleteFunc(slices.Clone(bs), func(b button) bool { return slices.Contains(drop, b.key) })
+		if bare, _, ok := fitButtons(m.w-1, kept); ok {
+			btnRow = " " + m.buttons(1, 1, bare, kept...)
+			break
+		}
+	}
+	title = ansi.Truncate(title, m.w, "…")
 	x := 0
 	for i, t := range tabs {
-		m.addZone(fmt.Sprintf("tab:%d", i), x, 1, lipgloss.Width(t), 1)
+		m.addZone(fmt.Sprintf("tab:%d", i), x, 2, lipgloss.Width(t), 1)
 		x += lipgloss.Width(t)
 	}
 	tabRow := strings.Join(tabs, "")
-	bs := m.detailButtons(e)
-	if bare, bw, ok := fitButtons(m.w-x-2, bs); ok {
-		gap := m.w - x - bw
-		tabRow += strings.Repeat(" ", gap) + m.buttons(x+gap, 1, bare, bs...)
+	inner := m.vp.View()
+	if m.noteEdit {
+		inner = m.note.View()
 	}
-	box := sBorder.Width(m.w - 2).Render(m.vp.View())
+	box := sBorder.Width(m.w - 2).Render(inner)
 	// the buttons above cover the actions; list only the rest
 	back := map[screen]string{scrStarted: "started labs", scrExam: "exam", scrExamResult: "exam result"}[m.back]
 	if back == "" {
 		back = "list"
 	}
-	help := "←→ switch tab · n/N next/previous " + m.siblingNoun() + " · esc back to the " + back + " · F1 keys"
-	return lipgloss.JoinVertical(lipgloss.Left, title, tabRow, box, m.statusLine(help))
+	help := "←→ tabs · y copy · A auto-check · n/N next/previous " + m.siblingNoun() + " · esc back to the " + back + " · F1 keys"
+	if m.noteEdit {
+		help = "editing notes · esc saves and stops editing · ctrl+s saves"
+	}
+	return lipgloss.JoinVertical(lipgloss.Left, title, btnRow, tabRow, box, m.statusLine(help))
 }
 
 // detailButtons are the buttons of the exercise screen. A button is lit only
@@ -365,14 +391,14 @@ func (m *model) refreshViewport(follow bool) {
 		return
 	}
 	m.vp.Width = m.w - 4
-	m.vp.Height = max(3, m.h-6)
+	m.vp.Height = max(3, m.h-7)
 	w := m.vp.Width - 2
 	var content string
 	switch {
 	case m.screen == scrEnv:
 		return
 	case m.tab == tabScenario:
-		intro := sMuted.Render("Press s to prepare the lab, then t to open a terminal (or o to work in VS Code). The task is also in /lab/TASK.md.")
+		intro := sMuted.Width(w).Render("Press s to prepare the lab, then t to open a terminal (or o to work in VS Code). The task is also in /lab/TASK.md. y copies a command.")
 		content = intro + "\n" + m.markdown("sc:"+m.cur.ID, m.cur.Scenario, w)
 	case m.tab == tabLearn && m.examLocked(m.cur):
 		content = sMuted.Render("\n  🔒 Tutorials are locked during the exam.")
@@ -404,7 +430,13 @@ func (m *model) refreshViewport(follow bool) {
 			content = sMuted.Render("\n  🔒 The solution is hidden. Press v to reveal it.")
 			break
 		}
-		content = m.markdown("sol:"+m.cur.ID, m.cur.Solution, w)
+		content = m.markdown(fmt.Sprintf("sol:%s:%d", m.cur.ID, len(m.mgr.History(m.cur.ID))), m.solutionText(), w)
+	case m.tab == tabNotes:
+		if n := m.notes.Get(m.cur.ID); n != "" {
+			content = m.markdown(fmt.Sprintf("note:%s:%d", m.cur.ID, len(n)), n, w) + "\n\n" + sMuted.Render("  enter edits · y copies")
+		} else {
+			content = sMuted.Render("\n  No notes yet. Press enter to write some: commands worth remembering, what\n  tripped you up. They're kept per exercise, and resetting progress keeps them.")
+		}
 	case m.tab == tabOutput:
 		b := m.output[m.cur.ID]
 		if b == nil || b.Len() == 0 {
