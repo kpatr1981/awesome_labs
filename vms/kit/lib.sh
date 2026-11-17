@@ -471,6 +471,148 @@ WRAP
   on_reset 'rm -f /usr/local/bin/dspy'
 }
 
+# ---------- notebook helpers (modules with notebook: true) ----------
+# A notebook exercise is graded on what its notebook does, not on files left in
+# /lab: the check runs the notebook from top to bottom in a fresh kernel, on a
+# scratch copy of /lab without the results it must write, and grades what it
+# wrote there (and, for code to fix, calls its functions on hidden data).
+NB_IMAGE=kl-jupyter:1
+NB_OUT=
+
+# nb_run NOTEBOOK [RESULT...] [<<'PY' test code PY]
+#   Copies /lab to a scratch folder ($NB_OUT, mounted as /lab in the container),
+#   removes RESULT... there, runs /lab/NOTEBOOK cell by cell, then the test code
+#   from stdin (if any) in the same kernel, and prints what the test printed.
+#   NB_HIDDEN="FILE..." (paths, e.g. "$KL_STATE/test.csv") are given to the test
+#   code only, as /tmp/kl-hidden/<name>: the test code and these files are taken
+#   out of reach before the notebook's first cell runs, so it can't read them.
+#   Prints "NB_FAIL <why>" and returns 1 when a cell fails or times out, and
+#   "NB_TESTFAIL <why>" (return 2) when the test code raises: your code ran but
+#   broke on the check's data.
+nb_run() {
+  local nb=$1 f U
+  shift
+  rm -rf /tmp/kl-nb.* 2>/dev/null
+  NB_OUT=$(mktemp -d /tmp/kl-nb.XXXXXX)
+  cp -a "$LAB/." "$NB_OUT/" 2>/dev/null
+  for f in "$@"; do rm -f "$NB_OUT/$f"; done
+  [ -t 0 ] && : >"$NB_OUT/.kl-test.py" || cat >"$NB_OUT/.kl-test.py"
+  if [ -n "${NB_HIDDEN:-}" ]; then
+    mkdir -p "$NB_OUT/.kl-hidden"
+    for f in $NB_HIDDEN; do cp "$f" "$NB_OUT/.kl-hidden/"; done
+  fi
+  U=$(lab_user)
+  chown -R "$U": "$NB_OUT"
+  if [ ! -s "$NB_OUT/$nb" ]; then echo "NB_FAIL /lab/$nb is missing: open the exercise's notebook (or start it again)"; return 1; fi
+  timeout "${NB_TIMEOUT:-300}" docker run --rm -i --network none --memory 2560m \
+    --user "$(id -u "$U"):$(id -g "$U")" -e HOME=/tmp -e MPLBACKEND=Agg -e PYTHONDONTWRITEBYTECODE=1 \
+    -v "$NB_OUT":/lab -w /lab "$NB_IMAGE" python - "$nb" "${NB_CELL_TIMEOUT:-120}" 2>/dev/null <<'NBRUN'
+import os, re, shutil, sys
+import nbformat
+from nbclient import NotebookClient
+from nbclient.exceptions import CellExecutionError, CellTimeoutError
+
+name, limit = sys.argv[1], int(sys.argv[2])
+# the check's own code and data: kept in memory, gone before the notebook runs
+test = open("/lab/.kl-test.py").read()
+os.remove("/lab/.kl-test.py")
+hidden = {}
+if os.path.isdir("/lab/.kl-hidden"):
+    for f in os.listdir("/lab/.kl-hidden"):
+        hidden[f] = open("/lab/.kl-hidden/" + f, "rb").read()
+    shutil.rmtree("/lab/.kl-hidden")
+nb = nbformat.read("/lab/" + name, as_version=4)
+client = NotebookClient(nb, timeout=limit, kernel_name="python3", resources={"metadata": {"path": "/lab"}})
+plain = lambda s: re.sub(r"\x1b\[[0-9;]*m", "", s)
+
+def printed(outputs):
+    out = []
+    for o in outputs:
+        if o.get("output_type") == "stream" and o.get("name") == "stdout":  # not warnings
+            out.append(o.get("text", ""))
+        elif o.get("output_type") in ("execute_result", "display_data"):
+            out.append(o.get("data", {}).get("text/plain", "") + "\n")
+    return "".join(out)
+
+with client.setup_kernel():
+    n = 0
+    for i, cell in enumerate(nb.cells):
+        if cell.cell_type != "code":
+            continue
+        n += 1
+        try:
+            client.execute_cell(cell, i)
+        except CellTimeoutError:
+            print(f"NB_FAIL code cell {n} ran longer than {limit}s")
+            sys.exit(1)
+        except CellExecutionError as e:
+            print(f"NB_FAIL code cell {n} raised {e.ename}: {plain(str(e.evalue)).strip()[:200]}")
+            sys.exit(1)
+    if hidden:
+        os.makedirs("/tmp/kl-hidden", exist_ok=True)
+        for f, data in hidden.items():
+            open("/tmp/kl-hidden/" + f, "wb").write(data)
+    if test.strip():
+        cell = nbformat.v4.new_code_cell(test)
+        nb.cells.append(cell)
+        try:
+            client.execute_cell(cell, len(nb.cells) - 1)
+        except (CellExecutionError, CellTimeoutError) as e:
+            print(f"NB_TESTFAIL {getattr(e, 'ename', 'a timeout')}: {plain(str(getattr(e, 'evalue', ''))).strip()[:200]}")
+            sys.exit(2)
+        sys.stdout.write(printed(cell.outputs))
+NBRUN
+  local rc=$?
+  [ $rc -eq 124 ] && { echo "NB_FAIL the notebook took longer than ${NB_TIMEOUT:-300}s"; return 1; }
+  return $rc
+}
+
+# nb_check NOTEBOOK [RESULT...] [<<'PY' test PY]
+#   nb_run, reported as a check of its own ("your notebook runs from top to
+#   bottom"); the test code's output is left in $NB_RESULT for further checks.
+NB_RESULT=
+nb_check() {
+  local nb=$1 o
+  o=$(mktemp)
+  nb_run "$@" >"$o" # not in $(...): nb_run sets NB_OUT for nb_out
+  NB_RESULT=$(cat "$o")
+  rm -f "$o"
+  if grep -q '^NB_FAIL ' <<<"$NB_RESULT"; then
+    fail "/lab/$nb runs from top to bottom in a fresh kernel ($(sed -n 's/^NB_FAIL //p' <<<"$NB_RESULT" | head -1))"
+    NB_RESULT=
+    return 1
+  fi
+  pass "/lab/$nb runs from top to bottom in a fresh kernel"
+  if grep -q '^NB_TESTFAIL ' <<<"$NB_RESULT"; then
+    fail "your code works on the check's own data (it raised $(sed -n 's/^NB_TESTFAIL //p' <<<"$NB_RESULT" | head -1))"
+    NB_RESULT=
+    return 1
+  fi
+}
+
+# nb_out FILE -> the path of FILE as the notebook wrote it during nb_check
+nb_out() { echo "$NB_OUT/$1"; }
+
+# nb_write NOTEBOOK <<'PY' ... PY -> write /lab/NOTEBOOK (for solve scripts): the
+# Python on stdin, split into code cells at lines that are just "# %%"
+nb_write() {
+  docker run --rm -i --user "$(id -u):$(id -g)" -e HOME=/tmp -v "$LAB":/lab "$NB_IMAGE" python -c '
+import sys, nbformat
+src = sys.stdin.read()
+cells, cur = [], []
+for line in src.splitlines():
+    if line.strip() == "# %%":
+        cells.append("\n".join(cur).strip("\n")); cur = []
+    else:
+        cur.append(line)
+cells.append("\n".join(cur).strip("\n"))
+nb = nbformat.v4.new_notebook()
+nb.cells = [nbformat.v4.new_code_cell(c) for c in cells if c.strip()]
+nb.metadata["kernelspec"] = {"display_name": "Python 3 (ipykernel)", "language": "python", "name": "python3"}
+nbformat.write(nb, "/lab/" + sys.argv[1])
+' "$1"
+}
+
 # ---------- Go helper ----------
 # go_test <<'GO' ... GO -> run a hidden test file against the learner's /lab/*.go
 go_test() {

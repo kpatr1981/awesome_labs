@@ -5,8 +5,6 @@ import (
 	"context"
 	"fmt"
 	"io"
-	"os"
-	"path/filepath"
 	"slices"
 	"strings"
 	"sync"
@@ -243,7 +241,7 @@ func newModel(d Deps, style string) *model {
 	sp.Style = lipgloss.NewStyle().Foreground(colAccent)
 	m := &model{
 		cat: cat, mgr: mgr, prog: prog,
-		tracks: []string{"", "docker", "kubernetes", "offsec", "linux", "networking", "cloud", "data", "defensive", "programming", "datascience", "git", "terraform", "ansible", "algorithms"},
+		tracks: append([]string{""}, exercise.TrackOrder...),
 		filter: ti, spin: sp, style: style,
 		output: map[string]*strings.Builder{}, result: map[string]string{},
 		mdCache: map[string]string{}, envStatus: map[exercise.Profile]string{},
@@ -266,15 +264,7 @@ func newModel(d Deps, style string) *model {
 	m.stopVMs = mgr.StopAll
 	m.check = mgr.Check
 	m.prepare = mgr.Prepare
-	m.unprepared = func(ctx context.Context) []lab.Env {
-		var out []lab.Env
-		for _, env := range lab.AllEnvs() {
-			if !mgr.HasBase(ctx, env) {
-				out = append(out, env)
-			}
-		}
-		return out
-	}
+	m.unprepared = mgr.Unprepared
 	m.exam = d.Exams.Current()
 	if m.exam != nil && m.exam.Over() {
 		m.finishExam()
@@ -1430,15 +1420,11 @@ func (m *model) showingOutputOf(id string) bool {
 
 // ---- preparing environments ahead of time ----
 
-func (m *model) prepareMarker() string { return filepath.Join(m.mgr.StateDir, "prepare-offered") }
+// prepareOffered reports whether the first-launch offer was already made
+// (by this UI or the web interface).
+func (m *model) prepareOffered() bool { return m.mgr.PrepareOffered() }
 
-// prepareOffered reports whether the first-launch offer was already made.
-func (m *model) prepareOffered() bool {
-	_, err := os.Stat(m.prepareMarker())
-	return err == nil
-}
-
-func (m *model) markPrepareOffered() { _ = os.WriteFile(m.prepareMarker(), []byte("1\n"), 0o644) }
+func (m *model) markPrepareOffered() { m.mgr.MarkPrepareOffered() }
 
 // envTracks names the tracks whose exercises run in env.
 func (m *model) envTracks(env lab.Env) string {

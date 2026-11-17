@@ -40,6 +40,16 @@ FROM python:3.12-slim
 RUN pip install --no-cache-dir numpy==2.2.6 pandas==2.2.3 scipy==1.15.3 scikit-learn==1.6.1 joblib==1.5.1
 DOCKERFILE
 fi
+# JupyterLab on top of it: the Data Science exercises are done in notebooks,
+# and their checks run the notebook with nbclient (lib.sh nb_run).
+if ! docker image inspect kl-jupyter:1 >/dev/null 2>&1; then
+  echo "==> building the notebook image (JupyterLab, ipykernel, matplotlib)"
+  docker build -q -t kl-jupyter:1 - <<'DOCKERFILE'
+FROM kl-datascience:1
+RUN pip install --no-cache-dir jupyterlab==4.6.4 ipykernel==7.4.0 matplotlib==3.11.2 && \
+    jupyter labextension disable "@jupyterlab/apputils-extension:announcements"
+DOCKERFILE
+fi
 # Terraform with its providers in a local mirror, for the Terraform track: `terraform
 # init` then works offline and never hits the registry's rate limits.
 if ! docker image inspect kl-terraform:1 >/dev/null 2>&1; then

@@ -413,6 +413,10 @@ func (m *model) refreshViewport(follow bool) {
 		return
 	case m.tab == tabScenario:
 		intro := sMuted.Width(w).Render("Press s to prepare the lab, then t to open a terminal (or o to work in VS Code). The task is also in /lab/TASK.md. y copies a command.")
+		if m.cur.Notebook {
+			intro = sMuted.Width(w).Render("This exercise is done in a Jupyter notebook, /lab/" + m.cur.NotebookName() +
+				": the check runs it from top to bottom. Open it with `awesome_labs web` (Notebook button), or in VS Code (o). s prepares the lab.")
+		}
 		content = intro + "\n" + m.markdown("sc:"+m.cur.ID, m.cur.Scenario, w)
 	case m.tab == tabLearn && m.examLocked(m.cur):
 		content = sMuted.Render("\n  🔒 Tutorials are locked during the exam.")

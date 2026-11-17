@@ -97,7 +97,7 @@ auto_stop: true
 # VM sizes. Changes apply when a VM is created: run
 #   awesome_labs env rebuild docker|k8s
 # afterwards. Defaults shown; the Kubernetes nodes need at least 2 CPUs / 2GiB.
-# docker:       {cpus: 2, memory: 3GiB}
+# docker:       {cpus: 2, memory: 4GiB}
 # controlplane: {cpus: 2, memory: 3GiB}
 # worker:       {cpus: 2, memory: 2560MiB}
 # offsec:       {cpus: 2, memory: 3GiB}

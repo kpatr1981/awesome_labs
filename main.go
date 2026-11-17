@@ -25,6 +25,7 @@ import (
 	"awesome_labs/internal/progress"
 	"awesome_labs/internal/tui"
 	"awesome_labs/internal/update"
+	"awesome_labs/internal/web"
 )
 
 // version is set at build time (make build / make release); "dev" otherwise.
@@ -38,6 +39,8 @@ func usage() {
 
 usage:
   awesome_labs                         open the interactive exercise browser
+  awesome_labs web [--addr HOST:PORT] [--no-open]
+                                  the same in your web browser, with terminals into the lab VMs
   awesome_labs install [--dry-run] [--yes] [--bin-dir DIR]
                                   detect the OS, install Lima and QEMU, and put this binary on your PATH
   awesome_labs status                  the exercise you're working on and the running VMs
@@ -56,6 +59,7 @@ usage:
   awesome_labs verify [-from id] [ids or prefixes...]
                                   author tool: setup -> check fails -> solve -> check passes
   awesome_labs lint                    validate all exercise files
+  awesome_labs notebook <id>           author tool: print the starter notebook start writes for a notebook exercise
   awesome_labs doctor [--fix]          check this machine and awesome_labs for the usual trouble
   awesome_labs version [--check]       this build's version (--check: is a newer release out?)
 
@@ -99,7 +103,7 @@ func run(args []string) error {
 		cmd = args[0]
 	}
 	switch cmd {
-	case "-h", "--help", "help", "lint", "list", "show", "status", "paths", "shell", "code", "sync", "doctor", "version":
+	case "-h", "--help", "help", "lint", "list", "show", "status", "paths", "shell", "code", "sync", "doctor", "version", "notebook":
 	default:
 		release, err := mgr.LockApp()
 		if err != nil {
@@ -260,6 +264,16 @@ func run(args []string) error {
 		prog.Reset(ex.ID)
 		mgr.ForgetHistory(ex.ID)
 		fmt.Printf("forgot progress on %s\n", ex.ID)
+	case "notebook":
+		ex, err := get()
+		if err != nil {
+			return err
+		}
+		if !ex.Notebook {
+			return fmt.Errorf("%s isn't in a notebook module", ex.ID)
+		}
+		_, err = os.Stdout.Write(append(exercise.StarterNotebook(ex), '\n'))
+		return err
 	case "solve":
 		ex, err := get()
 		if err != nil {
@@ -322,11 +336,74 @@ func run(args []string) error {
 		return envCmd(ctx, mgr, rest)
 	case "verify":
 		return verify(ctx, cat, mgr, rest)
+	case "web":
+		notes, err := progress.OpenNotes(mgr.StateDir)
+		if err != nil {
+			return fmt.Errorf("notes: %w", err)
+		}
+		return webCmd(web.Deps{Catalog: cat, Manager: mgr, Progress: prog, Notes: notes, Paths: paths, Exams: exams,
+			Version: version, OnExit: cfg.ExitAction(), AutoStop: cfg.AutoStopEnabled()}, rest)
 	default:
 		usage()
 		return fmt.Errorf("unknown command %q", cmd)
 	}
 	return nil
+}
+
+// webCmd serves the web interface until ctrl+c, then treats the lab VMs the
+// way leaving the terminal UI does (on_exit). A second ctrl+c leaves them as
+// they are, and so does stopping while an operation runs or failing to start.
+func webCmd(d web.Deps, args []string) error {
+	fset := flag.NewFlagSet("web", flag.ContinueOnError)
+	addr := fset.String("addr", "127.0.0.1:7681", "address to listen on (a non-loopback one exposes the lab shells to the network)")
+	noOpen := fset.Bool("no-open", false, "don't open the browser")
+	if err := fset.Parse(args); err != nil {
+		return err
+	}
+	srv, err := web.Listen(d, web.Options{Addr: *addr, Open: !*noOpen, Out: os.Stdout})
+	if err != nil {
+		return err // nothing ran: the VMs are as they were
+	}
+	// one handler for both presses, registered before serving: the first stops
+	// the server, the second skips (or interrupts) the cleanup
+	sigs := make(chan os.Signal, 2)
+	signal.Notify(sigs, os.Interrupt, syscall.SIGTERM)
+	defer signal.Stop(sigs)
+	serve, stopServe := context.WithCancel(context.Background())
+	defer stopServe()
+	cleanup, abort := context.WithCancel(context.Background())
+	defer abort()
+	go func() {
+		<-sigs
+		stopServe()
+		<-sigs
+		abort()
+	}()
+	busy, err := srv.Serve(serve)
+	d.Manager.StopAllCode()
+	switch {
+	case busy:
+		fmt.Println("an operation was running: leaving the lab VMs as they are")
+		return err
+	case cleanup.Err() != nil:
+		fmt.Println("leaving the lab VMs as they are")
+		return err
+	}
+	switch d.OnExit {
+	case "keep":
+		fmt.Println("leaving the lab VMs running (on_exit: keep)")
+	case "stop":
+		fmt.Println("stopping the lab VMs (on_exit: stop) — ctrl+c again leaves them as they are")
+		if e := d.Manager.StopAll(cleanup, os.Stdout); e != nil && cleanup.Err() == nil {
+			return e
+		}
+	default:
+		fmt.Println("deleting every lab VM (on_exit: delete) — ctrl+c again leaves them as they are")
+		if e := d.Manager.DeleteAll(cleanup, os.Stdout); e != nil && cleanup.Err() == nil {
+			return e
+		}
+	}
+	return err
 }
 
 // checkable refuses a check of an exercise whose lab is not the one set up.

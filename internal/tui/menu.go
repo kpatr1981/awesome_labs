@@ -14,6 +14,7 @@ package tui
 //	dlg:yes / dlg:no / dlg:close   dialog buttons
 
 import (
+	"awesome_labs/internal/exercise"
 	"context"
 	"fmt"
 	"io"
@@ -231,12 +232,8 @@ func trackName(t string) string {
 	switch t {
 	case "":
 		return "All tracks"
-	case "offsec":
-		return "Offensive Security"
-	case "defensive":
-		return "Defensive Security"
 	}
-	return trackLabel(t)
+	return exercise.TrackName(t)
 }
 
 // visibleItems drops hidden items and the separators left at the ends or

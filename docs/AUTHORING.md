@@ -7,6 +7,7 @@ track: kubernetes          # docker | kubernetes | offsec | linux | networking |
 module: Services & DNS     # module title
 profile: k8s               # docker | k8s | offsec — which lab environment
 order: 3                   # module order within the track
+notebook: false            # true = done in a Jupyter notebook, which the check runs (docker profile only)
 exercises:
 - id: k8s-041              # unique
   title: Give the deployment a stable address
@@ -23,11 +24,45 @@ exercises:
   check_worker: |          # bash, root, node01 (k8s only)
   solve: |                 # bash, as the lab user in /lab — the reference solution
   destructive: false       # true = env is rebuilt before the next exercise
+  deliverables: [answer.txt] # files in /lab the check grades (with notebook: true: the files the notebook writes)
+  starter: |               # notebook modules only: code for the starter notebook, cells split at "# %%"
 ```
 
 All scripts get `/opt/kubelab/lib.sh` sourced (see `vms/kit/lib.sh`). As root on the
 control plane, `KUBECONFIG` is `/etc/kubernetes/admin.conf`; the lab user has its own
 `~/.kube/config`.
+
+### Notebooks (`notebook: true`)
+
+A module with `notebook: true` (the Data Science track) is done in a Jupyter notebook and
+**graded on the notebook**. `start` writes `/lab/<id>.ipynb` (`awesome_labs notebook <id>`
+prints it): a "how it's graded" header, an imports cell, the exercise's `starter:` code
+(cells split at lines that are just `# %%`) and a save cell per deliverable. The web
+interface opens it in JupyterLab.
+
+- **check** starts with `nb_check <id>.ipynb [FILE...]` (lib.sh): it copies `/lab` to a
+  scratch folder without `FILE...`, runs the notebook top to bottom in a fresh kernel there,
+  and reports "runs from top to bottom" as a check of its own. Grade the files it wrote
+  through `"$(nb_out FILE)"`, never `/lab/FILE`. To call the notebook's functions, pass
+  test code on stdin (`<<'PY' ... PY`): it runs in the same kernel afterwards, its stdout
+  is in `$NB_RESULT` (print tagged lines such as `part1: ok` and read them back with
+  `sed`), and if it raises, a "works on the check's own data" check fails.
+- **Hidden data** (test labels, expected tables) stays in `$KL_STATE`; pass it with
+  `NB_HIDDEN="$KL_STATE/test.csv ..."` and read it in the test code at
+  `/tmp/kl-hidden/<name>`. The test code and these files are out of the notebook's reach
+  while it runs.
+- **solve** is `nb_write <id>.ipynb <<'PY' ... PY`: the reference notebook.
+- **deliverables** lists the files the notebook must write (no `.py`/`.ipynb`); leave it
+  out when the check only calls functions. Each must be named in the scenario.
+- **starter:** holds code to fix, or a skeleton, rather than a script in `/lab`: the check
+  calls the functions by name, so the scenario says to keep their names and arguments.
+
+`awesome_labs lint` enforces `nb_check`/`nb_write` on the exercise's own notebook. See
+`ds-001` (a result file), `ds-003` (functions to fix) and `ds-013` (a model graded on
+hidden data).
+
+Every script may use `$KL_STATE` for its own files, except `$KL_STATE/user`: that holds the
+lab user's name for every later script, and lint rejects any use of it.
 
 ## The contract
 

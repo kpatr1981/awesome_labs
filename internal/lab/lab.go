@@ -76,7 +76,7 @@ func (e Env) Worker() (VM, bool) {
 
 var (
 	DockerEnv = Env{Profile: exercise.ProfileDocker, Title: "Docker host", VMs: []VM{
-		{Name: "kl-docker", Role: "docker", Hostname: "docker-host", CPUs: 2, Memory: "3GiB"},
+		{Name: "kl-docker", Role: "docker", Hostname: "docker-host", CPUs: 2, Memory: "4GiB"}, // room for Jupyter notebooks
 	}}
 	K8sEnv = Env{Profile: exercise.ProfileK8s, Title: "Kubernetes cluster", VMs: []VM{
 		{Name: "kl-cp", Role: "cp", Hostname: "controlplane", CPUs: 2, Memory: "3GiB"},
@@ -181,6 +181,11 @@ func (m *Manager) EnvStatus(ctx context.Context, env Env) string {
 	if err != nil {
 		return "unknown: " + err.Error()
 	}
+	return m.envStatus(ctx, env, all)
+}
+
+// envStatus is EnvStatus from a listing already taken.
+func (m *Manager) envStatus(ctx context.Context, env Env, all map[string]lima.Instance) string {
 	missing, running := 0, 0
 	for _, v := range env.VMs {
 		switch all[v.Name].Status {
@@ -847,6 +852,12 @@ func (m *Manager) Start(ctx context.Context, ex *exercise.Exercise, log io.Write
 	}
 	if ex.Destructive {
 		m.SetTainted(env, true)
+	}
+	if ex.Notebook { // the notebook the check runs: written fresh by every start
+		nb := exercise.StarterNotebook(ex)
+		if _, err := m.root(ctx, env.Primary(), fmt.Sprintf("source /opt/kubelab/lib.sh\nlab_file /lab/%s <<'AWESOME_LABS_NB_EOF'\n%s\nAWESOME_LABS_NB_EOF", ex.NotebookName(), nb), nil, io.Discard); err != nil {
+			return fmt.Errorf("writing /lab/%s: %w", ex.NotebookName(), err)
+		}
 	}
 	task := fmt.Sprintf("# %s — %s\n\n%s\n", ex.ID, ex.Title, strings.TrimSpace(ex.Scenario))
 	if !m.HoldEnvs { // verify runs through every exercise; it isn't the user's work

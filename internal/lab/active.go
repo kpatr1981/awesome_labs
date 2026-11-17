@@ -9,6 +9,7 @@ import (
 	"path/filepath"
 	"sort"
 	"strings"
+	"sync"
 	"time"
 
 	"awesome_labs/internal/exercise"
@@ -127,6 +128,10 @@ func (m *Manager) VMs(ctx context.Context) ([]VMInfo, error) {
 	if err != nil {
 		return nil, err
 	}
+	return vmsFrom(all), nil
+}
+
+func vmsFrom(all map[string]lima.Instance) []VMInfo {
 	known := map[string]bool{}
 	var out []VMInfo
 	for _, env := range AllEnvs() {
@@ -147,8 +152,40 @@ func (m *Manager) VMs(ctx context.Context) ([]VMInfo, error) {
 		in := all[name]
 		out = append(out, VMInfo{Name: name, Status: in.Status, CPUs: in.CPUs, Memory: in.Memory})
 	}
-	return out, nil
+	return out
 }
+
+// EnvOverview is the state of one environment, as the environments screen shows it.
+type EnvOverview struct {
+	Env     Env
+	Status  string // EnvStatus
+	Saved   bool   // HasBase
+	Tainted bool
+}
+
+// Overview reports every environment and every lab VM from a single
+// `limactl list`; only a running environment is asked whether it is ready.
+func (m *Manager) Overview(ctx context.Context) ([]EnvOverview, []VMInfo, error) {
+	all, err := lima.List(ctx)
+	if err != nil {
+		return nil, nil, err
+	}
+	envs := AllEnvs()
+	out := make([]EnvOverview, len(envs))
+	var wg sync.WaitGroup
+	for i, env := range envs {
+		wg.Add(1)
+		go func() { // the readiness check runs a command in the VM
+			defer wg.Done()
+			out[i] = EnvOverview{Env: env, Status: m.envStatus(ctx, env, all), Saved: m.hasBase(env, all), Tainted: m.Tainted(env)}
+		}()
+	}
+	wg.Wait()
+	return out, vmsFrom(all), nil
+}
+
+// EnvOfVM is the environment a lab VM belongs to.
+func EnvOfVM(name string) (Env, bool) { return envOf(name) }
 
 // envOf returns the environment a VM belongs to.
 func envOf(name string) (Env, bool) {

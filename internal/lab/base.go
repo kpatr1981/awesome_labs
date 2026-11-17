@@ -244,6 +244,11 @@ func (m *Manager) HasBase(ctx context.Context, env Env) bool {
 	if err != nil {
 		return false
 	}
+	return m.hasBase(env, all)
+}
+
+// hasBase is HasBase from a listing already taken.
+func (m *Manager) hasBase(env Env, all map[string]lima.Instance) bool {
 	for _, vm := range env.VMs {
 		bi, has := m.readBase(vm)
 		key, err := m.baseKey(env, vm)
