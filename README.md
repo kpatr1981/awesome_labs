@@ -104,13 +104,18 @@ shows the plan.
 
 ## Download
 
-On Linux x86-64 you can skip building:
+You can skip building: the [latest release](https://github.com/kpatr1981/awesome_labs/releases/latest)
+(v0.19.0) has static binaries for Linux and macOS on x86-64 and ARM. On Linux x86-64:
 
 ```bash
 curl -fLo awesome_labs https://github.com/kpatr1981/awesome_labs/releases/latest/download/awesome_labs-linux-amd64
 chmod +x awesome_labs
 ./awesome_labs install
 ```
+
+For another platform, swap the suffix for `linux-arm64`, `darwin-amd64` or `darwin-arm64`.
+Check the download against `SHA256SUMS` from the same release. `awesome_labs version --check`
+tells you when a newer release is out.
 
 ## Build & run
 
@@ -352,6 +357,7 @@ unlock. Exams are kept in `~/.awesome_labs/exam-history.json`.
 ```bash
 awesome_labs exam status     # the running exam
 awesome_labs exam history    # past results
+awesome_labs exam abandon    # give up the running exam
 ```
 
 ### Saving memory, and other settings
@@ -421,13 +427,15 @@ fix each one.
 
 Exercises are YAML files in `exercises/<track>/NN-<module>.yaml`, embedded into the
 binary at build time. See **[docs/AUTHORING.md](docs/AUTHORING.md)**. Every exercise
-ships with a `solve` script, and
+ships with a `solve` script.
 
 ```bash
-awesome_labs verify [id-prefix ...]
+awesome_labs lint                    # validate every exercise file
+awesome_labs verify [-from id] [id-prefix ...]
+awesome_labs notebook ds-001         # print the starter notebook a notebook exercise writes
 ```
 
-runs each one end to end — *reset → setup → check must fail → solve → check must
+`verify` runs each one end to end — *reset → setup → check must fail → solve → check must
 pass* — which is how the whole catalogue is tested. Each exercise gets 25 minutes (50 for the
 destructive ones). Like the app, a verify run needs to be the only awesome_labs running. Set `AWESOME_LABS_EXERCISES=./exercises`
 to work on exercise files without rebuilding.
