@@ -11,7 +11,7 @@ exercise has a scenario, progressive hints and a full solution you can reveal, a
 have a short tutorial on the concepts and commands to read first.
 
 ```text
- awesome_labs  Program  View  Tracks  Help                        ✔ 37/1336 solved  ● 2 started, unsolved
+ awesome_labs  Program  View  Tracks  Help                        ✔ 37/1546 solved  ● 2 started, unsolved
 ╭──────────────────────────────────────────────╮╭───────────────────────────────────────────────╮
 │▸ Kubernetes · Troubleshooting the cluster     ││k8s-245 — The API server is gone               │
 │ ✔ k8s-241   ●●○○○ fix   node01 is NotReady    ││●●●○○ Medium · Fix something · Kubernetes      │
@@ -26,22 +26,22 @@ have a short tutorial on the concepts and commands to read first.
 
 | Track | Modules | Exercises |
 |-------|---------|-----------|
-| **Docker** | containers · images & Dockerfiles · volumes · networking · Compose · registries · security & limits · the daemon & host · production patterns · real-world troubleshooting · builds, runtime controls & Compose (BuildKit cache mounts, seccomp, cgroups, projected config) | 169 |
-| **Kubernetes** | pods · deployments · services & DNS · ConfigMaps & Secrets · scheduling · storage · Jobs/CronJobs/DaemonSets · probes, resources & autoscaling · Ingress & Gateway API · NetworkPolicies · RBAC & pod security · app troubleshooting · cluster troubleshooting · cluster administration · Helm, Kustomize & CRDs · BGP with Calico and MetalLB · advanced workloads & policy (affinity, PDBs, StatefulSets, admission policy, egress) | 254 |
-| **Offensive Security** | web exploitation (recon · SQL injection · path traversal · command injection · IDOR · SSRF · XXE · JWT · remediation) · web & API attacks (SSRF, SSTI, XXE, mass assignment, JWT forgery, business logic) · privilege escalation · *(more modules in progress)* | 65 |
-| **Linux** | disks, systemd, shell, cgroups, namespaces, LVM · Git beyond the basics · container internals: a container by hand, overlay layers, `runc`, user namespaces, capabilities, PID 1 · files, services & recovery (attrs, sysctl, systemd units & limits, filesystem repair) *(growing)* | 64 |
-| **Networking** | routing, NAT, firewalls, DNS, TLS, proxies, WireGuard, netem · OSPF, BGP, VRRP and IPv6 routing on FRR · paths, tunnels & TLS (subnetting, PMTU, GRE/VXLAN, bonding, certificate chains) *(growing)* | 62 |
-| **Cloud** | AWS CLI, CloudFormation and IAM permission debugging against a local emulator · events, storage & governance (SQS/SNS/EventBridge, S3 policies, KMS, DynamoDB, RBAC) *(growing)* | 67 |
-| **Data** | SQL, PostgreSQL operations and Redis · point-in-time recovery, replication and failover, PgBouncer, Redis Sentinel and AOF repair · SQL in depth & Redis data structures (window functions, JSONB, RLS, sorted sets, geo, ACLs) *(growing)* | 57 |
-| **Defensive Security** | incident response and hardening · packet-capture forensics with tshark · AppArmor, seccomp, SSH certificates and WAF tuning · threat hunting & containment (log analysis, deobfuscation, persistence, IR) *(growing)* | 60 |
-| **Programming** | Python and Go · common pitfalls & idioms (closures, decimals, slices, error wrapping, concurrency) *(growing)* | 65 |
-| **Data Science** | pandas, statistics and machine learning · analysis & model diagnostics (tidy data, joins, chi-square, calibration, importance) *(growing)* | 63 |
-| **Git** | the basics · branching & merging · inspecting history · undoing changes · rebasing & rewriting · stashing & tagging · remotes & collaboration · recovery & detective work (reflog, bisect, fsck) · plumbing & power tools · real-world workflows · config & aliases · ignore rules & attributes · hooks · submodules & subtrees · advanced merging (strategies, rerere, merge-tree) · searching & comparing · large repositories (shallow, partial, sparse) · repository troubleshooting · identity, SSH signing & trailers · multi-problem incidents · revisions, refs & scripting (gitrevisions, for-each-ref, plumbing commits, grafts) | 220 |
-| **Terraform** | the basics (init, plan, apply, outputs, provider versions) · variables, expressions & meta-arguments (`count`, `for_each`, templates, validation) · working with state (moved, removed, import, workspaces, backends, recovery) · modules (local, Git-pinned, refactoring into modules) · real Docker infrastructure with the `kreuzwerker/docker` provider · functions, lifecycle & testing (dynamic blocks, `lifecycle`, `check`, `import`, `terraform test`) *(growing)* | 70 |
-| **Ansible** | inventories & ad-hoc commands · playbooks (handlers, loops, conditionals, idempotence) · templates, files & variables (Jinja2, precedence, Vault) · roles & reuse (role design, dependencies, Galaxy from Git, ansible-lint) · operations & incidents (check mode, validate, block/rescue, become, constructed inventories) against SSH-managed nodes · control flow & extending Ansible (tags, blockinfile, delegation, handlers, vault IDs, collections, custom filters/modules) *(growing)* | 70 |
-| **Algorithms** | searching & sorting · data structures · graphs · dynamic programming · strings, greedy & maths — each exercise solvable in **Python or Go** *(growing)* | 50 |
+| **Docker** | containers · images & Dockerfiles · volumes · networking · Compose · registries · security & limits · the daemon & host · production patterns · real-world troubleshooting · builds, runtime controls & Compose (BuildKit cache mounts, seccomp, cgroups, projected config) · automating Docker: the Engine API, filters & templates, scripts | 184 |
+| **Kubernetes** | pods · deployments · services & DNS · ConfigMaps & Secrets · scheduling · storage · Jobs/CronJobs/DaemonSets · probes, resources & autoscaling · Ingress & Gateway API · NetworkPolicies · RBAC & pod security · app troubleshooting · cluster troubleshooting · cluster administration · Helm, Kustomize & CRDs · BGP with Calico and MetalLB · advanced workloads & policy (affinity, PDBs, StatefulSets, admission policy, egress) · failure policies & lifecycle controls (pod failure policies, per-index retries, scheduling and readiness gates, PVC retention) | 269 |
+| **Offensive Security** | web exploitation (recon · SQL injection · path traversal · command injection · IDOR · SSRF · XXE · JWT · remediation) · web & API attacks (SSRF, SSTI, XXE, mass assignment, JWT forgery, business logic) · privilege escalation · *(more modules in progress)* · applied cryptography attacks (XOR, ECB, CBC bit-flips, padding oracles, RSA, length extension) | 80 |
+| **Linux** | disks, systemd, shell, cgroups, namespaces, LVM · Git beyond the basics · container internals: a container by hand, overlay layers, `runc`, user namespaces, capabilities, PID 1 · files, services & recovery (attrs, sysctl, systemd units & limits, filesystem repair) *(growing)* · security & hardening (sudoers, systemd sandboxing, sshd, GPG, mount options, mutual TLS) | 79 |
+| **Networking** | routing, NAT, firewalls, DNS, TLS, proxies, WireGuard, netem · OSPF, BGP, VRRP and IPv6 routing on FRR · paths, tunnels & TLS (subnetting, PMTU, GRE/VXLAN, bonding, certificate chains) *(growing)* · TCP & sockets (connection states, TIME-WAIT, ephemeral ports, listen queues, Nagle, the bandwidth-delay product) | 77 |
+| **Cloud** | AWS CLI, CloudFormation and IAM permission debugging against a local emulator · events, storage & governance (SQS/SNS/EventBridge, S3 policies, KMS, DynamoDB, RBAC) *(growing)* · managed databases: RDS & Aurora (backups, replicas, encryption, failover, IAM auth, DR snapshots) | 82 |
+| **Data** | SQL, PostgreSQL operations and Redis · point-in-time recovery, replication and failover, PgBouncer, Redis Sentinel and AOF repair · SQL in depth & Redis data structures (window functions, JSONB, RLS, sorted sets, geo, ACLs) *(growing)* · logic in the database (PL/pgSQL functions & triggers, SECURITY DEFINER, Redis Lua and Functions) | 72 |
+| **Defensive Security** | incident response and hardening · packet-capture forensics with tshark · AppArmor, seccomp, SSH certificates and WAF tuning · threat hunting & containment (log analysis, deobfuscation, persistence, IR) *(growing)* · web & TLS hardening (nginx, security headers, CSP, internal CAs, mutual TLS, revocation) | 75 |
+| **Programming** | Python and Go · common pitfalls & idioms (closures, decimals, slices, error wrapping, concurrency) *(growing)* · secure coding (path traversal, XSS, password hashing, ReDoS, SSRF, zip slip, webhook signatures) | 80 |
+| **Data Science** | pandas, statistics and machine learning · analysis & model diagnostics (tidy data, joins, chi-square, calibration, importance) *(growing)* · customer & product analytics (funnels, cohorts, RFM, survival, attribution, churn). **Done in Jupyter notebooks** that the checks run | 78 |
+| **Git** | the basics · branching & merging · inspecting history · undoing changes · rebasing & rewriting · stashing & tagging · remotes & collaboration · recovery & detective work (reflog, bisect, fsck) · plumbing & power tools · real-world workflows · config & aliases · ignore rules & attributes · hooks · submodules & subtrees · advanced merging (strategies, rerere, merge-tree) · searching & comparing · large repositories (shallow, partial, sparse) · repository troubleshooting · identity, SSH signing & trailers · multi-problem incidents · revisions, refs & scripting (gitrevisions, for-each-ref, plumbing commits, grafts) · hosting & serving repositories (bare repos, mirrors, git daemon, receive protections, deploy hooks) | 235 |
+| **Terraform** | the basics (init, plan, apply, outputs, provider versions) · variables, expressions & meta-arguments (`count`, `for_each`, templates, validation) · working with state (moved, removed, import, workspaces, backends, recovery) · modules (local, Git-pinned, refactoring into modules) · real Docker infrastructure with the `kreuzwerker/docker` provider · functions, lifecycle & testing (dynamic blocks, `lifecycle`, `check`, `import`, `terraform test`) *(growing)* · Terraform in automation (saved plans, exit codes, JSON plan gates, state locks, mock-provider tests, pipelines) | 85 |
+| **Ansible** | inventories & ad-hoc commands · playbooks (handlers, loops, conditionals, idempotence) · templates, files & variables (Jinja2, precedence, Vault) · roles & reuse (role design, dependencies, Galaxy from Git, ansible-lint) · operations & incidents (check mode, validate, block/rescue, become, constructed inventories) against SSH-managed nodes · control flow & extending Ansible (tags, blockinfile, delegation, handlers, vault IDs, collections, custom filters/modules) *(growing)* · data structures & types (dicts, merging, JSON in and out, type errors) | 85 |
+| **Algorithms** | searching & sorting · data structures · graphs · dynamic programming · strings, greedy & maths — each exercise solvable in **Python or Go** *(growing)* · recursion & backtracking | 65 |
 
-That's 1336 exercises so far, with a target of 250 per track; ideas for what comes next are
+That's 1546 exercises so far, with a target of 250 per track; ideas for what comes next are
 in [docs/PENDING.md](docs/PENDING.md).
 
 Difficulty rises through each module (1 = beginner … 5 = expert), mixing **build** tasks
@@ -59,7 +59,7 @@ techniques on systems you own or are explicitly authorized to test.
 
 | Environment | VMs | What's inside |
 |-------------|-----|---------------|
-| **Docker host** | `kl-docker` (2 CPU, 3 GiB) | Ubuntu 24.04, Docker Engine + Compose + Buildx, common images pre-pulled, networking and diagnostic tools, a Python data-science image, Terraform 1.16 with an offline provider mirror, Ansible (ansible-core 2.21) with SSH-managed node containers |
+| **Docker host** | `kl-docker` (2 CPU, 4 GiB) | Ubuntu 24.04, Docker Engine + Compose + Buildx, common images pre-pulled, networking and diagnostic tools, a Python data-science image, Terraform 1.16 with an offline provider mirror, Ansible (ansible-core 2.21) with SSH-managed node containers |
 | **Kubernetes cluster** | `kl-cp` → `controlplane` (2 CPU, 3 GiB)<br>`kl-worker` → `node01` (2 CPU, 2.5 GiB) | kubeadm **v1.36**, containerd 2, Calico (enforces NetworkPolicies), metrics-server, local-path storage (default StorageClass), Traefik ingress + Gateway API (NodePorts 30080/30443), Helm |
 | **Offensive security lab** | `kl-offsec` (2 CPU, 3 GiB) | Ubuntu 24.04, Docker (hosts the vulnerable targets), attacker tooling (nmap, ncat, hydra, john, …) and wordlists under `/usr/share/kl`. Attacker and targets are the same isolated box |
 
@@ -99,7 +99,7 @@ shows the plan.
     to avoid a [QEMU crash on Lima's `user-v2` network](https://github.com/lima-vm/lima/issues/5722).
     Starting the `kl-cp` or `kl-worker` VMs with `limactl` directly skips it.
 - Go ≥ 1.27 to build
-- ~6 GiB of free RAM (one environment at a time; ~9 GiB with both), ~40 GiB of disk
+- ~6 GiB of free RAM (one environment at a time; ~10 GiB with Docker and Kubernetes both up), ~40 GiB of disk
 - Internet access (packages and images are downloaded on first start)
 
 ## Download
@@ -256,6 +256,72 @@ PATH*); on macOS the app in `/Applications` is found without it. Set
 Files outside `/lab` (`/etc`, the cluster's manifests…) are still edited from the
 terminal.
 
+### In your web browser
+
+`awesome_labs web` serves the same labs as a web page, with **terminals into the lab VMs
+in the browser**. It prints a link and opens it; the page and the terminals run until you
+press `ctrl+c` in the terminal you started it from.
+
+```bash
+awesome_labs web                     # http://127.0.0.1:7681, opens your browser
+awesome_labs web --addr 127.0.0.1:9000 --no-open
+```
+
+- **The exercise screen** has the same tabs as the terminal UI (Scenario, Learn, Hints,
+  Solution, Output, Notes) and buttons for Start, Terminal, Check, Hint, Solution, End,
+  Restart and Reset progress. A button is dimmed when it can't act yet and says why when
+  pressed. Start, Check and the environment operations stream their output live into the
+  Output tab and the status bar.
+- **Terminals** open in a panel below the exercise, or beside it (`⇆`), or maximized
+  (`⤢`): one tab per VM (`controlplane` and `node01` for Kubernetes). They run the same
+  shell as `t`/`w`, so your command history per exercise is kept. Starting the lab opens
+  one by itself. Each code block in the text has **Copy** and **▸ Terminal**, which pastes
+  it into the open terminal for you to run with Enter. A shell that ended reconnects on
+  Enter.
+- **Notebooks:** the Data Science track is done in Jupyter notebooks. **📓 Notebook** opens
+  JupyterLab in the same panel, on the exercise's notebook `/lab/<id>.ipynb`, which
+  starting the exercise writes: how it's graded, the code to fix (if any) and a save cell
+  for each file to produce. It runs on the docker host in `/lab`, as the lab user, with
+  pandas, NumPy, SciPy, scikit-learn and matplotlib. **The notebook is what's graded:**
+  Check runs it from top to bottom in a fresh kernel, on a copy of `/lab` without the
+  files it must write, then grades what it wrote, and calls the functions the task names
+  with the check's own data. Files made by hand don't count, and the check's hidden data
+  is out of the notebook's reach while it runs. The page lists the files each exercise
+  grades and how to save them. The container is capped at 2.5 GiB; closing the notebook
+  tab stops it and resetting the lab removes it. JupyterLab is only reachable through
+  the web interface, which adds the notebook's token itself. In the terminal UI, open
+  the notebook in VS Code (`o`).
+- **Environments & VMs** shows every environment and VM with start, stop, reset, prepare,
+  rebuild and delete.
+- **First launch** offers to build the environments that have no saved copy yet, one
+  checkbox each (the terminal UI asks the same once; whichever asks first, it isn't asked
+  again). Each is built, saved and stopped, so its first exercise starts in seconds.
+- **Only what's needed runs.** With `auto_stop: true` (the default) the server stops the
+  running lab VMs once no exercise is set up and nothing (an operation, a terminal, a
+  notebook) has used them for 10 minutes, or when an exercise is set up but no page has
+  been open for 30 minutes. Stopping keeps the disks and the lab: the exercise's page
+  boots it again.
+- The list on the left filters by text, track, progress and learning path; drag its
+  right edge to widen it (double-click resets it). `/` focuses the filter, `j`/`k` move
+  through the list and `1`–`6` switch tabs.
+
+Exams are started from the terminal UI (`X`); while one runs the web page honours it:
+hints and the solution of its questions are locked and its checks count.
+
+**Security.** A terminal in a web page is a shell on your lab VMs, so the server listens on
+`127.0.0.1` only, and every request needs the random token in the printed link. The token
+is kept in a same-site cookie after the first visit and is new each run. Requests from other
+sites and other `Host` names are refused. `--addr 0.0.0.0:7681` makes it reachable from
+your network: anyone with the link then gets those shells, so only do that on a network
+you trust.
+
+Like the app, `awesome_labs web` takes the single-instance lock, and `ctrl+c` treats the
+lab VMs the way leaving the app does (`on_exit`: by default every lab VM is deleted;
+`ctrl+c` a second time leaves them as they are). Stopping it while an operation runs
+cancels that operation and leaves the VMs as they are, and so does failing to start
+(say, the port is taken). Unlike the app, it does not delete leftover VMs when it
+starts.
+
 ### Learning paths
 
 | Path | What's in it |
@@ -305,7 +371,7 @@ on_exit: delete        # delete · stop · keep
 auto_check: false      # start with auto-check on (A toggles it)
 check_updates: false   # look for a newer release once a day; nothing about you is sent
 theme: auto            # auto · dark · light (NO_COLOR=1 turns colours off)
-docker:       {cpus: 2, memory: 3GiB}       # applied when a VM is (re)created:
+docker:       {cpus: 2, memory: 4GiB}       # applied when a VM is (re)created:
 controlplane: {cpus: 2, memory: 3GiB}       #   awesome_labs env rebuild docker|k8s
 worker:       {cpus: 2, memory: 2560MiB}
 ```
@@ -314,6 +380,7 @@ worker:       {cpus: 2, memory: 2560MiB}
 
 ```bash
 awesome_labs install [--dry-run] [--yes] [--bin-dir DIR]   # set up Lima, QEMU and the binary
+awesome_labs web [--addr HOST:PORT] [--no-open]   # the labs in your browser, with web terminals
 awesome_labs status                     # the exercise you're working on + running VMs
 awesome_labs list [filter]              # list exercises (✔ solved, ● started)
 awesome_labs paths [path-id]            # learning paths and progress
@@ -374,6 +441,7 @@ internal/lab               environments: create/bootstrap/reset VMs, run setup/c
 internal/lima              thin limactl wrapper
 internal/install           OS detection and the install command
 internal/tui               Bubble Tea interface
+internal/web               the web interface (awesome_labs web): HTTP API, web terminals, static/ page
 internal/progress          ~/.awesome_labs/progress.json and notes.json
 internal/doctor            awesome_labs doctor
 internal/update            the newer-release check

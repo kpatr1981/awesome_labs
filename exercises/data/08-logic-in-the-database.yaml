@@ -1,0 +1,1786 @@
+track: data
+module: Logic in the database
+profile: docker
+order: 8
+exercises:
+
+- id: data-076
+  title: Invoice numbers from one function
+  difficulty: 1
+  kind: build
+  tags: [postgres, functions, sql-function, volatility]
+  tutorial: |
+    **Concept.** A **SQL function** gives an expression or a query a name, so every caller
+    gets the same result for the same input: `CREATE FUNCTION name(arg type, ...) RETURNS
+    type LANGUAGE sql AS $$ SELECT ... $$`. Inside the body you use the arguments by name.
+
+    You also declare how the function behaves. **`IMMUTABLE`** promises that the same
+    arguments always give the same result and that no table is read, so PostgreSQL may
+    use the function in an index and work it out once while planning. `STABLE` and
+    `VOLATILE` promise less. **`STRICT`** returns NULL straight away when any argument is NULL.
+
+    **Read up on:**
+    - `CREATE [OR REPLACE] FUNCTION ... LANGUAGE sql`
+    - Function volatility categories: `IMMUTABLE`, `STABLE`, `VOLATILE`
+    - `lpad`, `length`, `greatest`, `extract`, string concatenation with `||`
+  scenario: |
+    PostgreSQL runs in **`kl-pg`** (`docker exec -it kl-pg psql -U lab -d lab`). Every
+    service formats invoice numbers its own way. Replace them all with one function:
+
+    **`invoice_code(n integer, issued date) RETURNS text`**, which returns
+    `INV-<year of issued>-<n>`, with `n` zero-padded to **at least six digits**:
+
+    | call | result |
+    |------|--------|
+    | `invoice_code(42, '2026-03-05')` | `INV-2026-000042` |
+    | `invoice_code(7, '2025-12-31')` | `INV-2025-000007` |
+    | `invoice_code(1234567, '2027-01-01')` | `INV-2027-1234567` (never cut short) |
+
+    Declare it **`IMMUTABLE`**.
+  hints:
+    - "`'INV-' || extract(year FROM issued)::int || '-' || ...` builds the frame."
+    - "`lpad(n::text, 6, '0')` pads, but it also *truncates* longer strings. Try it on `1234567`."
+    - "Pad to `greatest(6, length(n::text))` characters instead."
+  solution: |
+    ```sql
+    CREATE OR REPLACE FUNCTION invoice_code(n integer, issued date) RETURNS text
+    LANGUAGE sql IMMUTABLE STRICT
+    AS $$ SELECT 'INV-' || extract(year FROM issued)::int || '-' || lpad(n::text, greatest(6, length(n::text)), '0') $$;
+
+    SELECT invoice_code(42, '2026-03-05'), invoice_code(1234567, '2027-01-01');
+    ```
+  setup: |
+    pg_start
+    pg_sql "create table invoices(id serial primary key, issued date not null, amount numeric(10,2) not null);
+            insert into invoices(issued, amount) select date '2025-11-01' + (g % 120), g from generate_series(1, 300) g;"
+  check: |
+    n=$((RANDOM % 900 + 100))
+    check_eq "invoice_code(42, '2026-03-05')" "$(pg_sql "select invoice_code(42, '2026-03-05')" 2>/dev/null)" "INV-2026-000042"
+    check_eq "invoice_code($n, '2025-12-31')" "$(pg_sql "select invoice_code($n, '2025-12-31')" 2>/dev/null)" "INV-2025-000$n"
+    check_eq "six digits stay six digits" "$(pg_sql "select invoice_code(123456, '2026-01-01')" 2>/dev/null)" "INV-2026-123456"
+    check_eq "longer numbers are kept whole" "$(pg_sql "select invoice_code(1234567, '2027-01-01')" 2>/dev/null)" "INV-2027-1234567"
+    check_eq "invoice_code is IMMUTABLE" "$(pg_sql "select string_agg(provolatile::text, ',') from pg_proc where proname = 'invoice_code'")" "i"
+  solve: |
+    docker exec -i kl-pg psql -h 127.0.0.1 -U lab -d lab -v ON_ERROR_STOP=1 -q <<'SQL'
+    CREATE OR REPLACE FUNCTION invoice_code(n integer, issued date) RETURNS text
+    LANGUAGE sql IMMUTABLE STRICT
+    AS $$ SELECT 'INV-' || extract(year FROM issued)::int || '-' || lpad(n::text, greatest(6, length(n::text)), '0') $$;
+    SQL
+
+- id: data-077
+  title: Stamp every row with its last change
+  difficulty: 2
+  kind: build
+  tags: [postgres, trigger, plpgsql, before-update]
+  tutorial: |
+    **Concept.** A **trigger** runs a function automatically when rows change. The
+    function is written in PL/pgSQL, `RETURNS trigger`, and sees the row being written
+    as **`NEW`** (and the previous version as `OLD` on UPDATE and DELETE).
+
+    *When* it fires matters. A **`BEFORE ... FOR EACH ROW`** trigger runs before the row
+    is stored: whatever it puts in `NEW` and returns is what gets written. An `AFTER`
+    trigger runs once the row is stored, so changing `NEW` there has no effect. A rule
+    in a BEFORE trigger therefore holds for every statement, whoever writes it.
+
+    **Read up on:**
+    - `CREATE FUNCTION ... RETURNS trigger LANGUAGE plpgsql`, `NEW`, `RETURN NEW`
+    - `CREATE [OR REPLACE] TRIGGER ... BEFORE UPDATE ON ... FOR EACH ROW EXECUTE FUNCTION ...`
+  scenario: |
+    The table **`products`** in **`kl-pg`** has `id`, `name`, `price` and
+    **`updated_at`** (timestamptz). Some services forget to set `updated_at`, and one
+    even writes an old value back.
+
+    Make the database itself set `updated_at` to the **current time on every UPDATE**
+    of a row, **whatever the UPDATE statement says** about `updated_at`. Rows that
+    aren't updated keep the `updated_at` they have.
+  hints:
+    - "A trigger function can assign to the row: `NEW.updated_at := now();` then `RETURN NEW;`."
+    - "It has to fire `BEFORE UPDATE ... FOR EACH ROW`. An AFTER trigger is too late to change the row."
+  solution: |
+    ```sql
+    CREATE OR REPLACE FUNCTION touch_updated_at() RETURNS trigger LANGUAGE plpgsql AS $$
+    BEGIN
+      NEW.updated_at := now();
+      RETURN NEW;
+    END $$;
+
+    CREATE OR REPLACE TRIGGER products_touch BEFORE UPDATE ON products
+      FOR EACH ROW EXECUTE FUNCTION touch_updated_at();
+    ```
+  setup: |
+    pg_start
+    pg_sql "create table products(id serial primary key, name text not null, price numeric(10,2) not null, updated_at timestamptz not null default now());
+            insert into products(name, price, updated_at) select 'product-' || g, 10 + g % 90, '2026-01-01 00:00+00' from generate_series(1, 200) g;"
+  check: |
+    k=$((RANDOM % 150 + 1)); j=$((k + 25))
+    pg_sql "update products set price = price + 1 where id = $k" >/dev/null
+    check_eq "an UPDATE moves updated_at to now" "$(pg_sql "select updated_at > now() - interval '1 minute' from products where id = $k")" t
+    pg_sql "update products set price = price + 1, updated_at = '2001-01-01' where id = $j" >/dev/null
+    check_eq "an UPDATE can't write an old updated_at" "$(pg_sql "select updated_at > now() - interval '1 minute' from products where id = $j")" t
+    check_eq "a row nobody updated keeps its updated_at" "$(pg_sql "select updated_at = '2026-01-01 00:00+00' from products where id = 200")" t
+    check_eq "no product was lost" "$(pg_sql "select count(*) from products")" 200
+  solve: |
+    docker exec -i kl-pg psql -h 127.0.0.1 -U lab -d lab -v ON_ERROR_STOP=1 -q <<'SQL'
+    CREATE OR REPLACE FUNCTION touch_updated_at() RETURNS trigger LANGUAGE plpgsql AS $$
+    BEGIN
+      NEW.updated_at := now();
+      RETURN NEW;
+    END $$;
+    CREATE OR REPLACE TRIGGER products_touch BEFORE UPDATE ON products
+      FOR EACH ROW EXECUTE FUNCTION touch_updated_at();
+    SQL
+
+- id: data-078
+  title: The view that accepts rows it can't show
+  difficulty: 2
+  kind: fix
+  tags: [postgres, views, updatable-view, check-option, grants]
+  tutorial: |
+    **Concept.** A simple view (one table, no aggregates) is **automatically
+    updatable**: INSERT and UPDATE through it are passed down to the table. By default
+    nothing stops a row from being written through the view even if it doesn't match
+    the view's `WHERE`, so it disappears from the view as soon as it's written.
+    **`WITH CHECK OPTION`** makes PostgreSQL reject such writes. `CASCADED` (the default)
+    also applies the conditions of the views underneath.
+
+    `CREATE OR REPLACE VIEW` keeps the view's privileges, while `DROP VIEW` + `CREATE VIEW`
+    loses them.
+
+    **Read up on:**
+    - Updatable views, `WITH [CASCADED | LOCAL] CHECK OPTION`
+    - `ALTER VIEW ... SET (check_option = ...)`
+  scenario: |
+    In **`kl-pg`**, the EU help desk logs in as **`eu_desk`** (password **`eu-d3sk`**)
+    and manages customers through the view **`eu_customers`**, which shows the rows of
+    **`customers`** with `region = 'eu'`. Its privileges are on the view only.
+
+    The desk app had a bug and inserted three customers with a non-EU region through the
+    view. They vanished from the view, but they are in `customers` (their names start
+    with **`desk-`**).
+
+    1. Make the view **reject** any INSERT or UPDATE through it that would leave a row
+       outside the EU (`region <> 'eu'`). Keep the view's name and columns, and
+       `eu_desk` must still be able to add and edit EU customers through it.
+    2. **Delete** the three `desk-` rows.
+  hints:
+    - "As eu_desk: `docker exec -it -e PGPASSWORD=eu-d3sk kl-pg psql -h 127.0.0.1 -U eu_desk -d lab`, then try inserting a `'us'` customer through the view."
+    - "`ALTER VIEW eu_customers SET (check_option = cascaded);` or `CREATE OR REPLACE VIEW ... WITH CHECK OPTION`."
+    - "Dropping and recreating the view drops eu_desk's grants with it."
+  solution: |
+    ```sql
+    CREATE OR REPLACE VIEW eu_customers AS
+      SELECT id, name, region FROM customers WHERE region = 'eu'
+      WITH CASCADED CHECK OPTION;
+    DELETE FROM customers WHERE name LIKE 'desk-%';
+    ```
+  setup: |
+    pg_start
+    pg_sql "create table customers(id serial primary key, name text not null, region text not null check (region in ('eu','us','apac')));
+            insert into customers(name, region) select 'cust-' || g, (array['eu','us','apac'])[1 + g % 3] from generate_series(1, 300) g;
+            create view eu_customers as select id, name, region from customers where region = 'eu';
+            create role eu_desk login password 'eu-d3sk';
+            grant select, insert, update on eu_customers to eu_desk;
+            grant usage on sequence customers_id_seq to eu_desk;"
+    docker exec -i -e PGPASSWORD=eu-d3sk kl-pg psql -h 127.0.0.1 -U eu_desk -d lab -v ON_ERROR_STOP=1 -q \
+      -c "insert into eu_customers(name, region) values ('desk-1', 'us'), ('desk-2', 'apac'), ('desk-3', 'us')"
+  check: |
+    as_desk() { docker exec -i -e PGPASSWORD=eu-d3sk kl-pg psql -h 127.0.0.1 -U eu_desk -d lab -v ON_ERROR_STOP=1 -qAt -c "$1" 2>/dev/null; }
+    q_eu="begin; insert into eu_customers(name, region) values ('kl-ok', 'eu'); rollback;"
+    q_us="begin; insert into eu_customers(name, region) values ('kl-bad', 'us'); rollback;"
+    q_move="begin; update eu_customers set region = 'apac' where id = (select min(id) from eu_customers); rollback;"
+    q_edit="begin; update eu_customers set name = name || '!' where id = (select min(id) from eu_customers); rollback;"
+    check "eu_desk can still add an EU customer through the view" 'as_desk "$q_eu"'
+    check "eu_desk can still edit an EU customer through the view" 'as_desk "$q_edit"'
+    check_not "a US customer is rejected by the view" 'as_desk "$q_us"'
+    check_not "moving an EU customer out of the EU through the view is rejected" 'as_desk "$q_move"'
+    check_eq "the desk's wrong rows are gone" "$(pg_sql "select count(*) from customers where name like 'desk-%'")" 0
+    check_eq "every other customer is still there" "$(pg_sql "select count(*) from customers where name like 'cust-%'")" 300
+    check_eq "eu_customers still shows the 100 EU customers" "$(as_desk "select count(*) from eu_customers")" 100
+  solve: |
+    docker exec -i kl-pg psql -h 127.0.0.1 -U lab -d lab -v ON_ERROR_STOP=1 -q <<'SQL'
+    CREATE OR REPLACE VIEW eu_customers AS
+      SELECT id, name, region FROM customers WHERE region = 'eu'
+      WITH CASCADED CHECK OPTION;
+    DELETE FROM customers WHERE name LIKE 'desk-%';
+    SQL
+
+- id: data-079
+  title: Who changed this row, and what was it before?
+  difficulty: 3
+  kind: build
+  tags: [postgres, trigger, audit, jsonb, security-definer]
+  tutorial: |
+    **Concept.** An **audit trigger** records every change in a log table: `AFTER INSERT
+    OR UPDATE OR DELETE ... FOR EACH ROW`. Inside the function, **`TG_OP`** says which
+    operation fired it and **`TG_TABLE_NAME`** which table, so one function serves many
+    tables. `to_jsonb(OLD)` and `to_jsonb(NEW)` store whole rows. `OLD` is NULL on
+    INSERT and `NEW` is NULL on DELETE.
+
+    The function normally runs with the **caller's** privileges, so the caller would need
+    INSERT on the log. A **`SECURITY DEFINER`** function runs with its **owner's**
+    privileges instead, so callers can write audit rows without having any access to the
+    log. Pin its `search_path` (`SET search_path = public, pg_temp`). Inside such a
+    function `current_user` is the owner. **`session_user`** is still the role that
+    logged in.
+
+    **Read up on:**
+    - Trigger variables: `TG_OP`, `TG_TABLE_NAME`, `OLD`, `NEW`
+    - `to_jsonb(record)`
+    - `SECURITY DEFINER`, `current_user` versus `session_user`
+  scenario: |
+    In **`kl-pg`**, tellers log in as **`teller`** (password **`t3ller`**) and change
+    the tables **`accounts`** (`id`, `owner`, `balance`) and **`cards`** (`id`,
+    `account_id`, `last4`). The table **`audit_log`** exists but stays empty:
+
+    `audit_log(id bigserial, table_name, op, row_id, old_row jsonb, new_row jsonb, changed_by, changed_at)`
+
+    Write **one trigger function** and attach it to **both** tables so that every
+    INSERT, UPDATE and DELETE adds a row to `audit_log` with:
+
+    - `table_name`: the table, `op`: `INSERT`, `UPDATE` or `DELETE`, `row_id`: the row's `id`
+    - `old_row`: the row before the change as jsonb (NULL for INSERT)
+    - `new_row`: the row after the change as jsonb (NULL for DELETE)
+    - `changed_by`: the **role that logged in** and made the change (e.g. `teller`)
+
+    `teller` must keep working on both tables, and must **not** be able to read or write
+    `audit_log` directly.
+  hints:
+    - "Branch on `TG_OP`: `IF TG_OP = 'DELETE' THEN ... OLD.id ... ELSE ... NEW.id ...`. `RETURN NULL` is fine in an AFTER trigger."
+    - "Without extra grants, teller's changes now fail with *permission denied for table audit_log*. Make the function `SECURITY DEFINER SET search_path = public, pg_temp`."
+    - "In a SECURITY DEFINER function `current_user` is the owner (`lab`). Record `session_user`."
+  solution: |
+    ```sql
+    CREATE OR REPLACE FUNCTION audit_row() RETURNS trigger
+    LANGUAGE plpgsql SECURITY DEFINER SET search_path = public, pg_temp AS $$
+    BEGIN
+      IF TG_OP = 'DELETE' THEN
+        INSERT INTO audit_log(table_name, op, row_id, old_row, new_row, changed_by)
+        VALUES (TG_TABLE_NAME, TG_OP, OLD.id, to_jsonb(OLD), NULL, session_user);
+      ELSE
+        INSERT INTO audit_log(table_name, op, row_id, old_row, new_row, changed_by)
+        VALUES (TG_TABLE_NAME, TG_OP, NEW.id,
+                CASE WHEN TG_OP = 'UPDATE' THEN to_jsonb(OLD) END, to_jsonb(NEW), session_user);
+      END IF;
+      RETURN NULL;
+    END $$;
+
+    CREATE OR REPLACE TRIGGER accounts_audit AFTER INSERT OR UPDATE OR DELETE ON accounts
+      FOR EACH ROW EXECUTE FUNCTION audit_row();
+    CREATE OR REPLACE TRIGGER cards_audit AFTER INSERT OR UPDATE OR DELETE ON cards
+      FOR EACH ROW EXECUTE FUNCTION audit_row();
+    ```
+  setup: |
+    pg_start
+    pg_sql "create table accounts(id int primary key, owner text not null, balance numeric(12,2) not null);
+            create table cards(id int primary key, account_id int not null references accounts(id), last4 text not null);
+            create table audit_log(id bigserial primary key, table_name text not null, op text not null, row_id int not null,
+                                   old_row jsonb, new_row jsonb, changed_by text not null, changed_at timestamptz not null default now());
+            insert into accounts select g, 'owner-' || g, (g * 37) % 1000 from generate_series(1, 50) g;
+            insert into cards select g, g, lpad(((g * 7919) % 10000)::text, 4, '0') from generate_series(1, 50) g;
+            create role teller login password 't3ller';
+            grant select, insert, update, delete on accounts, cards to teller;"
+  check: |
+    as_t() { docker exec -i -e PGPASSWORD=t3ller kl-pg psql -h 127.0.0.1 -U teller -d lab -v ON_ERROR_STOP=1 -qAt -c "$1" 2>/dev/null; }
+    pg_sql "delete from cards where id = 9001; delete from accounts where id = 9001; delete from audit_log where row_id = 9001" >/dev/null 2>&1
+    q1="insert into accounts values (9001, 'kl-check', 10)"
+    q2="update accounts set balance = 25 where id = 9001"
+    q3="insert into cards values (9001, 9001, '4242')"
+    q4="delete from cards where id = 9001"
+    q5="delete from accounts where id = 9001"
+    q6="select count(*) from audit_log"
+    q7="insert into audit_log(table_name, op, row_id, changed_by) values ('x', 'x', 1, 'x')"
+    check "teller can insert an account" 'as_t "$q1"'
+    check "teller can update it" 'as_t "$q2"'
+    check "teller can add and remove a card" 'as_t "$q3" && as_t "$q4"'
+    check "teller can delete the account" 'as_t "$q5"'
+    check_eq "every change was logged, in order" "$(pg_sql "select string_agg(table_name || ':' || op, ',' order by id) from audit_log where row_id = 9001")" "accounts:INSERT,accounts:UPDATE,cards:INSERT,cards:DELETE,accounts:DELETE"
+    check_eq "the UPDATE keeps the old and the new balance" "$(pg_sql "select (old_row->>'balance')::numeric = 10 and (new_row->>'balance')::numeric = 25 from audit_log where row_id = 9001 and table_name = 'accounts' and op = 'UPDATE'")" t
+    check_eq "INSERTs have no old row and DELETEs no new row" "$(pg_sql "select count(*) from audit_log where row_id = 9001 and ((op = 'INSERT' and old_row is null and new_row->>'id' = '9001') or (op = 'DELETE' and new_row is null and old_row->>'id' = '9001'))")" 4
+    check_eq "changed_by is the role that made the change" "$(pg_sql "select string_agg(distinct changed_by, ',') from audit_log where row_id = 9001")" teller
+    check_not "teller can't read audit_log" 'as_t "$q6"'
+    check_not "teller can't write audit_log" 'as_t "$q7"'
+  solve: |
+    docker exec -i kl-pg psql -h 127.0.0.1 -U lab -d lab -v ON_ERROR_STOP=1 -q <<'SQL'
+    CREATE OR REPLACE FUNCTION audit_row() RETURNS trigger
+    LANGUAGE plpgsql SECURITY DEFINER SET search_path = public, pg_temp AS $$
+    BEGIN
+      IF TG_OP = 'DELETE' THEN
+        INSERT INTO audit_log(table_name, op, row_id, old_row, new_row, changed_by)
+        VALUES (TG_TABLE_NAME, TG_OP, OLD.id, to_jsonb(OLD), NULL, session_user);
+      ELSE
+        INSERT INTO audit_log(table_name, op, row_id, old_row, new_row, changed_by)
+        VALUES (TG_TABLE_NAME, TG_OP, NEW.id,
+                CASE WHEN TG_OP = 'UPDATE' THEN to_jsonb(OLD) END, to_jsonb(NEW), session_user);
+      END IF;
+      RETURN NULL;
+    END $$;
+    CREATE OR REPLACE TRIGGER accounts_audit AFTER INSERT OR UPDATE OR DELETE ON accounts
+      FOR EACH ROW EXECUTE FUNCTION audit_row();
+    CREATE OR REPLACE TRIGGER cards_audit AFTER INSERT OR UPDATE OR DELETE ON cards
+      FOR EACH ROW EXECUTE FUNCTION audit_row();
+    SQL
+
+- id: data-080
+  title: "INSERT 0 0: the signups that vanish"
+  difficulty: 3
+  kind: fix
+  tags: [postgres, trigger, plpgsql, before-trigger, troubleshooting, on-conflict]
+  tutorial: |
+    **Concept.** What a **BEFORE ROW** trigger returns decides what is written. Returning
+    `NEW` (possibly modified) writes that row. Returning **`NULL`** silently **skips** the
+    row: there is no error, and the command tag just says `INSERT 0 0`. AFTER triggers
+    can return NULL because the row is already stored by then. A trigger only fires for
+    the events it lists (`BEFORE INSERT OR UPDATE`).
+
+    BEFORE triggers run before uniqueness is checked, so `INSERT ... ON CONFLICT` compares
+    the row as the trigger left it.
+
+    **Read up on:**
+    - Trigger return values: BEFORE versus AFTER, row versus statement
+    - `lower`, `btrim`
+    - `\copy ... FROM pstdin`, `INSERT ... ON CONFLICT DO NOTHING`
+  scenario: |
+    Since yesterday's release, the signup form in **`kl-pg`** says "thanks", but
+    nothing new arrives in **`signups`** (`id`, `email` UNIQUE, `created_at`). In psql,
+    an insert answers `INSERT 0 0`. The release added the trigger **`signups_normalize`**
+    with the function **`normalize_email()`**.
+
+    1. Fix it so inserts are stored again, and `email` is stored **lower-cased and
+       without surrounding spaces**, both on **INSERT and on UPDATE**.
+    2. The signups lost since the release are in **`/lab/lost.csv`** (one `email`
+       column, with a header). Load them. Some differ only in case or spaces from
+       each other or from an existing signup: store every address **once**.
+  hints:
+    - "`\\sf normalize_email` shows the function. What does it return, and when does it fire?"
+    - "A BEFORE trigger must `RETURN NEW`. Use `NEW.email := lower(btrim(NEW.email));`, and recreate the trigger as `BEFORE INSERT OR UPDATE`."
+    - "Load the CSV into a temporary table with `\\copy lost FROM pstdin WITH (FORMAT csv, HEADER true)` (piping the file into psql), then `INSERT INTO signups(email) SELECT email FROM lost ON CONFLICT (email) DO NOTHING`."
+  solution: |
+    ```sql
+    CREATE OR REPLACE FUNCTION normalize_email() RETURNS trigger LANGUAGE plpgsql AS $$
+    BEGIN
+      NEW.email := lower(btrim(NEW.email));
+      RETURN NEW;
+    END $$;
+    DROP TRIGGER signups_normalize ON signups;
+    CREATE TRIGGER signups_normalize BEFORE INSERT OR UPDATE ON signups
+      FOR EACH ROW EXECUTE FUNCTION normalize_email();
+    ```
+    ```bash
+    docker exec -i kl-pg psql -U lab -d lab \
+      -c "CREATE TEMP TABLE lost(email text)" \
+      -c "\copy lost FROM pstdin WITH (FORMAT csv, HEADER true)" \
+      -c "INSERT INTO signups(email) SELECT email FROM lost ON CONFLICT (email) DO NOTHING" < /lab/lost.csv
+    ```
+  setup: |
+    pg_start
+    pg_sql <<'SQL'
+    create table signups(id serial primary key, email text not null unique, created_at timestamptz not null default now());
+    insert into signups(email) select 'user' || g || '@example.com' from generate_series(1, 100) g;
+    create function normalize_email() returns trigger language plpgsql as $$
+    begin
+      NEW.email := lower(NEW.email);
+      return null;
+    end $$;
+    create trigger signups_normalize before insert on signups for each row execute function normalize_email();
+    SQL
+    python3 - "$KL_STATE" <<'PY'
+    import random, string, hashlib, sys
+    def mangle(e):
+        e = "".join(c.upper() if random.random() < 0.4 else c for c in e)
+        return random.choice(["", " ", "  "]) + e + random.choice(["", " ", "  "])
+    new = []
+    while len(new) < 35:
+        e = "".join(random.choice(string.ascii_lowercase) for _ in range(6)) + str(len(new)) + "@" + random.choice(["example.com", "mail.test", "shop.io"])
+        new.append(e)
+    rows = [mangle(e) for e in new]
+    rows += [mangle(e) for e in random.sample(new, 3)]
+    rows += [mangle("user5@example.com"), mangle("user17@example.com")]
+    random.shuffle(rows)
+    open("/lab/lost.csv", "w").write("email\n" + "".join('"%s"\n' % r for r in rows))
+    final = sorted(set(["user%d@example.com" % g for g in range(1, 101)] + new))
+    open(sys.argv[1] + "/count", "w").write(str(len(final)))
+    open(sys.argv[1] + "/md5", "w").write(hashlib.md5(",".join(final).encode()).hexdigest())
+    PY
+    chown -R "$(lab_user):" /lab
+  check: |
+    check_eq "a new signup is stored, trimmed and lower-cased" "$(pg_sql "begin; insert into signups(email) values ('  KL.Check@Example.COM '); select email from signups where email = 'kl.check@example.com'; rollback;" 2>/dev/null)" "kl.check@example.com"
+    check_eq "an UPDATE is normalised too" "$(pg_sql "begin; update signups set email = '  KL.Moved@Example.COM' where id = (select min(id) from signups); select email from signups where id = (select min(id) from signups); rollback;" 2>/dev/null)" "kl.moved@example.com"
+    check_eq "every lost signup is back, once" "$(pg_sql "select count(*) from signups")" "$(cat "$KL_STATE/count")"
+    check_eq "the stored addresses are exactly the expected ones" "$(pg_sql "select md5(string_agg(email, ',' order by email collate \"C\")) from signups")" "$(cat "$KL_STATE/md5")"
+  solve: |
+    docker exec -i kl-pg psql -h 127.0.0.1 -U lab -d lab -v ON_ERROR_STOP=1 -q <<'SQL'
+    CREATE OR REPLACE FUNCTION normalize_email() RETURNS trigger LANGUAGE plpgsql AS $$
+    BEGIN
+      NEW.email := lower(btrim(NEW.email));
+      RETURN NEW;
+    END $$;
+    DROP TRIGGER IF EXISTS signups_normalize ON signups;
+    CREATE TRIGGER signups_normalize BEFORE INSERT OR UPDATE ON signups
+      FOR EACH ROW EXECUTE FUNCTION normalize_email();
+    SQL
+    docker exec -i kl-pg psql -h 127.0.0.1 -U lab -d lab -v ON_ERROR_STOP=1 -q \
+      -c "CREATE TEMP TABLE lost(email text)" \
+      -c "\copy lost FROM pstdin WITH (FORMAT csv, HEADER true)" \
+      -c "INSERT INTO signups(email) SELECT email FROM lost ON CONFLICT (email) DO NOTHING" < /lab/lost.csv
+
+- id: data-081
+  title: Support may see the email, not the card
+  difficulty: 3
+  kind: build
+  tags: [postgres, security-definer, functions, search-path, grants, security]
+  tutorial: |
+    **Concept.** A **`SECURITY DEFINER`** function runs with the privileges of its
+    **owner**, so it can hand out one narrow capability ("this column of that row")
+    without granting the table. Two things make it safe:
+
+    - **`REVOKE EXECUTE ... FROM PUBLIC`**: by default everyone may call a new function.
+      Grant it only to the roles that need it.
+    - **A pinned `search_path`** (`SET search_path = public, pg_temp`). Otherwise
+      unqualified names resolve through the *caller's* path, which starts with their own
+      temporary schema, so a caller could create a temporary table with the same name
+      and make the function read their table, with the owner's rights.
+
+    **Read up on:**
+    - `CREATE FUNCTION ... SECURITY DEFINER SET search_path = ...`
+    - "Writing SECURITY DEFINER functions safely" in the PostgreSQL docs
+    - `REVOKE ... ON FUNCTION ... FROM PUBLIC`, `GRANT EXECUTE`
+  scenario: |
+    In **`kl-pg`**, the table **`customers`** (`id`, `name`, `email`, `card_number`) holds
+    card numbers, so the support team's role **`support`** (password **`supp0rt`**) has
+    no privilege on it. Support only needs a customer's email.
+
+    Create **`customer_email(customer_id integer) RETURNS text`** that returns that
+    customer's email, such that:
+
+    - `support` can call it (`SELECT customer_email(17)`), but still can't read `customers`
+    - no other role can call it, e.g. **`intern`** (password `int3rn`)
+    - it runs with its owner's privileges and has its **`search_path` pinned**, so a
+      temporary table named `customers` in the caller's session can't fool it
+  hints:
+    - "`LANGUAGE sql STABLE SECURITY DEFINER SET search_path = public, pg_temp AS $$ SELECT email FROM customers WHERE id = customer_id $$`."
+    - "`REVOKE EXECUTE ON FUNCTION customer_email(integer) FROM PUBLIC; GRANT EXECUTE ON FUNCTION customer_email(integer) TO support;`"
+    - "Test the trap as support: `CREATE TEMP TABLE customers(id int, email text); INSERT INTO customers VALUES (17, 'evil@example.com'); SELECT customer_email(17);`"
+  solution: |
+    ```sql
+    CREATE OR REPLACE FUNCTION customer_email(customer_id integer) RETURNS text
+    LANGUAGE sql STABLE SECURITY DEFINER SET search_path = public, pg_temp
+    AS $$ SELECT email FROM customers WHERE id = customer_id $$;
+
+    REVOKE EXECUTE ON FUNCTION customer_email(integer) FROM PUBLIC;
+    GRANT EXECUTE ON FUNCTION customer_email(integer) TO support;
+    ```
+  setup: |
+    pg_start
+    pg_sql "create table customers(id int primary key, name text not null, email text not null, card_number text not null);
+            insert into customers select g, 'name-' || g, 'c' || g || '.' || substr(md5(random()::text), 1, 6) || '@example.com', '4' || lpad((g * 7919)::text, 15, '0') from generate_series(1, 500) g;
+            create role support login password 'supp0rt';
+            create role intern login password 'int3rn';"
+  check: |
+    as_s() { docker exec -i -e PGPASSWORD=supp0rt kl-pg psql -h 127.0.0.1 -U support -d lab -v ON_ERROR_STOP=1 -qAt -c "$1" 2>/dev/null; }
+    as_i() { docker exec -i -e PGPASSWORD=int3rn kl-pg psql -h 127.0.0.1 -U intern -d lab -v ON_ERROR_STOP=1 -qAt -c "$1" 2>/dev/null; }
+    k=$((RANDOM % 500 + 1))
+    want=$(pg_sql "select email from customers where id = $k")
+    q_table="select card_number from customers limit 1"
+    q_call="select customer_email(1)"
+    check_eq "support gets customer $k's email" "$(as_s "select customer_email($k)")" "$want"
+    check_not "support still can't read the customers table" 'as_s "$q_table"'
+    check_not "intern can't call customer_email" 'as_i "$q_call"'
+    check_eq "customer_email runs with its owner's privileges" "$(pg_sql "select string_agg(prosecdef::text, ',') from pg_proc where proname = 'customer_email'")" true
+    check_match "customer_email pins its search_path" "$(pg_sql "select array_to_string(proconfig, ',') from pg_proc where proname = 'customer_email'")" 'search_path='
+    check_eq "a temporary table called customers can't fool it" "$(as_s "create temp table customers(id int, email text); insert into customers values ($k, 'evil@example.com'); select customer_email($k);")" "$want"
+  solve: |
+    docker exec -i kl-pg psql -h 127.0.0.1 -U lab -d lab -v ON_ERROR_STOP=1 -q <<'SQL'
+    CREATE OR REPLACE FUNCTION customer_email(customer_id integer) RETURNS text
+    LANGUAGE sql STABLE SECURITY DEFINER SET search_path = public, pg_temp
+    AS $$ SELECT email FROM customers WHERE id = customer_id $$;
+    REVOKE EXECUTE ON FUNCTION customer_email(integer) FROM PUBLIC;
+    GRANT EXECUTE ON FUNCTION customer_email(integer) TO support;
+    SQL
+
+- id: data-082
+  title: Reserve stock, or say exactly why not
+  difficulty: 3
+  kind: build
+  tags: [postgres, plpgsql, functions, raise, sqlstate, concurrency]
+  tutorial: |
+    **Concept.** A PL/pgSQL function can put a whole business operation behind one call,
+    and refuse it with a precise error. **`RAISE EXCEPTION 'message %', value USING
+    ERRCODE = '...'`** aborts the call with a SQLSTATE that applications can test (a
+    plain `RAISE EXCEPTION` uses `P0001`). The call is atomic: when it raises an error,
+    every change it made is undone.
+
+    For stock, decide and decrement in **one statement**: `UPDATE ... SET available =
+    available - qty WHERE sku = ... AND available >= qty`. If another session is
+    updating the same row, PostgreSQL waits for it and re-checks the condition on the
+    new value. Reading the stock first and writing it later loses updates under
+    concurrency. `FOUND` tells you whether the UPDATE matched a row.
+
+    **Read up on:**
+    - PL/pgSQL `RAISE ... USING ERRCODE`, the `FOUND` variable, `INSERT ... RETURNING ... INTO`
+    - PostgreSQL error codes: `invalid_parameter_value` (22023), `no_data_found` (P0002), `raise_exception` (P0001)
+  scenario: |
+    In **`kl-pg`**, the table **`stock`** (`sku`, `available`) holds what can still be sold
+    and **`reservations`** (`id`, `order_id`, `sku`, `qty`, `created_at`) what orders have
+    reserved. Create
+
+    **`reserve(p_order integer, p_sku text, p_qty integer) RETURNS integer`**
+
+    | situation | result |
+    |-----------|--------|
+    | `p_qty` is less than 1 | error with SQLSTATE **`22023`** |
+    | the SKU doesn't exist | error with SQLSTATE **`P0002`** |
+    | fewer than `p_qty` available | error with SQLSTATE **`P0001`** |
+    | otherwise | `available` drops by `p_qty`, a reservation row is added, its **`id`** is returned |
+
+    A refused call changes nothing. It must stay correct when **many sessions reserve the
+    same SKU at once**: never more reserved than was available.
+  hints:
+    - "Check `p_qty` first: `RAISE EXCEPTION '...' USING ERRCODE = 'invalid_parameter_value';`"
+    - "`UPDATE stock SET available = available - p_qty WHERE sku = p_sku AND available >= p_qty;` then `IF NOT FOUND THEN ...`."
+    - "Not found means either an unknown SKU (`NOT EXISTS (SELECT 1 FROM stock WHERE sku = p_sku)` → `no_data_found`) or not enough stock (plain `RAISE EXCEPTION`)."
+    - "`INSERT INTO reservations(order_id, sku, qty) VALUES (...) RETURNING id INTO rid; RETURN rid;`"
+  solution: |
+    ```sql
+    CREATE OR REPLACE FUNCTION reserve(p_order integer, p_sku text, p_qty integer) RETURNS integer
+    LANGUAGE plpgsql AS $$
+    DECLARE rid integer;
+    BEGIN
+      IF p_qty IS NULL OR p_qty < 1 THEN
+        RAISE EXCEPTION 'quantity must be at least 1, got %', p_qty USING ERRCODE = 'invalid_parameter_value';
+      END IF;
+      UPDATE stock SET available = available - p_qty WHERE sku = p_sku AND available >= p_qty;
+      IF NOT FOUND THEN
+        IF NOT EXISTS (SELECT 1 FROM stock WHERE sku = p_sku) THEN
+          RAISE EXCEPTION 'unknown sku %', p_sku USING ERRCODE = 'no_data_found';
+        END IF;
+        RAISE EXCEPTION 'not enough stock for %', p_sku;
+      END IF;
+      INSERT INTO reservations(order_id, sku, qty) VALUES (p_order, p_sku, p_qty) RETURNING id INTO rid;
+      RETURN rid;
+    END $$;
+    ```
+  setup: |
+    pg_start
+    pg_sql "create table stock(sku text primary key, available int not null check (available >= 0));
+            create table reservations(id serial primary key, order_id int not null, sku text not null references stock(sku), qty int not null, created_at timestamptz not null default now());
+            insert into stock select 'SKU-' || lpad(g::text, 3, '0'), (g * 13) % 40 from generate_series(1, 200) g;"
+  check: |
+    # try 'SQL' -> ok:<result> or the SQLSTATE of the error it raised
+    try() {
+      pg_sql 2>/dev/null <<SQL
+    create function pg_temp.kl_try(q text) returns text language plpgsql as \$kl\$
+    declare r text;
+    begin execute q into r; return 'ok:' || coalesce(r, ''); exception when others then return sqlstate; end \$kl\$;
+    select pg_temp.kl_try(\$q\$$1\$q\$);
+    SQL
+    }
+    pg_sql "delete from reservations where sku like 'KL-%'; insert into stock values ('KL-A', 10), ('KL-B', 2), ('KL-C', 5) on conflict (sku) do update set available = excluded.available" >/dev/null
+    r=$(try "select reserve(900001, 'KL-A', 3)")
+    check_match "reserve returns the reservation id" "$r" '^ok:[0-9]+$'
+    check_eq "it took 3 of KL-A" "$(pg_sql "select available from stock where sku = 'KL-A'")" 7
+    check_eq "the reservation row is there" "$(pg_sql "select string_agg(id || ':' || order_id || ':' || qty, ',') from reservations where sku = 'KL-A'")" "${r#ok:}:900001:3"
+    check_eq "a quantity of 0 is refused with 22023" "$(try "select reserve(900002, 'KL-A', 0)")" 22023
+    check_eq "an unknown SKU is refused with P0002" "$(try "select reserve(900002, 'KL-NOPE', 1)")" P0002
+    check_eq "too much is refused with P0001" "$(try "select reserve(900002, 'KL-B', 3)")" P0001
+    check_eq "refused calls changed nothing" "$(pg_sql "select (select available from stock where sku = 'KL-B') || ':' || (select count(*) from reservations where order_id = 900002)")" "2:0"
+    for i in $(seq 20); do pg_sql "select reserve(900003, 'KL-C', 1)" >/dev/null 2>&1 & done; wait
+    check_eq "20 sessions at once got exactly the 5 available" "$(pg_sql "select (select count(*) from reservations where order_id = 900003) || ':' || (select available from stock where sku = 'KL-C')")" "5:0"
+    pg_sql "delete from reservations where sku like 'KL-%'; delete from stock where sku like 'KL-%'" >/dev/null 2>&1
+  solve: |
+    docker exec -i kl-pg psql -h 127.0.0.1 -U lab -d lab -v ON_ERROR_STOP=1 -q <<'SQL'
+    CREATE OR REPLACE FUNCTION reserve(p_order integer, p_sku text, p_qty integer) RETURNS integer
+    LANGUAGE plpgsql AS $$
+    DECLARE rid integer;
+    BEGIN
+      IF p_qty IS NULL OR p_qty < 1 THEN
+        RAISE EXCEPTION 'quantity must be at least 1, got %', p_qty USING ERRCODE = 'invalid_parameter_value';
+      END IF;
+      UPDATE stock SET available = available - p_qty WHERE sku = p_sku AND available >= p_qty;
+      IF NOT FOUND THEN
+        IF NOT EXISTS (SELECT 1 FROM stock WHERE sku = p_sku) THEN
+          RAISE EXCEPTION 'unknown sku %', p_sku USING ERRCODE = 'no_data_found';
+        END IF;
+        RAISE EXCEPTION 'not enough stock for %', p_sku;
+      END IF;
+      INSERT INTO reservations(order_id, sku, qty) VALUES (p_order, p_sku, p_qty) RETURNING id INTO rid;
+      RETURN rid;
+    END $$;
+    SQL
+
+- id: data-083
+  title: The rate limiter that lets bursts through
+  difficulty: 3
+  kind: fix
+  tags: [redis, lua, eval, atomicity, rate-limiting, ttl]
+  tutorial: |
+    **Concept.** Each Redis command is atomic, but a *sequence* of commands sent by a
+    client isn't: between your `GET` and your `INCR`, a hundred other clients can run
+    theirs. A **Lua script** sent with **`EVAL`** runs on the server **as one atomic
+    step**, so no other command runs in the middle of it. Keys are passed in `KEYS[]`,
+    other values in `ARGV[]`, and the script calls Redis with `redis.call(...)`.
+
+    A fixed-window rate limiter is `INCR` plus an expiry on the counter. If the expiry is
+    set by a separate command, a crash or a lost race can leave a counter that **never
+    expires**, and that client stays blocked for good.
+
+    **Read up on:**
+    - `EVAL script numkeys key... arg...`, `KEYS`, `ARGV`, `redis.call`, `tonumber`
+    - `INCR`, `EXPIRE`, `TTL` (`-1` = no expiry, `-2` = no key)
+  scenario: |
+    Redis runs in **`kl-redis`**. Every request runs **`/lab/ratelimit.sh CLIENT`**, which
+    prints `allowed` or `denied`: at most **10 requests per client per 60 seconds**,
+    counted in the key **`rl:<client>`**. Two complaints:
+
+    - under load, far more than 10 requests per minute get through
+    - client **`mobile-app`** has been denied since yesterday: its counter has no expiry
+
+    1. Write **`/lab/ratelimit.lua`**, run as `EVAL <script> 1 <key> <limit>
+       <window-seconds>`, that atomically counts the request and returns **`1`** if it
+       is within the limit and **`0`** if it isn't. The counter must always end up with an
+       expiry of `window` seconds when it has none, including an old counter left
+       without one.
+    2. Make **`ratelimit.sh`** use it, with the same usage and output.
+    3. Unblock **`mobile-app`**.
+  hints:
+    - "Read `ratelimit.sh`: what happens when 30 copies run the `GET` at the same moment?"
+    - "In the script: `local n = redis.call('INCR', KEYS[1])`, then compare `n` with `tonumber(ARGV[1])`."
+    - "`if redis.call('TTL', KEYS[1]) < 0 then redis.call('EXPIRE', KEYS[1], ARGV[2]) end` repairs counters without an expiry."
+    - "In the shell: `docker exec kl-redis redis-cli EVAL \"$(cat /lab/ratelimit.lua)\" 1 \"rl:$1\" 10 60`. Then `DEL rl:mobile-app`."
+  solution: |
+    ```lua
+    -- /lab/ratelimit.lua
+    local n = redis.call('INCR', KEYS[1])
+    if redis.call('TTL', KEYS[1]) < 0 then
+      redis.call('EXPIRE', KEYS[1], ARGV[2])
+    end
+    if n > tonumber(ARGV[1]) then return 0 end
+    return 1
+    ```
+    ```sh
+    #!/bin/sh
+    # /lab/ratelimit.sh
+    r=$(docker exec kl-redis redis-cli EVAL "$(cat /lab/ratelimit.lua)" 1 "rl:$1" 10 60)
+    if [ "$r" = 1 ]; then echo allowed; else echo denied; fi
+    ```
+    ```bash
+    docker exec kl-redis redis-cli DEL rl:mobile-app
+    ```
+  setup: |
+    docker rm -f kl-redis >/dev/null 2>&1
+    docker run -d --name kl-redis redis:7.4-alpine >/dev/null
+    on_reset 'docker rm -f kl-redis >/dev/null 2>&1; true'
+    eventually 20 '[ "$(docker exec kl-redis redis-cli ping)" = PONG ]'
+    lab_file /lab/ratelimit.sh 0755 <<'EOF'
+    #!/bin/sh
+    # ratelimit.sh CLIENT -> prints "allowed" or "denied"
+    # at most 10 requests per client per 60 seconds, counted in rl:<client>
+    key="rl:$1"
+    n=$(docker exec kl-redis redis-cli GET "$key")
+    if [ "${n:-0}" -ge 10 ]; then echo denied; exit 0; fi
+    docker exec kl-redis redis-cli INCR "$key" >/dev/null
+    if [ -z "$n" ]; then docker exec kl-redis redis-cli EXPIRE "$key" 60 >/dev/null; fi
+    echo allowed
+    EOF
+    docker exec kl-redis redis-cli SET rl:mobile-app 57 >/dev/null
+    docker exec kl-redis redis-cli SET rl:web-1 3 EX 50 >/dev/null
+    docker exec kl-redis redis-cli SET rl:web-2 8 EX 20 >/dev/null
+  check: |
+    R() { docker exec kl-redis redis-cli "$@"; }
+    lua=$(cat /lab/ratelimit.lua 2>/dev/null)
+    ev() { R EVAL "$lua" 1 "$@" 2>&1; }
+    R DEL rl:kl-a rl:kl-b rl:kl-c rl:kl-d >/dev/null
+    check "/lab/ratelimit.lua exists" '[ -s /lab/ratelimit.lua ]'
+    check_eq "limit 3: five calls in a row return 1 1 1 0 0" "$(echo $(for i in 1 2 3 4 5; do ev rl:kl-a 3 30; done))" "1 1 1 0 0"
+    t=$(R TTL rl:kl-a)
+    check "the counter expires within its 30 s window" '[ "$t" -gt 0 ] && [ "$t" -le 30 ]'
+    R SET rl:kl-b 2 >/dev/null
+    ev rl:kl-b 10 60 >/dev/null
+    t=$(R TTL rl:kl-b)
+    check "an old counter without an expiry gets one" '[ "$t" -gt 0 ] && [ "$t" -le 60 ]'
+    d=$(mktemp -d)
+    for i in $(seq 30); do ( ev rl:kl-c 10 60 > "$d/lua$i" ) & done; wait
+    check_eq "30 calls at once: exactly 10 get 1" "$(cat "$d"/lua* | grep -cx 1)" 10
+    for i in $(seq 30); do ( timeout 30 sh /lab/ratelimit.sh kl-d > "$d/sh$i" 2>/dev/null ) & done; wait
+    check_eq "30 requests at once through ratelimit.sh: exactly 10 allowed" "$(cat "$d"/sh* | grep -cx allowed)" 10
+    check_eq "... and 20 denied" "$(cat "$d"/sh* | grep -cx denied)" 20
+    rm -rf "$d"
+    m=$(R GET rl:mobile-app); mt=$(R TTL rl:mobile-app)
+    check "mobile-app is no longer locked out" '[ "${m:-0}" -lt 10 ] && [ "$mt" != -1 ]'
+    R DEL rl:kl-a rl:kl-b rl:kl-c rl:kl-d >/dev/null
+  solve: |
+    cat > /lab/ratelimit.lua <<'LUA'
+    local n = redis.call('INCR', KEYS[1])
+    if redis.call('TTL', KEYS[1]) < 0 then
+      redis.call('EXPIRE', KEYS[1], ARGV[2])
+    end
+    if n > tonumber(ARGV[1]) then return 0 end
+    return 1
+    LUA
+    cat > /lab/ratelimit.sh <<'EOF'
+    #!/bin/sh
+    # ratelimit.sh CLIENT -> prints "allowed" or "denied"
+    # at most 10 requests per client per 60 seconds, counted in rl:<client>
+    r=$(docker exec kl-redis redis-cli EVAL "$(cat /lab/ratelimit.lua)" 1 "rl:$1" 10 60)
+    if [ "$r" = 1 ]; then echo allowed; else echo denied; fi
+    EOF
+    docker exec kl-redis redis-cli DEL rl:mobile-app >/dev/null
+
+- id: data-084
+  title: The lock that anyone can release
+  difficulty: 3
+  kind: fix
+  tags: [redis, lua, distributed-lock, set-nx, atomicity]
+  tutorial: |
+    **Concept.** A simple Redis lock is a key that only one client can create:
+    **`SET lock:name <token> NX PX <ms>`** sets the key only if it doesn't exist, and gives
+    it an expiry in the same command, so a crashed holder can't keep the lock forever. The
+    **token** is a random value only the holder knows.
+
+    Releasing has to check ownership. If the holder was slow, its lock may have expired
+    and been taken by someone else, and a plain `DEL` would delete *their* lock. The check
+    ("is the value still my token?") and the delete must happen **atomically**, which
+    means in a Lua script.
+
+    **Read up on:**
+    - `SET ... NX PX`, and why `SETNX` + `EXPIRE` is not the same
+    - The "correct implementation with a single instance" section of the Redis distributed locks page
+    - `EVAL`, `redis.call('GET', ...)`, `redis.call('DEL', ...)`
+  scenario: |
+    The nightly report jobs serialise on Redis locks in **`kl-redis`** through
+    **`/lab/lock.sh`**:
+
+    ```
+    lock.sh acquire NAME TOKEN TTL_MS   -> prints "acquired" or "busy"
+    lock.sh release NAME TOKEN          -> prints "released" or "not-owner"
+    ```
+
+    Last night job A's lock expired while it was still running, job B took it, then A
+    finished and deleted B's lock, and job C started too. Fix it:
+
+    1. Write **`/lab/unlock.lua`**, run as `EVAL <script> 1 lock:<name> <token>`, that
+       deletes the key **only if it holds that token** and returns **`1`** if it deleted
+       it, **`0`** otherwise.
+    2. **`lock.sh release`** uses it and prints `not-owner` when the token doesn't match.
+    3. **`lock.sh acquire`** sets the lock and its expiry in **one command**, so no
+       moment exists where the lock has no expiry (no `SETNX` followed by
+       `PEXPIRE`/`EXPIRE`).
+  hints:
+    - "`SET \"lock:$2\" \"$3\" NX PX \"$4\"` replies `OK` when it took the lock, and nothing when the key already exists."
+    - "`if redis.call('GET', KEYS[1]) == ARGV[1] then return redis.call('DEL', KEYS[1]) end return 0`."
+    - "`docker exec kl-redis redis-cli EVAL \"$(cat /lab/unlock.lua)\" 1 \"lock:$2\" \"$3\"`."
+  solution: |
+    ```lua
+    -- /lab/unlock.lua
+    if redis.call('GET', KEYS[1]) == ARGV[1] then
+      return redis.call('DEL', KEYS[1])
+    end
+    return 0
+    ```
+    ```sh
+    #!/bin/sh
+    # /lab/lock.sh
+    r() { docker exec kl-redis redis-cli "$@"; }
+    case "$1" in
+      acquire) if [ "$(r SET "lock:$2" "$3" NX PX "$4")" = OK ]; then echo acquired; else echo busy; fi ;;
+      release) if [ "$(r EVAL "$(cat /lab/unlock.lua)" 1 "lock:$2" "$3")" = 1 ]; then echo released; else echo not-owner; fi ;;
+    esac
+    ```
+  setup: |
+    docker rm -f kl-redis >/dev/null 2>&1
+    docker run -d --name kl-redis redis:7.4-alpine >/dev/null
+    on_reset 'docker rm -f kl-redis >/dev/null 2>&1; true'
+    eventually 20 '[ "$(docker exec kl-redis redis-cli ping)" = PONG ]'
+    lab_file /lab/lock.sh 0755 <<'EOF'
+    #!/bin/sh
+    # lock.sh acquire NAME TOKEN TTL_MS   -> prints "acquired" or "busy"
+    # lock.sh release NAME TOKEN          -> prints "released" or "not-owner"
+    r() { docker exec kl-redis redis-cli "$@"; }
+    case "$1" in
+      acquire)
+        if [ "$(r SETNX "lock:$2" "$3")" = 1 ]; then
+          r PEXPIRE "lock:$2" "$4" >/dev/null
+          echo acquired
+        else
+          echo busy
+        fi ;;
+      release)
+        r DEL "lock:$2" >/dev/null
+        echo released ;;
+    esac
+    EOF
+    docker exec kl-redis redis-cli SET lock:report:daily job-b-7f3a PX 600000 >/dev/null
+  check: |
+    R() { docker exec kl-redis redis-cli "$@"; }
+    L() { timeout 15 sh /lab/lock.sh "$@" 2>/dev/null; }
+    R DEL lock:kl-x lock:kl-y >/dev/null
+    check "/lab/unlock.lua exists" '[ -s /lab/unlock.lua ]'
+    R CONFIG RESETSTAT >/dev/null
+    check_eq "acquire a free lock" "$(L acquire kl-x tok-1 20000)" acquired
+    st=$(R INFO commandstats)
+    check_not "acquire doesn't use SETNX, EXPIRE or PEXPIRE" 'grep -Eq "^cmdstat_(setnx|expire|pexpire):" <<<"$st"'
+    check_eq "the lock holds the owner's token" "$(R GET lock:kl-x)" tok-1
+    p=$(R PTTL lock:kl-x)
+    check "it expires within 20 s" '[ "$p" -gt 0 ] && [ "$p" -le 20000 ]'
+    check_eq "a second acquire is refused" "$(L acquire kl-x tok-2 20000)" busy
+    check_eq "the lock still belongs to tok-1" "$(R GET lock:kl-x)" tok-1
+    check_eq "another token can't release it" "$(L release kl-x tok-2)" not-owner
+    check_eq "it is still held" "$(R GET lock:kl-x)" tok-1
+    check_eq "the owner releases it" "$(L release kl-x tok-1)" released
+    check_eq "the lock is gone" "$(R EXISTS lock:kl-x)" 0
+    R SET lock:kl-y other PX 20000 >/dev/null
+    check_eq "unlock.lua returns 0 for a wrong token" "$(R EVAL "$(cat /lab/unlock.lua 2>/dev/null)" 1 lock:kl-y mine 2>&1)" 0
+    check_eq "unlock.lua returns 1 for the right token" "$(R EVAL "$(cat /lab/unlock.lua 2>/dev/null)" 1 lock:kl-y other 2>&1)" 1
+    R DEL lock:kl-x lock:kl-y >/dev/null
+  solve: |
+    cat > /lab/unlock.lua <<'LUA'
+    if redis.call('GET', KEYS[1]) == ARGV[1] then
+      return redis.call('DEL', KEYS[1])
+    end
+    return 0
+    LUA
+    cat > /lab/lock.sh <<'EOF'
+    #!/bin/sh
+    # lock.sh acquire NAME TOKEN TTL_MS   -> prints "acquired" or "busy"
+    # lock.sh release NAME TOKEN          -> prints "released" or "not-owner"
+    r() { docker exec kl-redis redis-cli "$@"; }
+    case "$1" in
+      acquire) if [ "$(r SET "lock:$2" "$3" NX PX "$4")" = OK ]; then echo acquired; else echo busy; fi ;;
+      release) if [ "$(r EVAL "$(cat /lab/unlock.lua)" 1 "lock:$2" "$3")" = 1 ]; then echo released; else echo not-owner; fi ;;
+    esac
+    EOF
+
+- id: data-085
+  title: The checkout script that half-applied the order
+  difficulty: 4
+  kind: fix
+  tags: [redis, lua, atomicity, validation, no-rollback, data-repair]
+  tutorial: |
+    **Concept.** A Redis Lua script is **atomic** (nothing else runs while it runs), but it
+    has **no rollback**. When a script returns an error halfway, every write it already
+    made stays. The same is true of `MULTI`/`EXEC`: a command that fails at run time
+    doesn't undo the others. A script that may refuse must therefore **check everything
+    first, then write**.
+
+    Mind two Redis details: `HINCRBY` on a missing field **creates** it, and a missing
+    value comes back to Lua as `false`.
+
+    **Read up on:**
+    - Scripting with Lua: atomicity, errors, `redis.error_reply`
+    - Redis transactions: "Errors inside a transaction" and why there are no rollbacks
+    - `HGET`, `HINCRBY`, `HDEL`, `RPUSH`
+  scenario: |
+    In **`kl-redis`**, the hash **`stock`** maps SKU → quantity, and the list **`orders`**
+    holds the ids of the orders that went through. Checkout runs **`/lab/checkout.lua`**:
+
+    `EVAL <script> 2 <stock-key> <orders-key> <order_id> <sku> <qty> [<sku> <qty> ...]`
+
+    Customers whose checkout failed were still charged stock: some SKUs went negative,
+    and unknown SKUs appeared in the hash.
+
+    1. Rewrite **`checkout.lua`** so that a cart that can't be served **in full**
+       changes **nothing** and returns the error **`out of stock: <sku>`** (the first
+       SKU that falls short; an unknown SKU is out of stock too and must not be created).
+       A cart that can be served takes every item and `RPUSH`es the order id, then returns
+       **`OK`**. A SKU appears at most once per cart.
+    2. Repair **`stock`**. The failed checkouts are in **`/lab/failed.log`**. The old
+       script stopped at the first SKU that went below zero: every item **before it, and
+       that SKU itself**, was taken. Give those back, and remove every field that isn't a
+       SKU listed in **`/lab/catalog.txt`**. The successful orders stay as they are.
+  hints:
+    - "Read the old script: it writes with `HINCRBY` and only then looks at the result."
+    - "First loop: `local have = redis.call('HGET', KEYS[1], ARGV[i])`. If `not have or tonumber(have) < tonumber(ARGV[i + 1])`, return `redis.error_reply('out of stock: ' .. ARGV[i])`. Second loop: the `HINCRBY`s, then the `RPUSH`."
+    - "For each line in failed.log, `HINCRBY stock <sku> <qty>` for the items up to and including the one named after `out of stock:`."
+    - "`HKEYS stock`, then `HDEL` every field that isn't in catalog.txt."
+  solution: |
+    ```lua
+    -- /lab/checkout.lua
+    for i = 2, #ARGV, 2 do
+      local have = redis.call('HGET', KEYS[1], ARGV[i])
+      if not have or tonumber(have) < tonumber(ARGV[i + 1]) then
+        return redis.error_reply('out of stock: ' .. ARGV[i])
+      end
+    end
+    for i = 2, #ARGV, 2 do
+      redis.call('HINCRBY', KEYS[1], ARGV[i], -tonumber(ARGV[i + 1]))
+    end
+    redis.call('RPUSH', KEYS[2], ARGV[1])
+    return 'OK'
+    ```
+    ```bash
+    # give back what each failed checkout took, up to and including the failing SKU
+    while read -r line; do
+      fail=${line##*out of stock: }
+      set -- $(echo "$line" | sed 's/^order [0-9]*: //; s/ -> .*//')
+      while [ $# -ge 2 ]; do
+        docker exec kl-redis redis-cli HINCRBY stock "$1" "$2"
+        [ "$1" = "$fail" ] && break
+        shift 2
+      done
+    done < /lab/failed.log
+    # drop the fields the old script created for unknown SKUs
+    for f in $(docker exec kl-redis redis-cli HKEYS stock); do
+      grep -qx "$f" /lab/catalog.txt || docker exec kl-redis redis-cli HDEL stock "$f"
+    done
+    ```
+  setup: |
+    docker rm -f kl-redis >/dev/null 2>&1
+    docker run -d --name kl-redis redis:7.4-alpine >/dev/null
+    on_reset 'docker rm -f kl-redis >/dev/null 2>&1; true'
+    eventually 20 '[ "$(docker exec kl-redis redis-cli ping)" = PONG ]'
+    lab_file /lab/checkout.lua <<'EOF'
+    -- KEYS[1] = stock hash, KEYS[2] = orders list
+    -- ARGV = order_id, sku1, qty1, sku2, qty2, ...
+    for i = 2, #ARGV, 2 do
+      local left = redis.call('HINCRBY', KEYS[1], ARGV[i], -tonumber(ARGV[i + 1]))
+      if left < 0 then
+        return redis.error_reply('out of stock: ' .. ARGV[i])
+      end
+    end
+    redis.call('RPUSH', KEYS[2], ARGV[1])
+    return 'OK'
+    EOF
+    python3 - "$KL_STATE" > /tmp/kl-checkout.txt <<'PY'
+    import random, sys
+    skus = ["sku-%02d" % i for i in range(1, 21)]
+    while True:
+        initial = {s: random.randint(0, 12) for s in skus}
+        buggy, orders, failed, oid = dict(initial), [], [], 1000
+        for _ in range(40):
+            oid += 1
+            items = random.sample(skus, random.randint(1, 4))
+            if random.random() < 0.15:
+                items[-1] = random.choice(["sku-99", "sku-77", "gift-card"])
+            cart = [(s, random.randint(1, 4)) for s in items]
+            fail = None
+            for s, q in cart:
+                buggy[s] = buggy.get(s, 0) - q
+                if buggy[s] < 0:
+                    fail = s
+                    break
+            (failed.append((oid, cart, fail)) if fail else orders.append((oid, cart)))
+        unknown = [f for f in buggy if f not in initial]
+        if len(failed) >= 4 and len(orders) >= 5 and unknown and any(c[0][0] != f for _, c, f in failed):
+            break
+    expected = dict(initial)
+    for _, cart in orders:
+        for s, q in cart:
+            expected[s] -= q
+    st = sys.argv[1]
+    open(st + "/expected", "w").write("".join("%s\t%d\n" % (s, expected[s]) for s in sorted(expected)))
+    open(st + "/orders", "w").write("".join("%d\n" % o for o, _ in orders))
+    open("/lab/catalog.txt", "w").write("".join(s + "\n" for s in skus))
+    open("/lab/failed.log", "w").write("".join(
+        "order %d: %s -> out of stock: %s\n" % (o, " ".join("%s %d" % it for it in c), f) for o, c, f in failed))
+    print("HSET stock " + " ".join("%s %d" % kv for kv in buggy.items()))
+    print("RPUSH orders " + " ".join(str(o) for o, _ in orders))
+    PY
+    docker exec -i kl-redis redis-cli < /tmp/kl-checkout.txt >/dev/null; rm -f /tmp/kl-checkout.txt
+    chown -R "$(lab_user):" /lab
+  check: |
+    R() { docker exec kl-redis redis-cli "$@"; }
+    got=$(R HGETALL stock | paste - - | LC_ALL=C sort)
+    check "stock is back to what the successful orders left" '[ "$got" = "$(cat "$KL_STATE/expected")" ]'
+    check_eq "the successful orders are untouched" "$(R LRANGE orders 0 -1 | paste -sd' ')" "$(paste -sd' ' "$KL_STATE/orders")"
+    lua=$(cat /lab/checkout.lua 2>/dev/null)
+    co() { R EVAL "$lua" 2 kl:t:stock kl:t:orders "$@" 2>&1; }
+    R DEL kl:t:stock kl:t:orders >/dev/null
+    R HSET kl:t:stock a 5 b 2 c 0 >/dev/null
+    check_match "a cart that can't be served fails with 'out of stock: b'" "$(co o1 a 2 b 3)" 'out of stock: b'
+    check_eq "... and changes nothing" "$(R HGETALL kl:t:stock | paste -sd' ')" "a 5 b 2 c 0"
+    check_match "an unknown SKU is out of stock" "$(co o2 a 1 zz 1)" 'out of stock: zz'
+    check_eq "... and isn't created" "$(R HEXISTS kl:t:stock zz):$(R HGET kl:t:stock a)" "0:5"
+    check_match "a SKU with 0 left is out of stock" "$(co o3 c 1)" 'out of stock: c'
+    check_eq "a cart that can be served returns OK" "$(co o4 a 2 b 2)" OK
+    check_eq "... takes every item" "$(R HGETALL kl:t:stock | paste -sd' ')" "a 3 b 0 c 0"
+    check_eq "... and only that order is recorded" "$(R LRANGE kl:t:orders 0 -1 | paste -sd' ')" o4
+    R DEL kl:t:stock kl:t:orders >/dev/null
+  solve: |
+    cat > /lab/checkout.lua <<'LUA'
+    -- KEYS[1] = stock hash, KEYS[2] = orders list
+    -- ARGV = order_id, sku1, qty1, sku2, qty2, ...
+    for i = 2, #ARGV, 2 do
+      local have = redis.call('HGET', KEYS[1], ARGV[i])
+      if not have or tonumber(have) < tonumber(ARGV[i + 1]) then
+        return redis.error_reply('out of stock: ' .. ARGV[i])
+      end
+    end
+    for i = 2, #ARGV, 2 do
+      redis.call('HINCRBY', KEYS[1], ARGV[i], -tonumber(ARGV[i + 1]))
+    end
+    redis.call('RPUSH', KEYS[2], ARGV[1])
+    return 'OK'
+    LUA
+    # the repair adds stock back, so it must run only once
+    if [ ! -e /lab/.stock-repaired ]; then
+      while read -r line; do
+        fail=${line##*out of stock: }
+        set -- $(echo "$line" | sed 's/^order [0-9]*: //; s/ -> .*//')
+        while [ $# -ge 2 ]; do
+          docker exec kl-redis redis-cli HINCRBY stock "$1" "$2" >/dev/null
+          [ "$1" = "$fail" ] && break
+          shift 2
+        done
+      done < /lab/failed.log
+      touch /lab/.stock-repaired
+    fi
+    for f in $(docker exec kl-redis redis-cli HKEYS stock); do
+      grep -qx "$f" /lab/catalog.txt || docker exec kl-redis redis-cli HDEL stock "$f" >/dev/null
+    done
+
+- id: data-086
+  title: Scripts that survive a restart
+  difficulty: 4
+  kind: build
+  tags: [redis, functions, function-load, fcall, fcall-ro, replica, lua]
+  tutorial: |
+    **Concept.** Scripts loaded with `SCRIPT LOAD` and run with `EVALSHA` live only in the
+    server's **script cache**. A restart or a failover empties it, and every call fails
+    with `NOSCRIPT`. **Redis Functions** (Redis 7+) are part of the data instead: a
+    **library** loaded with `FUNCTION LOAD` is saved in the RDB/AOF and replicated to
+    replicas, and you call its functions by name with **`FCALL name numkeys key... arg...`**.
+
+    A library is Lua code that starts with `#!lua name=<library>` and calls
+    `redis.register_function`. A function registered with the flag **`no-writes`** may
+    run through **`FCALL_RO`** and on read-only replicas. A function without that flag is
+    refused there.
+
+    **Read up on:**
+    - Redis Functions: `FUNCTION LOAD [REPLACE]`, `FUNCTION LIST`, `FCALL`, `FCALL_RO`
+    - `redis.register_function{function_name=..., callback=..., flags={'no-writes'}}`
+    - `redis-cli -x` (read the last argument from stdin)
+  scenario: |
+    The quota service uses Redis in **`kl-redis`** (primary) with a read-only replica
+    **`kl-redis-ro`**. Each tenant has a hash **`quota:<tenant>`** with `limit` and
+    `used`. **`/lab/app.sh`** runs two scripts (their source is in **`/lab/scripts/`**)
+    with `EVALSHA`. Since last night's restart, every call fails with `NOSCRIPT`.
+
+    Turn the scripts into a **function library named `quota`**, in **`/lab/quota.lua`**,
+    loaded into `kl-redis`:
+
+    - **`quota_use`** (1 key, 1 argument `amount`): if `used + amount <= limit`, add
+      `amount` to `used` and return what is left (`limit - used`). Otherwise change
+      nothing and return the error **`quota exceeded`**. A tenant without a `limit` is
+      always exceeded, and no key may be created for it.
+    - **`quota_left`** (1 key): return `limit - used` (a missing `used` counts as 0).
+      Flag it **`no-writes`**.
+
+    Then make **`app.sh`** keep its usage and output (`app.sh use TENANT AMOUNT`,
+    `app.sh left TENANT`), with **`use`** calling `FCALL` on **`kl-redis`** and **`left`**
+    calling `FCALL_RO` on the replica **`kl-redis-ro`**. It must keep working after
+    `docker restart kl-redis`.
+  hints:
+    - "`#!lua name=quota` on the first line, then `redis.register_function('quota_use', function(keys, args) ... end)`. Inside a function, use `keys[1]` and `args[1]`, not `KEYS`/`ARGV`."
+    - "`redis.register_function{function_name='quota_left', callback=function(keys, args) ... end, flags={'no-writes'}}`."
+    - "Load it with `docker exec -i kl-redis redis-cli -x FUNCTION LOAD REPLACE < /lab/quota.lua`. The replica gets it automatically."
+    - "In app.sh: `docker exec kl-redis redis-cli FCALL quota_use 1 \"quota:$2\" \"$3\"` and `docker exec kl-redis-ro redis-cli FCALL_RO quota_left 1 \"quota:$2\"`."
+  solution: |
+    ```lua
+    #!lua name=quota
+    -- /lab/quota.lua
+    redis.register_function('quota_use', function(keys, args)
+      local limit = tonumber(redis.call('HGET', keys[1], 'limit'))
+      local used = tonumber(redis.call('HGET', keys[1], 'used') or '0')
+      local n = tonumber(args[1])
+      if not limit or used + n > limit then
+        return redis.error_reply('quota exceeded')
+      end
+      return limit - redis.call('HINCRBY', keys[1], 'used', n)
+    end)
+
+    redis.register_function{
+      function_name = 'quota_left',
+      callback = function(keys, args)
+        local limit = tonumber(redis.call('HGET', keys[1], 'limit') or '0')
+        local used = tonumber(redis.call('HGET', keys[1], 'used') or '0')
+        return limit - used
+      end,
+      flags = {'no-writes'},
+    }
+    ```
+    ```bash
+    docker exec -i kl-redis redis-cli -x FUNCTION LOAD REPLACE < /lab/quota.lua
+    ```
+    ```sh
+    #!/bin/sh
+    # /lab/app.sh
+    case "$1" in
+      use)  docker exec kl-redis redis-cli FCALL quota_use 1 "quota:$2" "$3" ;;
+      left) docker exec kl-redis-ro redis-cli FCALL_RO quota_left 1 "quota:$2" ;;
+    esac
+    ```
+  setup: |
+    docker rm -f kl-redis kl-redis-ro >/dev/null 2>&1
+    docker network rm kl-redis-net >/dev/null 2>&1
+    docker network create kl-redis-net >/dev/null
+    docker run -d --name kl-redis --network kl-redis-net redis:7.4-alpine >/dev/null
+    docker run -d --name kl-redis-ro --network kl-redis-net redis:7.4-alpine redis-server --replicaof kl-redis 6379 >/dev/null
+    on_reset 'docker rm -f kl-redis kl-redis-ro >/dev/null 2>&1; docker network rm kl-redis-net >/dev/null 2>&1; true'
+    eventually 20 '[ "$(docker exec kl-redis redis-cli ping)" = PONG ]'
+    eventually 30 'docker exec kl-redis-ro redis-cli INFO replication | grep -q "master_link_status:up"'
+    docker exec kl-redis redis-cli HSET quota:acme limit 1000 used 400 >/dev/null
+    docker exec kl-redis redis-cli HSET quota:globex limit 50 used 50 >/dev/null
+    docker exec kl-redis redis-cli HSET quota:initech limit 200 >/dev/null
+    lab_file /lab/scripts/quota_use.lua <<'EOF'
+    -- EVALSHA <sha> 1 quota:<tenant> <amount>
+    local limit = tonumber(redis.call('HGET', KEYS[1], 'limit'))
+    local used = tonumber(redis.call('HGET', KEYS[1], 'used') or '0')
+    local n = tonumber(ARGV[1])
+    if not limit or used + n > limit then
+      return redis.error_reply('quota exceeded')
+    end
+    return limit - redis.call('HINCRBY', KEYS[1], 'used', n)
+    EOF
+    lab_file /lab/scripts/quota_left.lua <<'EOF'
+    -- EVALSHA <sha> 1 quota:<tenant>
+    local limit = tonumber(redis.call('HGET', KEYS[1], 'limit') or '0')
+    local used = tonumber(redis.call('HGET', KEYS[1], 'used') or '0')
+    return limit - used
+    EOF
+    use=$(docker exec kl-redis redis-cli SCRIPT LOAD "$(cat /lab/scripts/quota_use.lua)")
+    left=$(docker exec kl-redis redis-cli SCRIPT LOAD "$(cat /lab/scripts/quota_left.lua)")
+    lab_file /lab/app.sh 0755 <<EOF
+    #!/bin/sh
+    # app.sh use TENANT AMOUNT -> the quota left, or an error
+    # app.sh left TENANT       -> the quota left
+    # The scripts were loaded with SCRIPT LOAD when the app was deployed.
+    case "\$1" in
+      use)  docker exec kl-redis redis-cli EVALSHA $use 1 "quota:\$2" "\$3" ;;
+      left) docker exec kl-redis redis-cli EVALSHA $left 1 "quota:\$2" ;;
+    esac
+    EOF
+    docker restart kl-redis >/dev/null
+    eventually 20 '[ "$(docker exec kl-redis redis-cli ping)" = PONG ]'
+    eventually 30 'docker exec kl-redis-ro redis-cli INFO replication | grep -q "master_link_status:up"'
+  check: |
+    R() { docker exec kl-redis redis-cli "$@"; }
+    ro_left() { docker exec kl-redis-ro redis-cli FCALL_RO quota_left 1 "quota:$1" 2>&1; }
+    app_left() { timeout 15 sh /lab/app.sh left "$1" 2>&1; }
+    check_match "library quota is loaded" "$(R FUNCTION LIST LIBRARYNAME quota 2>&1 | paste -sd' ')" 'quota_use.*quota_left|quota_left.*quota_use'
+    R DEL quota:kl-t quota:kl-none >/dev/null
+    R HSET quota:kl-t limit 10 used 0 >/dev/null
+    check_eq "quota_use 4 leaves 6" "$(R FCALL quota_use 1 quota:kl-t 4 2>&1)" 6
+    check_eq "quota_use 4 again leaves 2" "$(R FCALL quota_use 1 quota:kl-t 4 2>&1)" 2
+    check_match "a third quota_use 4 is refused" "$(R FCALL quota_use 1 quota:kl-t 4 2>&1)" 'quota exceeded'
+    check_eq "... and used stays at 8" "$(R HGET quota:kl-t used)" 8
+    check_eq "quota_left works through FCALL_RO" "$(R FCALL_RO quota_left 1 quota:kl-t 2>&1)" 2
+    check_match "a tenant without a limit is refused" "$(R FCALL quota_use 1 quota:kl-none 1 2>&1)" 'quota exceeded'
+    check_eq "... and no key is created for it" "$(R EXISTS quota:kl-none)" 0
+    check "quota_left runs on the replica" 'eventually 10 "[ \"\$(ro_left kl-t)\" = 2 ]"'
+    timeout 60 docker restart kl-redis >/dev/null 2>&1
+    eventually 30 '[ "$(docker exec kl-redis redis-cli ping)" = PONG ]'
+    eventually 30 'docker exec kl-redis-ro redis-cli INFO replication | grep -q "master_link_status:up"'
+    check_match "the library is still there after a restart" "$(R FUNCTION LIST LIBRARYNAME quota 2>&1 | paste -sd' ')" 'quota_left'
+    check "app.sh left kl-t answers 2 after the restart" 'eventually 10 "[ \"\$(app_left kl-t)\" = 2 ]"'
+    check_eq "app.sh use kl-t 1 answers 1 after the restart" "$(timeout 15 sh /lab/app.sh use kl-t 1 2>&1)" 1
+    check "app.sh left reads from the replica" 'eventually 10 "[ \"\$(app_left kl-t)\" = 1 ]" && grep -q "kl-redis-ro" /lab/app.sh'
+    check_eq "the tenants' data survived" "$(R HGET quota:acme limit)" 1000
+    R DEL quota:kl-t >/dev/null
+  solve: |
+    cat > /lab/quota.lua <<'LUA'
+    #!lua name=quota
+    redis.register_function('quota_use', function(keys, args)
+      local limit = tonumber(redis.call('HGET', keys[1], 'limit'))
+      local used = tonumber(redis.call('HGET', keys[1], 'used') or '0')
+      local n = tonumber(args[1])
+      if not limit or used + n > limit then
+        return redis.error_reply('quota exceeded')
+      end
+      return limit - redis.call('HINCRBY', keys[1], 'used', n)
+    end)
+
+    redis.register_function{
+      function_name = 'quota_left',
+      callback = function(keys, args)
+        local limit = tonumber(redis.call('HGET', keys[1], 'limit') or '0')
+        local used = tonumber(redis.call('HGET', keys[1], 'used') or '0')
+        return limit - used
+      end,
+      flags = {'no-writes'},
+    }
+    LUA
+    docker exec -i kl-redis redis-cli -x FUNCTION LOAD REPLACE < /lab/quota.lua >/dev/null
+    cat > /lab/app.sh <<'EOF'
+    #!/bin/sh
+    # app.sh use TENANT AMOUNT -> the quota left, or an error
+    # app.sh left TENANT       -> the quota left
+    case "$1" in
+      use)  docker exec kl-redis redis-cli FCALL quota_use 1 "quota:$2" "$3" ;;
+      left) docker exec kl-redis-ro redis-cli FCALL_RO quota_left 1 "quota:$2" ;;
+    esac
+    EOF
+
+- id: data-087
+  title: Archive in batches, commit as you go
+  difficulty: 4
+  kind: build
+  tags: [postgres, procedure, plpgsql, transaction-control, batching]
+  tutorial: |
+    **Concept.** A **function** always runs inside the caller's transaction. A
+    **procedure** (`CREATE PROCEDURE`, run with `CALL`) may **`COMMIT`** in the middle of
+    its work. That's what long maintenance jobs need: moving millions of rows in one
+    transaction holds locks for the whole time, bloats the table and keeps replicas
+    replaying one huge transaction. Moving them a batch at a time, with a commit after
+    each batch, keeps every transaction short.
+
+    A batch can be moved in one statement: `WITH moved AS (DELETE ... RETURNING *) INSERT
+    INTO archive SELECT * FROM moved`. `GET DIAGNOSTICS n = ROW_COUNT` tells you how many
+    rows the last statement moved. A procedure can only commit when `CALL` isn't inside
+    an explicit transaction block.
+
+    **Read up on:**
+    - `CREATE PROCEDURE`, `CALL`, transaction management in PL/pgSQL
+    - Data-modifying statements in `WITH`
+    - `GET DIAGNOSTICS ... = ROW_COUNT`, `LOOP ... EXIT WHEN`
+  scenario: |
+    In **`kl-pg`**, **`events`** (`id`, `at` timestamptz, `payload`) has grown huge, and
+    **`events_archive`** has the same columns. Create the procedure
+
+    **`archive_events(cutoff timestamptz, batch_size integer)`**
+
+    that moves every row with **`at < cutoff`** from `events` to `events_archive`
+    (same `id`, `at`, `payload`), at most **`batch_size` rows per transaction**,
+    **committing after each batch**.
+
+    Then archive everything before **2026-01-01** with batches of **2000**.
+  hints:
+    - "`CREATE OR REPLACE PROCEDURE archive_events(cutoff timestamptz, batch_size integer) LANGUAGE plpgsql AS $$ ... $$;`"
+    - "One batch: `WITH moved AS (DELETE FROM events WHERE id IN (SELECT id FROM events WHERE at < cutoff ORDER BY id LIMIT batch_size) RETURNING *) INSERT INTO events_archive SELECT * FROM moved;`"
+    - "Wrap it in `LOOP`, read `GET DIAGNOSTICS n = ROW_COUNT`, `EXIT WHEN n = 0`, then `COMMIT`."
+    - "Run `CALL archive_events('2026-01-01', 2000);` on its own, not inside `BEGIN ... COMMIT`."
+  solution: |
+    ```sql
+    CREATE OR REPLACE PROCEDURE archive_events(cutoff timestamptz, batch_size integer)
+    LANGUAGE plpgsql AS $$
+    DECLARE moved integer;
+    BEGIN
+      LOOP
+        WITH batch AS (
+          DELETE FROM events
+          WHERE id IN (SELECT id FROM events WHERE at < cutoff ORDER BY id LIMIT batch_size)
+          RETURNING *
+        )
+        INSERT INTO events_archive SELECT * FROM batch;
+        GET DIAGNOSTICS moved = ROW_COUNT;
+        EXIT WHEN moved = 0;
+        COMMIT;
+      END LOOP;
+    END $$;
+
+    CALL archive_events('2026-01-01', 2000);
+    ```
+  setup: |
+    pg_start
+    pg_sql "create table events(id bigserial primary key, at timestamptz not null, payload text not null);
+            insert into events(at, payload) select timestamptz '2025-07-01 00:00+00' + g * interval '13 minutes', 'event-' || g from generate_series(1, 30000) g;
+            create index events_at on events(at);
+            create table events_archive (like events including all);"
+    pg_sql "select md5(string_agg(id::text, ',' order by id)) from events where at < '2026-01-01 00:00+00'" > "$KL_STATE/old"
+    pg_sql "select count(*) from events where at >= '2026-01-01 00:00+00'" > "$KL_STATE/new"
+  check: |
+    check_eq "archive_events is a procedure" "$(pg_sql "select string_agg(prokind::text, ',') from pg_proc where proname = 'archive_events'")" p
+    check_eq "nothing before 2026 is left in events" "$(pg_sql "select count(*) from events where at < '2026-01-01 00:00+00' and payload <> 'kl-check'")" 0
+    check_eq "the archive holds exactly the old events" "$(pg_sql "select md5(string_agg(id::text, ',' order by id)) from events_archive where payload <> 'kl-check'")" "$(cat "$KL_STATE/old")"
+    check_eq "the newer events stay in events" "$(pg_sql "select count(*) from events where payload <> 'kl-check'")" "$(cat "$KL_STATE/new")"
+    pg_sql "delete from events_archive where payload = 'kl-check'; delete from events where payload = 'kl-check';
+            insert into events(at, payload) select timestamptz '2025-06-01 00:00+00' + g * interval '1 second', 'kl-check' from generate_series(1, 2500) g" >/dev/null 2>&1
+    q="CALL archive_events('2026-01-01 00:00+00', 1000)"
+    check "CALL archive_events(..., 1000) on 2500 new rows succeeds" 'timeout 60 docker exec kl-pg psql -h 127.0.0.1 -U lab -d lab -v ON_ERROR_STOP=1 -qAt -c "$q"'
+    check_eq "all 2500 rows moved" "$(pg_sql "select (select count(*) from events where payload = 'kl-check') || ':' || (select count(*) from events_archive where payload = 'kl-check')")" "0:2500"
+    b=$(pg_sql "select count(*) || ':' || max(c) from (select count(*) c from events_archive where payload = 'kl-check' group by xmin::text) s")
+    check "they were committed in batches of at most 1000 ($b: transactions:largest)" '[ "${b%%:*}" -ge 3 ] && [ "${b##*:}" -le 1000 ]'
+    pg_sql "delete from events_archive where payload = 'kl-check'; delete from events where payload = 'kl-check'" >/dev/null 2>&1
+  solve: |
+    docker exec -i kl-pg psql -h 127.0.0.1 -U lab -d lab -v ON_ERROR_STOP=1 -q <<'SQL'
+    CREATE OR REPLACE PROCEDURE archive_events(cutoff timestamptz, batch_size integer)
+    LANGUAGE plpgsql AS $$
+    DECLARE moved integer;
+    BEGIN
+      LOOP
+        WITH batch AS (
+          DELETE FROM events
+          WHERE id IN (SELECT id FROM events WHERE at < cutoff ORDER BY id LIMIT batch_size)
+          RETURNING *
+        )
+        INSERT INTO events_archive SELECT * FROM batch;
+        GET DIAGNOSTICS moved = ROW_COUNT;
+        EXIT WHEN moved = 0;
+        COMMIT;
+      END LOOP;
+    END $$;
+    SQL
+    docker exec -i kl-pg psql -h 127.0.0.1 -U lab -d lab -v ON_ERROR_STOP=1 -q -c "CALL archive_events('2026-01-01 00:00+00', 2000)"
+
+- id: data-088
+  title: Order totals that drift
+  difficulty: 4
+  kind: fix
+  tags: [postgres, trigger, plpgsql, denormalization, consistency]
+  tutorial: |
+    **Concept.** Storing a **derived value** (an order's total, a line count) saves
+    recomputing it on every read, but every change to the source rows must update it.
+    An `INSERT` trigger alone is not enough. An `UPDATE` can change the amount *or move a
+    row to another parent* (`OLD.order_id` ≠ `NEW.order_id`), and a `DELETE` must take
+    the row's share away. Treat an UPDATE as "remove OLD, add NEW" and you cover every
+    case.
+
+    When the stored values are already wrong, fixing the trigger isn't enough: recompute
+    them once from the source with `UPDATE ... FROM (SELECT ... GROUP BY ...)`.
+
+    **Read up on:**
+    - Row triggers on `INSERT OR UPDATE OR DELETE`, `TG_OP`, `OLD`, `NEW`
+    - `UPDATE ... FROM`, `LEFT JOIN` with aggregates and `coalesce`
+  scenario: |
+    In **`kl-pg`**, **`orders`** (`id`, `customer`, `total`, `line_count`) stores the sum of
+    `qty * unit_price` and the number of lines of **`order_lines`** (`id`, `order_id`,
+    `sku`, `qty`, `unit_price`). The trigger **`order_lines_totals`** keeps them up to
+    date, yet finance reports that many totals are wrong.
+
+    1. Make `total` and `line_count` stay correct for **every** change to `order_lines`:
+       inserts, changed quantities or prices (also several rows in one statement), lines
+       **moved to another order**, and deletes.
+    2. Correct the totals and counts that are already wrong. Orders without lines have
+       `total = 0` and `line_count = 0`. Don't change `order_lines`.
+  hints:
+    - "`\\sf order_lines_totals` and `\\d order_lines`: which operations does the trigger handle?"
+    - "In one function: `IF TG_OP IN ('UPDATE', 'DELETE') THEN` subtract OLD's share from OLD.order_id. `IF TG_OP IN ('INSERT', 'UPDATE') THEN` add NEW's share to NEW.order_id."
+    - "Recreate the trigger `AFTER INSERT OR UPDATE OR DELETE ... FOR EACH ROW`."
+    - "Recompute: `UPDATE orders o SET total = s.t, line_count = s.c FROM (SELECT x.id, coalesce(sum(l.qty * l.unit_price), 0) t, count(l.id) c FROM orders x LEFT JOIN order_lines l ON l.order_id = x.id GROUP BY x.id) s WHERE s.id = o.id;`"
+  solution: |
+    ```sql
+    CREATE OR REPLACE FUNCTION order_lines_totals() RETURNS trigger LANGUAGE plpgsql AS $$
+    BEGIN
+      IF TG_OP IN ('UPDATE', 'DELETE') THEN
+        UPDATE orders SET total = total - OLD.qty * OLD.unit_price, line_count = line_count - 1
+        WHERE id = OLD.order_id;
+      END IF;
+      IF TG_OP IN ('INSERT', 'UPDATE') THEN
+        UPDATE orders SET total = total + NEW.qty * NEW.unit_price, line_count = line_count + 1
+        WHERE id = NEW.order_id;
+      END IF;
+      RETURN NULL;
+    END $$;
+    DROP TRIGGER order_lines_totals ON order_lines;
+    CREATE TRIGGER order_lines_totals AFTER INSERT OR UPDATE OR DELETE ON order_lines
+      FOR EACH ROW EXECUTE FUNCTION order_lines_totals();
+
+    UPDATE orders o SET total = s.t, line_count = s.c
+    FROM (SELECT x.id, coalesce(sum(l.qty * l.unit_price), 0) AS t, count(l.id) AS c
+          FROM orders x LEFT JOIN order_lines l ON l.order_id = x.id GROUP BY x.id) s
+    WHERE s.id = o.id;
+    ```
+  setup: |
+    pg_start
+    pg_sql <<'SQL'
+    create table orders(id int primary key, customer text not null, total numeric(12,2) not null default 0, line_count int not null default 0);
+    create table order_lines(id serial primary key, order_id int not null references orders(id), sku text not null,
+                             qty int not null check (qty > 0), unit_price numeric(10,2) not null);
+    create function order_lines_totals() returns trigger language plpgsql as $$
+    begin
+      update orders set total = total + NEW.qty * NEW.unit_price, line_count = line_count + 1 where id = NEW.order_id;
+      return NEW;
+    end $$;
+    create trigger order_lines_totals after insert on order_lines for each row execute function order_lines_totals();
+    insert into orders(id, customer) select g, 'cust-' || (g % 97) from generate_series(1, 400) g;
+    insert into order_lines(order_id, sku, qty, unit_price)
+      select 1 + (g * 7) % 390, 'SKU-' || (g % 50), 1 + g % 5, round((5 + (g * 37) % 200)::numeric / 1.7, 2) from generate_series(1, 2000) g;
+    -- what happened since: the trigger saw none of it
+    update order_lines set qty = qty + 1 where id % 17 = 0;
+    update order_lines set unit_price = unit_price + 0.5 where id % 29 = 0;
+    delete from order_lines where id % 23 = 0;
+    update order_lines set order_id = 1 + (order_id + 5) % 400 where id % 41 = 0;
+    SQL
+    pg_sql "select md5(string_agg(id || ':' || order_id || ':' || qty || ':' || unit_price, ',' order by id)) from order_lines" > "$KL_STATE/lines"
+  check: |
+    bad="select count(*) from orders o cross join lateral (select coalesce(sum(qty * unit_price), 0) t, count(*) c from order_lines l where l.order_id = o.id) s where o.total <> s.t or o.line_count <> s.c"
+    tot() { pg_sql "select string_agg(total || '/' || line_count, ' ' order by id) from orders where id in (990001, 990002)"; }
+    check_eq "every order's total and line_count match its lines" "$(pg_sql "$bad")" 0
+    check_eq "order_lines weren't changed" "$(pg_sql "select md5(string_agg(id || ':' || order_id || ':' || qty || ':' || unit_price, ',' order by id)) from order_lines where order_id < 990000")" "$(cat "$KL_STATE/lines")"
+    pg_sql "delete from order_lines where order_id >= 990000; delete from orders where id >= 990000; insert into orders(id, customer) values (990001, 'kl'), (990002, 'kl')" >/dev/null
+    pg_sql "insert into order_lines(order_id, sku, qty, unit_price) values (990001, 'A', 2, 10.00), (990001, 'B', 1, 5.50), (990001, 'C', 3, 1.25)" >/dev/null
+    check_eq "inserted lines are counted" "$(tot)" "29.25/3 0.00/0"
+    pg_sql "update order_lines set qty = 4 where order_id = 990001 and sku = 'A'" >/dev/null
+    check_eq "a changed quantity is counted" "$(tot)" "49.25/3 0.00/0"
+    pg_sql "update order_lines set unit_price = unit_price * 2 where order_id = 990001" >/dev/null
+    check_eq "a price change on several lines at once is counted" "$(tot)" "98.50/3 0.00/0"
+    pg_sql "update order_lines set order_id = 990002 where order_id = 990001 and sku = 'B'" >/dev/null
+    check_eq "a line moved to another order updates both orders" "$(tot)" "87.50/2 11.00/1"
+    pg_sql "delete from order_lines where order_id = 990001 and sku = 'C'" >/dev/null
+    check_eq "a deleted line is taken away" "$(tot)" "80.00/1 11.00/1"
+    pg_sql "delete from order_lines where order_id >= 990000; delete from orders where id >= 990000" >/dev/null
+    check_eq "the whole table still adds up" "$(pg_sql "$bad")" 0
+  solve: |
+    docker exec -i kl-pg psql -h 127.0.0.1 -U lab -d lab -v ON_ERROR_STOP=1 -q <<'SQL'
+    CREATE OR REPLACE FUNCTION order_lines_totals() RETURNS trigger LANGUAGE plpgsql AS $$
+    BEGIN
+      IF TG_OP IN ('UPDATE', 'DELETE') THEN
+        UPDATE orders SET total = total - OLD.qty * OLD.unit_price, line_count = line_count - 1
+        WHERE id = OLD.order_id;
+      END IF;
+      IF TG_OP IN ('INSERT', 'UPDATE') THEN
+        UPDATE orders SET total = total + NEW.qty * NEW.unit_price, line_count = line_count + 1
+        WHERE id = NEW.order_id;
+      END IF;
+      RETURN NULL;
+    END $$;
+    DROP TRIGGER IF EXISTS order_lines_totals ON order_lines;
+    CREATE TRIGGER order_lines_totals AFTER INSERT OR UPDATE OR DELETE ON order_lines
+      FOR EACH ROW EXECUTE FUNCTION order_lines_totals();
+    UPDATE orders o SET total = s.t, line_count = s.c
+    FROM (SELECT x.id, coalesce(sum(l.qty * l.unit_price), 0) AS t, count(l.id) AS c
+          FROM orders x LEFT JOIN order_lines l ON l.order_id = x.id GROUP BY x.id) s
+    WHERE s.id = o.id;
+    SQL
+
+- id: data-089
+  title: Every journal entry must balance
+  difficulty: 5
+  kind: build
+  tags: [postgres, constraint-trigger, deferrable, plpgsql, integrity, accounting]
+  tutorial: |
+    **Concept.** Some rules span **several rows**. In double-entry bookkeeping, the lines of
+    a journal entry must add up to zero. A `CHECK` constraint only sees one row. A normal
+    trigger fires after each statement's rows, when the entry is still half-written
+    (the debit is in, the credit isn't yet).
+
+    A **constraint trigger** created **`DEFERRABLE INITIALLY DEFERRED`** fires at
+    **COMMIT** instead, once the whole transaction is in place. If it raises an error,
+    the commit fails and the whole transaction is rolled back. It has to look at every
+    entry a change touches: on UPDATE a line can move from one entry (`OLD.entry_id`) to
+    another (`NEW.entry_id`), and on DELETE only `OLD` exists.
+
+    **Read up on:**
+    - `CREATE CONSTRAINT TRIGGER ... AFTER ... DEFERRABLE INITIALLY DEFERRED FOR EACH ROW`
+    - `SET CONSTRAINTS`, and what happens to a transaction whose deferred trigger fails
+    - `RAISE EXCEPTION ... USING ERRCODE`
+  scenario: |
+    In **`kl-pg`**, **`journal_entries`** (`id`, `posted_on`, `memo`) each have lines in
+    **`journal_lines`** (`id`, `entry_id`, `account`, `amount`): debits are positive,
+    credits negative, and an entry's amounts must **sum to zero**. Nothing enforces
+    that, and a bug wrote some unbalanced entries.
+
+    1. Write the ids of the entries whose lines don't sum to zero to
+       **`/lab/unbalanced.txt`**, one per line, ascending. Then **delete those entries
+       and their lines**.
+    2. Make the database enforce the rule **at commit time** with a deferrable, initially
+       deferred **constraint trigger** on `journal_lines`, so that:
+       - an entry can be written line by line inside one transaction
+       - a transaction that leaves any entry unbalanced, through INSERT, UPDATE (also
+         moving a line to another entry) or DELETE, fails with an error whose message
+         contains **`unbalanced`**
+       - an entry can still be deleted entirely (its lines, then the entry)
+  hints:
+    - "`SELECT entry_id FROM journal_lines GROUP BY entry_id HAVING sum(amount) <> 0 ORDER BY 1;`"
+    - "In the trigger function, collect the entries to check: `OLD.entry_id` unless `TG_OP = 'INSERT'`, `NEW.entry_id` unless `TG_OP = 'DELETE'`. For each, `IF (SELECT coalesce(sum(amount), 0) FROM journal_lines WHERE entry_id = e) <> 0 THEN RAISE EXCEPTION 'unbalanced entry %', e; END IF;`."
+    - "`CREATE CONSTRAINT TRIGGER journal_balanced AFTER INSERT OR UPDATE OR DELETE ON journal_lines DEFERRABLE INITIALLY DEFERRED FOR EACH ROW EXECUTE FUNCTION ...;`"
+    - "Test: `BEGIN; INSERT` a debit, `INSERT` a smaller credit, `COMMIT;` must fail."
+  solution: |
+    ```bash
+    docker exec kl-pg psql -U lab -d lab -qAt \
+      -c "SELECT entry_id FROM journal_lines GROUP BY entry_id HAVING sum(amount) <> 0 ORDER BY 1" > /lab/unbalanced.txt
+    ```
+    ```sql
+    DELETE FROM journal_lines WHERE entry_id IN (SELECT entry_id FROM journal_lines GROUP BY entry_id HAVING sum(amount) <> 0);
+    DELETE FROM journal_entries e WHERE NOT EXISTS (SELECT 1 FROM journal_lines l WHERE l.entry_id = e.id);
+
+    CREATE OR REPLACE FUNCTION check_entry_balance() RETURNS trigger LANGUAGE plpgsql AS $$
+    DECLARE ids int[] := '{}'; e int;
+    BEGIN
+      IF TG_OP <> 'INSERT' THEN ids := ids || OLD.entry_id; END IF;
+      IF TG_OP <> 'DELETE' THEN ids := ids || NEW.entry_id; END IF;
+      FOREACH e IN ARRAY ids LOOP
+        IF (SELECT coalesce(sum(amount), 0) FROM journal_lines WHERE entry_id = e) <> 0 THEN
+          RAISE EXCEPTION 'unbalanced entry %', e USING ERRCODE = 'check_violation';
+        END IF;
+      END LOOP;
+      RETURN NULL;
+    END $$;
+
+    CREATE CONSTRAINT TRIGGER journal_balanced
+      AFTER INSERT OR UPDATE OR DELETE ON journal_lines
+      DEFERRABLE INITIALLY DEFERRED
+      FOR EACH ROW EXECUTE FUNCTION check_entry_balance();
+    ```
+    (The second DELETE assumes every entry had lines. Deleting only the listed ids is
+    safer when some entries legitimately have none yet.)
+  setup: |
+    pg_start
+    pg_sql "create table journal_entries(id serial primary key, posted_on date not null, memo text not null);
+            create table journal_lines(id serial primary key, entry_id int not null references journal_entries(id),
+                                       account text not null, amount numeric(12,2) not null check (amount <> 0));"
+    python3 - "$KL_STATE" > /tmp/kl-journal.sql <<'PY'
+    import random, sys, hashlib
+    accounts = ["cash", "bank", "sales", "vat", "rent", "wages", "stock", "fees"]
+    entries, lines, lid = [], [], 0
+    for e in range(1, 301):
+        entries.append((e, "2026-%02d-%02d" % (1 + e % 12, 1 + e % 28), "entry %d" % e))
+        n = random.randint(2, 4)
+        amts = [random.randint(100, 99999) for _ in range(n - 1)]
+        amts.append(-sum(amts))
+        for a in amts:
+            lid += 1
+            lines.append([lid, e, random.choice(accounts), a])
+    bad = sorted(random.sample(range(1, 301), 3))
+    for b in bad:
+        own = [l for l in lines if l[1] == b]
+        l = random.choice(own)
+        l[3] += random.choice([-1, 1]) * random.randint(1, 500)
+        if l[3] == 0:
+            l[3] = 7
+    good = [l for l in lines if l[1] not in bad]
+    st = sys.argv[1]
+    open(st + "/bad", "w").write("".join("%d\n" % b for b in bad))
+    open(st + "/good", "w").write(hashlib.md5(",".join("%d:%d:%.2f" % (l[0], l[1], l[3] / 100) for l in good).encode()).hexdigest())
+    print("insert into journal_entries values " + ",".join("(%d, '%s', '%s')" % x for x in entries) + ";")
+    print("insert into journal_lines values " + ",".join("(%d, %d, '%s', %.2f)" % (l[0], l[1], l[2], l[3] / 100) for l in lines) + ";")
+    print("select setval('journal_entries_id_seq', 300); select setval('journal_lines_id_seq', %d);" % lid)
+    PY
+    pg_sql < /tmp/kl-journal.sql >/dev/null; rm -f /tmp/kl-journal.sql
+  check: |
+    sql() { docker exec -i kl-pg psql -h 127.0.0.1 -U lab -d lab -v ON_ERROR_STOP=1 -qAt 2>&1; }
+    check_eq "/lab/unbalanced.txt lists the unbalanced entries" "$(sed 's/[[:space:]]*$//; /^$/d' /lab/unbalanced.txt 2>/dev/null)" "$(cat "$KL_STATE/bad")"
+    ids=$(paste -sd, "$KL_STATE/bad")
+    check_eq "they are deleted, with their lines" "$(pg_sql "select (select count(*) from journal_entries where id in ($ids)) + (select count(*) from journal_lines where entry_id in ($ids))")" 0
+    check_eq "every other entry is intact" "$(pg_sql "select md5(string_agg(id || ':' || entry_id || ':' || amount, ',' order by id)) from journal_lines where entry_id < 990000")" "$(cat "$KL_STATE/good")"
+    check "a deferrable, initially deferred constraint trigger guards journal_lines" '[ "$(pg_sql "select count(*) from pg_trigger where tgrelid = '"'"'journal_lines'"'"'::regclass and not tgisinternal and tgconstraint <> 0 and tgdeferrable and tginitdeferred")" -ge 1 ]'
+    pg_sql "delete from journal_lines where entry_id >= 990000; delete from journal_entries where id >= 990000" >/dev/null 2>&1
+    sql >/dev/null <<'SQL'
+    begin;
+    insert into journal_entries values (990001, '2026-03-01', 'kl balanced');
+    insert into journal_lines(entry_id, account, amount) values (990001, 'cash', 50);
+    insert into journal_lines(entry_id, account, amount) values (990001, 'sales', -30);
+    insert into journal_lines(entry_id, account, amount) values (990001, 'vat', -20);
+    commit;
+    SQL
+    check_eq "a balanced entry written line by line commits" "$(pg_sql "select count(*) from journal_lines where entry_id = 990001")" 3
+    out=$(sql <<'SQL'
+    begin;
+    insert into journal_entries values (990002, '2026-03-01', 'kl unbalanced');
+    insert into journal_lines(entry_id, account, amount) values (990002, 'cash', 50);
+    insert into journal_lines(entry_id, account, amount) values (990002, 'sales', -40);
+    commit;
+    SQL
+    )
+    check_match "an unbalanced entry fails at commit, saying unbalanced" "$out" '[Uu]nbalanced'
+    check_eq "... and none of it is kept" "$(pg_sql "select count(*) from journal_entries where id = 990002")" 0
+    l=$(pg_sql "select min(id) from journal_lines where entry_id = 990001")
+    check_match "an UPDATE that unbalances an entry fails" "$(pg_sql "update journal_lines set amount = amount + 1 where id = ${l:-0}" 2>&1)" '[Uu]nbalanced'
+    check_match "a DELETE that unbalances an entry fails" "$(pg_sql "delete from journal_lines where id = ${l:-0}" 2>&1)" '[Uu]nbalanced'
+    pg_sql "insert into journal_entries values (990003, '2026-03-02', 'kl other')" >/dev/null 2>&1
+    check_match "moving a line to another entry fails" "$(pg_sql "update journal_lines set entry_id = 990003 where id = ${l:-0}" 2>&1)" '[Uu]nbalanced'
+    sql >/dev/null <<SQL
+    begin;
+    update journal_lines set amount = 60 where id = ${l:-0};
+    update journal_lines set amount = -40 where entry_id = 990001 and account = 'sales';
+    commit;
+    SQL
+    check_eq "two UPDATEs that balance together commit" "$(pg_sql "select sum(amount) || '/' || max(amount) from journal_lines where entry_id = 990001")" "0.00/60.00"
+    sql >/dev/null <<'SQL'
+    begin;
+    delete from journal_lines where entry_id = 990001;
+    delete from journal_entries where id in (990001, 990003);
+    commit;
+    SQL
+    check_eq "a whole entry can still be deleted" "$(pg_sql "select count(*) from journal_entries where id >= 990000")" 0
+    pg_sql "delete from journal_lines where entry_id >= 990000; delete from journal_entries where id >= 990000" >/dev/null 2>&1
+  solve: |
+    ids=$(docker exec kl-pg psql -h 127.0.0.1 -U lab -d lab -qAt -c "SELECT entry_id FROM journal_lines GROUP BY entry_id HAVING sum(amount) <> 0 ORDER BY 1")
+    if [ -n "$ids" ]; then echo "$ids" > /lab/unbalanced.txt; fi
+    list=$(paste -sd, /lab/unbalanced.txt)
+    docker exec -i kl-pg psql -h 127.0.0.1 -U lab -d lab -v ON_ERROR_STOP=1 -q <<SQL
+    DELETE FROM journal_lines WHERE entry_id IN ($list);
+    DELETE FROM journal_entries WHERE id IN ($list);
+    CREATE OR REPLACE FUNCTION check_entry_balance() RETURNS trigger LANGUAGE plpgsql AS \$\$
+    DECLARE ids int[] := '{}'; e int;
+    BEGIN
+      IF TG_OP <> 'INSERT' THEN ids := ids || OLD.entry_id; END IF;
+      IF TG_OP <> 'DELETE' THEN ids := ids || NEW.entry_id; END IF;
+      FOREACH e IN ARRAY ids LOOP
+        IF (SELECT coalesce(sum(amount), 0) FROM journal_lines WHERE entry_id = e) <> 0 THEN
+          RAISE EXCEPTION 'unbalanced entry %', e USING ERRCODE = 'check_violation';
+        END IF;
+      END LOOP;
+      RETURN NULL;
+    END \$\$;
+    DROP TRIGGER IF EXISTS journal_balanced ON journal_lines;
+    CREATE CONSTRAINT TRIGGER journal_balanced
+      AFTER INSERT OR UPDATE OR DELETE ON journal_lines
+      DEFERRABLE INITIALLY DEFERRED
+      FOR EACH ROW EXECUTE FUNCTION check_entry_balance();
+    SQL
+
+- id: data-090
+  title: "Incident: the release that broke the triggers"
+  difficulty: 5
+  kind: fix
+  tags: [incident, postgres, triggers, security-definer, search-path, troubleshooting]
+  tutorial: |
+    **Concept.** Logic in the database fails in ways the application can't explain, so
+    look at what the database runs on its own:
+
+    - **Triggers**: `\d table` lists them, including **disabled** ones, and `\sf function`
+      shows the code. A trigger that updates its own table can **recurse** until *stack
+      depth limit exceeded*. Change `NEW` in a BEFORE trigger instead, or guard with
+      `pg_trigger_depth()`.
+    - **Privileges inside triggers**: a trigger function runs as the caller unless it is
+      `SECURITY DEFINER`.
+    - **Per-role settings**: `ALTER ROLE ... SET search_path` silently changes which
+      table an unqualified name means. `\drds` (or `pg_db_role_setting`) lists them.
+
+    Fix one layer at a time: each fix may uncover the next problem.
+
+    **Read up on:**
+    - `ALTER TABLE ... ENABLE TRIGGER`, `pg_trigger.tgenabled`
+    - `pg_trigger_depth()`, BEFORE versus AFTER triggers
+    - `ALTER FUNCTION ... SECURITY DEFINER SET search_path`, `ALTER ROLE ... RESET`
+  scenario: |
+    The payments app connects to **`kl-pg`** as **`app`** (password **`app-pw`**). Since
+    this morning's release:
+
+    - every `UPDATE accounts ...` the app runs fails
+    - transfers the app writes don't show up in **`public.transfers`**, which the
+      reports read
+    - the change audit (`audit_log`) has stopped growing
+
+    Get it back to normal. As `app`, in a fresh session:
+
+    1. `UPDATE accounts SET balance = ... WHERE id = ...` works, and sets that row's
+       `updated_at` to the current time.
+    2. Every INSERT, UPDATE and DELETE on `accounts` writes an `audit_log` row with
+       `changed_by = 'app'`. `app` must still have **no privilege on `audit_log`**, and the
+       trigger **`accounts_audit`** stays (enabled).
+    3. `INSERT INTO transfers(from_id, to_id, amount) ...` lands in
+       **`public.transfers`**: a **positive** amount is accepted, **zero or negative**
+       is rejected.
+    4. The transfers the app wrote to the wrong table today are moved to
+       `public.transfers` (same `from_id`, `to_id`, `amount`, `created_at`), and the wrong
+       table is empty or gone.
+
+    Don't delete any account or any earlier transfer.
+  hints:
+    - "Log in as app: `docker exec -it -e PGPASSWORD=app-pw kl-pg psql -h 127.0.0.1 -U app -d lab`. Run the UPDATE, read the error, then `\\d accounts` and `\\sf accounts_touch`."
+    - "`accounts_touch` updates `accounts` from an AFTER UPDATE trigger, which fires itself again. Make it `BEFORE UPDATE` with `NEW.updated_at := now(); RETURN NEW;`."
+    - "`\\d accounts` lists `accounts_audit` under *Disabled user triggers*. Once enabled, app hits *permission denied for table audit_log*: `ALTER FUNCTION audit_row() SECURITY DEFINER SET search_path = public, pg_temp;`."
+    - "`SHOW search_path;` as app, and `\\drds`. `ALTER ROLE app RESET search_path;`, fix the inverted test in `transfers_validate`, then move the rows: `INSERT INTO public.transfers SELECT * FROM legacy.transfers; DELETE FROM legacy.transfers;`."
+  solution: |
+    ```sql
+    -- 1. the recursive trigger
+    CREATE OR REPLACE FUNCTION accounts_touch() RETURNS trigger LANGUAGE plpgsql AS $$
+    BEGIN NEW.updated_at := now(); RETURN NEW; END $$;
+    DROP TRIGGER accounts_touch ON accounts;
+    CREATE TRIGGER accounts_touch BEFORE UPDATE ON accounts FOR EACH ROW EXECUTE FUNCTION accounts_touch();
+
+    -- 2. the audit: enabled again, and allowed to write audit_log for its callers
+    ALTER FUNCTION audit_row() SECURITY DEFINER SET search_path = public, pg_temp;
+    ALTER TABLE accounts ENABLE TRIGGER accounts_audit;
+
+    -- 3. the inverted validation, and the role setting that sent inserts to legacy.transfers
+    CREATE OR REPLACE FUNCTION transfers_validate() RETURNS trigger LANGUAGE plpgsql AS $$
+    BEGIN
+      IF NEW.amount IS NULL OR NEW.amount <= 0 THEN
+        RAISE EXCEPTION 'transfer amount must be positive, got %', NEW.amount;
+      END IF;
+      RETURN NEW;
+    END $$;
+    ALTER ROLE app RESET search_path;
+
+    -- 4. today's misplaced transfers
+    INSERT INTO public.transfers SELECT * FROM legacy.transfers;
+    DELETE FROM legacy.transfers;
+    ```
+  setup: |
+    pg_start
+    pg_sql <<'SQL'
+    create table accounts(id int primary key, owner text not null, balance numeric(12,2) not null, updated_at timestamptz not null default now());
+    create table transfers(id serial primary key, from_id int not null references accounts(id), to_id int not null references accounts(id),
+                           amount numeric(12,2) not null, created_at timestamptz not null default now());
+    create table audit_log(id bigserial primary key, table_name text not null, op text not null, row_id int not null,
+                           changed_by text not null, changed_at timestamptz not null default now());
+    insert into accounts(id, owner, balance, updated_at) select g, 'owner-' || g, 100 + g, '2026-01-01 00:00+00' from generate_series(1, 100) g;
+    insert into transfers(from_id, to_id, amount, created_at)
+      select 1 + g % 100, 1 + (g * 7) % 100, 1 + g % 50, timestamptz '2026-02-01 00:00+00' + g * interval '1 hour' from generate_series(1, 300) g;
+
+    -- this morning's release
+    create function accounts_touch() returns trigger language plpgsql as $$
+    begin
+      update accounts set updated_at = now() where id = NEW.id;
+      return NEW;
+    end $$;
+    create trigger accounts_touch after update on accounts for each row execute function accounts_touch();
+
+    create function audit_row() returns trigger language plpgsql as $$
+    begin
+      if TG_OP = 'DELETE' then
+        insert into audit_log(table_name, op, row_id, changed_by) values (TG_TABLE_NAME, TG_OP, OLD.id, session_user);
+      else
+        insert into audit_log(table_name, op, row_id, changed_by) values (TG_TABLE_NAME, TG_OP, NEW.id, session_user);
+      end if;
+      return null;
+    end $$;
+    create trigger accounts_audit after insert or update or delete on accounts for each row execute function audit_row();
+    alter table accounts disable trigger accounts_audit;
+
+    create function transfers_validate() returns trigger language plpgsql as $$
+    begin
+      if NEW.amount > 0 then
+        raise exception 'transfer amount must be positive, got %', NEW.amount;
+      end if;
+      return NEW;
+    end $$;
+    create trigger transfers_validate before insert or update on transfers for each row execute function transfers_validate();
+
+    create schema legacy;
+    create table legacy.transfers (like public.transfers including defaults);
+
+    create role app login password 'app-pw';
+    grant usage on schema legacy to app;
+    grant select, insert, update on accounts, transfers, legacy.transfers to app;
+    grant usage on sequence transfers_id_seq to app;
+    alter role app set search_path = legacy, public;
+    SQL
+    for t in "3 8 120.00" "14 2 35.50" "27 61 9.99" "40 5 250.00" "8 3 17.25" "77 90 64.00" "5 40 12.00"; do
+      set -- $t
+      docker exec -i -e PGPASSWORD=app-pw kl-pg psql -h 127.0.0.1 -U app -d lab -v ON_ERROR_STOP=1 -q \
+        -c "insert into transfers(from_id, to_id, amount) values ($1, $2, $3)"
+    done
+    pg_sql "select string_agg(format('(%s, %s, %s, %s)', from_id, to_id, amount, extract(epoch from created_at)), ', ') from legacy.transfers" > "$KL_STATE/moved"
+    pg_sql "select count(*) from legacy.transfers" > "$KL_STATE/moved_n"
+  check: |
+    as_app() { timeout 20 docker exec -i -e PGPASSWORD=app-pw kl-pg psql -h 127.0.0.1 -U app -d lab -v ON_ERROR_STOP=1 -qAt -c "$1" 2>/dev/null; }
+    k=$((RANDOM % 100 + 1))
+    audits() { pg_sql "select count(*) from audit_log where table_name = 'accounts' and row_id = $k and op = 'UPDATE' and changed_by = 'app'"; }
+    before=$(audits)
+    q_upd="set statement_timeout = '5s'; update accounts set balance = balance + 1 where id = $k"
+    check "app can update an account" 'as_app "$q_upd"'
+    check_eq "the update set updated_at to now" "$(pg_sql "select updated_at > now() - interval '1 minute' from accounts where id = $k")" t
+    after=$(audits)
+    check "the update was audited with changed_by = app" '[ "$after" -gt "$before" ]'
+    check_eq "accounts_audit is still there and enabled" "$(pg_sql "select tgenabled from pg_trigger where tgname = 'accounts_audit' and tgrelid = 'accounts'::regclass")" O
+    check_eq "app has no privilege on audit_log" "$(pg_sql "select has_table_privilege('app', 'audit_log', 'SELECT') or has_table_privilege('app', 'audit_log', 'INSERT') or has_table_privilege('app', 'audit_log', 'UPDATE') or has_table_privilege('app', 'audit_log', 'DELETE')")" f
+    q_pos="begin; insert into transfers(from_id, to_id, amount) values (1, 2, 4.50); select count(*) from public.transfers where from_id = 1 and to_id = 2 and amount = 4.50 and created_at = now(); rollback;"
+    check_eq "a positive transfer from app is accepted and lands in public.transfers" "$(as_app "$q_pos")" 1
+    q_zero="begin; insert into transfers(from_id, to_id, amount) values (1, 2, 0); rollback;"
+    q_neg="begin; insert into transfers(from_id, to_id, amount) values (1, 2, -3); rollback;"
+    check_not "a zero amount is rejected" 'as_app "$q_zero"'
+    check_not "a negative amount is rejected" 'as_app "$q_neg"'
+    check_eq "today's misplaced transfers are in public.transfers" "$(pg_sql "select count(distinct t.id) from public.transfers t join (values $(cat "$KL_STATE/moved")) v(f, tt, a, e) on t.from_id = v.f and t.to_id = v.tt and t.amount = v.a and extract(epoch from t.created_at) = v.e")" "$(cat "$KL_STATE/moved_n")"
+    check "the wrong table is empty or gone" '[ -z "$(pg_sql "select to_regclass('"'"'legacy.transfers'"'"')")" ] || [ "$(pg_sql "select count(*) from legacy.transfers")" = 0 ]'
+    check_eq "no account and no earlier transfer was deleted" "$(pg_sql "select (select count(*) from accounts) || ':' || (select count(*) from public.transfers where id <= 300)")" "100:300"
+  solve: |
+    docker exec -i kl-pg psql -h 127.0.0.1 -U lab -d lab -v ON_ERROR_STOP=1 -q <<'SQL'
+    CREATE OR REPLACE FUNCTION accounts_touch() RETURNS trigger LANGUAGE plpgsql AS $$
+    BEGIN NEW.updated_at := now(); RETURN NEW; END $$;
+    DROP TRIGGER IF EXISTS accounts_touch ON accounts;
+    CREATE TRIGGER accounts_touch BEFORE UPDATE ON accounts FOR EACH ROW EXECUTE FUNCTION accounts_touch();
+    ALTER FUNCTION audit_row() SECURITY DEFINER SET search_path = public, pg_temp;
+    ALTER TABLE accounts ENABLE TRIGGER accounts_audit;
+    CREATE OR REPLACE FUNCTION transfers_validate() RETURNS trigger LANGUAGE plpgsql AS $$
+    BEGIN
+      IF NEW.amount IS NULL OR NEW.amount <= 0 THEN
+        RAISE EXCEPTION 'transfer amount must be positive, got %', NEW.amount;
+      END IF;
+      RETURN NEW;
+    END $$;
+    ALTER ROLE app RESET search_path;
+    INSERT INTO public.transfers SELECT * FROM legacy.transfers;
+    DELETE FROM legacy.transfers;
+    SQL

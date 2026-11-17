@@ -1,0 +1,1512 @@
+track: kubernetes
+module: Failure policies & lifecycle controls
+profile: k8s
+order: 21
+exercises:
+
+- id: k8s-354
+  title: Released from the scheduling gate
+  difficulty: 1
+  kind: fix
+  tags: [scheduling-gates, scheduling, pod-lifecycle]
+  tutorial: |
+    **Concept.** A pod can be created with **scheduling gates**: names listed in `spec.schedulingGates`. As long as one gate is left, the scheduler doesn't even look at the pod. It stays `Pending` with the status `SchedulingGated`, and no `FailedScheduling` event is ever written. Gates are how an external controller (a quota system, a batch queue) says "not yet". Gates can only be removed after the pod is created, never added, and once the last one is gone the pod is scheduled like any other.
+
+    **Read up on:**
+    - Kubernetes docs: Pod Scheduling Readiness
+    - `kubectl explain pod.spec.schedulingGates`
+    - `kubectl get pod` — the `SchedulingGated` status
+    - `kubectl patch --help` — JSON and merge patches
+  scenario: |
+    In namespace **`gated`** the pod **`report`** has been `Pending` all morning. It waits for a
+    quota controller that was uninstalled last week, so nothing is ever going to let it through.
+
+    Get **`report`** scheduled and **Running/Ready**. It must be **the same pod** (don't delete
+    and recreate it), and it must have **no scheduling gates** left.
+  hints:
+    - "`kubectl -n gated get pod report` shows `SchedulingGated`; `kubectl -n gated get pod report -o yaml` shows what holds it."
+    - "Most of a pod's spec is immutable, but its list of scheduling gates may shrink."
+    - "Remove the whole `spec.schedulingGates` list with a JSON patch (`op: remove`) or a merge patch that sets it to `null`."
+  solution: |
+    ```bash
+    kubectl -n gated get pod report -o jsonpath='{.spec.schedulingGates}'
+    kubectl -n gated patch pod report --type=merge -p '{"spec":{"schedulingGates":null}}'
+    kubectl -n gated wait --for=condition=Ready pod/report --timeout=60s
+    ```
+  setup: |
+    k_ns gated
+    kubectl apply -f - >/dev/null <<'EOF'
+    apiVersion: v1
+    kind: Pod
+    metadata: {name: report, namespace: gated, labels: {app: report}}
+    spec:
+      schedulingGates:
+      - name: quota.example.com/approved
+      containers:
+      - name: report
+        image: busybox:1.37
+        command: ["sleep", "infinity"]
+    EOF
+    kj -n gated pod report '{.metadata.uid}' >"$KL_STATE/uid-354"
+  check: |
+    check_eq "report is still the original pod" "$(kj -n gated pod report '{.metadata.uid}')" "$(cat "$KL_STATE/uid-354" 2>/dev/null)"
+    check_eq "no scheduling gates are left" "$(kj -n gated pod report '{.spec.schedulingGates}')" ""
+    check "report is scheduled and Ready" '[ -z "$(kj -n gated pod report "{.spec.schedulingGates}")" ] && wait_pod gated report 60'
+  solve: |
+    kubectl -n gated patch pod report --type=merge -p '{"spec":{"schedulingGates":null}}'
+    kubectl -n gated wait --for=condition=Ready pod/report --timeout=60s
+
+- id: k8s-355
+  title: Last words in the pod status
+  difficulty: 2
+  kind: build
+  tags: [termination-message, debugging, pod-lifecycle]
+  tutorial: |
+    **Concept.** When a container terminates, the kubelet copies a short **termination message** into the pod status (`state.terminated.message`, or `lastState` after a restart). Monitoring and `kubectl describe` show it next to the exit code, so it survives even when the logs are rotated away or the node is gone. By default the message is read from the file `/dev/termination-log` (`terminationMessagePath`), which most applications never write. The `terminationMessagePolicy` can tell the kubelet to fall back to the tail of the container's log when the file is empty and the container failed.
+
+    **Read up on:**
+    - Kubernetes docs: Determine the Reason for Pod Failure
+    - `kubectl explain pod.spec.containers.terminationMessagePolicy`
+    - `kubectl explain pod.spec.containers.terminationMessagePath`
+    - `kubectl get pod -o jsonpath='{.status.containerStatuses[0].state.terminated}'`
+  scenario: |
+    The on-call team wants crash reasons in the pod status, without having to fetch logs.
+
+    In namespace **`lastwords`**, create a Pod **`parser`** with:
+
+    - one container named **`parser`**, image **`busybox:1.37`**, `restartPolicy: Never`
+    - **exactly** this command (it is the real tool's failure, don't change it):
+
+      ```
+      sh -c 'echo "loading /data/input.csv"; echo "fatal: /data/input.csv: no such file or directory" >&2; exit 3'
+      ```
+
+    After the container exits (code 3), the pod's
+    `.status.containerStatuses[0].state.terminated.message` must contain the line
+    `fatal: /data/input.csv: no such file or directory`.
+  hints:
+    - "The command writes to stdout and stderr, never to `/dev/termination-log`, so the default policy leaves the message empty."
+    - "One container field decides where the kubelet takes the message from; `kubectl explain` lists its two values."
+    - "`terminationMessagePolicy: FallbackToLogsOnError` uses the last lines of the log when the container fails and the file is empty."
+  solution: |
+    ```yaml
+    apiVersion: v1
+    kind: Pod
+    metadata: {name: parser, namespace: lastwords}
+    spec:
+      restartPolicy: Never
+      containers:
+      - name: parser
+        image: busybox:1.37
+        command: ["sh", "-c", "echo \"loading /data/input.csv\"; echo \"fatal: /data/input.csv: no such file or directory\" >&2; exit 3"]
+        terminationMessagePolicy: FallbackToLogsOnError
+    ```
+
+    ```bash
+    kubectl -n lastwords get pod parser -o jsonpath='{.status.containerStatuses[0].state.terminated.message}'
+    ```
+  setup: |
+    k_ns lastwords
+  check: |
+    cmd_ok() { kubectl -n lastwords get pod parser -o json 2>/dev/null | jq -e '.spec.containers[0].command | join(" ") | contains("no such file or directory") and contains("exit 3") and (contains("termination-log") | not)' >/dev/null; }
+    term() { kj -n lastwords pod parser "{.status.containerStatuses[0].state.terminated.$1}"; }
+    check "pod parser exists" 'k_exists -n lastwords pod parser'
+    check "the command is unchanged" cmd_ok
+    check_eq "the kubelet falls back to the logs on error" "$(kj -n lastwords pod parser '{.spec.containers[0].terminationMessagePolicy}')" FallbackToLogsOnError
+    k_exists -n lastwords pod parser && eventually 60 '[ -n "$(term exitCode)" ]'
+    check_eq "the container exited with code 3" "$(term exitCode)" 3
+    check_match "the termination message holds the fatal line" "$(term message)" 'fatal: /data/input\.csv: no such file or directory'
+  solve: |
+    kubectl apply -f - >/dev/null <<'EOF'
+    apiVersion: v1
+    kind: Pod
+    metadata: {name: parser, namespace: lastwords}
+    spec:
+      restartPolicy: Never
+      containers:
+      - name: parser
+        image: busybox:1.37
+        command: ["sh", "-c", "echo \"loading /data/input.csv\"; echo \"fatal: /data/input.csv: no such file or directory\" >&2; exit 3"]
+        terminationMessagePolicy: FallbackToLogsOnError
+    EOF
+
+- id: k8s-356
+  title: Pause the export, don't kill it
+  difficulty: 2
+  kind: fix
+  tags: [job, suspend, batch]
+  tutorial: |
+    **Concept.** A Job can be **suspended** by setting `spec.suspend: true`. The Job controller then deletes the Job's running pods and creates no new ones, but the Job object itself, with its history and its completion count, stays. Setting the field back to `false` resumes it. The Job reports the state through a `Suspended` condition. Deleting the Job would also stop the pods, but it throws away the record of what was already done.
+
+    **Read up on:**
+    - Kubernetes docs: Jobs — Suspending a Job
+    - `kubectl explain job.spec.suspend`
+    - `kubectl get job -o jsonpath='{.status.conditions}'`
+  scenario: |
+    In namespace **`export`** the Job **`nightly-export`** started late and now runs during business
+    hours, hammering the database.
+
+    Pause it: no `nightly-export` pod may be running or pending, and the Job must report the
+    condition **`Suspended=True`**. Keep **the same Job** (don't delete it): it will be resumed
+    tonight.
+  hints:
+    - "There is a field in the Job spec made exactly for this."
+    - "`kubectl patch job ... --type=merge -p '{\"spec\":{...}}'` changes a single field."
+    - "The pods are stopped by the Job controller; give them a few seconds and watch `kubectl -n export get pods -w`."
+  solution: |
+    ```bash
+    kubectl -n export patch job nightly-export --type=merge -p '{"spec":{"suspend":true}}'
+    kubectl -n export get job nightly-export -o jsonpath='{.status.conditions[?(@.type=="Suspended")].status}'
+    kubectl -n export get pods
+    ```
+
+    Tonight: the same patch with `"suspend": false`.
+  setup: |
+    k_ns export
+    kubectl apply -f - >/dev/null <<'EOF'
+    apiVersion: batch/v1
+    kind: Job
+    metadata: {name: nightly-export, namespace: export}
+    spec:
+      completions: 2
+      parallelism: 2
+      backoffLimit: 2
+      template:
+        spec:
+          restartPolicy: Never
+          terminationGracePeriodSeconds: 5
+          containers:
+          - name: export
+            image: busybox:1.37
+            command: ["sh", "-c", "echo exporting tables; sleep 3600"]
+    EOF
+    kj -n export job nightly-export '{.metadata.uid}' >"$KL_STATE/uid-356"
+    wait_pods export job-name=nightly-export 90 >/dev/null || true
+  check: |
+    live() { kubectl -n export get pods -l job-name=nightly-export -o json 2>/dev/null | jq '[.items[] | select(.metadata.deletionTimestamp == null and (.status.phase == "Pending" or .status.phase == "Running"))] | length'; }
+    suspended() { [ "$(kj -n export job nightly-export '{.status.conditions[?(@.type=="Suspended")].status}')" = True ]; }
+    check_eq "nightly-export is still the original Job" "$(kj -n export job nightly-export '{.metadata.uid}')" "$(cat "$KL_STATE/uid-356" 2>/dev/null)"
+    check_eq "the Job is suspended" "$(kj -n export job nightly-export '{.spec.suspend}')" true
+    [ "$(kj -n export job nightly-export '{.spec.suspend}')" = true ] && eventually 60 'suspended && [ "$(live)" = 0 ]'
+    check "the Job reports Suspended=True" suspended
+    check_eq "no export pods are running or pending" "$(live)" 0
+  solve: |
+    kubectl -n export patch job nightly-export --type=merge -p '{"spec":{"suspend":true}}'
+
+- id: k8s-357
+  title: Fail fast on a bug, ignore evictions
+  difficulty: 3
+  kind: build
+  tags: [job, pod-failure-policy, backoff, batch]
+  tutorial: |
+    **Concept.** A Job retries failed pods up to `backoffLimit` times, with a growing delay. That is right for flaky failures and wrong for a bug, where every retry fails the same way and only wastes time. The opposite also happens: a pod evicted by a node drain or preempted by a higher priority pod didn't fail by its own fault, yet it uses up a retry. A **pod failure policy** decides, rule by rule, what a failed pod means: match on the container's **exit code** or on a **pod condition** (such as `DisruptionTarget`, set on pods killed by a disruption), and act with `FailJob`, `Ignore` (don't count it), `Count` (the default behaviour) or `FailIndex`. Rules are checked in order and the first match wins. The policy needs `restartPolicy: Never`.
+
+    **Read up on:**
+    - Kubernetes docs: Handling retriable and non-retriable pod failures with Pod failure policy
+    - `kubectl explain job.spec.podFailurePolicy.rules`
+    - `kubectl explain job.spec.podFailurePolicy.rules.onExitCodes`
+    - `kubectl explain job.spec.podFailurePolicy.rules.onPodConditions`
+  scenario: |
+    The data-validation tool exits with code **42** when the data itself is wrong. Retrying
+    can't help, yet the current pipeline retries six times and pages someone an hour later.
+
+    In namespace **`pfp`**, create a Job **`validate`**:
+
+    - one completion, **`backoffLimit: 6`** (kept for genuine, transient failures), pods never
+      restarted in place
+    - one container named **`validate`**, image **`busybox:1.37`**, with exactly this command:
+
+      ```
+      sh -c 'echo "schema check: 3 rows violate NOT NULL"; exit 42'
+      ```
+    - a **pod failure policy** with two rules:
+      - exit code **42** of container **`validate`** fails **the whole Job** at once
+      - a pod failing with the **`DisruptionTarget`** condition is **not counted** against the
+        backoff limit
+
+    The Job must end **Failed** with the reason **`PodFailurePolicy`**, after **one** pod.
+  hints:
+    - "`kubectl explain job.spec.podFailurePolicy.rules.action` lists the four actions."
+    - "An exit-code rule: `onExitCodes: {containerName: validate, operator: In, values: [42]}`."
+    - "A condition rule: `onPodConditions: [{type: DisruptionTarget}]`. A pod failure policy is only accepted with `restartPolicy: Never`."
+    - "`kubectl -n pfp get job validate -o jsonpath='{.status.conditions}'` shows the reason."
+  solution: |
+    ```yaml
+    apiVersion: batch/v1
+    kind: Job
+    metadata: {name: validate, namespace: pfp}
+    spec:
+      backoffLimit: 6
+      podFailurePolicy:
+        rules:
+        - action: FailJob
+          onExitCodes:
+            containerName: validate
+            operator: In
+            values: [42]
+        - action: Ignore
+          onPodConditions:
+          - type: DisruptionTarget
+      template:
+        spec:
+          restartPolicy: Never
+          containers:
+          - name: validate
+            image: busybox:1.37
+            command: ["sh", "-c", "echo \"schema check: 3 rows violate NOT NULL\"; exit 42"]
+    ```
+  setup: |
+    k_ns pfp
+  check: |
+    j() { kubectl -n pfp get job validate -o json 2>/dev/null; }
+    rule42() { j | jq -e '[.spec.podFailurePolicy.rules[]? | select(.action == "FailJob" and .onExitCodes.operator == "In" and (.onExitCodes.values | index(42)) and ((.onExitCodes.containerName // "validate") == "validate"))] | length > 0' >/dev/null; }
+    ruledis() { j | jq -e '[.spec.podFailurePolicy.rules[]? | select(.action == "Ignore" and any(.onPodConditions[]?; .type == "DisruptionTarget"))] | length > 0' >/dev/null; }
+    reason() { kj -n pfp job validate '{.status.conditions[?(@.type=="Failed")].reason}'; }
+    check "Job validate exists" 'k_exists -n pfp job validate'
+    check "backoffLimit is 6 and restartPolicy is Never" 'j | jq -e ".spec.backoffLimit == 6 and .spec.template.spec.restartPolicy == \"Never\""'
+    check "the command is unchanged" 'j | jq -e ".spec.template.spec.containers[0].name == \"validate\" and (.spec.template.spec.containers[0].command | join(\" \") | contains(\"exit 42\"))"'
+    check "exit code 42 of validate fails the Job" rule42
+    check "DisruptionTarget failures are ignored" ruledis
+    rule42 && eventually 60 '[ -n "$(reason)" ]'
+    check_eq "the Job failed because of its pod failure policy" "$(reason)" PodFailurePolicy
+    check_eq "only one pod was tried" "$(kj -n pfp job validate '{.status.failed}')" 1
+  solve: |
+    kubectl apply -f - >/dev/null <<'EOF'
+    apiVersion: batch/v1
+    kind: Job
+    metadata: {name: validate, namespace: pfp}
+    spec:
+      backoffLimit: 6
+      podFailurePolicy:
+        rules:
+        - action: FailJob
+          onExitCodes:
+            containerName: validate
+            operator: In
+            values: [42]
+        - action: Ignore
+          onPodConditions:
+          - type: DisruptionTarget
+      template:
+        spec:
+          restartPolicy: Never
+          containers:
+          - name: validate
+            image: busybox:1.37
+            command: ["sh", "-c", "echo \"schema check: 3 rows violate NOT NULL\"; exit 42"]
+    EOF
+
+- id: k8s-358
+  title: Retry each shard on its own
+  difficulty: 3
+  kind: build
+  tags: [job, indexed, backoff-limit-per-index, batch]
+  tutorial: |
+    **Concept.** In an **Indexed** Job every index is a separate piece of work, but by default the retries are shared: `backoffLimit` counts failures across all indexes, so one hopeless shard can use them all up and fail the Job while the others were fine. With **`backoffLimitPerIndex`** each index gets its own retry budget. An index that runs out is marked failed and listed in `status.failedIndexes`, the other indexes carry on, and when every index is done the Job ends `Failed` (reason `FailedIndexes`) if any index failed. `status.completedIndexes` lists the ones that succeeded, as ranges such as `0-2,4`.
+
+    **Read up on:**
+    - Kubernetes docs: Jobs — Backoff limit per index
+    - `kubectl explain job.spec.backoffLimitPerIndex`
+    - `kubectl explain job.status.failedIndexes` and `job.status.completedIndexes`
+    - the pod label `batch.kubernetes.io/job-completion-index`
+  scenario: |
+    Five storage shards must be verified. Shard 3 currently fails its checksum every time, and
+    the team wants the other four verified anyway, each with its own small retry budget.
+
+    In namespace **`shards`**, create a Job **`checksum`**:
+
+    - **Indexed** completion mode, **5 completions**, **5 in parallel**, `restartPolicy: Never`
+    - container **`worker`**, image **`busybox:1.37`**, with exactly this command:
+
+      ```
+      sh -c 'if [ "$JOB_COMPLETION_INDEX" = 3 ]; then echo "shard 3: checksum mismatch"; exit 1; fi; echo "shard $JOB_COMPLETION_INDEX verified"'
+      ```
+    - every index may be **retried once**, counted **per index**
+
+    When the Job has finished, indexes **0, 1, 2 and 4** must be completed, index **3** must be
+    listed as failed, and shard 3 must have been tried **exactly twice**.
+  hints:
+    - "`kubectl explain job.spec | grep -i index` shows the fields for per-index behaviour."
+    - "`backoffLimitPerIndex: 1` means one retry, so two pods for a shard that always fails."
+    - "Watch `kubectl -n shards get job checksum -o jsonpath='{.status.completedIndexes} {.status.failedIndexes}'`."
+  solution: |
+    ```yaml
+    apiVersion: batch/v1
+    kind: Job
+    metadata: {name: checksum, namespace: shards}
+    spec:
+      completionMode: Indexed
+      completions: 5
+      parallelism: 5
+      backoffLimitPerIndex: 1
+      template:
+        spec:
+          restartPolicy: Never
+          containers:
+          - name: worker
+            image: busybox:1.37
+            command: ["sh", "-c", "if [ \"$JOB_COMPLETION_INDEX\" = 3 ]; then echo \"shard 3: checksum mismatch\"; exit 1; fi; echo \"shard $JOB_COMPLETION_INDEX verified\""]
+    ```
+
+    ```bash
+    kubectl -n shards get pods -l batch.kubernetes.io/job-completion-index=3
+    ```
+  setup: |
+    k_ns shards
+  check: |
+    j() { kubectl -n shards get job checksum -o json 2>/dev/null; }
+    expand() {
+      local out="" p parts
+      IFS=, read -ra parts <<<"$1"
+      for p in "${parts[@]}"; do
+        if [[ $p == *-* ]]; then out="$out $(seq -s ' ' "${p%-*}" "${p#*-}")"; else out="$out $p"; fi
+      done
+      echo $out
+    }
+    finished() { [ -n "$(kj -n shards job checksum '{.status.conditions[?(@.type=="Failed")].status}{.status.conditions[?(@.type=="Complete")].status}')" ]; }
+    check "Job checksum exists" 'k_exists -n shards job checksum'
+    check "Indexed, 5 completions, 5 in parallel" 'j | jq -e ".spec.completionMode == \"Indexed\" and .spec.completions == 5 and .spec.parallelism == 5"'
+    check "the command is unchanged" 'j | jq -e ".spec.template.spec.containers[0].command | join(\" \") | contains(\"checksum mismatch\")"'
+    check "one retry per index" 'j | jq -e ".spec.backoffLimitPerIndex == 1"'
+    j | jq -e '.spec.backoffLimitPerIndex == 1' >/dev/null 2>&1 && eventually 120 finished
+    check_eq "shards 0, 1, 2 and 4 completed" "$(expand "$(kj -n shards job checksum '{.status.completedIndexes}')")" "0 1 2 4"
+    check_eq "shard 3 is reported failed" "$(kj -n shards job checksum '{.status.failedIndexes}')" 3
+    uid=$(kj -n shards job checksum '{.metadata.uid}')
+    check_eq "shard 3 was tried exactly twice" "$(kubectl -n shards get pods -l "batch.kubernetes.io/controller-uid=$uid,batch.kubernetes.io/job-completion-index=3" -o name 2>/dev/null | wc -l)" 2
+  solve: |
+    kubectl apply -f - >/dev/null <<'EOF'
+    apiVersion: batch/v1
+    kind: Job
+    metadata: {name: checksum, namespace: shards}
+    spec:
+      completionMode: Indexed
+      completions: 5
+      parallelism: 5
+      backoffLimitPerIndex: 1
+      template:
+        spec:
+          restartPolicy: Never
+          containers:
+          - name: worker
+            image: busybox:1.37
+            command: ["sh", "-c", "if [ \"$JOB_COMPLETION_INDEX\" = 3 ]; then echo \"shard 3: checksum mismatch\"; exit 1; fi; echo \"shard $JOB_COMPLETION_INDEX verified\""]
+    EOF
+
+- id: k8s-359
+  title: Done when the leader is done
+  difficulty: 3
+  kind: build
+  tags: [job, indexed, success-policy, batch]
+  tutorial: |
+    **Concept.** An Indexed Job normally succeeds only when **every** index has succeeded. Some workloads don't work that way: in a leader/worker simulation or a distributed training run, the result is ready when the leader finishes, and the workers never exit on their own. A **success policy** declares when the Job counts as successful: by a set of indexes (`succeededIndexes`), a number of them (`succeededCount`), or both. Once a rule is met the Job gets the `SuccessCriteriaMet` condition, the remaining pods are terminated, and the Job ends `Complete`. It only applies to Indexed Jobs.
+
+    **Read up on:**
+    - Kubernetes docs: Jobs — Success policy
+    - `kubectl explain job.spec.successPolicy.rules`
+    - `kubectl get job -o jsonpath='{.status.conditions}'` — `SuccessCriteriaMet`, `Complete`
+  scenario: |
+    A simulation runs as one leader (index 0) and three workers. The leader exits when the
+    simulation has converged; the workers just wait for it and never exit.
+
+    In namespace **`sim`**, create a Job **`sim`**:
+
+    - **Indexed**, **4 completions**, **4 in parallel**, `restartPolicy: Never`
+    - container **`sim`**, image **`busybox:1.37`**, with exactly this command:
+
+      ```
+      sh -c 'if [ "$JOB_COMPLETION_INDEX" = 0 ]; then sleep 5; echo "leader: simulation converged"; else echo "worker $JOB_COMPLETION_INDEX waiting for the leader"; sleep 3600; fi'
+      ```
+    - a **success policy**: the Job succeeds as soon as **index 0** has succeeded
+
+    The Job must end **Complete** with the condition **`SuccessCriteriaMet`**, with only index
+    `0` completed and no pods left running.
+  hints:
+    - "Without a policy the Job would wait an hour for the workers; `kubectl explain job.spec.successPolicy` shows the alternative."
+    - "`succeededIndexes` is a string in the same format as `completedIndexes`, e.g. `\"0\"` (quote it in YAML)."
+    - "The workers are stopped after the leader succeeds; their termination grace period still applies, so `Complete` can take half a minute."
+  solution: |
+    ```yaml
+    apiVersion: batch/v1
+    kind: Job
+    metadata: {name: sim, namespace: sim}
+    spec:
+      completionMode: Indexed
+      completions: 4
+      parallelism: 4
+      successPolicy:
+        rules:
+        - succeededIndexes: "0"
+      template:
+        spec:
+          restartPolicy: Never
+          containers:
+          - name: sim
+            image: busybox:1.37
+            command: ["sh", "-c", "if [ \"$JOB_COMPLETION_INDEX\" = 0 ]; then sleep 5; echo \"leader: simulation converged\"; else echo \"worker $JOB_COMPLETION_INDEX waiting for the leader\"; sleep 3600; fi"]
+    ```
+  setup: |
+    k_ns sim
+  check: |
+    j() { kubectl -n sim get job sim -o json 2>/dev/null; }
+    pol() { j | jq -e '[.spec.successPolicy.rules[]? | select(.succeededIndexes == "0" and ((.succeededCount // 1) == 1))] | length > 0' >/dev/null; }
+    complete() { [ "$(kj -n sim job sim '{.status.conditions[?(@.type=="Complete")].status}')" = True ]; }
+    check "Job sim exists" 'k_exists -n sim job sim'
+    check "Indexed, 4 completions, 4 in parallel" 'j | jq -e ".spec.completionMode == \"Indexed\" and .spec.completions == 4 and .spec.parallelism == 4"'
+    check "the command is unchanged" 'j | jq -e ".spec.template.spec.containers[0].command | join(\" \") | contains(\"sleep 3600\")"'
+    check "the success policy waits for index 0" pol
+    pol && eventually 150 complete
+    check "the Job is Complete" complete
+    check_eq "it met its success criteria" "$(kj -n sim job sim '{.status.conditions[?(@.type=="SuccessCriteriaMet")].status}')" True
+    check_eq "only the leader's index completed" "$(kj -n sim job sim '{.status.completedIndexes}')" 0
+    a=$(kj -n sim job sim '{.status.active}')
+    check_eq "no pods are left running" "${a:-0}" 0
+  solve: |
+    kubectl apply -f - >/dev/null <<'EOF'
+    apiVersion: batch/v1
+    kind: Job
+    metadata: {name: sim, namespace: sim}
+    spec:
+      completionMode: Indexed
+      completions: 4
+      parallelism: 4
+      successPolicy:
+        rules:
+        - succeededIndexes: "0"
+      template:
+        spec:
+          restartPolicy: Never
+          containers:
+          - name: sim
+            image: busybox:1.37
+            command: ["sh", "-c", "if [ \"$JOB_COMPLETION_INDEX\" = 0 ]; then sleep 5; echo \"leader: simulation converged\"; else echo \"worker $JOB_COMPLETION_INDEX waiting for the leader\"; sleep 3600; fi"]
+    EOF
+
+- id: k8s-360
+  title: Claims left behind by a scale-down
+  difficulty: 3
+  kind: fix
+  tags: [statefulset, pvc, retention-policy, storage]
+  tutorial: |
+    **Concept.** A StatefulSet creates one PersistentVolumeClaim per replica from its `volumeClaimTemplates`. By default it never deletes them: scale from 3 to 1 and the claims of replicas 1 and 2 stay, still holding their volumes, so a later scale-up finds the old data again. That is safe, but on a cluster that scales a lot it leaks disk. The **`persistentVolumeClaimRetentionPolicy`** chooses separately what happens to the claims **when the StatefulSet is scaled down** (`whenScaled`) and **when it is deleted** (`whenDeleted`): `Retain` (the default) or `Delete`. It only acts on future events; claims already orphaned have to be cleaned up by hand.
+
+    **Read up on:**
+    - Kubernetes docs: StatefulSets — PersistentVolumeClaim retention
+    - `kubectl explain statefulset.spec.persistentVolumeClaimRetentionPolicy`
+    - `kubectl get pvc` — claim names are `<template>-<statefulset>-<ordinal>`
+  scenario: |
+    In namespace **`ledger`**, the StatefulSet **`ledger`** was scaled from 3 replicas to 1. Its
+    claims **`data-ledger-1`** and **`data-ledger-2`** are still there, holding disk that nobody
+    uses.
+
+    1. Remove the two orphaned claims. **`data-ledger-0`** must stay: the same claim, still used
+       by **`ledger-0`**, which must be Ready.
+    2. Configure the StatefulSet so that from now on **scaling down deletes** the claims of the
+       removed replicas, while **deleting the StatefulSet keeps** all claims.
+
+    `ledger` stays at **1 replica**.
+  hints:
+    - "`kubectl -n ledger get pvc` and `kubectl -n ledger get sts ledger -o yaml | grep -A3 Retention`."
+    - "The two orphaned claims are not used by any pod, so `kubectl delete pvc` removes them right away."
+    - "`kubectl explain sts.spec.persistentVolumeClaimRetentionPolicy` — two fields, each `Retain` or `Delete`."
+  solution: |
+    ```bash
+    kubectl -n ledger delete pvc data-ledger-1 data-ledger-2
+    kubectl -n ledger patch sts ledger --type=merge -p \
+      '{"spec":{"persistentVolumeClaimRetentionPolicy":{"whenScaled":"Delete","whenDeleted":"Retain"}}}'
+    kubectl -n ledger get pvc
+    ```
+  setup: |
+    k_ns ledger
+    kubectl apply -f - >/dev/null <<'EOF'
+    apiVersion: v1
+    kind: Service
+    metadata: {name: ledger, namespace: ledger}
+    spec:
+      clusterIP: None
+      selector: {app: ledger}
+      ports: [{port: 80}]
+    ---
+    apiVersion: apps/v1
+    kind: StatefulSet
+    metadata: {name: ledger, namespace: ledger}
+    spec:
+      serviceName: ledger
+      replicas: 3
+      podManagementPolicy: Parallel
+      selector: {matchLabels: {app: ledger}}
+      template:
+        metadata: {labels: {app: ledger}}
+        spec:
+          terminationGracePeriodSeconds: 2
+          containers:
+          - name: ledger
+            image: busybox:1.37
+            command: ["sh", "-c", "date >> /data/started; sleep infinity"]
+            volumeMounts: [{name: data, mountPath: /data}]
+      volumeClaimTemplates:
+      - metadata: {name: data}
+        spec:
+          accessModes: [ReadWriteOnce]
+          resources: {requests: {storage: 64Mi}}
+    EOF
+    eventually 180 '[ "$(kj -n ledger sts ledger "{.status.readyReplicas}")" = 3 ]' || true
+    kubectl -n ledger scale sts ledger --replicas=1 >/dev/null
+    eventually 60 '! k_exists -n ledger pod ledger-1 && ! k_exists -n ledger pod ledger-2' || true
+    kj -n ledger pvc data-ledger-0 '{.metadata.uid}' >"$KL_STATE/uid-360"
+  check: |
+    claims() { kubectl -n ledger get pvc -o json 2>/dev/null | jq -r '[.items[] | select(.metadata.deletionTimestamp == null) | .metadata.name] | sort | join(" ")'; }
+    check_eq "scale-downs delete claims, deleting the StatefulSet keeps them" "$(kj -n ledger sts ledger '{.spec.persistentVolumeClaimRetentionPolicy.whenScaled} {.spec.persistentVolumeClaimRetentionPolicy.whenDeleted}')" "Delete Retain"
+    check_eq "ledger still runs 1 replica" "$(kj -n ledger sts ledger '{.spec.replicas}')" 1
+    check_eq "only data-ledger-0 is left" "$(claims)" data-ledger-0
+    check_eq "data-ledger-0 is the original claim" "$(kj -n ledger pvc data-ledger-0 '{.metadata.uid}')" "$(cat "$KL_STATE/uid-360" 2>/dev/null)"
+    check "ledger-0 is Ready" 'wait_pod ledger ledger-0 90'
+  solve: |
+    kubectl -n ledger delete pvc data-ledger-1 data-ledger-2 --ignore-not-found
+    kubectl -n ledger patch sts ledger --type=merge -p '{"spec":{"persistentVolumeClaimRetentionPolicy":{"whenScaled":"Delete","whenDeleted":"Retain"}}}'
+
+- id: k8s-361
+  title: Choose who leaves on scale-down
+  difficulty: 3
+  kind: build
+  tags: [deployment, replicaset, scaling, pod-deletion-cost]
+  tutorial: |
+    **Concept.** When a ReplicaSet scales down it has to pick victims. It prefers pods that are not scheduled, not running or not ready; among equal pods it looks at the annotation **`controller.kubernetes.io/pod-deletion-cost`** (an integer, default 0) and removes the pods with the **lowest** cost first; after that it spreads the removals over nodes and prefers the newest pods. The annotation lets an application, or an operator, mark which replicas are expensive to lose (a warm cache, a long session) before shrinking. It is a hint for scale-down only, not a protection against deletion or eviction.
+
+    **Read up on:**
+    - Kubernetes docs: ReplicaSet — Pod deletion cost
+    - `kubectl annotate --help`
+    - `kubectl scale --help`
+  scenario: |
+    In namespace **`scale`**, the Deployment **`workers`** runs 3 replicas. The pod named in
+    **`/lab/keep.txt`** holds a warm in-memory cache that takes an hour to rebuild.
+
+    Scale **`workers`** down to **1 replica** so that the remaining pod is **exactly the one in
+    `/lab/keep.txt`**: the same pod, not a replacement. It must be Ready.
+  hints:
+    - "Scaling down lets the ReplicaSet choose; you can influence its choice before you scale."
+    - "Look for the `pod-deletion-cost` annotation in the ReplicaSet documentation."
+    - "Pods with a lower deletion cost go first. Give the pod to keep a high cost, then scale."
+  solution: |
+    ```bash
+    keep=$(cat /lab/keep.txt)
+    kubectl -n scale annotate pod "$keep" controller.kubernetes.io/pod-deletion-cost=1000 --overwrite
+    kubectl -n scale scale deploy workers --replicas=1
+    kubectl -n scale get pods
+    ```
+  setup: |
+    k_ns scale
+    kubectl -n scale create deployment workers --image=nginx:1.29-alpine --replicas=3 >/dev/null
+    wait_deploy scale workers 120 >/dev/null || true
+    pod=$(kubectl -n scale get pods -l app=workers -o name | shuf -n1)
+    pod=${pod#pod/}
+    echo "$pod" | lab_file /lab/keep.txt
+    echo "$pod $(kj -n scale pod "$pod" '{.metadata.uid}')" >"$KL_STATE/keep-361"
+  check: |
+    read -r keep uid <"$KL_STATE/keep-361"
+    live() { kubectl -n scale get pods -l app=workers -o json 2>/dev/null | jq -r '[.items[] | select(.metadata.deletionTimestamp == null) | .metadata.uid] | join(" ")'; }
+    check_eq "workers is scaled to 1 replica" "$(kj -n scale deploy workers '{.spec.replicas}')" 1
+    check_eq "the only pod left is the one from keep.txt" "$(live)" "$uid"
+    check "it is Ready" "pod_ready scale '$keep'"
+  solve: |
+    keep=$(cat /lab/keep.txt)
+    kubectl -n scale annotate pod "$keep" controller.kubernetes.io/pod-deletion-cost=1000 --overwrite
+    kubectl -n scale scale deploy workers --replicas=1
+
+- id: k8s-362
+  title: Stay on your own node
+  difficulty: 3
+  kind: build
+  tags: [service, internal-traffic-policy, daemonset, networking]
+  tutorial: |
+    **Concept.** A Service normally spreads traffic over all its ready endpoints, on any node. For a **node-local agent** (a log or metrics collector run as a DaemonSet, a node-level cache) that is wrong: a client must talk to the agent on its own node, both for speed and because the agent only knows about its node. **`internalTrafficPolicy: Local`** tells kube-proxy to send traffic from inside the cluster only to endpoints on the client's node. If the node has no such endpoint the traffic is dropped, not sent elsewhere. (`externalTrafficPolicy` is the counterpart for traffic from outside the cluster.)
+
+    **Read up on:**
+    - Kubernetes docs: Service Internal Traffic Policy
+    - `kubectl explain service.spec.internalTrafficPolicy`
+    - `kubectl get pods -o wide` — which pod runs on which node
+  scenario: |
+    In namespace **`nodelocal`** a DaemonSet **`node-agent`** (label `app=node-agent`, port 80)
+    runs one agent on each node. It answers HTTP with its own host name (`Hostname: ...`).
+
+    Create a Service **`node-agent`** (ClusterIP, port **80** to the pods' port 80, selecting
+    `app=node-agent`) so that a client pod always reaches **the agent on its own node**, never
+    the one on another node.
+
+    The check runs clients on **`node01`** and on **`controlplane`**; each must only ever get
+    the answer of its own node's agent.
+  hints:
+    - "A plain Service balances over both agents: try `curl` a few times from a pod and see two host names."
+    - "`kubectl explain service.spec | grep -i policy`."
+    - "With `internalTrafficPolicy: Local`, kube-proxy only uses endpoints on the client's own node."
+  solution: |
+    ```yaml
+    apiVersion: v1
+    kind: Service
+    metadata: {name: node-agent, namespace: nodelocal}
+    spec:
+      selector: {app: node-agent}
+      internalTrafficPolicy: Local
+      ports:
+      - {port: 80, targetPort: 80}
+    ```
+  setup: |
+    k_ns nodelocal
+    kubectl apply -f - >/dev/null <<'EOF'
+    apiVersion: apps/v1
+    kind: DaemonSet
+    metadata: {name: node-agent, namespace: nodelocal}
+    spec:
+      selector: {matchLabels: {app: node-agent}}
+      template:
+        metadata: {labels: {app: node-agent}}
+        spec:
+          tolerations:
+          - {key: node-role.kubernetes.io/control-plane, operator: Exists, effect: NoSchedule}
+          containers:
+          - name: agent
+            image: traefik/whoami:v1.10
+            ports: [{containerPort: 80}]
+    EOF
+    eventually 120 '[ "$(kj -n nodelocal ds node-agent "{.status.numberReady}")" = 2 ]' || true
+  check: |
+    agent_on() { kubectl -n nodelocal get pods -l app=node-agent -o json 2>/dev/null | jq -r --arg n "$1" '[.items[] | select(.spec.nodeName == $n and .metadata.deletionTimestamp == null) | .metadata.name][0] // empty'; }
+    from() {
+      local out="" t
+      for t in 1 2 3; do
+        out=$(timeout 90 kubectl -n nodelocal run "kl-from-$RANDOM" --rm -i --restart=Never --quiet \
+          --image=curlimages/curl:8.11.1 \
+          --overrides="{\"apiVersion\":\"v1\",\"spec\":{\"nodeName\":\"$1\",\"tolerations\":[{\"operator\":\"Exists\"}]}}" \
+          --command -- sh -c "for i in 1 2 3 4 5 6; do curl -s -m 3 http://node-agent/ | sed -n 's/^Hostname: //p'; done" 2>/dev/null | sort -u | paste -sd' ')
+        [ -n "$out" ] && break
+        sleep 2
+      done
+      echo "$out"
+    }
+    pol=$(kj -n nodelocal svc node-agent '{.spec.internalTrafficPolicy}')
+    check "Service node-agent exists" 'k_exists -n nodelocal svc node-agent'
+    check "it selects the agents on port 80" '[ "$(kj -n nodelocal svc node-agent "{.spec.selector.app} {.spec.ports[0].port}")" = "node-agent 80" ]'
+    check_eq "internal traffic stays on the client's node" "$pol" Local
+    check_eq "an agent runs on each node" "$(kj -n nodelocal ds node-agent '{.status.numberReady}')" 2
+    for n in node01 controlplane; do
+      if [ "$pol" = Local ]; then
+        check_eq "a client on $n only reaches the agent on $n" "$(from "$n")" "$(agent_on "$n")"
+      else
+        check "a client on $n only reaches the agent on $n" false
+      fi
+    done
+  solve: |
+    kubectl apply -f - >/dev/null <<'EOF'
+    apiVersion: v1
+    kind: Service
+    metadata: {name: node-agent, namespace: nodelocal}
+    spec:
+      selector: {app: node-agent}
+      internalTrafficPolicy: Local
+      ports:
+      - {port: 80, targetPort: 80}
+    EOF
+
+- id: k8s-363
+  title: A gate the load balancer opens
+  difficulty: 4
+  kind: build
+  tags: [readiness-gates, pod-conditions, service, endpoints]
+  tutorial: |
+    **Concept.** A pod is Ready when all its containers are ready, and, if it declares **readiness gates**, when every gate's condition in the pod status is also `True`. A readiness gate (`spec.readinessGates[].conditionType`) is a condition type that some other controller owns, typically a cloud load-balancer controller that registers the pod with an external balancer and only then sets the condition. Until then the pod stays out of the Service's ready endpoints, and a rolling update waits. Conditions live in the pod's **status**, which is written through the `status` subresource, not by editing the spec.
+
+    **Read up on:**
+    - Kubernetes docs: Pod Lifecycle — Pod readiness gates
+    - `kubectl explain pod.spec.readinessGates`
+    - `kubectl patch --help` — the `--subresource` flag
+    - `kubectl get endpointslices -l kubernetes.io/service-name=NAME`
+  scenario: |
+    The team's load-balancer integration will set a pod condition **`lb.example.com/registered`**
+    once a pod is registered. The controller isn't installed in this cluster yet, so you will
+    play its part.
+
+    In namespace **`lbgate`** there is a Service **`checkout`** selecting `app=checkout`.
+
+    1. Create a Deployment **`checkout`**: **2 replicas**, label `app=checkout`, image
+       **`nginx:1.29-alpine`**, whose pods declare the readiness gate
+       **`lb.example.com/registered`**.
+    2. Acting as the controller, mark **both** pods as registered (condition
+       `lb.example.com/registered` = `True`).
+
+    In the end both pods must be **Ready**, carry the condition, and be the **2 ready
+    endpoints** of Service `checkout`. The readiness gate must stay in the Deployment.
+  hints:
+    - "After step 1, `kubectl -n lbgate get pods -o wide` shows `READINESS GATES 0/1` and the pods are not Ready."
+    - "Conditions are part of the pod status; `kubectl patch` can write the status with `--subresource=status`."
+    - "A strategic merge patch merges conditions by `type`: `{\"status\":{\"conditions\":[{\"type\":\"lb.example.com/registered\",\"status\":\"True\"}]}}`."
+  solution: |
+    ```yaml
+    apiVersion: apps/v1
+    kind: Deployment
+    metadata: {name: checkout, namespace: lbgate}
+    spec:
+      replicas: 2
+      selector: {matchLabels: {app: checkout}}
+      template:
+        metadata: {labels: {app: checkout}}
+        spec:
+          readinessGates:
+          - conditionType: lb.example.com/registered
+          containers:
+          - name: web
+            image: nginx:1.29-alpine
+    ```
+
+    ```bash
+    for p in $(kubectl -n lbgate get pods -l app=checkout -o name); do
+      kubectl -n lbgate patch "$p" --subresource=status --type=strategic \
+        -p '{"status":{"conditions":[{"type":"lb.example.com/registered","status":"True"}]}}'
+    done
+    kubectl -n lbgate get pods -o wide
+    kubectl -n lbgate get endpointslices -l kubernetes.io/service-name=checkout
+    ```
+  setup: |
+    k_ns lbgate
+    kubectl apply -f - >/dev/null <<'EOF'
+    apiVersion: v1
+    kind: Service
+    metadata: {name: checkout, namespace: lbgate}
+    spec:
+      selector: {app: checkout}
+      ports: [{port: 80, targetPort: 80}]
+    EOF
+  check: |
+    j() { kubectl -n lbgate get deploy checkout -o json 2>/dev/null; }
+    gate() { j | jq -e '[.spec.template.spec.readinessGates[]?.conditionType] | index("lb.example.com/registered")' >/dev/null; }
+    reg() { kubectl -n lbgate get pods -l app=checkout -o json 2>/dev/null | jq '[.items[] | select(.metadata.deletionTimestamp == null) | select(any(.status.conditions[]?; .type == "lb.example.com/registered" and .status == "True")) | select(any(.status.conditions[]?; .type == "Ready" and .status == "True"))] | length'; }
+    eps() { kubectl -n lbgate get endpointslices -l kubernetes.io/service-name=checkout -o json 2>/dev/null | jq '[.items[].endpoints[]? | select(.conditions.ready == true)] | length'; }
+    check "Deployment checkout exists" 'k_exists -n lbgate deploy checkout'
+    check "2 replicas of nginx labelled app=checkout" 'j | jq -e ".spec.replicas == 2 and .spec.template.metadata.labels.app == \"checkout\" and (.spec.template.spec.containers[0].image | startswith(\"nginx\"))"'
+    check "the pods declare the lb.example.com/registered readiness gate" gate
+    gate && eventually 30 '[ "$(reg)" = 2 ]'
+    check_eq "both pods are registered and Ready" "$(reg)" 2
+    gate && eventually 30 '[ "$(eps)" = 2 ]'
+    check_eq "Service checkout has 2 ready endpoints" "$(eps)" 2
+  solve: |
+    kubectl apply -f - >/dev/null <<'EOF'
+    apiVersion: apps/v1
+    kind: Deployment
+    metadata: {name: checkout, namespace: lbgate}
+    spec:
+      replicas: 2
+      selector: {matchLabels: {app: checkout}}
+      template:
+        metadata: {labels: {app: checkout}}
+        spec:
+          readinessGates:
+          - conditionType: lb.example.com/registered
+          containers:
+          - name: web
+            image: nginx:1.29-alpine
+    EOF
+    for i in $(seq 60); do
+      [ "$(kubectl -n lbgate get pods -l app=checkout --no-headers 2>/dev/null | wc -l)" -ge 2 ] && break
+      sleep 2
+    done
+    kubectl -n lbgate wait --for=condition=ContainersReady pod -l app=checkout --timeout=120s >/dev/null
+    for p in $(kubectl -n lbgate get pods -l app=checkout -o name); do
+      kubectl -n lbgate patch "$p" --subresource=status --type=strategic \
+        -p '{"status":{"conditions":[{"type":"lb.example.com/registered","status":"True"}]}}' >/dev/null
+    done
+    kubectl -n lbgate wait --for=condition=Ready pod -l app=checkout --timeout=60s >/dev/null
+
+- id: k8s-364
+  title: Evict the pods that are already broken
+  difficulty: 4
+  kind: fix
+  tags: [pdb, eviction, drain, unhealthy-pod-eviction-policy]
+  tutorial: |
+    **Concept.** A PodDisruptionBudget protects **healthy** pods, but by default it also stands guard over unhealthy ones. With the default policy (`IfHealthyBudget`) a Running pod that is not Ready may only be evicted while the application still has enough healthy pods. When every pod is unready, for example because they all wait for a database that is down, the budget is never met and a node drain hangs forever on pods that serve nothing. **`unhealthyPodEvictionPolicy: AlwaysAllow`** lets the eviction API remove Running-but-not-Ready pods regardless of the budget, while Ready pods stay protected as before. The eviction API also takes a **dry run**, which tells you whether an eviction would be allowed without doing it.
+
+    **Read up on:**
+    - Kubernetes docs: Specifying a Disruption Budget — Unhealthy Pod Eviction Policy
+    - `kubectl explain pdb.spec.unhealthyPodEvictionPolicy`
+    - Kubernetes docs: API-initiated Eviction
+    - `kubectl get pdb` — `ALLOWED DISRUPTIONS`
+  scenario: |
+    In namespace **`reports`**, the 3 pods of Deployment **`reports`** are Running but not Ready:
+    they wait for a database that is offline until a migration finishes tomorrow. That is
+    expected, **leave the Deployment and its pods alone**.
+
+    Tonight node01 is drained for a kernel update, and the drain hangs: the budget
+    **`reports-pdb`** refuses to evict any `reports` pod.
+
+    Change **`reports-pdb`** so that pods which are **not healthy can always be evicted**, while
+    healthy pods keep the current protection. Keep its name, its selector (`app=reports`) and
+    **`minAvailable: 2`**.
+
+    The check asks the eviction API, as a dry run, to evict a `reports` pod: it must be
+    accepted.
+  hints:
+    - "`kubectl -n reports get pdb` shows 0 allowed disruptions: no pod is healthy, so the budget can never be met."
+    - "Try it: `kubectl drain node01 --ignore-daemonsets --delete-emptydir-data --dry-run=server` (nothing is evicted)."
+    - "`kubectl explain pdb.spec` — one field decides how the budget treats pods that are Running but not Ready."
+  solution: |
+    ```bash
+    kubectl -n reports patch pdb reports-pdb --type=merge \
+      -p '{"spec":{"unhealthyPodEvictionPolicy":"AlwaysAllow"}}'
+    ```
+
+    A dry-run eviction to prove it:
+
+    ```bash
+    pod=$(kubectl -n reports get pods -l app=reports -o jsonpath='{.items[0].metadata.name}')
+    echo '{"apiVersion":"policy/v1","kind":"Eviction","metadata":{"name":"'$pod'","namespace":"reports"},"deleteOptions":{"dryRun":["All"]}}' >/tmp/evict.json
+    kubectl create --raw /api/v1/namespaces/reports/pods/$pod/eviction -f /tmp/evict.json
+    ```
+  setup: |
+    k_ns reports
+    kubectl apply -f - >/dev/null <<'EOF'
+    apiVersion: apps/v1
+    kind: Deployment
+    metadata: {name: reports, namespace: reports}
+    spec:
+      replicas: 3
+      selector: {matchLabels: {app: reports}}
+      template:
+        metadata: {labels: {app: reports}}
+        spec:
+          containers:
+          - name: reports
+            image: nginx:1.29-alpine
+            readinessProbe:
+              exec: {command: ["test", "-f", "/tmp/db-ready"]}
+              periodSeconds: 5
+    ---
+    apiVersion: policy/v1
+    kind: PodDisruptionBudget
+    metadata: {name: reports-pdb, namespace: reports}
+    spec:
+      minAvailable: 2
+      selector: {matchLabels: {app: reports}}
+    EOF
+    eventually 120 '[ "$(kubectl -n reports get pods -l app=reports --field-selector=status.phase=Running -o name | wc -l)" = 3 ]' || true
+  check: |
+    p() { kubectl -n reports get pdb reports-pdb -o json 2>/dev/null; }
+    evict_dry() {
+      local pod
+      pod=$(kubectl -n reports get pods -l app=reports --field-selector=status.phase=Running -o jsonpath='{.items[0].metadata.name}' 2>/dev/null)
+      [ -n "$pod" ] || return 1
+      printf '{"apiVersion":"policy/v1","kind":"Eviction","metadata":{"name":"%s","namespace":"reports"},"deleteOptions":{"dryRun":["All"]}}' "$pod" >"$KL_STATE/evict-364.json"
+      kubectl create --raw "/api/v1/namespaces/reports/pods/$pod/eviction" -f "$KL_STATE/evict-364.json" >/dev/null 2>&1
+    }
+    pol=$(kj -n reports pdb reports-pdb '{.spec.unhealthyPodEvictionPolicy}')
+    check "reports-pdb keeps minAvailable 2 and selects app=reports" 'p | jq -e ".spec.minAvailable == 2 and .spec.selector.matchLabels.app == \"reports\""'
+    check_eq "pods that are not healthy may always be evicted" "$pol" AlwaysAllow
+    check "the Deployment still waits for the database" 'kj -n reports deploy reports "{.spec.template.spec.containers[0].readinessProbe.exec.command}" | grep -q db-ready'
+    check_eq "the reports pods are still not Ready" "$(ready_pods reports app=reports)" 0
+    [ "$pol" = AlwaysAllow ] && eventually 30 evict_dry
+    check "the eviction API accepts evicting a reports pod (dry run)" evict_dry
+  solve: |
+    kubectl -n reports patch pdb reports-pdb --type=merge -p '{"spec":{"unhealthyPodEvictionPolicy":"AlwaysAllow"}}'
+
+- id: k8s-365
+  title: Re-target a queued Job
+  difficulty: 4
+  kind: fix
+  tags: [job, suspend, node-selector, scheduling, batch]
+  tutorial: |
+    **Concept.** A Job's pod template is immutable: once a Job exists you can't change what its pods look like. There is one exception, built for batch queueing systems: while a Job is **suspended and has never started**, its **scheduling directives** (node selector, node affinity, tolerations, scheduling gates, labels and annotations of the template) may still be changed. A queue controller creates Jobs suspended, decides where they should run, writes that into the template, and only then resumes them. Resume first and the template is frozen again.
+
+    **Read up on:**
+    - Kubernetes docs: Jobs — Mutable Scheduling Directives
+    - `kubectl explain job.spec.suspend`
+    - `kubectl explain job.spec.template.spec.nodeSelector`
+    - `kubectl get nodes --show-labels` — the `kubernetes.io/hostname` label
+  scenario: |
+    In namespace **`render`**, the Job **`frames`** was queued (suspended) for a GPU node pool that
+    was never bought: its pods select the node label `accelerator=nvidia-a100`, which no node has.
+
+    Make it run on **node01** instead, and let it start:
+
+    - keep **the same Job** (don't delete and recreate it: its UID must not change)
+    - its pod template must select **`kubernetes.io/hostname: node01`** in its node selector, and
+      no longer ask for the `accelerator` label
+    - the Job must run and end **Complete**, with all 3 pods having run on node01
+  hints:
+    - "Try `kubectl -n render edit job frames` on the pod template: the error message explains when such a change is allowed."
+    - "The order matters: change the template while the Job is still suspended, then resume it."
+    - "A JSON patch can replace `/spec/template/spec/nodeSelector` as a whole; a merge patch then sets `spec.suspend` to `false`."
+  solution: |
+    ```bash
+    kubectl -n render patch job frames --type=json -p \
+      '[{"op":"replace","path":"/spec/template/spec/nodeSelector","value":{"kubernetes.io/hostname":"node01"}}]'
+    kubectl -n render patch job frames --type=merge -p '{"spec":{"suspend":false}}'
+    kubectl -n render wait --for=condition=complete job/frames --timeout=120s
+    kubectl -n render get pods -o wide
+    ```
+  setup: |
+    k_ns render
+    kubectl apply -f - >/dev/null <<'EOF'
+    apiVersion: batch/v1
+    kind: Job
+    metadata: {name: frames, namespace: render}
+    spec:
+      suspend: true
+      completions: 3
+      parallelism: 3
+      template:
+        spec:
+          restartPolicy: Never
+          nodeSelector: {accelerator: nvidia-a100}
+          containers:
+          - name: render
+            image: busybox:1.37
+            command: ["sh", "-c", "echo \"frame rendered on $(hostname)\"; sleep 3"]
+    EOF
+    kj -n render job frames '{.metadata.uid}' >"$KL_STATE/uid-365"
+  check: |
+    uid=$(cat "$KL_STATE/uid-365" 2>/dev/null)
+    complete() { [ "$(kj -n render job frames '{.status.conditions[?(@.type=="Complete")].status}')" = True ]; }
+    susp=$(kj -n render job frames '{.spec.suspend}')
+    check_eq "frames is still the original Job" "$(kj -n render job frames '{.metadata.uid}')" "$uid"
+    check_eq "the Job is no longer suspended" "$susp" false
+    check_eq "its pods select kubernetes.io/hostname=node01" "$(kj -n render job frames '{.spec.template.spec.nodeSelector.kubernetes\.io/hostname}')" node01
+    check "its pods no longer ask for the GPU label" 'k_exists -n render job frames && ! kj -n render job frames "{.spec.template.spec.nodeSelector}" | grep -q accelerator'
+    [ "$susp" = false ] && eventually 90 complete
+    check "the Job is Complete" complete
+    nodes=$(kubectl -n render get pods -l "batch.kubernetes.io/controller-uid=$uid" -o jsonpath='{range .items[*]}{.spec.nodeName}{"\n"}{end}' 2>/dev/null | sort -u | paste -sd' ')
+    check_eq "all frames were rendered on node01" "$nodes" node01
+  solve: |
+    kubectl -n render patch job frames --type=json -p '[{"op":"replace","path":"/spec/template/spec/nodeSelector","value":{"kubernetes.io/hostname":"node01"}}]'
+    kubectl -n render patch job frames --type=merge -p '{"spec":{"suspend":false}}'
+    kubectl -n render wait --for=condition=complete job/frames --timeout=120s
+
+- id: k8s-366
+  title: A corrupt shard shouldn't sink the import
+  difficulty: 4
+  kind: fix
+  tags: [job, indexed, pod-failure-policy, backoff-limit-per-index, batch]
+  tutorial: |
+    **Concept.** Per-index retries and pod failure policies combine. With `backoffLimitPerIndex` set, a pod failure policy rule may use the action **`FailIndex`**: the index whose pod matched is marked failed at once, without using up its retries, and the other indexes go on. Ordinary failures still get their per-index retries. **`maxFailedIndexes`** adds a safety net: once more indexes than that have failed, the whole Job stops, because the input is clearly broken. Note that the Job-wide `backoffLimit` still applies if you set it, and that most of a Job's spec is immutable, so changing its failure handling means recreating it.
+
+    **Read up on:**
+    - Kubernetes docs: Jobs — Backoff limit per index, Pod failure policy
+    - `kubectl explain job.spec.maxFailedIndexes`
+    - `kubectl explain job.spec.podFailurePolicy.rules.action` — `FailIndex`
+    - `kubectl get job -o yaml` — strip `status`, `selector` and generated labels before reusing it
+  scenario: |
+    In namespace **`import`**, the Indexed Job **`import`** loads 6 shards, 3 at a time, with the
+    script in ConfigMap **`import-script`**. One shard has corrupt input: the script then exits
+    with code **3**. Today that shard is retried until the Job-wide `backoffLimit` runs out, and
+    the whole import fails with it.
+
+    Recreate the Job **`import`** (same name, same image, same script and volume, **6
+    completions**, **3 in parallel**, Indexed) so that:
+
+    - an ordinary failure of a shard is retried up to **2 times**, counted **per shard**
+    - exit code **3** fails **only that shard**, **immediately**, without any retry
+    - if more than **2** shards fail, the whole Job stops
+
+    When it has finished, every good shard must be completed, the corrupt shard must be listed
+    in `failedIndexes`, and the corrupt shard must have run **exactly once**.
+  hints:
+    - "`kubectl -n import logs -l job-name=import --prefix` shows which shard is corrupt; `kubectl -n import get job import -o yaml` shows the current spec."
+    - "Three Job fields are involved: `backoffLimitPerIndex`, `maxFailedIndexes`, and a `podFailurePolicy` rule with the action `FailIndex`. Leave out the old `backoffLimit`: it would still stop the whole Job."
+    - "The spec can't be changed in place: delete the Job and create the new one. A pod failure policy needs `restartPolicy: Never`."
+  solution: |
+    ```bash
+    kubectl -n import delete job import
+    kubectl apply -f - <<'EOF'
+    apiVersion: batch/v1
+    kind: Job
+    metadata: {name: import, namespace: import}
+    spec:
+      completionMode: Indexed
+      completions: 6
+      parallelism: 3
+      backoffLimitPerIndex: 2
+      maxFailedIndexes: 2
+      podFailurePolicy:
+        rules:
+        - action: FailIndex
+          onExitCodes: {operator: In, values: [3]}
+      template:
+        spec:
+          restartPolicy: Never
+          containers:
+          - name: import
+            image: busybox:1.37
+            command: ["sh", "/scripts/run.sh"]
+            volumeMounts: [{name: scripts, mountPath: /scripts}]
+          volumes:
+          - name: scripts
+            configMap: {name: import-script}
+    EOF
+    kubectl -n import get job import -o jsonpath='{.status.completedIndexes} / {.status.failedIndexes}'
+    ```
+  setup: |
+    k_ns import
+    bad=$((RANDOM % 6))
+    echo "$bad" >"$KL_STATE/bad-366"
+    cat >"$KL_STATE/run-366.sh" <<EOF
+    #!/bin/sh
+    i=\$JOB_COMPLETION_INDEX
+    echo "shard \$i: importing"
+    sleep 2
+    if [ "\$i" = "$bad" ]; then
+      echo "shard \$i: corrupt input, giving up" >&2
+      exit 3
+    fi
+    echo "shard \$i: imported"
+    EOF
+    kubectl -n import create configmap import-script --from-file=run.sh="$KL_STATE/run-366.sh" >/dev/null
+    kubectl apply -f - >/dev/null <<'EOF'
+    apiVersion: batch/v1
+    kind: Job
+    metadata: {name: import, namespace: import}
+    spec:
+      completionMode: Indexed
+      completions: 6
+      parallelism: 3
+      backoffLimit: 1
+      template:
+        spec:
+          restartPolicy: Never
+          containers:
+          - name: import
+            image: busybox:1.37
+            command: ["sh", "/scripts/run.sh"]
+            volumeMounts: [{name: scripts, mountPath: /scripts}]
+          volumes:
+          - name: scripts
+            configMap: {name: import-script}
+    EOF
+  check: |
+    j() { kubectl -n import get job import -o json 2>/dev/null; }
+    expand() {
+      local out="" p parts
+      IFS=, read -ra parts <<<"$1"
+      for p in "${parts[@]}"; do
+        if [[ $p == *-* ]]; then out="$out $(seq -s ' ' "${p%-*}" "${p#*-}")"; else out="$out $p"; fi
+      done
+      echo $out
+    }
+    rule() { j | jq -e '[.spec.podFailurePolicy.rules[]? | select(.action == "FailIndex" and .onExitCodes.operator == "In" and (.onExitCodes.values | index(3)))] | length > 0' >/dev/null; }
+    finished() { [ -n "$(kj -n import job import '{.status.conditions[?(@.type=="Failed")].status}{.status.conditions[?(@.type=="Complete")].status}')" ]; }
+    bad=$(cat "$KL_STATE/bad-366" 2>/dev/null)
+    want=$(seq 0 5 | grep -vx "$bad" | paste -sd' ')
+    check "Job import exists" 'k_exists -n import job import'
+    check "Indexed, 6 completions, 3 in parallel, running run.sh" 'j | jq -e ".spec.completionMode == \"Indexed\" and .spec.completions == 6 and .spec.parallelism == 3 and (.spec.template.spec.containers[0].command | join(\" \") | contains(\"run.sh\"))"'
+    check "2 retries per shard, at most 2 failed shards" 'j | jq -e ".spec.backoffLimitPerIndex == 2 and .spec.maxFailedIndexes == 2"'
+    check "exit code 3 fails only that shard" rule
+    rule && eventually 120 finished
+    check_eq "every good shard completed" "$(expand "$(kj -n import job import '{.status.completedIndexes}')")" "$want"
+    check_eq "the corrupt shard is reported failed" "$(kj -n import job import '{.status.failedIndexes}')" "$bad"
+    uid=$(kj -n import job import '{.metadata.uid}')
+    check_eq "the corrupt shard ran exactly once" "$(kubectl -n import get pods -l "batch.kubernetes.io/controller-uid=$uid,batch.kubernetes.io/job-completion-index=$bad" -o name 2>/dev/null | wc -l)" 1
+  solve: |
+    if ! kubectl -n import get job import -o jsonpath='{.spec.podFailurePolicy}' 2>/dev/null | grep -q FailIndex; then
+      kubectl -n import delete job import --ignore-not-found --wait=true >/dev/null
+    fi
+    kubectl apply -f - >/dev/null <<'EOF'
+    apiVersion: batch/v1
+    kind: Job
+    metadata: {name: import, namespace: import}
+    spec:
+      completionMode: Indexed
+      completions: 6
+      parallelism: 3
+      backoffLimitPerIndex: 2
+      maxFailedIndexes: 2
+      podFailurePolicy:
+        rules:
+        - action: FailIndex
+          onExitCodes: {operator: In, values: [3]}
+      template:
+        spec:
+          restartPolicy: Never
+          containers:
+          - name: import
+            image: busybox:1.37
+            command: ["sh", "/scripts/run.sh"]
+            volumeMounts: [{name: scripts, mountPath: /scripts}]
+          volumes:
+          - name: scripts
+            configMap: {name: import-script}
+    EOF
+
+- id: k8s-367
+  title: "Incident: the nightly batch is stuck"
+  difficulty: 5
+  kind: fix
+  tags: [incident, troubleshooting, job, scheduling-gates, readiness-gates, suspend]
+  tutorial: |
+    **Concept.** Batch pipelines fail quietly. A Job that never starts, one that gave up, and one that nobody resumed all look the same from far away: the report isn't there in the morning. Work through each object: `kubectl get jobs` (completions, age), `kubectl get pods` (status column: `SchedulingGated`, `Pending`, `Running` but not Ready), `kubectl describe` and the Job's conditions (reasons such as `DeadlineExceeded`). Then look for what was supposed to move it forward: a controller that removes a gate, sets a condition or resumes a Job. If that controller is gone, the fix belongs in the spec, not in one-off patches that the next run will need again.
+
+    **Read up on:**
+    - `kubectl get job -o jsonpath='{.status.conditions}'` — `Failed` reasons
+    - `kubectl explain job.spec.activeDeadlineSeconds`, `job.spec.suspend`
+    - `kubectl explain pod.spec.schedulingGates`, `pod.spec.readinessGates`
+    - `kubectl get pods -o wide` — the `READINESS GATES` column
+  scenario: |
+    Namespace **`nightly`** runs the nightly batch and its status page. Nothing has worked since
+    two platform controllers were decommissioned last week: the **quota operator** (it released
+    pods gated with `quota.example.com/approved`) and the **load-balancer integration** (it set
+    the pod condition `lb.example.com/registered`). Neither is coming back. On top of that,
+    someone changed the batch during the outage. The symptoms:
+
+    1. Job **`extract`** has had a pod for hours that never got a node.
+    2. Job **`transform`** fails after a few seconds, although its work takes about 25 seconds.
+    3. The 2 pods of Deployment **`status-page`** are Running but never Ready, and Service
+       `status-page` has no endpoints.
+    4. Job **`cleanup`** never started.
+
+    Get everything working:
+
+    - Jobs **`extract`**, **`transform`** and **`cleanup`** end **Complete**. `transform` must do
+      the same work (keep its command) and must be allowed **at least 60 seconds** if it has a
+      deadline at all.
+    - **`status-page`** runs **2/2 Ready** pods that **no longer depend on the decommissioned
+      integration** (no readiness gates in its pod template), and Service `status-page` has 2
+      ready endpoints.
+  hints:
+    - "`kubectl -n nightly get pods -o wide` already tells three stories: look at STATUS and READINESS GATES."
+    - "`kubectl -n nightly get job transform -o jsonpath='{.status.conditions[*].reason}'`, then compare its spec with the 25 seconds of work. A failed Job doesn't run again: it has to be recreated."
+    - "Gates and conditions are owned by controllers that no longer exist: remove the gate from the waiting pod, and remove the readiness gate from the Deployment's template."
+    - "`kubectl -n nightly get job cleanup -o jsonpath='{.spec.suspend}'`."
+  solution: |
+    ```bash
+    # 1. extract: release the pod from the gate nobody will remove
+    for p in $(kubectl -n nightly get pods -l job-name=extract -o name); do
+      kubectl -n nightly patch "$p" --type=merge -p '{"spec":{"schedulingGates":null}}'
+    done
+
+    # 2. transform: DeadlineExceeded after 10s. Recreate it with time to finish
+    kubectl -n nightly get job transform -o yaml > transform.yaml
+    #   edit: activeDeadlineSeconds: 120; remove status, spec.selector and the
+    #   controller-uid / job-name labels of the template
+    kubectl -n nightly delete job transform
+    kubectl apply -f transform.yaml
+
+    # 3. status-page: drop the readiness gate of the retired integration
+    kubectl -n nightly patch deploy status-page --type=json \
+      -p '[{"op":"remove","path":"/spec/template/spec/readinessGates"}]'
+
+    # 4. cleanup: it was left suspended
+    kubectl -n nightly patch job cleanup --type=merge -p '{"spec":{"suspend":false}}'
+
+    kubectl -n nightly wait --for=condition=complete job --all --timeout=120s
+    kubectl -n nightly rollout status deploy status-page
+    ```
+  setup: |
+    k_ns nightly
+    kubectl apply -f - >/dev/null <<'EOF'
+    apiVersion: batch/v1
+    kind: Job
+    metadata: {name: extract, namespace: nightly}
+    spec:
+      template:
+        spec:
+          restartPolicy: Never
+          schedulingGates:
+          - name: quota.example.com/approved
+          containers:
+          - name: extract
+            image: busybox:1.37
+            command: ["sh", "-c", "echo extracting; sleep 2; echo extracted"]
+    ---
+    apiVersion: batch/v1
+    kind: Job
+    metadata: {name: transform, namespace: nightly}
+    spec:
+      activeDeadlineSeconds: 10
+      backoffLimit: 2
+      template:
+        spec:
+          restartPolicy: Never
+          containers:
+          - name: transform
+            image: busybox:1.37
+            command: ["sh", "-c", "echo transforming; sleep 25; echo transformed"]
+    ---
+    apiVersion: batch/v1
+    kind: Job
+    metadata: {name: cleanup, namespace: nightly}
+    spec:
+      suspend: true
+      template:
+        spec:
+          restartPolicy: Never
+          containers:
+          - name: cleanup
+            image: busybox:1.37
+            command: ["sh", "-c", "echo removing temporary files; sleep 2"]
+    ---
+    apiVersion: apps/v1
+    kind: Deployment
+    metadata: {name: status-page, namespace: nightly}
+    spec:
+      replicas: 2
+      selector: {matchLabels: {app: status-page}}
+      template:
+        metadata: {labels: {app: status-page}}
+        spec:
+          readinessGates:
+          - conditionType: lb.example.com/registered
+          containers:
+          - name: web
+            image: nginx:1.29-alpine
+    ---
+    apiVersion: v1
+    kind: Service
+    metadata: {name: status-page, namespace: nightly}
+    spec:
+      selector: {app: status-page}
+      ports: [{port: 80, targetPort: 80}]
+    EOF
+    eventually 60 '[ -n "$(kj -n nightly job transform "{.status.conditions[?(@.type==\"Failed\")].status}")" ]' || true
+  check: |
+    complete() { [ "$(kj -n nightly job "$1" '{.status.conditions[?(@.type=="Complete")].status}')" = True ]; }
+    failed() { [ "$(kj -n nightly job "$1" '{.status.conditions[?(@.type=="Failed")].status}')" = True ]; }
+    gated() { kubectl -n nightly get pods -l job-name=extract -o json 2>/dev/null | jq -e '[.items[] | select(.metadata.deletionTimestamp == null and ((.spec.schedulingGates // []) | length) > 0)] | length > 0' >/dev/null; }
+    tj() { kubectl -n nightly get job transform -o json 2>/dev/null; }
+    eps() { kubectl -n nightly get endpointslices -l kubernetes.io/service-name=status-page -o json 2>/dev/null | jq '[.items[].endpoints[]? | select(.conditions.ready == true)] | length'; }
+
+    info "extract"
+    k_exists -n nightly job extract && ! gated && eventually 60 'complete extract || failed extract'
+    check "extract completed" 'complete extract'
+
+    info "transform"
+    check "transform still does the same work" 'tj | jq -e ".spec.template.spec.containers[0].command | join(\" \") | contains(\"sleep 25\")"'
+    check "transform is allowed at least 60 seconds" 'tj | jq -e "(.spec.activeDeadlineSeconds // 86400) >= 60"'
+    tj | jq -e '(.spec.activeDeadlineSeconds // 86400) >= 60' >/dev/null 2>&1 && ! failed transform && eventually 90 'complete transform || failed transform'
+    check "transform completed" 'complete transform'
+
+    info "status-page"
+    check_eq "no readiness gates left in the pod template" "$(kj -n nightly deploy status-page '{.spec.template.spec.readinessGates}')" ""
+    check "status-page runs 2/2 Ready pods" '[ -z "$(kj -n nightly deploy status-page "{.spec.template.spec.readinessGates}")" ] && [ "$(kj -n nightly deploy status-page "{.spec.replicas}")" = 2 ] && wait_deploy nightly status-page 120'
+    deploy_ready nightly status-page && eventually 30 '[ "$(eps)" = 2 ]'
+    check_eq "Service status-page has 2 ready endpoints" "$(eps)" 2
+
+    info "cleanup"
+    susp=$(kj -n nightly job cleanup '{.spec.suspend}')
+    check_eq "cleanup is no longer suspended" "$susp" false
+    [ "$susp" = false ] && eventually 60 'complete cleanup || failed cleanup'
+    check "cleanup completed" 'complete cleanup'
+  solve: |
+    for p in $(kubectl -n nightly get pods -l job-name=extract -o name); do
+      kubectl -n nightly patch "$p" --type=merge -p '{"spec":{"schedulingGates":null}}' >/dev/null
+    done
+    if [ "$(kubectl -n nightly get job transform -o jsonpath='{.spec.activeDeadlineSeconds}' 2>/dev/null)" = 10 ]; then
+      kubectl -n nightly delete job transform --wait=true >/dev/null
+    fi
+    kubectl apply -f - >/dev/null <<'EOF'
+    apiVersion: batch/v1
+    kind: Job
+    metadata: {name: transform, namespace: nightly}
+    spec:
+      activeDeadlineSeconds: 120
+      backoffLimit: 2
+      template:
+        spec:
+          restartPolicy: Never
+          containers:
+          - name: transform
+            image: busybox:1.37
+            command: ["sh", "-c", "echo transforming; sleep 25; echo transformed"]
+    EOF
+    kubectl -n nightly patch deploy status-page --type=merge -p '{"spec":{"template":{"spec":{"readinessGates":null}}}}' >/dev/null
+    kubectl -n nightly patch job cleanup --type=merge -p '{"spec":{"suspend":false}}' >/dev/null
+    kubectl -n nightly wait --for=condition=complete job/extract job/transform job/cleanup --timeout=150s >/dev/null
+    kubectl -n nightly rollout status deploy status-page --timeout=120s >/dev/null
+
+- id: k8s-368
+  title: "Incident: maintenance night"
+  difficulty: 5
+  kind: fix
+  tags: [incident, troubleshooting, pdb, daemonset, internal-traffic-policy, statefulset, pvc]
+  tutorial: |
+    **Concept.** Maintenance is when the fine print of an object starts to matter: how a budget treats pods that are already broken, what a node-local Service does on a node with no local endpoint, what a StatefulSet does with the disks of replicas it no longer runs. None of these show up while everything is healthy and nothing moves. Before you change anything, find out for each symptom which object is responsible and which field decides its behaviour; the fix is usually one field, and the wrong fix (removing the budget, sending node-local traffic across nodes) creates the next incident.
+
+    **Read up on:**
+    - `kubectl explain pdb.spec.unhealthyPodEvictionPolicy`
+    - `kubectl explain service.spec.internalTrafficPolicy`, `kubectl explain daemonset.spec.template.spec.tolerations`
+    - `kubectl explain statefulset.spec.persistentVolumeClaimRetentionPolicy`
+    - `kubectl describe node controlplane` — `Taints`
+  scenario: |
+    Tonight is maintenance night in namespace **`maint`**, and three things stand in the way:
+
+    1. **The drain hangs.** Draining node01 waits forever on the 3 pods of Deployment
+       **`reports`**. They are Running but not Ready because they wait for a database that is
+       offline until tomorrow: **leave the Deployment and its pods alone**. The budget
+       **`reports-pdb`** must keep demanding `minAvailable: 2` for healthy pods (same name and
+       selector), but must let pods that aren't healthy be evicted. The check asks the eviction
+       API, as a dry run, to evict a `reports` pod.
+    2. **Timeouts on the control plane.** Clients on **`controlplane`** time out when they call
+       Service **`agent`**; clients on node01 are fine. The agent is a DaemonSet **`agent`** that
+       is meant to run on **every** node, and the Service must keep sending each client **only
+       to the agent on its own node**. Each node must end with its own Ready agent, and a client
+       on either node must reach that node's agent.
+    3. **Disks nobody uses.** StatefulSet **`ledger`** was scaled from 3 replicas to 1, but the
+       claims **`data-ledger-1`** and **`data-ledger-2`** are still there. Remove them (keep
+       **`data-ledger-0`**, the same claim, and a Ready `ledger-0`), and make sure future
+       scale-downs **delete** the claims of removed replicas, while **deleting** the StatefulSet
+       still **keeps** its claims. `ledger` stays at 1 replica.
+  hints:
+    - "1: `kubectl -n maint get pdb` shows 0 allowed disruptions, and no pod is healthy. One budget field changes how unhealthy pods are treated."
+    - "2: `kubectl -n maint get pods -o wide -l app=agent` and `kubectl -n maint get svc agent -o yaml`. Why is there no agent on the control plane? `kubectl describe node controlplane | grep Taints`."
+    - "2: Switching the Service to `Cluster` would hide the problem and break the node-local design; the DaemonSet needs a toleration."
+    - "3: Delete the two orphaned claims, then set `persistentVolumeClaimRetentionPolicy` on the StatefulSet."
+  solution: |
+    ```bash
+    # 1. let the budget evict pods that are not healthy anyway
+    kubectl -n maint patch pdb reports-pdb --type=merge \
+      -p '{"spec":{"unhealthyPodEvictionPolicy":"AlwaysAllow"}}'
+
+    # 2. the agent didn't tolerate the control-plane taint, and the Service is node-local
+    kubectl -n maint patch ds agent --type=merge -p \
+      '{"spec":{"template":{"spec":{"tolerations":[{"key":"node-role.kubernetes.io/control-plane","operator":"Exists","effect":"NoSchedule"}]}}}}'
+    kubectl -n maint rollout status ds agent
+
+    # 3. orphaned claims and the retention policy
+    kubectl -n maint delete pvc data-ledger-1 data-ledger-2
+    kubectl -n maint patch sts ledger --type=merge -p \
+      '{"spec":{"persistentVolumeClaimRetentionPolicy":{"whenScaled":"Delete","whenDeleted":"Retain"}}}'
+    ```
+  setup: |
+    k_ns maint
+    kubectl apply -f - >/dev/null <<'EOF'
+    apiVersion: apps/v1
+    kind: Deployment
+    metadata: {name: reports, namespace: maint}
+    spec:
+      replicas: 3
+      selector: {matchLabels: {app: reports}}
+      template:
+        metadata: {labels: {app: reports}}
+        spec:
+          containers:
+          - name: reports
+            image: nginx:1.29-alpine
+            readinessProbe:
+              exec: {command: ["test", "-f", "/tmp/db-ready"]}
+              periodSeconds: 5
+    ---
+    apiVersion: policy/v1
+    kind: PodDisruptionBudget
+    metadata: {name: reports-pdb, namespace: maint}
+    spec:
+      minAvailable: 2
+      selector: {matchLabels: {app: reports}}
+    ---
+    apiVersion: apps/v1
+    kind: DaemonSet
+    metadata: {name: agent, namespace: maint}
+    spec:
+      selector: {matchLabels: {app: agent}}
+      template:
+        metadata: {labels: {app: agent}}
+        spec:
+          containers:
+          - name: agent
+            image: traefik/whoami:v1.10
+            ports: [{containerPort: 80}]
+    ---
+    apiVersion: v1
+    kind: Service
+    metadata: {name: agent, namespace: maint}
+    spec:
+      selector: {app: agent}
+      internalTrafficPolicy: Local
+      ports: [{port: 80, targetPort: 80}]
+    ---
+    apiVersion: v1
+    kind: Service
+    metadata: {name: ledger, namespace: maint}
+    spec:
+      clusterIP: None
+      selector: {app: ledger}
+      ports: [{port: 80}]
+    ---
+    apiVersion: apps/v1
+    kind: StatefulSet
+    metadata: {name: ledger, namespace: maint}
+    spec:
+      serviceName: ledger
+      replicas: 3
+      podManagementPolicy: Parallel
+      selector: {matchLabels: {app: ledger}}
+      template:
+        metadata: {labels: {app: ledger}}
+        spec:
+          terminationGracePeriodSeconds: 2
+          containers:
+          - name: ledger
+            image: busybox:1.37
+            command: ["sh", "-c", "date >> /data/started; sleep infinity"]
+            volumeMounts: [{name: data, mountPath: /data}]
+      volumeClaimTemplates:
+      - metadata: {name: data}
+        spec:
+          accessModes: [ReadWriteOnce]
+          resources: {requests: {storage: 64Mi}}
+    EOF
+    eventually 180 '[ "$(kj -n maint sts ledger "{.status.readyReplicas}")" = 3 ]' || true
+    kubectl -n maint scale sts ledger --replicas=1 >/dev/null
+    eventually 60 '! k_exists -n maint pod ledger-1 && ! k_exists -n maint pod ledger-2' || true
+    kj -n maint pvc data-ledger-0 '{.metadata.uid}' >"$KL_STATE/uid-368"
+    eventually 60 '[ "$(kj -n maint ds agent "{.status.numberReady}")" = 1 ]' || true
+    eventually 60 '[ "$(kubectl -n maint get pods -l app=reports --field-selector=status.phase=Running -o name | wc -l)" = 3 ]' || true
+  check: |
+    evict_dry() {
+      local pod
+      pod=$(kubectl -n maint get pods -l app=reports --field-selector=status.phase=Running -o jsonpath='{.items[0].metadata.name}' 2>/dev/null)
+      [ -n "$pod" ] || return 1
+      printf '{"apiVersion":"policy/v1","kind":"Eviction","metadata":{"name":"%s","namespace":"maint"},"deleteOptions":{"dryRun":["All"]}}' "$pod" >"$KL_STATE/evict-368.json"
+      kubectl create --raw "/api/v1/namespaces/maint/pods/$pod/eviction" -f "$KL_STATE/evict-368.json" >/dev/null 2>&1
+    }
+    agent_on() { kubectl -n maint get pods -l app=agent -o json 2>/dev/null | jq -r --arg n "$1" '[.items[] | select(.spec.nodeName == $n and .metadata.deletionTimestamp == null) | .metadata.name][0] // empty'; }
+    from() {
+      local out="" t
+      for t in 1 2 3; do
+        out=$(timeout 90 kubectl -n maint run "kl-from-$RANDOM" --rm -i --restart=Never --quiet \
+          --image=curlimages/curl:8.11.1 \
+          --overrides="{\"apiVersion\":\"v1\",\"spec\":{\"nodeName\":\"$1\",\"tolerations\":[{\"operator\":\"Exists\"}]}}" \
+          --command -- sh -c "for i in 1 2 3 4 5 6; do curl -s -m 3 http://agent/ | sed -n 's/^Hostname: //p'; done" 2>/dev/null | sort -u | paste -sd' ')
+        [ -n "$out" ] && break
+        sleep 2
+      done
+      echo "$out"
+    }
+    claims() { kubectl -n maint get pvc -o json 2>/dev/null | jq -r '[.items[] | select(.metadata.deletionTimestamp == null) | .metadata.name] | sort | join(" ")'; }
+
+    info "1. The drain hangs"
+    pol=$(kj -n maint pdb reports-pdb '{.spec.unhealthyPodEvictionPolicy}')
+    check "reports-pdb keeps minAvailable 2 and selects app=reports" 'kubectl -n maint get pdb reports-pdb -o json | jq -e ".spec.minAvailable == 2 and .spec.selector.matchLabels.app == \"reports\""'
+    check_eq "pods that are not healthy may always be evicted" "$pol" AlwaysAllow
+    check "the reports Deployment still waits for the database" 'kj -n maint deploy reports "{.spec.template.spec.containers[0].readinessProbe.exec.command}" | grep -q db-ready'
+    [ "$pol" = AlwaysAllow ] && eventually 30 evict_dry
+    check "the eviction API accepts evicting a reports pod (dry run)" evict_dry
+
+    info "2. Timeouts on the control plane"
+    check_eq "Service agent still keeps traffic on the client's node" "$(kj -n maint svc agent '{.spec.internalTrafficPolicy}')" Local
+    desired=$(kj -n maint ds agent '{.status.desiredNumberScheduled}')
+    check_eq "the agent is meant to run on both nodes" "$desired" 2
+    [ "$desired" = 2 ] && eventually 90 '[ "$(kj -n maint ds agent "{.status.numberReady} {.status.updatedNumberScheduled}")" = "2 2" ]'
+    check_eq "an agent is Ready on each node" "$(kj -n maint ds agent '{.status.numberReady}')" 2
+    for n in controlplane node01; do
+      a=$(agent_on "$n")
+      if [ -n "$a" ] && [ "$(kj -n maint svc agent '{.spec.internalTrafficPolicy}')" = Local ]; then
+        check_eq "a client on $n reaches the agent on $n" "$(from "$n")" "$a"
+      else
+        check "a client on $n reaches the agent on $n" false
+      fi
+    done
+
+    info "3. Disks nobody uses"
+    check_eq "scale-downs delete claims, deleting the StatefulSet keeps them" "$(kj -n maint sts ledger '{.spec.persistentVolumeClaimRetentionPolicy.whenScaled} {.spec.persistentVolumeClaimRetentionPolicy.whenDeleted}')" "Delete Retain"
+    check_eq "ledger still runs 1 replica" "$(kj -n maint sts ledger '{.spec.replicas}')" 1
+    check_eq "only data-ledger-0 is left" "$(claims | tr ' ' '\n' | grep '^data-ledger-' | paste -sd' ')" data-ledger-0
+    check_eq "data-ledger-0 is the original claim" "$(kj -n maint pvc data-ledger-0 '{.metadata.uid}')" "$(cat "$KL_STATE/uid-368" 2>/dev/null)"
+    check "ledger-0 is Ready" 'wait_pod maint ledger-0 90'
+  solve: |
+    kubectl -n maint patch pdb reports-pdb --type=merge -p '{"spec":{"unhealthyPodEvictionPolicy":"AlwaysAllow"}}'
+    kubectl -n maint patch ds agent --type=merge -p '{"spec":{"template":{"spec":{"tolerations":[{"key":"node-role.kubernetes.io/control-plane","operator":"Exists","effect":"NoSchedule"}]}}}}'
+    kubectl -n maint rollout status ds agent --timeout=150s
+    kubectl -n maint delete pvc data-ledger-1 data-ledger-2 --ignore-not-found
+    kubectl -n maint patch sts ledger --type=merge -p '{"spec":{"persistentVolumeClaimRetentionPolicy":{"whenScaled":"Delete","whenDeleted":"Retain"}}}'

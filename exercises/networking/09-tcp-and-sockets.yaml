@@ -1,0 +1,1888 @@
+track: networking
+module: TCP & sockets
+profile: docker
+order: 9
+exercises:
+
+- id: net-079
+  title: Who is listening, and on which address?
+  difficulty: 1
+  kind: build
+  tags: [ss, sockets, listen, bind-address]
+  tutorial: |
+    **Concept.** A server **binds** its listening socket to an address and a
+    port. Bound to `0.0.0.0` (all IPv4 addresses) or to the host's own LAN
+    address, it accepts connections from other machines. Bound to
+    `127.0.0.1`, it only accepts connections from the same host, however open
+    the firewall is. `ss -ltn` lists the TCP listening sockets (`-u` for UDP),
+    the **Local Address:Port** column shows the binding, and `-p` adds the
+    process that owns each socket.
+
+    **Read up on:**
+    - `ss -ltnp`, `ss -lunp`, `ss -H`
+    - Wildcard, loopback and specific bind addresses
+  scenario: |
+    The namespace **`app`** (`10.79.0.10`) runs several services. Some
+    of them only listen on the loopback address and are invisible to the
+    rest of the network, such as the namespace `peer` (`10.79.0.20`) on the
+    same LAN.
+
+    Write **`/lab/answer.txt`** with one line per **TCP** port that **other
+    machines** can connect to, as **`PORT PROGRAM`** (the process name `ss`
+    shows), sorted by port number, smallest first. For example:
+
+    ```
+    2210 queued
+    4580 billingd
+    ```
+  hints:
+    - "`sudo ip netns exec app ss -ltnp` lists the TCP listeners with their processes."
+    - "A listener on `127.0.0.1:PORT` is local only. `0.0.0.0:PORT` and `10.79.0.10:PORT` are reachable from the LAN."
+    - "UDP sockets (`ss -lun`) don't belong in the answer."
+  solution: |
+    ```bash
+    sudo ip netns exec app ss -ltnpH | awk '$4 !~ /^127\./' \
+      | sed -E 's/^\S+\s+\S+\s+\S+\s+\S*:([0-9]+)\s.*users:\(\("([^"]+)".*/\1 \2/' \
+      | sort -n > /lab/answer.txt
+    cat /lab/answer.txt
+    ```
+  setup: |
+    on_reset 'for n in app peer; do ip netns pids $n 2>/dev/null | xargs -r kill -9; done; rm -rf /opt/kl-sock79'
+    netns_new app peer
+    netns_link app eth0 peer eth0
+    ip -n app addr add 10.79.0.10/24 dev eth0
+    ip -n peer addr add 10.79.0.20/24 dev eth0
+    mkdir -p /opt/kl-sock79
+    cat > /opt/kl-sock79/listen.py <<'EOF'
+    import socket, sys
+    name, addr, port, proto = sys.argv[1], sys.argv[2], int(sys.argv[3]), sys.argv[4]
+    with open("/proc/self/comm", "w") as f:
+        f.write(name)
+    if proto == "udp":
+        s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+        s.bind((addr, port))
+        while True:
+            s.recvfrom(512)
+    s = socket.socket()
+    s.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+    s.bind((addr, port))
+    s.listen(16)
+    while True:
+        c, _ = s.accept()
+        c.close()
+    EOF
+    python3 - > "$KL_STATE/plan79" <<'PY'
+    import random
+    names = ["billingd", "reportd", "cached", "adminui", "syncd", "metricsd", "queued"]
+    random.shuffle(names)
+    ports = random.sample(range(2000, 9900), 7)
+    addrs = ["0.0.0.0", "0.0.0.0", "10.79.0.10", "127.0.0.1", "127.0.0.1", "127.0.0.1"]
+    random.shuffle(addrs)
+    for i in range(6):
+        print(names[i], addrs[i], ports[i], "tcp")
+    print(names[6], random.choice(["0.0.0.0", "10.79.0.10"]), ports[6], "udp")
+    PY
+    while read -r name addr port proto; do
+      ip netns exec app setsid python3 /opt/kl-sock79/listen.py "$name" "$addr" "$port" "$proto" </dev/null >/dev/null 2>&1 &
+    done < "$KL_STATE/plan79"
+    awk '$4 == "tcp" && $2 !~ /^127\./ {print $3, $1}' "$KL_STATE/plan79" | sort -n > "$KL_STATE/answer"
+    eventually 10 '[ "$(ip netns exec app ss -ltnH | wc -l)" -ge 6 ] && [ "$(ip netns exec app ss -lunH | wc -l)" -ge 1 ]'
+  check: |
+    got=$(sed 's/[[:space:]]*$//; /^$/d' /lab/answer.txt 2>/dev/null | tr -s ' \t' '  ')
+    check_eq "TCP ports reachable from the LAN, with their programs" "$got" "$(cat "$KL_STATE/answer")"
+  solve: |
+    sudo ip netns exec app ss -ltnpH | awk '$4 !~ /^127\./' \
+      | sed -E 's/^\S+\s+\S+\s+\S+\s+\S*:([0-9]+)\s.*users:\(\("([^"]+)".*/\1 \2/' \
+      | sort -n > /lab/answer.txt
+
+- id: net-080
+  title: Who is holding the database connections?
+  difficulty: 1
+  kind: build
+  tags: [ss, connections, established, filters]
+  tutorial: |
+    **Concept.** Every TCP connection is a socket with a **state**
+    (`ESTAB`, `SYN-SENT`, `TIME-WAIT`, …) and a pair of endpoints. When a
+    server runs out of connection slots, the first question is *who holds
+    them*. `ss` filters by state and by port (`ss -tn state established
+    '( sport = :5432 )'`), and counting the peer addresses answers it. With a
+    single state filter, `ss` leaves out the State column.
+
+    **Read up on:**
+    - `ss` state filters and `( sport = :PORT )` / `( dport = :PORT )` expressions
+    - `sort | uniq -c | sort -rn`
+  scenario: |
+    The database server **`db`** (`10.80.0.5`) refuses new clients: all
+    its PostgreSQL connection slots (port **5432**) are taken. Several
+    application servers on the LAN connect to it, and to the cache on port
+    6379 of the same host.
+
+    Write two lines to **`/lab/answer.txt`**:
+
+    1. the **IP address** of the client that holds the **most established
+       connections to port 5432**
+    2. **how many** such connections it holds
+  hints:
+    - "`sudo ip netns exec db ss -tn state established '( sport = :5432 )'`."
+    - "The Peer column is `ADDRESS:PORT`. Strip the port, then `sort | uniq -c | sort -rn`."
+  solution: |
+    ```bash
+    sudo ip netns exec db ss -tnH state established '( sport = :5432 )' \
+      | awk '{split($4, a, ":"); print a[1]}' | sort | uniq -c | sort -rn | head -1 \
+      | awk '{print $2; print $1}' > /lab/answer.txt
+    ```
+  setup: |
+    on_reset 'for n in db app1 app2 app3 app4 kl-lan; do ip netns pids $n 2>/dev/null | xargs -r kill -9; done; rm -rf /opt/kl-sock80'
+    lan_up db=10.80.0.5/24 app1=10.80.0.11/24 app2=10.80.0.12/24 app3=10.80.0.13/24 app4=10.80.0.14/24
+    mkdir -p /opt/kl-sock80
+    cat > /opt/kl-sock80/server.py <<'EOF'
+    import socket, threading
+    def serve(port):
+        s = socket.socket()
+        s.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+        s.bind(("10.80.0.5", port))
+        s.listen(128)
+        held = []
+        while True:
+            c, _ = s.accept()
+            held.append(c)
+    for p in (5432, 6379):
+        threading.Thread(target=serve, args=(p,), daemon=True).start()
+    threading.Event().wait()
+    EOF
+    cat > /opt/kl-sock80/hold.py <<'EOF'
+    import socket, sys, time
+    port, n = int(sys.argv[1]), int(sys.argv[2])
+    held = [socket.create_connection(("10.80.0.5", port), timeout=5) for _ in range(n)]
+    while True:
+        time.sleep(3600)
+    EOF
+    ip netns exec db setsid python3 /opt/kl-sock80/server.py </dev/null >/dev/null 2>&1 &
+    eventually 10 'ip netns exec db ss -ltnH | grep -q 10.80.0.5:6379'
+    python3 - > "$KL_STATE/plan80" <<'PY'
+    import random
+    c = random.sample(range(3, 30), 4)
+    for i, n in enumerate(c, 1):
+        print(f"app{i} 5432 {n}")
+    print(f"app{c.index(min(c)) + 1} 6379 45")
+    PY
+    total=0
+    while read -r ns port n; do
+      ip netns exec "$ns" setsid python3 /opt/kl-sock80/hold.py "$port" "$n" </dev/null >/dev/null 2>&1 &
+      total=$((total + n))
+    done < "$KL_STATE/plan80"
+    awk '$2 == 5432' "$KL_STATE/plan80" | sort -k3,3nr | head -1 | awk '{sub("app", "", $1); print "10.80.0.1" $1; print $3}' > "$KL_STATE/answer"
+    eventually 20 "[ \"\$(ip netns exec db ss -tnH state established | wc -l)\" -ge $total ]"
+  check: |
+    check_eq "the client with the most connections to 5432, and its count" "$(sed 's/[[:space:]]*$//; /^$/d' /lab/answer.txt 2>/dev/null)" "$(cat "$KL_STATE/answer")"
+  solve: |
+    sudo ip netns exec db ss -tnH state established '( sport = :5432 )' \
+      | awk '{split($4, a, ":"); print a[1]}' | sort | uniq -c | sort -rn | head -1 \
+      | awk '{print $2; print $1}' > /lab/answer.txt
+
+- id: net-081
+  title: Refused, timed out or unreachable?
+  difficulty: 2
+  kind: build
+  tags: [tcp, rst, icmp, firewall, troubleshooting, nc]
+  tutorial: |
+    **Concept.** *"I can't connect"* comes in different flavours, and each
+    one points somewhere else:
+
+    - **Connection refused**: the host answered with a TCP **reset**. Nothing
+      listens on the port (or a firewall rejects with a reset).
+    - **Timed out**: no answer at all. A firewall **drops** the packets, or
+      the host is gone.
+    - **No route to host**: an **ICMP unreachable** came back, often a
+      firewall rejecting with *admin-prohibited*, or a router with no path.
+    - **Connected**: something is listening and the path is open.
+
+    `nc -vz -w 3 HOST PORT`, `curl -v` and bash's `/dev/tcp/HOST/PORT` all
+    report which one it was.
+
+    **Read up on:**
+    - `nc -vz -w`, `timeout`, bash `/dev/tcp`
+    - TCP RST versus ICMP destination unreachable (codes 3, 10, 13)
+  scenario: |
+    From the namespace **`probe`**, test the TCP ports of the server
+    **`10.81.0.10`** listed in **`/lab/ports.txt`**. Write
+    **`/lab/answer.txt`** with one line per port, in the same order, as
+    **`PORT RESULT`**, where `RESULT` is one of:
+
+    - `open`: the connection is established
+    - `refused`: *Connection refused*
+    - `timeout`: no answer within 3 seconds
+    - `unreachable`: *No route to host*
+  hints:
+    - "`sudo ip netns exec probe nc -vz -w 3 10.81.0.10 PORT` prints the outcome."
+    - "Or `sudo ip netns exec probe timeout 3 bash -c 'exec 3<>/dev/tcp/10.81.0.10/PORT'`: exit code 124 means it timed out, and the error message tells the rest apart."
+  solution: |
+    ```bash
+    while read -r p; do
+      out=$(sudo ip netns exec probe timeout 3 bash -c "exec 3<>/dev/tcp/10.81.0.10/$p" 2>&1 </dev/null); rc=$?
+      if [ $rc = 0 ]; then r=open
+      elif [ $rc = 124 ]; then r=timeout
+      elif grep -q refused <<<"$out"; then r=refused
+      else r=unreachable; fi
+      echo "$p $r"
+    done < /lab/ports.txt > /lab/answer.txt
+    ```
+  setup: |
+    on_reset 'for n in probe srv; do ip netns pids $n 2>/dev/null | xargs -r kill -9; done; rm -rf /opt/kl-sock81'
+    netns_new probe srv
+    netns_link probe eth0 srv eth0
+    ip -n probe addr add 10.81.0.20/24 dev eth0
+    ip -n srv addr add 10.81.0.10/24 dev eth0
+    python3 - > "$KL_STATE/plan81" <<'PY'
+    import random
+    kinds = ["open", "open", "refused", "refused", "timeout", "timeout", "unreachable",
+             random.choice(["open", "refused", "unreachable"])]
+    random.shuffle(kinds)
+    ports = random.sample(range(1000, 9999), len(kinds))
+    reset = True
+    for p, k in zip(ports, kinds):
+        how = ""
+        if k == "refused":
+            how = "reset" if reset else "closed"
+            reset = not reset
+        print(p, k, how)
+    PY
+    listen=$(awk '$2 == "open" || $3 == "reset" {print $1}' "$KL_STATE/plan81" | tr '\n' ' ')
+    set_of() { awk -v k="$1" '$2 == k || $3 == k {print $1}' "$KL_STATE/plan81" | paste -sd, -; }
+    ip netns exec srv nft -f - <<EOF
+    table ip kl81 {
+      chain input {
+        type filter hook input priority 0; policy accept;
+        tcp dport { $(set_of timeout) } drop
+        tcp dport { $(set_of unreachable) } reject with icmp type admin-prohibited
+        tcp dport { $(set_of reset) } reject with tcp reset
+      }
+    }
+    EOF
+    mkdir -p /opt/kl-sock81
+    cat > /opt/kl-sock81/srv.py <<'EOF'
+    import socket, sys, threading
+    def serve(p):
+        s = socket.socket()
+        s.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+        s.bind(("10.81.0.10", p))
+        s.listen(16)
+        while True:
+            c, _ = s.accept()
+            c.close()
+    for p in sys.argv[1:]:
+        threading.Thread(target=serve, args=(int(p),), daemon=True).start()
+    threading.Event().wait()
+    EOF
+    ip netns exec srv setsid python3 /opt/kl-sock81/srv.py $listen </dev/null >/dev/null 2>&1 &
+    awk '{print $1}' "$KL_STATE/plan81" > /lab/ports.txt
+    awk '{print $1, $2}' "$KL_STATE/plan81" > "$KL_STATE/answer"
+    chown "$(lab_user):" /lab/ports.txt
+    eventually 10 "[ \"\$(ip netns exec srv ss -ltnH | wc -l)\" -ge $(wc -w <<<"$listen") ]"
+  check: |
+    got=$(sed 's/[[:space:]]*$//; /^$/d' /lab/answer.txt 2>/dev/null | tr -s ' \t' '  ' | tr A-Z a-z)
+    check_eq "the outcome for every port" "$got" "$(cat "$KL_STATE/answer")"
+  solve: |
+    while read -r p; do
+      out=$(sudo ip netns exec probe timeout 3 bash -c "exec 3<>/dev/tcp/10.81.0.10/$p" 2>&1 </dev/null); rc=$?
+      if [ $rc = 0 ]; then r=open
+      elif [ $rc = 124 ]; then r=timeout
+      elif grep -q refused <<<"$out"; then r=refused
+      else r=unreachable; fi
+      echo "$p $r"
+    done < /lab/ports.txt > /lab/answer.txt
+
+- id: net-082
+  title: "Address already in use"
+  difficulty: 3
+  kind: fix
+  tags: [tcp, time-wait, so_reuseaddr, sockets, python]
+  tutorial: |
+    **Concept.** The side that closes a TCP connection **first** keeps it in
+    **`TIME-WAIT`** for 60 seconds, so that late packets of the old
+    connection can't be mistaken for a new one. When a server hangs up on
+    its clients, those sockets sit on the server's own port, and a restarted
+    server can't `bind()` it: *Address already in use*. Setting
+    **`SO_REUSEADDR`** on the listening socket before `bind()` allows the bind
+    while old connections are in TIME-WAIT (it still refuses a second live
+    listener).
+
+    A server must also survive clients that misbehave. A load-balancer health
+    check often connects and **resets** the connection straight away, so
+    `recv()` and `send()` can raise `ConnectionResetError` or
+    `BrokenPipeError`. That should end one connection, not the process.
+
+    **Read up on:**
+    - The TCP state machine: FIN_WAIT, TIME_WAIT, CLOSE_WAIT
+    - `socket.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)`
+    - `ss -tan state time-wait`
+  scenario: |
+    The echo service **`/lab/echo_server.py`** answers each request line with
+    `pong <line>` and hangs up. It runs in the namespace **`svc`**
+    (`10.82.0.10`) and takes its port as its only argument (default 7000).
+    Two problems keep paging the on-call:
+
+    - After every deploy it can't come back for about a minute:
+      `OSError: [Errno 98] Address already in use`.
+    - The load balancer's health check, which connects and then resets the
+      connection, sometimes kills it with `ConnectionResetError`.
+
+    Fix **`/lab/echo_server.py`** so that it survives a reset connection and
+    starts again **immediately** after being stopped, while its old
+    connections are still in TIME-WAIT. It must keep the same behaviour and
+    command line. To reproduce:
+
+    ```bash
+    sudo ip netns exec svc python3 /lab/echo_server.py &
+    echo hello | sudo ip netns exec cli nc 10.82.0.10 7000
+    sudo pkill -f echo_server.py; sudo ip netns exec svc python3 /lab/echo_server.py
+    ```
+  hints:
+    - "`sudo ip netns exec svc ss -tan state time-wait` after a request: whose port are those sockets on?"
+    - "Set `SO_REUSEADDR` on `srv` before `srv.bind(...)`."
+    - "Wrap the handling of each connection in `try: ... except OSError: pass`."
+  solution: |
+    ```python
+    srv = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+    srv.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)   # bind despite TIME-WAIT
+    srv.bind(("0.0.0.0", port))
+    srv.listen(64)
+
+    while True:
+        conn, addr = srv.accept()
+        with conn:
+            try:
+                line = conn.recv(1024).strip()
+                conn.sendall(b"pong " + line + b"\n")
+            except OSError:      # reset by the peer, broken pipe, ...
+                pass
+    ```
+  setup: |
+    on_reset 'for n in svc cli; do ip netns pids $n 2>/dev/null | xargs -r kill -9; done'
+    netns_new svc cli
+    netns_link svc eth0 cli eth0
+    ip -n svc addr add 10.82.0.10/24 dev eth0
+    ip -n cli addr add 10.82.0.20/24 dev eth0
+    lab_file /lab/echo_server.py <<'EOF'
+    #!/usr/bin/env python3
+    """The echo service: answers each request line with "pong <line>" and hangs up.
+
+    Usage: python3 echo_server.py [PORT]   (default 7000)
+    """
+    import socket
+    import sys
+
+    port = int(sys.argv[1]) if len(sys.argv) > 1 else 7000
+
+    srv = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+    srv.bind(("0.0.0.0", port))
+    srv.listen(64)
+    print(f"listening on port {port}", flush=True)
+
+    while True:
+        conn, addr = srv.accept()
+        with conn:
+            line = conn.recv(1024).strip()
+            conn.sendall(b"pong " + line + b"\n")
+    EOF
+  check: |
+    port=$((20000 + RANDOM % 20000))
+    start_srv() { ip netns exec svc python3 /lab/echo_server.py $port </dev/null >/dev/null 2>&1 & echo $!; }
+    ask() {
+      ip netns exec cli timeout 3 python3 -c '
+    import socket, sys
+    s = socket.create_connection(("10.82.0.10", int(sys.argv[1])), timeout=2)
+    s.sendall(b"hello\n")
+    d = b""
+    while True:
+        b = s.recv(100)
+        if not b:
+            break
+        d += b
+    print(d.decode().strip())
+    ' $port 2>/dev/null
+    }
+    hit_and_reset() {
+      ip netns exec cli timeout 3 python3 -c '
+    import socket, struct, sys
+    s = socket.create_connection(("10.82.0.10", int(sys.argv[1])), timeout=2)
+    s.setsockopt(socket.SOL_SOCKET, socket.SO_LINGER, struct.pack("ii", 1, 0))
+    s.close()
+    ' $port 2>/dev/null
+    }
+    p1=$(start_srv)
+    eventually 6 '[ "$(ask)" = "pong hello" ]'
+    check_eq "the service answers" "$(ask)" "pong hello"
+    hit_and_reset; sleep 0.5; hit_and_reset; sleep 0.5
+    check "it survives health checks that reset the connection" 'kill -0 $p1 && [ "$(ask)" = "pong hello" ]'
+    check "its connections are in TIME-WAIT on the service port" '[ -n "$(ip netns exec svc ss -tanH state time-wait "( sport = :$port )")" ]'
+    kill $p1 2>/dev/null; sleep 0.5
+    p2=$(start_srv)
+    sleep 1.5
+    check "it starts again at once and answers" 'kill -0 $p2 && [ "$(ask)" = "pong hello" ]'
+    kill $p1 $p2 2>/dev/null
+  solve: |
+    cat > /lab/echo_server.py <<'EOF'
+    #!/usr/bin/env python3
+    """The echo service: answers each request line with "pong <line>" and hangs up.
+
+    Usage: python3 echo_server.py [PORT]   (default 7000)
+    """
+    import socket
+    import sys
+
+    port = int(sys.argv[1]) if len(sys.argv) > 1 else 7000
+
+    srv = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+    srv.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+    srv.bind(("0.0.0.0", port))
+    srv.listen(64)
+    print(f"listening on port {port}", flush=True)
+
+    while True:
+        conn, addr = srv.accept()
+        with conn:
+            try:
+                line = conn.recv(1024).strip()
+                conn.sendall(b"pong " + line + b"\n")
+            except OSError:
+                pass
+    EOF
+
+- id: net-083
+  title: "Cannot assign requested address"
+  difficulty: 3
+  kind: fix
+  tags: [tcp, ephemeral-ports, ip_local_port_range, time-wait, sysctl]
+  tutorial: |
+    **Concept.** Every outgoing connection needs a local **ephemeral port**,
+    picked from `net.ipv4.ip_local_port_range`. A port is busy as long as a
+    socket to the **same destination** uses it, including sockets in
+    **TIME-WAIT**, which the **client** holds for 60 s when it closes first.
+    A client making many short connections to one server can run out, and
+    `connect()` fails with *Cannot assign requested address*
+    (`EADDRNOTAVAIL`). The Linux default range is `32768 60999`.
+    `net.ipv4.ip_local_reserved_ports` keeps chosen ports out of automatic
+    assignment, so a service that binds one of them on restart never finds it
+    taken by an outgoing connection.
+
+    **Read up on:**
+    - `net.ipv4.ip_local_port_range`, `net.ipv4.ip_local_reserved_ports`
+    - `ss -tan state time-wait`, `sysctl -w`
+  scenario: |
+    The namespace **`batch`** (`10.83.0.20`) runs a job that sends hundreds
+    of short requests to the API at `10.83.0.10:8080`. Since the host was
+    "hardened", most of them fail. See **`/lab/batch.log`**, and run the job
+    yourself with `sudo ip netns exec batch kl-batch [COUNT]`.
+
+    In `batch`:
+
+    - set the ephemeral port range back to the Linux default, **`32768 60999`**
+    - **reserve port `50000`**: batch's monitoring agent listens there, and an
+      outgoing connection must never take it
+    - `sudo ip netns exec batch kl-batch 500` must report **`500 ok, 0
+      failed`**
+  hints:
+    - "`sudo ip netns exec batch ss -tan state time-wait | wc -l` right after a run, and `sudo ip netns exec batch sysctl net.ipv4.ip_local_port_range`."
+    - "`sudo ip netns exec batch sysctl -w net.ipv4.ip_local_port_range=\"32768 60999\"`."
+    - "`net.ipv4.ip_local_reserved_ports` takes a comma-separated list of ports and ranges."
+  solution: |
+    ```bash
+    sudo ip netns exec batch sysctl -w net.ipv4.ip_local_port_range="32768 60999"
+    sudo ip netns exec batch sysctl -w net.ipv4.ip_local_reserved_ports=50000
+    sudo ip netns exec batch kl-batch 500
+    ```
+  setup: |
+    on_reset 'for n in batch api; do ip netns pids $n 2>/dev/null | xargs -r kill -9; done; rm -rf /opt/kl-sock83 /usr/local/bin/kl-batch'
+    netns_new batch api
+    netns_link batch eth0 api eth0
+    ip -n batch addr add 10.83.0.20/24 dev eth0
+    ip -n api addr add 10.83.0.10/24 dev eth0
+    ip netns exec batch sysctl -qw net.ipv4.ip_local_port_range="61000 61015"
+    mkdir -p /opt/kl-sock83
+    cat > /opt/kl-sock83/api.py <<'EOF'
+    import socket
+    s = socket.socket()
+    s.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+    s.bind(("10.83.0.10", 8080))
+    s.listen(128)
+    while True:
+        c, _ = s.accept()
+        try:
+            c.settimeout(2)
+            if c.recv(64):
+                c.sendall(b"ok\n")
+                c.recv(64)  # wait for the client to hang up
+        except OSError:
+            pass
+        c.close()
+    EOF
+    cat > /usr/local/bin/kl-batch <<'EOF'
+    #!/usr/bin/env python3
+    """kl-batch [COUNT]: send COUNT short requests to the API (default 200)."""
+    import socket, sys
+    n = int(sys.argv[1]) if len(sys.argv) > 1 else 200
+    ok, errors = 0, {}
+    for i in range(n):
+        try:
+            s = socket.create_connection(("10.83.0.10", 8080), timeout=3)
+            s.sendall(b"job\n")
+            if s.recv(16) == b"ok\n":
+                ok += 1
+            s.close()
+        except OSError as e:
+            errors[str(e)] = errors.get(str(e), 0) + 1
+    print(f"{ok} ok, {n - ok} failed")
+    for e, c in errors.items():
+        print(f"  {c} x {e}")
+    sys.exit(0 if ok == n else 1)
+    EOF
+    chmod 755 /usr/local/bin/kl-batch
+    ip netns exec api setsid python3 /opt/kl-sock83/api.py </dev/null >/dev/null 2>&1 &
+    eventually 10 'ip netns exec api ss -ltnH | grep -q 10.83.0.10:8080'
+    ip netns exec batch /usr/local/bin/kl-batch 40 > /lab/batch.log 2>&1
+    chown "$(lab_user):" /lab/batch.log
+  check: |
+    check_eq "batch's ephemeral port range" "$(ip netns exec batch sysctl -n net.ipv4.ip_local_port_range | tr -s '\t ' '  ')" "32768 60999"
+    res=$(ip netns exec batch sysctl -n net.ipv4.ip_local_reserved_ports)
+    check "port 50000 is reserved in batch (got '$res')" 'python3 -c "import sys; sys.exit(0 if any(int(r.split(\"-\")[0]) <= 50000 <= int(r.split(\"-\")[-1]) for r in sys.argv[1].split(\",\") if r.strip()) else 1)" "$res"'
+    out=$(ip netns exec batch timeout 60 /usr/local/bin/kl-batch 500 2>&1)
+    check_match "kl-batch 500 runs without errors" "$out" '^500 ok, 0 failed'
+  solve: |
+    sudo ip netns exec batch sysctl -qw net.ipv4.ip_local_port_range="32768 60999"
+    sudo ip netns exec batch sysctl -qw net.ipv4.ip_local_reserved_ports=50000
+
+- id: net-084
+  title: Fail fast instead of hanging
+  difficulty: 3
+  kind: build
+  tags: [nftables, reject, tcp-reset, icmp, firewall, forward]
+  tutorial: |
+    **Concept.** A firewall that **drops** packets leaves the sender
+    guessing: a TCP client retransmits its SYN for about two minutes before
+    it gives up, and a UDP client simply waits. Inside your own network it's
+    usually kinder to **reject**: answer TCP with a **reset**, so `connect()`
+    fails at once with *Connection refused*, and other traffic with an
+    **ICMP destination unreachable**. Code 13 (*communication
+    administratively prohibited*) says "a firewall said no", and the client
+    sees *No route to host* straight away. nftables does both with
+    `reject with tcp reset` and `reject with icmp type admin-prohibited`.
+
+    **Read up on:**
+    - nftables `reject` statement and its `with tcp reset` / `with icmp type ...` forms
+    - `ip protocol tcp`, `nft list ruleset`, `nft flush chain`
+  scenario: |
+    The router **`fw`** connects the office (`desk`, `10.84.1.10`) to the
+    server network `10.84.2.0/24`. The old directory server **`10.84.2.50`**
+    has been retired, and `fw` drops everything sent to it. Hundreds of
+    machines still have it configured, and each of them hangs for minutes
+    before trying the next server.
+
+    Change the forward chain of `fw`'s table **`ip filter`** so that traffic
+    to `10.84.2.50`:
+
+    - over **TCP** is answered with a **TCP reset**
+    - of **any other kind** is answered with an ICMP **admin-prohibited**
+      (type 3, code 13)
+
+    Traffic to the other servers, such as the wiki at
+    `http://10.84.2.10/`, must keep flowing.
+  hints:
+    - "`sudo ip netns exec fw nft list ruleset` shows the drop rule. `sudo ip netns exec desk nc -vz -w 3 10.84.2.50 389` shows the hang."
+    - "A TCP reset only makes sense for TCP packets: match `ip protocol tcp` first, then add a second rule for the rest."
+    - "`nft flush chain ip filter forward`, then `nft add rule ip filter forward ip daddr 10.84.2.50 ip protocol tcp reject with tcp reset` and one with `reject with icmp type admin-prohibited`."
+  solution: |
+    ```bash
+    sudo ip netns exec fw nft flush chain ip filter forward
+    sudo ip netns exec fw nft add rule ip filter forward ip daddr 10.84.2.50 ip protocol tcp reject with tcp reset
+    sudo ip netns exec fw nft add rule ip filter forward ip daddr 10.84.2.50 reject with icmp type admin-prohibited
+    sudo ip netns exec desk nc -vz -w 3 10.84.2.50 389     # Connection refused, at once
+    sudo ip netns exec desk ping -c1 10.84.2.50            # Packet filtered
+    ```
+  setup: |
+    on_reset 'for n in desk fw web; do ip netns pids $n 2>/dev/null | xargs -r kill -9; done; rm -rf /srv/kl-web84'
+    netns_new desk fw web
+    netns_link desk eth0 fw eth0
+    netns_link fw eth1 web eth0
+    ip -n desk addr add 10.84.1.10/24 dev eth0; ip -n desk route add default via 10.84.1.1
+    ip -n fw addr add 10.84.1.1/24 dev eth0; ip -n fw addr add 10.84.2.1/24 dev eth1
+    ip -n web addr add 10.84.2.10/24 dev eth0; ip -n web route add default via 10.84.2.1
+    ip netns exec fw sysctl -qw net.ipv4.ip_forward=1
+    ip netns exec fw nft -f - <<'EOF'
+    table ip filter {
+      chain forward {
+        type filter hook forward priority 0; policy accept;
+        ip daddr 10.84.2.50 counter drop comment "old directory server, retired"
+      }
+    }
+    EOF
+    mkdir -p /srv/kl-web84; echo "<h1>wiki</h1>" > /srv/kl-web84/index.html
+    ip netns exec web setsid python3 -m http.server 80 --bind 10.84.2.10 --directory /srv/kl-web84 </dev/null >/dev/null 2>&1 &
+    eventually 10 "ip netns exec desk curl -fsS -m 2 http://10.84.2.10/"
+  check: |
+    d=$(mktemp -d)
+    ip netns exec desk timeout 8 tcpdump -nn -l -c 1 -i eth0 'src host 10.84.2.50 and tcp[tcpflags] & tcp-rst != 0' > $d/rst 2>/dev/null &
+    c1=$!
+    ip netns exec desk timeout 8 tcpdump -nn -l -c 1 -i eth0 'icmp[icmptype] == icmp-unreach and icmp[icmpcode] == 13' > $d/icmp 2>/dev/null &
+    c2=$!
+    sleep 1.5
+    t0=$(date +%s%N)
+    tcp=$(ip netns exec desk timeout 4 bash -c 'exec 3<>/dev/tcp/10.84.2.50/389' 2>&1 </dev/null)
+    ms=$(( ($(date +%s%N) - t0) / 1000000 ))
+    udp=$(ip netns exec desk timeout 5 python3 -c '
+    import socket
+    s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+    s.settimeout(3)
+    s.connect(("10.84.2.50", 53))
+    s.send(b"query")
+    try:
+        s.recv(100)
+        print("answer")
+    except socket.timeout:
+        print("timeout")
+    except OSError as e:
+        print(e.errno)
+    ' 2>/dev/null)
+    sleep 0.5
+    kill $c1 $c2 2>/dev/null; wait $c1 $c2 2>/dev/null
+    check_match "TCP to 10.84.2.50 is refused" "$tcp" 'refused'
+    check "... within a second (took ${ms} ms)" '[ $ms -lt 1000 ]'
+    check "the refusal is a TCP reset" 'grep -q " IP " $d/rst'
+    check_eq "UDP to 10.84.2.50 fails at once with 'no route to host' (errno 113)" "$udp" 113
+    check "that error is an ICMP admin-prohibited (type 3, code 13)" 'grep -q " IP " $d/icmp'
+    check "the wiki at 10.84.2.10 still works" 'ip netns exec desk curl -fsS -m 2 http://10.84.2.10/ | grep -q wiki'
+    rm -rf $d
+  solve: |
+    sudo ip netns exec fw nft flush chain ip filter forward
+    sudo ip netns exec fw nft add rule ip filter forward ip daddr 10.84.2.50 ip protocol tcp reject with tcp reset
+    sudo ip netns exec fw nft add rule ip filter forward ip daddr 10.84.2.50 reject with icmp type admin-prohibited
+
+- id: net-085
+  title: IPv6 clients get in, IPv4 clients are refused
+  difficulty: 3
+  kind: fix
+  tags: [ipv6, dual-stack, bindv6only, ipv6_v6only, sockets, ss]
+  tutorial: |
+    **Concept.** A server can serve both IPv4 and IPv6 from **one** IPv6
+    socket bound to `[::]`: IPv4 clients then show up as **v4-mapped**
+    addresses (`::ffff:10.0.0.5`). That only works while the socket's
+    **`IPV6_V6ONLY`** option is off. Programs that don't set it themselves get
+    the system default, the sysctl **`net.ipv6.bindv6only`**. With it on, the
+    same socket accepts IPv6 only, and IPv4 clients get *Connection refused*.
+    `ss -ltn` tells them apart: a dual-stack listener shows as `*:PORT`, an
+    IPv6-only one as `[::]:PORT`. The other way out is a second, IPv4
+    listener (`0.0.0.0:PORT`).
+
+    **Read up on:**
+    - `IPV6_V6ONLY` (RFC 3493) and v4-mapped IPv6 addresses
+    - `net.ipv6.bindv6only`
+    - `ss -ltn`, `curl http://[ADDR]:PORT/`
+  scenario: |
+    The web app in the namespace **`srv`** listens on port **8080**. It's
+    reachable at `10.85.0.1` from **`c4`** (an IPv4 client) and at
+    `fd85::1` from **`c6`** (an IPv6 client). IPv6 clients get the page, but
+    IPv4 clients get *Connection refused*.
+
+    The app is managed with **`sudo kl-app start|stop|restart`**, reads
+    **`/etc/kl-app.conf`** (one `listen = ADDRESS:PORT` line per listener)
+    and logs to `/var/log/kl-app.log`. Make both of these work, with the app
+    still running from `kl-app`:
+
+    ```bash
+    sudo ip netns exec c4 curl http://10.85.0.1:8080/
+    sudo ip netns exec c6 curl 'http://[fd85::1]:8080/'
+    ```
+  hints:
+    - "`sudo ip netns exec srv ss -ltn`: `[::]:8080` or `*:8080`?"
+    - "`sudo ip netns exec srv sysctl net.ipv6.bindv6only`."
+    - "Either turn `bindv6only` off in `srv` and restart the app, or add a `listen = 0.0.0.0:8080` line (that only works while the IPv6 socket is IPv6-only)."
+  solution: |
+    ```bash
+    sudo ip netns exec srv ss -ltn                   # [::]:8080 = IPv6 only
+    sudo ip netns exec srv sysctl -w net.ipv6.bindv6only=0
+    sudo kl-app restart
+    sudo ip netns exec srv ss -ltn                   # now *:8080
+    sudo ip netns exec c4 curl -s http://10.85.0.1:8080/
+    ```
+  setup: |
+    on_reset 'for n in srv c4 c6; do ip netns pids $n 2>/dev/null | xargs -r kill -9; done; rm -rf /opt/kl-sock85 /usr/local/bin/kl-app /etc/kl-app.conf /var/log/kl-app.log'
+    netns_new srv c4 c6
+    netns_link srv eth0 c4 eth0
+    netns_link srv eth1 c6 eth0
+    ip -n srv addr add 10.85.0.1/24 dev eth0; ip -n c4 addr add 10.85.0.2/24 dev eth0
+    ip -n srv -6 addr add fd85::1/64 dev eth1 nodad; ip -n c6 -6 addr add fd85::2/64 dev eth0 nodad
+    ip netns exec srv sysctl -qw net.ipv6.bindv6only=1
+    mkdir -p /opt/kl-sock85
+    cat > /opt/kl-sock85/app.py <<'EOF'
+    import socket, socketserver, sys, threading
+    from http.server import BaseHTTPRequestHandler
+
+    class Handler(BaseHTTPRequestHandler):
+        def do_GET(self):
+            body = b"hello from srv\n"
+            self.send_response(200)
+            self.send_header("Content-Length", str(len(body)))
+            self.end_headers()
+            self.wfile.write(body)
+        def log_message(self, *a):
+            pass
+
+    servers = []
+    for line in open(sys.argv[1]):
+        line = line.split("#")[0].strip()
+        if not line.startswith("listen"):
+            continue
+        spec = line.split("=", 1)[1].strip()
+        host, port = spec.rsplit(":", 1)
+        host = host.strip("[]")
+        family = socket.AF_INET6 if ":" in host else socket.AF_INET
+        cls = type("Server", (socketserver.ThreadingTCPServer,),
+                   {"address_family": family, "allow_reuse_address": True, "daemon_threads": True})
+        servers.append(cls((host, int(port)), Handler))
+        print(f"listening on {spec}", flush=True)
+    if not servers:
+        sys.exit("no listen lines in " + sys.argv[1])
+    for s in servers[1:]:
+        threading.Thread(target=s.serve_forever, daemon=True).start()
+    servers[0].serve_forever()
+    EOF
+    printf '# kl-app: one "listen = ADDRESS:PORT" line per listener\nlisten = [::]:8080\n' > /etc/kl-app.conf
+    cat > /usr/local/bin/kl-app <<'EOF'
+    #!/bin/bash
+    # kl-app start|stop|restart -- the web app in the namespace srv
+    case "$1" in
+      start) ip netns exec srv setsid python3 /opt/kl-sock85/app.py /etc/kl-app.conf </dev/null >>/var/log/kl-app.log 2>&1 & ;;
+      stop) pkill -f /opt/kl-sock85/app.py; sleep 0.5 ;;
+      restart) "$0" stop; "$0" start ;;
+      *) echo "usage: kl-app start|stop|restart" >&2; exit 2 ;;
+    esac
+    EOF
+    chmod 755 /usr/local/bin/kl-app
+    /usr/local/bin/kl-app start
+    eventually 10 'ip netns exec c6 curl -fsS -m 2 "http://[fd85::1]:8080/"'
+  check: |
+    check "IPv4 clients get the page" 'eventually 5 "ip netns exec c4 curl -fsS -m 2 http://10.85.0.1:8080/ | grep -q \"hello from srv\""'
+    check "IPv6 clients get the page" 'ip netns exec c6 curl -fsS -m 2 "http://[fd85::1]:8080/" | grep -q "hello from srv"'
+    check "the app runs from kl-app" 'pgrep -f /opt/kl-sock85/app.py'
+  solve: |
+    sudo ip netns exec srv sysctl -qw net.ipv6.bindv6only=0
+    sudo kl-app restart
+    sleep 1
+
+- id: net-086
+  title: The receiver that stopped reading
+  difficulty: 3
+  kind: build
+  tags: [tcp, zero-window, flow-control, tcpdump, pcap, bpf]
+  tutorial: |
+    **Concept.** TCP **flow control** keeps a fast sender from swamping a
+    slow receiver. Every segment carries the receiver's **window**, the free
+    space in its receive buffer. When the application stops reading, the
+    buffer fills, the window shrinks, and the receiver finally advertises
+    **window 0**: the sender must stop and send only small *window probes*.
+    In a capture this tells you that the network is fine and the **receiving
+    application** is the bottleneck. The raw window field sits at bytes
+    14–15 of the TCP header, so `tcp[14:2] == 0` matches it. Resets carry
+    window 0 too, so leave them out.
+
+    **Read up on:**
+    - TCP flow control, zero window and window probes
+    - `man pcap-filter`: `tcp[OFFSET:SIZE]`, `tcp[tcpflags]`, `tcp-rst`
+    - `tcpdump -nr FILE`
+  scenario: |
+    **`/lab/transfer.pcap`** is a capture taken on the file server
+    `10.86.0.10` while several clients downloaded from it on port 9000. One
+    download crawled, and the client team blames the network.
+
+    Write two lines to **`/lab/answer.txt`**:
+
+    1. the **IP address** of the client whose **receive window dropped to
+       zero**
+    2. **how many packets** that client sent advertising a window of 0
+       (don't count resets)
+  hints:
+    - "`tcpdump -nr /lab/transfer.pcap 'tcp[14:2] == 0'` lists every packet with a zero window field."
+    - "Exclude resets with `and tcp[tcpflags] & tcp-rst == 0`, then count the sources."
+  solution: |
+    ```bash
+    f=/lab/transfer.pcap
+    ip=$(tcpdump -nr $f 'tcp[14:2] == 0 and tcp[tcpflags] & tcp-rst == 0' 2>/dev/null \
+      | awk '{print $3}' | cut -d. -f1-4 | sort | uniq -c | sort -rn | head -1 | awk '{print $2}')
+    n=$(tcpdump -nr $f "src host $ip and tcp[14:2] == 0 and tcp[tcpflags] & tcp-rst == 0" 2>/dev/null | wc -l)
+    printf '%s\n%s\n' "$ip" "$n" > /lab/answer.txt
+    ```
+  setup: |
+    on_reset 'for n in files clients; do ip netns pids $n 2>/dev/null | xargs -r kill -9; done; rm -rf /opt/kl-sock86'
+    netns_new files clients
+    netns_link files eth0 clients eth0
+    ip -n files addr add 10.86.0.10/24 dev eth0
+    for i in 21 22 23 24; do ip -n clients addr add 10.86.0.$i/24 dev eth0; done
+    ip netns exec files tc qdisc add dev eth0 root netem rate 50mbit
+    mkdir -p /opt/kl-sock86
+    cat > /opt/kl-sock86/server.py <<'EOF'
+    import socket, threading
+    data = b"x" * (1 << 20)
+    def send(c):
+        try:
+            c.sendall(data)
+        except OSError:
+            pass
+        c.close()
+    s = socket.socket()
+    s.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+    s.bind(("10.86.0.10", 9000))
+    s.listen(16)
+    while True:
+        c, _ = s.accept()
+        threading.Thread(target=send, args=(c,), daemon=True).start()
+    EOF
+    cat > /opt/kl-sock86/client.py <<'EOF'
+    import socket, sys, time
+    src, slow = sys.argv[1], sys.argv[2] == "slow"
+    s = socket.socket()
+    if slow:
+        s.setsockopt(socket.SOL_SOCKET, socket.SO_RCVBUF, 4096)
+    s.bind((src, 0))
+    s.settimeout(10)
+    s.connect(("10.86.0.10", 9000))
+    if slow:
+        for _ in range(12):
+            s.recv(1000)
+            time.sleep(0.25)
+    else:
+        while s.recv(65536):
+            pass
+    s.close()
+    EOF
+    ip netns exec files setsid python3 /opt/kl-sock86/server.py </dev/null >/dev/null 2>&1 &
+    eventually 10 'ip netns exec files ss -ltnH | grep -q 10.86.0.10:9000'
+    slow=10.86.0.$((21 + RANDOM % 4)); echo $slow > "$KL_STATE/answer"
+    for attempt in 1 2 3; do
+      rm -f /lab/transfer.pcap
+      ip netns exec files tcpdump -nn -U -s 96 -i eth0 -w /lab/transfer.pcap 'tcp port 9000' </dev/null >/dev/null 2>&1 &
+      cap=$!
+      sleep 1
+      pids=
+      for i in 21 22 23 24; do
+        a=10.86.0.$i; mode=fast; [ $a = $slow ] && mode=slow
+        ip netns exec clients python3 /opt/kl-sock86/client.py $a $mode </dev/null >/dev/null 2>&1 &
+        pids="$pids $!"
+        sleep 0.2
+      done
+      wait $pids
+      sleep 0.5
+      kill -INT $cap; wait $cap
+      zw=$(tcpdump -nr /lab/transfer.pcap 'tcp[14:2] == 0 and tcp[tcpflags] & tcp-rst == 0' 2>/dev/null | awk '{print $3}' | cut -d. -f1-4 | sort -u | tr '\n' ' ')
+      [ "$zw" = "$slow " ] && break
+    done
+    cp /lab/transfer.pcap "$KL_STATE/transfer86.pcap"
+    chown "$(lab_user):" /lab/transfer.pcap
+  check: |
+    ip=$(cat "$KL_STATE/answer")
+    n=$(tcpdump -nr "$KL_STATE/transfer86.pcap" "src host $ip and tcp[14:2] == 0 and tcp[tcpflags] & tcp-rst == 0" 2>/dev/null | wc -l)
+    check_eq "the client with the zero window" "$(sed -n 1p /lab/answer.txt 2>/dev/null | tr -d '[:space:]')" "$ip"
+    check_eq "its zero-window packets" "$(sed -n 2p /lab/answer.txt 2>/dev/null | tr -d '[:space:]')" "$n"
+  solve: |
+    f=/lab/transfer.pcap
+    ip=$(tcpdump -nr $f 'tcp[14:2] == 0 and tcp[tcpflags] & tcp-rst == 0' 2>/dev/null \
+      | awk '{print $3}' | cut -d. -f1-4 | sort | uniq -c | sort -rn | head -1 | awk '{print $2}')
+    n=$(tcpdump -nr $f "src host $ip and tcp[14:2] == 0 and tcp[tcpflags] & tcp-rst == 0" 2>/dev/null | wc -l)
+    printf '%s\n%s\n' "$ip" "$n" > /lab/answer.txt
+
+- id: net-087
+  title: Give up on a dead server sooner
+  difficulty: 3
+  kind: build
+  tags: [tcp, syn-retries, retransmission, timeouts, sysctl, failover]
+  tutorial: |
+    **Concept.** When nothing answers, TCP keeps retransmitting with
+    **exponential backoff**, and the kernel decides when to give up:
+
+    - **`net.ipv4.tcp_syn_retries`** for a new connection. The first SYN
+      waits 1 s, then 2, 4, 8 … s, so with *N* retries `connect()` fails after
+      2^(N+1) − 1 seconds. The default, 6, is 127 s. (Recent kernels resend
+      the first few SYNs every second, see `tcp_syn_linear_timeouts`, but
+      still give up after about that long.)
+    - **`net.ipv4.tcp_retries2`** for data on an established connection
+      that is never acknowledged. Linux computes its time limit as if the
+      timeout started at 200 ms and doubled each time: about
+      0.2 × (2^(N+1) − 1) s, while that stays under the 120 s cap. The
+      default, 15, is over 15 minutes.
+
+    Failover logic in an application that relies on these defaults can wait
+    minutes before it tries the standby. Fewer retries mean faster failure,
+    but every lost packet then costs more, so don't go to zero.
+
+    **Read up on:**
+    - `net.ipv4.tcp_syn_retries`, `net.ipv4.tcp_retries2` in `ip-sysctl.rst`
+    - TCP retransmission timeout and exponential backoff
+  scenario: |
+    The namespace **`worker`** connects to its database with
+    **`sudo ip netns exec worker kl-connect`**, which tries the primary
+    `10.87.0.11` first, then the standby `10.87.0.12`. The primary is down
+    and doesn't answer at all, and `kl-connect` hangs for over two minutes
+    before it moves on.
+
+    Tune TCP **in `worker` only** (the VM's own settings stay as they are):
+
+    - a connection attempt to a server that doesn't answer must **fail in
+      under 10 seconds**, yet survive the loss of the first **two** SYNs
+      (at least two SYN retries)
+    - an established connection whose peer stops answering must fail
+      **within 30 seconds**, yet allow **at least 5** retransmissions
+
+    `kl-connect` must then reach the standby in under 10 seconds.
+  hints:
+    - "`sudo ip netns exec worker sysctl net.ipv4.tcp_syn_retries net.ipv4.tcp_retries2`."
+    - "SYN retries: 2^(N+1) − 1 seconds. Which N is under 10 s and still at least 2?"
+    - "retries2: 0.2 × (2^(N+1) − 1) seconds. Which values of N are at least 5 and under 30 s?"
+  solution: |
+    ```bash
+    # syn_retries 2 -> 1+2+4 = 7 s; retries2 5 -> 12.6 s, 6 -> 25.4 s
+    sudo ip netns exec worker sysctl -w net.ipv4.tcp_syn_retries=2 net.ipv4.tcp_retries2=6
+    sudo ip netns exec worker kl-connect
+    ```
+  setup: |
+    on_reset 'for n in worker dbs; do ip netns pids $n 2>/dev/null | xargs -r kill -9; done; rm -rf /opt/kl-sock87 /usr/local/bin/kl-connect'
+    netns_new worker dbs
+    netns_link worker eth0 dbs eth0
+    ip -n worker addr add 10.87.0.2/24 dev eth0
+    ip -n dbs addr add 10.87.0.11/24 dev eth0; ip -n dbs addr add 10.87.0.12/24 dev eth0
+    ip netns exec worker sysctl -qw net.ipv4.tcp_syn_retries=6 net.ipv4.tcp_retries2=15
+    ip netns exec dbs nft -f - <<'EOF'
+    table ip outage {
+      chain input {
+        type filter hook input priority 0; policy accept;
+        ip daddr 10.87.0.11 drop
+      }
+    }
+    EOF
+    sysctl -n net.ipv4.tcp_syn_retries net.ipv4.tcp_retries2 | tr '\n' ' ' > "$KL_STATE/host87"
+    mkdir -p /opt/kl-sock87
+    cat > /opt/kl-sock87/db.py <<'EOF'
+    import socket
+    s = socket.socket()
+    s.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+    s.bind(("0.0.0.0", 5432))
+    s.listen(16)
+    while True:
+        c, _ = s.accept()
+        c.close()
+    EOF
+    cat > /usr/local/bin/kl-connect <<'EOF'
+    #!/usr/bin/env python3
+    """kl-connect: connect to the primary database, or fall over to the standby."""
+    import socket, sys, time
+    start = time.time()
+    for host in ("10.87.0.11", "10.87.0.12"):
+        t = time.time()
+        print(f"trying {host}:5432 ...", flush=True)
+        try:
+            s = socket.create_connection((host, 5432))
+        except OSError as e:
+            print(f"  failed after {time.time() - t:.1f} s: {e}", flush=True)
+            continue
+        s.close()
+        print(f"connected to {host} after {time.time() - start:.1f} s")
+        break
+    else:
+        sys.exit("no database reachable")
+    EOF
+    chmod 755 /usr/local/bin/kl-connect
+    ip netns exec dbs setsid python3 /opt/kl-sock87/db.py </dev/null >/dev/null 2>&1 &
+    eventually 10 'ip netns exec worker timeout 2 bash -c "exec 3<>/dev/tcp/10.87.0.12/5432"'
+  check: |
+    s=$(ip netns exec worker sysctl -n net.ipv4.tcp_syn_retries)
+    r=$(ip netns exec worker sysctl -n net.ipv4.tcp_retries2)
+    check "worker survives two lost SYNs (tcp_syn_retries is $s)" '[ "$s" -ge 2 ]'
+    check "worker gives up on a silent server in under 10 s (tcp_syn_retries is $s)" '[ "$s" -le 2 ]'
+    check "an established connection fails within 30 s after at least 5 retransmissions (tcp_retries2 is $r)" '[ "$r" -ge 5 ] && [ "$r" -le 6 ]'
+    check_eq "the VM's own settings are unchanged" "$(sysctl -n net.ipv4.tcp_syn_retries net.ipv4.tcp_retries2 | tr '\n' ' ')" "$(cat "$KL_STATE/host87")"
+    if [ "$s" -le 2 ]; then
+      out=$(ip netns exec worker timeout 15 /usr/local/bin/kl-connect 2>&1)
+      check_match "kl-connect reaches the standby in under 10 s" "$(tail -1 <<<"$out")" '^connected to 10\.87\.0\.12 after [0-9]\.[0-9] s$'
+    else
+      fail "kl-connect reaches the standby in under 10 s (not run: it would wait $(( (2 << s) - 1 )) s on the primary)"
+    fi
+  solve: |
+    sudo ip netns exec worker sysctl -qw net.ipv4.tcp_syn_retries=2 net.ipv4.tcp_retries2=6
+
+- id: net-088
+  title: Who is sending the resets?
+  difficulty: 4
+  kind: build
+  tags: [tcp, rst, ttl, middlebox, tcpdump, troubleshooting]
+  tutorial: |
+    **Concept.** *Connection refused* means a TCP **reset** came back, but
+    not necessarily **from the server**. Firewalls and other middleboxes
+    forge resets on the server's behalf, with the server's address as the
+    source. The IP **TTL** gives them away: every host starts its packets
+    at a known value (64 on Linux), and every router on the way subtracts
+    one. Compare the TTL of the reset with the TTL of packets the server
+    really sent (its SYN-ACK on a port that works). The difference is the
+    number of routers between the two senders, so `64 - TTL` tells you how
+    far away the reset was made.
+
+    **Read up on:**
+    - `tcpdump -v` (shows `ttl`), `tcp[tcpflags] & tcp-rst != 0`
+    - IP TTL and hop counting, `traceroute -n`
+  scenario: |
+    From **`client`**, the server **`192.0.2.80`** sits behind four
+    routers, `r1` (nearest to the client) to `r4` (nearest to the server).
+    Their names and addresses are in **`/lab/routers.txt`**. The web site on
+    port 80 works, but the ports in **`/lab/ports.txt`** all fail with
+    *Connection refused*.
+
+    For each of those ports, find out **who sends the reset**: the server
+    itself, or one of the routers. Write **`/lab/answer.txt`** with one line
+    per port, in the same order, as **`PORT WHO`**, where `WHO` is `server`,
+    `r1`, `r2`, `r3` or `r4`.
+
+    Work from `client` only: the routers belong to the provider, so treat
+    them as boxes you can't log in to.
+  hints:
+    - "`sudo ip netns exec client tcpdump -nn -v -i right 'tcp[tcpflags] & tcp-rst != 0'` in one terminal, `sudo ip netns exec client curl -s http://192.0.2.80:PORT/` in another."
+    - "Capture the SYN-ACK from port 80 as well: what TTL do the server's own packets arrive with?"
+    - "A reset made by router rK starts at TTL 64 and crosses K − 1 routers on its way back to the client."
+  solution: |
+    ```bash
+    for p in $(cat /lab/ports.txt); do
+      sudo ip netns exec client timeout 4 tcpdump -nn -v -l -c 1 -i right \
+        "tcp src port $p and tcp[tcpflags] & tcp-rst != 0" > /tmp/rst.txt 2>/dev/null &
+      sleep 1
+      sudo ip netns exec client curl -s -m 2 http://192.0.2.80:$p/ >/dev/null
+      wait
+      ttl=$(grep -o 'ttl [0-9]*' /tmp/rst.txt | head -1 | cut -d' ' -f2)
+      hops=$((64 - ttl))        # the server is 4 routers away
+      if [ $hops -ge 4 ]; then echo "$p server"; else echo "$p r$((hops + 1))"; fi
+    done > /lab/answer.txt
+    ```
+  setup: |
+    on_reset 'for n in client r1 r2 r3 r4 server; do ip netns pids $n 2>/dev/null | xargs -r kill -9; done; rm -rf /opt/kl-sock88'
+    netns_new client r1 r2 r3 r4 server
+    chain=(client r1 r2 r3 r4 server)
+    for i in 0 1 2 3 4; do netns_link ${chain[$i]} right ${chain[$((i + 1))]} left; done
+    for i in 0 1 2 3 4; do
+      ip -n ${chain[$i]} addr add 10.88.$i.1/24 dev right
+      ip -n ${chain[$((i + 1))]} addr add 10.88.$i.2/24 dev left
+    done
+    ip -n server addr add 192.0.2.80/32 dev left
+    ip -n client route add default via 10.88.0.2
+    for i in 1 2 3 4; do
+      r=${chain[$i]}; ip netns exec $r sysctl -qw net.ipv4.ip_forward=1
+      ip -n $r route add default via 10.88.$i.2
+      ip -n $r route add 10.88.0.0/16 via 10.88.$((i - 1)).1 2>/dev/null
+    done
+    ip -n server route add default via 10.88.4.1
+    : > /lab/routers.txt
+    for i in 1 2 3 4; do echo "r$i 10.88.$((i - 1)).2" >> /lab/routers.txt; done
+    read -r p1 p2 p3 < <(python3 -c 'import random; print(*random.sample([5601, 6443, 8443, 8883, 9000, 9443], 3))')
+    a=$((1 + RANDOM % 4)); b=$((1 + RANDOM % 4))
+    while [ $b = $a ]; do b=$((1 + RANDOM % 4)); done
+    for x in "$a $p1" "$b $p2"; do
+      read -r rn port <<<"$x"
+      ip netns exec r$rn nft -f - <<EOF
+    table inet provider {
+      chain forward {
+        type filter hook forward priority 0; policy accept;
+        tcp dport $port reject with tcp reset
+      }
+    }
+    EOF
+    done
+    printf '%s r%s\n%s r%s\n%s server\n' "$p1" "$a" "$p2" "$b" "$p3" > "$KL_STATE/who88"
+    mkdir -p /opt/kl-sock88
+    cat > /opt/kl-sock88/srv.py <<'EOF'
+    import socket, sys, threading
+    def serve(p):
+        s = socket.socket()
+        s.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+        s.bind(("192.0.2.80", p))
+        s.listen(16)
+        while True:
+            c, _ = s.accept()
+            try:
+                c.recv(1024)
+                c.sendall(b"HTTP/1.0 200 OK\r\nContent-Length: 3\r\n\r\nok\n")
+            except OSError:
+                pass
+            c.close()
+    for p in sys.argv[1:]:
+        threading.Thread(target=serve, args=(int(p),), daemon=True).start()
+    threading.Event().wait()
+    EOF
+    ip netns exec server setsid python3 /opt/kl-sock88/srv.py 80 "$p1" "$p2" </dev/null >/dev/null 2>&1 &
+    shuf "$KL_STATE/who88" > "$KL_STATE/answer"
+    awk '{print $1}' "$KL_STATE/answer" > /lab/ports.txt
+    chown "$(lab_user):" /lab/routers.txt /lab/ports.txt
+    eventually 10 'ip netns exec client curl -fsS -m 2 http://192.0.2.80/'
+  check: |
+    got=$(sed 's/[[:space:]]*$//; /^$/d' /lab/answer.txt 2>/dev/null | tr -s ' \t' '  ' | tr A-Z a-z)
+    check_eq "who sends the reset, port by port" "$got" "$(cat "$KL_STATE/answer")"
+  solve: |
+    for p in $(cat /lab/ports.txt); do
+      sudo ip netns exec client timeout 4 tcpdump -nn -v -l -c 1 -i right "tcp src port $p and tcp[tcpflags] & tcp-rst != 0" > /tmp/kl-rst88.txt 2>/dev/null &
+      sleep 1
+      sudo ip netns exec client curl -s -m 2 http://192.0.2.80:$p/ >/dev/null
+      wait
+      ttl=$(grep -o 'ttl [0-9]*' /tmp/kl-rst88.txt | head -1 | cut -d' ' -f2)
+      hops=$((64 - ttl))
+      if [ $hops -ge 4 ]; then echo "$p server"; else echo "$p r$((hops + 1))"; fi
+    done > /lab/answer.txt
+    rm -f /tmp/kl-rst88.txt
+
+- id: net-089
+  title: The listen queue that overflows
+  difficulty: 4
+  kind: fix
+  tags: [tcp, backlog, somaxconn, accept-queue, nstat, ss]
+  tutorial: |
+    **Concept.** The kernel completes the TCP handshake on its own and parks
+    each new connection in the listening socket's **accept queue** until the
+    application calls `accept()`. The queue's length is the **backlog**
+    passed to `listen()`, capped by **`net.core.somaxconn`**. When a burst
+    fills it, the kernel drops the client's handshake ACK (and soon its
+    SYNs). The client then waits for retransmissions, a second or more, and
+    the counter **`TcpExtListenOverflows`** goes up. For a listening socket,
+    `ss -ltn` shows the queue's current length as **Recv-Q** and its limit
+    as **Send-Q**. A program has to call `listen()` again, so restart it,
+    before a new limit applies.
+
+    **Read up on:**
+    - `listen(2)` backlog, `net.core.somaxconn`
+    - `ss -ltn` (Recv-Q / Send-Q of a listener), `nstat -az TcpExtListenOverflows`
+  scenario: |
+    The order API in the namespace **`api`** (`10.89.0.10:8080`) answers in
+    a millisecond, yet when the warehouse scanners all sync at once, many
+    requests take over a second and some fail.
+    **`sudo ip netns exec load kl-burst 200`** reproduces it: 200 clients
+    call the API at the same moment.
+
+    The API is managed with **`sudo kl-api start|stop|restart`** and reads
+    **`/etc/kl-api.conf`**. Make it absorb the burst:
+
+    - its listen queue holds **at least 1024** connections (the limit `ss`
+      shows for the listener)
+    - during `kl-burst 200`, **every** client is answered and the API's
+      namespace records **no listen queue overflows**
+  hints:
+    - "`sudo ip netns exec api ss -ltn 'sport = :8080'`: compare Send-Q with the backlog in `/etc/kl-api.conf`."
+    - "`sudo ip netns exec api nstat -az TcpExtListenOverflows` before and after a burst."
+    - "Raise `backlog` in the config **and** `net.core.somaxconn` in `api`, then `sudo kl-api restart`."
+  solution: |
+    ```bash
+    sudo ip netns exec api ss -ltn 'sport = :8080'          # Send-Q 8
+    sudo ip netns exec api sysctl -w net.core.somaxconn=4096
+    sudo sed -i 's/^backlog=.*/backlog=4096/' /etc/kl-api.conf
+    sudo kl-api restart
+    sudo ip netns exec api ss -ltn 'sport = :8080'          # Send-Q 4096
+    sudo ip netns exec load kl-burst 200
+    sudo ip netns exec api nstat -az TcpExtListenOverflows
+    ```
+  setup: |
+    on_reset 'for n in api load; do ip netns pids $n 2>/dev/null | xargs -r kill -9; done; rm -rf /opt/kl-sock89 /usr/local/bin/kl-api /usr/local/bin/kl-burst /etc/kl-api.conf /var/log/kl-api.log'
+    netns_new api load
+    netns_link api eth0 load eth0
+    ip -n api addr add 10.89.0.10/24 dev eth0
+    ip -n load addr add 10.89.0.20/24 dev eth0
+    ip netns exec api sysctl -qw net.core.somaxconn=64
+    mkdir -p /opt/kl-sock89
+    printf '# kl-api settings, read at start\nport=8080\nbacklog=8\n' > /etc/kl-api.conf
+    cat > /opt/kl-sock89/api.py <<'EOF'
+    import socket, time
+    conf = {}
+    for line in open("/etc/kl-api.conf"):
+        line = line.split("#")[0].strip()
+        if "=" in line:
+            k, v = line.split("=", 1)
+            conf[k.strip()] = v.strip()
+    s = socket.socket()
+    s.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+    s.bind(("10.89.0.10", int(conf.get("port", 8080))))
+    s.listen(int(conf.get("backlog", 8)))
+    print(f"listening, backlog {conf.get('backlog')}", flush=True)
+    while True:
+        c, _ = s.accept()
+        try:
+            c.settimeout(2)
+            if c.recv(64):
+                time.sleep(0.001)  # look the order up
+                c.sendall(b"ok\n")
+        except OSError:
+            pass
+        c.close()
+    EOF
+    cat > /usr/local/bin/kl-api <<'EOF'
+    #!/bin/bash
+    # kl-api start|stop|restart -- the order API in the namespace api (reads /etc/kl-api.conf)
+    case "$1" in
+      start) ip netns exec api setsid python3 /opt/kl-sock89/api.py </dev/null >>/var/log/kl-api.log 2>&1 & ;;
+      stop) pkill -f /opt/kl-sock89/api.py; sleep 0.5 ;;
+      restart) "$0" stop; "$0" start ;;
+      *) echo "usage: kl-api start|stop|restart" >&2; exit 2 ;;
+    esac
+    EOF
+    cat > /usr/local/bin/kl-burst <<'EOF'
+    #!/usr/bin/env python3
+    """kl-burst [N]: N clients (default 200) call the API at the same moment."""
+    import socket, sys, threading, time
+    n = int(sys.argv[1]) if len(sys.argv) > 1 else 200
+    bar, lock, res = threading.Barrier(n), threading.Lock(), []
+    def client():
+        bar.wait()
+        t = time.time()
+        try:
+            s = socket.create_connection(("10.89.0.10", 8080), timeout=10)
+            s.settimeout(10)
+            s.sendall(b"GET /orders\n")
+            ok = s.recv(16) == b"ok\n"
+            s.close()
+        except OSError:
+            ok = False
+        with lock:
+            res.append((ok, time.time() - t))
+    ts = [threading.Thread(target=client) for _ in range(n)]
+    for t in ts:
+        t.start()
+    for t in ts:
+        t.join()
+    good = sum(1 for ok, _ in res if ok)
+    lat = sorted(d for _, d in res)
+    print(f"{good}/{n} answered, median {lat[len(lat) // 2]:.2f} s, slowest {lat[-1]:.2f} s")
+    sys.exit(0 if good == n else 1)
+    EOF
+    chmod 755 /usr/local/bin/kl-api /usr/local/bin/kl-burst
+    /usr/local/bin/kl-api start
+    eventually 10 'ip netns exec api ss -ltnH | grep -q 10.89.0.10:8080'
+  check: |
+    lo() { ip netns exec api awk '/^TcpExt:/ { if (!h) { for (i = 1; i <= NF; i++) n[i] = $i; h = 1 } else { for (i = 1; i <= NF; i++) if (n[i] == "ListenOverflows") print $i } }' /proc/net/netstat; }
+    check "the API listens on 10.89.0.10:8080" 'eventually 5 "ip netns exec api ss -ltnH | grep -q 10.89.0.10:8080"'
+    q=$(ip netns exec api ss -ltnH 'sport = :8080' | awk '{print $3}' | head -1)
+    check "its listen queue holds at least 1024 connections (ss shows ${q:-nothing})" '[ "${q:-0}" -ge 1024 ]'
+    before=$(lo)
+    out=$(ip netns exec load timeout 40 /usr/local/bin/kl-burst 200 2>&1)
+    after=$(lo)
+    info "kl-burst 200: $out"
+    check_match "every client of the burst is answered" "$out" '^200/200 answered'
+    check_eq "listen queue overflows during the burst" "$(( ${after:-0} - ${before:-0} ))" 0
+  solve: |
+    sudo ip netns exec api sysctl -qw net.core.somaxconn=4096
+    sudo sed -i 's/^backlog=.*/backlog=4096/' /etc/kl-api.conf
+    sudo kl-api restart
+    sleep 1
+
+- id: net-090
+  title: Forty milliseconds per request
+  difficulty: 4
+  kind: fix
+  tags: [tcp, nagle, delayed-ack, tcp_nodelay, latency, python]
+  tutorial: |
+    **Concept.** **Nagle's algorithm** saves packets by holding back a small
+    write while earlier data is still unacknowledged. **Delayed ACKs** save
+    packets on the other side by waiting up to ~40 ms for something to
+    piggyback the ACK on. Together they deadlock briefly in a pattern known
+    as **write-write-read**: the client sends a request in two small
+    writes, the first goes out, the second waits for an ACK, and the server
+    delays its ACK because it hasn't got the whole request yet. Every
+    request then costs ~40 ms on a link with a round trip of microseconds.
+    Fix it by sending each request in **one write**, or by setting
+    **`TCP_NODELAY`** on the socket (interactive protocols such as Redis,
+    SSH and HTTP clients do).
+
+    **Read up on:**
+    - Nagle's algorithm (RFC 896) and delayed ACKs (RFC 1122)
+    - `socket.setsockopt(socket.IPPROTO_TCP, socket.TCP_NODELAY, 1)`
+    - `tcpdump -ttt` to see the gaps between packets
+  scenario: |
+    **`/lab/client.py`** looks up keys on the key-value server
+    `10.90.0.10:7070` over one TCP connection and prints `key=value` lines.
+    The nightly job runs it from the namespace **`app`**:
+
+    ```bash
+    time sudo ip netns exec app python3 /lab/client.py /lab/keys.txt
+    ```
+
+    It needs about 8 seconds for 200 keys, although the server answers each
+    lookup in microseconds. Fix **`/lab/client.py`** so that **150 lookups
+    take under 1 second**. Keep the protocol, the command line and the
+    output: the check runs your client with its own list of keys and
+    compares the values.
+  hints:
+    - "`sudo ip netns exec app tcpdump -nn -ttt -i eth0 port 7070` while the client runs: where are the ~40 ms gaps?"
+    - "Each request is sent with two `sendall()` calls: the length, then the key."
+    - "Build the request as one bytes object and send it in a single `sendall()`, or set `TCP_NODELAY` right after connecting."
+  solution: |
+    ```python
+    def lookup(sock, key):
+        payload = key.encode()
+        sock.sendall(struct.pack("!I", len(payload)) + payload)   # one write
+        (n,) = struct.unpack("!I", recv_exact(sock, 4))
+        return recv_exact(sock, n).decode()
+
+    # and/or, after connecting:
+    sock.setsockopt(socket.IPPROTO_TCP, socket.TCP_NODELAY, 1)
+    ```
+  setup: |
+    on_reset 'for n in app kv; do ip netns pids $n 2>/dev/null | xargs -r kill -9; done; rm -rf /opt/kl-sock90'
+    netns_new app kv
+    netns_link app eth0 kv eth0
+    ip -n app addr add 10.90.0.20/24 dev eth0
+    ip -n kv addr add 10.90.0.10/24 dev eth0
+    mkdir -p /opt/kl-sock90
+    head -c 16 /dev/urandom | od -An -tx1 | tr -d ' \n' > "$KL_STATE/kv90.secret"
+    cat > /opt/kl-sock90/server.py <<'EOF'
+    import hashlib, socket, struct, sys, threading
+    secret = open(sys.argv[1], "rb").read().strip()
+    def recv_exact(c, n):
+        b = b""
+        while len(b) < n:
+            d = c.recv(n - len(b))
+            if not d:
+                raise ConnectionError
+            b += d
+        return b
+    def handle(c):
+        try:
+            while True:
+                (n,) = struct.unpack("!I", recv_exact(c, 4))
+                key = recv_exact(c, n)
+                v = hashlib.sha256(secret + key).hexdigest()[:12].encode()
+                c.sendall(struct.pack("!I", len(v)) + v)
+        except (OSError, struct.error):
+            pass
+        finally:
+            c.close()
+    s = socket.socket()
+    s.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+    s.bind(("10.90.0.10", 7070))
+    s.listen(16)
+    while True:
+        c, _ = s.accept()
+        threading.Thread(target=handle, args=(c,), daemon=True).start()
+    EOF
+    ip netns exec kv setsid python3 /opt/kl-sock90/server.py "$KL_STATE/kv90.secret" </dev/null >/dev/null 2>&1 &
+    python3 -c 'import random, string
+    for _ in range(200):
+        print("sku-" + "".join(random.choices(string.ascii_lowercase + string.digits, k=8)))' > /lab/keys.txt
+    lab_file /lab/client.py <<'EOF'
+    #!/usr/bin/env python3
+    """Look up every key in a file on the kv server and print "key=value" lines.
+
+    Usage: python3 client.py [KEYS_FILE]   (default /lab/keys.txt)
+    """
+    import socket
+    import struct
+    import sys
+
+    SERVER = ("10.90.0.10", 7070)
+
+
+    def recv_exact(sock, n):
+        buf = b""
+        while len(buf) < n:
+            chunk = sock.recv(n - len(buf))
+            if not chunk:
+                raise ConnectionError("server closed the connection")
+            buf += chunk
+        return buf
+
+
+    def lookup(sock, key):
+        payload = key.encode()
+        # request: the key's length as 4 bytes (big-endian), then the key
+        sock.sendall(struct.pack("!I", len(payload)))
+        sock.sendall(payload)
+        # reply: the value's length as 4 bytes, then the value
+        (n,) = struct.unpack("!I", recv_exact(sock, 4))
+        return recv_exact(sock, n).decode()
+
+
+    def main():
+        keys_file = sys.argv[1] if len(sys.argv) > 1 else "/lab/keys.txt"
+        keys = [k.strip() for k in open(keys_file) if k.strip()]
+        with socket.create_connection(SERVER) as sock:
+            for key in keys:
+                print(f"{key}={lookup(sock, key)}")
+
+
+    if __name__ == "__main__":
+        main()
+    EOF
+    eventually 10 'ip netns exec kv ss -ltnH | grep -q 10.90.0.10:7070'
+  check: |
+    k=$(mktemp)
+    python3 -c 'import random, string
+    for _ in range(150):
+        print("chk-" + "".join(random.choices(string.ascii_lowercase, k=8)))' > "$k"
+    chmod 644 "$k"
+    want=$(python3 - "$k" "$KL_STATE/kv90.secret" <<'PY'
+    import hashlib, sys
+    secret = open(sys.argv[2], "rb").read().strip()
+    for k in open(sys.argv[1]):
+        k = k.strip()
+        print(f"{k}={hashlib.sha256(secret + k.encode()).hexdigest()[:12]}")
+    PY
+    )
+    t0=$(date +%s%N)
+    out=$(ip netns exec app timeout 30 python3 /lab/client.py "$k" 2>/dev/null)
+    ms=$(( ($(date +%s%N) - t0) / 1000000 ))
+    rm -f "$k"
+    check_eq "the client prints the right value for each of 150 keys" "$(sha256sum <<<"$out")" "$(sha256sum <<<"$want")"
+    check "150 lookups take under 1 s (took ${ms} ms)" '[ $ms -lt 1000 ]'
+  solve: |
+    grep -q TCP_NODELAY /lab/client.py || sed -i 's/^    with socket.create_connection(SERVER) as sock:$/&\n        sock.setsockopt(socket.IPPROTO_TCP, socket.TCP_NODELAY, 1)/' /lab/client.py
+
+- id: net-091
+  title: A long, fat pipe
+  difficulty: 4
+  kind: fix
+  tags: [tcp, bdp, receive-window, tcp_rmem, so_rcvbuf, netem, throughput]
+  tutorial: |
+    **Concept.** TCP can only have one **receive window** of data in flight
+    before it must wait for acknowledgements, so a single connection's
+    throughput is at most **window ÷ round-trip time**. To fill a link the
+    window must reach the **bandwidth-delay product** (BDP): 100 Mbit/s ×
+    100 ms = 1.25 MB. Linux grows the receive buffer automatically
+    (*autotuning*) up to the third value of **`net.ipv4.tcp_rmem`**. An
+    application that sets **`SO_RCVBUF`** itself switches autotuning off
+    for that socket and is stuck with what it asked for (capped by
+    `net.core.rmem_max`). A small buffer is harmless on a LAN and crippling
+    across a continent.
+
+    **Read up on:**
+    - Bandwidth-delay product, TCP window scaling and receive-buffer autotuning
+    - `net.ipv4.tcp_rmem`, `SO_RCVBUF` in `man 7 socket` and `man 7 tcp`
+    - `ss -tmi` (`rcv_space`, `skmem`)
+  scenario: |
+    The disaster-recovery site **`dr`** pulls the nightly snapshot from
+    **`prod`** (`10.91.0.10:9100`) with **`/lab/fetch.py`**:
+
+    ```bash
+    sudo ip netns exec dr python3 /lab/fetch.py
+    ```
+
+    The 8 MiB snapshot crawls in at about 1 MB/s. The WAN between the sites
+    has a **100 ms** round trip (emulated with `netem` on both ends) and is
+    provisioned for **100 Mbit/s**. Make it fast:
+
+    - the 8 MiB arrive intact in **under 4 seconds**
+    - `dr`'s TCP receive buffers may grow to at least **three times the
+      link's bandwidth-delay product** (the maximum in `net.ipv4.tcp_rmem`)
+    - the WAN emulation stays in place, and `fetch.py` keeps its command line
+      (`fetch.py [OUTPUT]`)
+  hints:
+    - "During a transfer, `sudo ip netns exec dr ss -tmi dst 10.91.0.10` shows the receive buffer (`rb` in `skmem`)."
+    - "BDP = 100 Mbit/s × 0.1 s = 1.25 MB, so the tcp_rmem maximum must be at least 3.75 MB. `sudo ip netns exec dr sysctl net.ipv4.tcp_rmem`."
+    - "Look at `fetch.py`: a fixed `SO_RCVBUF` turns autotuning off."
+  solution: |
+    ```bash
+    sudo ip netns exec dr sysctl -w net.ipv4.tcp_rmem="4096 131072 6291456"
+    sed -i '/SO_RCVBUF/d' /lab/fetch.py      # let the kernel autotune
+    sudo ip netns exec dr python3 /lab/fetch.py
+    ```
+  setup: |
+    on_reset 'for n in prod dr; do ip netns pids $n 2>/dev/null | xargs -r kill -9; done; rm -rf /opt/kl-sock91'
+    netns_new prod dr
+    netns_link prod eth0 dr eth0
+    ip -n prod addr add 10.91.0.10/24 dev eth0
+    ip -n dr addr add 10.91.0.20/24 dev eth0
+    for n in prod dr; do ip netns exec $n tc qdisc add dev eth0 root netem delay 50ms limit 10000; done
+    ip netns exec dr sysctl -qw net.ipv4.tcp_rmem="4096 65536 131072"
+    mkdir -p /opt/kl-sock91
+    head -c 8388608 /dev/urandom > /opt/kl-sock91/snapshot.bin
+    sha256sum < /opt/kl-sock91/snapshot.bin | cut -d' ' -f1 > "$KL_STATE/sha91"
+    cat > /opt/kl-sock91/server.py <<'EOF'
+    import socket, threading
+    data = open("/opt/kl-sock91/snapshot.bin", "rb").read()
+    def send(c):
+        try:
+            c.sendall(data)
+        except OSError:
+            pass
+        c.close()
+    s = socket.socket()
+    s.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+    s.bind(("10.91.0.10", 9100))
+    s.listen(16)
+    while True:
+        c, _ = s.accept()
+        threading.Thread(target=send, args=(c,), daemon=True).start()
+    EOF
+    ip netns exec prod setsid python3 /opt/kl-sock91/server.py </dev/null >/dev/null 2>&1 &
+    lab_file /lab/fetch.py <<'EOF'
+    #!/usr/bin/env python3
+    """Pull the nightly snapshot from prod and save it.
+
+    Usage: python3 fetch.py [OUTPUT]   (default /lab/snapshot.bin)
+    """
+    import socket
+    import sys
+    import time
+
+    out = sys.argv[1] if len(sys.argv) > 1 else "/lab/snapshot.bin"
+
+    sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+    # a fixed 64 KiB receive buffer keeps memory use predictable
+    sock.setsockopt(socket.SOL_SOCKET, socket.SO_RCVBUF, 65536)
+    sock.settimeout(30)
+    start = time.time()
+    sock.connect(("10.91.0.10", 9100))
+    total = 0
+    with open(out, "wb") as f:
+        while True:
+            chunk = sock.recv(1 << 20)
+            if not chunk:
+                break
+            f.write(chunk)
+            total += len(chunk)
+    sock.close()
+    secs = time.time() - start
+    print(f"{total} bytes in {secs:.2f} s ({total / secs / 1e6:.1f} MB/s)")
+    EOF
+    eventually 10 'ip netns exec prod ss -ltnH | grep -q 10.91.0.10:9100'
+  check: |
+    mx=$(ip netns exec dr sysctl -n net.ipv4.tcp_rmem | awk '{print $3}')
+    check "dr's tcp_rmem maximum is at least 3 x the BDP, 3750000 bytes (it is $mx)" '[ "$mx" -ge 3750000 ]'
+    check "the WAN emulation is still in place on both ends" 'for n in prod dr; do ip netns exec $n tc qdisc show dev eth0 | grep -q "netem.*delay 50ms" || exit 1; done'
+    f=$(mktemp)
+    t0=$(date +%s%N)
+    ip netns exec dr timeout 15 python3 /lab/fetch.py "$f" >/dev/null 2>&1
+    ms=$(( ($(date +%s%N) - t0) / 1000000 ))
+    check_eq "the snapshot arrives intact" "$(sha256sum < "$f" | cut -d' ' -f1)" "$(cat "$KL_STATE/sha91")"
+    check "it arrives in under 4 s (took ${ms} ms)" '[ $ms -lt 4000 ]'
+    rm -f "$f"
+  solve: |
+    sudo ip netns exec dr sysctl -qw net.ipv4.tcp_rmem="4096 131072 6291456"
+    sed -i '/SO_RCVBUF/d; /fixed 64 KiB receive buffer/d' /lab/fetch.py
+
+- id: net-092
+  title: "Incident: the morning rush"
+  difficulty: 5
+  kind: fix
+  tags: [incident, tcp, ephemeral-ports, somaxconn, backlog, nftables, rate-limit, troubleshooting]
+  tutorial: |
+    **Concept.** When a service falls over **only under load**, look at
+    each stage a connection goes through and at the limit that applies
+    there:
+
+    1. the **client** needs a free ephemeral port (`ip_local_port_range`,
+       TIME-WAIT), or `connect()` fails with *Cannot assign requested address*
+    2. the server's **firewall** may rate-limit new connections, and dropped
+       SYNs come back as one-second retransmissions
+    3. the server's **accept queue** (backlog, `somaxconn`) may overflow:
+       retransmissions again, and `TcpExtListenOverflows` counts them
+
+    Read the error messages, the latency, `ss`, `nstat` and the firewall
+    counters (`nft list ruleset` shows `counter` values) before you change
+    anything.
+
+    **Read up on:**
+    - Everything earlier in this module
+    - nftables `limit rate [over] N/second burst M packets`, `nft -a list ruleset`, `nft replace rule ... handle H`
+  scenario: |
+    Every morning at nine the branch proxy **`edge`** (`10.92.0.20`) fires
+    the stores' first orders at the order service in **`app`**
+    (`10.92.0.10:8080`), and the service falls over. Reproduce it with
+    **`sudo ip netns exec edge kl-rush`** (5 waves of 200 simultaneous
+    orders). The service is managed with **`sudo kl-orders
+    start|stop|restart`** and reads **`/etc/kl-orders.conf`**.
+
+    Find and fix everything that breaks the rush, so that:
+
+    - `kl-rush` reports **`1000 ok, 0 slow (>1 s), 0 failed`**
+    - `app` records **no listen queue overflows** during the rush
+    - `edge` uses the **standard** ephemeral port range, `32768 60999`
+    - `app` keeps its **flood guard**: the rule in table `inet appfw` that
+      drops new connections to port 8080 above a rate stays, set to the
+      production values, **2000/second with a burst of 1000 packets**
+  hints:
+    - "Run `kl-rush` and read the error breakdown: which errors come from `edge` itself?"
+    - "`sudo ip netns exec app nft list ruleset` (watch the counters), `sudo ip netns exec app ss -ltn 'sport = :8080'` and `sudo ip netns exec app nstat -az TcpExtListenOverflows`."
+    - "`sudo ip netns exec app nft -a list chain inet appfw input` shows rule handles for `nft replace rule inet appfw input handle H ...`."
+    - "After changing `somaxconn`, restart the service: the backlog is fixed when it calls `listen()`."
+  solution: |
+    ```bash
+    # 1. edge runs out of ephemeral ports (Cannot assign requested address)
+    sudo ip netns exec edge sysctl -w net.ipv4.ip_local_port_range="32768 60999"
+    # 2. the flood guard drops the rush's SYNs (50/second burst 20)
+    sudo ip netns exec app nft -a list chain inet appfw input
+    sudo ip netns exec app nft replace rule inet appfw input handle H \
+      tcp dport 8080 ct state new limit rate over 2000/second burst 1000 packets counter drop
+    # 3. somaxconn caps the backlog at 16
+    sudo ip netns exec app sysctl -w net.core.somaxconn=4096
+    sudo kl-orders restart
+    sudo ip netns exec edge kl-rush
+    ```
+  setup: |
+    on_reset 'for n in edge app; do ip netns pids $n 2>/dev/null | xargs -r kill -9; done; rm -rf /opt/kl-sock92 /usr/local/bin/kl-orders /usr/local/bin/kl-rush /etc/kl-orders.conf /var/log/kl-orders.log'
+    netns_new edge app
+    netns_link edge eth0 app eth0
+    ip -n edge addr add 10.92.0.20/24 dev eth0
+    ip -n app addr add 10.92.0.10/24 dev eth0
+    ip netns exec edge sysctl -qw net.ipv4.ip_local_port_range="60000 60499"
+    ip netns exec app sysctl -qw net.core.somaxconn=16
+    ip netns exec app nft -f - <<'EOF'
+    table inet appfw {
+      chain input {
+        type filter hook input priority 0; policy accept;
+        tcp dport 22 ip saddr != 10.92.0.0/24 drop
+        tcp dport 8080 ct state new limit rate over 50/second burst 20 packets counter drop comment "flood guard (load test settings)"
+      }
+    }
+    EOF
+    mkdir -p /opt/kl-sock92
+    printf '# kl-orders settings, read at start\nport=8080\nbacklog=4096\n' > /etc/kl-orders.conf
+    cat > /opt/kl-sock92/orders.py <<'EOF'
+    import selectors, socket, time
+    conf = {}
+    for line in open("/etc/kl-orders.conf"):
+        line = line.split("#")[0].strip()
+        if "=" in line:
+            k, v = line.split("=", 1)
+            conf[k.strip()] = v.strip()
+    sel = selectors.DefaultSelector()
+    ls = socket.socket()
+    ls.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+    ls.bind(("10.92.0.10", int(conf.get("port", 8080))))
+    ls.listen(int(conf.get("backlog", 128)))
+    ls.setblocking(False)
+    sel.register(ls, selectors.EVENT_READ, "listen")
+    print(f"listening, backlog {conf.get('backlog')}", flush=True)
+    while True:
+        for key, _ in sel.select():
+            sock = key.fileobj
+            if key.data == "listen":
+                try:
+                    c, _ = ls.accept()
+                except BlockingIOError:
+                    continue
+                c.setblocking(False)
+                sel.register(c, selectors.EVENT_READ, "request")
+                continue
+            try:
+                d = sock.recv(256)
+            except OSError:
+                d = b""
+            if not d:
+                sel.unregister(sock)
+                sock.close()
+            elif key.data == "request":
+                time.sleep(0.001)  # look the order up
+                try:
+                    sock.send(b"ok\n")
+                except OSError:
+                    pass
+                sel.modify(sock, selectors.EVENT_READ, "answered")
+    EOF
+    cat > /usr/local/bin/kl-orders <<'EOF'
+    #!/bin/bash
+    # kl-orders start|stop|restart -- the order service in the namespace app (reads /etc/kl-orders.conf)
+    case "$1" in
+      start) ip netns exec app setsid python3 /opt/kl-sock92/orders.py </dev/null >>/var/log/kl-orders.log 2>&1 & ;;
+      stop) pkill -f /opt/kl-sock92/orders.py; sleep 0.5 ;;
+      restart) "$0" stop; "$0" start ;;
+      *) echo "usage: kl-orders start|stop|restart" >&2; exit 2 ;;
+    esac
+    EOF
+    cat > /usr/local/bin/kl-rush <<'EOF'
+    #!/usr/bin/env python3
+    """kl-rush: the morning rush, 5 waves of 200 simultaneous orders to 10.92.0.10:8080."""
+    import socket, sys, threading, time
+    WAVES, PER = 5, 200
+    res, lock = [], threading.Lock()
+    def order(bar):
+        bar.wait()
+        t = time.time()
+        err = None
+        try:
+            s = socket.create_connection(("10.92.0.10", 8080), timeout=5)
+            s.settimeout(5)
+            s.sendall(b"ORDER\n")
+            if s.recv(16) != b"ok\n":
+                err = "unexpected answer"
+            s.close()
+        except OSError as e:
+            err = str(e)
+        with lock:
+            res.append((err, time.time() - t))
+    for w in range(WAVES):
+        bar = threading.Barrier(PER)
+        ts = [threading.Thread(target=order, args=(bar,)) for _ in range(PER)]
+        for t in ts:
+            t.start()
+        for t in ts:
+            t.join()
+        time.sleep(0.2)
+    ok = sum(1 for e, d in res if e is None and d < 1.0)
+    slow = sum(1 for e, d in res if e is None and d >= 1.0)
+    errs = {}
+    for e, d in res:
+        if e is not None:
+            errs[e] = errs.get(e, 0) + 1
+    print(f"{len(res)} requests: {ok} ok, {slow} slow (>1 s), {sum(errs.values())} failed")
+    for e, c in sorted(errs.items(), key=lambda x: -x[1]):
+        print(f"  {c} x {e}")
+    sys.exit(0 if ok == len(res) else 1)
+    EOF
+    chmod 755 /usr/local/bin/kl-orders /usr/local/bin/kl-rush
+    /usr/local/bin/kl-orders start
+    eventually 10 'ip netns exec app ss -ltnH | grep -q 10.92.0.10:8080'
+  check: |
+    lo() { ip netns exec app awk '/^TcpExt:/ { if (!h) { for (i = 1; i <= NF; i++) n[i] = $i; h = 1 } else { for (i = 1; i <= NF; i++) if (n[i] == "ListenOverflows") print $i } }' /proc/net/netstat; }
+    range=$(ip netns exec edge sysctl -n net.ipv4.ip_local_port_range | tr -s '\t ' '  ')
+    check_eq "edge's ephemeral port range" "$range" "32768 60999"
+    fw=$(ip netns exec app nft -j list chain inet appfw input 2>/dev/null)
+    guard=$(jq '[.nftables[] | select(.rule) | .rule.expr | select(any(.[]; .match.right == 8080) and any(.[]; .limit.rate == 2000 and .limit.per == "second" and .limit.burst == 1000 and .limit.inv == true) and any(.[]; has("drop")))] | length' <<<"$fw" 2>/dev/null)
+    check_eq "app's flood guard on port 8080 (rules at 2000/second, burst 1000)" "$guard" 1
+    check "the order service listens on 10.92.0.10:8080" 'eventually 5 "ip netns exec app ss -ltnH | grep -q 10.92.0.10:8080"'
+    if [ "$range" = "32768 60999" ] && [ "$guard" = 1 ]; then
+      before=$(lo)
+      out=$(ip netns exec edge timeout 90 /usr/local/bin/kl-rush 2>&1)
+      after=$(lo)
+      info "kl-rush: $(head -1 <<<"$out")"
+      check_match "kl-rush: every order answered within a second" "$(head -1 <<<"$out")" ': 1000 ok, 0 slow \(>1 s\), 0 failed$'
+      check_eq "listen queue overflows on app during the rush" "$(( ${after:-0} - ${before:-0} ))" 0
+    else
+      fail "kl-rush: every order answered within a second (not run: fix the settings above first)"
+    fi
+  solve: |
+    sudo ip netns exec edge sysctl -qw net.ipv4.ip_local_port_range="32768 60999"
+    h=$(sudo ip netns exec app nft -a list chain inet appfw input | awk '/dport 8080/ {print $NF}')
+    sudo ip netns exec app nft replace rule inet appfw input handle "$h" tcp dport 8080 ct state new limit rate over 2000/second burst 1000 packets counter drop
+    sudo ip netns exec app sysctl -qw net.core.somaxconn=4096
+    sudo kl-orders restart
+    sleep 1
+
+- id: net-093
+  title: "Incident: the backup misses its window"
+  difficulty: 5
+  kind: fix
+  tags: [incident, tcp, throughput, tcp_wmem, window-scaling, tc, htb, netem, troubleshooting]
+  tutorial: |
+    **Concept.** A bulk transfer is only as fast as its **tightest limit**,
+    and there are several on the way:
+
+    - the **sender's** send buffer (`net.ipv4.tcp_wmem`) caps the data it
+      can have in flight
+    - the **receiver's** window caps it too. Without the **window scaling**
+      option (`net.ipv4.tcp_window_scaling`, negotiated in the SYNs) the
+      window can never exceed 64 KiB, however large the buffer
+    - every **router** on the path can shape or queue traffic (`tc`)
+
+    Over a long round trip, each of them is *window ÷ RTT*. Fix one and the
+    next one becomes the limit, so measure after every change. `ss -ti` on
+    both ends shows `wscale`, `cwnd`, `rcv_space` and the send-buffer
+    numbers, and `tc -s qdisc` shows what each router does with the traffic.
+
+    **Read up on:**
+    - `net.ipv4.tcp_wmem`, `net.ipv4.tcp_window_scaling` (RFC 7323)
+    - `ss -tmi`, `tc -s qdisc show`, netem with a child qdisc
+  scenario: |
+    The branch server **`branch`** (`10.93.1.10`) uploads its nightly backup
+    to the archive **`archive`** (`10.93.2.10:7000`) through the WAN router
+    **`wan`**. The link has an **80 ms** round trip, emulated by `netem` on
+    both of `wan`'s interfaces. The backup no longer fits its window:
+
+    ```bash
+    sudo ip netns exec branch kl-upload
+    ```
+
+    uploads 16 MiB and waits for the archive to confirm the checksum. Make it
+    finish in **under 8 seconds**, with the archive confirming the
+    checksum. Keep the WAN emulation: `wan`'s **40 ms netem delay** on each
+    of its two interfaces must stay.
+  hints:
+    - "Watch an upload from both ends: `sudo ip netns exec branch ss -tmi dst 10.93.2.10` and `sudo ip netns exec archive ss -tmi`. Is `wscale` there? How big is the send buffer?"
+    - "`sudo ip netns exec wan tc -s qdisc show`: is netem the only thing on the path?"
+    - "There are three limits: one on the sender, one on the receiver, one on the router."
+  solution: |
+    ```bash
+    # the sender: a 32 KiB send buffer
+    sudo ip netns exec branch sysctl -w net.ipv4.tcp_wmem="4096 16384 4194304"
+    # the receiver: no window scaling, so at most 64 KiB in flight
+    sudo ip netns exec archive sysctl -w net.ipv4.tcp_window_scaling=1
+    # the router: a 4 Mbit/s htb shaper left under the netem delay by a test
+    sudo ip netns exec wan tc qdisc show dev eth1
+    sudo ip netns exec wan tc qdisc del dev eth1 root
+    sudo ip netns exec wan tc qdisc add dev eth1 root netem delay 40ms limit 10000
+    sudo ip netns exec branch kl-upload
+    ```
+  setup: |
+    on_reset 'for n in branch wan archive; do ip netns pids $n 2>/dev/null | xargs -r kill -9; done; rm -rf /opt/kl-sock93 /usr/local/bin/kl-upload'
+    netns_new branch wan archive
+    netns_link branch eth0 wan eth0
+    netns_link wan eth1 archive eth0
+    ip -n branch addr add 10.93.1.10/24 dev eth0; ip -n branch route add default via 10.93.1.1
+    ip -n wan addr add 10.93.1.1/24 dev eth0; ip -n wan addr add 10.93.2.1/24 dev eth1
+    ip -n archive addr add 10.93.2.10/24 dev eth0; ip -n archive route add default via 10.93.2.1
+    ip netns exec wan sysctl -qw net.ipv4.ip_forward=1
+    for i in eth0 eth1; do ip netns exec wan tc qdisc add dev $i root handle 1: netem delay 40ms limit 10000; done
+    ip netns exec wan tc qdisc add dev eth1 parent 1:1 handle 10: htb default 1
+    ip netns exec wan tc class add dev eth1 parent 10: classid 10:1 htb rate 4mbit
+    ip netns exec branch sysctl -qw net.ipv4.tcp_wmem="4096 16384 32768"
+    ip netns exec archive sysctl -qw net.ipv4.tcp_window_scaling=0
+    mkdir -p /opt/kl-sock93
+    head -c 16777216 /dev/urandom > /opt/kl-sock93/backup.tar
+    cat > /opt/kl-sock93/receiver.py <<'EOF'
+    import hashlib, socket, struct, threading
+    def recv_exact(c, n):
+        b = bytearray()
+        while len(b) < n:
+            d = c.recv(min(1 << 20, n - len(b)))
+            if not d:
+                raise ConnectionError
+            b += d
+        return bytes(b)
+    def handle(c):
+        try:
+            (n,) = struct.unpack("!Q", recv_exact(c, 8))
+            h, left = hashlib.sha256(), n
+            while left:
+                d = c.recv(min(1 << 20, left))
+                if not d:
+                    raise ConnectionError
+                h.update(d)
+                left -= len(d)
+            c.sendall(f"stored {h.hexdigest()}\n".encode())
+        except (OSError, struct.error):
+            pass
+        c.close()
+    s = socket.socket()
+    s.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+    s.bind(("10.93.2.10", 7000))
+    s.listen(16)
+    while True:
+        c, _ = s.accept()
+        threading.Thread(target=handle, args=(c,), daemon=True).start()
+    EOF
+    cat > /usr/local/bin/kl-upload <<'EOF'
+    #!/usr/bin/env python3
+    """kl-upload: send the nightly backup (16 MiB) to the archive and check its receipt."""
+    import hashlib, socket, struct, sys, time
+    data = open("/opt/kl-sock93/backup.tar", "rb").read()
+    want = hashlib.sha256(data).hexdigest()
+    start = time.time()
+    s = socket.create_connection(("10.93.2.10", 7000), timeout=60)
+    s.sendall(struct.pack("!Q", len(data)) + data)
+    reply = s.makefile().readline().strip()
+    secs = time.time() - start
+    rate = len(data) / secs / 1e6
+    print(f"uploaded {len(data)} bytes in {secs:.1f} s ({rate:.2f} MB/s), archive says: {reply or 'nothing'}")
+    sys.exit(0 if reply == f"stored {want}" else 1)
+    EOF
+    chmod 755 /usr/local/bin/kl-upload
+    ip netns exec archive setsid python3 /opt/kl-sock93/receiver.py </dev/null >/dev/null 2>&1 &
+    eventually 10 'ip netns exec branch timeout 2 bash -c "exec 3<>/dev/tcp/10.93.2.10/7000"'
+  check: |
+    check "the WAN emulation is still there (netem 40 ms on both of wan's interfaces)" 'for i in eth0 eth1; do ip netns exec wan tc qdisc show dev $i | grep -q "netem.*delay 40ms" || exit 1; done'
+    t0=$(date +%s%N)
+    out=$(ip netns exec branch timeout 12 /usr/local/bin/kl-upload 2>&1); rc=$?
+    ms=$(( ($(date +%s%N) - t0) / 1000000 ))
+    [ -n "$out" ] && info "kl-upload: $out"
+    check "the archive confirms the backup's checksum" '[ $rc = 0 ]'
+    check "the upload takes under 8 s (took ${ms} ms)" '[ $ms -lt 8000 ]'
+  solve: |
+    sudo ip netns exec branch sysctl -qw net.ipv4.tcp_wmem="4096 16384 4194304"
+    sudo ip netns exec archive sysctl -qw net.ipv4.tcp_window_scaling=1
+    sudo ip netns exec wan tc qdisc del dev eth1 root
+    sudo ip netns exec wan tc qdisc add dev eth1 root netem delay 40ms limit 10000

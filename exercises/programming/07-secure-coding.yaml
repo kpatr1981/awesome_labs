@@ -1,0 +1,3220 @@
+track: programming
+module: Secure coding
+profile: docker
+order: 7
+exercises:
+
+- id: prog-066
+  title: Session tokens anyone can predict
+  difficulty: 1
+  kind: fix
+  tags: [python, secrets, random, tokens]
+  tutorial: |
+    **Concept.** The `random` module is a **Mersenne Twister**: fast and
+    fine for simulations, but fully predictable. Anyone who sees a few
+    hundred outputs can work out every future one, and the same seed always
+    gives the same sequence. Anything an attacker must not guess (session
+    ids, password-reset codes, API keys) comes from the operating system's
+    CSPRNG, which Python exposes as the **`secrets`** module.
+
+    **Read up on:**
+    - The warning at the top of the `random` module's documentation
+    - `secrets.token_urlsafe`, `secrets.token_bytes`, `secrets.randbelow`
+    - How many random bytes a token needs (the `secrets` docs' "How many bytes should tokens use?")
+  scenario: |
+    **`/lab/tokens.py`** mints the tokens of a web app with the `random`
+    module. Make them unguessable:
+
+    - **`new_session_token()`** returns a URL-safe string (only `A-Z`,
+      `a-z`, `0-9`, `-` and `_`) of **at least 43 characters**, made from at
+      least **32 random bytes**
+    - **`new_reset_code()`** returns exactly **6 digits** as a string
+      (leading zeros kept, e.g. `"004211"`)
+
+    Both must come from a cryptographically secure source: seeding the
+    `random` module must have no effect on what they return.
+  hints:
+    - "Try it: `python3 -c 'import random, tokens; random.seed(1); print(tokens.new_session_token())'` twice."
+    - "`secrets.token_urlsafe(32)` encodes 32 random bytes as 43 URL-safe characters."
+    - "`f\"{secrets.randbelow(10**6):06d}\"`."
+  solution: |
+    ```python
+    import secrets
+
+
+    def new_session_token():
+        return secrets.token_urlsafe(32)
+
+
+    def new_reset_code():
+        return f"{secrets.randbelow(10**6):06d}"
+    ```
+  setup: |
+    lab_file /lab/tokens.py <<'EOF'
+    import random
+    import string
+
+    ALPHABET = string.ascii_letters + string.digits
+
+
+    def new_session_token():
+        """The value of the session cookie."""
+        return "".join(random.choice(ALPHABET) for _ in range(32))
+
+
+    def new_reset_code():
+        """A 6-digit code mailed to users who forgot their password."""
+        return "%06d" % random.randint(0, 999999)
+    EOF
+  check: |
+    d=$(mktemp -d)
+    cat >"$d/t.py" <<'PY'
+    import random, re, unittest, tokens
+
+    class T(unittest.TestCase):
+        def test_token_shape(self):
+            toks = [tokens.new_session_token() for _ in range(200)]
+            for t in toks:
+                self.assertIsInstance(t, str)
+                self.assertRegex(t, r"\A[A-Za-z0-9_-]{43,}\Z")
+            self.assertEqual(len(set(toks)), 200)
+
+        def test_token_ignores_seed(self):
+            random.seed(1234); a = [tokens.new_session_token() for _ in range(3)]
+            random.seed(1234); b = [tokens.new_session_token() for _ in range(3)]
+            self.assertNotEqual(a, b, "seeding random reproduces the tokens")
+
+        def test_code_shape(self):
+            codes = [tokens.new_reset_code() for _ in range(300)]
+            for c in codes:
+                self.assertIsInstance(c, str)
+                self.assertRegex(c, r"\A[0-9]{6}\Z")
+            self.assertGreater(len(set(codes)), 280)
+
+        def test_code_ignores_seed(self):
+            random.seed(99); a = [tokens.new_reset_code() for _ in range(6)]
+            random.seed(99); b = [tokens.new_reset_code() for _ in range(6)]
+            self.assertNotEqual(a, b, "seeding random reproduces the codes")
+
+    unittest.main()
+    PY
+    out=$(cd /lab && PYTHONPATH=/lab timeout 60 python3 -B "$d/t.py" 2>&1); rc=$?
+    rm -rf "$d"; [ "$rc" -ne 0 ] && echo "$out" | tail -15
+    check "hidden tests pass" '[ "$rc" -eq 0 ]'
+  solve: |
+    cat > /lab/tokens.py <<'PY'
+    import secrets
+
+
+    def new_session_token():
+        """The value of the session cookie."""
+        return secrets.token_urlsafe(32)
+
+
+    def new_reset_code():
+        """A 6-digit code mailed to users who forgot their password."""
+        return f"{secrets.randbelow(10**6):06d}"
+    PY
+
+- id: prog-067
+  title: The download that escapes its folder
+  difficulty: 2
+  kind: fix
+  tags: [python, path-traversal, pathlib, security]
+  tutorial: |
+    **Concept.** A file name from a request is untrusted. Joining it onto a
+    folder and checking the result with `startswith` misses several escapes:
+    `../`, absolute names (`os.path.join` drops everything before them), a
+    **sibling folder whose name starts the same way** (`/srv/files-private`
+    starts with `/srv/files`), and **symlinks** inside the folder that point
+    out of it. The robust test resolves the real path first and then asks
+    whether it is *inside* the folder, component by component.
+
+    **Read up on:**
+    - `pathlib.Path.resolve`, `pathlib.PurePath.is_relative_to`
+    - `os.path.realpath`, `os.path.commonpath`
+    - OWASP: "Path Traversal"
+  scenario: |
+    The download handler calls **`resolve(root, name)`** in
+    **`/lab/files.py`** with the folder it serves and the file name from the
+    URL. The current check lets some names escape `root`.
+
+    Fix `resolve` so that it:
+
+    - returns the **fully resolved** absolute path, symlinks followed, as a
+      `str` (the file doesn't have to exist yet)
+    - raises **`PermissionError`** whenever that path is not `root` itself or
+      inside it: `../` tricks, absolute names, sibling folders that share a
+      prefix, and symlinks in `root` that lead outside all count
+    - still accepts harmless names such as `sub/../a.txt` and symlinks that
+      stay inside `root`
+
+    `/lab/public` holds a few files to try it on.
+  hints:
+    - "`python3 -c 'import files; print(files.resolve(\"/lab/public\", \"../public-old/x\"))'`."
+    - "`Path(root).resolve()` and `(base / name).resolve()` follow every symlink and `..`."
+    - "`path.is_relative_to(base)` compares whole path components, unlike `startswith`."
+  solution: |
+    ```python
+    from pathlib import Path
+
+
+    def resolve(root, name):
+        base = Path(root).resolve()
+        path = (base / name).resolve()
+        if not path.is_relative_to(base):
+            raise PermissionError(name)
+        return str(path)
+    ```
+  setup: |
+    lab_file /lab/files.py <<'EOF'
+    import os
+
+
+    def resolve(root, name):
+        """Return the path of file `name` inside folder `root`.
+
+        Raise PermissionError if it would be outside root.
+        """
+        path = os.path.normpath(os.path.join(root, name))
+        if not path.startswith(root):
+            raise PermissionError(name)
+        return path
+    EOF
+    echo "hello" | lab_file /lab/public/hello.txt
+    echo "terms" | lab_file /lab/public/docs/terms.txt
+    echo "old secrets" | lab_file /lab/public-old/x
+  check: |
+    d=$(mktemp -d)
+    cat >"$d/t.py" <<'PY'
+    import os, tempfile, unittest, files
+
+    T0 = tempfile.mkdtemp()
+    ROOT = os.path.join(T0, "files")
+    os.makedirs(os.path.join(ROOT, "sub"))
+    os.makedirs(os.path.join(T0, "files-private"))
+    os.makedirs(os.path.join(T0, "secret"))
+    for p in ("files/a.txt", "files/sub/b.txt", "files-private/key.txt", "secret/s.txt"):
+        open(os.path.join(T0, p), "w").write("x")
+    os.symlink(os.path.join(T0, "secret"), os.path.join(ROOT, "out"))
+    os.symlink(os.path.join(ROOT, "sub"), os.path.join(ROOT, "alias"))
+    real = lambda *p: os.path.realpath(os.path.join(ROOT, *p))
+
+    class T(unittest.TestCase):
+        def test_ok(self):
+            self.assertEqual(files.resolve(ROOT, "a.txt"), real("a.txt"))
+            self.assertEqual(files.resolve(ROOT, "sub/b.txt"), real("sub", "b.txt"))
+            self.assertEqual(files.resolve(ROOT, "sub/../a.txt"), real("a.txt"))
+            self.assertEqual(files.resolve(ROOT, "new.txt"), real("new.txt"))
+            self.assertEqual(files.resolve(ROOT + "/", "a.txt"), real("a.txt"))
+
+        def test_symlink_inside(self):
+            self.assertEqual(files.resolve(ROOT, "alias/b.txt"), real("sub", "b.txt"))
+
+        def test_escapes(self):
+            for name in ("../files-private/key.txt", "../secret/s.txt", "../../etc/passwd",
+                         "/etc/passwd", "sub/../../secret/s.txt", "out/s.txt", "out"):
+                with self.subTest(name=name):
+                    with self.assertRaises(PermissionError):
+                        files.resolve(ROOT, name)
+
+        def test_returns_str(self):
+            self.assertIsInstance(files.resolve(ROOT, "a.txt"), str)
+
+    unittest.main()
+    PY
+    out=$(cd /lab && PYTHONPATH=/lab timeout 60 python3 -B "$d/t.py" 2>&1); rc=$?
+    rm -rf "$d"; [ "$rc" -ne 0 ] && echo "$out" | tail -15
+    check "hidden tests pass" '[ "$rc" -eq 0 ]'
+  solve: |
+    cat > /lab/files.py <<'PY'
+    from pathlib import Path
+
+
+    def resolve(root, name):
+        """Return the path of file `name` inside folder `root`.
+
+        Raise PermissionError if it would be outside root.
+        """
+        base = Path(root).resolve()
+        path = (base / name).resolve()
+        if not path.is_relative_to(base):
+            raise PermissionError(name)
+        return str(path)
+    PY
+
+- id: prog-068
+  title: The guestbook that runs scripts
+  difficulty: 2
+  kind: fix
+  tags: [go, xss, html/template, security]
+  tutorial: |
+    **Concept.** Go has two template packages with the same API.
+    `text/template` writes values out verbatim; **`html/template`** knows it
+    is producing HTML and escapes every value **for its context**: text
+    becomes `&lt;b&gt;`, attribute values are quoted, and URLs in `href` with
+    a dangerous scheme like `javascript:` are replaced by `#ZgotmplZ`. Using
+    `text/template` for a web page is a cross-site-scripting (XSS) hole.
+
+    **Read up on:**
+    - The package documentation of `html/template` ("Contexts", "Security Model")
+    - OWASP: "Cross Site Scripting Prevention Cheat Sheet"
+  scenario: |
+    **`/lab/guestbook.go`** renders visitors' entries with
+    **`Render(w io.Writer, entries []Entry) error`**. A visitor signed it
+    with a `<script>` as their name and a `javascript:` URL as their
+    website, and now the page runs their code.
+
+    Fix it so that every field is escaped for where it appears:
+
+    - names and messages are shown as text (`<b>` appears as `&lt;b&gt;`)
+    - a website with a `javascript:` URL can no longer end up in an `href`
+    - the page layout stays the same: a `<ul>` with one
+      `<li><a href="...">Name</a>: Message</li>` per entry
+  hints:
+    - "Look at the imports."
+    - "`html/template` has the same `Must`, `New`, `Parse` and `Execute` as `text/template`."
+  solution: |
+    Replace the import: `"text/template"` becomes `"html/template"`. Nothing
+    else changes; the template is now escaped by context.
+  setup: |
+    lab_file /lab/guestbook.go <<'EOF'
+    package main
+
+    import (
+        "io"
+        "text/template"
+    )
+
+    type Entry struct {
+        Name    string
+        Website string
+        Message string
+    }
+
+    var page = template.Must(template.New("page").Parse(`<ul>
+    {{range .}}<li><a href="{{.Website}}">{{.Name}}</a>: {{.Message}}</li>
+    {{end}}</ul>
+    `))
+
+    // Render writes the guestbook page for entries.
+    func Render(w io.Writer, entries []Entry) error {
+        return page.Execute(w, entries)
+    }
+
+    func main() {}
+    EOF
+  check: |
+    go_test <<'GO'
+    package main
+
+    import (
+        "strings"
+        "testing"
+    )
+
+    func render(t *testing.T, e ...Entry) string {
+        var b strings.Builder
+        if err := Render(&b, e); err != nil {
+            t.Fatalf("Render: %v", err)
+        }
+        return b.String()
+    }
+
+    func TestNormal(t *testing.T) {
+        out := render(t, Entry{"Ana", "https://ana.example/blog", "Hi <b>all</b>"})
+        if !strings.Contains(out, `<li><a href="https://ana.example/blog">Ana</a>: Hi &lt;b&gt;all&lt;/b&gt;</li>`) {
+            t.Fatalf("unexpected page:\n%s", out)
+        }
+        if !strings.HasPrefix(strings.TrimSpace(out), "<ul>") || !strings.HasSuffix(strings.TrimSpace(out), "</ul>") {
+            t.Fatalf("the list is gone:\n%s", out)
+        }
+    }
+
+    func TestHostile(t *testing.T) {
+        out := render(t, Entry{"<script>alert(1)</script>", "javascript:alert(2)", `x" onmouseover="alert(3)`})
+        if strings.Contains(out, "<script>") || !strings.Contains(out, "&lt;script&gt;") {
+            t.Errorf("name not escaped:\n%s", out)
+        }
+        if strings.Contains(out, "javascript:") {
+            t.Errorf("javascript: URL kept:\n%s", out)
+        }
+        if strings.Contains(out, `" onmouseover="`) {
+            t.Errorf("message not escaped:\n%s", out)
+        }
+    }
+
+    func TestQuoteInURL(t *testing.T) {
+        out := render(t, Entry{"Bo", `https://bo.example/" onclick="alert(4)`, "hey"})
+        if strings.Contains(out, `" onclick="`) {
+            t.Errorf("attribute broken out of:\n%s", out)
+        }
+    }
+    GO
+    rc=$?
+    check "hidden tests pass" '[ "$rc" -eq 0 ]'
+  solve: |
+    sed -i 's#"text/template"#"html/template"#' /lab/guestbook.go
+
+- id: prog-069
+  title: Passwords stored as bare MD5
+  difficulty: 3
+  kind: fix
+  tags: [python, hashlib, pbkdf2, passwords, migration]
+  tutorial: |
+    **Concept.** A password hash must be **slow** and **salted**. A bare MD5
+    or SHA-256 can be brute-forced at billions of guesses per second, and
+    without a salt equal passwords get equal hashes, so one precomputed table
+    cracks them all. Use a key-derivation function such as **PBKDF2**,
+    **scrypt** or **argon2** with a random per-user salt, store the algorithm,
+    work factor and salt next to the hash, and compare in **constant time**.
+
+    Existing hashes can't be converted (you don't know the passwords), so you
+    keep verifying the old format and **re-hash on the next successful
+    login**.
+
+    **Read up on:**
+    - `hashlib.pbkdf2_hmac`, `secrets.token_bytes`, `hmac.compare_digest`
+    - OWASP: "Password Storage Cheat Sheet" (PBKDF2-HMAC-SHA256 work factor)
+  scenario: |
+    **`/lab/passwords.py`** stores passwords as unsalted MD5. Rewrite its
+    three functions:
+
+    - **`hash_password(pw)`** returns
+      **`pbkdf2_sha256$<iterations>$<salt>$<hash>`**, where iterations is at
+      least **600000**, salt is **16 random bytes** written as 32 lowercase
+      hex digits, and hash is the lowercase hex of
+      `hashlib.pbkdf2_hmac("sha256", pw.encode(), <salt bytes>, iterations)`
+    - **`verify_password(pw, stored)`** checks against that format, using the
+      **iterations and salt stored in the value**, and also accepts the
+      **legacy** format (exactly 32 lowercase hex digits, the MD5 of the
+      password) so existing users can still log in. Any other value gives
+      `False`, never an exception. Compare with `hmac.compare_digest`.
+    - **`needs_rehash(stored)`** is `True` for legacy values and for PBKDF2
+      values with fewer than 600000 iterations, and `False` for a value
+      `hash_password` just made.
+  hints:
+    - "`salt = secrets.token_bytes(16)`; `salt.hex()` and `bytes.fromhex(...)` convert both ways."
+    - "`algo, iterations, salt, digest = stored.split(\"$\")` raises `ValueError` on a malformed value: catch it."
+    - "`re.fullmatch(r\"[0-9a-f]{32}\", stored)` spots the legacy format."
+  solution: |
+    ```python
+    import hashlib, hmac, re, secrets
+
+    ITERATIONS = 600_000
+    LEGACY = re.compile(r"[0-9a-f]{32}")
+
+    def _pbkdf2(pw, salt, iterations):
+        return hashlib.pbkdf2_hmac("sha256", pw.encode(), salt, iterations).hex()
+
+    def hash_password(pw):
+        salt = secrets.token_bytes(16)
+        return f"pbkdf2_sha256${ITERATIONS}${salt.hex()}${_pbkdf2(pw, salt, ITERATIONS)}"
+
+    def verify_password(pw, stored):
+        if LEGACY.fullmatch(stored):
+            return hmac.compare_digest(hashlib.md5(pw.encode()).hexdigest(), stored)
+        try:
+            algo, iterations, salt, digest = stored.split("$")
+            if algo != "pbkdf2_sha256":
+                return False
+            return hmac.compare_digest(_pbkdf2(pw, bytes.fromhex(salt), int(iterations)), digest)
+        except ValueError:
+            return False
+
+    def needs_rehash(stored):
+        if LEGACY.fullmatch(stored):
+            return True
+        try:
+            algo, iterations, _, _ = stored.split("$")
+            return algo != "pbkdf2_sha256" or int(iterations) < ITERATIONS
+        except ValueError:
+            return True
+    ```
+  setup: |
+    lab_file /lab/passwords.py <<'EOF'
+    import hashlib
+
+
+    def hash_password(pw):
+        """The value stored in users.password_hash."""
+        return hashlib.md5(pw.encode()).hexdigest()
+
+
+    def verify_password(pw, stored):
+        return hash_password(pw) == stored
+
+
+    def needs_rehash(stored):
+        """True when the login code should store a fresh hash_password(pw)."""
+        return False
+    EOF
+  check: |
+    d=$(mktemp -d)
+    cat >"$d/t.py" <<'PY'
+    import hashlib, re, unittest, passwords as p
+
+    FMT = re.compile(r"pbkdf2_sha256\$(\d+)\$([0-9a-f]{32})\$([0-9a-f]{64})")
+
+    def make(pw, salt, n):
+        return "pbkdf2_sha256$%d$%s$%s" % (n, salt.hex(), hashlib.pbkdf2_hmac("sha256", pw.encode(), salt, n).hex())
+
+    class T(unittest.TestCase):
+        @classmethod
+        def setUpClass(cls):
+            cls.h1 = p.hash_password("correct horse")
+            cls.h2 = p.hash_password("correct horse")
+
+        def test_format(self):
+            m = FMT.fullmatch(self.h1)
+            self.assertIsNotNone(m, self.h1)
+            n, salt, digest = int(m[1]), bytes.fromhex(m[2]), m[3]
+            self.assertGreaterEqual(n, 600000)
+            self.assertEqual(hashlib.pbkdf2_hmac("sha256", b"correct horse", salt, n).hex(), digest)
+
+        def test_salted(self):
+            self.assertNotEqual(self.h1, self.h2)
+
+        def test_verify_new(self):
+            self.assertTrue(p.verify_password("correct horse", self.h1))
+            self.assertFalse(p.verify_password("correct horsE", self.h1))
+            self.assertFalse(p.verify_password("", self.h1))
+            self.assertFalse(p.needs_rehash(self.h1))
+
+        def test_unicode(self):
+            h = make("pässwörd", b"\x01" * 16, 1000)
+            self.assertTrue(p.verify_password("pässwörd", h))
+
+        def test_stored_iterations(self):
+            h = make("tr0ub4dor", bytes(range(16)), 1000)
+            self.assertTrue(p.verify_password("tr0ub4dor", h))
+            self.assertFalse(p.verify_password("tr0ub4dor!", h))
+            self.assertTrue(p.needs_rehash(h))
+
+        def test_legacy(self):
+            old = hashlib.md5(b"hunter2").hexdigest()
+            self.assertTrue(p.verify_password("hunter2", old))
+            self.assertFalse(p.verify_password("hunter3", old))
+            self.assertTrue(p.needs_rehash(old))
+
+        def test_garbage(self):
+            for bad in ("", "nonsense", "pbkdf2_sha256$x$y$z", "pbkdf2_sha256$1000$zz$00",
+                        "md5$abc", "sha1$1000$" + "00" * 16 + "$" + "00" * 32, "A" * 32):
+                with self.subTest(stored=bad):
+                    self.assertFalse(p.verify_password("x", bad))
+
+    unittest.main()
+    PY
+    out=$(cd /lab && PYTHONPATH=/lab timeout 90 python3 -B "$d/t.py" 2>&1); rc=$?
+    rm -rf "$d"; [ "$rc" -ne 0 ] && echo "$out" | tail -15
+    check "hidden tests pass" '[ "$rc" -eq 0 ]'
+  solve: |
+    cat > /lab/passwords.py <<'PY'
+    import hashlib
+    import hmac
+    import re
+    import secrets
+
+    ITERATIONS = 600_000
+    LEGACY = re.compile(r"[0-9a-f]{32}")
+
+
+    def _pbkdf2(pw, salt, iterations):
+        return hashlib.pbkdf2_hmac("sha256", pw.encode(), salt, iterations).hex()
+
+
+    def hash_password(pw):
+        """The value stored in users.password_hash."""
+        salt = secrets.token_bytes(16)
+        return f"pbkdf2_sha256${ITERATIONS}${salt.hex()}${_pbkdf2(pw, salt, ITERATIONS)}"
+
+
+    def verify_password(pw, stored):
+        if LEGACY.fullmatch(stored):
+            return hmac.compare_digest(hashlib.md5(pw.encode()).hexdigest(), stored)
+        try:
+            algo, iterations, salt, digest = stored.split("$")
+            if algo != "pbkdf2_sha256":
+                return False
+            return hmac.compare_digest(_pbkdf2(pw, bytes.fromhex(salt), int(iterations)), digest)
+        except ValueError:
+            return False
+
+
+    def needs_rehash(stored):
+        """True when the login code should store a fresh hash_password(pw)."""
+        if LEGACY.fullmatch(stored):
+            return True
+        try:
+            algo, iterations, _, _ = stored.split("$")
+            return algo != "pbkdf2_sha256" or int(iterations) < ITERATIONS
+        except ValueError:
+            return True
+    PY
+
+- id: prog-070
+  title: Sign the session cookie
+  difficulty: 3
+  kind: build
+  tags: [python, hmac, json, cookies, deserialization]
+  tutorial: |
+    **Concept.** Data you hand to a client and read back later (a cookie, a
+    hidden form field, a link) can be edited by that client. Two rules keep
+    it safe. **Never unpickle it**: `pickle.loads` on attacker data runs
+    attacker code. And **sign it**: send `payload.signature` where the
+    signature is an **HMAC** of the payload with a server-side key, and
+    reject anything whose signature doesn't match (compared in constant
+    time) *before* looking inside.
+
+    **Read up on:**
+    - The red warning box at the top of the `pickle` documentation
+    - `hmac.new(key, msg, "sha256").hexdigest()`, `hmac.compare_digest`
+    - `base64.urlsafe_b64encode`, `json.dumps`
+  scenario: |
+    The old session cookie was a base64 **pickle**, which let anyone run
+    code on the server. In **`/lab/session.py`**, implement:
+
+    - **`dump_session(data, key)`**: `data` is a dict, `key` is bytes.
+      Return **`<payload>.<signature>`** where payload is the URL-safe
+      base64 (`base64.urlsafe_b64encode`, padding kept) of `data` as UTF-8
+      JSON, and signature is the lowercase **hex HMAC-SHA256** of the
+      payload's ASCII bytes with `key`
+    - **`load_session(token, key)`**: return the dict, or raise
+      **`ValueError`** if the token is malformed, the signature doesn't match
+      (check it **first**, with `hmac.compare_digest`), the payload isn't
+      base64 JSON, the JSON isn't an object, or the dict has an **`exp`**
+      key (Unix time) that `time.time()` has passed
+
+    Never use `pickle`.
+  hints:
+    - "`payload, sig = token.rsplit(\".\", 1)` raises `ValueError` when there is no dot."
+    - "`hmac.new(key, payload.encode(), \"sha256\").hexdigest()`."
+    - "`base64` and `json` errors are subclasses of `ValueError` already."
+  solution: |
+    ```python
+    import base64, hmac, json, time
+
+    def _sign(payload, key):
+        return hmac.new(key, payload.encode("ascii"), "sha256").hexdigest()
+
+    def dump_session(data, key):
+        payload = base64.urlsafe_b64encode(json.dumps(data).encode()).decode("ascii")
+        return payload + "." + _sign(payload, key)
+
+    def load_session(token, key):
+        payload, sig = token.rsplit(".", 1)
+        if not hmac.compare_digest(sig.encode(), _sign(payload, key).encode()):
+            raise ValueError("bad signature")
+        data = json.loads(base64.urlsafe_b64decode(payload.encode("ascii")))
+        if not isinstance(data, dict):
+            raise ValueError("not an object")
+        if "exp" in data and time.time() > data["exp"]:
+            raise ValueError("expired")
+        return data
+    ```
+  setup: |
+    lab_file /lab/session.py <<'EOF'
+    """Signed session cookies: <base64 JSON>.<hex HMAC-SHA256>."""
+
+
+    def dump_session(data, key):
+        raise NotImplementedError
+
+
+    def load_session(token, key):
+        raise NotImplementedError
+    EOF
+  check: |
+    d=$(mktemp -d)
+    cat >"$d/t.py" <<'PY'
+    import base64, hmac, json, os, pickle, tempfile, time, unittest
+    import session as s
+
+    KEY = os.urandom(32)
+    MARK = os.path.join(tempfile.mkdtemp(), "pwned")
+
+    def b64(obj):
+        return base64.urlsafe_b64encode(json.dumps(obj).encode()).decode()
+
+    def sign(payload, key=KEY):
+        return payload + "." + hmac.new(key, payload.encode(), "sha256").hexdigest()
+
+    class Evil:
+        def __reduce__(self):
+            return (open, (MARK, "w"))
+
+    class T(unittest.TestCase):
+        def test_roundtrip(self):
+            data = {"user": "ana", "roles": ["staff"], "name": "Zoë"}
+            self.assertEqual(s.load_session(s.dump_session(data, KEY), KEY), data)
+
+        def test_format(self):
+            tok = s.dump_session({"user": "ana"}, KEY)
+            payload, sig = tok.split(".")
+            self.assertEqual(sig, hmac.new(KEY, payload.encode(), "sha256").hexdigest())
+            self.assertEqual(json.loads(base64.urlsafe_b64decode(payload)), {"user": "ana"})
+
+        def test_accepts_signed(self):
+            self.assertEqual(s.load_session(sign(b64({"user": "bo"})), KEY), {"user": "bo"})
+
+        def test_tampered(self):
+            tok = s.dump_session({"user": "ana"}, KEY)
+            payload, sig = tok.split(".")
+            bad = [b64({"user": "admin"}) + "." + sig,
+                   payload + "." + sig[:-1] + ("0" if sig[-1] != "0" else "1"),
+                   payload + ".", payload, "", "...", payload + "." + sig + "x"]
+            for t in bad:
+                with self.subTest(token=t):
+                    with self.assertRaises(ValueError):
+                        s.load_session(t, KEY)
+
+        def test_wrong_key(self):
+            with self.assertRaises(ValueError):
+                s.load_session(s.dump_session({"user": "ana"}, KEY), b"other key")
+
+        def test_not_object(self):
+            for obj in ([1, 2], "admin", 7, None):
+                with self.assertRaises(ValueError):
+                    s.load_session(sign(b64(obj)), KEY)
+            with self.assertRaises(ValueError):
+                s.load_session(sign("!!!not base64!!!"), KEY)
+
+        def test_no_pickle(self):
+            evil = base64.urlsafe_b64encode(pickle.dumps(Evil())).decode()
+            for t in (evil, evil + ".00", sign(evil)):
+                with self.assertRaises(ValueError):
+                    s.load_session(t, KEY)
+            self.assertFalse(os.path.exists(MARK), "a pickle in the cookie ran code")
+
+        def test_expiry(self):
+            with self.assertRaises(ValueError):
+                s.load_session(s.dump_session({"user": "ana", "exp": time.time() - 5}, KEY), KEY)
+            ok = {"user": "ana", "exp": time.time() + 3600}
+            self.assertEqual(s.load_session(s.dump_session(ok, KEY), KEY), ok)
+
+    unittest.main()
+    PY
+    out=$(cd /lab && PYTHONPATH=/lab timeout 60 python3 -B "$d/t.py" 2>&1); rc=$?
+    rm -rf "$d"; [ "$rc" -ne 0 ] && echo "$out" | tail -15
+    check "hidden tests pass" '[ "$rc" -eq 0 ]'
+    check_not "session.py does not use pickle" 'grep -Eq "import +c?pickle|from +c?pickle|pickle\.loads?\(" /lab/session.py'
+  solve: |
+    cat > /lab/session.py <<'PY'
+    """Signed session cookies: <base64 JSON>.<hex HMAC-SHA256>."""
+    import base64
+    import hmac
+    import json
+    import time
+
+
+    def _sign(payload, key):
+        return hmac.new(key, payload.encode("ascii"), "sha256").hexdigest()
+
+
+    def dump_session(data, key):
+        payload = base64.urlsafe_b64encode(json.dumps(data).encode()).decode("ascii")
+        return payload + "." + _sign(payload, key)
+
+
+    def load_session(token, key):
+        payload, sig = token.rsplit(".", 1)
+        if not hmac.compare_digest(sig.encode(), _sign(payload, key).encode()):
+            raise ValueError("bad signature")
+        data = json.loads(base64.urlsafe_b64decode(payload.encode("ascii")))
+        if not isinstance(data, dict):
+            raise ValueError("not an object")
+        if "exp" in data and time.time() > data["exp"]:
+            raise ValueError("expired")
+        return data
+    PY
+
+- id: prog-071
+  title: The validator that hangs
+  difficulty: 3
+  kind: fix
+  tags: [python, regex, redos, denial-of-service]
+  tutorial: |
+    **Concept.** Python's `re` is a **backtracking** engine. A pattern with a
+    repetition inside a repetition that can match the same text in many ways,
+    like `([a-z]+-?)*`, makes the engine try exponentially many splits when
+    the input *almost* matches: 30 characters can take minutes. That's a
+    **ReDoS**, a denial of service with one request. Rewrite the pattern so
+    each character can be matched in only one way (here: make the separator
+    mandatory between words), and anchor with `fullmatch` rather than `$`,
+    which also matches before a trailing newline.
+
+    **Read up on:**
+    - OWASP: "Regular expression Denial of Service (ReDoS)"
+    - `re.fullmatch`, and how `$` treats a final `\n`
+  scenario: |
+    A sign-up form with a 40-character name of `a`s and a `!` took the whole
+    service down. **`/lab/validate.py`** has two validators. Fix both so
+    they answer **quickly for any input** and accept exactly:
+
+    - **`valid_name(s)`**: one or more words of ASCII letters and digits,
+      separated by **single spaces**, with no leading or trailing space
+      (`"Ana Lopez 2"` yes; `""`, `"Ana  Lopez"`, `"Ana "`, `"Ana\tLopez"`,
+      `"Ana\n"` no)
+    - **`valid_slug(s)`**: one or more groups of lowercase letters and
+      digits joined by **single hyphens**, none at either end (`"my-post-2"`
+      yes; `"-x"`, `"x-"`, `"a--b"`, `"My-post"` no)
+
+    Both return a `bool`.
+  hints:
+    - "Time it: `python3 -c 'import validate; validate.valid_name(\"a\" * 26 + \"!\")'`."
+    - "Write the first word, then `( word)*`: `[A-Za-z0-9]+(?: [A-Za-z0-9]+)*`."
+    - "`bool(re.fullmatch(...))` anchors both ends without the trailing-newline gap."
+  solution: |
+    ```python
+    import re
+
+    NAME = re.compile(r"[A-Za-z0-9]+(?: [A-Za-z0-9]+)*")
+    SLUG = re.compile(r"[a-z0-9]+(?:-[a-z0-9]+)*")
+
+    def valid_name(s):
+        return NAME.fullmatch(s) is not None
+
+    def valid_slug(s):
+        return SLUG.fullmatch(s) is not None
+    ```
+  setup: |
+    lab_file /lab/validate.py <<'EOF'
+    import re
+
+    NAME = re.compile(r"^([A-Za-z0-9]+\s?)*$")
+    SLUG = re.compile(r"^([a-z0-9]+-?)+$")
+
+
+    def valid_name(s):
+        return bool(NAME.match(s))
+
+
+    def valid_slug(s):
+        return bool(SLUG.match(s))
+    EOF
+  check: |
+    d=$(mktemp -d)
+    cat >"$d/t.py" <<'PY'
+    import signal, unittest, validate as v
+
+    def too_slow(*_):
+        raise TimeoutError("took more than 2 seconds")
+
+    signal.signal(signal.SIGALRM, too_slow)
+
+    class T(unittest.TestCase):
+        def quick(self, fn, s):
+            signal.alarm(2)
+            try:
+                return fn(s)
+            finally:
+                signal.alarm(0)
+
+        def test_name_values(self):
+            for s in ("Ana", "Ana Lopez", "Ana Lopez 2", "x", "R2D2 C3PO"):
+                self.assertIs(self.quick(v.valid_name, s), True, s)
+            for s in ("", " ", "Ana  Lopez", "Ana ", " Ana", "Ana\tLopez", "Ana\n", "Zoë", "Ana-Lopez", "Ana!"):
+                self.assertIs(self.quick(v.valid_name, s), False, repr(s))
+
+        def test_slug_values(self):
+            for s in ("a", "my-post", "my-post-2", "2024-recap"):
+                self.assertIs(self.quick(v.valid_slug, s), True, s)
+            for s in ("", "-x", "x-", "a--b", "My-post", "my post", "my_post", "post\n"):
+                self.assertIs(self.quick(v.valid_slug, s), False, repr(s))
+
+        def test_name_fast(self):
+            for s in ("a" * 40 + "!", "a " * 2000 + "!", "a" * 50000 + "\t", "ab " * 3000):
+                self.assertFalse(self.quick(v.valid_name, s))
+            self.assertTrue(self.quick(v.valid_name, " ".join(["word"] * 5000)))
+
+        def test_slug_fast(self):
+            for s in ("a" * 40 + "_", "a-" * 2000 + "_", "a" * 50000 + "-"):
+                self.assertFalse(self.quick(v.valid_slug, s))
+            self.assertTrue(self.quick(v.valid_slug, "-".join(["ab"] * 5000)))
+
+    unittest.main()
+    PY
+    out=$(cd /lab && PYTHONPATH=/lab timeout 60 python3 -B "$d/t.py" 2>&1); rc=$?
+    rm -rf "$d"; [ "$rc" -ne 0 ] && echo "$out" | tail -15
+    check "hidden tests pass" '[ "$rc" -eq 0 ]'
+  solve: |
+    cat > /lab/validate.py <<'PY'
+    import re
+
+    NAME = re.compile(r"[A-Za-z0-9]+(?: [A-Za-z0-9]+)*")
+    SLUG = re.compile(r"[a-z0-9]+(?:-[a-z0-9]+)*")
+
+
+    def valid_name(s):
+        return NAME.fullmatch(s) is not None
+
+
+    def valid_slug(s):
+        return SLUG.fullmatch(s) is not None
+    PY
+
+- id: prog-072
+  title: Verify the webhook signature
+  difficulty: 3
+  kind: build
+  tags: [go, hmac, webhooks, replay]
+  tutorial: |
+    **Concept.** A webhook endpoint is a public URL: anyone can POST to it.
+    The sender proves a delivery is genuine by sending an **HMAC** of the
+    body made with a secret you share. Include a **timestamp** in what is
+    signed and refuse old deliveries, or an attacker can **replay** a
+    captured request forever. Compare MACs with `hmac.Equal`, which takes
+    the same time however many bytes match, never with `==`.
+
+    **Read up on:**
+    - `crypto/hmac` (`hmac.New`, `hmac.Equal`), `crypto/sha256`, `encoding/hex`
+    - `strconv.ParseInt`, `time.Unix`
+    - Any payment provider's "verify webhook signatures" guide
+  scenario: |
+    In **`/lab/webhook.go`**, implement
+
+    ```go
+    func Verify(secret []byte, timestamp, signature string, body []byte, now time.Time) error
+    ```
+
+    for the `X-Timestamp` and `X-Signature` headers of a delivery:
+
+    - the signed message is **`timestamp + "." + body`**
+    - `signature` must be **`sha256=`** followed by the lowercase **hex
+      HMAC-SHA256** of that message with `secret`. If it isn't (wrong
+      prefix, not hex, wrong value), return an error that matches
+      **`ErrBadSignature`** with `errors.Is`. Check this **first**.
+    - `timestamp` is Unix seconds. If it isn't an integer or is **more than
+      300 seconds** away from `now` (in either direction), return an error
+      that matches **`ErrStale`**. Exactly 300 seconds is still fine.
+    - otherwise return `nil`
+  hints:
+    - "`m := hmac.New(sha256.New, secret); m.Write([]byte(timestamp + \".\")); m.Write(body)`."
+    - "`hex.DecodeString(strings.TrimPrefix(...))`, then `hmac.Equal(got, m.Sum(nil))`."
+    - "`d := now.Sub(time.Unix(ts, 0))`; stale when `d > 300*time.Second || d < -300*time.Second`."
+  solution: |
+    ```go
+    func Verify(secret []byte, timestamp, signature string, body []byte, now time.Time) error {
+        hexSig, ok := strings.CutPrefix(signature, "sha256=")
+        if !ok {
+            return ErrBadSignature
+        }
+        got, err := hex.DecodeString(hexSig)
+        if err != nil {
+            return ErrBadSignature
+        }
+        m := hmac.New(sha256.New, secret)
+        m.Write([]byte(timestamp + "."))
+        m.Write(body)
+        if !hmac.Equal(got, m.Sum(nil)) {
+            return ErrBadSignature
+        }
+        ts, err := strconv.ParseInt(timestamp, 10, 64)
+        if err != nil {
+            return ErrStale
+        }
+        if d := now.Sub(time.Unix(ts, 0)); d > 300*time.Second || d < -300*time.Second {
+            return ErrStale
+        }
+        return nil
+    }
+    ```
+  setup: |
+    lab_file /lab/webhook.go <<'EOF'
+    package main
+
+    import (
+        "errors"
+        "time"
+    )
+
+    var (
+        ErrBadSignature = errors.New("webhook: bad signature")
+        ErrStale        = errors.New("webhook: stale or invalid timestamp")
+    )
+
+    // Verify checks one webhook delivery: its X-Timestamp and X-Signature
+    // headers and its raw body.
+    func Verify(secret []byte, timestamp, signature string, body []byte, now time.Time) error {
+        // TODO
+        return nil
+    }
+
+    func main() {}
+    EOF
+  check: |
+    go_test <<'GO'
+    package main
+
+    import (
+        "crypto/hmac"
+        "crypto/sha256"
+        "encoding/hex"
+        "errors"
+        "strconv"
+        "strings"
+        "testing"
+        "time"
+    )
+
+    var secret = []byte("whsec_9f2c1e")
+
+    func sig(key []byte, ts string, body string) string {
+        m := hmac.New(sha256.New, key)
+        m.Write([]byte(ts + "." + body))
+        return "sha256=" + hex.EncodeToString(m.Sum(nil))
+    }
+
+    func TestVerify(t *testing.T) {
+        now := time.Unix(1767225600, 0)
+        ts := strconv.FormatInt(now.Unix(), 10)
+        body := `{"event":"invoice.paid","id":42}`
+        good := sig(secret, ts, body)
+        at := func(d int64) string { return strconv.FormatInt(now.Unix()+d, 10) }
+
+        cases := []struct {
+            name      string
+            ts, sig   string
+            body      string
+            want      error
+        }{
+            {"valid", ts, good, body, nil},
+            {"300s old", at(-300), sig(secret, at(-300), body), body, nil},
+            {"300s ahead", at(300), sig(secret, at(300), body), body, nil},
+            {"301s old", at(-301), sig(secret, at(-301), body), body, ErrStale},
+            {"an hour ahead", at(3600), sig(secret, at(3600), body), body, ErrStale},
+            {"timestamp not a number", "soon", sig(secret, "soon", body), body, ErrStale},
+            {"body changed", ts, good, strings.Replace(body, "42", "43", 1), ErrBadSignature},
+            {"timestamp changed", at(1), good, body, ErrBadSignature},
+            {"other secret", ts, sig([]byte("other"), ts, body), body, ErrBadSignature},
+            {"no prefix", ts, strings.TrimPrefix(good, "sha256="), body, ErrBadSignature},
+            {"sha1 prefix", ts, "sha1=" + strings.TrimPrefix(good, "sha256="), body, ErrBadSignature},
+            {"not hex", ts, "sha256=zz" + good[9:], body, ErrBadSignature},
+            {"truncated", ts, good[:len(good)-2], body, ErrBadSignature},
+            {"empty", ts, "", body, ErrBadSignature},
+            {"old and forged", at(-9999), "sha256=00", body, ErrBadSignature},
+        }
+        for _, c := range cases {
+            err := Verify(secret, c.ts, c.sig, []byte(c.body), now)
+            if c.want == nil && err != nil {
+                t.Errorf("%s: got %v, want nil", c.name, err)
+            }
+            if c.want != nil && !errors.Is(err, c.want) {
+                t.Errorf("%s: got %v, want %v", c.name, err, c.want)
+            }
+        }
+    }
+    GO
+    rc=$?
+    check "hidden tests pass" '[ "$rc" -eq 0 ]'
+  solve: |
+    cat > /lab/webhook.go <<'GO'
+    package main
+
+    import (
+        "crypto/hmac"
+        "crypto/sha256"
+        "encoding/hex"
+        "errors"
+        "strconv"
+        "strings"
+        "time"
+    )
+
+    var (
+        ErrBadSignature = errors.New("webhook: bad signature")
+        ErrStale        = errors.New("webhook: stale or invalid timestamp")
+    )
+
+    // Verify checks one webhook delivery: its X-Timestamp and X-Signature
+    // headers and its raw body.
+    func Verify(secret []byte, timestamp, signature string, body []byte, now time.Time) error {
+        hexSig, ok := strings.CutPrefix(signature, "sha256=")
+        if !ok {
+            return ErrBadSignature
+        }
+        got, err := hex.DecodeString(hexSig)
+        if err != nil {
+            return ErrBadSignature
+        }
+        m := hmac.New(sha256.New, secret)
+        m.Write([]byte(timestamp + "."))
+        m.Write(body)
+        if !hmac.Equal(got, m.Sum(nil)) {
+            return ErrBadSignature
+        }
+        ts, err := strconv.ParseInt(timestamp, 10, 64)
+        if err != nil {
+            return ErrStale
+        }
+        if d := now.Sub(time.Unix(ts, 0)); d > 300*time.Second || d < -300*time.Second {
+            return ErrStale
+        }
+        return nil
+    }
+
+    func main() {}
+    GO
+
+- id: prog-073
+  title: Keep secrets out of the logs
+  difficulty: 3
+  kind: build
+  tags: [go, slog, logging, redaction]
+  tutorial: |
+    **Concept.** Logs are copied to many places and read by many people, so
+    passwords, tokens and `Authorization` headers must never reach them. With
+    `log/slog` you can enforce that in **one place**: the handler's
+    **`ReplaceAttr`** hook sees every attribute (including those inside
+    groups and those added with `With`) just before it is written, and can
+    replace its value.
+
+    **Read up on:**
+    - `log/slog`: `HandlerOptions.ReplaceAttr`, `HandlerOptions.Level`, `slog.NewJSONHandler`
+    - `slog.Attr`, `slog.StringValue`, `Value.Kind`
+  scenario: |
+    In **`/lab/logger.go`**, make **`NewLogger(w io.Writer) *slog.Logger`**
+    return a logger that writes **JSON** lines to `w`, at level **Info** and
+    above, and redacts:
+
+    - any attribute whose **key**, ignoring case, is `password`, `token`,
+      `secret`, `authorization` or `api_key`: its value becomes the string
+      **`[REDACTED]`**, whatever its type
+    - any other **string** value that starts with **`Bearer `**: it becomes
+      **`Bearer [REDACTED]`**
+
+    Both rules apply at every level of nesting: in groups, `WithGroup` and
+    attributes added with `With`. Everything else is logged unchanged.
+  hints:
+    - "`slog.NewJSONHandler(w, &slog.HandlerOptions{Level: slog.LevelInfo, ReplaceAttr: redact})`."
+    - "`func redact(groups []string, a slog.Attr) slog.Attr`: it's called for nested attributes too, with their group names in `groups`."
+    - "`strings.ToLower(a.Key)`; `a.Value.Kind() == slog.KindString && strings.HasPrefix(a.Value.String(), \"Bearer \")`."
+  solution: |
+    ```go
+    var sensitive = map[string]bool{"password": true, "token": true, "secret": true, "authorization": true, "api_key": true}
+
+    func redact(groups []string, a slog.Attr) slog.Attr {
+        if sensitive[strings.ToLower(a.Key)] {
+            return slog.String(a.Key, "[REDACTED]")
+        }
+        if a.Value.Kind() == slog.KindString && strings.HasPrefix(a.Value.String(), "Bearer ") {
+            return slog.String(a.Key, "Bearer [REDACTED]")
+        }
+        return a
+    }
+
+    func NewLogger(w io.Writer) *slog.Logger {
+        return slog.New(slog.NewJSONHandler(w, &slog.HandlerOptions{Level: slog.LevelInfo, ReplaceAttr: redact}))
+    }
+    ```
+  setup: |
+    lab_file /lab/logger.go <<'EOF'
+    package main
+
+    import (
+        "io"
+        "log/slog"
+    )
+
+    // NewLogger returns the service's logger.
+    // TODO: redact secrets (see /lab/TASK.md).
+    func NewLogger(w io.Writer) *slog.Logger {
+        return slog.New(slog.NewJSONHandler(w, nil))
+    }
+
+    func main() {
+        log := NewLogger(nil)
+        _ = log
+    }
+    EOF
+  check: |
+    go_test <<'GO'
+    package main
+
+    import (
+        "bytes"
+        "encoding/json"
+        "log/slog"
+        "strings"
+        "testing"
+    )
+
+    func lines(t *testing.T, b *bytes.Buffer) []map[string]any {
+        var out []map[string]any
+        for _, l := range strings.Split(strings.TrimSpace(b.String()), "\n") {
+            if l == "" {
+                continue
+            }
+            var m map[string]any
+            if err := json.Unmarshal([]byte(l), &m); err != nil {
+                t.Fatalf("not a JSON line: %q", l)
+            }
+            out = append(out, m)
+        }
+        return out
+    }
+
+    func TestRedaction(t *testing.T) {
+        var b bytes.Buffer
+        log := NewLogger(&b)
+        log.Debug("debugging", "x", 1)
+        log.Info("login", "user", "ana", "password", "hunter2-pw")
+        log.Warn("call", slog.Group("req", "Authorization", "Bearer abc123tok", "path", "/x"))
+        log.With("API_KEY", "k-123456").WithGroup("db").Error("connect", "Secret", "s3cr3t-val", "host", "db1")
+        log.Info("upstream", "header", "Bearer xyz789tok", "note", "Bearerless")
+        log.Info("numbers", "token", 424242, "count", 3)
+
+        raw := b.String()
+        for _, leak := range []string{"hunter2-pw", "abc123tok", "k-123456", "s3cr3t-val", "xyz789tok", "424242"} {
+            if strings.Contains(raw, leak) {
+                t.Errorf("%q leaked into the log", leak)
+            }
+        }
+        ls := lines(t, &b)
+        if len(ls) != 5 {
+            t.Fatalf("want 5 lines (Info and above), got %d:\n%s", len(ls), raw)
+        }
+        if ls[0]["msg"] != "login" || ls[0]["user"] != "ana" || ls[0]["password"] != "[REDACTED]" {
+            t.Errorf("line 1: %v", ls[0])
+        }
+        req, _ := ls[1]["req"].(map[string]any)
+        if req["Authorization"] != "[REDACTED]" || req["path"] != "/x" {
+            t.Errorf("line 2: %v", ls[1])
+        }
+        db, _ := ls[2]["db"].(map[string]any)
+        if ls[2]["API_KEY"] != "[REDACTED]" || db["Secret"] != "[REDACTED]" || db["host"] != "db1" {
+            t.Errorf("line 3: %v", ls[2])
+        }
+        if ls[3]["header"] != "Bearer [REDACTED]" || ls[3]["note"] != "Bearerless" {
+            t.Errorf("line 4: %v", ls[3])
+        }
+        if ls[4]["token"] != "[REDACTED]" || ls[4]["count"] != float64(3) {
+            t.Errorf("line 5: %v", ls[4])
+        }
+        if ls[2]["level"] != "ERROR" || ls[1]["level"] != "WARN" {
+            t.Errorf("levels changed: %v %v", ls[1]["level"], ls[2]["level"])
+        }
+    }
+    GO
+    rc=$?
+    check "hidden tests pass" '[ "$rc" -eq 0 ]'
+  solve: |
+    cat > /lab/logger.go <<'GO'
+    package main
+
+    import (
+        "io"
+        "log/slog"
+        "strings"
+    )
+
+    var sensitive = map[string]bool{"password": true, "token": true, "secret": true, "authorization": true, "api_key": true}
+
+    func redact(groups []string, a slog.Attr) slog.Attr {
+        if sensitive[strings.ToLower(a.Key)] {
+            return slog.String(a.Key, "[REDACTED]")
+        }
+        if a.Value.Kind() == slog.KindString && strings.HasPrefix(a.Value.String(), "Bearer ") {
+            return slog.String(a.Key, "Bearer [REDACTED]")
+        }
+        return a
+    }
+
+    // NewLogger returns the service's logger.
+    func NewLogger(w io.Writer) *slog.Logger {
+        return slog.New(slog.NewJSONHandler(w, &slog.HandlerOptions{Level: slog.LevelInfo, ReplaceAttr: redact}))
+    }
+
+    func main() {}
+    GO
+
+- id: prog-074
+  title: Slow down password guessing
+  difficulty: 3
+  kind: build
+  tags: [go, rate-limiting, brute-force, sync]
+  tutorial: |
+    **Concept.** A login form that accepts unlimited attempts can be brute
+    forced. A **sliding-window limiter** allows at most *N* attempts per key
+    (a user name or client IP) in any window of length *W*: keep the times
+    of recent attempts, drop those older than *W*, and refuse when *N*
+    remain. Taking the current time as a parameter makes it testable, and a
+    mutex makes it safe for concurrent requests.
+
+    **Read up on:**
+    - Sliding-window rate limiting, compared with fixed windows and token buckets
+    - `time.Time.Sub`, `sync.Mutex`
+    - OWASP: "Blocking Brute Force Attacks"
+  scenario: |
+    In **`/lab/limiter.go`**, implement:
+
+    - **`NewLimiter(max int, window time.Duration) *Limiter`**
+    - **`(*Limiter).Allow(key string, now time.Time) bool`**: an attempt at
+      `now` is allowed when **fewer than `max`** earlier **allowed**
+      attempts for that key are still in the window, meaning `now.Sub(t) <
+      window`. An allowed attempt is recorded; a **refused one isn't**.
+    - **`(*Limiter).Reset(key string)`**: forget the key's attempts (called
+      after a successful login)
+
+    Keys are independent, and `Allow` and `Reset` may be called from many
+    goroutines at once.
+  hints:
+    - "A `map[string][]time.Time` of allowed attempts, guarded by a `sync.Mutex`."
+    - "In `Allow`, first keep only the times with `now.Sub(t) < window`, then compare the count with max."
+    - "With max 3 and a 1-minute window, attempts at 0s, 10s, 20s pass, 30s and 59s fail, 60s passes and 61s fails."
+  solution: |
+    ```go
+    type Limiter struct {
+        mu     sync.Mutex
+        max    int
+        window time.Duration
+        hits   map[string][]time.Time
+    }
+
+    func NewLimiter(max int, window time.Duration) *Limiter {
+        return &Limiter{max: max, window: window, hits: map[string][]time.Time{}}
+    }
+
+    func (l *Limiter) Allow(key string, now time.Time) bool {
+        l.mu.Lock()
+        defer l.mu.Unlock()
+        var kept []time.Time
+        for _, t := range l.hits[key] {
+            if now.Sub(t) < l.window {
+                kept = append(kept, t)
+            }
+        }
+        if len(kept) >= l.max {
+            l.hits[key] = kept
+            return false
+        }
+        l.hits[key] = append(kept, now)
+        return true
+    }
+
+    func (l *Limiter) Reset(key string) {
+        l.mu.Lock()
+        defer l.mu.Unlock()
+        delete(l.hits, key)
+    }
+    ```
+  setup: |
+    lab_file /lab/limiter.go <<'EOF'
+    package main
+
+    import "time"
+
+    // Limiter allows at most max attempts per key in any sliding window.
+    type Limiter struct {
+        // TODO
+    }
+
+    func NewLimiter(max int, window time.Duration) *Limiter {
+        return &Limiter{}
+    }
+
+    // Allow reports whether an attempt for key at now may go ahead.
+    func (l *Limiter) Allow(key string, now time.Time) bool {
+        return true
+    }
+
+    // Reset forgets the attempts of key.
+    func (l *Limiter) Reset(key string) {}
+
+    func main() {}
+    EOF
+  check: |
+    go_test <<'GO'
+    package main
+
+    import (
+        "sync"
+        "sync/atomic"
+        "testing"
+        "time"
+    )
+
+    var t0 = time.Unix(1767225600, 0)
+
+    func at(s int) time.Time { return t0.Add(time.Duration(s) * time.Second) }
+
+    func TestWindow(t *testing.T) {
+        l := NewLimiter(3, time.Minute)
+        steps := []struct {
+            sec  int
+            want bool
+        }{{0, true}, {10, true}, {20, true}, {30, false}, {59, false}, {60, true}, {61, false}, {70, true}, {79, false}, {80, true}, {81, false}}
+        for _, s := range steps {
+            if got := l.Allow("ana", at(s.sec)); got != s.want {
+                t.Fatalf("Allow at %ds = %v, want %v", s.sec, got, s.want)
+            }
+        }
+    }
+
+    func TestKeysAndReset(t *testing.T) {
+        l := NewLimiter(2, time.Minute)
+        if !l.Allow("ana", at(0)) || !l.Allow("ana", at(1)) || l.Allow("ana", at(2)) {
+            t.Fatal("ana: want true, true, false")
+        }
+        if !l.Allow("bo", at(2)) {
+            t.Fatal("bo is limited by ana's attempts")
+        }
+        l.Reset("ana")
+        if !l.Allow("ana", at(3)) || !l.Allow("ana", at(4)) || l.Allow("ana", at(5)) {
+            t.Fatal("after Reset: want true, true, false")
+        }
+        if !l.Allow("bo", at(5)) || l.Allow("bo", at(6)) {
+            t.Fatal("Reset(ana) changed bo")
+        }
+    }
+
+    func TestRefusedNotCounted(t *testing.T) {
+        l := NewLimiter(1, 10*time.Second)
+        l.Allow("k", at(0))
+        for s := 1; s < 10; s++ {
+            if l.Allow("k", at(s)) {
+                t.Fatalf("allowed at %ds", s)
+            }
+        }
+        if !l.Allow("k", at(10)) {
+            t.Fatal("refused attempts were counted: still blocked at 10s")
+        }
+    }
+
+    func TestConcurrent(t *testing.T) {
+        l := NewLimiter(10, time.Minute)
+        var ok atomic.Int32
+        var wg sync.WaitGroup
+        for i := 0; i < 200; i++ {
+            wg.Add(1)
+            go func(i int) {
+                defer wg.Done()
+                if l.Allow("shared", at(0)) {
+                    ok.Add(1)
+                }
+                if i%10 == 0 {
+                    l.Reset("other")
+                }
+                l.Allow("other", at(0))
+            }(i)
+        }
+        wg.Wait()
+        if ok.Load() != 10 {
+            t.Fatalf("%d of 200 concurrent attempts allowed, want 10", ok.Load())
+        }
+    }
+    GO
+    rc=$?
+    check "hidden tests pass" '[ "$rc" -eq 0 ]'
+  solve: |
+    cat > /lab/limiter.go <<'GO'
+    package main
+
+    import (
+        "sync"
+        "time"
+    )
+
+    // Limiter allows at most max attempts per key in any sliding window.
+    type Limiter struct {
+        mu     sync.Mutex
+        max    int
+        window time.Duration
+        hits   map[string][]time.Time
+    }
+
+    func NewLimiter(max int, window time.Duration) *Limiter {
+        return &Limiter{max: max, window: window, hits: map[string][]time.Time{}}
+    }
+
+    // Allow reports whether an attempt for key at now may go ahead.
+    func (l *Limiter) Allow(key string, now time.Time) bool {
+        l.mu.Lock()
+        defer l.mu.Unlock()
+        var kept []time.Time
+        for _, t := range l.hits[key] {
+            if now.Sub(t) < l.window {
+                kept = append(kept, t)
+            }
+        }
+        if len(kept) >= l.max {
+            l.hits[key] = kept
+            return false
+        }
+        l.hits[key] = append(kept, now)
+        return true
+    }
+
+    // Reset forgets the attempts of key.
+    func (l *Limiter) Reset(key string) {
+        l.mu.Lock()
+        defer l.mu.Unlock()
+        delete(l.hits, key)
+    }
+
+    func main() {}
+    GO
+
+- id: prog-075
+  title: Unzip uploads without zip slip
+  difficulty: 4
+  kind: build
+  tags: [go, archive/zip, zip-slip, os.Root, security]
+  tutorial: |
+    **Concept.** An archive entry's name is attacker-controlled. Names like
+    `../../etc/cron.d/x` or `/root/.ssh/authorized_keys` write outside the
+    target folder (**zip slip**). Symlink entries, or symlinks already in
+    the target, can redirect later writes. Sizes are attacker-controlled
+    too: a few KB can inflate to gigabytes (a **zip bomb**). So check
+    **every** entry before writing anything. Then write through
+    **`os.Root`** (Go 1.24), which refuses any path, `..` or symlink that
+    leads out of its directory.
+
+    **Read up on:**
+    - `archive/zip`: `OpenReader`, `File.Mode`, `File.UncompressedSize64`
+    - `filepath.IsLocal`
+    - `os.OpenRoot`, `Root.Mkdir`, `Root.OpenFile` (Go 1.24)
+    - Snyk: "Zip Slip Vulnerability"
+  scenario: |
+    In **`/lab/unzip.go`**, implement **`Extract(archive, dest string)
+    error`**, which unpacks the zip file `archive` into the existing folder
+    `dest`:
+
+    - extract directories and regular files at their relative paths,
+      creating missing parent folders (folders `0755`, files `0644`)
+    - **check every entry before writing anything**: if any name is not a
+      local path (absolute, empty, or escaping with `..`), any entry is a
+      symlink or another non-regular file, or the declared sizes add up to
+      more than **10 MiB** (`10 << 20` bytes), return an error and leave
+      `dest` untouched
+    - never write outside `dest`, even through a symlink that is already in
+      `dest`: return an error instead
+  hints:
+    - "`zr, err := zip.OpenReader(archive)`; `for _, f := range zr.File`; `f.Mode()`, `f.FileInfo().IsDir()`, `f.UncompressedSize64`."
+    - "`filepath.IsLocal(f.Name)` is false for `\"\"`, `/abs` and anything with a `..` that climbs out."
+    - "`root, _ := os.OpenRoot(dest)`; create folders one component at a time with `root.Mkdir` (ignore `fs.ErrExist`); `root.OpenFile(name, os.O_WRONLY|os.O_CREATE|os.O_TRUNC, 0644)` fails on a path that escapes."
+  solution: |
+    ```go
+    const maxTotal = 10 << 20
+
+    func mkdirs(root *os.Root, dir string) error {
+        cur := ""
+        for _, part := range strings.Split(dir, "/") {
+            if part == "" || part == "." {
+                continue
+            }
+            cur = path.Join(cur, part)
+            if err := root.Mkdir(cur, 0o755); err != nil && !errors.Is(err, fs.ErrExist) {
+                return err
+            }
+        }
+        return nil
+    }
+
+    func Extract(archive, dest string) error {
+        zr, err := zip.OpenReader(archive)
+        if err != nil {
+            return err
+        }
+        defer zr.Close()
+        var total uint64
+        for _, f := range zr.File {
+            if !filepath.IsLocal(f.Name) {
+                return fmt.Errorf("unsafe name %q", f.Name)
+            }
+            if !f.FileInfo().IsDir() && !f.Mode().IsRegular() {
+                return fmt.Errorf("%q is not a regular file", f.Name)
+            }
+            total += f.UncompressedSize64
+            if total > maxTotal {
+                return errors.New("archive too large")
+            }
+        }
+        root, err := os.OpenRoot(dest)
+        if err != nil {
+            return err
+        }
+        defer root.Close()
+        for _, f := range zr.File {
+            if f.FileInfo().IsDir() {
+                if err := mkdirs(root, f.Name); err != nil {
+                    return err
+                }
+                continue
+            }
+            if err := mkdirs(root, path.Dir(f.Name)); err != nil {
+                return err
+            }
+            if err := writeFile(root, f); err != nil {
+                return err
+            }
+        }
+        return nil
+    }
+
+    func writeFile(root *os.Root, f *zip.File) error {
+        rc, err := f.Open()
+        if err != nil {
+            return err
+        }
+        defer rc.Close()
+        out, err := root.OpenFile(f.Name, os.O_WRONLY|os.O_CREATE|os.O_TRUNC, 0o644)
+        if err != nil {
+            return err
+        }
+        n, err := io.Copy(out, io.LimitReader(rc, int64(f.UncompressedSize64)+1))
+        if cerr := out.Close(); err == nil {
+            err = cerr
+        }
+        if err == nil && uint64(n) > f.UncompressedSize64 {
+            err = errors.New("entry larger than declared")
+        }
+        return err
+    }
+    ```
+  setup: |
+    lab_file /lab/unzip.go <<'EOF'
+    package main
+
+    import "errors"
+
+    // Extract unpacks the zip file archive into the existing folder dest.
+    func Extract(archive, dest string) error {
+        return errors.New("not implemented")
+    }
+
+    func main() {}
+    EOF
+  check: |
+    go_test <<'GO'
+    package main
+
+    import (
+        "archive/zip"
+        "bytes"
+        "io/fs"
+        "os"
+        "path/filepath"
+        "testing"
+    )
+
+    type entry struct {
+        name, body string
+        mode       fs.FileMode
+        size       int
+    }
+
+    func mkzip(t *testing.T, es ...entry) string {
+        t.Helper()
+        p := filepath.Join(t.TempDir(), "a.zip")
+        f, _ := os.Create(p)
+        zw := zip.NewWriter(f)
+        for _, e := range es {
+            h := &zip.FileHeader{Name: e.name, Method: zip.Deflate}
+            if e.mode != 0 {
+                h.SetMode(e.mode)
+            }
+            w, err := zw.CreateHeader(h)
+            if err != nil {
+                t.Fatal(err)
+            }
+            if e.size > 0 {
+                w.Write(bytes.Repeat([]byte{0}, e.size))
+            } else {
+                w.Write([]byte(e.body))
+            }
+        }
+        zw.Close()
+        f.Close()
+        return p
+    }
+
+    func empty(t *testing.T, dir string) bool {
+        es, err := os.ReadDir(dir)
+        return err == nil && len(es) == 0
+    }
+
+    func TestGood(t *testing.T) {
+        dest := t.TempDir()
+        z := mkzip(t, entry{name: "readme.txt", body: "hi"}, entry{name: "docs/"},
+            entry{name: "docs/a/b.txt", body: "deep"}, entry{name: "img/x.bin", body: "\x00\x01"})
+        if err := Extract(z, dest); err != nil {
+            t.Fatalf("Extract: %v", err)
+        }
+        for name, want := range map[string]string{"readme.txt": "hi", "docs/a/b.txt": "deep", "img/x.bin": "\x00\x01"} {
+            got, err := os.ReadFile(filepath.Join(dest, name))
+            if err != nil || string(got) != want {
+                t.Errorf("%s: %q, %v", name, got, err)
+            }
+        }
+        if st, err := os.Stat(filepath.Join(dest, "docs")); err != nil || !st.IsDir() {
+            t.Errorf("docs/ is not a folder")
+        }
+    }
+
+    func TestRejected(t *testing.T) {
+        cases := map[string][]entry{
+            "dot-dot":    {{name: "ok.txt", body: "ok"}, {name: "../evil.txt", body: "x"}},
+            "nested":     {{name: "ok.txt", body: "ok"}, {name: "docs/../../evil.txt", body: "x"}},
+            "absolute":   {{name: "ok.txt", body: "ok"}, {name: "/tmp/kl-evil-abs.txt", body: "x"}},
+            "symlink":    {{name: "ok.txt", body: "ok"}, {name: "link", body: "/etc/passwd", mode: fs.ModeSymlink | 0o777}},
+            "bomb":       {{name: "ok.txt", body: "ok"}, {name: "zeros.bin", size: 11 << 20}},
+            "many small": {{name: "a.bin", size: 6 << 20}, {name: "b.bin", size: 5 << 20}},
+        }
+        for name, es := range cases {
+            parent := t.TempDir()
+            dest := filepath.Join(parent, "out")
+            os.Mkdir(dest, 0o755)
+            if err := Extract(mkzip(t, es...), dest); err == nil {
+                t.Errorf("%s: Extract returned nil", name)
+            }
+            if !empty(t, dest) {
+                t.Errorf("%s: dest is not untouched", name)
+            }
+            if _, err := os.Lstat(filepath.Join(parent, "evil.txt")); err == nil {
+                t.Errorf("%s: wrote outside dest", name)
+            }
+        }
+        if _, err := os.Lstat("/tmp/kl-evil-abs.txt"); err == nil {
+            t.Errorf("wrote an absolute path")
+        }
+    }
+
+    func TestExistingSymlink(t *testing.T) {
+        dest, outside := t.TempDir(), t.TempDir()
+        os.Symlink(outside, filepath.Join(dest, "cache"))
+        err := Extract(mkzip(t, entry{name: "cache/x.txt", body: "x"}), dest)
+        if err == nil {
+            t.Errorf("Extract returned nil")
+        }
+        if !empty(t, outside) {
+            t.Errorf("wrote through the symlink, outside dest")
+        }
+    }
+    GO
+    rc=$?
+    check "hidden tests pass" '[ "$rc" -eq 0 ]'
+  solve: |
+    cat > /lab/unzip.go <<'GO'
+    package main
+
+    import (
+        "archive/zip"
+        "errors"
+        "fmt"
+        "io"
+        "io/fs"
+        "os"
+        "path"
+        "path/filepath"
+        "strings"
+    )
+
+    const maxTotal = 10 << 20
+
+    // Extract unpacks the zip file archive into the existing folder dest.
+    func Extract(archive, dest string) error {
+        zr, err := zip.OpenReader(archive)
+        if err != nil {
+            return err
+        }
+        defer zr.Close()
+        var total uint64
+        for _, f := range zr.File {
+            if !filepath.IsLocal(f.Name) {
+                return fmt.Errorf("unsafe name %q", f.Name)
+            }
+            if !f.FileInfo().IsDir() && !f.Mode().IsRegular() {
+                return fmt.Errorf("%q is not a regular file", f.Name)
+            }
+            total += f.UncompressedSize64
+            if total > maxTotal {
+                return errors.New("archive too large")
+            }
+        }
+        root, err := os.OpenRoot(dest)
+        if err != nil {
+            return err
+        }
+        defer root.Close()
+        for _, f := range zr.File {
+            if f.FileInfo().IsDir() {
+                if err := mkdirs(root, f.Name); err != nil {
+                    return err
+                }
+                continue
+            }
+            if err := mkdirs(root, path.Dir(f.Name)); err != nil {
+                return err
+            }
+            if err := writeFile(root, f); err != nil {
+                return err
+            }
+        }
+        return nil
+    }
+
+    func mkdirs(root *os.Root, dir string) error {
+        cur := ""
+        for _, part := range strings.Split(dir, "/") {
+            if part == "" || part == "." {
+                continue
+            }
+            cur = path.Join(cur, part)
+            if err := root.Mkdir(cur, 0o755); err != nil && !errors.Is(err, fs.ErrExist) {
+                return err
+            }
+        }
+        return nil
+    }
+
+    func writeFile(root *os.Root, f *zip.File) error {
+        rc, err := f.Open()
+        if err != nil {
+            return err
+        }
+        defer rc.Close()
+        out, err := root.OpenFile(f.Name, os.O_WRONLY|os.O_CREATE|os.O_TRUNC, 0o644)
+        if err != nil {
+            return err
+        }
+        n, err := io.Copy(out, io.LimitReader(rc, int64(f.UncompressedSize64)+1))
+        if cerr := out.Close(); err == nil {
+            err = cerr
+        }
+        if err == nil && uint64(n) > f.UncompressedSize64 {
+            err = errors.New("entry larger than declared")
+        }
+        return err
+    }
+
+    func main() {}
+    GO
+
+- id: prog-076
+  title: A server that waits forever
+  difficulty: 4
+  kind: fix
+  tags: [go, net/http, timeouts, slowloris, MaxBytesReader]
+  tutorial: |
+    **Concept.** A zero-value `http.Server` has **no timeouts**. A client
+    that opens connections and sends headers one byte at a time
+    (**Slowloris**) ties up the server forever. `io.ReadAll(r.Body)` reads
+    whatever size the client sends. Production servers set
+    `ReadHeaderTimeout`, `ReadTimeout`, `WriteTimeout`, `IdleTimeout` and
+    `MaxHeaderBytes`, and cap each request body with
+    **`http.MaxBytesReader`**, answering **413** when it is exceeded.
+
+    **Read up on:**
+    - `http.Server` fields, and Cloudflare's "The complete guide to Go net/http timeouts"
+    - `http.MaxBytesReader`, `*http.MaxBytesError`, `errors.As`
+    - `json.Decoder.DisallowUnknownFields`
+  scenario: |
+    **`/lab/server.go`** is a notes service. `NewServer(addr string)
+    *http.Server` builds its server and `POST /notes` takes `{"text":
+    "..."}` and answers `{"length": <len(text)>}`. One client holding idle
+    connections can take it down, and so can one huge upload.
+
+    Fix it, keeping the API:
+
+    - `NewServer` sets **`ReadHeaderTimeout`** (more than 0, at most **5s**),
+      **`ReadTimeout`** and **`WriteTimeout`** (more than 0, at most
+      **30s**), **`IdleTimeout`** (more than 0, at most **120s**) and
+      **`MaxHeaderBytes`** (more than 0, at most **64 KiB**)
+    - a connection that never finishes sending its headers is closed by the
+      server within those 5 seconds
+    - a `/notes` body larger than **1 MiB** (`1 << 20` bytes) gets **413**;
+      a body of exactly 1 MiB still works
+    - a JSON body with **unknown fields** gets **400**
+  hints:
+    - "Set the fields in the `&http.Server{...}` literal."
+    - "`r.Body = http.MaxBytesReader(w, r.Body, 1<<20)`; then `var mbe *http.MaxBytesError; if errors.As(err, &mbe) { ... 413 }`."
+    - "`dec := json.NewDecoder(r.Body); dec.DisallowUnknownFields()`."
+  solution: |
+    ```go
+    const maxBody = 1 << 20
+
+    func NewServer(addr string) *http.Server {
+        mux := http.NewServeMux()
+        mux.HandleFunc("/notes", handleNotes)
+        return &http.Server{
+            Addr: addr, Handler: mux,
+            ReadHeaderTimeout: 5 * time.Second,
+            ReadTimeout:       15 * time.Second,
+            WriteTimeout:      15 * time.Second,
+            IdleTimeout:       60 * time.Second,
+            MaxHeaderBytes:    16 << 10,
+        }
+    }
+
+    func handleNotes(w http.ResponseWriter, r *http.Request) {
+        if r.Method != http.MethodPost {
+            http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
+            return
+        }
+        r.Body = http.MaxBytesReader(w, r.Body, maxBody)
+        dec := json.NewDecoder(r.Body)
+        dec.DisallowUnknownFields()
+        var note struct {
+            Text string `json:"text"`
+        }
+        if err := dec.Decode(&note); err != nil {
+            var mbe *http.MaxBytesError
+            if errors.As(err, &mbe) {
+                http.Error(w, "body too large", http.StatusRequestEntityTooLarge)
+                return
+            }
+            http.Error(w, "bad json", http.StatusBadRequest)
+            return
+        }
+        w.Header().Set("Content-Type", "application/json")
+        json.NewEncoder(w).Encode(map[string]int{"length": len(note.Text)})
+    }
+    ```
+  setup: |
+    lab_file /lab/server.go <<'EOF'
+    package main
+
+    import (
+        "encoding/json"
+        "io"
+        "log"
+        "net/http"
+    )
+
+    // NewServer returns the notes service's HTTP server.
+    func NewServer(addr string) *http.Server {
+        mux := http.NewServeMux()
+        mux.HandleFunc("/notes", handleNotes)
+        return &http.Server{Addr: addr, Handler: mux}
+    }
+
+    func handleNotes(w http.ResponseWriter, r *http.Request) {
+        if r.Method != http.MethodPost {
+            http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
+            return
+        }
+        body, err := io.ReadAll(r.Body)
+        if err != nil {
+            http.Error(w, "read error", http.StatusBadRequest)
+            return
+        }
+        var note struct {
+            Text string `json:"text"`
+        }
+        if err := json.Unmarshal(body, &note); err != nil {
+            http.Error(w, "bad json", http.StatusBadRequest)
+            return
+        }
+        w.Header().Set("Content-Type", "application/json")
+        json.NewEncoder(w).Encode(map[string]int{"length": len(note.Text)})
+    }
+
+    func main() {
+        log.Fatal(NewServer(":8080").ListenAndServe())
+    }
+    EOF
+  check: |
+    go_test <<'GO'
+    package main
+
+    import (
+        "errors"
+        "io"
+        "net"
+        "net/http"
+        "net/http/httptest"
+        "strings"
+        "testing"
+        "time"
+    )
+
+    func TestFields(t *testing.T) {
+        s := NewServer("127.0.0.1:0")
+        in := func(d, max time.Duration) bool { return d > 0 && d <= max }
+        if !in(s.ReadHeaderTimeout, 5*time.Second) {
+            t.Errorf("ReadHeaderTimeout = %v", s.ReadHeaderTimeout)
+        }
+        if !in(s.ReadTimeout, 30*time.Second) || !in(s.WriteTimeout, 30*time.Second) {
+            t.Errorf("ReadTimeout = %v, WriteTimeout = %v", s.ReadTimeout, s.WriteTimeout)
+        }
+        if !in(s.IdleTimeout, 120*time.Second) {
+            t.Errorf("IdleTimeout = %v", s.IdleTimeout)
+        }
+        if s.MaxHeaderBytes <= 0 || s.MaxHeaderBytes > 64<<10 {
+            t.Errorf("MaxHeaderBytes = %d", s.MaxHeaderBytes)
+        }
+    }
+
+    func post(h http.Handler, body string) *httptest.ResponseRecorder {
+        w := httptest.NewRecorder()
+        h.ServeHTTP(w, httptest.NewRequest("POST", "/notes", strings.NewReader(body)))
+        return w
+    }
+
+    func TestBodies(t *testing.T) {
+        h := NewServer("127.0.0.1:0").Handler
+        if w := post(h, `{"text":"hello"}`); w.Code != 200 || !strings.Contains(w.Body.String(), `"length":5`) {
+            t.Fatalf("small note: %d %s", w.Code, w.Body.String())
+        }
+        exact := `{"text":"` + strings.Repeat("a", 1<<20-11) + `"}`
+        if w := post(h, exact); w.Code != 200 || !strings.Contains(w.Body.String(), `"length":1048565`) {
+            t.Fatalf("exactly 1 MiB: %d", w.Code)
+        }
+        if w := post(h, `{"text":"`+strings.Repeat("a", 1<<20)+`"}`); w.Code != 413 {
+            t.Fatalf("over 1 MiB: %d, want 413", w.Code)
+        }
+        if w := post(h, `{"text":"hi","admin":true}`); w.Code != 400 {
+            t.Fatalf("unknown field: %d, want 400", w.Code)
+        }
+        if w := post(h, `{"text":`); w.Code != 400 {
+            t.Fatalf("broken JSON: %d, want 400", w.Code)
+        }
+        w := httptest.NewRecorder()
+        h.ServeHTTP(w, httptest.NewRequest("GET", "/notes", nil))
+        if w.Code != 405 {
+            t.Fatalf("GET: %d, want 405", w.Code)
+        }
+    }
+
+    func TestSlowClient(t *testing.T) {
+        s := NewServer("127.0.0.1:0")
+        if s.ReadHeaderTimeout <= 0 || s.ReadHeaderTimeout > 5*time.Second {
+            t.Fatalf("ReadHeaderTimeout = %v", s.ReadHeaderTimeout)
+        }
+        ln, err := net.Listen("tcp", "127.0.0.1:0")
+        if err != nil {
+            t.Fatal(err)
+        }
+        go s.Serve(ln)
+        defer s.Close()
+        c, err := net.Dial("tcp", ln.Addr().String())
+        if err != nil {
+            t.Fatal(err)
+        }
+        defer c.Close()
+        io.WriteString(c, "POST /notes HTTP/1.1\r\nHost: x\r\n")
+        c.SetReadDeadline(time.Now().Add(8 * time.Second))
+        _, err = io.ReadAll(c)
+        var ne net.Error
+        if errors.As(err, &ne) && ne.Timeout() {
+            t.Fatal("a client that never finished its headers was still connected after 8s")
+        }
+    }
+    GO
+    rc=$?
+    check "hidden tests pass" '[ "$rc" -eq 0 ]'
+  solve: |
+    cat > /lab/server.go <<'GO'
+    package main
+
+    import (
+        "encoding/json"
+        "errors"
+        "log"
+        "net/http"
+        "time"
+    )
+
+    const maxBody = 1 << 20
+
+    // NewServer returns the notes service's HTTP server.
+    func NewServer(addr string) *http.Server {
+        mux := http.NewServeMux()
+        mux.HandleFunc("/notes", handleNotes)
+        return &http.Server{
+            Addr:              addr,
+            Handler:           mux,
+            ReadHeaderTimeout: 5 * time.Second,
+            ReadTimeout:       15 * time.Second,
+            WriteTimeout:      15 * time.Second,
+            IdleTimeout:       60 * time.Second,
+            MaxHeaderBytes:    16 << 10,
+        }
+    }
+
+    func handleNotes(w http.ResponseWriter, r *http.Request) {
+        if r.Method != http.MethodPost {
+            http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
+            return
+        }
+        r.Body = http.MaxBytesReader(w, r.Body, maxBody)
+        dec := json.NewDecoder(r.Body)
+        dec.DisallowUnknownFields()
+        var note struct {
+            Text string `json:"text"`
+        }
+        if err := dec.Decode(&note); err != nil {
+            var mbe *http.MaxBytesError
+            if errors.As(err, &mbe) {
+                http.Error(w, "body too large", http.StatusRequestEntityTooLarge)
+                return
+            }
+            http.Error(w, "bad json", http.StatusBadRequest)
+            return
+        }
+        w.Header().Set("Content-Type", "application/json")
+        json.NewEncoder(w).Encode(map[string]int{"length": len(note.Text)})
+    }
+
+    func main() {
+        log.Fatal(NewServer(":8080").ListenAndServe())
+    }
+    GO
+
+- id: prog-077
+  title: Link previews that reach the metadata service
+  difficulty: 4
+  kind: build
+  tags: [python, ssrf, ipaddress, urllib, security]
+  tutorial: |
+    **Concept.** A feature that fetches a URL the user typed (link previews,
+    webhooks, "import from URL") runs that request **from inside your
+    network**. That is **SSRF**: `http://169.254.169.254/` reads the cloud
+    metadata service, and `http://localhost:6379/` or `http://10.0.0.5/`
+    reach internal services. Blocklisting strings doesn't work, because
+    `127.1`, `2130706433` and `0x7f.1` are all 127.0.0.1 to the resolver.
+    The reliable check parses the URL, **resolves the host the way the
+    fetch will**, and accepts only if **every** address is a public one.
+
+    **Read up on:**
+    - OWASP: "Server Side Request Forgery Prevention Cheat Sheet"
+    - `urllib.parse.urlsplit` (`scheme`, `hostname`, `port`, `username`)
+    - `socket.getaddrinfo`, `ipaddress.ip_address(...).is_global`
+  scenario: |
+    The chat app fetches a preview of every link posted. In
+    **`/lab/urlcheck.py`**, implement **`is_safe_url(url)`**, called before
+    each fetch. It returns `True` only when all of these hold, and `False`
+    otherwise (it never raises):
+
+    - the scheme is **`http`** or **`https`** (in any case)
+    - there is a host name, and **no user name or password** in the URL
+    - the port, if given, is a valid one (1–65535)
+    - the host **resolves** with `socket.getaddrinfo`, and **every**
+      address it resolves to is **global** (`ipaddress` `is_global`), so not
+      loopback, private, link-local, shared (`100.64.0.0/10`) or unspecified
+
+    The check runs offline, so test with IP addresses and `localhost`.
+  hints:
+    - "`parts = urlsplit(url)`; `parts.port` raises `ValueError` for a bad port, so wrap the whole function in `try`."
+    - "`{info[4][0] for info in socket.getaddrinfo(host, None)}` is the set of addresses."
+    - "An IPv6 address can carry a zone (`fe80::1%eth0`): split on `%` before `ip_address`."
+  solution: |
+    ```python
+    import ipaddress, socket
+    from urllib.parse import urlsplit
+
+    def is_safe_url(url):
+        try:
+            parts = urlsplit(url)
+            if parts.scheme.lower() not in ("http", "https"):
+                return False
+            if not parts.hostname or parts.username is not None or parts.password is not None:
+                return False
+            if parts.port is not None and not 1 <= parts.port <= 65535:
+                return False
+            addrs = {info[4][0] for info in socket.getaddrinfo(parts.hostname, None)}
+            return bool(addrs) and all(ipaddress.ip_address(a.split("%")[0]).is_global for a in addrs)
+        except (ValueError, OSError, UnicodeError):
+            return False
+    ```
+  setup: |
+    lab_file /lab/urlcheck.py <<'EOF'
+    """Decide whether the preview fetcher may fetch a URL."""
+
+
+    def is_safe_url(url):
+        # TODO: see /lab/TASK.md. For now everything is fetched.
+        return True
+    EOF
+  check: |
+    d=$(mktemp -d)
+    cat >"$d/t.py" <<'PY'
+    import unittest
+    from urlcheck import is_safe_url
+
+    SAFE = ["http://8.8.8.8/", "https://1.1.1.1:8443/path?q=1", "HTTPS://9.9.9.9",
+            "http://8.8.4.4:80", "http://[2606:4700:4700::1111]/dns"]
+    UNSAFE = ["http://127.0.0.1/", "http://localhost:8080/admin", "http://LOCALHOST/",
+              "http://127.1/", "http://2130706433/", "http://0x7f.1/", "http://0.0.0.0:6379/",
+              "http://10.1.2.3/", "http://172.16.5.4/", "http://192.168.0.10/",
+              "http://169.254.169.254/latest/meta-data/", "http://100.64.0.1/",
+              "http://[::1]/", "http://[fd00::1]/", "http://[fe80::1]/",
+              "ftp://8.8.8.8/", "file:///etc/passwd", "gopher://8.8.8.8:70/", "javascript:alert(1)",
+              "http://user:pw@8.8.8.8/", "http://admin@8.8.8.8/", "http:///nohost", "http://8.8.8.8:99999/",
+              "http://8.8.8.8:0/", "http://8.8.8.8:port/", "", "8.8.8.8", "//8.8.8.8/", "http://[::1/"]
+
+    class T(unittest.TestCase):
+        def test_safe(self):
+            for u in SAFE:
+                with self.subTest(url=u):
+                    self.assertIs(is_safe_url(u), True)
+
+        def test_unsafe(self):
+            for u in UNSAFE:
+                with self.subTest(url=u):
+                    self.assertIs(is_safe_url(u), False)
+
+    unittest.main()
+    PY
+    out=$(cd /lab && PYTHONPATH=/lab timeout 60 python3 -B "$d/t.py" 2>&1); rc=$?
+    rm -rf "$d"; [ "$rc" -ne 0 ] && echo "$out" | tail -15
+    check "hidden tests pass" '[ "$rc" -eq 0 ]'
+  solve: |
+    cat > /lab/urlcheck.py <<'PY'
+    """Decide whether the preview fetcher may fetch a URL."""
+    import ipaddress
+    import socket
+    from urllib.parse import urlsplit
+
+
+    def is_safe_url(url):
+        try:
+            parts = urlsplit(url)
+            if parts.scheme.lower() not in ("http", "https"):
+                return False
+            if not parts.hostname or parts.username is not None or parts.password is not None:
+                return False
+            if parts.port is not None and not 1 <= parts.port <= 65535:
+                return False
+            addrs = {info[4][0] for info in socket.getaddrinfo(parts.hostname, None)}
+            return bool(addrs) and all(ipaddress.ip_address(a.split("%")[0]).is_global for a in addrs)
+        except (ValueError, OSError, UnicodeError):
+            return False
+    PY
+
+- id: prog-078
+  title: A calculator that can't run code
+  difficulty: 4
+  kind: build
+  tags: [python, ast, eval, sandboxing]
+  tutorial: |
+    **Concept.** `eval(user_input)` runs any Python the user types,
+    `__import__("os").system(...)` included, and no list of "forbidden
+    words" makes it safe. To evaluate a small language, **parse** it with
+    `ast.parse(expr, mode="eval")` and walk the tree yourself, accepting only
+    the node types you allow and rejecting everything else. Arithmetic needs
+    resource limits too: `9 ** 9 ** 9` is perfectly valid and never finishes.
+
+    **Read up on:**
+    - `ast.parse`, `ast.Expression`, `ast.BinOp`, `ast.UnaryOp`, `ast.Constant`
+    - The `operator` module (`operator.add`, `operator.pow`, ...)
+    - Why `ast.literal_eval` doesn't do arithmetic
+  scenario: |
+    The old `calc` was `return eval(expr)`. In **`/lab/calc.py`**,
+    implement **`calc(expr)`**, which evaluates an arithmetic expression and
+    returns an `int` or `float`:
+
+    - allowed: **int and float literals** (not `True`/`False`, not complex),
+      the binary operators **`+ - * / // % **`**, unary **`+ -`**, and
+      parentheses
+    - **anything else** (names, calls, attributes, strings, comparisons,
+      lists, ...) or a syntax error raises **`ValueError`**
+    - expressions longer than **200 characters** raise `ValueError`
+    - **`a ** b`** is computed only when **|a| ≤ 1,000,000** and **|b| ≤
+      100**, otherwise `ValueError` (check *before* computing)
+    - errors while computing (division by zero, float overflow) and results
+      that aren't `int` or `float` (a complex from `(-8) ** 0.5`) raise
+      `ValueError`
+
+    Never call `eval` or `exec`.
+  hints:
+    - "`tree = ast.parse(expr, mode=\"eval\")` raises `SyntaxError`; evaluate `tree.body` with a recursive function."
+    - "Map node types to functions: `{ast.Add: operator.add, ast.Pow: operator.pow, ...}` and `type(node.op)`."
+    - "`isinstance(True, int)` is `True`: test `type(node.value) in (int, float)`."
+  solution: |
+    ```python
+    import ast, operator
+
+    BIN = {ast.Add: operator.add, ast.Sub: operator.sub, ast.Mult: operator.mul,
+           ast.Div: operator.truediv, ast.FloorDiv: operator.floordiv,
+           ast.Mod: operator.mod, ast.Pow: operator.pow}
+    UN = {ast.UAdd: operator.pos, ast.USub: operator.neg}
+
+    def _ev(node):
+        if isinstance(node, ast.Constant) and type(node.value) in (int, float):
+            return node.value
+        if isinstance(node, ast.UnaryOp) and type(node.op) in UN:
+            return UN[type(node.op)](_ev(node.operand))
+        if isinstance(node, ast.BinOp) and type(node.op) in BIN:
+            a, b = _ev(node.left), _ev(node.right)
+            if isinstance(node.op, ast.Pow) and (abs(a) > 1_000_000 or abs(b) > 100):
+                raise ValueError("exponent too large")
+            return BIN[type(node.op)](a, b)
+        raise ValueError("not allowed: " + type(node).__name__)
+
+    def calc(expr):
+        if len(expr) > 200:
+            raise ValueError("too long")
+        try:
+            tree = ast.parse(expr, mode="eval")
+            result = _ev(tree.body)
+        except (SyntaxError, ZeroDivisionError, OverflowError) as e:
+            raise ValueError(str(e))
+        if type(result) not in (int, float):
+            raise ValueError("not a real number")
+        return result
+    ```
+  setup: |
+    lab_file /lab/calc.py <<'EOF'
+    """The calculator behind the "Quick maths" box. It used to hand the text to eval."""
+
+
+    def calc(expr):
+        raise NotImplementedError
+    EOF
+  check: |
+    d=$(mktemp -d)
+    cat >"$d/t.py" <<'PY'
+    import os, signal, tempfile, unittest
+    from calc import calc
+
+    def too_slow(*_):
+        raise TimeoutError("took more than 3 seconds")
+
+    signal.signal(signal.SIGALRM, too_slow)
+    MARK = os.path.join(tempfile.mkdtemp(), "pwned")
+
+    class T(unittest.TestCase):
+        def setUp(self):
+            signal.alarm(3)
+
+        def tearDown(self):
+            signal.alarm(0)
+
+        def test_arithmetic(self):
+            cases = {"1 + 2 * 3": 7, "(1 + 2) * 3": 9, "-2 ** 2": -4, "2 ** -1": 0.5, "7 // 2": 3,
+                     "7 % 3": 1, "1.5 * 4": 6.0, "10 / 4": 2.5, "2**10": 1024, "--3": 3, "+4": 4,
+                     "1000000 ** 100": 10 ** 600, "2.5e3 - 1": 2499.0}
+            for expr, want in cases.items():
+                with self.subTest(expr=expr):
+                    got = calc(expr)
+                    self.assertEqual(got, want)
+                    self.assertIs(type(got), type(want))
+
+        def test_rejected(self):
+            bad = ["__import__('os').system('touch %s')" % MARK, "open('%s', 'w')" % MARK,
+                   "().__class__.__bases__[0].__subclasses__()", "x + 1", "True + 1", "'a' * 3",
+                   "1 if 1 else 2", "1 < 2", "[1, 2]", "lambda: 1", "1j * 2", "1 +", "", "a" * 10,
+                   "(1).real", "abs(-1)", "1; 2", "1 + 1" + " " * 200, "1 and 2", "~1", "1 << 2"]
+            for expr in bad:
+                with self.subTest(expr=expr):
+                    with self.assertRaises(ValueError):
+                        calc(expr)
+            self.assertFalse(os.path.exists(MARK), "the expression ran code")
+
+        def test_limits(self):
+            for expr in ("9 ** 9 ** 9", "2 ** 101", "1000001 ** 2", "(10 ** 6 + 1) ** 2", "-1000001 ** 2",
+                         "2 ** 1000", "1 / 0", "5 // 0", "5 % 0", "0 ** -1", "1000000.0 ** 100", "(-8) ** 0.5"):
+                with self.subTest(expr=expr):
+                    with self.assertRaises(ValueError):
+                        calc(expr)
+            self.assertEqual(calc("(-1000000) ** 100"), 10 ** 600)
+
+    unittest.main()
+    PY
+    out=$(cd /lab && PYTHONPATH=/lab timeout 60 python3 -B "$d/t.py" 2>&1); rc=$?
+    rm -rf "$d"; [ "$rc" -ne 0 ] && echo "$out" | tail -15
+    check "hidden tests pass" '[ "$rc" -eq 0 ]'
+    check_not "calc.py does not call eval or exec" 'grep -Eq "(^|[^_a-zA-Z.])(eval|exec)\(" /lab/calc.py'
+  solve: |
+    cat > /lab/calc.py <<'PY'
+    """The calculator behind the "Quick maths" box."""
+    import ast
+    import operator
+
+    BIN = {ast.Add: operator.add, ast.Sub: operator.sub, ast.Mult: operator.mul,
+           ast.Div: operator.truediv, ast.FloorDiv: operator.floordiv,
+           ast.Mod: operator.mod, ast.Pow: operator.pow}
+    UN = {ast.UAdd: operator.pos, ast.USub: operator.neg}
+
+
+    def _ev(node):
+        if isinstance(node, ast.Constant) and type(node.value) in (int, float):
+            return node.value
+        if isinstance(node, ast.UnaryOp) and type(node.op) in UN:
+            return UN[type(node.op)](_ev(node.operand))
+        if isinstance(node, ast.BinOp) and type(node.op) in BIN:
+            a, b = _ev(node.left), _ev(node.right)
+            if isinstance(node.op, ast.Pow) and (abs(a) > 1_000_000 or abs(b) > 100):
+                raise ValueError("exponent too large")
+            return BIN[type(node.op)](a, b)
+        raise ValueError("not allowed: " + type(node).__name__)
+
+
+    def calc(expr):
+        if len(expr) > 200:
+            raise ValueError("too long")
+        try:
+            tree = ast.parse(expr, mode="eval")
+            result = _ev(tree.body)
+        except (SyntaxError, ZeroDivisionError, OverflowError) as e:
+            raise ValueError(str(e))
+        if type(result) not in (int, float):
+            raise ValueError("not a real number")
+        return result
+    PY
+
+- id: prog-079
+  title: "Security review: the intranet app"
+  difficulty: 5
+  kind: fix
+  tags: [python, wsgi, sql-injection, xss, path-traversal, access-control, incident]
+  tutorial: |
+    **Concept.** A real security review rarely finds one bug. It finds a
+    handful, each a classic: **SQL injection** (build queries with
+    placeholders), **XSS** (escape everything that goes into HTML),
+    **path traversal** (resolve, then confine), **broken access control**
+    (decide on server-side state, never on what the client says it is) and
+    **predictable session ids**. Fix each one at its root cause, then make
+    sure the features still work.
+
+    The app is plain **WSGI**: `app(environ, start_response)`. You can call
+    it directly with a dict, or serve it with `wsgiref.simple_server`.
+
+    **Read up on:**
+    - PEP 3333 (WSGI), `wsgiref.simple_server`, `http.cookies.SimpleCookie`
+    - `sqlite3` placeholders (`?`), `html.escape`, `pathlib.Path.resolve`, `secrets`
+    - OWASP Top 10: A01 Broken Access Control, A03 Injection
+  scenario: |
+    **`/lab/intranet.py`** (run it with `python3 /lab/intranet.py`, port
+    8000) failed its security review. The report:
+
+    1. **`/search?q=`**: `zzz' UNION SELECT amount FROM salaries --` lists
+       everyone's salary, and a name containing `'` crashes the page.
+    2. **`/search?q=`**: the search term and employee names are put into
+       the HTML as they are. `<script>` in either one runs in the reader's
+       browser.
+    3. **`/files?name=`**: `../.env`, `/etc/passwd` and
+       `../docs-private/plan.txt` are served. Only files inside `docs/` may
+       be (`policies/../handbook.txt` is fine). Anything else gets **403**
+       or **404**.
+    4. **`/admin`**: sending the cookie `role=admin` is enough. It must use
+       the **`sid`** cookie: look the session up in `SESSIONS`, and answer
+       200 only if that user's **`role` in the `employees` table** is
+       `admin`. Otherwise answer **403**.
+    5. **`start_session(user)`** returns ids like `Ana Lopez-3`. They must
+       be unguessable: at least **32 characters** from `secrets`, never
+       containing the user name.
+
+    Fix all five without changing the routes, the database layout, the
+    `DOCS`, `DB` and `SESSIONS` names, or what the pages show for normal
+    input. Keep everything in `intranet.py`.
+  hints:
+    - "Call it directly: `python3 -c 'import intranet, wsgiref.util as u; e = {\"PATH_INFO\": \"/files\", \"QUERY_STRING\": \"name=../.env\"}; u.setup_testing_defaults(e); print(intranet.app(e, print))'`."
+    - "1: `\"... WHERE name LIKE ? ORDER BY name\", (\"%\" + q + \"%\",)`. 2: `html.escape` on q and on every name."
+    - "3: `Path(DOCS).resolve()`, `(base / name).resolve()`, `is_relative_to`, then `is_file()`."
+    - "4: `cookie[\"sid\"].value` → `SESSIONS.get(...)` → `SELECT role FROM employees WHERE name = ?`. 5: `secrets.token_urlsafe(32)`."
+  solution: |
+    ```python
+    import html, secrets
+    from pathlib import Path
+
+    def start_session(user):
+        sid = secrets.token_urlsafe(32)
+        SESSIONS[sid] = user
+        return sid
+
+    def search(env, params):
+        q = params.get("q", [""])[0]
+        rows = query("SELECT name FROM employees WHERE name LIKE ? ORDER BY name", ("%" + q + "%",))
+        if not rows:
+            return "200 OK", "<p>No results for %s</p>" % html.escape(q)
+        return "200 OK", "<ul>" + "".join("<li>%s</li>" % html.escape(r[0]) for r in rows) + "</ul>"
+
+    def files(env, params):
+        name = params.get("name", [""])[0]
+        base = Path(DOCS).resolve()
+        path = (base / name).resolve()
+        if not path.is_relative_to(base) or not path.is_file():
+            return "404 Not Found", "no such document"
+        return "200 OK", path.read_text()
+
+    def admin(env, params):
+        cookie = SimpleCookie(env.get("HTTP_COOKIE", ""))
+        user = SESSIONS.get(cookie["sid"].value) if "sid" in cookie else None
+        rows = query("SELECT role FROM employees WHERE name = ?", (user,)) if user else []
+        if not rows or rows[0][0] != "admin":
+            return "403 Forbidden", "admins only"
+        ...  # the salary table, as before
+    ```
+  setup: |
+    lab_file /lab/intranet.py <<'EOF'
+    """The intranet: a small WSGI app. `python3 intranet.py` serves it on port 8000."""
+    import os
+    import sqlite3
+    from http.cookies import SimpleCookie
+    from urllib.parse import parse_qs
+
+    HERE = os.path.dirname(os.path.abspath(__file__))
+    DOCS = os.path.join(HERE, "docs")
+    DB = os.path.join(HERE, "intranet.db")
+    SESSIONS = {}  # session id -> employee name
+
+
+    def start_session(user):
+        """Called by the single sign-on callback; returns the value of the sid cookie."""
+        sid = "%s-%d" % (user, len(SESSIONS) + 1)
+        SESSIONS[sid] = user
+        return sid
+
+
+    def query(sql, args=()):
+        conn = sqlite3.connect(DB)
+        try:
+            return conn.execute(sql, args).fetchall()
+        finally:
+            conn.close()
+
+
+    def search(env, params):
+        q = params.get("q", [""])[0]
+        rows = query("SELECT name FROM employees WHERE name LIKE '%" + q + "%' ORDER BY name")
+        if not rows:
+            return "200 OK", "<p>No results for %s</p>" % q
+        return "200 OK", "<ul>" + "".join("<li>%s</li>" % r[0] for r in rows) + "</ul>"
+
+
+    def files(env, params):
+        name = params.get("name", [""])[0]
+        path = os.path.join(DOCS, name)
+        if not os.path.isfile(path):
+            return "404 Not Found", "no such document"
+        with open(path) as f:
+            return "200 OK", f.read()
+
+
+    def admin(env, params):
+        cookie = SimpleCookie(env.get("HTTP_COOKIE", ""))
+        if "role" not in cookie or cookie["role"].value != "admin":
+            return "403 Forbidden", "admins only"
+        rows = query("SELECT e.name, s.amount FROM salaries s JOIN employees e ON e.id = s.employee_id ORDER BY e.name")
+        return "200 OK", "<table>" + "".join("<tr><td>%s</td><td>%d</td></tr>" % r for r in rows) + "</table>"
+
+
+    ROUTES = {"/search": search, "/files": files, "/admin": admin}
+
+
+    def app(env, start_response):
+        handler = ROUTES.get(env.get("PATH_INFO", "/"))
+        if handler is None:
+            status, body = "404 Not Found", "not found"
+        else:
+            status, body = handler(env, parse_qs(env.get("QUERY_STRING", "")))
+        ctype = "text/plain" if handler is files else "text/html"
+        start_response(status, [("Content-Type", ctype + "; charset=utf-8")])
+        return [body.encode()]
+
+
+    if __name__ == "__main__":
+        from wsgiref.simple_server import make_server
+        make_server("127.0.0.1", 8000, app).serve_forever()
+    EOF
+    echo "Welcome to the company handbook." | lab_file /lab/docs/handbook.txt
+    echo "Leave policy: 25 days a year." | lab_file /lab/docs/policies/leave.txt
+    echo "Q3 plan: reorganise everything." | lab_file /lab/docs-private/plan.txt
+    echo "DB_PASSWORD=$(head -c9 /dev/urandom | base64)" | lab_file /lab/.env 0600
+    rm -f /lab/intranet.db
+    python3 - <<'PY'
+    import sqlite3
+    c = sqlite3.connect("/lab/intranet.db")
+    c.executescript("""
+    CREATE TABLE employees (id INTEGER PRIMARY KEY, name TEXT NOT NULL, role TEXT NOT NULL);
+    CREATE TABLE salaries (employee_id INTEGER NOT NULL, amount INTEGER NOT NULL);
+    INSERT INTO employees VALUES (1, 'Ana Lopez', 'staff'), (2, 'Dan Brown', 'staff'),
+      (3, 'Root Admin', 'admin'), (4, 'Sean O''Brien', 'staff');
+    INSERT INTO salaries VALUES (1, 51234), (2, 48765), (3, 98765), (4, 47000);
+    """)
+    c.commit()
+    PY
+    chown "$(lab_user):" /lab/intranet.db
+  check: |
+    d=$(mktemp -d); mkdir "$d/app"
+    cp /lab/*.py "$d/app/" 2>/dev/null
+    cat >"$d/t.py" <<'PY'
+    import io, os, sqlite3, unittest, wsgiref.util
+    import intranet as m
+
+    HERE = os.path.dirname(os.path.abspath(m.__file__))
+    os.makedirs(os.path.join(HERE, "docs", "policies"), exist_ok=True)
+    os.makedirs(os.path.join(HERE, "docs-private"), exist_ok=True)
+    for p, text in {"docs/handbook.txt": "Welcome aboard", "docs/policies/leave.txt": "25 days",
+                    "docs-private/plan.txt": "TOPSECRETPLAN", ".env": "DB_PASSWORD=TOPSECRETENV"}.items():
+        open(os.path.join(HERE, p), "w").write(text)
+    if os.path.exists(m.DB):
+        os.remove(m.DB)
+    c = sqlite3.connect(m.DB)
+    c.executescript("""
+    CREATE TABLE employees (id INTEGER PRIMARY KEY, name TEXT NOT NULL, role TEXT NOT NULL);
+    CREATE TABLE salaries (employee_id INTEGER NOT NULL, amount INTEGER NOT NULL);
+    INSERT INTO employees VALUES (1, 'Ana Lopez', 'staff'), (2, 'Dan Brown', 'staff'), (3, 'Root Admin', 'admin'),
+      (4, 'Mallory <img src=x onerror=alert(1)>', 'staff'), (5, 'Sean O''Brien', 'staff');
+    INSERT INTO salaries VALUES (1, 51234), (2, 48765), (3, 98765), (4, 40001), (5, 47000);
+    """)
+    c.commit(); c.close()
+    SALARIES = ("51234", "48765", "98765", "40001", "47000")
+
+    def call(path, query="", cookie=None):
+        env = {"PATH_INFO": path, "QUERY_STRING": query, "wsgi.input": io.BytesIO()}
+        if cookie:
+            env["HTTP_COOKIE"] = cookie
+        wsgiref.util.setup_testing_defaults(env)
+        got = {}
+        def start_response(status, headers, exc_info=None):
+            got["status"] = status
+        body = b"".join(m.app(env, start_response)).decode()
+        return int(got["status"].split()[0]), body
+
+    from urllib.parse import quote
+
+    class Search(unittest.TestCase):
+        def test_normal(self):
+            code, body = call("/search", "q=an")
+            self.assertEqual(code, 200)
+            self.assertIn("Ana Lopez", body); self.assertIn("Dan Brown", body)
+            self.assertNotIn("Root Admin", body)
+
+        def test_injection(self):
+            code, body = call("/search", "q=" + quote("zzz' UNION SELECT amount FROM salaries --"))
+            self.assertEqual(code, 200)
+            for s in SALARIES:
+                self.assertNotIn(s, body)
+
+        def test_quote(self):
+            code, body = call("/search", "q=" + quote("O'Brien"))
+            self.assertEqual(code, 200)
+            self.assertIn("Brien", body)
+
+        def test_xss_term(self):
+            code, body = call("/search", "q=" + quote("<script>alert(1)</script>"))
+            self.assertNotIn("<script>", body)
+            self.assertIn("&lt;script&gt;", body)
+
+        def test_xss_name(self):
+            code, body = call("/search", "q=Mallory")
+            self.assertIn("Mallory", body)
+            self.assertNotIn("<img", body)
+
+    class Files(unittest.TestCase):
+        def test_inside(self):
+            self.assertEqual(call("/files", "name=handbook.txt"), (200, "Welcome aboard"))
+            self.assertEqual(call("/files", "name=" + quote("policies/leave.txt")), (200, "25 days"))
+            self.assertEqual(call("/files", "name=" + quote("policies/../handbook.txt")), (200, "Welcome aboard"))
+
+        def test_outside(self):
+            for name in ("../.env", "/etc/passwd", "../docs-private/plan.txt", "../intranet.db",
+                         "policies/../../.env", "nope.txt", ""):
+                with self.subTest(name=name):
+                    code, body = call("/files", "name=" + quote(name))
+                    self.assertIn(code, (403, 404))
+                    for leak in ("TOPSECRET", "root:", "SQLite"):
+                        self.assertNotIn(leak, body)
+
+    class Admin(unittest.TestCase):
+        def test_denied(self):
+            ana = m.start_session("Ana Lopez")
+            for cookie in (None, "role=admin", "sid=" + ana, "role=admin; sid=" + ana,
+                           "sid=Root Admin-1", "sid=bogus"):
+                with self.subTest(cookie=cookie):
+                    code, body = call("/admin", cookie=cookie)
+                    self.assertEqual(code, 403)
+                    self.assertNotIn("98765", body)
+
+        def test_admin(self):
+            code, body = call("/admin", cookie="sid=" + m.start_session("Root Admin"))
+            self.assertEqual(code, 200)
+            self.assertIn("98765", body); self.assertIn("51234", body)
+
+    class Sessions(unittest.TestCase):
+        def test_unguessable(self):
+            a, b = m.start_session("Dan Brown"), m.start_session("Dan Brown")
+            self.assertNotEqual(a, b)
+            for sid in (a, b):
+                self.assertGreaterEqual(len(sid), 32)
+                self.assertNotIn("Dan Brown", sid)
+                self.assertEqual(m.SESSIONS[sid], "Dan Brown")
+
+    unittest.main()
+    PY
+    out=$(cd "$d/app" && PYTHONPATH="$d/app" timeout 60 python3 -B "$d/t.py" 2>&1); rc=$?
+    rm -rf "$d"; [ "$rc" -ne 0 ] && echo "$out" | tail -25
+    check "hidden tests pass" '[ "$rc" -eq 0 ]'
+  solve: |
+    cat > /lab/intranet.py <<'PY'
+    """The intranet: a small WSGI app. `python3 intranet.py` serves it on port 8000."""
+    import html
+    import os
+    import secrets
+    import sqlite3
+    from http.cookies import SimpleCookie
+    from pathlib import Path
+    from urllib.parse import parse_qs
+
+    HERE = os.path.dirname(os.path.abspath(__file__))
+    DOCS = os.path.join(HERE, "docs")
+    DB = os.path.join(HERE, "intranet.db")
+    SESSIONS = {}  # session id -> employee name
+
+
+    def start_session(user):
+        """Called by the single sign-on callback; returns the value of the sid cookie."""
+        sid = secrets.token_urlsafe(32)
+        SESSIONS[sid] = user
+        return sid
+
+
+    def query(sql, args=()):
+        conn = sqlite3.connect(DB)
+        try:
+            return conn.execute(sql, args).fetchall()
+        finally:
+            conn.close()
+
+
+    def search(env, params):
+        q = params.get("q", [""])[0]
+        rows = query("SELECT name FROM employees WHERE name LIKE ? ORDER BY name", ("%" + q + "%",))
+        if not rows:
+            return "200 OK", "<p>No results for %s</p>" % html.escape(q)
+        return "200 OK", "<ul>" + "".join("<li>%s</li>" % html.escape(r[0]) for r in rows) + "</ul>"
+
+
+    def files(env, params):
+        name = params.get("name", [""])[0]
+        base = Path(DOCS).resolve()
+        path = (base / name).resolve()
+        if not path.is_relative_to(base) or not path.is_file():
+            return "404 Not Found", "no such document"
+        return "200 OK", path.read_text()
+
+
+    def admin(env, params):
+        cookie = SimpleCookie(env.get("HTTP_COOKIE", ""))
+        user = SESSIONS.get(cookie["sid"].value) if "sid" in cookie else None
+        rows = query("SELECT role FROM employees WHERE name = ?", (user,)) if user else []
+        if not rows or rows[0][0] != "admin":
+            return "403 Forbidden", "admins only"
+        rows = query("SELECT e.name, s.amount FROM salaries s JOIN employees e ON e.id = s.employee_id ORDER BY e.name")
+        return "200 OK", "<table>" + "".join(
+            "<tr><td>%s</td><td>%d</td></tr>" % (html.escape(n), a) for n, a in rows) + "</table>"
+
+
+    ROUTES = {"/search": search, "/files": files, "/admin": admin}
+
+
+    def app(env, start_response):
+        handler = ROUTES.get(env.get("PATH_INFO", "/"))
+        if handler is None:
+            status, body = "404 Not Found", "not found"
+        else:
+            status, body = handler(env, parse_qs(env.get("QUERY_STRING", "")))
+        ctype = "text/plain" if handler is files else "text/html"
+        start_response(status, [("Content-Type", ctype + "; charset=utf-8")])
+        return [body.encode()]
+
+
+    if __name__ == "__main__":
+        from wsgiref.simple_server import make_server
+        make_server("127.0.0.1", 8000, app).serve_forever()
+    PY
+
+- id: prog-080
+  title: "Security review: the invoices API"
+  difficulty: 5
+  kind: fix
+  tags: [go, net/http, idor, cors, open-redirect, mass-assignment, incident]
+  tutorial: |
+    **Concept.** The most common API flaws aren't clever. They are missing
+    decisions. **IDOR** (insecure direct object reference): the handler
+    checks *who you are* but not *whether this object is yours*. **Mass
+    assignment**: decoding a request straight into the stored struct lets
+    the client set fields it should never touch, like `role`. **CORS
+    reflection**: echoing any `Origin` back with
+    `Access-Control-Allow-Credentials: true` lets every website read your
+    users' data. **Open redirect**: a `?next=` parameter that sends the
+    browser anywhere makes your domain a phishing tool.
+
+    **Read up on:**
+    - OWASP API Security Top 10: API1 (BOLA), API3 (property level authorization)
+    - MDN: "Cross-Origin Resource Sharing (CORS)", the `Vary` header
+    - OWASP: "Unvalidated Redirects and Forwards Cheat Sheet"
+    - `json.Decoder.DisallowUnknownFields`, `http.Redirect`
+  scenario: |
+    **`/lab/api.go`** is the invoices API (`NewApp(store) http.Handler`;
+    clients send `Authorization: Bearer <token>`). The pentest found:
+
+    1. **`GET /api/invoices/{id}`** returns *any* invoice to any logged-in
+       user. A user may read only invoices whose `Owner` is their `Name`.
+       Users with role `admin` may read all. Other people's invoices answer
+       **404**, exactly like missing ones.
+    2. **`PATCH /api/me`** with `{"role":"admin"}` makes you an admin, and
+       `{"name":"bob"}` makes you bob. Only **`display_name`** may change.
+       A body with any other field, or without `display_name`, or that isn't
+       valid JSON, answers **400** and changes **nothing**.
+    3. **CORS** echoes every `Origin` with credentials allowed. Only
+       **`AppOrigin`** (`https://app.example.com`, exactly) may get
+       `Access-Control-Allow-Origin` (and `Access-Control-Allow-Credentials:
+       true`). Other origins get neither header. Every response carries
+       **`Vary: Origin`**.
+    4. **`GET /logout?next=`** redirects anywhere. Keep the 303, but
+       redirect to `next` only if it is a **local path**: it starts with
+       `/`, its second character is neither `/` nor `\`, and it has no
+       control characters. Otherwise redirect to **`/`**.
+
+    Keep the types, the routes and the 401 for missing or unknown tokens.
+  hints:
+    - "1: after loading the invoice, `if !ok || (inv.Owner != u.Name && u.Role != \"admin\")` → 404."
+    - "2: decode into a separate struct with a single field, `DisplayName *string` tagged `json:\"display_name\"`, after `dec.DisallowUnknownFields()`; copy it into `u` only when everything succeeded."
+    - "3: `w.Header().Add(\"Vary\", \"Origin\")`; set the two CORS headers only when `r.Header.Get(\"Origin\") == AppOrigin`."
+    - "4: `strings.HasPrefix(next, \"/\") && !strings.HasPrefix(next, \"//\") && !strings.HasPrefix(next, \"/\\\\\")`, plus a loop that rejects bytes below 0x20 and 0x7f."
+  solution: |
+    ```go
+    func cors(next http.Handler) http.Handler {
+        return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+            w.Header().Add("Vary", "Origin")
+            if r.Header.Get("Origin") == AppOrigin {
+                w.Header().Set("Access-Control-Allow-Origin", AppOrigin)
+                w.Header().Set("Access-Control-Allow-Credentials", "true")
+            }
+            next.ServeHTTP(w, r)
+        })
+    }
+
+    // in patchMe
+    var in struct {
+        DisplayName *string `json:"display_name"`
+    }
+    dec := json.NewDecoder(r.Body)
+    dec.DisallowUnknownFields()
+    if err := dec.Decode(&in); err != nil || in.DisplayName == nil {
+        http.Error(w, "only display_name can be changed", http.StatusBadRequest)
+        return
+    }
+    u.DisplayName = *in.DisplayName
+
+    // in getInvoice
+    if !ok || (inv.Owner != u.Name && u.Role != "admin") {
+        http.Error(w, "not found", http.StatusNotFound)
+        return
+    }
+
+    func localPath(next string) bool {
+        if !strings.HasPrefix(next, "/") || strings.HasPrefix(next, "//") || strings.HasPrefix(next, "/\\") {
+            return false
+        }
+        for i := 0; i < len(next); i++ {
+            if next[i] < 0x20 || next[i] == 0x7f {
+                return false
+            }
+        }
+        return true
+    }
+    ```
+  setup: |
+    lab_file /lab/api.go <<'EOF'
+    package main
+
+    import (
+        "encoding/json"
+        "net/http"
+        "strconv"
+        "strings"
+        "sync"
+    )
+
+    // AppOrigin is where the single-page front end is served from.
+    const AppOrigin = "https://app.example.com"
+
+    type User struct {
+        Name        string `json:"name"`
+        DisplayName string `json:"display_name"`
+        Role        string `json:"role"` // "staff" or "admin"
+    }
+
+    type Invoice struct {
+        ID     int    `json:"id"`
+        Owner  string `json:"owner"`
+        Amount int    `json:"amount"`
+    }
+
+    type Store struct {
+        mu       sync.Mutex
+        Tokens   map[string]string // bearer token -> user name
+        Users    map[string]*User  // user name -> user
+        Invoices map[int]Invoice
+    }
+
+    func NewApp(s *Store) http.Handler {
+        mux := http.NewServeMux()
+        mux.HandleFunc("GET /api/me", s.getMe)
+        mux.HandleFunc("PATCH /api/me", s.patchMe)
+        mux.HandleFunc("GET /api/invoices/{id}", s.getInvoice)
+        mux.HandleFunc("GET /logout", logout)
+        return cors(mux)
+    }
+
+    // cors lets the front end call the API with the user's credentials.
+    func cors(next http.Handler) http.Handler {
+        return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+            if origin := r.Header.Get("Origin"); origin != "" {
+                w.Header().Set("Access-Control-Allow-Origin", origin)
+                w.Header().Set("Access-Control-Allow-Credentials", "true")
+            }
+            next.ServeHTTP(w, r)
+        })
+    }
+
+    // user returns the caller, or nil. Call it with s.mu held.
+    func (s *Store) user(r *http.Request) *User {
+        tok, ok := strings.CutPrefix(r.Header.Get("Authorization"), "Bearer ")
+        if !ok {
+            return nil
+        }
+        return s.Users[s.Tokens[tok]]
+    }
+
+    func writeJSON(w http.ResponseWriter, v any) {
+        w.Header().Set("Content-Type", "application/json")
+        json.NewEncoder(w).Encode(v)
+    }
+
+    func (s *Store) getMe(w http.ResponseWriter, r *http.Request) {
+        s.mu.Lock()
+        defer s.mu.Unlock()
+        u := s.user(r)
+        if u == nil {
+            http.Error(w, "unauthorized", http.StatusUnauthorized)
+            return
+        }
+        writeJSON(w, u)
+    }
+
+    func (s *Store) patchMe(w http.ResponseWriter, r *http.Request) {
+        s.mu.Lock()
+        defer s.mu.Unlock()
+        u := s.user(r)
+        if u == nil {
+            http.Error(w, "unauthorized", http.StatusUnauthorized)
+            return
+        }
+        if err := json.NewDecoder(r.Body).Decode(u); err != nil {
+            http.Error(w, "bad json", http.StatusBadRequest)
+            return
+        }
+        writeJSON(w, u)
+    }
+
+    func (s *Store) getInvoice(w http.ResponseWriter, r *http.Request) {
+        s.mu.Lock()
+        defer s.mu.Unlock()
+        u := s.user(r)
+        if u == nil {
+            http.Error(w, "unauthorized", http.StatusUnauthorized)
+            return
+        }
+        id, err := strconv.Atoi(r.PathValue("id"))
+        if err != nil {
+            http.Error(w, "bad id", http.StatusBadRequest)
+            return
+        }
+        inv, ok := s.Invoices[id]
+        if !ok {
+            http.Error(w, "not found", http.StatusNotFound)
+            return
+        }
+        writeJSON(w, inv)
+    }
+
+    // logout ends the session and sends the browser back where it came from.
+    func logout(w http.ResponseWriter, r *http.Request) {
+        http.SetCookie(w, &http.Cookie{Name: "session", Value: "", Path: "/", MaxAge: -1})
+        next := r.URL.Query().Get("next")
+        if next == "" {
+            next = "/"
+        }
+        http.Redirect(w, r, next, http.StatusSeeOther)
+    }
+
+    func main() {}
+    EOF
+  check: |
+    go_test <<'GO'
+    package main
+
+    import (
+        "encoding/json"
+        "net/http"
+        "net/http/httptest"
+        "net/url"
+        "strings"
+        "testing"
+    )
+
+    func store() *Store {
+        return &Store{
+            Tokens: map[string]string{"tok-ana-7f3a": "ana", "tok-bob-91c2": "bob", "tok-root-55e0": "root"},
+            Users: map[string]*User{
+                "ana":  {Name: "ana", DisplayName: "Ana", Role: "staff"},
+                "bob":  {Name: "bob", DisplayName: "Bob", Role: "staff"},
+                "root": {Name: "root", DisplayName: "Root", Role: "admin"},
+            },
+            Invoices: map[int]Invoice{1: {1, "ana", 1200}, 2: {2, "bob", 3400}, 3: {3, "ana", 560}},
+        }
+    }
+
+    func do(h http.Handler, method, target, token, body string, hdr ...string) *httptest.ResponseRecorder {
+        r := httptest.NewRequest(method, target, strings.NewReader(body))
+        if token != "" {
+            r.Header.Set("Authorization", "Bearer "+token)
+        }
+        for i := 0; i+1 < len(hdr); i += 2 {
+            r.Header.Set(hdr[i], hdr[i+1])
+        }
+        w := httptest.NewRecorder()
+        h.ServeHTTP(w, r)
+        return w
+    }
+
+    func TestInvoices(t *testing.T) {
+        h := NewApp(store())
+        cases := []struct {
+            token, path string
+            want        int
+        }{
+            {"tok-ana-7f3a", "/api/invoices/1", 200}, {"tok-ana-7f3a", "/api/invoices/3", 200},
+            {"tok-ana-7f3a", "/api/invoices/2", 404}, {"tok-bob-91c2", "/api/invoices/1", 404},
+            {"tok-bob-91c2", "/api/invoices/2", 200}, {"tok-root-55e0", "/api/invoices/2", 200},
+            {"tok-root-55e0", "/api/invoices/1", 200}, {"tok-ana-7f3a", "/api/invoices/99", 404},
+            {"", "/api/invoices/1", 401}, {"tok-nobody", "/api/invoices/1", 401},
+        }
+        for _, c := range cases {
+            if w := do(h, "GET", c.path, c.token, ""); w.Code != c.want {
+                t.Errorf("%s as %q: %d, want %d", c.path, c.token, w.Code, c.want)
+            } else if c.want == 404 && strings.Contains(w.Body.String(), "3400") {
+                t.Errorf("%s as %q leaked the invoice", c.path, c.token)
+            }
+        }
+        if w := do(h, "GET", "/api/invoices/2", "tok-bob-91c2", ""); !strings.Contains(w.Body.String(), `"amount":3400`) {
+            t.Errorf("bob's invoice: %s", w.Body.String())
+        }
+    }
+
+    func me(t *testing.T, h http.Handler, token string) User {
+        var u User
+        w := do(h, "GET", "/api/me", token, "")
+        if w.Code != 200 || json.Unmarshal(w.Body.Bytes(), &u) != nil {
+            t.Fatalf("GET /api/me: %d %s", w.Code, w.Body.String())
+        }
+        return u
+    }
+
+    func TestPatchMe(t *testing.T) {
+        s := store()
+        h := NewApp(s)
+        for _, body := range []string{`{"role":"admin"}`, `{"display_name":"X","role":"admin"}`,
+            `{"name":"bob"}`, `{"display_name":"Y","name":"bob"}`, `{}`, `{"display_name":`, `[1]`} {
+            if w := do(h, "PATCH", "/api/me", "tok-ana-7f3a", body); w.Code != 400 {
+                t.Errorf("PATCH %s: %d, want 400", body, w.Code)
+            }
+        }
+        if u := me(t, h, "tok-ana-7f3a"); u != (User{"ana", "Ana", "staff"}) {
+            t.Fatalf("a rejected PATCH changed the user: %+v", u)
+        }
+        if w := do(h, "PATCH", "/api/me", "tok-ana-7f3a", `{"display_name":"Ana L."}`); w.Code != 200 {
+            t.Fatalf("PATCH display_name: %d", w.Code)
+        }
+        if u := me(t, h, "tok-ana-7f3a"); u != (User{"ana", "Ana L.", "staff"}) {
+            t.Fatalf("after PATCH: %+v", u)
+        }
+        if w := do(h, "GET", "/api/invoices/2", "tok-ana-7f3a", ""); w.Code != 404 {
+            t.Fatalf("ana reads bob's invoice after the PATCHes: %d", w.Code)
+        }
+        if w := do(h, "PATCH", "/api/me", "", `{"display_name":"Z"}`); w.Code != 401 {
+            t.Fatalf("PATCH without a token: %d", w.Code)
+        }
+    }
+
+    func TestCORS(t *testing.T) {
+        h := NewApp(store())
+        w := do(h, "GET", "/api/me", "tok-ana-7f3a", "", "Origin", "https://app.example.com")
+        if w.Header().Get("Access-Control-Allow-Origin") != "https://app.example.com" ||
+            w.Header().Get("Access-Control-Allow-Credentials") != "true" {
+            t.Errorf("the front end lost CORS: %v", w.Header())
+        }
+        if !strings.Contains(strings.Join(w.Header().Values("Vary"), ","), "Origin") {
+            t.Errorf("no Vary: Origin")
+        }
+        for _, o := range []string{"https://evil.example", "https://app.example.com.evil.example", "null", "http://app.example.com"} {
+            w := do(h, "GET", "/api/me", "tok-ana-7f3a", "", "Origin", o)
+            if w.Header().Get("Access-Control-Allow-Origin") != "" || w.Header().Get("Access-Control-Allow-Credentials") != "" {
+                t.Errorf("origin %q allowed: %v", o, w.Header())
+            }
+            if !strings.Contains(strings.Join(w.Header().Values("Vary"), ","), "Origin") {
+                t.Errorf("origin %q: no Vary: Origin", o)
+            }
+        }
+    }
+
+    func TestLogout(t *testing.T) {
+        h := NewApp(store())
+        cases := map[string]string{
+            "": "/", "/invoices?page=2": "/invoices?page=2", "/": "/",
+            "https://evil.example/x": "/", "//evil.example": "/", "/\\evil.example": "/",
+            "/\t/evil.example": "/", "javascript:alert(1)": "/", "evil.example": "/",
+        }
+        for next, want := range cases {
+            w := do(h, "GET", "/logout?next="+url.QueryEscape(next), "", "")
+            if w.Code != 303 || w.Header().Get("Location") != want {
+                t.Errorf("next=%q: %d Location %q, want 303 %q", next, w.Code, w.Header().Get("Location"), want)
+            }
+        }
+    }
+    GO
+    rc=$?
+    check "hidden tests pass" '[ "$rc" -eq 0 ]'
+  solve: |
+    cat > /lab/api.go <<'GO'
+    package main
+
+    import (
+        "encoding/json"
+        "net/http"
+        "strconv"
+        "strings"
+        "sync"
+    )
+
+    // AppOrigin is where the single-page front end is served from.
+    const AppOrigin = "https://app.example.com"
+
+    type User struct {
+        Name        string `json:"name"`
+        DisplayName string `json:"display_name"`
+        Role        string `json:"role"` // "staff" or "admin"
+    }
+
+    type Invoice struct {
+        ID     int    `json:"id"`
+        Owner  string `json:"owner"`
+        Amount int    `json:"amount"`
+    }
+
+    type Store struct {
+        mu       sync.Mutex
+        Tokens   map[string]string // bearer token -> user name
+        Users    map[string]*User  // user name -> user
+        Invoices map[int]Invoice
+    }
+
+    func NewApp(s *Store) http.Handler {
+        mux := http.NewServeMux()
+        mux.HandleFunc("GET /api/me", s.getMe)
+        mux.HandleFunc("PATCH /api/me", s.patchMe)
+        mux.HandleFunc("GET /api/invoices/{id}", s.getInvoice)
+        mux.HandleFunc("GET /logout", logout)
+        return cors(mux)
+    }
+
+    // cors lets the front end call the API with the user's credentials.
+    func cors(next http.Handler) http.Handler {
+        return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+            w.Header().Add("Vary", "Origin")
+            if r.Header.Get("Origin") == AppOrigin {
+                w.Header().Set("Access-Control-Allow-Origin", AppOrigin)
+                w.Header().Set("Access-Control-Allow-Credentials", "true")
+            }
+            next.ServeHTTP(w, r)
+        })
+    }
+
+    // user returns the caller, or nil. Call it with s.mu held.
+    func (s *Store) user(r *http.Request) *User {
+        tok, ok := strings.CutPrefix(r.Header.Get("Authorization"), "Bearer ")
+        if !ok {
+            return nil
+        }
+        return s.Users[s.Tokens[tok]]
+    }
+
+    func writeJSON(w http.ResponseWriter, v any) {
+        w.Header().Set("Content-Type", "application/json")
+        json.NewEncoder(w).Encode(v)
+    }
+
+    func (s *Store) getMe(w http.ResponseWriter, r *http.Request) {
+        s.mu.Lock()
+        defer s.mu.Unlock()
+        u := s.user(r)
+        if u == nil {
+            http.Error(w, "unauthorized", http.StatusUnauthorized)
+            return
+        }
+        writeJSON(w, u)
+    }
+
+    func (s *Store) patchMe(w http.ResponseWriter, r *http.Request) {
+        s.mu.Lock()
+        defer s.mu.Unlock()
+        u := s.user(r)
+        if u == nil {
+            http.Error(w, "unauthorized", http.StatusUnauthorized)
+            return
+        }
+        var in struct {
+            DisplayName *string `json:"display_name"`
+        }
+        dec := json.NewDecoder(r.Body)
+        dec.DisallowUnknownFields()
+        if err := dec.Decode(&in); err != nil || in.DisplayName == nil {
+            http.Error(w, "only display_name can be changed", http.StatusBadRequest)
+            return
+        }
+        u.DisplayName = *in.DisplayName
+        writeJSON(w, u)
+    }
+
+    func (s *Store) getInvoice(w http.ResponseWriter, r *http.Request) {
+        s.mu.Lock()
+        defer s.mu.Unlock()
+        u := s.user(r)
+        if u == nil {
+            http.Error(w, "unauthorized", http.StatusUnauthorized)
+            return
+        }
+        id, err := strconv.Atoi(r.PathValue("id"))
+        if err != nil {
+            http.Error(w, "bad id", http.StatusBadRequest)
+            return
+        }
+        inv, ok := s.Invoices[id]
+        if !ok || (inv.Owner != u.Name && u.Role != "admin") {
+            http.Error(w, "not found", http.StatusNotFound)
+            return
+        }
+        writeJSON(w, inv)
+    }
+
+    func localPath(next string) bool {
+        if !strings.HasPrefix(next, "/") || strings.HasPrefix(next, "//") || strings.HasPrefix(next, "/\\") {
+            return false
+        }
+        for i := 0; i < len(next); i++ {
+            if next[i] < 0x20 || next[i] == 0x7f {
+                return false
+            }
+        }
+        return true
+    }
+
+    // logout ends the session and sends the browser back where it came from.
+    func logout(w http.ResponseWriter, r *http.Request) {
+        http.SetCookie(w, &http.Cookie{Name: "session", Value: "", Path: "/", MaxAge: -1})
+        next := r.URL.Query().Get("next")
+        if !localPath(next) {
+            next = "/"
+        }
+        http.Redirect(w, r, next, http.StatusSeeOther)
+    }
+
+    func main() {}
+    GO

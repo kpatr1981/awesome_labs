@@ -1,0 +1,1751 @@
+track: linux
+module: Security & hardening
+profile: docker
+order: 9
+exercises:
+
+- id: linux-080
+  title: Files anyone can write, files nobody owns
+  difficulty: 1
+  kind: fix
+  tags: [permissions, find, world-writable, nouser, audit]
+  tutorial: |
+    **Concept.** Two findings come up in every permissions audit. **World-writable**
+    files and directories (the `w` in the "other" triplet) let any local user tamper
+    with them. Shared scratch directories are the exception: they carry the **sticky
+    bit** (`1777`, like `/tmp`) so users can't delete each other's files. **Orphaned**
+    files belong to a UID or GID that no longer exists. If a new account later gets that
+    number, it inherits them. `find` finds both: `-perm -0002` matches "other can write",
+    and `-nouser` / `-nogroup` match unknown owners.
+
+    **Read up on:**
+    - `man find`: `-perm -MODE`, `-nouser`, `-nogroup`, `-type l`, `-exec ... {} +`
+    - `chmod o-w` (remove one bit, keep the rest)
+    - `chown -h` and symbolic links
+  scenario: |
+    An audit of **`/srv/kl-app`** (the application tree of the `kl-app` user) found
+    problems. Fix them **without changing any other permission bits**:
+
+    - Nothing under `/srv/kl-app` (files or directories, at any depth) may be
+      **writable by others**. The one exception is the shared scratch directory
+      **`/srv/kl-app/tmp`** itself, which must stay **`1777`**.
+    - Every file or directory whose **owner or group no longer exists** must
+      belong to **`kl-app:kl-app`**.
+
+    Symbolic links don't count. Their permissions are always `777`.
+  hints:
+    - "`sudo find /srv/kl-app ! -type l -perm -0002 -ls` lists the world-writable entries."
+    - "Leave `/srv/kl-app/tmp` itself out with `! -path /srv/kl-app/tmp`, and fix the rest with `-exec chmod o-w {} +`."
+    - "`sudo find /srv/kl-app \\( -nouser -o -nogroup \\) -ls` lists the orphans. `chown -h kl-app:kl-app` fixes them."
+  solution: |
+    ```bash
+    sudo find /srv/kl-app ! -type l -perm -0002 -ls
+    sudo find /srv/kl-app ! -type l -perm -0002 ! -path /srv/kl-app/tmp -exec chmod o-w {} +
+    sudo find /srv/kl-app \( -nouser -o -nogroup \) -ls
+    sudo find /srv/kl-app \( -nouser -o -nogroup \) -exec chown -h kl-app:kl-app {} +
+    ```
+  setup: |
+    on_reset 'rm -rf /srv/kl-app; userdel kl-app 2>/dev/null; groupdel kl-app 2>/dev/null; true'
+    rm -rf /srv/kl-app
+    getent group kl-app >/dev/null || groupadd -r kl-app
+    id kl-app >/dev/null 2>&1 || useradd -r -g kl-app -M -d /srv/kl-app -s /usr/sbin/nologin kl-app
+    d=/srv/kl-app
+    mkdir -p $d/bin $d/conf $d/data/2026 $d/uploads/avatars $d/tmp
+    for f in start stop rotate; do printf '#!/bin/sh\necho %s\n' $f > $d/bin/$f.sh; chmod 755 $d/bin/$f.sh; done
+    printf 'listen=8080\nworkers=4\n' > $d/conf/app.conf; chmod 644 $d/conf/app.conf
+    printf 'db_password=Db-%s\n' $RANDOM > $d/conf/db.conf; chmod 640 $d/conf/db.conf
+    for m in jan feb mar apr; do echo "id,total" > $d/data/2026/$m.csv; done; chmod 644 $d/data/2026/*.csv
+    for i in 1 2 3; do head -c 500 /dev/urandom > $d/uploads/avatars/u$i.png; done; chmod 644 $d/uploads/avatars/*
+    echo lock > $d/tmp/session.lock
+    ln -s app.conf $d/conf/current.conf
+    chown -R kl-app:kl-app $d; chown -h kl-app:kl-app $d/conf/current.conf
+    chmod 755 $d $d/bin $d/conf $d/data $d/data/2026 $d/uploads $d/uploads/avatars
+    chmod 1777 $d/tmp
+    # the findings: some world-writable entries...
+    chmod 777 $d/uploads; chmod 666 $d/tmp/session.lock
+    files=(bin/start.sh bin/stop.sh bin/rotate.sh conf/app.conf conf/db.conf data/2026/jan.csv data/2026/feb.csv data/2026/mar.csv data/2026/apr.csv uploads/avatars/u1.png uploads/avatars/u2.png uploads/avatars/u3.png)
+    mapfile -t pick < <(printf '%s\n' "${files[@]}" | shuf -n 4)
+    chmod o+w $d/${pick[0]} $d/${pick[1]}
+    # ...and some owned by an account that is gone
+    u=40000; while getent passwd $u >/dev/null || getent group $u >/dev/null; do u=$((u + 1)); done
+    chown $u:$u $d/${pick[2]} $d/data/2026
+    chown kl-app:$u $d/${pick[3]}
+    # what every mode must be at the end: the same, minus "other can write" (tmp keeps 1777)
+    find $d ! -type l -printf '%p %m\n' | while read -r p m; do
+      if [ "$p" = $d/tmp ]; then echo "$p $m"; else printf '%s %o\n' "$p" $(( 8#$m & ~2 )); fi
+    done | sort > "$KL_STATE/modes"
+  check: |
+    d=/srv/kl-app
+    check_eq "entries others can write (besides tmp itself)" "$(find $d ! -type l -perm -0002 ! -path $d/tmp | wc -l)" 0
+    check_eq "entries with an unknown owner or group" "$(find $d \( -nouser -o -nogroup \) | wc -l)" 0
+    check_eq "entries not owned by kl-app:kl-app" "$(find $d ! -type l \( ! -user kl-app -o ! -group kl-app \) | wc -l)" 0
+    check_eq "tmp is still a sticky shared directory" "$(stat -c %a $d/tmp 2>/dev/null)" 1777
+    bad=$(find $d ! -type l -printf '%p %m\n' | sort | diff - "$KL_STATE/modes" | grep -c '^>')
+    check_eq "entries whose other permission bits changed (or that are gone)" "$bad" 0
+  solve: |
+    sudo find /srv/kl-app ! -type l -perm -0002 ! -path /srv/kl-app/tmp -exec chmod o-w {} +
+    sudo find /srv/kl-app \( -nouser -o -nogroup \) -exec chown -h kl-app:kl-app {} +
+
+- id: linux-081
+  title: Reports the whole host can read
+  difficulty: 2
+  kind: fix
+  tags: [umask, systemd, drop-in, permissions]
+  tutorial: |
+    **Concept.** A program usually creates files with mode `0666` (or `0777` for
+    directories), and the process's **umask** removes bits from that. With the common
+    umask `0022` new files come out `0644`, readable by everyone. systemd starts each
+    service with **`UMask=0022`** unless the unit says otherwise. `UMask=0027` removes
+    write for the group and everything for others, so files come out `0640`. A umask
+    only affects **new** files. Existing ones keep their mode until you `chmod` them.
+
+    **Read up on:**
+    - `man systemd.exec`: `UMask=`
+    - `umask` in the shell, and how it combines with the requested mode
+    - `systemctl show -p UMask UNIT`
+  scenario: |
+    **`kl-reports.service`** (a oneshot that runs as `kl-reports`) writes revenue reports to
+    **`/var/lib/kl-reports/`**. Every report comes out world-readable.
+
+    - Make the service create its reports with mode **`0640`** (owner read/write,
+      group read, nothing for others). Do it with a **drop-in** for
+      `kl-reports.service`. Don't change the unit file or the script
+      `/usr/local/bin/kl-reports`.
+    - The reports **already there** must get mode `0640` too.
+  hints:
+    - "`ls -l /var/lib/kl-reports` and `systemctl show -p UMask kl-reports`."
+    - "Which umask turns 0666 into 0640? Put it in `[Service]` as `UMask=` in `/etc/systemd/system/kl-reports.service.d/umask.conf`."
+    - "`sudo systemctl daemon-reload`, `sudo systemctl start kl-reports`, then `sudo chmod 640` the old reports."
+  solution: |
+    ```bash
+    sudo mkdir -p /etc/systemd/system/kl-reports.service.d
+    printf '[Service]\nUMask=0027\n' | sudo tee /etc/systemd/system/kl-reports.service.d/umask.conf
+    sudo systemctl daemon-reload
+    sudo chmod 640 /var/lib/kl-reports/*.csv
+    sudo systemctl start kl-reports
+    ls -l /var/lib/kl-reports
+    ```
+  setup: |
+    on_reset 'rm -rf /etc/systemd/system/kl-reports.service /etc/systemd/system/kl-reports.service.d /usr/local/bin/kl-reports /var/lib/kl-reports; systemctl daemon-reload; systemctl reset-failed kl-reports 2>/dev/null; userdel kl-reports 2>/dev/null; groupdel kl-reports 2>/dev/null; true'
+    getent group kl-reports >/dev/null || groupadd -r kl-reports
+    id kl-reports >/dev/null 2>&1 || useradd -r -g kl-reports -M -s /usr/sbin/nologin kl-reports
+    rm -rf /var/lib/kl-reports /etc/systemd/system/kl-reports.service.d
+    install -d -o kl-reports -g kl-reports -m 0755 /var/lib/kl-reports
+    cat > /usr/local/bin/kl-reports <<'EOF'
+    #!/bin/sh
+    # write the current revenue report
+    f=/var/lib/kl-reports/revenue-$(date +%Y%m%d-%H%M%S)-$$.csv
+    echo "region,revenue" > "$f"
+    for r in north south east west; do
+      echo "$r,$(od -An -N2 -tu2 /dev/urandom | tr -d ' ')" >> "$f"
+    done
+    EOF
+    chmod 755 /usr/local/bin/kl-reports
+    cat > /etc/systemd/system/kl-reports.service <<'EOF'
+    [Unit]
+    Description=Lab revenue reports
+
+    [Service]
+    Type=oneshot
+    User=kl-reports
+    ExecStart=/usr/local/bin/kl-reports
+    EOF
+    sha1sum /etc/systemd/system/kl-reports.service /usr/local/bin/kl-reports > "$KL_STATE/sums"
+    systemctl daemon-reload
+    for i in 1 2 3; do systemctl start kl-reports; done
+    ls /var/lib/kl-reports > "$KL_STATE/old"
+  check: |
+    d=/var/lib/kl-reports
+    check "the unit file and the script are unchanged" 'sha1sum -c --status "$KL_STATE/sums"'
+    check "a drop-in exists" 'ls /etc/systemd/system/kl-reports.service.d/*.conf'
+    bad=0; for f in $(cat "$KL_STATE/old"); do [ "$(stat -c %a $d/$f 2>/dev/null)" = 640 ] || bad=$((bad + 1)); done
+    check_eq "existing reports that are not 0640" "$bad" 0
+    before=$(ls $d)
+    systemctl start kl-reports >/dev/null 2>&1
+    new=$(comm -13 <(echo "$before") <(ls $d) | head -1)
+    check "a run writes a new report" '[ -n "$new" ]'
+    check_eq "the new report's mode" "$(stat -c %a "$d/$new" 2>/dev/null)" 640
+    check_eq "the new report's owner" "$(stat -c %U:%G "$d/$new" 2>/dev/null)" kl-reports:kl-reports
+    check_not "other users can't read it" 'sudo -u nobody cat "$d/$new"'
+  solve: |
+    sudo mkdir -p /etc/systemd/system/kl-reports.service.d
+    printf '[Service]\nUMask=0027\n' | sudo tee /etc/systemd/system/kl-reports.service.d/umask.conf >/dev/null
+    sudo systemctl daemon-reload
+    sudo chmod 640 /var/lib/kl-reports/*.csv
+
+- id: linux-082
+  title: Let the on-call engineers restart one service
+  difficulty: 2
+  kind: build
+  tags: [sudo, sudoers, visudo, least-privilege]
+  tutorial: |
+    **Concept.** `sudo` reads its rules from `/etc/sudoers` and every file in
+    `/etc/sudoers.d/`. A rule reads **who where = (as whom) what**, for example
+    `%ops ALL=(root) NOPASSWD: /usr/bin/systemctl restart web.service`. A `%` marks a
+    group. A command listed **with arguments** allows exactly those arguments and no
+    others. Write sudoers files with **`visudo`** (`visudo -f FILE` checks the syntax
+    before saving, `visudo -cf FILE` checks a file). A broken file makes sudo refuse to
+    work for everyone. Drop-in files should be mode `0440`, owned by root.
+
+    **Read up on:**
+    - `man sudoers`: user specifications, `Cmnd_List`, `NOPASSWD`, `%group`
+    - `visudo -f`, `visudo -c`
+    - `sudo -l`, `sudo -l -U USER`, `sudo -l COMMAND`
+  scenario: |
+    The members of the group **`kl-oncall`** (today only `dana`) must be able to
+    handle **`kl-api.service`** at night without a root password. Create
+    **`/etc/sudoers.d/kl-oncall`** (owner `root:root`, mode **`0440`**) so that members of
+    `kl-oncall`, **and only they**, can run, as root and **without a password**,
+    exactly:
+
+    - `systemctl restart kl-api.service`
+    - `systemctl status kl-api.service`
+
+    Nothing else: not `systemctl stop`, not other services, not a shell. The rule must
+    work for anyone added to the group later (so grant it to the group, not to `dana`).
+
+    **Careful:** a syntax error in `/etc/sudoers.d` disables `sudo`, and this lab needs
+    `sudo`. Edit with `sudo visudo -f /etc/sudoers.d/kl-oncall`, which checks the syntax
+    before it saves.
+  hints:
+    - "The rule starts with `%kl-oncall ALL=(root) NOPASSWD:`."
+    - "Give full paths (`/usr/bin/systemctl`) and list both commands with their arguments, separated by a comma."
+    - "Test it: `sudo -l -U dana`, then `sudo -u dana sudo -n systemctl restart kl-api.service`."
+  solution: |
+    ```bash
+    sudo visudo -f /etc/sudoers.d/kl-oncall
+    # %kl-oncall ALL=(root) NOPASSWD: /usr/bin/systemctl restart kl-api.service, /usr/bin/systemctl status kl-api.service
+    sudo chmod 0440 /etc/sudoers.d/kl-oncall
+    sudo visudo -cf /etc/sudoers.d/kl-oncall
+    sudo -l -U dana
+    sudo -u dana sudo -n systemctl restart kl-api.service
+    ```
+  setup: |
+    on_reset 'rm -f /etc/sudoers.d/kl-oncall; systemctl stop kl-api 2>/dev/null; rm -f /etc/systemd/system/kl-api.service; systemctl daemon-reload; systemctl reset-failed kl-api 2>/dev/null; for u in dana erin kl-fred; do userdel -r $u 2>/dev/null; done; groupdel kl-oncall 2>/dev/null; true'
+    rm -f /etc/sudoers.d/kl-oncall
+    groupadd -f kl-oncall
+    for u in dana erin; do id $u >/dev/null 2>&1 || useradd -m -s /bin/bash $u; done
+    usermod -aG kl-oncall dana
+    cat > /etc/systemd/system/kl-api.service <<'EOF'
+    [Unit]
+    Description=Lab API
+
+    [Service]
+    ExecStart=/bin/sh -c 'while :; do sleep 5; done'
+    EOF
+    systemctl daemon-reload
+    systemctl start kl-api
+  check: |
+    f=/etc/sudoers.d/kl-oncall
+    check "the file exists" '[ -f $f ]'
+    check_eq "owner and mode" "$(stat -c '%U:%G %a' $f 2>/dev/null)" "root:root 440"
+    check "visudo accepts it" 'visudo -cqf $f'
+    before=$(systemctl show -p MainPID --value kl-api)
+    check "dana can restart kl-api without a password" 'timeout 20 sudo -u dana sudo -n systemctl restart kl-api.service'
+    check "kl-api really restarted" '[ "$(systemctl show -p MainPID --value kl-api)" != "$before" ] && systemctl is-active -q kl-api'
+    check "dana can read its status" 'timeout 20 sudo -u dana sudo -n systemctl status kl-api.service'
+    check_not "dana can't stop it" 'sudo -u dana sudo -n -l systemctl stop kl-api.service'
+    check_not "dana can't restart other services" 'sudo -u dana sudo -n -l systemctl restart cron.service'
+    check_not "dana can't get a shell" 'sudo -u dana sudo -n -l /bin/bash'
+    check_not "erin (not on call) can't restart it" 'sudo -u erin sudo -n -l systemctl restart kl-api.service'
+    id kl-fred >/dev/null 2>&1 || useradd -M -s /bin/bash -G kl-oncall kl-fred
+    check "a new member of kl-oncall gets the same right" 'sudo -u kl-fred sudo -n -l systemctl restart kl-api.service'
+    userdel kl-fred 2>/dev/null
+  solve: |
+    t=$(mktemp)
+    echo '%kl-oncall ALL=(root) NOPASSWD: /usr/bin/systemctl restart kl-api.service, /usr/bin/systemctl status kl-api.service' > "$t"
+    sudo visudo -cqf "$t"
+    sudo install -m 0440 -o root -g root "$t" /etc/sudoers.d/kl-oncall
+    rm -f "$t"
+
+- id: linux-083
+  title: Put the notes service in a sandbox
+  difficulty: 3
+  kind: build
+  tags: [systemd, sandboxing, protectsystem, privatetmp, hardening]
+  tutorial: |
+    **Concept.** systemd can confine a service with mount namespaces and kernel flags,
+    without changing the program:
+
+    - **`ProtectSystem=strict`** mounts the whole filesystem read-only for the service,
+      apart from `/dev`, `/proc` and `/sys`.
+    - **`ReadWritePaths=`** opens up the paths the service really has to write.
+    - **`ProtectHome=yes`** makes `/home`, `/root` and `/run/user` empty and
+      inaccessible.
+    - **`PrivateTmp=yes`** gives the service its own `/tmp` and `/var/tmp`.
+    - **`NoNewPrivileges=yes`** makes sure setuid binaries and file capabilities can
+      never raise its privileges.
+
+    You can see the result from outside: `nsenter -t PID -m` enters the service's mount
+    namespace, and `/proc/PID/status` shows `NoNewPrivs`.
+
+    **Read up on:**
+    - `man systemd.exec`: the "Sandboxing" section
+    - `systemd-analyze security UNIT`
+    - `nsenter -t PID -m`
+  scenario: |
+    **`kl-notes.service`** runs as root. All it needs is to write its state to
+    **`/var/lib/kl-notes`** (it updates `/var/lib/kl-notes/heartbeat` every second).
+    Confine it with a **drop-in** (don't edit `/etc/systemd/system/kl-notes.service`):
+
+    - the whole filesystem is **read-only** for it (`ProtectSystem=strict`), except
+      **`/var/lib/kl-notes`**, which it can still write
+    - it can't see the users' home directories
+    - it gets a **private `/tmp`**
+    - it can **never gain new privileges**
+
+    The service must be running and updating its heartbeat when you're done.
+  hints:
+    - "`systemd-analyze security kl-notes` lists what is not restricted yet."
+    - "Put `ProtectSystem=strict`, `ReadWritePaths=/var/lib/kl-notes`, `ProtectHome=yes`, `PrivateTmp=yes` and `NoNewPrivileges=yes` under `[Service]` in `/etc/systemd/system/kl-notes.service.d/sandbox.conf`."
+    - "`sudo systemctl daemon-reload && sudo systemctl restart kl-notes`, then `sudo nsenter -t $(systemctl show -p MainPID --value kl-notes) -m touch /etc/x` should fail."
+  solution: |
+    ```bash
+    sudo mkdir -p /etc/systemd/system/kl-notes.service.d
+    sudo tee /etc/systemd/system/kl-notes.service.d/sandbox.conf <<'EOF'
+    [Service]
+    ProtectSystem=strict
+    ReadWritePaths=/var/lib/kl-notes
+    ProtectHome=yes
+    PrivateTmp=yes
+    NoNewPrivileges=yes
+    EOF
+    sudo systemctl daemon-reload
+    sudo systemctl restart kl-notes
+    pid=$(systemctl show -p MainPID --value kl-notes)
+    sudo nsenter -t "$pid" -m touch /etc/probe    # Read-only file system
+    grep NoNewPrivs /proc/$pid/status
+    ```
+  setup: |
+    on_reset 'systemctl stop kl-notes 2>/dev/null; rm -rf /etc/systemd/system/kl-notes.service /etc/systemd/system/kl-notes.service.d /opt/kl-notes /var/lib/kl-notes; systemctl daemon-reload; systemctl reset-failed kl-notes 2>/dev/null; true'
+    rm -rf /etc/systemd/system/kl-notes.service.d
+    mkdir -p /opt/kl-notes /var/lib/kl-notes
+    cat > /opt/kl-notes/notes.py <<'EOF'
+    import time
+    while True:
+        with open("/var/lib/kl-notes/heartbeat", "w") as f:
+            f.write("%d\n" % time.time())
+        time.sleep(1)
+    EOF
+    cat > /etc/systemd/system/kl-notes.service <<'EOF'
+    [Unit]
+    Description=Lab notes service
+
+    [Service]
+    ExecStart=/usr/bin/python3 /opt/kl-notes/notes.py
+
+    [Install]
+    WantedBy=multi-user.target
+    EOF
+    sha1sum /etc/systemd/system/kl-notes.service > "$KL_STATE/unit"
+    systemctl daemon-reload
+    systemctl start kl-notes
+  check: |
+    show() { systemctl show -p "$1" --value kl-notes; }
+    check "the unit file is unchanged" 'sha1sum -c --status "$KL_STATE/unit"'
+    check "a drop-in exists" 'ls /etc/systemd/system/kl-notes.service.d/*.conf'
+    check_eq "ProtectSystem" "$(show ProtectSystem)" strict
+    check "ReadWritePaths includes /var/lib/kl-notes" 'show ReadWritePaths | tr " " "\n" | grep -Eqx -- "-?/var/lib/kl-notes/?"'
+    check_eq "ProtectHome" "$(show ProtectHome)" yes
+    check_eq "PrivateTmp" "$(show PrivateTmp)" yes
+    check_eq "NoNewPrivileges" "$(show NoNewPrivileges)" yes
+    check "kl-notes is running" 'eventually 6 "systemctl is-active -q kl-notes"'
+    pid=$(show MainPID)
+    if [ "${pid:-0}" -gt 0 ]; then
+      check_not "it can't write to /etc" 'nsenter -t $pid -m touch /etc/.kl-notes-probe'
+      rm -f /etc/.kl-notes-probe
+      check "it can write /var/lib/kl-notes" 'nsenter -t $pid -m touch /var/lib/kl-notes/.probe'
+      rm -f /var/lib/kl-notes/.probe
+      check_eq "entries it sees in /home" "$(nsenter -t $pid -m ls -A /home 2>/dev/null | wc -l)" 0
+      check "it has its own /tmp" '[ "$(nsenter -t $pid -m stat -c %d:%i /tmp)" != "$(stat -c %d:%i /tmp)" ]'
+      check "the kernel enforces no-new-privileges" 'grep -Eq "^NoNewPrivs:\s+1" /proc/$pid/status'
+    else
+      fail "the service has no main process to inspect"
+    fi
+    check "the heartbeat is fresh" 'eventually 8 "[ \$(( \$(date +%s) - \$(stat -c %Y /var/lib/kl-notes/heartbeat) )) -le 3 ]"'
+  solve: |
+    sudo mkdir -p /etc/systemd/system/kl-notes.service.d
+    printf '[Service]\nProtectSystem=strict\nReadWritePaths=/var/lib/kl-notes\nProtectHome=yes\nPrivateTmp=yes\nNoNewPrivileges=yes\n' | sudo tee /etc/systemd/system/kl-notes.service.d/sandbox.conf >/dev/null
+    sudo systemctl daemon-reload
+    sudo systemctl restart kl-notes
+
+- id: linux-084
+  title: Which certificates need renewing?
+  difficulty: 3
+  kind: build
+  tags: [openssl, x509, certificates, expiry, der, pem]
+  tutorial: |
+    **Concept.** An X.509 certificate is valid between its `notBefore` and `notAfter`
+    dates. `openssl x509 -noout -enddate` prints the end date, and
+    **`openssl x509 -checkend SECONDS`** returns a failure if the certificate expires
+    within that many seconds (or has already expired). Certificates come in two
+    encodings: **PEM** (base64 between `-----BEGIN CERTIFICATE-----` lines) and binary
+    **DER** (`-inform der`). A PEM file can also hold a **bundle** of several
+    certificates, and `openssl x509` reads only the **first** one.
+
+    **Read up on:**
+    - `openssl x509 -noout -subject -enddate`, `-checkend`, `-inform der`
+    - `openssl storeutl -certs FILE` or `openssl crl2pkcs7 -nocrl -certfile FILE | openssl pkcs7 -print_certs`
+    - Splitting a PEM bundle with `awk` or `csplit`
+  scenario: |
+    **`/etc/kl-certs`** holds the certificates of the internal services, in whatever
+    format each team delivered them. Some are bundles, some are binary DER, and there are
+    a few files that aren't certificates at all.
+
+    Write the **names of the files** (just the file name, e.g. `api.pem`) that contain at
+    least one certificate that has **already expired or expires within the next 30
+    days**, sorted, one per line, into **`/lab/renew.txt`**.
+  hints:
+    - "`openssl x509 -in FILE -noout -enddate` for one PEM file. `file /etc/kl-certs/*` tells you which ones are binary."
+    - "`openssl x509 -checkend 2592000 -noout` fails when the certificate expires within 30 days."
+    - "A bundle needs every certificate checked, not just the first. Split it into one file per `BEGIN CERTIFICATE` block, or use `openssl storeutl -noout -text -certs FILE | grep 'Not After'`."
+  solution: |
+    ```bash
+    cd /etc/kl-certs
+    for f in *; do
+      t=$(mktemp -d)
+      if ! openssl x509 -inform der -in "$f" -out "$t/c1.pem" 2>/dev/null; then
+        # PEM: one file per certificate in the bundle
+        awk -v d="$t" '/^-----BEGIN CERTIFICATE-----$/{n++; p=1} p{print > (d "/c" n ".pem")} /^-----END CERTIFICATE-----$/{p=0}' "$f" 2>/dev/null
+      fi
+      for c in "$t"/c*.pem; do
+        [ -e "$c" ] || continue
+        openssl x509 -in "$c" -noout -checkend 2592000 >/dev/null || { echo "$f"; break; }
+      done
+      rm -rf "$t"
+    done | sort > /lab/renew.txt
+    ```
+  setup: |
+    on_reset 'rm -rf /etc/kl-certs'
+    rm -rf /etc/kl-certs; mkdir -p /etc/kl-certs
+    W=$(mktemp -d)
+    cat > $W/ca.cnf <<EOF
+    [ca]
+    default_ca = d
+    [d]
+    dir = $W
+    database = $W/index.txt
+    new_certs_dir = $W/new
+    serial = $W/serial
+    default_md = sha256
+    policy = p
+    unique_subject = no
+    copy_extensions = copy
+    [p]
+    commonName = supplied
+    EOF
+    mkdir $W/new; : > $W/index.txt; echo 1000 > $W/serial
+    openssl req -x509 -newkey ec -pkeyopt ec_paramgen_curve:P-256 -nodes -keyout $W/ca.key -out $W/ca.pem -subj "/CN=KL Lab CA" -days 3650 >/dev/null 2>&1
+    # issue CN CLASS OUT -> a PEM certificate that has expired (old), expires in 3-20 days (soon) or in 50+ days (fine)
+    issue() {
+      local s e
+      case $2 in
+        old)  s=$((400 + RANDOM % 300)); e=-$((3 + RANDOM % 60)) ;;
+        soon) s=$((300 + RANDOM % 60)); e=$((3 + RANDOM % 18)) ;;
+        fine) s=$((10 + RANDOM % 300)); e=$((50 + RANDOM % 600)) ;;
+      esac
+      openssl req -new -newkey ec -pkeyopt ec_paramgen_curve:P-256 -nodes -keyout $W/k.pem -out $W/r.csr -subj "/CN=$1" -addext "subjectAltName=DNS:$1" >/dev/null 2>&1
+      openssl ca -batch -config $W/ca.cnf -cert $W/ca.pem -keyfile $W/ca.key -in $W/r.csr -out "$3" -notext \
+        -startdate "$(date -u -d "-$s days" +%Y%m%d%H%M%SZ)" -enddate "$(date -u -d "$e days" +%Y%m%d%H%M%SZ)" >/dev/null 2>&1
+    }
+    any() { local c=(old soon fine fine); echo ${c[$((RANDOM % 4))]}; }
+    : > $W/flag
+    mark() { case " $* " in *" old "*|*" soon "*) echo "$FILE" >> $W/flag ;; esac; }
+    c=$(any); FILE=api.pem;  issue api.kl.test $c /etc/kl-certs/api.pem;  mark $c
+    c=$(any); FILE=mail.pem; issue mail.kl.test $c /etc/kl-certs/mail.pem; mark $c
+    c=$(any); FILE=db.pem;   issue db.kl.test $c /etc/kl-certs/db.pem;   mark $c
+    FILE=internal.pem; issue wiki.kl.test fine /etc/kl-certs/internal.pem
+    c=$(any); FILE=ldap.pem; issue ldap.kl.test $c $W/x.pem; mark $c
+    { openssl x509 -in $W/x.pem -noout -subject -issuer -dates; cat $W/x.pem; } > /etc/kl-certs/ldap.pem
+    c=$(any); FILE=vpn.crt;  issue vpn.kl.test $c $W/x.pem; mark $c
+    openssl x509 -in $W/x.pem -outform der -out /etc/kl-certs/vpn.crt
+    FILE=legacy.cer; issue legacy.kl.test soon $W/x.pem; mark soon
+    openssl x509 -in $W/x.pem -outform der -out /etc/kl-certs/legacy.cer
+    # bundles: leaf first, then the issuer. In web the leaf is fine and only the second one is not.
+    c=old; [ $((RANDOM % 2)) = 0 ] && c=soon
+    FILE=bundle-web.pem; issue web.kl.test fine $W/a.pem; issue "KL Web Issuing CA" $c $W/b.pem; mark fine $c
+    cat $W/a.pem $W/b.pem > /etc/kl-certs/bundle-web.pem
+    c1=$(any); c2=$(any)
+    FILE=bundle-git.pem; issue git.kl.test $c1 $W/a.pem; issue "KL Git Issuing CA" $c2 $W/b.pem; mark $c1 $c2
+    cat $W/a.pem $W/b.pem > /etc/kl-certs/bundle-git.pem
+    # not certificates
+    cp $W/k.pem /etc/kl-certs/server.key; chmod 600 /etc/kl-certs/server.key
+    cp $W/r.csr /etc/kl-certs/request.csr
+    chmod 644 /etc/kl-certs/*.pem /etc/kl-certs/*.crt /etc/kl-certs/*.cer /etc/kl-certs/*.csr
+    sort -u $W/flag > "$KL_STATE/answer"
+    rm -rf $W
+  check: |
+    check_eq "files to renew" "$(sed '/^$/d' /lab/renew.txt 2>/dev/null)" "$(cat "$KL_STATE/answer")"
+  solve: |
+    cd /etc/kl-certs
+    for f in *; do
+      t=$(mktemp -d)
+      if ! openssl x509 -inform der -in "$f" -out "$t/c1.pem" 2>/dev/null; then
+        awk -v d="$t" '/^-----BEGIN CERTIFICATE-----$/{n++; p=1} p{print > (d "/c" n ".pem")} /^-----END CERTIFICATE-----$/{p=0}' "$f" 2>/dev/null
+      fi
+      for c in "$t"/c*.pem; do
+        [ -e "$c" ] || continue
+        openssl x509 -in "$c" -noout -checkend 2592000 >/dev/null 2>&1 || { echo "$f"; break; }
+      done
+      rm -rf "$t"
+    done | sort > /lab/renew.txt
+
+- id: linux-085
+  title: Verify the release before you install it
+  difficulty: 3
+  kind: build
+  tags: [gpg, signatures, fingerprint, supply-chain, integrity]
+  tutorial: |
+    **Concept.** A detached signature (`file.asc`) proves that a file is unchanged
+    since someone signed it, but only someone holding **a** key. Anyone can create a key
+    with any name and e-mail address, so "Good signature from Vendor" means nothing
+    until you have checked that the signing key's **fingerprint** is the one the
+    vendor published through a channel you trust. `gpg --verify FILE.asc FILE` checks a
+    signature, and `--status-fd 1` prints machine-readable lines. The
+    `VALIDSIG <fingerprint> ...` line names the exact key that made a good signature.
+
+    **Read up on:**
+    - `gpg --import`, `gpg --list-keys --with-fingerprint`
+    - `gpg --verify SIG FILE`, `--status-fd 1` (`GOODSIG`, `BADSIG`, `VALIDSIG`)
+    - Using a throw-away keyring: `GNUPGHOME=$(mktemp -d)`
+  scenario: |
+    The mirror **`/srv/kl-dl`** carries the releases of `kl-tool` (`kl-tool-*.tar.gz`), a
+    detached signature for each (`.tar.gz.asc`) and the vendor's key file `KEYS.asc`.
+    The vendor's web site publishes its signing key's fingerprint, which you'll find in
+    **`/lab/fingerprint.txt`**. The mirror may have been tampered with.
+
+    Write the **file names of the tarballs that carry a valid signature made by the key
+    with that fingerprint** (e.g. `kl-tool-1.4.0.tar.gz`), sorted, one per line, into
+    **`/lab/verified.txt`**.
+  hints:
+    - "Import the keys, preferably into a throw-away keyring: `export GNUPGHOME=$(mktemp -d); gpg --import /srv/kl-dl/KEYS.asc`. How many keys are in there?"
+    - "`gpg --verify kl-tool-X.tar.gz.asc kl-tool-X.tar.gz` for each one. A *Good signature* isn't enough on its own: which key made it?"
+    - "`gpg --status-fd 1 --verify ... | grep VALIDSIG` gives the full fingerprint. Compare it with the published one, spaces removed."
+  solution: |
+    ```bash
+    export GNUPGHOME=$(mktemp -d)
+    gpg --import /srv/kl-dl/KEYS.asc
+    gpg --list-keys --with-fingerprint       # two keys with the same name
+    fpr=$(tr -d ' \n' < /lab/fingerprint.txt)
+    for t in /srv/kl-dl/*.tar.gz; do
+      [ -f "$t.asc" ] || continue
+      gpg --batch --status-fd 1 --verify "$t.asc" "$t" 2>/dev/null \
+        | grep -q "^\[GNUPG:\] VALIDSIG $fpr " && basename "$t"
+    done | sort > /lab/verified.txt
+    ```
+  setup: |
+    on_reset 'rm -rf /srv/kl-dl'
+    rm -rf /srv/kl-dl; mkdir -p /srv/kl-dl
+    G=$(mktemp -d); chmod 700 $G; export GNUPGHOME=$G
+    for i in 1 2; do
+      gpg --batch --yes --pinentry-mode loopback --passphrase '' --quick-gen-key 'KL Tools Release <release@kl.test>' ed25519 sign never >/dev/null 2>&1
+    done
+    mapfile -t fp < <(gpg --with-colons --list-keys 2>/dev/null | awk -F: '$1 == "fpr" {print $10}')
+    real=${fp[0]} fake=${fp[1]}
+    printf '%s\n' "$real" | sed 's/.\{4\}/& /g; s/ $//' | lab_file /lab/fingerprint.txt
+    gpg --armor --export "$fake" "$real" > /srv/kl-dl/KEYS.asc
+    sign() { gpg --batch --yes --pinentry-mode loopback --passphrase '' -u "$1!" --armor --detach-sign -o "$2.asc" "$2"; }
+    vers=(1.4.0 1.4.1 1.5.0 1.5.1 1.6.0 1.6.1)
+    : > $G/answer
+    i=0
+    for c in $(printf '%s\n' good good good tampered impostor unsigned | shuf); do
+      v=${vers[$i]}; i=$((i + 1)); f=/srv/kl-dl/kl-tool-$v.tar.gz
+      t=$(mktemp -d); mkdir $t/kl-tool-$v
+      echo "$v" > $t/kl-tool-$v/VERSION; head -c 3000 /dev/urandom | base64 > $t/kl-tool-$v/payload.txt
+      tar -C $t -czf $f kl-tool-$v
+      case $c in
+        good | tampered) sign "$real" $f ;;
+        impostor) sign "$fake" $f ;;
+      esac
+      if [ $c = tampered ]; then echo "# patched" >> $t/kl-tool-$v/payload.txt; tar -C $t -czf $f kl-tool-$v; fi
+      [ $c = good ] && basename $f >> $G/answer
+      rm -rf $t
+    done
+    sort $G/answer > "$KL_STATE/answer"
+    gpgconf --kill all 2>/dev/null; unset GNUPGHOME; rm -rf $G
+    chmod 644 /srv/kl-dl/*
+  check: |
+    check_eq "the tarballs with a valid vendor signature" "$(sed '/^$/d' /lab/verified.txt 2>/dev/null)" "$(cat "$KL_STATE/answer")"
+  solve: |
+    export GNUPGHOME=$(mktemp -d); chmod 700 "$GNUPGHOME"
+    gpg --batch --import /srv/kl-dl/KEYS.asc 2>/dev/null
+    fpr=$(tr -d ' \n' < /lab/fingerprint.txt)
+    for t in /srv/kl-dl/*.tar.gz; do
+      [ -f "$t.asc" ] || continue
+      if gpg --batch --status-fd 1 --verify "$t.asc" "$t" 2>/dev/null | grep -q "^\[GNUPG:\] VALIDSIG $fpr "; then basename "$t"; fi
+    done | sort > /lab/verified.txt
+    gpgconf --kill all 2>/dev/null; rm -rf "$GNUPGHOME"
+
+- id: linux-086
+  title: Harden the tooling SSH daemon
+  difficulty: 3
+  kind: build
+  tags: [ssh, sshd, hardening, authentication]
+  tutorial: |
+    **Concept.** `sshd_config` decides **who** may log in and **how**. On a hardened
+    server, password logins are off (`PasswordAuthentication no`, plus
+    `KbdInteractiveAuthentication no`, which PAM would otherwise use to ask for a
+    password), root can't log in directly (`PermitRootLogin no`), only an allow-listed
+    group gets in (`AllowGroups`), and a client gets only a few attempts
+    (`MaxAuthTries`). `sshd -t` checks a configuration, and **`sshd -T`** prints the
+    settings in effect. A running `sshd` re-reads its file on `SIGHUP`
+    (`systemctl reload`). A client shows the methods a server offers in its
+    *Permission denied (...)* message.
+
+    **Read up on:**
+    - `man sshd_config`: `PasswordAuthentication`, `KbdInteractiveAuthentication`, `PermitRootLogin`, `AllowGroups`, `MaxAuthTries`
+    - `sshd -t -f FILE`, `sshd -T -f FILE`
+    - `ssh -o PreferredAuthentications=none HOST` to see the offered methods
+  scenario: |
+    Besides the system SSH server, this host runs a second daemon for internal tooling:
+    **`kl-sshd.service`**, listening on **127.0.0.1:2222**, configured by
+    **`/etc/kl-sshd/sshd_config`**. Harden that file and make the running daemon use it:
+
+    - **no password logins** of any kind (neither `password` nor `keyboard-interactive`)
+    - **root** can't log in
+    - only members of the group **`kl-ssh`** may log in (`kl-dev` is a member,
+      `kl-temp` is not)
+    - at most **3** authentication attempts per connection
+
+    `kl-dev` must still be able to log in with its key. You can try it yourself with the
+    private key in **`/lab/kl_key`**:
+    `ssh -i /lab/kl_key -p 2222 kl-dev@127.0.0.1`. Keep the port and the listening
+    address. Leave the system SSH server (port 22) alone.
+  hints:
+    - "`ssh -p 2222 -o PreferredAuthentications=none nobody@127.0.0.1` shows what the server offers now."
+    - "Set `PasswordAuthentication no`, `KbdInteractiveAuthentication no`, `PermitRootLogin no`, `AllowGroups kl-ssh` and `MaxAuthTries 3`."
+    - "`sudo sshd -t -f /etc/kl-sshd/sshd_config`, then `sudo systemctl reload kl-sshd`. `sudo sshd -T -f /etc/kl-sshd/sshd_config` shows the result."
+  solution: |
+    ```bash
+    f=/etc/kl-sshd/sshd_config
+    sudo sed -i -E 's/^(PasswordAuthentication|KbdInteractiveAuthentication|PermitRootLogin|MaxAuthTries) .*//' $f
+    printf 'PasswordAuthentication no\nKbdInteractiveAuthentication no\nPermitRootLogin no\nAllowGroups kl-ssh\nMaxAuthTries 3\n' | sudo tee -a $f
+    sudo sshd -t -f $f && sudo systemctl reload kl-sshd
+    ssh -p 2222 -o PreferredAuthentications=none nobody@127.0.0.1   # Permission denied (publickey)
+    ssh -i /lab/kl_key -p 2222 kl-dev@127.0.0.1 id
+    ```
+  setup: |
+    on_reset 'systemctl stop kl-sshd 2>/dev/null; rm -rf /etc/systemd/system/kl-sshd.service /etc/kl-sshd; systemctl daemon-reload; systemctl reset-failed kl-sshd 2>/dev/null; userdel -r kl-dev 2>/dev/null; userdel -r kl-temp 2>/dev/null; groupdel kl-ssh 2>/dev/null; true'
+    groupadd -f kl-ssh
+    for u in kl-dev kl-temp; do
+      id $u >/dev/null 2>&1 || useradd -m -s /bin/bash $u
+      echo "$u:Pw-$RANDOM-$RANDOM" | chpasswd
+    done
+    usermod -aG kl-ssh kl-dev
+    systemctl stop kl-sshd 2>/dev/null
+    rm -rf /etc/kl-sshd; mkdir -p /etc/kl-sshd/keys
+    ssh-keygen -q -t ed25519 -N '' -f /etc/kl-sshd/ssh_host_ed25519_key
+    rm -f "$KL_STATE/kl_key" "$KL_STATE/kl_key.pub"
+    ssh-keygen -q -t ed25519 -N '' -C kl-lab -f "$KL_STATE/kl_key"
+    for u in kl-dev kl-temp root; do cp "$KL_STATE/kl_key.pub" /etc/kl-sshd/keys/$u; done
+    chmod 644 /etc/kl-sshd/keys/*
+    cp "$KL_STATE/kl_key" /lab/kl_key; chown "$(lab_user):" /lab/kl_key; chmod 600 /lab/kl_key
+    cat > /etc/kl-sshd/sshd_config <<'EOF'
+    # Second SSH daemon for internal tooling
+    Port 2222
+    ListenAddress 127.0.0.1
+    HostKey /etc/kl-sshd/ssh_host_ed25519_key
+    PidFile /run/kl-sshd.pid
+    AuthorizedKeysFile .ssh/authorized_keys /etc/kl-sshd/keys/%u
+    StrictModes yes
+    UsePAM yes
+    PermitRootLogin yes
+    PasswordAuthentication yes
+    KbdInteractiveAuthentication yes
+    MaxAuthTries 6
+    Subsystem sftp internal-sftp
+    EOF
+    cat > /etc/systemd/system/kl-sshd.service <<'EOF'
+    [Unit]
+    Description=Lab SSH daemon for tooling (127.0.0.1:2222)
+    After=network.target
+
+    [Service]
+    ExecStartPre=/usr/bin/mkdir -p /run/sshd
+    ExecStartPre=/usr/sbin/sshd -t -f /etc/kl-sshd/sshd_config
+    ExecStart=/usr/sbin/sshd -D -e -f /etc/kl-sshd/sshd_config
+    ExecReload=/usr/sbin/sshd -t -f /etc/kl-sshd/sshd_config
+    ExecReload=/bin/kill -HUP $MAINPID
+    Restart=on-failure
+    EOF
+    systemctl daemon-reload
+    systemctl start kl-sshd
+    eventually 10 'ss -ltn "sport = :2222" | grep -q LISTEN'
+  check: |
+    SO='-F /dev/null -p 2222 -o BatchMode=yes -o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null -o IdentitiesOnly=yes -o ConnectTimeout=5 -o LogLevel=ERROR'
+    k="$KL_STATE/kl_key"
+    check "kl-sshd is running" 'systemctl is-active -q kl-sshd'
+    eventually 10 'ss -ltn "sport = :2222" | grep -q LISTEN'
+    T=$(sshd -T -f /etc/kl-sshd/sshd_config 2>/dev/null)
+    for want in "passwordauthentication no" "kbdinteractiveauthentication no" "permitrootlogin no" "allowgroups kl-ssh" "maxauthtries 3"; do
+      check "sshd_config: $want" "grep -qx '$want' <<<\"\$T\""
+    done
+    m=$(timeout 15 ssh $SO -o PreferredAuthentications=none nobody@127.0.0.1 true </dev/null 2>&1)
+    check_match "the running daemon offers only public keys" "$m" 'Permission denied \(publickey\)'
+    check_eq "kl-dev logs in with its key" "$(timeout 15 ssh $SO -i $k kl-dev@127.0.0.1 id -un </dev/null 2>/dev/null)" kl-dev
+    check_not "kl-temp (not in kl-ssh) is refused" 'timeout 15 ssh $SO -i $k kl-temp@127.0.0.1 true </dev/null'
+    check_not "root is refused" 'timeout 15 ssh $SO -i $k root@127.0.0.1 true </dev/null'
+  solve: |
+    f=/etc/kl-sshd/sshd_config
+    sudo sed -i -E '/^(PasswordAuthentication|KbdInteractiveAuthentication|PermitRootLogin|MaxAuthTries|AllowGroups) /d' $f
+    printf 'PasswordAuthentication no\nKbdInteractiveAuthentication no\nPermitRootLogin no\nAllowGroups kl-ssh\nMaxAuthTries 3\n' | sudo tee -a $f >/dev/null
+    sudo sshd -t -f $f
+    sudo systemctl reload kl-sshd
+    sleep 1
+
+- id: linux-087
+  title: The deploy key that sshd ignores
+  difficulty: 3
+  kind: fix
+  tags: [ssh, authorized_keys, strictmodes, permissions, journald]
+  tutorial: |
+    **Concept.** Before `sshd` trusts an `authorized_keys` file, **`StrictModes`** (on by
+    default) checks that nobody else could have planted a key in it. The file, the
+    `~/.ssh` directory **and the home directory** must be owned by the user (or root)
+    and must not be writable by group or others. If that check fails, the key is
+    silently ignored and the client falls back to a password. The reason is only in the
+    **server's** log (`Authentication refused: bad ownership or modes ...`). Each key
+    must also sit on **one line**. `ssh-keygen -l -f FILE` lists the keys it can parse.
+
+    **Read up on:**
+    - `man sshd`: the `AUTHORIZED_KEYS FILE FORMAT` section
+    - `man sshd_config`: `StrictModes`
+    - `journalctl -u UNIT`, `ssh -v`, `ssh-keygen -l -f`
+  scenario: |
+    The CI system logs in to **`kl-deploy`** on the tooling SSH daemon
+    (**`kl-sshd.service`**, 127.0.0.1:2222) with the key **`/lab/deploy_key`**. The key
+    is in `~kl-deploy/.ssh/authorized_keys`, yet the login falls back to asking for a
+    password:
+
+    ```
+    ssh -i /lab/deploy_key -p 2222 kl-deploy@127.0.0.1
+    ```
+
+    Make that key login work. Don't change **`/etc/kl-sshd/sshd_config`** (no turning
+    off `StrictModes`). Fix the account instead.
+  hints:
+    - "`journalctl -u kl-sshd -n 20` shows why sshd refused the key."
+    - "`namei -l /home/kl-deploy/.ssh/authorized_keys`: home and `~/.ssh` must not be writable by group or others, and the same goes for the file."
+    - "`ssh-keygen -l -f /home/kl-deploy/.ssh/authorized_keys` (as root) must list the key. Is it on one line?"
+  solution: |
+    ```bash
+    journalctl -u kl-sshd -n 20       # bad ownership or modes for directory /home/kl-deploy
+    sudo namei -l /home/kl-deploy/.ssh/authorized_keys
+    sudo chmod 755 /home/kl-deploy
+    sudo chmod 700 /home/kl-deploy/.ssh
+    sudo chmod 600 /home/kl-deploy/.ssh/authorized_keys
+    sudo cat /home/kl-deploy/.ssh/authorized_keys     # the key is wrapped over two lines
+    sudo cp /lab/deploy_key.pub /home/kl-deploy/.ssh/authorized_keys
+    sudo chown kl-deploy: /home/kl-deploy/.ssh/authorized_keys
+    ssh -i /lab/deploy_key -p 2222 kl-deploy@127.0.0.1 id
+    ```
+  setup: |
+    on_reset 'systemctl stop kl-sshd 2>/dev/null; rm -rf /etc/systemd/system/kl-sshd.service /etc/kl-sshd; systemctl daemon-reload; systemctl reset-failed kl-sshd 2>/dev/null; userdel -r kl-deploy 2>/dev/null; true'
+    id kl-deploy >/dev/null 2>&1 || useradd -m -s /bin/bash kl-deploy
+    echo "kl-deploy:Pw-$RANDOM-$RANDOM" | chpasswd
+    systemctl stop kl-sshd 2>/dev/null
+    rm -rf /etc/kl-sshd; mkdir -p /etc/kl-sshd
+    ssh-keygen -q -t ed25519 -N '' -f /etc/kl-sshd/ssh_host_ed25519_key
+    rm -f "$KL_STATE/deploy_key" "$KL_STATE/deploy_key.pub"
+    ssh-keygen -q -t ed25519 -N '' -C deploy@ci -f "$KL_STATE/deploy_key"
+    cp "$KL_STATE/deploy_key" /lab/deploy_key; cp "$KL_STATE/deploy_key.pub" /lab/deploy_key.pub
+    chown "$(lab_user):" /lab/deploy_key /lab/deploy_key.pub; chmod 600 /lab/deploy_key; chmod 644 /lab/deploy_key.pub
+    h=/home/kl-deploy
+    mkdir -p $h/.ssh
+    fold -w 60 "$KL_STATE/deploy_key.pub" > $h/.ssh/authorized_keys
+    chown -R kl-deploy:kl-deploy $h
+    chmod 775 $h; chmod 777 $h/.ssh; chmod 664 $h/.ssh/authorized_keys
+    cat > /etc/kl-sshd/sshd_config <<'EOF'
+    # Second SSH daemon for internal tooling
+    Port 2222
+    ListenAddress 127.0.0.1
+    HostKey /etc/kl-sshd/ssh_host_ed25519_key
+    PidFile /run/kl-sshd.pid
+    AuthorizedKeysFile .ssh/authorized_keys
+    StrictModes yes
+    UsePAM yes
+    PermitRootLogin no
+    PasswordAuthentication yes
+    KbdInteractiveAuthentication no
+    Subsystem sftp internal-sftp
+    EOF
+    sha1sum /etc/kl-sshd/sshd_config > "$KL_STATE/sshd.sum"
+    cat > /etc/systemd/system/kl-sshd.service <<'EOF'
+    [Unit]
+    Description=Lab SSH daemon for tooling (127.0.0.1:2222)
+    After=network.target
+
+    [Service]
+    ExecStartPre=/usr/bin/mkdir -p /run/sshd
+    ExecStartPre=/usr/sbin/sshd -t -f /etc/kl-sshd/sshd_config
+    ExecStart=/usr/sbin/sshd -D -e -f /etc/kl-sshd/sshd_config
+    ExecReload=/usr/sbin/sshd -t -f /etc/kl-sshd/sshd_config
+    ExecReload=/bin/kill -HUP $MAINPID
+    Restart=on-failure
+    EOF
+    systemctl daemon-reload
+    systemctl start kl-sshd
+    eventually 10 'ss -ltn "sport = :2222" | grep -q LISTEN'
+  check: |
+    SO='-F /dev/null -p 2222 -o BatchMode=yes -o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null -o IdentitiesOnly=yes -o ConnectTimeout=5 -o LogLevel=ERROR'
+    check "kl-sshd is running" 'systemctl is-active -q kl-sshd'
+    check "sshd_config is unchanged" 'sha1sum -c --status "$KL_STATE/sshd.sum"'
+    check_eq "the deploy key logs in as kl-deploy" "$(timeout 15 ssh $SO -i "$KL_STATE/deploy_key" kl-deploy@127.0.0.1 id -un </dev/null 2>/dev/null)" kl-deploy
+    fp=$(ssh-keygen -lf "$KL_STATE/deploy_key.pub" | cut -d' ' -f2)
+    check "authorized_keys holds the deploy key on one line" 'ssh-keygen -lf /home/kl-deploy/.ssh/authorized_keys 2>/dev/null | grep -qF "$fp"'
+    check_eq "the home directory still belongs to kl-deploy" "$(stat -c %U /home/kl-deploy 2>/dev/null)" kl-deploy
+  solve: |
+    h=/home/kl-deploy
+    sudo chmod 755 $h
+    sudo chmod 700 $h/.ssh
+    sudo cp /lab/deploy_key.pub $h/.ssh/authorized_keys
+    sudo chown kl-deploy:kl-deploy $h/.ssh/authorized_keys
+    sudo chmod 600 $h/.ssh/authorized_keys
+
+- id: linux-088
+  title: Hardened, and now it can't write anything
+  difficulty: 3
+  kind: fix
+  tags: [systemd, sandboxing, statedirectory, logsdirectory, runtimedirectory]
+  tutorial: |
+    **Concept.** With `ProtectSystem=strict` a service sees a read-only filesystem, and
+    that includes `/var` and `/run`. Instead of opening holes with `ReadWritePaths=`
+    (where you would also have to create the directories and set their owner), let
+    systemd manage the service's directories:
+    **`StateDirectory=NAME`** (`/var/lib/NAME`), **`LogsDirectory=NAME`**
+    (`/var/log/NAME`), **`RuntimeDirectory=NAME`** (`/run/NAME`, removed when the service
+    stops) and **`CacheDirectory=`**. systemd creates them, gives them to the service's
+    `User=`, and makes them writable inside the sandbox.
+
+    **Read up on:**
+    - `man systemd.exec`: `StateDirectory=`, `LogsDirectory=`, `RuntimeDirectory=`, `ReadWritePaths=`
+    - `journalctl -u UNIT` — "Read-only file system", "Permission denied"
+  scenario: |
+    After a security review, **`kl-ledger.service`** (runs as user `kl-ledger`) got a
+    sandbox: `ProtectSystem=strict`, `ProtectHome=yes`, `PrivateTmp=yes` and
+    `NoNewPrivileges=yes`. Since then it doesn't start.
+
+    The service needs to write:
+
+    - **`/var/lib/kl-ledger/ledger.db`**: it appends an entry every second. The
+      entries already in it must be kept.
+    - **`/var/log/kl-ledger/ledger.log`**: its log
+    - **`/run/kl-ledger/ledger.pid`**: its PID
+
+    Get it running. **All four sandbox settings must stay in force**, and it must still
+    run as `kl-ledger`. You may edit the unit or add a drop-in.
+  hints:
+    - "`journalctl -u kl-ledger -n 20`: which path fails first, and why?"
+    - "`/var/lib/kl-ledger` belongs to root. `/var/log/kl-ledger` and `/run/kl-ledger` don't exist at all."
+    - "`StateDirectory=kl-ledger`, `LogsDirectory=kl-ledger` and `RuntimeDirectory=kl-ledger` create, chown and unlock all three. Then `daemon-reload` and restart."
+  solution: |
+    ```bash
+    journalctl -u kl-ledger -n 20
+    sudo mkdir -p /etc/systemd/system/kl-ledger.service.d
+    sudo tee /etc/systemd/system/kl-ledger.service.d/dirs.conf <<'EOF'
+    [Service]
+    StateDirectory=kl-ledger
+    LogsDirectory=kl-ledger
+    RuntimeDirectory=kl-ledger
+    EOF
+    sudo systemctl daemon-reload
+    sudo systemctl restart kl-ledger
+    ls -l /var/lib/kl-ledger /var/log/kl-ledger /run/kl-ledger
+    ```
+  setup: |
+    on_reset 'systemctl stop kl-ledger 2>/dev/null; rm -rf /etc/systemd/system/kl-ledger.service /etc/systemd/system/kl-ledger.service.d /opt/kl-ledger /var/lib/kl-ledger /var/log/kl-ledger /run/kl-ledger; systemctl daemon-reload; systemctl reset-failed kl-ledger 2>/dev/null; userdel kl-ledger 2>/dev/null; groupdel kl-ledger 2>/dev/null; true'
+    getent group kl-ledger >/dev/null || groupadd -r kl-ledger
+    id kl-ledger >/dev/null 2>&1 || useradd -r -g kl-ledger -M -s /usr/sbin/nologin kl-ledger
+    rm -rf /etc/systemd/system/kl-ledger.service.d /var/log/kl-ledger /run/kl-ledger /var/lib/kl-ledger
+    mkdir -p /opt/kl-ledger /var/lib/kl-ledger
+    printf 'entry 0 genesis-%s\nentry 0 migrated-%s\nentry 0 audited-%s\n' $RANDOM $RANDOM $RANDOM > /var/lib/kl-ledger/ledger.db
+    head -n 3 /var/lib/kl-ledger/ledger.db > "$KL_STATE/ledger-head"
+    cat > /opt/kl-ledger/ledger.py <<'EOF'
+    import os, time
+    with open("/run/kl-ledger/ledger.pid", "w") as f:
+        f.write("%d\n" % os.getpid())
+    log = open("/var/log/kl-ledger/ledger.log", "a", buffering=1)
+    n = 0
+    while True:
+        n += 1
+        with open("/var/lib/kl-ledger/ledger.db", "a") as db:
+            db.write("entry %d %d\n" % (n, time.time()))
+        log.write("wrote entry %d\n" % n)
+        time.sleep(1)
+    EOF
+    cat > /etc/systemd/system/kl-ledger.service <<'EOF'
+    [Unit]
+    Description=Lab ledger
+
+    [Service]
+    User=kl-ledger
+    ExecStart=/usr/bin/python3 /opt/kl-ledger/ledger.py
+    ProtectSystem=strict
+    ProtectHome=yes
+    PrivateTmp=yes
+    NoNewPrivileges=yes
+    EOF
+    systemctl daemon-reload
+    systemctl start kl-ledger 2>/dev/null || true
+  check: |
+    show() { systemctl show -p "$1" --value kl-ledger; }
+    db=/var/lib/kl-ledger/ledger.db
+    check "kl-ledger is running" 'eventually 8 "systemctl is-active -q kl-ledger"'
+    check_eq "User" "$(show User)" kl-ledger
+    check_eq "ProtectSystem" "$(show ProtectSystem)" strict
+    check_eq "ProtectHome" "$(show ProtectHome)" yes
+    check_eq "PrivateTmp" "$(show PrivateTmp)" yes
+    check_eq "NoNewPrivileges" "$(show NoNewPrivileges)" yes
+    pid=$(show MainPID)
+    check_eq "the PID file holds its PID" "$(tr -d ' \n' < /run/kl-ledger/ledger.pid 2>/dev/null)" "$pid"
+    check_eq "the old ledger entries are kept" "$(head -n 3 $db 2>/dev/null)" "$(cat "$KL_STATE/ledger-head")"
+    n1=$(wc -l < $db 2>/dev/null || echo 0)
+    check "new entries are appended" 'eventually 6 "[ \$(wc -l < $db) -gt $n1 ]"'
+    check "it logs to /var/log/kl-ledger/ledger.log" 'grep -q "wrote entry" /var/log/kl-ledger/ledger.log'
+    if [ "${pid:-0}" -gt 0 ]; then
+      check_not "/etc is still read-only for it" 'nsenter -t $pid -m touch /etc/.kl-ledger-probe'
+      rm -f /etc/.kl-ledger-probe
+    fi
+  solve: |
+    sudo mkdir -p /etc/systemd/system/kl-ledger.service.d
+    printf '[Service]\nStateDirectory=kl-ledger\nLogsDirectory=kl-ledger\nRuntimeDirectory=kl-ledger\n' | sudo tee /etc/systemd/system/kl-ledger.service.d/dirs.conf >/dev/null
+    sudo systemctl daemon-reload
+    sudo systemctl restart kl-ledger
+
+- id: linux-089
+  title: A key that can only deliver backups
+  difficulty: 4
+  kind: build
+  tags: [ssh, authorized_keys, forced-command, restrict, least-privilege]
+  tutorial: |
+    **Concept.** Each line of `authorized_keys` can start with **options** that limit
+    what that one key may do, whatever the client asks for:
+
+    - **`command="..."`** forces a command. The client's request is passed to it in
+      `$SSH_ORIGINAL_COMMAND`.
+    - **`from="pattern"`** accepts the key only from matching client addresses.
+    - **`restrict`** turns off port, agent and X11 forwarding and PTY allocation in one
+      word (you can then switch single features back on).
+
+    This is how backup and CI keys get exactly one job, while the same account keeps
+    other, unrestricted keys.
+
+    **Read up on:**
+    - `man sshd`: `AUTHORIZED_KEYS FILE FORMAT` — `command=`, `from=`, `restrict`, `no-pty`, `no-port-forwarding`
+    - `ssh -W host:port` (stdio forwarding), `ssh -tt`, `ssh -b ADDRESS`
+  scenario: |
+    The NAS pushes its nightly backup to **`kl-backup`** on the tooling SSH daemon
+    (**127.0.0.1:2222**) with the key pair **`/lab/backup_key`** /
+    **`/lab/backup_key.pub`**. The receiver is **`/usr/local/bin/kl-backup-recv`**: it
+    stores whatever arrives on stdin as `/srv/kl-backups/latest.dat`.
+
+    Add the backup key to **`/home/kl-backup/.ssh/authorized_keys`** so that this key:
+
+    - always runs **`/usr/local/bin/kl-backup-recv`**, whatever command the client asks
+      for
+    - gets **no PTY**, **no port forwarding**, and no agent or X11 forwarding
+    - is accepted **only from 127.0.0.1**
+
+    The **admin key** already in that file must keep working without restrictions.
+    Don't change `/etc/kl-sshd/sshd_config`.
+  hints:
+    - "Options go in front of the key on the same line, separated by commas and without spaces: `OPTIONS ssh-ed25519 AAAA... backup@nas`."
+    - "`restrict,command=\"/usr/local/bin/kl-backup-recv\",from=\"127.0.0.1\"` covers everything."
+    - "Test: `echo hi | ssh -i /lab/backup_key -p 2222 kl-backup@127.0.0.1 id` should only report 3 stored bytes; `ssh -i /lab/backup_key -p 2222 -W 127.0.0.1:2222 kl-backup@127.0.0.1` must fail; and `ssh -b 127.0.0.2 ...` must be refused."
+  solution: |
+    ```bash
+    f=/home/kl-backup/.ssh/authorized_keys
+    echo "restrict,command=\"/usr/local/bin/kl-backup-recv\",from=\"127.0.0.1\" $(cat /lab/backup_key.pub)" | sudo tee -a $f
+    echo hello | ssh -i /lab/backup_key -p 2222 kl-backup@127.0.0.1 whatever
+    ssh -tt -i /lab/backup_key -p 2222 kl-backup@127.0.0.1          # PTY allocation request failed
+    ssh -i /lab/backup_key -p 2222 -W 127.0.0.1:22 kl-backup@127.0.0.1  # stdio forwarding failed
+    ssh -b 127.0.0.2 -i /lab/backup_key -p 2222 kl-backup@127.0.0.1    # refused
+    ```
+  setup: |
+    on_reset 'systemctl stop kl-sshd 2>/dev/null; rm -rf /etc/systemd/system/kl-sshd.service /etc/kl-sshd /srv/kl-backups /usr/local/bin/kl-backup-recv; systemctl daemon-reload; systemctl reset-failed kl-sshd 2>/dev/null; userdel -r kl-backup 2>/dev/null; true'
+    id kl-backup >/dev/null 2>&1 || useradd -m -s /bin/bash kl-backup
+    echo "kl-backup:Pw-$RANDOM-$RANDOM" | chpasswd
+    systemctl stop kl-sshd 2>/dev/null
+    rm -rf /etc/kl-sshd; mkdir -p /etc/kl-sshd
+    ssh-keygen -q -t ed25519 -N '' -f /etc/kl-sshd/ssh_host_ed25519_key
+    rm -f "$KL_STATE"/backup_key* "$KL_STATE"/admin_key*
+    ssh-keygen -q -t ed25519 -N '' -C backup@nas -f "$KL_STATE/backup_key"
+    ssh-keygen -q -t ed25519 -N '' -C admin@ops -f "$KL_STATE/admin_key"
+    cp "$KL_STATE/backup_key" /lab/backup_key; cp "$KL_STATE/backup_key.pub" /lab/backup_key.pub
+    chown "$(lab_user):" /lab/backup_key /lab/backup_key.pub; chmod 600 /lab/backup_key; chmod 644 /lab/backup_key.pub
+    h=/home/kl-backup
+    mkdir -p $h/.ssh
+    cp "$KL_STATE/admin_key.pub" $h/.ssh/authorized_keys
+    chown -R kl-backup:kl-backup $h/.ssh; chmod 700 $h/.ssh; chmod 600 $h/.ssh/authorized_keys
+    rm -rf /srv/kl-backups; install -d -o kl-backup -g kl-backup -m 0750 /srv/kl-backups
+    cat > /usr/local/bin/kl-backup-recv <<'EOF'
+    #!/bin/sh
+    # Store the backup stream that arrives on stdin.
+    cat > /srv/kl-backups/latest.dat
+    echo "kl-backup-recv: stored $(stat -c %s /srv/kl-backups/latest.dat) bytes (asked for: ${SSH_ORIGINAL_COMMAND:-nothing})"
+    EOF
+    chmod 755 /usr/local/bin/kl-backup-recv
+    cat > /etc/kl-sshd/sshd_config <<'EOF'
+    # Second SSH daemon for internal tooling
+    Port 2222
+    ListenAddress 127.0.0.1
+    HostKey /etc/kl-sshd/ssh_host_ed25519_key
+    PidFile /run/kl-sshd.pid
+    AuthorizedKeysFile .ssh/authorized_keys
+    StrictModes yes
+    UsePAM yes
+    PermitRootLogin no
+    PasswordAuthentication yes
+    KbdInteractiveAuthentication no
+    AllowTcpForwarding yes
+    Subsystem sftp internal-sftp
+    EOF
+    sha1sum /etc/kl-sshd/sshd_config > "$KL_STATE/sshd.sum"
+    cat > /etc/systemd/system/kl-sshd.service <<'EOF'
+    [Unit]
+    Description=Lab SSH daemon for tooling (127.0.0.1:2222)
+    After=network.target
+
+    [Service]
+    ExecStartPre=/usr/bin/mkdir -p /run/sshd
+    ExecStartPre=/usr/sbin/sshd -t -f /etc/kl-sshd/sshd_config
+    ExecStart=/usr/sbin/sshd -D -e -f /etc/kl-sshd/sshd_config
+    ExecReload=/usr/sbin/sshd -t -f /etc/kl-sshd/sshd_config
+    ExecReload=/bin/kill -HUP $MAINPID
+    Restart=on-failure
+    EOF
+    systemctl daemon-reload
+    systemctl start kl-sshd
+    eventually 10 'ss -ltn "sport = :2222" | grep -q LISTEN'
+  check: |
+    SO='-F /dev/null -p 2222 -o BatchMode=yes -o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null -o IdentitiesOnly=yes -o ConnectTimeout=5 -o LogLevel=ERROR'
+    k="$KL_STATE/backup_key"
+    check "kl-sshd is running" 'systemctl is-active -q kl-sshd'
+    check "sshd_config is unchanged" 'sha1sum -c --status "$KL_STATE/sshd.sum"'
+    o=$(timeout 15 ssh $SO -i $k kl-backup@127.0.0.1 id -un </dev/null 2>&1)
+    check_match "any command runs kl-backup-recv instead" "$o" '^kl-backup-recv: stored 0 bytes'
+    tok="backup-$RANDOM$RANDOM"
+    echo "$tok" | timeout 15 ssh $SO -i $k kl-backup@127.0.0.1 upload >/dev/null 2>&1
+    check_eq "the data sent arrives in latest.dat" "$(cat /srv/kl-backups/latest.dat 2>/dev/null)" "$tok"
+    o=$(timeout 15 ssh $SO -tt -i $k kl-backup@127.0.0.1 x </dev/null 2>&1)
+    check_match "the backup key gets no PTY" "$o" 'PTY allocation request failed'
+    o=$(timeout 15 ssh $SO -i $k -W 127.0.0.1:2222 kl-backup@127.0.0.1 </dev/null 2>/dev/null | head -c 64)
+    check_not "the backup key can't forward connections" 'grep -q SSH-2.0 <<<"$o"'
+    line=$(grep -F "$(cut -d' ' -f2 "$k.pub")" /home/kl-backup/.ssh/authorized_keys 2>/dev/null | head -1)
+    re='(^|,)restrict(,|[[:space:]])'
+    check "agent and X11 forwarding are off for it" '[[ $line =~ $re ]] || { [[ $line == *no-agent-forwarding* ]] && [[ $line == *no-X11-forwarding* ]]; }'
+    o=$(timeout 15 ssh $SO -b 127.0.0.2 -i $k kl-backup@127.0.0.1 id </dev/null 2>&1)
+    check_not "the backup key is refused from 127.0.0.2" 'grep -q kl-backup-recv <<<"$o"'
+    check_eq "the admin key still runs normal commands" "$(timeout 15 ssh $SO -i "$KL_STATE/admin_key" kl-backup@127.0.0.1 id -un </dev/null 2>/dev/null)" kl-backup
+  solve: |
+    f=/home/kl-backup/.ssh/authorized_keys
+    if ! sudo grep -qF "$(cut -d' ' -f2 /lab/backup_key.pub)" $f; then
+      echo "restrict,command=\"/usr/local/bin/kl-backup-recv\",from=\"127.0.0.1\" $(cat /lab/backup_key.pub)" | sudo tee -a $f >/dev/null
+    fi
+
+- id: linux-090
+  title: The TLS site that won't come up
+  difficulty: 4
+  kind: fix
+  tags: [tls, openssl, nginx, certificate-chain, private-key, docker]
+  tutorial: |
+    **Concept.** A TLS server needs two things that belong together: a **private key**
+    and the **certificate** for its public half. If they don't match, nginx refuses to
+    start (`key values mismatch`). Compare the public keys to see which key belongs to a
+    certificate. The server must also send the **chain**: its own certificate first,
+    then the intermediate CA certificates that link it to a root the clients trust.
+    Clients don't fetch missing intermediates, so a server that sends only its own
+    certificate fails with *unable to get local issuer certificate*. In nginx,
+    `ssl_certificate` points at that "full chain" file.
+
+    **Read up on:**
+    - `openssl x509 -noout -pubkey`, `openssl pkey -pubout`, comparing them
+    - `openssl x509 -noout -subject -issuer`, `openssl verify -CAfile ROOT -untrusted INTERMEDIATE CERT`
+    - nginx `ssl_certificate` (full chain, leaf first) and `ssl_certificate_key`
+    - `openssl s_client -connect HOST:PORT -servername NAME -showcerts`
+  scenario: |
+    The container **`kl-tls`** (nginx) serves **https://web.kl.test:8443/** from the files in
+    **`/lab/tls`** (mounted at `/etc/nginx/tls`, configuration
+    `/lab/tls/nginx.conf`). After a "certificate rotation" it doesn't start any more.
+
+    In `/lab/tls`: the site certificate `server.crt` (valid, keep it), the issuing CA
+    `issuing-ca.crt`, the root CA `root-ca.crt`, the configured key `server.key`, and
+    the keys found on the old server in `keys/`.
+
+    Get the site up so that a client trusting **only the root CA** can connect:
+
+    ```
+    curl --cacert /lab/tls/root-ca.crt --resolve web.kl.test:8443:127.0.0.1 https://web.kl.test:8443/
+    ```
+
+    It must serve **the existing `server.crt`**. Restart the container with
+    `docker start kl-tls` (or `docker restart kl-tls`).
+  hints:
+    - "`docker logs kl-tls` shows why nginx stopped."
+    - "`openssl x509 -in server.crt -noout -pubkey | sha256sum` and `openssl pkey -in KEY -pubout | sha256sum` for each key: the matching one has the same hash."
+    - "With the right key it starts, but `curl` says *unable to get local issuer certificate*: nginx must send `server.crt` **followed by** `issuing-ca.crt`. Concatenate them in that order and point `ssl_certificate` at the result."
+  solution: |
+    ```bash
+    cd /lab/tls
+    docker logs kl-tls                 # key values mismatch
+    openssl x509 -in server.crt -noout -pubkey | sha256sum
+    for k in server.key keys/*.key; do echo "$k $(openssl pkey -in $k -pubout | sha256sum)"; done
+    cp keys/<the matching one>.key server.key
+    cat server.crt issuing-ca.crt > fullchain.crt
+    sed -i 's#ssl_certificate .*#ssl_certificate     /etc/nginx/tls/fullchain.crt;#' nginx.conf
+    docker start kl-tls
+    curl --cacert root-ca.crt --resolve web.kl.test:8443:127.0.0.1 https://web.kl.test:8443/
+    ```
+  setup: |
+    on_reset 'docker rm -f kl-tls >/dev/null 2>&1; true'
+    docker rm -f kl-tls >/dev/null 2>&1
+    W=$(mktemp -d)
+    key() { openssl genpkey -algorithm EC -pkeyopt ec_paramgen_curve:P-256 -out "$1" 2>/dev/null; }
+    key $W/root.key; key $W/int.key; key $W/leaf.key
+    printf '[req]\ndistinguished_name=dn\nprompt=no\n[dn]\nCN=KL Lab Root CA\n[v3]\nbasicConstraints=critical,CA:TRUE\nkeyUsage=critical,keyCertSign,cRLSign\nsubjectKeyIdentifier=hash\n' > $W/root.cnf
+    openssl req -x509 -new -key $W/root.key -config $W/root.cnf -extensions v3 -days 3650 -out $W/root.crt 2>/dev/null
+    openssl req -new -key $W/int.key -subj "/CN=KL Lab Issuing CA 1" -out $W/int.csr 2>/dev/null
+    printf 'basicConstraints=critical,CA:TRUE,pathlen:0\nkeyUsage=critical,keyCertSign,cRLSign\n' > $W/int.ext
+    openssl x509 -req -in $W/int.csr -CA $W/root.crt -CAkey $W/root.key -CAcreateserial -days 1825 -extfile $W/int.ext -out $W/int.crt 2>/dev/null
+    openssl req -new -key $W/leaf.key -subj "/CN=web.kl.test" -out $W/leaf.csr 2>/dev/null
+    printf 'basicConstraints=CA:FALSE\nkeyUsage=critical,digitalSignature\nextendedKeyUsage=serverAuth\nsubjectAltName=DNS:web.kl.test\n' > $W/leaf.ext
+    openssl x509 -req -in $W/leaf.csr -CA $W/int.crt -CAkey $W/int.key -CAcreateserial -days 365 -extfile $W/leaf.ext -out $W/leaf.crt 2>/dev/null
+    rm -rf /lab/tls; mkdir -p /lab/tls/keys /lab/tls/www
+    names=(2025-03.key 2025-09.key 2026-01.key); right=$((RANDOM % 3))
+    for i in 0 1 2; do
+      if [ $i = $right ]; then cp $W/leaf.key /lab/tls/keys/${names[$i]}; else key /lab/tls/keys/${names[$i]}; fi
+    done
+    key /lab/tls/server.key
+    cp $W/leaf.crt /lab/tls/server.crt; cp $W/int.crt /lab/tls/issuing-ca.crt; cp $W/root.crt /lab/tls/root-ca.crt
+    cp $W/root.crt "$KL_STATE/tls-root.crt"
+    openssl x509 -in $W/leaf.crt -noout -fingerprint -sha256 > "$KL_STATE/tls-leaf"
+    tok="kl-web $(head -c6 /dev/urandom | od -An -tx1 | tr -d ' \n')"
+    echo "$tok" > /lab/tls/www/index.html; echo "$tok" > "$KL_STATE/tls-page"
+    cat > /lab/tls/nginx.conf <<'EOF'
+    worker_processes 1;
+    error_log stderr;
+    events {}
+    http {
+      server {
+        listen 443 ssl;
+        server_name web.kl.test;
+        ssl_certificate     /etc/nginx/tls/server.crt;
+        ssl_certificate_key /etc/nginx/tls/server.key;
+        root /etc/nginx/tls/www;
+      }
+    }
+    EOF
+    rm -rf $W
+    chown -R "$(lab_user):" /lab/tls
+    chmod 600 /lab/tls/server.key /lab/tls/keys/*.key
+    chmod 644 /lab/tls/*.crt /lab/tls/nginx.conf /lab/tls/www/index.html
+    docker run -d --name kl-tls -p 127.0.0.1:8443:443 -v /lab/tls:/etc/nginx/tls:ro nginx:1.27-alpine nginx -c /etc/nginx/tls/nginx.conf -g 'daemon off;' >/dev/null
+    eventually 10 '! c_running kl-tls'
+  check: |
+    check "kl-tls is running" 'eventually 10 c_running kl-tls'
+    page=$(curl -sS -m 5 --cacert "$KL_STATE/tls-root.crt" --resolve web.kl.test:8443:127.0.0.1 https://web.kl.test:8443/ 2>&1)
+    check_eq "https://web.kl.test:8443/ verifies against the root CA alone" "$page" "$(cat "$KL_STATE/tls-page")"
+    fp=$(timeout 10 openssl s_client -connect 127.0.0.1:8443 -servername web.kl.test </dev/null 2>/dev/null | openssl x509 -noout -fingerprint -sha256 2>/dev/null)
+    check_eq "it serves the original web.kl.test certificate" "$fp" "$(cat "$KL_STATE/tls-leaf")"
+  solve: |
+    cd /lab/tls
+    want=$(openssl x509 -in server.crt -noout -pubkey | sha256sum)
+    for k in keys/*.key; do
+      if [ "$(openssl pkey -in "$k" -pubout | sha256sum)" = "$want" ]; then cp "$k" server.key; fi
+    done
+    cat server.crt issuing-ca.crt > fullchain.crt
+    sed -i 's#ssl_certificate .*#ssl_certificate     /etc/nginx/tls/fullchain.crt;#' nginx.conf
+    docker start kl-tls >/dev/null
+
+- id: linux-091
+  title: Uploads that can never be run
+  difficulty: 4
+  kind: build
+  tags: [mount, fstab, noexec, nosuid, nodev, bind-mount]
+  tutorial: |
+    **Concept.** Mount options limit what a filesystem can be used for, whatever the
+    file permissions say. **`noexec`** forbids executing programs from it, **`nosuid`**
+    ignores setuid/setgid bits, and **`nodev`** ignores device files. They suit any
+    directory that untrusted users or a web application can write to. A directory that
+    is not its own filesystem can still get them: **bind-mount it onto itself** and apply
+    the options. In `/etc/fstab` a line like `SRC DIR none bind,OPTIONS 0 0` does both
+    in one step, and `mount DIR` then reads that line.
+
+    **Read up on:**
+    - `man mount`: `--bind`, `-o remount,bind,...`, `noexec`, `nosuid`, `nodev`
+    - `man fstab`, `findmnt`, `findmnt --fstab`
+  scenario: |
+    The web application stores user uploads in **`/srv/kl-www/uploads`**, a plain
+    directory on the root filesystem. Someone already uploaded an executable script.
+
+    Make sure nothing in that directory can ever be used as a program or a device:
+
+    - mount `/srv/kl-www/uploads` with **`noexec`**, **`nosuid`** and **`nodev`**,
+      **now**
+    - and **after a reboot**: put it in **`/etc/fstab`** as a **bind** mount of the
+      directory onto itself, so `mount /srv/kl-www/uploads` recreates it
+    - the files already in it must stay, and it must stay on the root filesystem
+      (no tmpfs or image)
+  hints:
+    - "The fstab line: `/srv/kl-www/uploads /srv/kl-www/uploads none bind,nosuid,nodev,noexec 0 0`."
+    - "`sudo systemctl daemon-reload`, then `sudo mount /srv/kl-www/uploads` mounts it from that line."
+    - "`findmnt /srv/kl-www/uploads` shows the options in effect. Try running `/srv/kl-www/uploads/2026/invoice.sh`."
+  solution: |
+    ```bash
+    echo '/srv/kl-www/uploads /srv/kl-www/uploads none bind,nosuid,nodev,noexec 0 0' | sudo tee -a /etc/fstab
+    sudo systemctl daemon-reload
+    sudo mount /srv/kl-www/uploads
+    findmnt /srv/kl-www/uploads
+    /srv/kl-www/uploads/2026/invoice.sh     # Permission denied
+    ```
+  setup: |
+    on_reset 'for i in 1 2 3 4 5; do umount /srv/kl-www/uploads 2>/dev/null || break; done; sed -i "\#/srv/kl-www/uploads#d" /etc/fstab; systemctl daemon-reload; rm -rf /srv/kl-www; true'
+    for i in 1 2 3 4 5; do umount /srv/kl-www/uploads 2>/dev/null || break; done
+    sed -i "\#/srv/kl-www/uploads#d" /etc/fstab
+    rm -rf /srv/kl-www; mkdir -p /srv/kl-www/uploads/2025 /srv/kl-www/uploads/2026 /srv/kl-www/html
+    echo '<h1>kl-www</h1>' > /srv/kl-www/html/index.html
+    for i in 1 2 3; do head -c $((1000 + RANDOM % 3000)) /dev/urandom > /srv/kl-www/uploads/2025/photo-$i.jpg; done
+    printf 'name,amount\nacme,%s\n' $RANDOM > /srv/kl-www/uploads/2026/invoice.csv
+    printf '#!/bin/sh\necho "this upload just ran on the server"\n' > /srv/kl-www/uploads/2026/invoice.sh
+    chmod 755 /srv/kl-www/uploads/2026/invoice.sh
+    chown -R www-data:www-data /srv/kl-www/uploads
+    (cd /srv/kl-www/uploads && find . -type f -exec sha1sum {} + | sort) > "$KL_STATE/uploads"
+  check: |
+    d=/srv/kl-www/uploads
+    has() { [[ ,$1, == *,$2,* ]]; }
+    live() { findmnt -n -o OPTIONS --mountpoint $d 2>/dev/null | tail -1; }
+    o=$(awk -v d=$d '$1 !~ /^#/ && $2 == d {print $4}' /etc/fstab | tail -1)
+    check "/etc/fstab has an entry for $d" '[ -n "$o" ]'
+    for x in bind noexec nosuid nodev; do check "its fstab options include $x" "has '$o' $x"; done
+    lo=$(live)
+    for x in noexec nosuid nodev; do check "it is mounted now with $x" "has '$lo' $x"; done
+    check_eq "it is still the root filesystem underneath" "$(findmnt -n -o FSTYPE --mountpoint $d 2>/dev/null | tail -1)" "$(findmnt -n -o FSTYPE --mountpoint /)"
+    check "the uploaded files are intact" 'diff -q <(cd $d && find . -type f ! -name ".kl-*" -exec sha1sum {} + | sort) "$KL_STATE/uploads"'
+    cp /usr/bin/true $d/.kl-probe 2>/dev/null && chmod 755 $d/.kl-probe
+    check_not "programs in it can't be executed" '$d/.kl-probe'
+    rm -f $d/.kl-probe
+    check_not "device files in it don't work" 'mknod $d/.kl-null c 1 3 && echo x > $d/.kl-null'
+    rm -f $d/.kl-null
+    for i in 1 2 3 4 5; do umount $d 2>/dev/null || break; done
+    check "it mounts again from fstab alone" 'timeout 10 mount $d'
+    lo=$(live)
+    check "and gets noexec,nosuid,nodev from there" 'has "$lo" noexec && has "$lo" nosuid && has "$lo" nodev'
+  solve: |
+    d=/srv/kl-www/uploads
+    grep -q "^$d " /etc/fstab || echo "$d $d none bind,nosuid,nodev,noexec 0 0" | sudo tee -a /etc/fstab >/dev/null
+    sudo systemctl daemon-reload
+    findmnt --mountpoint $d >/dev/null || sudo mount $d
+
+- id: linux-092
+  title: A firewall that lets the wrong people in
+  difficulty: 4
+  kind: fix
+  tags: [iptables, firewall, conntrack, netns, stateful]
+  tutorial: |
+    **Concept.** A host firewall with a **default-deny** `INPUT` policy accepts only what
+    the rules allow, and the **first** rule that matches decides. Three rules are easy to
+    forget:
+
+    - **loopback** (`-i lo`): local programs talk to each other over it
+    - **`-m conntrack --ctstate ESTABLISHED,RELATED`**: replies to connections the host
+      opened itself come in through `INPUT` too, and without this rule they're dropped
+    - **narrow sources**: a broad `-s` network rule placed early matches before the
+      specific rules below it, which then never run
+
+    `iptables-save` / `iptables-restore` write and load a whole ruleset from a file. Here
+    the "server" is a network namespace, so its firewall is separate from the host's.
+
+    **Read up on:**
+    - `man iptables`, `man iptables-extensions`: `conntrack`, `-i`, `-s`, `--dport`
+    - `iptables -L -n -v --line-numbers`, `iptables-restore`, `iptables-save`
+    - `ip netns exec NS COMMAND`
+  scenario: |
+    The server lives in the network namespace **`kl-fw`**. It serves **web on TCP
+    8080**, **metrics on TCP 9100** and a **database on TCP 5432**. Two networks reach
+    it: the **office** (`kl-office`, 10.77.1.0/24, the server is 10.77.1.1) and the
+    **guest Wi-Fi** (`kl-guest`, 10.77.2.0/24, the server is 10.77.2.1).
+
+    Its firewall is loaded from **`/etc/kl-fw/rules.v4`** with
+    `sudo ip netns exec kl-fw iptables-restore < /etc/kl-fw/rules.v4`. Fix that file so
+    that, once loaded:
+
+    - the `INPUT` policy stays **`DROP`**
+    - **web (8080)** is reachable from both networks
+    - **metrics (9100)** only from the **office**
+    - the **database (5432)** from neither network, but programs on the server itself
+      can still reach it at `127.0.0.1:5432`
+    - both networks can **ping** the server
+    - the server itself can still fetch updates from **`http://10.77.1.10:7000/`** (in
+      the office)
+
+    The check loads your file itself before testing.
+  hints:
+    - "Test from each side: `sudo ip netns exec kl-guest curl -m 2 http://10.77.2.1:9100/`. `sudo ip netns exec kl-fw iptables -L INPUT -n -v --line-numbers` shows which rule matched."
+    - "`-s 10.77.0.0/16 -j ACCEPT` covers both networks and every port. Replace it with a rule for exactly what the office needs."
+    - "Once that's gone, local access to 5432 and the update fetch also need rules: `-i lo -j ACCEPT` and `-m conntrack --ctstate ESTABLISHED,RELATED -j ACCEPT`, near the top."
+  solution: |
+    ```bash
+    sudo tee /etc/kl-fw/rules.v4 <<'EOF'
+    *filter
+    :INPUT DROP [0:0]
+    :FORWARD DROP [0:0]
+    :OUTPUT ACCEPT [0:0]
+    -A INPUT -i lo -j ACCEPT
+    -A INPUT -m conntrack --ctstate ESTABLISHED,RELATED -j ACCEPT
+    -A INPUT -p icmp --icmp-type echo-request -j ACCEPT
+    -A INPUT -p tcp --dport 8080 -j ACCEPT
+    -A INPUT -s 10.77.1.0/24 -p tcp --dport 9100 -j ACCEPT
+    COMMIT
+    EOF
+    sudo ip netns exec kl-fw iptables-restore < /etc/kl-fw/rules.v4
+    sudo ip netns exec kl-guest curl -m 2 http://10.77.2.1:9100/   # times out
+    sudo ip netns exec kl-fw curl -s http://10.77.1.10:7000/       # works
+    ```
+  setup: |
+    on_reset 'pkill -f "[/]opt/kl-fw/" 2>/dev/null; rm -rf /opt/kl-fw /etc/kl-fw; true'
+    pkill -f "[/]opt/kl-fw/" 2>/dev/null
+    for n in kl-fw kl-office kl-guest; do ip netns del $n 2>/dev/null; done
+    netns_new kl-fw kl-office kl-guest
+    netns_link kl-fw o0 kl-office eth0
+    netns_link kl-fw g0 kl-guest eth0
+    ip -n kl-fw addr add 10.77.1.1/24 dev o0
+    ip -n kl-fw addr add 10.77.2.1/24 dev g0
+    ip -n kl-office addr add 10.77.1.10/24 dev eth0
+    ip -n kl-office route add default via 10.77.1.1
+    ip -n kl-guest addr add 10.77.2.20/24 dev eth0
+    ip -n kl-guest route add default via 10.77.2.1
+    rm -rf /opt/kl-fw; mkdir -p /opt/kl-fw/web /opt/kl-fw/metrics /opt/kl-fw/db /opt/kl-fw/updates
+    for s in web metrics db updates; do echo "kl-$s" > /opt/kl-fw/$s/index.html; done
+    run() { ip netns exec $1 setsid python3 -m http.server $3 --bind $4 --directory /opt/kl-fw/$2 </dev/null >/dev/null 2>&1 & }
+    run kl-fw web 8080 0.0.0.0
+    run kl-fw metrics 9100 0.0.0.0
+    run kl-fw db 5432 0.0.0.0
+    run kl-office updates 7000 10.77.1.10
+    for p in 8080 9100 5432; do eventually 10 "ip netns exec kl-fw ss -ltn | grep -q ':$p '"; done
+    eventually 10 "ip netns exec kl-office ss -ltn | grep -q ':7000 '"
+    mkdir -p /etc/kl-fw
+    cat > /etc/kl-fw/rules.v4 <<'EOF'
+    # Packet filter of the kl-fw server. Load with:
+    #   ip netns exec kl-fw iptables-restore < /etc/kl-fw/rules.v4
+    *filter
+    :INPUT DROP [0:0]
+    :FORWARD DROP [0:0]
+    :OUTPUT ACCEPT [0:0]
+    -A INPUT -p icmp --icmp-type echo-request -j ACCEPT
+    -A INPUT -p tcp --dport 8080 -j ACCEPT
+    # office: metrics
+    -A INPUT -s 10.77.0.0/16 -j ACCEPT
+    # guests: no metrics
+    -A INPUT -s 10.77.2.0/24 -p tcp --dport 9100 -j DROP
+    COMMIT
+    EOF
+    ip netns exec kl-fw iptables-restore < /etc/kl-fw/rules.v4
+  check: |
+    code() { ip netns exec "$1" curl -s -o /dev/null -m 2 -w '%{http_code}' "$2" 2>/dev/null; }
+    check "rules.v4 loads" 'ip netns exec kl-fw iptables-restore < /etc/kl-fw/rules.v4'
+    check_eq "INPUT policy" "$(ip netns exec kl-fw iptables -S INPUT 2>/dev/null | head -1)" "-P INPUT DROP"
+    check_eq "office reaches web" "$(code kl-office http://10.77.1.1:8080/)" 200
+    check_eq "guests reach web" "$(code kl-guest http://10.77.2.1:8080/)" 200
+    check_eq "office reaches metrics" "$(code kl-office http://10.77.1.1:9100/)" 200
+    check_not "guests can't reach metrics" '[ "$(code kl-guest http://10.77.2.1:9100/)" = 200 ] || [ "$(code kl-guest http://10.77.1.1:9100/)" = 200 ]'
+    check_not "office can't reach the database" '[ "$(code kl-office http://10.77.1.1:5432/)" = 200 ]'
+    check_not "guests can't reach the database" '[ "$(code kl-guest http://10.77.2.1:5432/)" = 200 ]'
+    check_eq "the server reaches its own database on 127.0.0.1" "$(code kl-fw http://127.0.0.1:5432/)" 200
+    check_eq "the server fetches updates from the office" "$(code kl-fw http://10.77.1.10:7000/)" 200
+    check "office can ping the server" 'ip netns exec kl-office ping -c1 -W1 10.77.1.1'
+    check "guests can ping the server" 'ip netns exec kl-guest ping -c1 -W1 10.77.2.1'
+  solve: |
+    sudo tee /etc/kl-fw/rules.v4 >/dev/null <<'EOF'
+    *filter
+    :INPUT DROP [0:0]
+    :FORWARD DROP [0:0]
+    :OUTPUT ACCEPT [0:0]
+    -A INPUT -i lo -j ACCEPT
+    -A INPUT -m conntrack --ctstate ESTABLISHED,RELATED -j ACCEPT
+    -A INPUT -p icmp --icmp-type echo-request -j ACCEPT
+    -A INPUT -p tcp --dport 8080 -j ACCEPT
+    -A INPUT -s 10.77.1.0/24 -p tcp --dport 9100 -j ACCEPT
+    COMMIT
+    EOF
+    sudo ip netns exec kl-fw iptables-restore < /etc/kl-fw/rules.v4
+
+- id: linux-093
+  title: A private CA for mutual TLS
+  difficulty: 5
+  kind: build
+  tags: [tls, pki, openssl, mtls, nginx, x509-extensions, docker]
+  tutorial: |
+    **Concept.** A small private **certificate authority** is a key plus a self-signed
+    certificate marked `basicConstraints=CA:TRUE`. It signs certificates for your
+    services, and anything that trusts the CA certificate trusts them. Extensions say
+    what each certificate is for:
+
+    - **`subjectAltName`**: the DNS names and IP addresses a server certificate covers.
+      Clients ignore the CN.
+    - **`extendedKeyUsage`**: `serverAuth` for servers, `clientAuth` for clients.
+
+    In **mutual TLS** the server also asks the *client* for a certificate and checks it
+    against the CA (`ssl_client_certificate` + `ssl_verify_client on` in nginx). Without
+    a valid client certificate, nginx answers `400`.
+
+    **Read up on:**
+    - `openssl genpkey`, `openssl req -x509 -new`, `openssl req -new`
+    - `openssl x509 -req -CA -CAkey -CAcreateserial -extfile`, `man x509v3_config`
+    - `openssl verify -CAfile ca.crt -purpose sslserver|sslclient`
+    - nginx `ssl_client_certificate`, `ssl_verify_client`; `curl --cert --key --cacert`
+  scenario: |
+    The internal API **`api.kl.test`** must only answer clients that present a
+    certificate from your own CA. Build everything in **`/lab/pki`**:
+
+    - **`ca.key`** (mode **600**) and **`ca.crt`**: a CA certificate,
+      `basicConstraints` **critical, CA:TRUE**
+    - **`server.key`** and **`server.crt`**: signed by the CA, valid for **`DNS:api.kl.test`**
+      and **`IP:127.0.0.1`**, extended key usage **serverAuth**
+    - **`client.key`** and **`client.crt`**: signed by the CA, CN **`kl-agent`**,
+      extended key usage **clientAuth** only
+
+    Complete **`/lab/pki/nginx.conf`** (it already answers `kl-api ok`) so nginx serves
+    TLS with the server certificate and **requires a client certificate signed by your
+    CA**, then run it:
+
+    ```
+    docker run -d --name kl-mtls -p 127.0.0.1:9443:443 -v /lab/pki:/etc/nginx/pki:ro \
+      nginx:1.27-alpine nginx -c /etc/nginx/pki/nginx.conf -g 'daemon off;'
+    ```
+
+    With the client certificate, `https://api.kl.test:9443/` and `https://127.0.0.1:9443/`
+    must return `kl-api ok`. Without one, or with one from another CA, they must not.
+  hints:
+    - "Keys: `openssl genpkey -algorithm EC -pkeyopt ec_paramgen_curve:P-256 -out ca.key`. For the CA, write a small config with a `[req]` section (`distinguished_name`, `prompt = no`), a `[dn]` section with the CN and a `[v3]` section with `basicConstraints = critical,CA:TRUE` and `keyUsage = critical,keyCertSign,cRLSign`, then `openssl req -x509 -new -key ca.key -config ca.cnf -extensions v3 -days 3650 -out ca.crt`."
+    - "For each leaf: `openssl req -new -key X.key -subj /CN=... -out X.csr`, then `openssl x509 -req -in X.csr -CA ca.crt -CAkey ca.key -CAcreateserial -days 365 -extfile X.ext -out X.crt`. Put `subjectAltName=` and `extendedKeyUsage=` lines in the `.ext` file."
+    - "nginx: `ssl_certificate`, `ssl_certificate_key`, `ssl_client_certificate /etc/nginx/pki/ca.crt;` and `ssl_verify_client on;`. `docker logs kl-mtls` shows config errors."
+    - "Test: `curl --cacert ca.crt --cert client.crt --key client.key --resolve api.kl.test:9443:127.0.0.1 https://api.kl.test:9443/`, and the same without `--cert/--key` (expect 400)."
+  solution: |
+    ```bash
+    cd /lab/pki
+    k() { openssl genpkey -algorithm EC -pkeyopt ec_paramgen_curve:P-256 -out "$1"; chmod 600 "$1"; }
+    k ca.key; k server.key; k client.key
+    printf '[req]\ndistinguished_name=dn\nprompt=no\n[dn]\nCN=KL Internal CA\n[v3]\nbasicConstraints=critical,CA:TRUE\nkeyUsage=critical,keyCertSign,cRLSign\nsubjectKeyIdentifier=hash\n' > ca.cnf
+    openssl req -x509 -new -key ca.key -config ca.cnf -extensions v3 -days 3650 -out ca.crt
+
+    printf 'basicConstraints=CA:FALSE\nkeyUsage=critical,digitalSignature\nextendedKeyUsage=serverAuth\nsubjectAltName=DNS:api.kl.test,IP:127.0.0.1\n' > server.ext
+    openssl req -new -key server.key -subj /CN=api.kl.test -out server.csr
+    openssl x509 -req -in server.csr -CA ca.crt -CAkey ca.key -CAcreateserial -days 365 -extfile server.ext -out server.crt
+
+    printf 'basicConstraints=CA:FALSE\nkeyUsage=critical,digitalSignature\nextendedKeyUsage=clientAuth\n' > client.ext
+    openssl req -new -key client.key -subj /CN=kl-agent -out client.csr
+    openssl x509 -req -in client.csr -CA ca.crt -CAkey ca.key -CAcreateserial -days 365 -extfile client.ext -out client.crt
+    ```
+
+    In `nginx.conf`, inside `server { ... }`:
+
+    ```nginx
+    ssl_certificate        /etc/nginx/pki/server.crt;
+    ssl_certificate_key    /etc/nginx/pki/server.key;
+    ssl_client_certificate /etc/nginx/pki/ca.crt;
+    ssl_verify_client      on;
+    ```
+
+    Then start the container with the `docker run` command from the task and test with `curl`.
+  setup: |
+    on_reset 'docker rm -f kl-mtls >/dev/null 2>&1; true'
+    docker rm -f kl-mtls >/dev/null 2>&1
+    rm -rf /lab/pki
+    lab_file /lab/pki/nginx.conf <<'EOF'
+    worker_processes 1;
+    error_log stderr;
+    events {}
+    http {
+      server {
+        listen 443 ssl;
+        server_name api.kl.test;
+
+        # TODO: the server certificate and its key
+
+        # TODO: accept only clients with a certificate from our CA
+
+        location / {
+          default_type text/plain;
+          return 200 "kl-api ok\n";
+        }
+      }
+    }
+    EOF
+  check: |
+    p=/lab/pki
+    for f in ca.key ca.crt server.key server.crt client.key client.crt; do check "$f exists" "[ -s $p/$f ]"; done
+    check_eq "ca.key is private" "$(stat -c %a $p/ca.key 2>/dev/null)" 600
+    check_match "the CA has basicConstraints critical, CA:TRUE" "$(openssl x509 -in $p/ca.crt -noout -ext basicConstraints 2>/dev/null | tr -d '\n')" 'critical.*CA:TRUE'
+    check "the CA certificate is self-signed" 'openssl verify -CAfile $p/ca.crt $p/ca.crt'
+    check "the server certificate is signed by the CA, for servers" 'openssl verify -CAfile $p/ca.crt -purpose sslserver $p/server.crt'
+    san=$(openssl x509 -in $p/server.crt -noout -ext subjectAltName 2>/dev/null)
+    check "the server certificate covers DNS:api.kl.test" 'grep -q "DNS:api.kl.test" <<<"$san"'
+    check "the server certificate covers IP 127.0.0.1" 'grep -q "IP Address:127.0.0.1" <<<"$san"'
+    check "the client certificate is signed by the CA, for clients" 'openssl verify -CAfile $p/ca.crt -purpose sslclient $p/client.crt'
+    check "the client certificate is for client authentication only" 'openssl x509 -in $p/client.crt -noout -ext extendedKeyUsage | grep -q "TLS Web Client Authentication" && ! openssl verify -CAfile $p/ca.crt -purpose sslserver $p/client.crt'
+    check_eq "the client certificate's CN" "$(openssl x509 -in $p/client.crt -noout -subject -nameopt multiline 2>/dev/null | awk -F' = ' '/commonName/ {print $2}')" kl-agent
+    pubeq() { [ -n "$(openssl x509 -in $1 -noout -pubkey 2>/dev/null)" ] && [ "$(openssl x509 -in $1 -noout -pubkey 2>/dev/null | sha256sum)" = "$(openssl pkey -in $2 -pubout 2>/dev/null | sha256sum)" ]; }
+    check "server.key belongs to server.crt" 'pubeq $p/server.crt $p/server.key'
+    check "client.key belongs to client.crt" 'pubeq $p/client.crt $p/client.key'
+    check "kl-mtls is running" 'eventually 10 c_running kl-mtls'
+    U=https://api.kl.test:9443/
+    R="--resolve api.kl.test:9443:127.0.0.1"
+    check_eq "with the client certificate (by name)" "$(curl -s -m 5 $R --cacert $p/ca.crt --cert $p/client.crt --key $p/client.key $U)" "kl-api ok"
+    check_eq "with the client certificate (by IP)" "$(curl -s -m 5 --cacert $p/ca.crt --cert $p/client.crt --key $p/client.key https://127.0.0.1:9443/)" "kl-api ok"
+    check_eq "without a client certificate" "$(curl -s -o /dev/null -w '%{http_code}' -m 5 $R --cacert $p/ca.crt $U)" 400
+    W=$(mktemp -d)
+    openssl req -x509 -newkey ec -pkeyopt ec_paramgen_curve:P-256 -nodes -keyout $W/ca.key -out $W/ca.crt -subj "/CN=Rogue CA" -days 30 >/dev/null 2>&1
+    openssl req -new -newkey ec -pkeyopt ec_paramgen_curve:P-256 -nodes -keyout $W/c.key -out $W/c.csr -subj /CN=kl-agent >/dev/null 2>&1
+    printf 'extendedKeyUsage=clientAuth\n' > $W/c.ext
+    openssl x509 -req -in $W/c.csr -CA $W/ca.crt -CAkey $W/ca.key -CAcreateserial -days 30 -extfile $W/c.ext -out $W/c.crt >/dev/null 2>&1
+    check_not "a client certificate from another CA is refused" '[ "$(curl -s -m 5 $R --cacert $p/ca.crt --cert $W/c.crt --key $W/c.key $U)" = "kl-api ok" ]'
+    rm -rf $W
+  solve: |
+    cd /lab/pki
+    k() { openssl genpkey -algorithm EC -pkeyopt ec_paramgen_curve:P-256 -out "$1" 2>/dev/null; chmod 600 "$1"; }
+    k ca.key; k server.key; k client.key
+    printf '[req]\ndistinguished_name=dn\nprompt=no\n[dn]\nCN=KL Internal CA\n[v3]\nbasicConstraints=critical,CA:TRUE\nkeyUsage=critical,keyCertSign,cRLSign\nsubjectKeyIdentifier=hash\n' > ca.cnf
+    openssl req -x509 -new -key ca.key -config ca.cnf -extensions v3 -days 3650 -out ca.crt
+    printf 'basicConstraints=CA:FALSE\nkeyUsage=critical,digitalSignature\nextendedKeyUsage=serverAuth\nsubjectAltName=DNS:api.kl.test,IP:127.0.0.1\n' > server.ext
+    openssl req -new -key server.key -subj /CN=api.kl.test -out server.csr
+    openssl x509 -req -in server.csr -CA ca.crt -CAkey ca.key -CAcreateserial -days 365 -extfile server.ext -out server.crt 2>/dev/null
+    printf 'basicConstraints=CA:FALSE\nkeyUsage=critical,digitalSignature\nextendedKeyUsage=clientAuth\n' > client.ext
+    openssl req -new -key client.key -subj /CN=kl-agent -out client.csr
+    openssl x509 -req -in client.csr -CA ca.crt -CAkey ca.key -CAcreateserial -days 365 -extfile client.ext -out client.crt 2>/dev/null
+    chmod 644 ca.crt server.crt client.crt
+    cat > nginx.conf <<'EOF'
+    worker_processes 1;
+    error_log stderr;
+    events {}
+    http {
+      server {
+        listen 443 ssl;
+        server_name api.kl.test;
+        ssl_certificate        /etc/nginx/pki/server.crt;
+        ssl_certificate_key    /etc/nginx/pki/server.key;
+        ssl_client_certificate /etc/nginx/pki/ca.crt;
+        ssl_verify_client      on;
+        location / {
+          default_type text/plain;
+          return 200 "kl-api ok\n";
+        }
+      }
+    }
+    EOF
+    docker rm -f kl-mtls >/dev/null 2>&1 || true
+    docker run -d --name kl-mtls -p 127.0.0.1:9443:443 -v /lab/pki:/etc/nginx/pki:ro nginx:1.27-alpine nginx -c /etc/nginx/pki/nginx.conf -g 'daemon off;' >/dev/null
+    sleep 2
+
+- id: linux-094
+  title: "Incident: the inventory API after the security review"
+  difficulty: 5
+  kind: fix
+  tags: [incident, tls, systemd, sandboxing, permissions, hosts]
+  tutorial: |
+    **Concept.** Hardening changes break things in layers: fix one and the next one
+    shows. Work from the evidence (`systemctl status`, `journalctl -u`, then the client's
+    error message) and fix each cause properly, **without undoing the hardening that
+    caused it**. For TLS, read the client's error carefully. *Could not resolve*,
+    *connection timed out*, *certificate has expired* and *unable to get local issuer*
+    each point somewhere else.
+
+    **Read up on:**
+    - `systemctl status`, `journalctl -u UNIT -n 50`, `systemctl reset-failed`
+    - `ReadWritePaths=` / `StateDirectory=` with `ProtectSystem=strict`
+    - `getent hosts NAME`, `/etc/hosts`
+    - `openssl x509 -noout -dates -ext subjectAltName`, issuing a certificate with
+      `openssl req -new` + `openssl x509 -req -CA ... -CAkey ...`
+    - `curl -v --cacert`
+  scenario: |
+    Since last week's security review, the internal **inventory API** is down.
+
+    - **`kl-inventory.service`** runs `/opt/kl-inventory/app.py` as the user
+      **`kl-inventory`**. It serves HTTPS on **127.0.0.1:8444** with the key and
+      certificate in **`/etc/kl-inventory/tls/`** (`server.key`, `server.crt`), and it
+      records every health check in **`/var/lib/kl-inventory/cache/`**.
+    - Certificates come from the internal CA in **`/etc/kl-ca/`** (`ca.crt`, and its key
+      `ca.key`).
+
+    Get it working again, so that this command on the host prints **`ok`**:
+
+    ```
+    curl --cacert /etc/kl-ca/ca.crt https://inventory.kl.test:8444/health
+    ```
+
+    The review's decisions stay:
+
+    - the service keeps running as `kl-inventory` with **`ProtectSystem=strict`,
+      `ProtectHome=yes`, `PrivateTmp=yes` and `NoNewPrivileges=yes`**
+    - the TLS private key must **not be readable by other users**
+    - the CA key stays `root`-only (mode 600)
+    - don't change `app.py`
+
+    The certificate the service uses must be signed by the internal CA, be valid for
+    `inventory.kl.test`, and have **at least 30 days** left.
+  hints:
+    - "`journalctl -u kl-inventory -n 20` after every attempt: each fix reveals the next problem. `sudo systemctl reset-failed kl-inventory` lets you start it again right away."
+    - "First failure: the sandbox makes `/var/lib/kl-inventory` read-only. A drop-in with `ReadWritePaths=` (or `StateDirectory=`) opens it without loosening the rest."
+    - "Next: who can read `server.key`? `chgrp kl-inventory` and `chmod 640` keep it private."
+    - "Then follow `curl -v`: `getent hosts inventory.kl.test` (the address is stale), and `openssl x509 -in /etc/kl-inventory/tls/server.crt -noout -dates`. Re-issue it with the CA, `subjectAltName=DNS:inventory.kl.test`, and restart the service."
+  solution: |
+    ```bash
+    systemctl status kl-inventory; journalctl -u kl-inventory -n 20
+    # 1. the sandbox: let it write its state directory
+    printf '[Service]\nReadWritePaths=/var/lib/kl-inventory\n' | sudo tee /etc/systemd/system/kl-inventory.service.d/state.conf
+    # 2. the key: private, but readable by the service's group
+    sudo chgrp kl-inventory /etc/kl-inventory/tls/server.key
+    sudo chmod 640 /etc/kl-inventory/tls/server.key
+    # 3. the name: a stale /etc/hosts entry
+    getent hosts inventory.kl.test
+    sudo sed -i '/inventory\.kl\.test/d' /etc/hosts
+    echo '127.0.0.1 inventory.kl.test' | sudo tee -a /etc/hosts
+    # 4. the certificate expired: re-issue it from the internal CA
+    openssl x509 -in /etc/kl-inventory/tls/server.crt -noout -dates
+    cd "$(mktemp -d)"
+    sudo openssl req -new -key /etc/kl-inventory/tls/server.key -subj /CN=inventory.kl.test -out server.csr
+    printf 'subjectAltName=DNS:inventory.kl.test\nextendedKeyUsage=serverAuth\n' > server.ext
+    sudo openssl x509 -req -in server.csr -CA /etc/kl-ca/ca.crt -CAkey /etc/kl-ca/ca.key -CAcreateserial -days 365 -extfile server.ext -out server.crt
+    sudo install -m 644 server.crt /etc/kl-inventory/tls/server.crt
+    sudo systemctl daemon-reload
+    sudo systemctl reset-failed kl-inventory
+    sudo systemctl restart kl-inventory
+    curl --cacert /etc/kl-ca/ca.crt https://inventory.kl.test:8444/health
+    ```
+  setup: |
+    on_reset 'systemctl stop kl-inventory 2>/dev/null; rm -rf /etc/systemd/system/kl-inventory.service /etc/systemd/system/kl-inventory.service.d /opt/kl-inventory /etc/kl-inventory /etc/kl-ca /var/lib/kl-inventory; sed -i "/inventory\.kl\.test/d" /etc/hosts; systemctl daemon-reload; systemctl reset-failed kl-inventory 2>/dev/null; userdel kl-inventory 2>/dev/null; groupdel kl-inventory 2>/dev/null; true'
+    systemctl stop kl-inventory 2>/dev/null
+    getent group kl-inventory >/dev/null || groupadd -r kl-inventory
+    id kl-inventory >/dev/null 2>&1 || useradd -r -g kl-inventory -M -s /usr/sbin/nologin kl-inventory
+    rm -rf /etc/kl-ca /etc/kl-inventory /opt/kl-inventory /var/lib/kl-inventory /etc/systemd/system/kl-inventory.service.d
+    # the internal CA
+    mkdir -p /etc/kl-ca
+    openssl genpkey -algorithm EC -pkeyopt ec_paramgen_curve:P-256 -out /etc/kl-ca/ca.key 2>/dev/null
+    chmod 600 /etc/kl-ca/ca.key
+    printf '[req]\ndistinguished_name=dn\nprompt=no\n[dn]\nCN=KL Internal CA\n[v3]\nbasicConstraints=critical,CA:TRUE\nkeyUsage=critical,keyCertSign,cRLSign\nsubjectKeyIdentifier=hash\n' > /etc/kl-ca/ca.cnf
+    openssl req -x509 -new -key /etc/kl-ca/ca.key -config /etc/kl-ca/ca.cnf -extensions v3 -days 3650 -out /etc/kl-ca/ca.crt 2>/dev/null
+    rm -f /etc/kl-ca/ca.cnf; chmod 644 /etc/kl-ca/ca.crt
+    # last year's server certificate, issued by that CA and now expired
+    mkdir -p /etc/kl-inventory/tls
+    openssl genpkey -algorithm EC -pkeyopt ec_paramgen_curve:P-256 -out /etc/kl-inventory/tls/server.key 2>/dev/null
+    W=$(mktemp -d)
+    cat > $W/ca.cnf <<EOF
+    [ca]
+    default_ca = d
+    [d]
+    dir = $W
+    database = $W/index.txt
+    new_certs_dir = $W
+    serial = $W/serial
+    default_md = sha256
+    policy = p
+    unique_subject = no
+    copy_extensions = copy
+    [p]
+    commonName = supplied
+    EOF
+    : > $W/index.txt; echo 2000 > $W/serial
+    openssl req -new -key /etc/kl-inventory/tls/server.key -subj /CN=inventory.kl.test -addext subjectAltName=DNS:inventory.kl.test -out $W/r.csr 2>/dev/null
+    openssl ca -batch -config $W/ca.cnf -cert /etc/kl-ca/ca.crt -keyfile /etc/kl-ca/ca.key -in $W/r.csr -out /etc/kl-inventory/tls/server.crt -notext \
+      -startdate "$(date -u -d '-380 days' +%Y%m%d%H%M%SZ)" -enddate "$(date -u -d '-15 days' +%Y%m%d%H%M%SZ)" >/dev/null 2>&1
+    rm -rf $W
+    chown root:root /etc/kl-inventory/tls/server.key; chmod 600 /etc/kl-inventory/tls/server.key
+    chmod 644 /etc/kl-inventory/tls/server.crt
+    # the application
+    install -d -o kl-inventory -g kl-inventory -m 0750 /var/lib/kl-inventory /var/lib/kl-inventory/cache
+    mkdir -p /opt/kl-inventory
+    cat > /opt/kl-inventory/app.py <<'EOF'
+    import http.server, os, ssl, time
+    CACHE = "/var/lib/kl-inventory/cache"
+    TLS = "/etc/kl-inventory/tls"
+    with open(os.path.join(CACHE, "started"), "w") as f:
+        f.write("%d\n" % time.time())
+
+    class Handler(http.server.BaseHTTPRequestHandler):
+        def do_GET(self):
+            if self.path != "/health":
+                self.send_error(404)
+                return
+            with open(os.path.join(CACHE, "last-health"), "w") as f:
+                f.write("%d\n" % time.time())
+            body = b"ok\n"
+            self.send_response(200)
+            self.send_header("Content-Type", "text/plain")
+            self.send_header("Content-Length", str(len(body)))
+            self.end_headers()
+            self.wfile.write(body)
+
+        def log_message(self, *args):
+            pass
+
+    ctx = ssl.SSLContext(ssl.PROTOCOL_TLS_SERVER)
+    ctx.load_cert_chain(os.path.join(TLS, "server.crt"), os.path.join(TLS, "server.key"))
+    srv = http.server.HTTPServer(("127.0.0.1", 8444), Handler)
+    srv.socket = ctx.wrap_socket(srv.socket, server_side=True)
+    print("inventory API on https://127.0.0.1:8444", flush=True)
+    srv.serve_forever()
+    EOF
+    chmod 644 /opt/kl-inventory/app.py
+    sha1sum /opt/kl-inventory/app.py > "$KL_STATE/inv.sum"
+    cat > /etc/systemd/system/kl-inventory.service <<'EOF'
+    [Unit]
+    Description=Lab inventory API (HTTPS on 127.0.0.1:8444)
+
+    [Service]
+    User=kl-inventory
+    ExecStart=/usr/bin/python3 /opt/kl-inventory/app.py
+    Restart=on-failure
+    RestartSec=2
+
+    [Install]
+    WantedBy=multi-user.target
+    EOF
+    mkdir -p /etc/systemd/system/kl-inventory.service.d
+    cat > /etc/systemd/system/kl-inventory.service.d/hardening.conf <<'EOF'
+    # security review 2026-11: sandbox the inventory API
+    [Service]
+    ProtectSystem=strict
+    ProtectHome=yes
+    PrivateTmp=yes
+    NoNewPrivileges=yes
+    EOF
+    # the API used to live on another host
+    sed -i '/inventory\.kl\.test/d' /etc/hosts
+    echo '10.250.0.9 inventory.kl.test' >> /etc/hosts
+    systemctl daemon-reload
+    systemctl start kl-inventory 2>/dev/null || true
+  check: |
+    show() { systemctl show -p "$1" --value kl-inventory; }
+    k=/etc/kl-inventory/tls/server.key c=/etc/kl-inventory/tls/server.crt
+    check "app.py is unchanged" 'sha1sum -c --status "$KL_STATE/inv.sum"'
+    check "kl-inventory is running" 'eventually 10 "systemctl is-active -q kl-inventory"'
+    check_eq "it runs as" "$(show User)" kl-inventory
+    check_eq "ProtectSystem" "$(show ProtectSystem)" strict
+    check_eq "ProtectHome" "$(show ProtectHome)" yes
+    check_eq "PrivateTmp" "$(show PrivateTmp)" yes
+    check_eq "NoNewPrivileges" "$(show NoNewPrivileges)" yes
+    check_eq "other users can't read the key" "$(( 0$(stat -c %a $k 2>/dev/null || echo 777) & 4 ))" 0
+    check "the service user can read the key" 'sudo -u kl-inventory head -c1 $k'
+    check_eq "the CA key is still root-only" "$(stat -c '%U %a' /etc/kl-ca/ca.key 2>/dev/null)" "root 600"
+    check "the certificate is signed by the internal CA (and not expired)" 'openssl verify -CAfile /etc/kl-ca/ca.crt $c'
+    check "the certificate has 30 more days" 'openssl x509 -in $c -noout -checkend 2592000'
+    check "the certificate is for inventory.kl.test" 'openssl x509 -in $c -noout -ext subjectAltName | grep -q "DNS:inventory.kl.test"'
+    rm -f /var/lib/kl-inventory/cache/last-health
+    check_eq "the health check" "$(curl -sS -m 5 --cacert /etc/kl-ca/ca.crt https://inventory.kl.test:8444/health 2>&1)" ok
+    check "the health check is recorded" '[ -f /var/lib/kl-inventory/cache/last-health ]'
+  solve: |
+    sudo mkdir -p /etc/systemd/system/kl-inventory.service.d
+    printf '[Service]\nReadWritePaths=/var/lib/kl-inventory\n' | sudo tee /etc/systemd/system/kl-inventory.service.d/state.conf >/dev/null
+    sudo chgrp kl-inventory /etc/kl-inventory/tls/server.key
+    sudo chmod 640 /etc/kl-inventory/tls/server.key
+    sudo sed -i '/inventory\.kl\.test/d' /etc/hosts
+    echo '127.0.0.1 inventory.kl.test' | sudo tee -a /etc/hosts >/dev/null
+    w=$(mktemp -d)
+    sudo openssl req -new -key /etc/kl-inventory/tls/server.key -subj /CN=inventory.kl.test -out "$w/server.csr"
+    printf 'subjectAltName=DNS:inventory.kl.test\nextendedKeyUsage=serverAuth\n' > "$w/server.ext"
+    sudo openssl x509 -req -in "$w/server.csr" -CA /etc/kl-ca/ca.crt -CAkey /etc/kl-ca/ca.key -CAcreateserial -days 365 -extfile "$w/server.ext" -out "$w/server.crt" 2>/dev/null
+    sudo install -m 644 "$w/server.crt" /etc/kl-inventory/tls/server.crt
+    sudo rm -rf "$w"
+    sudo systemctl daemon-reload
+    sudo systemctl reset-failed kl-inventory
+    sudo systemctl restart kl-inventory
+    for i in $(seq 1 20); do curl -s -m 2 --cacert /etc/kl-ca/ca.crt https://inventory.kl.test:8444/health >/dev/null && break; sleep 0.5; done

@@ -1,0 +1,1746 @@
+track: terraform
+module: Terraform in automation
+profile: docker
+order: 7
+exercises:
+
+- id: tf-071
+  title: Apply exactly the approved plan
+  difficulty: 1
+  kind: build
+  tags: [terraform, plan, saved-plan, apply, review]
+  tutorial: |
+    **Concept.** `terraform plan -out=FILE` saves a plan: the exact actions,
+    the state they were planned against, and the variable values used.
+    Someone reviews it with `terraform show FILE`, and `terraform apply FILE`
+    then carries out **exactly** those actions without asking again. The
+    review was the approval. Pipelines use this so the thing applied is the
+    thing that was reviewed, not a fresh plan that might differ.
+
+    **Read up on:**
+    - `terraform plan -out=FILE`
+    - `terraform show FILE`
+    - `terraform apply FILE` vs `terraform apply`
+  scenario: |
+    In **`/lab/release`**, the release manager reviewed and approved the saved
+    plan **`approved.tfplan`**. Check what it does, then apply **exactly that
+    plan**, so that **`VERSION`** holds the release number that was approved.
+
+    Don't edit the configuration, and don't make a new plan.
+  hints:
+    - "`terraform show approved.tfplan` prints the plan in readable form."
+    - "A plain `terraform apply` makes a new plan with the default variable values. Give `apply` the plan file instead."
+  solution: |
+    ```bash
+    cd /lab/release
+    terraform show approved.tfplan
+    terraform apply approved.tfplan
+    cat VERSION
+    ```
+  setup: |
+    tf_start
+    rm -rf /lab/release
+    v="1.$((RANDOM % 20 + 2)).$((RANDOM % 10))"
+    lab_file /lab/release/main.tf <<'EOF'
+    variable "release" {
+      type    = string
+      default = "0.0.0-dev"
+    }
+
+    resource "local_file" "version" {
+      filename = "${path.module}/VERSION"
+      content  = "${var.release}\n"
+    }
+    EOF
+    tf_as_user /lab/release init -input=false -no-color >/dev/null
+    tf_as_user /lab/release plan -input=false -no-color -var "release=$v" -out=approved.tfplan >/dev/null
+    echo "$v" > "$KL_STATE/answer"
+    sha256sum /lab/release/main.tf > "$KL_STATE/sums"
+  check: |
+    check "local_file.version is managed" 'tf_has /lab/release local_file.version'
+    check_eq "VERSION holds the approved release" "$(cat /lab/release/VERSION 2>/dev/null)" "$(cat "$KL_STATE/answer")"
+    check "main.tf is unchanged" 'sha256sum -c --quiet "$KL_STATE/sums"'
+  solve: |
+    cd /lab/release
+    terraform show -no-color approved.tfplan
+    terraform apply -input=false -no-color approved.tfplan
+
+- id: tf-072
+  title: A drift alarm for the nightly job
+  difficulty: 2
+  kind: build
+  tags: [terraform, plan, detailed-exitcode, drift, scripting]
+  tutorial: |
+    **Concept.** A plain `terraform plan` exits 0 whether or not it found
+    changes, so a script can't tell "all good" from "something drifted".
+    With **`-detailed-exitcode`** the exit status carries the answer: **0**
+    means no changes, **2** means the plan has changes, and **1** means the
+    plan failed. A scheduled job that only plans, never applies, is a cheap
+    drift alarm.
+
+    **Read up on:**
+    - `terraform plan -detailed-exitcode`
+    - `-input=false` and `-no-color` in scripts
+    - `$?` and `case` in bash
+  scenario: |
+    Write **`/lab/alarm/drift.sh`** (executable) for the nightly drift job.
+    Run from `/lab/alarm`, it plans the configuration there and **never
+    changes anything**. The **last line** it prints and its **exit status**
+    must be:
+
+    | situation | last line | exit status |
+    |---|---|---|
+    | the plan has no changes | `clean` | 0 |
+    | the plan has changes (drift) | `drift` | 2 |
+    | the plan fails | `error` | 1 |
+
+    The check runs it three times: as things are, after deleting a managed
+    file, and with a broken `.tf` file added.
+  hints:
+    - "`terraform plan -detailed-exitcode` already returns 0, 2 or 1. Your script only has to turn that into a word."
+    - "Save `$?` straight after the plan. With `set -e`, exit status 2 would end the script before you can read it."
+    - "Send Terraform's own output to `/dev/null` so the word is the last thing printed."
+  solution: |
+    ```bash
+    cd /lab/alarm
+    cat > drift.sh <<'EOF'
+    #!/bin/bash
+    # Nightly drift job: plan only, report clean / drift / error.
+    cd "$(dirname "$0")"
+    terraform plan -detailed-exitcode -input=false -no-color >/dev/null 2>&1
+    case $? in
+      0) echo clean; exit 0 ;;
+      2) echo drift; exit 2 ;;
+      *) echo error; exit 1 ;;
+    esac
+    EOF
+    chmod +x drift.sh
+    ./drift.sh; echo "exit $?"
+    ```
+  setup: |
+    tf_start
+    rm -rf /lab/alarm
+    lab_file /lab/alarm/main.tf <<'EOF'
+    resource "local_file" "motd" {
+      filename = "${path.module}/motd.txt"
+      content  = "Authorised use only.\n"
+    }
+
+    resource "local_file" "limits" {
+      filename = "${path.module}/limits.conf"
+      content  = "max_sessions=10\n"
+    }
+    EOF
+    tf_as_user /lab/alarm init -input=false -no-color >/dev/null
+    tf_as_user /lab/alarm apply -auto-approve -input=false -no-color >/dev/null
+  check: |
+    d=/lab/alarm
+    run() { out=$(as_user "cd $d && timeout 120 ./drift.sh" 2>/dev/null); rc=$?; last=$(printf '%s\n' "$out" | tail -n1); }
+    check "drift.sh is executable" '[ -x $d/drift.sh ]'
+    run
+    check_eq "no changes: last line and exit status" "$last $rc" "clean 0"
+    mv $d/motd.txt $d/.kl-motd 2>/dev/null
+    run
+    check_eq "a managed file was deleted: last line and exit status" "$last $rc" "drift 2"
+    check_not "drift.sh did not put the file back (it must not apply)" '[ -e $d/motd.txt ]'
+    mv -f $d/.kl-motd $d/motd.txt 2>/dev/null
+    printf 'resource "local_file" "broken" {\n' > $d/zz-kl-broken.tf
+    run
+    rm -f $d/zz-kl-broken.tf
+    check_eq "a broken configuration: last line and exit status" "$last $rc" "error 1"
+    check "the plan is clean again" 'tf_clean $d'
+  solve: |
+    cd /lab/alarm
+    cat > drift.sh <<'EOF'
+    #!/bin/bash
+    # Nightly drift job: plan only, report clean / drift / error.
+    cd "$(dirname "$0")"
+    terraform plan -detailed-exitcode -input=false -no-color >/dev/null 2>&1
+    case $? in
+      0) echo clean; exit 0 ;;
+      2) echo drift; exit 2 ;;
+      *) echo error; exit 1 ;;
+    esac
+    EOF
+    chmod +x drift.sh
+    ./drift.sh
+
+- id: tf-073
+  title: The pipeline that waits for input
+  difficulty: 2
+  kind: fix
+  tags: [terraform, automation, tf_var, input, auto-approve]
+  tutorial: |
+    **Concept.** On a CI runner nobody is there to type. Terraform asks
+    questions in two places: a required variable with no value, and the
+    "Do you want to perform these actions?" prompt. In automation, pass
+    **`-input=false`** so a missing value is an error instead of a prompt,
+    pass **`-auto-approve`** (or apply a saved plan), and feed variables
+    from the environment: **`TF_VAR_<name>`** sets `var.<name>`. The lab's
+    `terraform` command forwards every exported `TF_*` variable into the
+    Terraform container.
+
+    **Read up on:**
+    - `TF_VAR_name` environment variables
+    - `-input=false`, `-auto-approve`
+    - `TF_IN_AUTOMATION`
+  scenario: |
+    The CI runner calls **`/lab/pipe/ci.sh`** with the target environment in
+    the variable **`DEPLOY_ENV`** and **no terminal** (stdin is closed).
+    Today the job dies at the first question Terraform asks.
+
+    Fix **`ci.sh`** (leave `main.tf` alone) so that
+    `DEPLOY_ENV=<name> ./ci.sh </dev/null` runs unattended, **exits 0**, and
+    leaves **`deployed.txt`** containing `environment=<name>`.
+
+    Don't hard-code a name: the check runs the script twice with two names
+    it makes up.
+  hints:
+    - "Run it the way CI does: `DEPLOY_ENV=qa ./ci.sh </dev/null`, and read the error."
+    - "`export TF_VAR_environment=\"$DEPLOY_ENV\"` sets `var.environment`."
+    - "`terraform apply -input=false -auto-approve` never waits for a person."
+  solution: |
+    ```bash
+    cd /lab/pipe
+    cat > ci.sh <<'EOF'
+    #!/bin/bash
+    # Deploy job. The CI runner calls:  DEPLOY_ENV=<environment> ./ci.sh
+    set -euo pipefail
+    cd "$(dirname "$0")"
+    export TF_IN_AUTOMATION=1
+    export TF_VAR_environment="$DEPLOY_ENV"
+
+    terraform init -input=false
+    terraform apply -input=false -auto-approve
+    EOF
+    DEPLOY_ENV=qa ./ci.sh </dev/null
+    cat deployed.txt
+    ```
+  setup: |
+    tf_start
+    rm -rf /lab/pipe
+    lab_file /lab/pipe/main.tf <<'EOF'
+    variable "environment" {
+      type = string
+    }
+
+    resource "local_file" "env" {
+      filename = "${path.module}/deployed.txt"
+      content  = "environment=${var.environment}\n"
+    }
+    EOF
+    lab_file /lab/pipe/ci.sh 0755 <<'EOF'
+    #!/bin/bash
+    # Deploy job. The CI runner calls:  DEPLOY_ENV=<environment> ./ci.sh
+    set -euo pipefail
+    cd "$(dirname "$0")"
+
+    terraform init
+    terraform apply
+    EOF
+    sha256sum /lab/pipe/main.tf > "$KL_STATE/sums"
+  check: |
+    d=/lab/pipe
+    check "main.tf is unchanged" 'sha256sum -c --quiet "$KL_STATE/sums"'
+    for e in "qa-$RANDOM" "canary-$RANDOM"; do
+      as_user "cd $d && DEPLOY_ENV=$e timeout 180 ./ci.sh </dev/null" >/dev/null 2>&1
+      check_eq "DEPLOY_ENV=$e ./ci.sh exits 0" "$?" 0
+      check_eq "deployed.txt after the $e run" "$(cat $d/deployed.txt 2>/dev/null)" "environment=$e"
+    done
+  solve: |
+    cd /lab/pipe
+    cat > ci.sh <<'EOF'
+    #!/bin/bash
+    # Deploy job. The CI runner calls:  DEPLOY_ENV=<environment> ./ci.sh
+    set -euo pipefail
+    cd "$(dirname "$0")"
+    export TF_IN_AUTOMATION=1
+    export TF_VAR_environment="$DEPLOY_ENV"
+
+    terraform init -input=false -no-color
+    terraform apply -input=false -auto-approve -no-color
+    EOF
+    chmod +x ci.sh
+    DEPLOY_ENV=dev ./ci.sh </dev/null
+
+- id: tf-074
+  title: The plan that ignores main.tf
+  difficulty: 3
+  kind: fix
+  tags: [terraform, override-files, troubleshooting, ci]
+  tutorial: |
+    **Concept.** Terraform loads every `.tf` **and `.tf.json`** file in the
+    directory. Files named `override.tf`, `override.tf.json`, or ending in
+    **`_override.tf`** / **`_override.tf.json`** are special: they're loaded
+    last and *merged into* the blocks they name, replacing individual
+    arguments. CI systems and developers drop them in to tweak a setting
+    without touching the real files, and a forgotten one makes the
+    configuration behave differently from what the main files say, with
+    no error and no warning.
+
+    **Read up on:**
+    - Override files and how they merge
+    - The JSON configuration syntax (`.tf.json`)
+    - `ls -a`: not every configuration file ends in `.tf`
+  scenario: |
+    In **`/lab/api`**, `main.tf` declares `log_level = info` and
+    `port = 8080`, yet the deployed **`api.conf`** says `debug` and `9090`,
+    and `terraform plan` reports **No changes**.
+
+    Make Terraform deploy what **`main.tf`** declares: `api.conf` must read
+
+    ```
+    log_level=info
+    port=8080
+    ```
+
+    Don't edit `main.tf`, and don't paper over it with `.tfvars` files or
+    `-var`: get rid of whatever overrides `main.tf`. Apply, and leave the
+    plan empty.
+  hints:
+    - "List *every* file in the directory, not just `*.tf`."
+    - "Files ending in `_override.tf` or `_override.tf.json` (or named `override.tf`) are merged over the normal ones."
+    - "Remove them, then `terraform apply`."
+  solution: |
+    ```bash
+    cd /lab/api
+    ls -la
+    cat debug_override.tf ci_override.tf.json
+    rm debug_override.tf ci_override.tf.json
+    terraform apply -auto-approve
+    cat api.conf
+    ```
+  setup: |
+    tf_start
+    rm -rf /lab/api
+    lab_file /lab/api/main.tf <<'EOF'
+    variable "log_level" {
+      type    = string
+      default = "info"
+    }
+
+    variable "port" {
+      type    = number
+      default = 8080
+    }
+
+    resource "local_file" "config" {
+      filename = "${path.module}/api.conf"
+      content  = "log_level=${var.log_level}\nport=${var.port}\n"
+    }
+    EOF
+    lab_file /lab/api/debug_override.tf <<'EOF'
+    # temporary while chasing the 502s -- sam
+    variable "log_level" {
+      default = "debug"
+    }
+    EOF
+    lab_file /lab/api/ci_override.tf.json <<'EOF'
+    {
+      "variable": {
+        "port": {
+          "default": 9090
+        }
+      }
+    }
+    EOF
+    tf_as_user /lab/api init -input=false -no-color >/dev/null
+    tf_as_user /lab/api apply -auto-approve -input=false -no-color >/dev/null
+    sha256sum /lab/api/main.tf > "$KL_STATE/sums"
+  check: |
+    d=/lab/api
+    check_eq "api.conf" "$(cat $d/api.conf 2>/dev/null)" "$(printf 'log_level=info\nport=8080')"
+    check "main.tf is unchanged" 'sha256sum -c --quiet "$KL_STATE/sums"'
+    check_not "no override files are left" 'ls -A $d | grep -qE "(^|_)override\.tf(\.json)?$"'
+    check_not "no tfvars files set the values" 'ls -A $d | grep -qE "\.tfvars(\.json)?$"'
+    check "the plan is empty" 'tf_clean $d'
+  solve: |
+    cd /lab/api
+    rm -f debug_override.tf ci_override.tf.json
+    terraform apply -auto-approve -input=false -no-color
+
+- id: tf-075
+  title: Block destroys with a JSON plan gate
+  difficulty: 3
+  kind: build
+  tags: [terraform, show-json, policy, jq, ci]
+  tutorial: |
+    **Concept.** `terraform show -json PLANFILE` turns a saved plan into
+    machine-readable JSON. Its **`resource_changes`** list has one entry per
+    resource instance, with the `address` and `change.actions`: `["create"]`,
+    `["update"]`, `["delete"]`, `["no-op"]`, or a pair such as
+    `["delete", "create"]` for a replacement. A small script over that JSON
+    is a **policy gate**: a pipeline step that refuses dangerous plans
+    before anyone presses *apply*.
+
+    **Read up on:**
+    - `terraform show -json` and the JSON plan format
+    - `resource_changes[].change.actions`
+    - `jq` `select`, `index`
+  scenario: |
+    Write **`/lab/gate/gate.sh`** (executable), the pipeline's policy gate.
+    It takes **one argument, the path of a saved plan**, and is run from
+    `/lab/gate`:
+
+    - if the plan would **delete** any resource instance (a destroy, or a
+      replacement, which deletes too), print **each such address**, one per
+      line, and **exit 1**
+    - otherwise **exit 0**
+
+    Use `terraform show -json` rather than parsing the human-readable
+    output. The check makes its own plans (an empty one, one that only
+    creates, one that destroys and one that replaces) and runs your gate
+    on each.
+  hints:
+    - "`terraform plan -out=test.tfplan`, then `terraform show -json test.tfplan | jq .resource_changes` to see the shape."
+    - "`jq -r '.resource_changes[]? | select(.change.actions | index(\"delete\")) | .address'` lists the instances that lose an object."
+    - "Print the addresses and `exit 1` only when that list isn't empty."
+  solution: |
+    ```bash
+    cd /lab/gate
+    cat > gate.sh <<'EOF'
+    #!/bin/bash
+    # usage: ./gate.sh PLANFILE   -- refuse plans that delete anything
+    plan=${1:?usage: gate.sh PLANFILE}
+    json=$(terraform show -json "$plan") || { echo "cannot read $plan" >&2; exit 1; }
+    bad=$(jq -r '.resource_changes[]? | select(.change.actions | index("delete")) | .address' <<<"$json")
+    if [ -n "$bad" ]; then
+      echo "$bad"
+      exit 1
+    fi
+    exit 0
+    EOF
+    chmod +x gate.sh
+    terraform plan -var='names=["alpha"]' -out=test.tfplan
+    ./gate.sh test.tfplan; echo "exit $?"
+    ```
+  setup: |
+    tf_start
+    rm -rf /lab/gate /lab/.kl-gate
+    lab_file /lab/gate/main.tf <<'EOF'
+    variable "names" {
+      type = set(string)
+    }
+
+    variable "motd" {
+      type    = string
+      default = "hello"
+    }
+
+    resource "local_file" "f" {
+      for_each = var.names
+      filename = "${path.module}/out/${each.key}.txt"
+      content  = "${var.motd}\n"
+    }
+    EOF
+    lab_file /lab/gate/terraform.tfvars <<'EOF'
+    names = ["alpha", "bravo"]
+    EOF
+    tf_as_user /lab/gate init -input=false -no-color >/dev/null
+    tf_as_user /lab/gate apply -auto-approve -input=false -no-color >/dev/null
+  check: |
+    d=/lab/gate p=/lab/.kl-gate
+    rm -rf $p; mkdir -p $p; chown "$(lab_user):" $p
+    mk() { tf_as_user $d plan -input=false -lock=false -no-color -out="$p/$1.tfplan" "${@:2}" >/dev/null 2>&1; }
+    mk noop
+    mk add -var='names=["alpha","bravo","charlie"]'
+    mk del -var='names=["alpha"]'
+    mk rep -var='motd=changed'
+    gate() { out=$(as_user "cd $d && timeout 60 ./gate.sh $p/$1.tfplan" 2>/dev/null); rc=$?; }
+    check "gate.sh is executable" '[ -x $d/gate.sh ]'
+    gate noop
+    check_eq "an empty plan passes" "$rc" 0
+    gate add
+    check_eq "a plan that only creates passes" "$rc" 0
+    gate del
+    check_eq "a plan that destroys is blocked" "$rc" 1
+    check "it names the destroyed instance" 'grep -qF "local_file.f[\"bravo\"]" <<<"$out"'
+    check_not "it doesn't name the instance that stays" 'grep -qF "alpha" <<<"$out"'
+    gate rep
+    check_eq "a plan that replaces is blocked" "$rc" 1
+    check "it names both replaced instances" 'grep -qF "local_file.f[\"alpha\"]" <<<"$out" && grep -qF "local_file.f[\"bravo\"]" <<<"$out"'
+    rm -rf $p
+  solve: |
+    cd /lab/gate
+    cat > gate.sh <<'EOF'
+    #!/bin/bash
+    # usage: ./gate.sh PLANFILE   -- refuse plans that delete anything
+    plan=${1:?usage: gate.sh PLANFILE}
+    json=$(terraform show -json "$plan") || { echo "cannot read $plan" >&2; exit 1; }
+    bad=$(jq -r '.resource_changes[]? | select(.change.actions | index("delete")) | .address' <<<"$json")
+    if [ -n "$bad" ]; then
+      echo "$bad"
+      exit 1
+    fi
+    exit 0
+    EOF
+    chmod +x gate.sh
+    terraform plan -input=false -no-color -out=current.tfplan
+    ./gate.sh current.tfplan
+
+- id: tf-076
+  title: "Saved plan is stale"
+  difficulty: 3
+  kind: fix
+  tags: [terraform, saved-plan, stale, state, review]
+  tutorial: |
+    **Concept.** A saved plan records the state **serial** it was made
+    against. If anything writes the state afterwards (another apply, even a
+    targeted one), `terraform apply PLANFILE` refuses with **Saved plan is
+    stale**: the plan's assumptions may no longer hold. The fix is a fresh
+    plan, and that fresh plan deserves a real review: whatever changed the
+    state may also have created things your configuration doesn't know
+    about, and Terraform will plan to destroy them.
+
+    **Read up on:**
+    - "Saved plan is stale"
+    - State serials and lineage
+    - Reading `terraform plan` for unexpected destroys
+  scenario: |
+    In **`/lab/rel`**, the plan **`release.tfplan`** (app version 2 plus a
+    new feature flag file) was approved yesterday. Meanwhile, Sam applied an
+    emergency rate-limit hotfix from his branch into the same state. His
+    file is **`/lab/hotfix/hotfix.tf`**, and he never merged it. Now
+    `terraform apply release.tfplan` fails with *Saved plan is stale*.
+
+    Ship the release:
+
+    - **`app.conf`** says `version=2` and **`features.conf`** exists
+    - Sam's **`ratelimit.conf`** (`local_file.hotfix`) is **never destroyed
+      or re-created**, and stays managed
+    - the hotfix is part of `/lab/rel`'s configuration, so later plans don't
+      try to remove it
+    - make the new plan a saved plan, `release.tfplan`, review it, and
+      apply it. Afterwards the plan is empty.
+  hints:
+    - "Run `terraform plan` and read it carefully: what does it want to destroy?"
+    - "The state has `local_file.hotfix`, but `/lab/rel` has no block for it, so Terraform plans to delete it."
+    - "Copy `/lab/hotfix/hotfix.tf` into `/lab/rel`, then `terraform plan -out=release.tfplan` and `terraform apply release.tfplan`."
+  solution: |
+    ```bash
+    cd /lab/rel
+    terraform apply release.tfplan     # Error: Saved plan is stale
+    terraform plan                     # ...local_file.hotfix will be destroyed!
+    cp /lab/hotfix/hotfix.tf .
+    terraform plan -out=release.tfplan # only app + feature now
+    terraform apply release.tfplan
+    terraform plan                     # No changes
+    ```
+  setup: |
+    tf_start
+    rm -rf /lab/rel /lab/hotfix
+    lab_file /lab/rel/main.tf <<'EOF'
+    resource "local_file" "app" {
+      filename = "${path.module}/app.conf"
+      content  = "version=1\n"
+    }
+    EOF
+    tf_as_user /lab/rel init -input=false -no-color >/dev/null
+    tf_as_user /lab/rel apply -auto-approve -input=false -no-color >/dev/null
+    lab_file /lab/rel/main.tf <<'EOF'
+    resource "local_file" "app" {
+      filename = "${path.module}/app.conf"
+      content  = "version=2\n"
+    }
+
+    resource "local_file" "feature" {
+      filename = "${path.module}/features.conf"
+      content  = "new_checkout=true\n"
+    }
+    EOF
+    tf_as_user /lab/rel plan -input=false -no-color -out=release.tfplan >/dev/null
+    # Sam's hotfix, applied from his branch into the same state
+    lab_file /lab/rel/hotfix.tf <<'EOF'
+    resource "local_file" "hotfix" {
+      filename = "${path.module}/ratelimit.conf"
+      content  = "requests_per_minute=120\n"
+    }
+    EOF
+    tf_as_user /lab/rel apply -auto-approve -input=false -no-color -target=local_file.hotfix >/dev/null 2>&1
+    mkdir -p /lab/hotfix
+    mv /lab/rel/hotfix.tf /lab/hotfix/hotfix.tf
+    chown -R "$(lab_user):" /lab/hotfix
+    stat -c '%i %y' /lab/rel/ratelimit.conf > "$KL_STATE/hotfix"
+    sha256sum /lab/rel/release.tfplan > "$KL_STATE/oldplan"
+  check: |
+    d=/lab/rel
+    check_eq "app.conf" "$(cat $d/app.conf 2>/dev/null)" "version=2"
+    check_eq "features.conf" "$(cat $d/features.conf 2>/dev/null)" "new_checkout=true"
+    check "local_file.hotfix is still managed" 'tf_has $d local_file.hotfix'
+    check_eq "ratelimit.conf was never destroyed or re-created" "$(stat -c '%i %y' $d/ratelimit.conf 2>/dev/null)" "$(cat "$KL_STATE/hotfix")"
+    check "the hotfix is in /lab/rel's configuration" 'grep -qs "resource \"local_file\" \"hotfix\"" $d/*.tf'
+    check "release.tfplan is a new saved plan" '[ -s $d/release.tfplan ] && ! sha256sum -c --quiet "$KL_STATE/oldplan"'
+    check "the plan is empty" 'tf_clean $d'
+  solve: |
+    cd /lab/rel
+    cp /lab/hotfix/hotfix.tf .
+    terraform plan -input=false -no-color -out=release.tfplan
+    terraform apply -input=false -no-color release.tfplan
+
+- id: tf-077
+  title: One backend block, many environments
+  difficulty: 3
+  kind: build
+  tags: [terraform, backend, backend-config, reconfigure, environments]
+  tutorial: |
+    **Concept.** A backend block can't use variables, so pipelines leave it
+    (partly) empty, `backend "local" {}`, and pass the settings at init
+    time: **`terraform init -backend-config=FILE`** (a file of `key = value`
+    lines) or `-backend-config="key=value"`. This is **partial
+    configuration**: one codebase, one settings file per environment.
+
+    Switching an initialised directory to other settings makes `init` stop
+    and ask what you mean. `-migrate-state` **copies** the current state to
+    the new place (for moving the same state). `-reconfigure` just points
+    at the new place and leaves the old state alone (for a *different*
+    environment).
+
+    **Read up on:**
+    - Partial backend configuration, `-backend-config`
+    - `terraform init -reconfigure` vs `-migrate-state`
+    - The `local` backend's `path`
+  scenario: |
+    **`/lab/infra`** has an empty `backend "local" {}` block. Dev is already
+    deployed: it was initialised with **`backend/dev.hcl`**, its state is
+    **`/lab/states/dev.tfstate`**, and it was applied with
+    `env/dev.tfvars`.
+
+    Deploy **prod** from the same directory:
+
+    - create **`backend/prod.hcl`** so prod's state lives at
+      **`/lab/states/prod.tfstate`**
+    - keep the backend block in the `.tf` files empty (no `path` in code)
+    - apply with **`env/prod.tfvars`**, giving **`out/prod.txt`**
+    - **dev must be untouched**: `dev.tfstate` keeps its cluster,
+      `out/dev.txt` stays, and prod's state is a new state, not a copy of
+      dev's
+  hints:
+    - "`backend/prod.hcl` holds one line, like `backend/dev.hcl`."
+    - "`terraform init -backend-config=backend/prod.hcl` alone stops with *Backend configuration changed*."
+    - "You're not moving dev's state, you're starting prod's: `-reconfigure`, not `-migrate-state`."
+  solution: |
+    ```bash
+    cd /lab/infra
+    cat backend/dev.hcl
+    echo 'path = "../states/prod.tfstate"' > backend/prod.hcl
+    terraform init -reconfigure -backend-config=backend/prod.hcl
+    terraform apply -var-file=env/prod.tfvars
+    ls /lab/states out
+    ```
+  setup: |
+    tf_start
+    rm -rf /lab/infra /lab/states
+    mkdir -p /lab/states
+    chown "$(lab_user):" /lab/states
+    lab_file /lab/infra/backend.tf <<'EOF'
+    terraform {
+      backend "local" {}
+    }
+    EOF
+    lab_file /lab/infra/main.tf <<'EOF'
+    variable "env" {
+      type = string
+    }
+
+    resource "random_pet" "cluster" {
+      prefix = var.env
+    }
+
+    resource "local_file" "marker" {
+      filename = "${path.module}/out/${var.env}.txt"
+      content  = "cluster=${random_pet.cluster.id}\n"
+    }
+    EOF
+    lab_file /lab/infra/backend/dev.hcl <<'EOF'
+    path = "../states/dev.tfstate"
+    EOF
+    lab_file /lab/infra/env/dev.tfvars <<'EOF'
+    env = "dev"
+    EOF
+    lab_file /lab/infra/env/prod.tfvars <<'EOF'
+    env = "prod"
+    EOF
+    tf_as_user /lab/infra init -input=false -no-color -backend-config=backend/dev.hcl >/dev/null
+    tf_as_user /lab/infra apply -auto-approve -input=false -no-color -var-file=env/dev.tfvars >/dev/null
+    tf_get /lab/states/dev.tfstate random_pet.cluster id > "$KL_STATE/devpet"
+    jq -r .lineage /lab/states/dev.tfstate > "$KL_STATE/devlineage"
+  check: |
+    d=/lab/infra s=/lab/states
+    devpet=$(cat "$KL_STATE/devpet")
+    check "backend/prod.hcl sets a path ending in prod.tfstate" 'grep -qE "^\s*path\s*=\s*\"[^\"]*prod\.tfstate\"" $d/backend/prod.hcl'
+    check_not "the backend block in the code stays empty" 'grep -qE "^\s*path\s*=" $d/*.tf'
+    check "/lab/states/prod.tfstate holds local_file.marker" 'tf_has $s/prod.tfstate local_file.marker'
+    prodpet=$(tf_get $s/prod.tfstate random_pet.cluster id)
+    check_match "the prod cluster is named prod-..." "$prodpet" '^prod-'
+    check_eq "out/prod.txt" "$(cat $d/out/prod.txt 2>/dev/null)" "cluster=${prodpet:-?}"
+    check_eq "dev.tfstate still holds the dev cluster" "$(tf_get $s/dev.tfstate random_pet.cluster id)" "$devpet"
+    check_eq "out/dev.txt is still there" "$(cat $d/out/dev.txt 2>/dev/null)" "cluster=$devpet"
+    check_not "prod's state is not a copy of dev's" '[ "$(jq -r .lineage $s/prod.tfstate 2>/dev/null)" = "$(cat "$KL_STATE/devlineage")" ]'
+  solve: |
+    cd /lab/infra
+    echo 'path = "../states/prod.tfstate"' > backend/prod.hcl
+    terraform init -reconfigure -backend-config=backend/prod.hcl -input=false -no-color
+    terraform apply -var-file=env/prod.tfvars -auto-approve -input=false -no-color
+
+- id: tf-078
+  title: The lint stage that never fails
+  difficulty: 3
+  kind: fix
+  tags: [terraform, fmt, validate, ci, scripting]
+  tutorial: |
+    **Concept.** A CI lint stage must **report**, not repair. `terraform
+    fmt` rewrites files and exits 0, so it never fails a build.
+    **`terraform fmt -check`** only checks and exits non-zero when a file
+    needs formatting, and **`-recursive`** includes subdirectories such as
+    `modules/`, which plain `fmt` skips. `terraform validate` catches broken
+    references and types, but it needs an initialised directory, and
+    `terraform init -backend=false` does that without touching any state.
+    Finally, a script only fails if a failing command makes *it* exit
+    non-zero.
+
+    **Read up on:**
+    - `terraform fmt -check -recursive`
+    - `terraform validate`, `terraform init -backend=false`
+    - `set -e`, and what `|| echo ...` does to an exit status
+  scenario: |
+    **`/lab/lint/lint.sh`** is the repository's CI lint stage, and it has
+    never failed a build. Fix it so that, run from `/lab/lint`, it:
+
+    - **exits 0** for the repository as it is now
+    - **exits non-zero** when any `.tf` file **anywhere** in the repository
+      (the root or `modules/...`) isn't formatted, and **doesn't rewrite**
+      that file (CI reports, the author fixes)
+    - **exits non-zero** when the configuration doesn't validate
+
+    The check copies the repository, breaks the copy in each of those ways,
+    and runs your `lint.sh` there.
+  hints:
+    - "Add a badly indented line to `modules/naming/main.tf` and run `./lint.sh; echo $?`."
+    - "`terraform fmt -check -recursive` checks every directory and changes nothing."
+    - "`|| echo ...` turns a failure into success. Let `validate` fail the script, for example with `set -euo pipefail`."
+  solution: |
+    ```bash
+    cd /lab/lint
+    cat > lint.sh <<'EOF'
+    #!/bin/bash
+    # CI lint stage. Fails the build when any .tf file in the repository
+    # is badly formatted or the configuration is invalid.
+    set -euo pipefail
+    cd "$(dirname "$0")"
+    terraform init -backend=false -input=false -no-color >/dev/null
+    terraform fmt -check -recursive
+    terraform validate -no-color
+    echo "lint passed"
+    EOF
+    ./lint.sh; echo "exit $?"
+    ```
+  setup: |
+    tf_start
+    rm -rf /lab/lint /lab/.kl-lint
+    lab_file /lab/lint/main.tf <<'EOF'
+    module "naming" {
+      source = "./modules/naming"
+      env    = var.env
+      app    = "shop"
+    }
+
+    variable "env" {
+      type    = string
+      default = "dev"
+    }
+
+    resource "local_file" "name" {
+      filename = "${path.module}/name.txt"
+      content  = "${module.naming.name}\n"
+    }
+    EOF
+    lab_file /lab/lint/modules/naming/main.tf <<'EOF'
+    variable "env" {
+      type = string
+    }
+
+    variable "app" {
+      type = string
+    }
+
+    output "name" {
+      value = "${var.env}-${var.app}"
+    }
+    EOF
+    lab_file /lab/lint/lint.sh 0755 <<'EOF'
+    #!/bin/bash
+    # CI lint stage. Must FAIL the build when any .tf file in the repository
+    # is badly formatted or the configuration is invalid.
+    cd "$(dirname "$0")"
+    terraform init -backend=false -input=false -no-color >/dev/null
+    terraform fmt
+    terraform validate -no-color || echo "validate reported problems"
+    echo "lint finished"
+    EOF
+  check: |
+    src=/lab/lint m=/lab/.kl-lint
+    prep() { rm -rf $m; cp -a $src $m; }
+    run() { chown -R "$(lab_user):" $m; as_user "cd $m && timeout 120 ./lint.sh" >/dev/null 2>&1; rc=$?; }
+    check "lint.sh is executable" '[ -x $src/lint.sh ]'
+    prep; run
+    check_eq "the clean repository passes" "$rc" 0
+    prep; printf '\nvariable "extra" {\ntype=string\n}\n' >> $m/modules/naming/main.tf; run
+    check_not "a badly formatted file in modules/ fails the stage" '[ "$rc" = 0 ]'
+    check "the stage reports it without rewriting it" 'grep -q "^type=string" $m/modules/naming/main.tf'
+    prep; printf '\nlocals {\nx=1\n}\n' >> $m/main.tf; run
+    check_not "a badly formatted root file fails the stage" '[ "$rc" = 0 ]'
+    check "the stage reports it without rewriting it" 'grep -q "^x=1" $m/main.tf'
+    prep; printf '\noutput "oops" {\n  value = local.missing\n}\n' >> $m/main.tf; run
+    check_not "an invalid configuration fails the stage" '[ "$rc" = 0 ]'
+    rm -rf $m
+  solve: |
+    cd /lab/lint
+    cat > lint.sh <<'EOF'
+    #!/bin/bash
+    # CI lint stage. Fails the build when any .tf file in the repository
+    # is badly formatted or the configuration is invalid.
+    set -euo pipefail
+    cd "$(dirname "$0")"
+    terraform init -backend=false -input=false -no-color >/dev/null
+    terraform fmt -check -recursive
+    terraform validate -no-color
+    echo "lint passed"
+    EOF
+    chmod +x lint.sh
+    ./lint.sh
+
+- id: tf-079
+  title: Keep the password out of the plan
+  difficulty: 3
+  kind: fix
+  tags: [terraform, ephemeral, secrets, sensitive, saved-plan]
+  tutorial: |
+    **Concept.** `sensitive = true` only hides a value in the CLI output.
+    It's still stored in the **state** and in every **saved plan file**,
+    and in a pipeline those are artifacts that get uploaded and kept. An
+    **ephemeral** input variable (`ephemeral = true`, Terraform 1.10+) is
+    never written to either. Terraform refuses to put an ephemeral value
+    anywhere it would be persisted, such as a resource argument. It is
+    allowed in places that are used and then forgotten: provider
+    configuration, `locals`, and **provisioner** blocks.
+
+    **Read up on:**
+    - Ephemeral input variables (`ephemeral = true`)
+    - Where ephemeral values may be referenced
+    - `local-exec` `environment`
+  scenario: |
+    **`/lab/seed`** seeds a database with a password that the CI runner
+    exports as **`TF_VAR_db_password`**. In the lab it's in a file:
+
+    ```bash
+    export TF_VAR_db_password=$(cat /lab/seed/.db_password)
+    ```
+
+    A security review found the password in `terraform.tfstate` and in
+    every saved plan. Make **`db_password` ephemeral** and keep the seeding
+    working, then apply. When you're done:
+
+    - **`seeded.txt`** holds the SHA-256 of the password (the provisioner
+      writes it; the check deletes it and re-runs the seeding)
+    - **`terraform.tfstate`** doesn't contain the password
+    - a **saved plan** (`terraform plan -out=...`) doesn't contain it
+    - the password isn't written into any `.tf` or `.tfvars` file
+  hints:
+    - "Add `ephemeral = true` to the variable and run `terraform validate`: Terraform says where the value may no longer go."
+    - "`terraform_data.seed`'s `input` is stored in the state. Drop it."
+    - "Hand the password to the provisioner directly: `environment = { PW = var.db_password }`."
+  solution: |
+    ```bash
+    cd /lab/seed
+    export TF_VAR_db_password=$(cat .db_password)
+    cat > main.tf <<'EOF'
+    variable "db_password" {
+      type      = string
+      sensitive = true
+      ephemeral = true
+    }
+
+    resource "terraform_data" "seed" {
+      provisioner "local-exec" {
+        command = "printf %s \"$PW\" | sha256sum | cut -d' ' -f1 > ${path.module}/seeded.txt"
+        environment = {
+          PW = var.db_password
+        }
+      }
+    }
+    EOF
+    terraform apply -auto-approve
+    rm -f terraform.tfstate.backup      # the old copy still holds the password
+    grep -c "$TF_VAR_db_password" terraform.tfstate   # 0
+    ```
+  setup: |
+    tf_start
+    rm -rf /lab/seed /lab/.kl-seed.tfplan
+    pw=$(head -c 12 /dev/urandom | od -An -tx1 | tr -d ' \n')
+    printf '%s' "$pw" > "$KL_STATE/pw"
+    printf '%s' "$pw" | sha256sum | cut -d' ' -f1 > "$KL_STATE/sum"
+    printf '%s' "$pw" | lab_file /lab/seed/.db_password 0600
+    lab_file /lab/seed/main.tf <<'EOF'
+    variable "db_password" {
+      type      = string
+      sensitive = true
+    }
+
+    resource "terraform_data" "seed" {
+      input = var.db_password
+
+      provisioner "local-exec" {
+        command = "printf %s \"$PW\" | sha256sum | cut -d' ' -f1 > ${path.module}/seeded.txt"
+        environment = {
+          PW = self.input
+        }
+      }
+    }
+    EOF
+    as_user "cd /lab/seed && terraform init -input=false -no-color >/dev/null && TF_VAR_db_password=$pw terraform apply -auto-approve -input=false -no-color >/dev/null"
+  check: |
+    d=/lab/seed
+    pw=$(cat "$KL_STATE/pw")
+    check "db_password is declared ephemeral" 'grep -qE "^\s*ephemeral\s*=\s*true" $d/*.tf'
+    check_not "the password isn't written into the configuration" 'grep -qsF "$pw" $d/*.tf $d/*.tf.json $d/*.tfvars $d/*.tfvars.json'
+    rm -f $d/seeded.txt
+    as_user "cd $d && TF_VAR_db_password=$pw timeout 120 terraform apply -replace=terraform_data.seed -auto-approve -input=false -no-color" >/dev/null 2>&1
+    check_eq "seeding works (seeded.txt after a re-run)" "$(cat $d/seeded.txt 2>/dev/null)" "$(cat "$KL_STATE/sum")"
+    check "terraform_data.seed is managed" 'tf_has $d terraform_data.seed'
+    check_not "terraform.tfstate doesn't contain the password" 'grep -qF "$pw" $d/terraform.tfstate'
+    rm -f /lab/.kl-seed.tfplan
+    as_user "cd $d && TF_VAR_db_password=$pw timeout 120 terraform plan -input=false -lock=false -no-color -out=/lab/.kl-seed.tfplan" >/dev/null 2>&1
+    leak=$(python3 -c 'import sys, zipfile
+    z = zipfile.ZipFile(sys.argv[1])
+    print("yes" if any(sys.argv[2].encode() in z.read(n) for n in z.namelist()) else "no")' /lab/.kl-seed.tfplan "$pw" 2>/dev/null)
+    check_eq "a saved plan doesn't contain the password" "$leak" no
+    rm -f /lab/.kl-seed.tfplan
+  solve: |
+    cd /lab/seed
+    export TF_VAR_db_password=$(cat .db_password)
+    cat > main.tf <<'EOF'
+    variable "db_password" {
+      type      = string
+      sensitive = true
+      ephemeral = true
+    }
+
+    resource "terraform_data" "seed" {
+      provisioner "local-exec" {
+        command = "printf %s \"$PW\" | sha256sum | cut -d' ' -f1 > ${path.module}/seeded.txt"
+        environment = {
+          PW = var.db_password
+        }
+      }
+    }
+    EOF
+    terraform apply -auto-approve -input=false -no-color
+    rm -f terraform.tfstate.backup
+
+- id: tf-080
+  title: "Error acquiring the state lock"
+  difficulty: 4
+  kind: fix
+  tags: [terraform, state, locking, force-unlock, troubleshooting]
+  tutorial: |
+    **Concept.** Every command that may write the state **locks** it first,
+    so two runs can't write it at once. A second run fails with **Error
+    acquiring the state lock**. The error's *Lock Info* tells you who holds
+    the lock: an ID, the operation, the time, and **Who** (`user@host`).
+    The `local` backend locks with an operating-system file lock, which
+    lives exactly as long as the process holding it. `terraform
+    force-unlock` is for remote backends whose lock outlived a crashed run.
+    It can't release a local lock that a live process still holds. Find the
+    process and stop it. `-lock-timeout=30s` makes Terraform wait instead
+    of failing at once.
+
+    **Read up on:**
+    - State locking, `-lock-timeout`
+    - `terraform force-unlock` and when it applies
+    - `.terraform.tfstate.lock.info`
+  scenario: |
+    Deploying release 42 from **`/lab/app`** fails with *Error acquiring
+    the state lock*. A nightly job that reads this state has hung somewhere
+    on this host. It's safe to kill.
+
+    Find what holds the lock, **stop it**, and deploy:
+
+    - **`release.txt`** says `release=42`
+    - the state is no longer locked, and the plan is empty
+    - don't work around the lock with `-lock=false`: the hung job must be
+      gone
+  hints:
+    - "Read the *Lock Info* in the error, or `cat /lab/app/.terraform.tfstate.lock.info`. Look at **Who**."
+    - "The part after `@` is a host name. Here, Terraform runs in containers: `docker ps`."
+    - "Stop that container (`docker rm -f ...`), then `terraform apply`."
+  solution: |
+    ```bash
+    cd /lab/app
+    terraform apply                       # Error acquiring the state lock ... Who: ...@ci-nightly
+    cat .terraform.tfstate.lock.info
+    docker ps                             # the hung job
+    docker rm -f ci-nightly
+    terraform apply -auto-approve
+    terraform plan                        # No changes
+    ```
+  setup: |
+    tf_start
+    rm -rf /lab/app /lab/.runner
+    docker rm -f ci-nightly >/dev/null 2>&1 || true
+    on_reset 'docker rm -f ci-nightly >/dev/null 2>&1; true'
+    lab_file /lab/app/main.tf <<'EOF'
+    resource "local_file" "release" {
+      filename = "${path.module}/release.txt"
+      content  = "release=41\n"
+    }
+    EOF
+    tf_as_user /lab/app init -input=false -no-color >/dev/null
+    tf_as_user /lab/app apply -auto-approve -input=false -no-color >/dev/null
+    lab_file /lab/app/main.tf <<'EOF'
+    resource "local_file" "release" {
+      filename = "${path.module}/release.txt"
+      content  = "release=42\n"
+    }
+    EOF
+    # the nightly inventory job: plans against the app's state and hangs
+    lab_file /lab/.runner/nightly/main.tf <<'EOF'
+    terraform {
+      backend "local" {
+        path = "/lab/app/terraform.tfstate"
+      }
+    }
+
+    data "external" "inventory" {
+      program = ["sh", "-c", "sleep 3600"]
+    }
+    EOF
+    tf_as_user /lab/.runner/nightly init -input=false -no-color >/dev/null
+    docker run -d --name ci-nightly --hostname ci-nightly --init \
+      -u "$(id -u "$(lab_user)"):$(id -g "$(lab_user)")" -e HOME=/tmp \
+      -v /lab:/lab -w /lab/.runner/nightly kl-terraform:1 plan -input=false -no-color >/dev/null
+    eventually 60 '[ -f /lab/app/.terraform.tfstate.lock.info ]' && sleep 3 && c_running ci-nightly
+  check: |
+    d=/lab/app
+    check_not "the hung nightly job is stopped" 'c_running ci-nightly'
+    check_eq "release.txt" "$(cat $d/release.txt 2>/dev/null)" "release=42"
+    check "the state can be locked again" '(cd $d && timeout 60 terraform plan -lock-timeout=5s -input=false -no-color) >/dev/null 2>&1'
+    check "the plan is empty" 'tf_clean $d'
+  solve: |
+    cd /lab/app
+    cat .terraform.tfstate.lock.info
+    docker rm -f ci-nightly >/dev/null
+    terraform apply -auto-approve -input=false -no-color
+
+- id: tf-081
+  title: The deploy job rejects the plan artifact
+  difficulty: 4
+  kind: fix
+  tags: [terraform, lock-file, saved-plan, providers, ci]
+  tutorial: |
+    **Concept.** A saved plan is tied to the exact provider versions it was
+    made with: the plan file carries a copy of the **dependency lock file**
+    (`.terraform.lock.hcl`). A pipeline that plans in one job and applies in
+    another must give the apply job the **same lock file**, so its `terraform
+    init` installs the same versions. Otherwise Terraform refuses the plan
+    with *Inconsistent dependency lock file*. That's why the lock file is
+    committed to version control, never ignored.
+
+    **Read up on:**
+    - The dependency lock file, and committing it
+    - Applying a saved plan in a different working directory
+    - `terraform init` with an existing lock file
+  scenario: |
+    The build job (**`/lab/build`**) planned release **`/lab/artifacts/release.tfplan`**.
+    The deploy job is a **fresh checkout** in **`/lab/deploy`** and must
+    apply **exactly that artifact**, but it refuses the plan with an error
+    about the dependency lock file.
+
+    Fix the deploy checkout and apply the artifact:
+
+    - **`/lab/www/build.txt`** holds the build planned in the artifact, and
+      the shared state `/lab/states/web.tfstate` manages it
+    - `/lab/deploy` locks `hashicorp/local` to the **same version the build
+      job planned with**
+    - `/lab/deploy/.gitignore` no longer keeps the lock file out of git
+    - don't change `versions.tf`
+  hints:
+    - "`terraform init` in `/lab/deploy`, then `terraform apply /lab/artifacts/release.tfplan`. Read the error."
+    - "Compare `/lab/build/.terraform.lock.hcl` with the one `init` just wrote in `/lab/deploy`."
+    - "Copy the build job's lock file over, re-run `terraform init`, apply the artifact, and drop the lock file from `.gitignore`."
+  solution: |
+    ```bash
+    cd /lab/deploy
+    terraform init && terraform apply /lab/artifacts/release.tfplan   # Inconsistent dependency lock file
+    diff /lab/build/.terraform.lock.hcl .terraform.lock.hcl          # 2.8.0 vs 2.9.1
+    sed -i '/^\.terraform\.lock\.hcl$/d' .gitignore
+    cp /lab/build/.terraform.lock.hcl .
+    terraform init
+    terraform apply /lab/artifacts/release.tfplan
+    cat /lab/www/build.txt
+    ```
+  setup: |
+    tf_start
+    rm -rf /lab/build /lab/deploy /lab/artifacts /lab/states /lab/www
+    mkdir -p /lab/artifacts /lab/states /lab/www
+    chown "$(lab_user):" /lab/artifacts /lab/states /lab/www
+    b="$(date +%Y%m%d).$((RANDOM % 900 + 100))"
+    echo "$b" > "$KL_STATE/build"
+    lab_file /lab/build/versions.tf <<'EOF'
+    terraform {
+      required_providers {
+        local = {
+          source  = "hashicorp/local"
+          version = "2.8.0"
+        }
+      }
+
+      backend "local" {
+        path = "/lab/states/web.tfstate"
+      }
+    }
+    EOF
+    lab_file /lab/build/main.tf <<'EOF'
+    variable "build" {
+      type = string
+    }
+
+    resource "local_file" "web" {
+      filename = "/lab/www/build.txt"
+      content  = "build=${var.build}\n"
+    }
+    EOF
+    printf '.terraform/\n.terraform.lock.hcl\n*.tfplan\n' | lab_file /lab/build/.gitignore
+    # the build runner's cached lock file still selects 2.8.0
+    tf_as_user /lab/build init -input=false -no-color >/dev/null
+    sed -i 's/version = "2.8.0"/version = ">= 2.8.0"/' /lab/build/versions.tf
+    tf_as_user /lab/build init -input=false -no-color >/dev/null
+    tf_as_user /lab/build plan -input=false -no-color -var "build=$b" -out=/lab/artifacts/release.tfplan >/dev/null
+    mkdir -p /lab/deploy
+    cp /lab/build/versions.tf /lab/build/main.tf /lab/build/.gitignore /lab/deploy/
+    chown -R "$(lab_user):" /lab/deploy
+  check: |
+    check_eq "build.txt holds the planned build" "$(cat /lab/www/build.txt 2>/dev/null)" "build=$(cat "$KL_STATE/build")"
+    check "the shared state manages local_file.web" 'tf_has /lab/states/web.tfstate local_file.web'
+    check_match "/lab/deploy locks hashicorp/local to the planned version" "$(grep -A1 'registry.terraform.io/hashicorp/local' /lab/deploy/.terraform.lock.hcl 2>/dev/null | grep version)" '"2\.8\.0"'
+    check_not "the lock file is no longer ignored" 'grep -qE "^\s*/?\.terraform\.lock\.hcl\s*$" /lab/deploy/.gitignore'
+    check "versions.tf is unchanged" 'cmp -s /lab/deploy/versions.tf /lab/build/versions.tf'
+  solve: |
+    cd /lab/deploy
+    sed -i '/^\.terraform\.lock\.hcl$/d' .gitignore
+    cp /lab/build/.terraform.lock.hcl .
+    terraform init -input=false -no-color
+    terraform show -no-color /lab/artifacts/release.tfplan
+    terraform apply -input=false -no-color /lab/artifacts/release.tfplan
+
+- id: tf-082
+  title: Unit tests that need no Docker
+  difficulty: 4
+  kind: build
+  tags: [terraform, test, mock_provider, ci]
+  tutorial: |
+    **Concept.** `terraform test` normally creates real infrastructure, so a
+    CI runner without a Docker daemon (or without cloud credentials) can't
+    run the tests. A **`mock_provider "NAME" {}`** block in a `.tftest.hcl`
+    file replaces that provider for the whole test file. Terraform still
+    uses the real provider's schema, but never configures it or calls it.
+    Arguments keep the values you set, computed attributes get generated
+    placeholders, and `command = apply` runs entirely in memory. Use mocks
+    for fast unit tests of naming, counts and wiring, and keep a few real
+    integration tests elsewhere.
+
+    **Read up on:**
+    - `terraform test`, `run` blocks, `variables`
+    - `mock_provider`, `mock_resource`, `override_resource`
+    - Comparing lists in `assert` (`==` between a list and a tuple)
+  scenario: |
+    **`/lab/webmod`** is a module that runs `replicas` nginx containers named
+    `web-<env>-<index>` and outputs their **`names`**. The CI runner has
+    **no Docker daemon**.
+
+    Write **`/lab/webmod/tests/unit.tftest.hcl`** that:
+
+    - mocks the docker provider with **`mock_provider "docker"`**
+    - has a run with `env = "ci"` and **`replicas = 3`** that asserts the
+      output `names` is exactly `web-ci-0`, `web-ci-1`, `web-ci-2`, in order
+
+    `terraform test` must pass **with no Docker daemon reachable**. The check
+    runs it in a container without the Docker socket, and also against
+    copies of the module that build the names differently or ignore
+    `replicas`. Your tests must fail those.
+  hints:
+    - "Start the file with `mock_provider \"docker\" {}`. Nothing else is needed to stop the real provider being used."
+    - "`run \"names\" { command = apply  variables { env = \"ci\"  replicas = 3 } assert { ... } }` (one setting per line)."
+    - "`output.names == [\"web-ci-0\", ...]` can be false even when the elements match, because it compares a list with a tuple. Compare `join(\",\", output.names)` with a string instead."
+  solution: |
+    ```bash
+    cd /lab/webmod
+    mkdir -p tests
+    cat > tests/unit.tftest.hcl <<'EOF'
+    mock_provider "docker" {}
+
+    variables {
+      env      = "ci"
+      replicas = 3
+    }
+
+    run "names_follow_the_pattern" {
+      command = apply
+
+      assert {
+        condition     = join(",", output.names) == "web-ci-0,web-ci-1,web-ci-2"
+        error_message = "expected one container per replica, named web-<env>-<index>"
+      }
+    }
+    EOF
+    terraform init
+    terraform test
+    ```
+  setup: |
+    tf_start
+    rm -rf /lab/webmod /lab/.kl-mock
+    lab_file /lab/webmod/main.tf <<'EOF'
+    terraform {
+      required_providers {
+        docker = {
+          source = "kreuzwerker/docker"
+        }
+      }
+    }
+
+    variable "env" {
+      type = string
+    }
+
+    variable "replicas" {
+      type    = number
+      default = 1
+    }
+
+    resource "docker_image" "web" {
+      name         = "nginx:1.27-alpine"
+      keep_locally = true
+    }
+
+    resource "docker_container" "web" {
+      count = var.replicas
+      name  = "web-${var.env}-${count.index}"
+      image = docker_image.web.image_id
+    }
+
+    output "names" {
+      value = docker_container.web[*].name
+    }
+    EOF
+  check: |
+    d=/lab/webmod m=/lab/.kl-mock f=/lab/webmod/tests/unit.tftest.hcl
+    u=$(id -u "$(lab_user)"); g=$(id -g "$(lab_user)")
+    check "tests/unit.tftest.hcl exists" '[ -s $f ]'
+    check "it mocks the docker provider" 'grep -qE "^\s*mock_provider\s+\"docker\"" $f'
+    # terraform as a CI runner without Docker sees it: no socket mounted
+    nodock() { timeout 300 docker run --rm -u "$u:$g" -e HOME=/tmp -v /lab:/lab -w "$1" kl-terraform:1 "${@:2}"; }
+    t() {
+      rm -rf $m; mkdir -p $m; cp -r $d/main.tf $d/tests $m/ 2>/dev/null; chown -R "$u:$g" $m
+      [ -n "$1" ] && sed -i "$1" $m/main.tf
+      nodock $m init -input=false -no-color >/dev/null 2>&1
+      nodock $m test -no-color 2>&1
+    }
+    out=$(t "")
+    check_match "terraform test passes with no Docker daemon" "$(grep -E 'passed, ' <<<"$out" | tail -1)" 'Success! [1-9][0-9]* passed, 0 failed'
+    mut=$(t 's/"web-${var.env}-${count.index}"/"${var.env}-web-${count.index}"/')
+    check "the tests fail a module that names containers differently" 'grep -qE "Failure! .*[1-9][0-9]* failed" <<<"$mut"'
+    mut=$(t 's/count = var.replicas/count = 1/')
+    check "the tests fail a module that ignores replicas" 'grep -qE "Failure! .*[1-9][0-9]* failed" <<<"$mut"'
+    rm -rf $m
+  solve: |
+    cd /lab/webmod
+    mkdir -p tests
+    cat > tests/unit.tftest.hcl <<'EOF'
+    mock_provider "docker" {}
+
+    variables {
+      env      = "ci"
+      replicas = 3
+    }
+
+    run "names_follow_the_pattern" {
+      command = apply
+
+      assert {
+        condition     = join(",", output.names) == "web-ci-0,web-ci-1,web-ci-2"
+        error_message = "expected one container per replica, named web-<env>-<index>"
+      }
+    }
+    EOF
+    terraform init -input=false -no-color
+    terraform test -no-color
+
+- id: tf-083
+  title: Two stacks, one script
+  difficulty: 4
+  kind: build
+  tags: [terraform, chdir, remote-state, ordering, scripting]
+  tutorial: |
+    **Concept.** Real repositories hold several **root configurations**
+    (stacks) with their own state, where one reads another's outputs with
+    `terraform_remote_state`. A pipeline must run them **in dependency
+    order**: the producer before the consumer on the way up, and the
+    reverse on the way down. **`terraform -chdir=DIR <command>`** runs any
+    command as if started in `DIR`, so one script can drive every stack
+    without `cd`-ing around. And the script must stop at the first failure,
+    or it builds on top of a broken layer.
+
+    **Read up on:**
+    - `terraform -chdir=DIR`
+    - `data "terraform_remote_state"`
+    - `terraform destroy -auto-approve`, `set -e`
+  scenario: |
+    **`/lab/stacks`** holds two stacks: **`network`** and **`app`**. The app
+    reads the network's `vpc_name` output from its state, and the network
+    refuses to be destroyed while the app is still deployed. Neither has
+    been initialised.
+
+    Write two executable scripts, run from `/lab/stacks`, fully
+    non-interactive:
+
+    - **`up.sh`**: initialise and apply both stacks in the right order, and
+      **exit non-zero as soon as a step fails**, without going on to the
+      next stack. Running it again when everything is deployed exits 0.
+    - **`down.sh`**: destroy both stacks in the order that works, exit 0.
+
+    The check runs `up.sh`, runs it again, breaks the network stack and
+    runs it once more, then runs `down.sh`.
+  hints:
+    - "`terraform -chdir=network init -input=false` then `terraform -chdir=network apply -auto-approve -input=false`."
+    - "Up: network, then app. Down: app, then network (try the other way round and read the error)."
+    - "`set -euo pipefail` at the top makes a failing step end the script."
+  solution: |
+    ```bash
+    cd /lab/stacks
+    cat > up.sh <<'EOF'
+    #!/bin/bash
+    # Deploy the stacks in dependency order: network first, then app.
+    set -euo pipefail
+    cd "$(dirname "$0")"
+    for stack in network app; do
+      terraform -chdir="$stack" init -input=false -no-color
+      terraform -chdir="$stack" apply -auto-approve -input=false -no-color
+    done
+    EOF
+    cat > down.sh <<'EOF'
+    #!/bin/bash
+    # Tear down in reverse order: the app first, then its network.
+    set -euo pipefail
+    cd "$(dirname "$0")"
+    for stack in app network; do
+      terraform -chdir="$stack" init -input=false -no-color
+      terraform -chdir="$stack" destroy -auto-approve -input=false -no-color
+    done
+    EOF
+    chmod +x up.sh down.sh
+    ./up.sh && cat app/app.txt
+    ```
+  setup: |
+    tf_start
+    rm -rf /lab/stacks
+    lab_file /lab/stacks/network/main.tf <<'EOF'
+    resource "random_pet" "vpc" {
+      prefix = "vpc"
+    }
+
+    # The network can't be removed while an app is still deployed in it.
+    resource "terraform_data" "in_use_guard" {
+      provisioner "local-exec" {
+        when    = destroy
+        command = "if [ -e ../app/app.txt ]; then echo 'network is still in use by the app stack' >&2; exit 1; fi"
+      }
+    }
+
+    output "vpc_name" {
+      value = random_pet.vpc.id
+    }
+    EOF
+    lab_file /lab/stacks/app/main.tf <<'EOF'
+    data "terraform_remote_state" "network" {
+      backend = "local"
+      config = {
+        path = "../network/terraform.tfstate"
+      }
+    }
+
+    resource "local_file" "app" {
+      filename = "${path.module}/app.txt"
+      content  = "vpc=${data.terraform_remote_state.network.outputs.vpc_name}\n"
+    }
+    EOF
+  check: |
+    s=/lab/stacks
+    run() { as_user "cd $s && timeout 300 ./$1" >/dev/null 2>&1; }
+    check "up.sh and down.sh are executable" '[ -x $s/up.sh ] && [ -x $s/down.sh ]'
+    run up.sh
+    check_eq "up.sh exits 0" "$?" 0
+    vpc=$(tf_output $s/network vpc_name)
+    check "the network stack is deployed" 'tf_has $s/network random_pet.vpc'
+    check_eq "app.txt names the network" "$(cat $s/app/app.txt 2>/dev/null)" "vpc=${vpc:-?}"
+    run up.sh
+    check_eq "running up.sh again exits 0" "$?" 0
+    rm -f $s/app/app.txt
+    printf 'resource "local_file" "broken" {\n' > $s/network/zz-kl-broken.tf
+    run up.sh; rc=$?
+    rm -f $s/network/zz-kl-broken.tf
+    check_not "up.sh fails when the network step fails" '[ "$rc" = 0 ]'
+    check_not "...and doesn't go on to the app stack" '[ -e $s/app/app.txt ]'
+    run up.sh
+    run down.sh
+    check_eq "down.sh exits 0" "$?" 0
+    check "both stacks have been deployed" '[ -f $s/network/terraform.tfstate ] && [ -f $s/app/terraform.tfstate ]'
+    check_eq "nothing is left in the network state" "$(tf_addrs $s/network | wc -l)" 0
+    check_eq "nothing is left in the app state" "$(tf_addrs $s/app | wc -l)" 0
+    check_not "app.txt is gone" '[ -e $s/app/app.txt ]'
+  solve: |
+    cd /lab/stacks
+    cat > up.sh <<'EOF'
+    #!/bin/bash
+    # Deploy the stacks in dependency order: network first, then app.
+    set -euo pipefail
+    cd "$(dirname "$0")"
+    for stack in network app; do
+      terraform -chdir="$stack" init -input=false -no-color
+      terraform -chdir="$stack" apply -auto-approve -input=false -no-color
+    done
+    EOF
+    cat > down.sh <<'EOF'
+    #!/bin/bash
+    # Tear down in reverse order: the app first, then its network.
+    set -euo pipefail
+    cd "$(dirname "$0")"
+    for stack in app network; do
+      terraform -chdir="$stack" init -input=false -no-color
+      terraform -chdir="$stack" destroy -auto-approve -input=false -no-color
+    done
+    EOF
+    chmod +x up.sh down.sh
+    ./up.sh
+
+- id: tf-084
+  title: Write the deploy pipeline
+  difficulty: 5
+  kind: build
+  tags: [terraform, pipeline, saved-plan, show-json, detailed-exitcode, scripting]
+  tutorial: |
+    **Concept.** A deploy pipeline is the pieces of this module in one
+    script: `init -input=false`; a **saved plan** with
+    `-detailed-exitcode` so the script knows whether there is anything to
+    do; the plan **published** for reviewers as text (`terraform show
+    -no-color`) and JSON (`terraform show -json`); a **policy gate** on the
+    JSON; and an apply of **that saved plan** only after approval. Each
+    outcome gets its own exit status, so the CI system can colour the build
+    correctly.
+
+    **Read up on:**
+    - `terraform plan -detailed-exitcode -out=FILE`
+    - `terraform show -no-color FILE`, `terraform show -json FILE`
+    - `terraform apply FILE`
+  scenario: |
+    Write **`/lab/pipeline/run.sh`** (executable), the deploy pipeline for
+    the site in `/lab/pipeline`. Run from that directory, non-interactively,
+    it initialises, plans, and decides. Approval comes from the variable
+    **`APPROVE`**: only `APPROVE=yes` counts.
+
+    Whenever the plan succeeds it leaves the saved plan in
+    **`out/tfplan`**, a plain-text rendering of it (no colour codes) in
+    **`out/plan.txt`**, and its JSON in **`out/plan.json`**. The **last line**
+    it prints and its **exit status**:
+
+    | outcome | last line | exit |
+    |---|---|---|
+    | init or plan fails | `error` | 1 |
+    | the plan has no changes | `no-changes` | 0 |
+    | the plan deletes or replaces anything (never applied, even with `APPROVE=yes`) | `blocked` | 3 |
+    | changes, `APPROVE` isn't `yes` (nothing applied) | `pending` | 2 |
+    | changes, `APPROVE=yes`: apply **`out/tfplan`** | `applied` | 0 |
+
+    If the apply itself fails, end with `error` and exit 1. The check edits
+    `terraform.tfvars` and runs your pipeline through every row.
+  hints:
+    - "Capture the plan's exit status: `terraform plan -detailed-exitcode -out=out/tfplan ...; rc=$?` (0, 1 or 2)."
+    - "Write `plan.txt` and `plan.json` from the *saved* plan with `terraform show`."
+    - "Blocked: `jq -e '[.resource_changes[]? | select(.change.actions | index(\"delete\"))] | length > 0' out/plan.json`."
+    - "A small `finish() { echo \"$1\"; exit \"$2\"; }` keeps every exit path to one line."
+  solution: |
+    ```bash
+    cd /lab/pipeline
+    cat > run.sh <<'EOF'
+    #!/bin/bash
+    # Deploy pipeline: init, plan, publish the plan, gate, apply.
+    set -uo pipefail
+    cd "$(dirname "$0")"
+    mkdir -p out
+    finish() { echo "$1"; exit "$2"; }
+
+    terraform init -input=false -no-color >/dev/null || finish error 1
+    terraform plan -input=false -no-color -detailed-exitcode -out=out/tfplan >/dev/null
+    rc=$?
+    [ "$rc" = 1 ] && finish error 1
+    terraform show -no-color out/tfplan > out/plan.txt || finish error 1
+    terraform show -json out/tfplan > out/plan.json || finish error 1
+    [ "$rc" = 0 ] && finish no-changes 0
+    if jq -e '[.resource_changes[]? | select(.change.actions | index("delete"))] | length > 0' out/plan.json >/dev/null; then
+      finish blocked 3
+    fi
+    [ "${APPROVE:-}" = yes ] || finish pending 2
+    terraform apply -input=false -no-color out/tfplan >/dev/null || finish error 1
+    finish applied 0
+    EOF
+    chmod +x run.sh
+    ./run.sh; echo "exit $?"            # pending 2: the contact page
+    APPROVE=yes ./run.sh                # applied
+    ```
+  setup: |
+    tf_start
+    rm -rf /lab/pipeline
+    lab_file /lab/pipeline/main.tf <<'EOF'
+    variable "pages" {
+      type = set(string)
+    }
+
+    variable "banner" {
+      type = string
+    }
+
+    resource "local_file" "page" {
+      for_each = var.pages
+      filename = "${path.module}/site/${each.key}.html"
+      content  = "<h1>${var.banner}</h1>\n<p>${each.key}</p>\n"
+    }
+    EOF
+    lab_file /lab/pipeline/terraform.tfvars <<'EOF'
+    pages  = ["index", "about"]
+    banner = "Acme"
+    EOF
+    tf_as_user /lab/pipeline init -input=false -no-color >/dev/null
+    tf_as_user /lab/pipeline apply -auto-approve -input=false -no-color >/dev/null
+    lab_file /lab/pipeline/terraform.tfvars <<'EOF'
+    pages  = ["index", "about", "contact"]
+    banner = "Acme"
+    EOF
+    sha256sum /lab/pipeline/main.tf > "$KL_STATE/sums"
+  check: |
+    d=/lab/pipeline
+    esc=$(printf '\033')
+    run() { out=$(as_user "cd $d && APPROVE=$1 timeout 300 ./run.sh" 2>/dev/null); rc=$?; last=$(printf '%s\n' "$out" | tail -n1); }
+    tfvars() { printf 'pages  = [%s]\nbanner = "%s"\n' "$1" "$2" | lab_file $d/terraform.tfvars; }
+    check "run.sh is executable" '[ -x $d/run.sh ]'
+    check "main.tf is unchanged" 'sha256sum -c --quiet "$KL_STATE/sums"'
+    # start from a known state: these three pages deployed
+    tfvars '"index", "about", "contact"' Acme
+    tf_as_user $d init -input=false -no-color >/dev/null 2>&1
+    tf_as_user $d apply -auto-approve -input=false -no-color >/dev/null 2>&1
+    rm -rf $d/out
+    tfvars '"index", "about", "contact", "pricing"' Acme
+    run no
+    check_eq "a new page, not approved: last line and exit status" "$last $rc" "pending 2"
+    check_not "...and nothing was applied" '[ -e $d/site/pricing.html ]'
+    check "out/tfplan is a saved plan" '[ -s $d/out/tfplan ]'
+    check "out/plan.txt shows the change, without colour codes" 'grep -qF "local_file.page[\"pricing\"]" $d/out/plan.txt && ! grep -qF "$esc[" $d/out/plan.txt'
+    check_eq "out/plan.json lists the create" "$(jq -r '.resource_changes[]? | select(.change.actions == ["create"]) | .address' $d/out/plan.json 2>/dev/null)" 'local_file.page["pricing"]'
+    run yes
+    check_eq "the same change with APPROVE=yes" "$last $rc" "applied 0"
+    check_eq "site/pricing.html" "$(cat $d/site/pricing.html 2>/dev/null)" "$(printf '<h1>Acme</h1>\n<p>pricing</p>')"
+    run yes
+    check_eq "nothing left to do" "$last $rc" "no-changes 0"
+    tfvars '"index", "about", "contact", "pricing"' "Acme Corp"
+    run yes
+    check_eq "a change that replaces every page, even with APPROVE=yes" "$last $rc" "blocked 3"
+    check_eq "...and the pages were left alone" "$(head -n1 $d/site/index.html 2>/dev/null)" "<h1>Acme</h1>"
+    tfvars '"index", "about", "contact", "pricing"' Acme
+    printf 'resource "local_file" "broken" {\n' > $d/zz-kl-broken.tf
+    run yes
+    rm -f $d/zz-kl-broken.tf
+    check_eq "a broken configuration" "$last $rc" "error 1"
+    check "the plan is empty" 'tf_clean $d'
+  solve: |
+    cd /lab/pipeline
+    cat > run.sh <<'EOF'
+    #!/bin/bash
+    # Deploy pipeline: init, plan, publish the plan, gate, apply.
+    set -uo pipefail
+    cd "$(dirname "$0")"
+    mkdir -p out
+    finish() { echo "$1"; exit "$2"; }
+
+    terraform init -input=false -no-color >/dev/null || finish error 1
+    terraform plan -input=false -no-color -detailed-exitcode -out=out/tfplan >/dev/null
+    rc=$?
+    [ "$rc" = 1 ] && finish error 1
+    terraform show -no-color out/tfplan > out/plan.txt || finish error 1
+    terraform show -json out/tfplan > out/plan.json || finish error 1
+    [ "$rc" = 0 ] && finish no-changes 0
+    if jq -e '[.resource_changes[]? | select(.change.actions | index("delete"))] | length > 0' out/plan.json >/dev/null; then
+      finish blocked 3
+    fi
+    [ "${APPROVE:-}" = yes ] || finish pending 2
+    terraform apply -input=false -no-color out/tfplan >/dev/null || finish error 1
+    finish applied 0
+    EOF
+    chmod +x run.sh
+    APPROVE=yes ./run.sh
+
+- id: tf-085
+  title: "Incident: the pipeline is green, the site is not"
+  difficulty: 5
+  kind: fix
+  tags: [terraform, incident, ci, lock-file, tf_var, tf_cli_args, pipefail, troubleshooting]
+  tutorial: |
+    **Concept.** A pipeline can lie in two ways: it can **hide failures**
+    (`cmd | tee log` returns `tee`'s status unless `pipefail` is set, and
+    `|| true` swallows anything), and its **environment** can quietly change
+    what Terraform does. `TF_VAR_name` is case-sensitive and must match the
+    variable exactly. **`TF_CLI_ARGS`** and **`TF_CLI_ARGS_<command>`** add
+    flags to every run of a command, so a leftover `-target` there turns
+    every deploy into a partial one. And `init` only selects new provider
+    versions with `-upgrade`. A constraint the lock file no longer satisfies
+    stops `init` until someone upgrades the lock file and commits it. Find
+    the real errors first: make the pipeline fail honestly, then fix what
+    it reports.
+
+    **Read up on:**
+    - `set -o pipefail`, `PIPESTATUS`
+    - `TF_VAR_name`, `TF_CLI_ARGS_name`
+    - `terraform init -upgrade` and the lock file
+  scenario: |
+    The shop's deploy job, **`/lab/shop/ci.sh`**, has been green for a week,
+    yet the site in **`/lab/shop/site/`** is missing pages. The job sources
+    the runner's environment from **`runner.env`**. Get the pipeline
+    honest and working. When you're done:
+
+    - `./ci.sh` **exits 0** and deploys **everything**: `site/index.html`,
+      `site/status.html`, `site/contact.html` and `site/banner.txt`, with the
+      region **`eu-west`** that `runner.env` provides
+    - `./ci.sh` **exits non-zero** when any stage fails (the check breaks
+      the configuration, and makes an apply fail)
+    - `runner.env` sets no `TF_CLI_ARGS*` variables, and there are no
+      `.tfvars` files
+    - `main.tf` and `versions.tf` are unchanged (the `>= 2.9.0` constraint
+      is wanted). The lock file selects a 2.9.x `hashicorp/local`, and
+      `ci.sh` uses the lock file as committed (no `-upgrade` in it)
+    - the plan is empty
+  hints:
+    - "First make the job honest: `set -euo pipefail`, and drop the `|| true`. Then run it and read the first real error."
+    - "`init`: the lock file still selects an old provider. Run `terraform init -upgrade` once yourself, not in `ci.sh`."
+    - "`plan`: `TF_VAR_Region` doesn't set `var.region`. The name is case-sensitive."
+    - "Only the banner gets deployed? Look for `TF_CLI_ARGS_plan` in `runner.env`."
+  solution: |
+    ```bash
+    cd /lab/shop
+    # 1. make the pipeline report failures
+    sed -i 's/^cd "$(dirname "$0")"$/set -euo pipefail\n&/; s/ || true$//' ci.sh
+    ./ci.sh                       # init: locked local 2.8.0 doesn't match >= 2.9.0
+    # 2. upgrade the lock file once (and commit it)
+    terraform init -upgrade
+    ./ci.sh                       # plan: No value for required variable "region"
+    # 3. the variable name is case-sensitive; 4. the leftover -target
+    sed -i 's/^TF_VAR_Region=/TF_VAR_region=/; /emergency/d; /TF_CLI_ARGS/d' runner.env
+    ./ci.sh && ls site/
+    ```
+  setup: |
+    tf_start
+    rm -rf /lab/shop
+    lab_file /lab/shop/versions.tf <<'EOF'
+    terraform {
+      required_providers {
+        local = {
+          source  = "hashicorp/local"
+          version = "2.8.0"
+        }
+      }
+    }
+    EOF
+    lab_file /lab/shop/main.tf <<'EOF'
+    variable "region" {
+      type = string
+    }
+
+    variable "pages" {
+      type    = set(string)
+      default = ["index", "status", "contact"]
+    }
+
+    resource "local_file" "page" {
+      for_each = var.pages
+      filename = "${path.module}/site/${each.key}.html"
+      content  = "<h1>${each.key}</h1>\n<p>served from ${var.region}</p>\n"
+    }
+
+    resource "local_file" "banner" {
+      filename = "${path.module}/site/banner.txt"
+      content  = "Maintenance window: Sunday 02:00 (${var.region})\n"
+    }
+    EOF
+    # the lock file was committed back when 2.8.0 was pinned ...
+    tf_as_user /lab/shop init -input=false -no-color >/dev/null
+    # ... then the constraint was raised, and nobody upgraded the lock file
+    sed -i 's/version = "2.8.0"/version = ">= 2.9.0"/' /lab/shop/versions.tf
+    lab_file /lab/shop/runner.env <<'EOF'
+    # Environment the CI runner provides to the deploy job.
+    TF_IN_AUTOMATION=1
+    TF_VAR_Region=eu-west
+    # 2026-10-02 emergency: only push the banner, remove after the incident -- ops
+    TF_CLI_ARGS_plan=-target=local_file.banner
+    EOF
+    lab_file /lab/shop/ci.sh 0755 <<'EOF'
+    #!/bin/bash
+    # Deploy job: the CI runner runs ./ci.sh from the repository root.
+    cd "$(dirname "$0")"
+    set -a; . ./runner.env; set +a
+
+    terraform init -input=false -no-color | tee init.log
+    terraform plan -input=false -no-color -out=tfplan | tee plan.log
+    terraform apply -input=false -no-color tfplan | tee apply.log || true
+    echo "deploy finished"
+    EOF
+    sha256sum /lab/shop/main.tf /lab/shop/versions.tf > "$KL_STATE/sums"
+  check: |
+    d=/lab/shop
+    run() { as_user "cd $d && timeout 300 ./ci.sh" >/dev/null 2>&1; }
+    check "main.tf and versions.tf are unchanged" 'sha256sum -c --quiet "$KL_STATE/sums"'
+    check_not "runner.env sets no TF_CLI_ARGS variables" 'grep -qE "^\s*(export\s+)?TF_CLI_ARGS" $d/runner.env'
+    check_not "there are no tfvars files" 'ls -A $d | grep -qE "\.tfvars(\.json)?$"'
+    check_not "ci.sh doesn't upgrade providers" 'grep -q -- "-upgrade" $d/ci.sh'
+    check_match "the lock file selects hashicorp/local 2.9.x" "$(grep -A1 'registry.terraform.io/hashicorp/local' $d/.terraform.lock.hcl 2>/dev/null | grep version)" '"2\.9\.'
+    run
+    check_eq "./ci.sh exits 0" "$?" 0
+    for p in index status contact; do
+      check_eq "site/$p.html" "$(cat $d/site/$p.html 2>/dev/null)" "$(printf '<h1>%s</h1>\n<p>served from eu-west</p>' $p)"
+    done
+    check_eq "site/banner.txt" "$(cat $d/site/banner.txt 2>/dev/null)" "Maintenance window: Sunday 02:00 (eu-west)"
+    check_eq "every resource is managed" "$(tf_addrs $d | tr '\n' ' ')" 'local_file.banner local_file.page["contact"] local_file.page["index"] local_file.page["status"] '
+    # an apply that fails: a page went missing and the site directory is read-only
+    if [ -d $d/site ]; then
+      rm -f $d/site/index.html; chmod 555 $d/site
+      run; rc=$?
+      chmod 755 $d/site
+      check_not "./ci.sh fails when the apply fails" '[ "$rc" = 0 ]'
+      run
+    fi
+    printf 'resource "local_file" "broken" {\n' > $d/zz-kl-broken.tf
+    run; rc=$?
+    rm -f $d/zz-kl-broken.tf
+    check_not "./ci.sh fails when the configuration is broken" '[ "$rc" = 0 ]'
+    check "the plan is empty" '(export TF_VAR_region=eu-west; tf_clean $d)'
+  solve: |
+    cd /lab/shop
+    sed -i 's/^TF_VAR_Region=/TF_VAR_region=/; /emergency/d; /TF_CLI_ARGS/d' runner.env
+    terraform init -upgrade -input=false -no-color
+    cat > ci.sh <<'EOF'
+    #!/bin/bash
+    # Deploy job: the CI runner runs ./ci.sh from the repository root.
+    set -euo pipefail
+    cd "$(dirname "$0")"
+    set -a; . ./runner.env; set +a
+
+    terraform init -input=false -no-color | tee init.log
+    terraform plan -input=false -no-color -out=tfplan | tee plan.log
+    terraform apply -input=false -no-color tfplan | tee apply.log
+    echo "deploy finished"
+    EOF
+    ./ci.sh
