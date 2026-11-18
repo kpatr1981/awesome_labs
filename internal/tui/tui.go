@@ -216,7 +216,7 @@ type Deps struct {
 	Exams    *exam.Store
 	Notes    *progress.Notes
 
-	OnExit       string // delete (default), stop or keep
+	OnExit       string // stop (default), delete or keep
 	AutoCheck    bool
 	CheckUpdates bool
 	Theme        string // auto, dark or light
@@ -254,7 +254,7 @@ func newModel(d Deps, style string) *model {
 		m.notes, _ = progress.OpenNotes(mgr.StateDir)
 	}
 	if m.onExit == "" {
-		m.onExit = "delete"
+		m.onExit = "stop"
 	}
 	m.fetchHistory = func(ex *exercise.Exercise) { mgr.FetchHistory(context.Background(), ex) }
 	m.pushSeen = time.Now() // auto-check reacts to saves made from now on
@@ -290,9 +290,10 @@ func (m *model) isActive(ex *exercise.Exercise) bool {
 	return ex != nil && m.hasActive && m.active.ID == ex.ID
 }
 
-// Init starts by deleting every lab VM left over from an earlier run,
-// running or stopped: exiting deletes them, so any still there were left by a
-// crash or a ctrl+c while busy. No exercise is set up on the VMs after it.
+// With on_exit: delete, Init starts by deleting every lab VM left over from
+// an earlier run, running or stopped: exiting deletes them, so any still there
+// were left by a crash or a ctrl+c while busy. No exercise is set up on the
+// VMs after it.
 //
 // With on_exit set to stop or keep, the VMs were left on purpose: nothing is
 // deleted and the exercise you were on is still set up.

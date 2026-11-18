@@ -38,9 +38,10 @@ func usage() {
 	fmt.Fprint(os.Stderr, `awesome_labs — hands-on infrastructure and security labs on Lima VMs
 
 usage:
-  awesome_labs                         open the interactive exercise browser
-  awesome_labs web [--addr HOST:PORT] [--no-open]
-                                  the same in your web browser, with terminals into the lab VMs
+  awesome_labs [--addr HOST:PORT] [--no-open]
+                                  open the labs in your web browser, with terminals into the lab VMs
+                                  (the same as: awesome_labs web ...)
+  awesome_labs tui                     the interactive exercise browser in this terminal
   awesome_labs install [--dry-run] [--yes] [--bin-dir DIR]
                                   detect the OS, install Lima and QEMU, and put this binary on your PATH
   awesome_labs status                  the exercise you're working on and the running VMs
@@ -86,6 +87,10 @@ func run(args []string) error {
 	if len(args) > 0 && args[0] == "install" {
 		return install.Run(args[1:], os.Stdin, os.Stdout)
 	}
+	// the web interface is the default: no command, or only its flags, runs it
+	if len(args) == 0 || (strings.HasPrefix(args[0], "-") && args[0] != "-h" && args[0] != "--help") {
+		args = append([]string{"web"}, args...)
+	}
 	fsys, root := exercisesFS()
 	cat, err := exercise.Load(fsys, root)
 	if err != nil {
@@ -98,10 +103,7 @@ func run(args []string) error {
 	// only one awesome_labs changes the VMs and the progress at a time; the
 	// read-only commands may run beside it, and so may a shell and the VS Code
 	// sync, which only work inside /lab of a running VM
-	cmd := ""
-	if len(args) > 0 {
-		cmd = args[0]
-	}
+	cmd := args[0]
 	switch cmd {
 	case "-h", "--help", "help", "lint", "list", "show", "status", "paths", "shell", "code", "sync", "doctor", "version", "notebook":
 	default:
@@ -135,7 +137,10 @@ func run(args []string) error {
 	ctx, cancel := signal.NotifyContext(context.Background(), os.Interrupt)
 	defer cancel()
 
-	if len(args) == 0 {
+	if cmd == "tui" {
+		if len(args) > 1 {
+			return fmt.Errorf("tui takes no arguments")
+		}
 		mgr.AutoStop = cfg.AutoStopEnabled()
 		notes, err := progress.OpenNotes(mgr.StateDir)
 		if err != nil {

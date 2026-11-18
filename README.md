@@ -10,17 +10,10 @@ project…), drops you into a shell, and checks your work when you're done. Ever
 exercise has a scenario, progressive hints and a full solution you can reveal, and most
 have a short tutorial on the concepts and commands to read first.
 
-```text
- awesome_labs  Program  View  Tracks  Help                        ✔ 37/1546 solved  ● 2 started, unsolved
-╭──────────────────────────────────────────────╮╭───────────────────────────────────────────────╮
-│▸ Kubernetes · Troubleshooting the cluster     ││k8s-245 — The API server is gone               │
-│ ✔ k8s-241   ●●○○○ fix   node01 is NotReady    ││●●●○○ Medium · Fix something · Kubernetes      │
-│ ● k8s-242   ●●○○○ fix   The container runtime…││                                               │
-│   k8s-245   ●●●○○ fix   The API server is gone││  kubectl get pods → The connection to the     │
-│   ...                                         ││  server controlplane:6443 was refused …       │
-╰──────────────────────────────────────────────╯╰───────────────────────────────────────────────╯
- ↑↓ move · enter open · / filter · tab next track · F10 menu · F1 keys · q quit
-```
+Run `awesome_labs` and the labs open **in your web browser**: the catalogue, each
+exercise's scenario, tutorial, hints and solution, live output from start and check, and
+terminals into the lab VMs right on the page. A terminal UI (`awesome_labs tui`) and plain
+commands (`awesome_labs start/check <id>`) are there too.
 
 ## What you get
 
@@ -37,17 +30,18 @@ have a short tutorial on the concepts and commands to read first.
 | **Programming** | Python and Go · common pitfalls & idioms (closures, decimals, slices, error wrapping, concurrency) *(growing)* · secure coding (path traversal, XSS, password hashing, ReDoS, SSRF, zip slip, webhook signatures) | 80 |
 | **Data Science** | pandas, statistics and machine learning · analysis & model diagnostics (tidy data, joins, chi-square, calibration, importance) *(growing)* · customer & product analytics (funnels, cohorts, RFM, survival, attribution, churn). **Done in Jupyter notebooks** that the checks run | 78 |
 | **Git** | the basics · branching & merging · inspecting history · undoing changes · rebasing & rewriting · stashing & tagging · remotes & collaboration · recovery & detective work (reflog, bisect, fsck) · plumbing & power tools · real-world workflows · config & aliases · ignore rules & attributes · hooks · submodules & subtrees · advanced merging (strategies, rerere, merge-tree) · searching & comparing · large repositories (shallow, partial, sparse) · repository troubleshooting · identity, SSH signing & trailers · multi-problem incidents · revisions, refs & scripting (gitrevisions, for-each-ref, plumbing commits, grafts) · hosting & serving repositories (bare repos, mirrors, git daemon, receive protections, deploy hooks) | 235 |
-| **Terraform** | the basics (init, plan, apply, outputs, provider versions) · variables, expressions & meta-arguments (`count`, `for_each`, templates, validation) · working with state (moved, removed, import, workspaces, backends, recovery) · modules (local, Git-pinned, refactoring into modules) · real Docker infrastructure with the `kreuzwerker/docker` provider · functions, lifecycle & testing (dynamic blocks, `lifecycle`, `check`, `import`, `terraform test`) *(growing)* · Terraform in automation (saved plans, exit codes, JSON plan gates, state locks, mock-provider tests, pipelines) | 85 |
+| **Terraform** | the basics (init, plan, apply, outputs, provider versions) · variables, expressions & meta-arguments (`count`, `for_each`, templates, validation) · working with state (moved, removed, import, workspaces, backends, recovery) · modules (local, Git-pinned, refactoring into modules) · real Docker infrastructure with the `kreuzwerker/docker` provider · functions, lifecycle & testing (dynamic blocks, `lifecycle`, `check`, `import`, `terraform test`) *(growing)* · Terraform in automation (saved plans, exit codes, JSON plan gates, state locks, mock-provider tests, pipelines) · every module runs beginner → advanced and ends with a real-world capstone lab | 92 |
 | **Ansible** | inventories & ad-hoc commands · playbooks (handlers, loops, conditionals, idempotence) · templates, files & variables (Jinja2, precedence, Vault) · roles & reuse (role design, dependencies, Galaxy from Git, ansible-lint) · operations & incidents (check mode, validate, block/rescue, become, constructed inventories) against SSH-managed nodes · control flow & extending Ansible (tags, blockinfile, delegation, handlers, vault IDs, collections, custom filters/modules) *(growing)* · data structures & types (dicts, merging, JSON in and out, type errors) | 85 |
 | **Algorithms** | searching & sorting · data structures · graphs · dynamic programming · strings, greedy & maths — each exercise solvable in **Python or Go** *(growing)* · recursion & backtracking | 65 |
 
-That's 1546 exercises so far, with a target of 250 per track; ideas for what comes next are
+That's 1553 exercises so far, with a target of 250 per track; ideas for what comes next are
 in [docs/PENDING.md](docs/PENDING.md).
 
 Difficulty rises through each module (1 = beginner … 5 = expert), mixing **build** tasks
 ("create X" / "capture the flag") and **fix** tasks ("X is broken — find out why" /
 "patch the vulnerability"). The Docker and Kubernetes modules end with a multi-problem
-*incident*.
+*incident*. Every Terraform module goes beginner → intermediate → advanced and ends with a
+**capstone**: one big, realistic lab (a ticket from a real team) that combines the module's skills.
 
 ## Responsible use
 
@@ -124,13 +118,87 @@ git clone https://github.com/kpatr1981/awesome_labs.git
 cd awesome_labs
 make build          # or: go build -o awesome_labs .
 ./awesome_labs install   # installs what's missing and puts awesome_labs on your PATH
-awesome_labs             # interactive browser
+awesome_labs             # the labs in your web browser (the default)
+awesome_labs tui         # or the interactive browser in this terminal
 ```
 
 `make build` produces a single static binary with the exercises built in. `make release`
 builds one for Linux and macOS on x86-64 and ARM into `dist/`, with checksums.
 
-### Menus and the mouse
+### The web interface
+
+The web interface is awesome_labs' main interface: `awesome_labs` (the same as
+`awesome_labs web`) serves the labs as a web page, with **terminals into the lab VMs in
+the browser**. It prints a link and opens it; the page and the terminals run until you
+press `ctrl+c` in the terminal you started it from.
+
+```bash
+awesome_labs                         # http://127.0.0.1:7681, opens your browser
+awesome_labs web --addr 127.0.0.1:9000 --no-open
+```
+
+- **The exercise screen** has the same tabs as the terminal UI (Scenario, Learn, Hints,
+  Solution, Output, Notes) and buttons for Start, Terminal, Check, Hint, Solution, End,
+  Restart and Reset progress. A button is dimmed when it can't act yet and says why when
+  pressed. Start, Check and the environment operations stream their output live into the
+  Output tab and the status bar.
+- **Terminals** open in a panel below the exercise, or beside it (`⇆`), or maximized
+  (`⤢`): one tab per VM (`controlplane` and `node01` for Kubernetes). They run the same
+  shell as `t`/`w`, so your command history per exercise is kept. Starting the lab opens
+  one by itself. Each code block in the text has **Copy** and **▸ Terminal**, which pastes
+  it into the open terminal for you to run with Enter. A shell that ended reconnects on
+  Enter.
+- **Notebooks:** the Data Science track is done in Jupyter notebooks. **📓 Notebook** opens
+  JupyterLab in the same panel, on the exercise's notebook `/lab/<id>.ipynb`, which
+  starting the exercise writes: how it's graded, the code to fix (if any) and a save cell
+  for each file to produce. It runs on the docker host in `/lab`, as the lab user, with
+  pandas, NumPy, SciPy, scikit-learn and matplotlib. **The notebook is what's graded:**
+  Check runs it from top to bottom in a fresh kernel, on a copy of `/lab` without the
+  files it must write, then grades what it wrote, and calls the functions the task names
+  with the check's own data. Files made by hand don't count, and the check's hidden data
+  is out of the notebook's reach while it runs. The page lists the files each exercise
+  grades and how to save them. The container is capped at 2.5 GiB; closing the notebook
+  tab stops it and resetting the lab removes it. JupyterLab is only reachable through
+  the web interface, which adds the notebook's token itself. In the terminal UI, open
+  the notebook in VS Code (`o`).
+- **Environments & VMs** shows every environment and VM with start, stop, reset, prepare,
+  rebuild and delete.
+- **First launch** offers to build the environments that have no saved copy yet, one
+  checkbox each (the terminal UI asks the same once; whichever asks first, it isn't asked
+  again). Each is built, saved and stopped, so its first exercise starts in seconds.
+- **Only what's needed runs.** With `auto_stop: true` (the default) the server stops the
+  running lab VMs once no exercise is set up and nothing (an operation, a terminal, a
+  notebook) has used them for 10 minutes, or when an exercise is set up but no page has
+  been open for 30 minutes. Stopping keeps the disks and the lab: the exercise's page
+  boots it again.
+- The list on the left filters by text, track, progress and learning path; drag its
+  right edge to widen it (double-click resets it). `/` focuses the filter, `j`/`k` move
+  through the list and `1`–`6` switch tabs.
+
+Exams are started from the terminal UI (`X`); while one runs the web page honours it:
+hints and the solution of its questions are locked and its checks count.
+
+**Security.** A terminal in a web page is a shell on your lab VMs, so the server listens on
+`127.0.0.1` only, and every request needs the random token in the printed link. The token
+is kept in a same-site cookie after the first visit and is new each run. Requests from other
+sites and other `Host` names are refused. `--addr 0.0.0.0:7681` makes it reachable from
+your network: anyone with the link then gets those shells, so only do that on a network
+you trust.
+
+Like the terminal UI, the web interface takes the single-instance lock, and `ctrl+c` treats
+the lab VMs the way leaving the terminal UI does (`on_exit`: by default every lab VM is
+stopped, keeping the exercise you were on set up; `ctrl+c` a second time leaves them as
+they are). Stopping it while an operation runs cancels that operation and leaves the VMs
+as they are, and so does failing to start (say, the port is taken). Unlike the terminal UI with `on_exit: delete`, it does not
+delete leftover VMs when it starts.
+
+### The terminal UI
+
+`awesome_labs tui` opens the same labs in your terminal: a keyboard- and mouse-driven
+exercise browser that drops you into a shell in the lab VM. It is also where exams are
+started (`X`).
+
+#### Menus and the mouse
 
 Away from the exercise screen, everything is also reachable from the **menu bar** at the top: click a menu, press
 `F10`, or `alt` + the underlined letter (`alt+p` Program, `alt+v` View,
@@ -163,7 +231,7 @@ key next to its name (on a narrow terminal, just the name). Confirmations open
 as a dialog with **Yes** / **No** buttons (`y`/`n` still work). `F1` lists every
 shortcut. While the mouse is in use, most terminals select text with `shift`+drag.
 
-### In the browser
+#### The exercise list
 
 | Key | Action |
 |-----|--------|
@@ -180,9 +248,9 @@ shortcut. While the mouse is in use, most terminals select text with `shift`+dra
 | `a` | jump to the exercise you're **working on** (shown as `▶` in the header and list) |
 | `S` | your labs: the active exercise, then others started earlier and not solved |
 | `e` | environments & VMs: live state of every VM; create, stop, reset, rebuild, delete, **P** prepare (build and keep a saved copy) — `X` stops all, `K` deletes all |
-| `Q` (`q` on the list, `ctrl+c`, Program → Exit) | exit — always **deletes every lab VM**, running or stopped, first, and starting the app deletes any left over (`ctrl+c` while busy or deleting exits at once and leaves them as they are) |
+| `Q` (`q` on the list, `ctrl+c`, Program → Exit) | exit — handles the lab VMs by `on_exit` first: by default **stops** them, keeping the exercise you were on set up (`ctrl+c` while busy or stopping exits at once and leaves them as they are) |
 
-### In an exercise
+#### In an exercise
 
 | Key | Action |
 |-----|--------|
@@ -205,7 +273,7 @@ shortcut. While the mouse is in use, most terminals select text with `shift`+dra
 Leaving the exercise that is set up on the VMs **keeps its lab**: your files and
 containers stay in the VMs, and `a` (or opening it again) takes you back to carry on
 where you left off. The lab is cleaned only when you **end** the exercise (`x`), start
-another one (asks first), or exit the app. Ending it resets the environment to pristine
+another one (asks first), or exit the app with `on_exit: delete`. Ending it resets the environment to pristine
 in place and leaves it running, so the next exercise on it starts without building or
 booting anything (and skips its own reset). An exercise that breaks its environment
 beyond a reset has its VMs deleted instead. Starting an exercise **deletes the VMs of
@@ -261,72 +329,6 @@ PATH*); on macOS the app in `/Applications` is found without it. Set
 Files outside `/lab` (`/etc`, the cluster's manifests…) are still edited from the
 terminal.
 
-### In your web browser
-
-`awesome_labs web` serves the same labs as a web page, with **terminals into the lab VMs
-in the browser**. It prints a link and opens it; the page and the terminals run until you
-press `ctrl+c` in the terminal you started it from.
-
-```bash
-awesome_labs web                     # http://127.0.0.1:7681, opens your browser
-awesome_labs web --addr 127.0.0.1:9000 --no-open
-```
-
-- **The exercise screen** has the same tabs as the terminal UI (Scenario, Learn, Hints,
-  Solution, Output, Notes) and buttons for Start, Terminal, Check, Hint, Solution, End,
-  Restart and Reset progress. A button is dimmed when it can't act yet and says why when
-  pressed. Start, Check and the environment operations stream their output live into the
-  Output tab and the status bar.
-- **Terminals** open in a panel below the exercise, or beside it (`⇆`), or maximized
-  (`⤢`): one tab per VM (`controlplane` and `node01` for Kubernetes). They run the same
-  shell as `t`/`w`, so your command history per exercise is kept. Starting the lab opens
-  one by itself. Each code block in the text has **Copy** and **▸ Terminal**, which pastes
-  it into the open terminal for you to run with Enter. A shell that ended reconnects on
-  Enter.
-- **Notebooks:** the Data Science track is done in Jupyter notebooks. **📓 Notebook** opens
-  JupyterLab in the same panel, on the exercise's notebook `/lab/<id>.ipynb`, which
-  starting the exercise writes: how it's graded, the code to fix (if any) and a save cell
-  for each file to produce. It runs on the docker host in `/lab`, as the lab user, with
-  pandas, NumPy, SciPy, scikit-learn and matplotlib. **The notebook is what's graded:**
-  Check runs it from top to bottom in a fresh kernel, on a copy of `/lab` without the
-  files it must write, then grades what it wrote, and calls the functions the task names
-  with the check's own data. Files made by hand don't count, and the check's hidden data
-  is out of the notebook's reach while it runs. The page lists the files each exercise
-  grades and how to save them. The container is capped at 2.5 GiB; closing the notebook
-  tab stops it and resetting the lab removes it. JupyterLab is only reachable through
-  the web interface, which adds the notebook's token itself. In the terminal UI, open
-  the notebook in VS Code (`o`).
-- **Environments & VMs** shows every environment and VM with start, stop, reset, prepare,
-  rebuild and delete.
-- **First launch** offers to build the environments that have no saved copy yet, one
-  checkbox each (the terminal UI asks the same once; whichever asks first, it isn't asked
-  again). Each is built, saved and stopped, so its first exercise starts in seconds.
-- **Only what's needed runs.** With `auto_stop: true` (the default) the server stops the
-  running lab VMs once no exercise is set up and nothing (an operation, a terminal, a
-  notebook) has used them for 10 minutes, or when an exercise is set up but no page has
-  been open for 30 minutes. Stopping keeps the disks and the lab: the exercise's page
-  boots it again.
-- The list on the left filters by text, track, progress and learning path; drag its
-  right edge to widen it (double-click resets it). `/` focuses the filter, `j`/`k` move
-  through the list and `1`–`6` switch tabs.
-
-Exams are started from the terminal UI (`X`); while one runs the web page honours it:
-hints and the solution of its questions are locked and its checks count.
-
-**Security.** A terminal in a web page is a shell on your lab VMs, so the server listens on
-`127.0.0.1` only, and every request needs the random token in the printed link. The token
-is kept in a same-site cookie after the first visit and is new each run. Requests from other
-sites and other `Host` names are refused. `--addr 0.0.0.0:7681` makes it reachable from
-your network: anyone with the link then gets those shells, so only do that on a network
-you trust.
-
-Like the app, `awesome_labs web` takes the single-instance lock, and `ctrl+c` treats the
-lab VMs the way leaving the app does (`on_exit`: by default every lab VM is deleted;
-`ctrl+c` a second time leaves them as they are). Stopping it while an operation runs
-cancels that operation and leaves the VMs as they are, and so does failing to start
-(say, the port is taken). Unlike the app, it does not delete leftover VMs when it
-starts.
-
 ### Learning paths
 
 | Path | What's in it |
@@ -347,7 +349,7 @@ difficulty or id).
 
 ### Exam mode
 
-Press `X`, pick a pool (a whole track or any path), the number of questions, a time
+In the terminal UI (`awesome_labs tui`), press `X`, pick a pool (a whole track or any path), the number of questions, a time
 limit and whether hints are allowed. awesome_labs draws a balanced random set: about a
 third easy, a third medium, a third hard. A countdown runs in the header, hints and
 solutions are locked, and **the last check of each question counts**. When you finish
@@ -364,16 +366,17 @@ awesome_labs exam abandon    # give up the running exam
 
 Only one environment runs at a time: starting a Docker exercise deletes the Kubernetes
 VMs and vice versa, while the environment you're using stays up and is cleaned between
-exercises. By default exiting deletes every lab VM, running or stopped, and starting the
-app deletes any left over. With `on_exit: stop` they are stopped instead (their memory is
-freed, their disks kept), and with `keep` left running: either way the exercise you were
-on is still set up next time, and `t` or `c` starts its VMs again without a reset. With
+exercises. By default exiting stops every lab VM (their memory is freed, their disks
+kept): the exercise you were on is still set up next time, and `t` or `c` starts its VMs
+again without a reset, while starting a different exercise resets the lab as always. With
+`on_exit: keep` they are left running, and with `on_exit: delete` exiting deletes every lab
+VM, running or stopped, and starting the app deletes any left over. With
 `auto_stop: true` (the default), solving an exercise with `awesome_labs check` stops its
 VMs. Settings live in `~/.awesome_labs/config.yaml`:
 
 ```yaml
 auto_stop: true
-on_exit: delete        # delete · stop · keep
+on_exit: stop          # stop · delete · keep
 auto_check: false      # start with auto-check on (A toggles it)
 check_updates: false   # look for a newer release once a day; nothing about you is sent
 theme: auto            # auto · dark · light (NO_COLOR=1 turns colours off)
@@ -386,7 +389,8 @@ worker:       {cpus: 2, memory: 2560MiB}
 
 ```bash
 awesome_labs install [--dry-run] [--yes] [--bin-dir DIR]   # set up Lima, QEMU and the binary
-awesome_labs web [--addr HOST:PORT] [--no-open]   # the labs in your browser, with web terminals
+awesome_labs [web] [--addr HOST:PORT] [--no-open]   # the labs in your browser, with web terminals (the default)
+awesome_labs tui                        # the interactive browser in this terminal
 awesome_labs status                     # the exercise you're working on + running VMs
 awesome_labs list [filter]              # list exercises (✔ solved, ● started)
 awesome_labs paths [path-id]            # learning paths and progress

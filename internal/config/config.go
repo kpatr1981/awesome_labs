@@ -22,10 +22,10 @@ type Config struct {
 	// only the environment of the exercise you start, deleting the others.
 	AutoStop *bool `yaml:"auto_stop"`
 
-	// OnExit is what leaving the app does to the lab VMs: "delete" (the
-	// default) deletes them all, "stop" stops them and "keep" leaves them
+	// OnExit is what leaving the app does to the lab VMs: "stop" (the
+	// default) stops them, "delete" deletes them all and "keep" leaves them
 	// running. With stop or keep the exercise you were on is still set up
-	// when you come back.
+	// when you come back; starting another exercise resets the lab anyway.
 	OnExit string `yaml:"on_exit"`
 	// AutoCheck checks the exercise whenever its files change (a save in VS
 	// Code, leaving the terminal). Toggled with A on the exercise screen.
@@ -47,10 +47,10 @@ func (c Config) AutoStopEnabled() bool { return c.AutoStop == nil || *c.AutoStop
 // ExitAction returns the effective on_exit setting: delete, stop or keep.
 func (c Config) ExitAction() string {
 	switch c.OnExit {
-	case "stop", "keep":
+	case "delete", "keep":
 		return c.OnExit
 	}
-	return "delete"
+	return "stop"
 }
 
 // Validate reports settings with values awesome_labs doesn't know.
@@ -72,15 +72,16 @@ const template = `# awesome_labs configuration
 #
 # Stop an exercise's environment once you solve it with "awesome_labs check".
 # The app always keeps only the environment of the exercise you start: the
-# others are deleted, and exiting or starting the app deletes every lab VM.
+# others are deleted, and exiting the app stops every lab VM (see on_exit).
 # After its first build each environment keeps a stopped copy (klbase-* in
 # "limactl list"), so it comes back in seconds; "env rebuild" replaces it.
 auto_stop: true
 
-# What leaving the app does to the lab VMs: delete (default) deletes them all;
-# stop stops them, freeing their memory; keep leaves them running. With stop
-# or keep the exercise you were on is still set up when you come back.
-# on_exit: delete
+# What leaving the app does to the lab VMs: stop (default) stops them, freeing
+# their memory; delete deletes them all, freeing their disk too; keep leaves
+# them running. With stop or keep the exercise you were on is still set up
+# when you come back (starting another exercise resets the lab anyway).
+# on_exit: stop
 
 # Check the exercise whenever its files change: a save in VS Code, or leaving
 # the terminal. A on the exercise screen turns it on and off.

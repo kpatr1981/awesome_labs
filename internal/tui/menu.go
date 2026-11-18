@@ -261,10 +261,10 @@ func visibleItems(items []menuItem) []menuItem {
 	return out
 }
 
-// quitAndStop is every way out of the app. By default (on_exit: delete) it
-// deletes every lab VM, running or stopped, then quits; with on_exit: stop it
-// stops them and with keep it leaves them running, keeping the exercise you
-// are on set up for next time. While an operation is running it refuses;
+// quitAndStop is every way out of the app. By default (on_exit: stop) it
+// stops every lab VM and with keep it leaves them running, keeping the
+// exercise you are on set up for next time; with on_exit: delete it deletes
+// every lab VM, running or stopped, then quits. While an operation is running it refuses;
 // ctrl+c then quits at once and leaves the VMs as they are.
 func (m *model) quitAndStop() tea.Cmd {
 	if m.quitting {

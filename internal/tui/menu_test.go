@@ -575,7 +575,7 @@ func TestMenuHighlightFollowsItsItem(t *testing.T) {
 	}
 }
 
-// The Program menu holds only Exit, and exiting deletes the VMs.
+// The Program menu holds only Exit, and exiting stops the VMs (the default on_exit).
 func TestProgramMenuIsOnlyExit(t *testing.T) {
 	m := build(t, named("list"), false)
 	mn := m.menus()[0]
@@ -583,7 +583,7 @@ func TestProgramMenuIsOnlyExit(t *testing.T) {
 		t.Fatalf("first menu %q has %d items", mn.title, len(mn.items))
 	}
 	mn.items[0].run()
-	if !m.quitting || !strings.Contains(m.flash, "deleting") {
+	if !m.quitting || !strings.Contains(m.flash, "stopping") {
 		t.Errorf("exit: quitting %v, flash %q", m.quitting, m.flash)
 	}
 }
@@ -744,11 +744,12 @@ func TestQuitStopsTheVMs(t *testing.T) {
 	}
 }
 
-// Starting the app deletes the lab VMs left over from an earlier run and
-// forgets the exercise that was set up on them.
+// With on_exit: delete, starting the app deletes the lab VMs left over from
+// an earlier run and forgets the exercise that was set up on them.
 func TestStartDeletesLeftoverVMs(t *testing.T) {
 	m := newTestModel(t)
 	m.op = ""
+	m.onExit = "delete"
 	m.activate(t, "d-1")
 	deleted := make(chan struct{}, 1)
 	m.deleteVMs = func(context.Context, io.Writer) error { deleted <- struct{}{}; return nil }
