@@ -188,3 +188,40 @@ The standard pattern for a web task:
 For a **fix** exercise, ship the vulnerable source with `lab_file /lab/app.py`; the
 `check` starts the learner's version in a throwaway container (register its removal
 with `on_reset`) and probes that the bug is gone *and* the app still works.
+
+## Trying exercises without a VM (`verify -local`)
+
+`awesome_labs verify -local [-j N] [-from id] [-rebuild] [-force] [ids or prefixes...]`
+runs the same setup → check fails → solve → check passes as `verify`, but each exercise
+gets a **fresh privileged container on this machine's Docker** instead of the lab VM:
+Ubuntu 24.04 with systemd as PID 1, the Docker engine at the versions the VM pins, the
+packages of `vms/docker.yaml` and `vms/bootstrap/docker.sh`, a lab user (`lab`, sudo, in
+the docker group), the real kit in `/opt/kubelab`, and the docker bootstrap's images
+(including `kl-terraform`, `kl-ansible`, `kl-node`, `kl-jupyter`). Scripts run the way
+the lab runner runs them: root through `sudo -H` from `/`, `solve` as the lab user in
+`/lab`. The container is thrown away afterwards, so there is no reset.
+
+```bash
+awesome_labs verify -local tf-0                # every Terraform exercise from tf-0…
+awesome_labs verify -local -j 3 docker-00 ans- # three at a time
+```
+
+- **First run** builds the harness image `kl-local-host:<hash>` and the **image store**,
+  a Docker volume `kl-local-store` holding the inner engine's images (seeded from the
+  lab's image cache, `-cache DIR`, then the bootstrap pulls the rest). That takes a few
+  minutes once; it is rebuilt when the Dockerfile, `docker.sh`, `common.sh` or
+  `images.txt` change, or with `-rebuild`. Each exercise then copies the store into its
+  own volume (a reflink copy on btrfs/XFS, a full copy elsewhere) and starts in seconds.
+- **Only the docker profile** runs here. Kubernetes and offsec exercises, ones with a
+  worker script, and destructive ones are listed as skipped.
+- **Host safety:** the container shares the host's kernel, devices and clock, so
+  exercises whose scripts make loop devices, LVM or filesystems, use swap, apply kernel
+  sysctls, set the clock or unload modules are skipped (`-force` runs them anyway, at
+  your own risk). Network namespaces, veths, netem and nftables stay inside the
+  container.
+- Everything it creates is named `kl-local-*` and removed when the run ends or is
+  interrupted; leftovers of a killed run are removed by the next one.
+- It is a quick check, not a replacement: run `awesome_labs verify` on the real VM before
+  a release. Differences from the VM: no Lima user/SSH, container DNS, the host's kernel.
+- `AWESOME_LABS_STATE_DIR=DIR` keeps the run's logs (and any progress/config) away from
+  `~/.awesome_labs`; it doesn't move Lima's VMs.

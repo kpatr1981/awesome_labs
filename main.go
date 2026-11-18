@@ -60,6 +60,8 @@ usage:
   awesome_labs verify [-from id] [-record verified.json] [ids or prefixes...]
                                   author tool: setup -> check fails -> solve -> check passes
                                   (-record notes each pass in the verified-content record)
+  awesome_labs verify -local [-j N] [-from id] [-rebuild] [-force] [ids or prefixes...]
+                                  the same without VMs: each exercise in a throwaway container (docker profile)
   awesome_labs verified [-file verified.json] [-accept [-except ids] [-note text] ids|all] [-prune]
                                   author tool: the release gate: list exercises new or changed since their last pass
   awesome_labs counts [-check] [files...]
@@ -71,6 +73,8 @@ usage:
 
 environment:
   AWESOME_LABS_EXERCISES=dir           load exercises from disk instead of the built-in set
+  AWESOME_LABS_STATE_DIR=dir           keep progress, config and logs there instead of ~/.awesome_labs
+                                  (Lima's VMs are not moved; meant for verify -local and tests)
 `)
 }
 
@@ -112,6 +116,9 @@ func run(args []string) error {
 	switch cmd {
 	case "-h", "--help", "help", "lint", "list", "show", "status", "paths", "shell", "code", "sync", "doctor", "version", "notebook", "verified", "counts":
 	default:
+		if cmd == "verify" && localVerify(args[1:]) {
+			break // no VMs: verify -local runs beside the app
+		}
 		release, err := mgr.LockApp()
 		if err != nil {
 			return err
@@ -588,6 +595,9 @@ func envCmd(ctx context.Context, mgr *lab.Manager, args []string) error {
 
 // verify runs each exercise end to end: setup, check must fail, solve, check must pass.
 func verify(ctx context.Context, cat *exercise.Catalog, mgr *lab.Manager, args []string) error {
+	if localVerify(args) {
+		return verifyLocal(ctx, cat, mgr.StateDir, args)
+	}
 	fset := flag.NewFlagSet("verify", flag.ContinueOnError)
 	from := fset.String("from", "", "start at this exercise id")
 	record := fset.String("record", "", "note each exercise that passes in this verified-content record (e.g. "+defaultRecord+")")
