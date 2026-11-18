@@ -4,6 +4,147 @@ profile: k8s
 order: 16
 exercises:
 
+# ===== Beginner =====
+
+- id: k8s-302
+  title: Feed a pod its configuration
+  difficulty: 2
+  kind: build
+  tags: [projected, volumes, downwardapi, env, envfrom, configmap, secret, optional]
+  tutorial: |
+    **Concept.** A pod can consume configuration as files or as environment variables. A `projected` volume merges ConfigMaps, Secrets and pod metadata into one directory with a mode per file. `envFrom` imports every key of a source, can add a `prefix`, and with `optional: true` lets the pod start even when the source does not exist yet. Files can be refreshed while a pod runs; environment variables are fixed when the container starts.
+
+    **Read up on:**
+    - Kubernetes docs: Projected Volumes
+    - `kubectl explain pod.spec.volumes.projected.sources` — `configMap`, `secret`, `downwardAPI`, and per-item `mode`
+    - `kubectl explain pod.spec.containers.envFrom` — `prefix`, `configMapRef.optional`, `secretRef.optional`
+    - `kubectl explain pod.spec.containers.env.valueFrom.secretKeyRef`
+  scenario: |
+    Two teams need configuration delivered to their pods, one as files and one as environment variables:
+
+    1. **Files, from three sources.** Namespace **`proj`** has a ConfigMap **`app-conf`** (key `settings.ini`) and a Secret
+       **`app-creds`** (key `token`).
+
+       Create pod **`portal`** (`busybox:1.37`, `sleep infinity`) with **a single volume**
+       mounted at **`/etc/portal`** that contains exactly three files:
+
+       - `settings.ini` — from the ConfigMap
+       - `token` — from the Secret, readable by its owner only (mode `0400`)
+       - `podname` — holding the pod's own name
+
+    2. **Environment, with a prefix and an optional source.** Namespace **`envs`** has a ConfigMap **`site`** and a Secret **`site-creds`** (key `token`).
+
+       Create pod **`reporter`** (`busybox:1.37`, `sleep infinity`) so that its environment has:
+
+       - every key of ConfigMap `site` as a variable, with its name **prefixed by `SITE_`**
+       - **`API_TOKEN`** from the `token` key of the Secret
+       - every key of a Secret named **`site-overrides`** (it does not exist today and may be
+         created later by another team) - the pod must start fine without it
+  hints:
+    - "Part 1: The volume type is `projected`; give it three `sources`."
+    - "Part 1: The pod name comes from `fieldRef: {fieldPath: metadata.name}` in a downwardAPI source."
+    - "Part 2: `envFrom` takes a list; each item can have `prefix` and either `configMapRef` or `secretRef`."
+    - "Part 2: Look at the key names in the ConfigMap first: `kubectl -n envs get cm site -o yaml`."
+    - "Part 2: `kubectl explain pod.spec.containers.envFrom.secretRef` lists the field that makes a missing Secret acceptable."
+  solution: |
+    **1. Files, from three sources**
+
+    ```yaml
+    volumes:
+    - name: cfg
+      projected:
+        sources:
+        - configMap: {name: app-conf, items: [{key: settings.ini, path: settings.ini}]}
+        - secret: {name: app-creds, items: [{key: token, path: token, mode: 0400}]}
+        - downwardAPI: {items: [{path: podname, fieldRef: {fieldPath: metadata.name}}]}
+    ```
+
+    **2. Environment, with a prefix and an optional source**
+
+    ```yaml
+    envFrom:
+    - prefix: SITE_
+      configMapRef: {name: site}
+    - secretRef: {name: site-overrides, optional: true}
+    env:
+    - name: API_TOKEN
+      valueFrom: {secretKeyRef: {name: site-creds, key: token}}
+    ```
+  setup: |
+    # --- part 1: Files, from three sources ---
+    k_ns proj
+    t="tok-$(head -c6 /dev/urandom | od -An -tx1 | tr -d ' \n')"
+    echo "$t" >"$KL_STATE/answer-302"
+    kubectl -n proj create configmap app-conf --from-literal=settings.ini='mode=production' >/dev/null
+    kubectl -n proj create secret generic app-creds --from-literal=token="$t" >/dev/null
+
+    # --- part 2: Environment, with a prefix and an optional source ---
+    k_ns envs
+    r="eu-$((RANDOM % 900 + 100))"
+    t="tok-$(head -c6 /dev/urandom | od -An -tx1 | tr -d ' \n')"
+    printf '%s\n%s\n' "$r" "$t" >"$KL_STATE/answer-312"
+    kubectl -n envs create configmap site --from-literal=REGION="$r" --from-literal=TIER=gold >/dev/null
+    kubectl -n envs create secret generic site-creds --from-literal=token="$t" >/dev/null
+  check: |
+    info "Part 1: Files, from three sources"
+    wait_pod proj portal 60
+    check "one projected volume mounted at /etc/portal" '[ "$(kubectl -n proj get pod portal -o json | jq "[.spec.volumes[]? | select(.projected and (.name | startswith(\"kube-api-access\") | not))] | length")" = 1 ] && [ "$(kubectl -n proj get pod portal -o json | jq "[.spec.containers[0].volumeMounts[]? | select(.mountPath==\"/etc/portal\")] | length")" = 1 ]'
+    check "directory holds exactly the three files" '[ "$(kubectl -n proj exec portal -- ls /etc/portal | sort | tr "\n" " ")" = "podname settings.ini token " ]'
+    check "settings.ini comes from the ConfigMap" '[ "$(kubectl -n proj exec portal -- cat /etc/portal/settings.ini)" = "mode=production" ]'
+    check "token comes from the Secret" '[ "$(kubectl -n proj exec portal -- cat /etc/portal/token)" = "$(cat $KL_STATE/answer-302)" ]'
+    check "token is mode 0400" '[ "$(kubectl -n proj exec portal -- stat -L -c %a /etc/portal/token)" = 400 ]'
+    check "podname holds the pod name" '[ "$(kubectl -n proj exec portal -- cat /etc/portal/podname)" = portal ]'
+
+    info "Part 2: Environment, with a prefix and an optional source"
+    wait_pod envs reporter 60
+    reg=$(sed -n 1p "$KL_STATE/answer-312" 2>/dev/null); tok=$(sed -n 2p "$KL_STATE/answer-312" 2>/dev/null)
+    check "SITE_REGION comes from the ConfigMap" '[ "$(kubectl -n envs exec reporter -- printenv SITE_REGION)" = "$reg" ]'
+    check "SITE_TIER comes from the ConfigMap" '[ "$(kubectl -n envs exec reporter -- printenv SITE_TIER)" = gold ]'
+    check "no unprefixed REGION variable" '! kubectl -n envs exec reporter -- printenv REGION'
+    check "API_TOKEN comes from the Secret" '[ "$(kubectl -n envs exec reporter -- printenv API_TOKEN)" = "$tok" ]'
+    check "site-overrides is referenced as optional" '[ "$(kubectl -n envs get pod reporter -o json | jq -r "[.spec.containers[0].envFrom[]? | select(.secretRef.name==\"site-overrides\") | .secretRef.optional] | first")" = true ]'
+  solve: |
+    # --- part 1: Files, from three sources ---
+    kubectl apply -f - <<'EOF'
+    apiVersion: v1
+    kind: Pod
+    metadata: {name: portal, namespace: proj}
+    spec:
+      containers:
+      - name: portal
+        image: busybox:1.37
+        command: ["sleep", "infinity"]
+        volumeMounts: [{name: cfg, mountPath: /etc/portal}]
+      volumes:
+      - name: cfg
+        projected:
+          sources:
+          - configMap: {name: app-conf, items: [{key: settings.ini, path: settings.ini}]}
+          - secret: {name: app-creds, items: [{key: token, path: token, mode: 0400}]}
+          - downwardAPI: {items: [{path: podname, fieldRef: {fieldPath: metadata.name}}]}
+    EOF
+
+    # --- part 2: Environment, with a prefix and an optional source ---
+    kubectl apply -f - <<'EOF'
+    apiVersion: v1
+    kind: Pod
+    metadata: {name: reporter, namespace: envs}
+    spec:
+      containers:
+      - name: reporter
+        image: busybox:1.37
+        command: ["sleep", "infinity"]
+        envFrom:
+        - prefix: SITE_
+          configMapRef: {name: site}
+        - secretRef: {name: site-overrides, optional: true}
+        env:
+        - name: API_TOKEN
+          valueFrom: {secretKeyRef: {name: site-creds, key: token}}
+    EOF
+
+# ===== Intermediate =====
+
 - id: k8s-301
   title: Answer the auditors
   difficulty: 3
@@ -148,143 +289,6 @@ exercises:
 
     # --- part 3: Policy compliance ---
     kubectl get deploy -n audit --no-headers -o custom-columns=N:.metadata.name,P:.spec.template.spec.containers[0].readinessProbe | awk '$2=="<none>" {print $1}' | sort > /lab/no-probe.txt
-
-- id: k8s-302
-  title: Feed a pod its configuration
-  difficulty: 2
-  kind: build
-  tags: [projected, volumes, downwardapi, env, envfrom, configmap, secret, optional]
-  tutorial: |
-    **Concept.** A pod can consume configuration as files or as environment variables. A `projected` volume merges ConfigMaps, Secrets and pod metadata into one directory with a mode per file. `envFrom` imports every key of a source, can add a `prefix`, and with `optional: true` lets the pod start even when the source does not exist yet. Files can be refreshed while a pod runs; environment variables are fixed when the container starts.
-
-    **Read up on:**
-    - Kubernetes docs: Projected Volumes
-    - `kubectl explain pod.spec.volumes.projected.sources` — `configMap`, `secret`, `downwardAPI`, and per-item `mode`
-    - `kubectl explain pod.spec.containers.envFrom` — `prefix`, `configMapRef.optional`, `secretRef.optional`
-    - `kubectl explain pod.spec.containers.env.valueFrom.secretKeyRef`
-  scenario: |
-    Two teams need configuration delivered to their pods, one as files and one as environment variables:
-
-    1. **Files, from three sources.** Namespace **`proj`** has a ConfigMap **`app-conf`** (key `settings.ini`) and a Secret
-       **`app-creds`** (key `token`).
-
-       Create pod **`portal`** (`busybox:1.37`, `sleep infinity`) with **a single volume**
-       mounted at **`/etc/portal`** that contains exactly three files:
-
-       - `settings.ini` — from the ConfigMap
-       - `token` — from the Secret, readable by its owner only (mode `0400`)
-       - `podname` — holding the pod's own name
-
-    2. **Environment, with a prefix and an optional source.** Namespace **`envs`** has a ConfigMap **`site`** and a Secret **`site-creds`** (key `token`).
-
-       Create pod **`reporter`** (`busybox:1.37`, `sleep infinity`) so that its environment has:
-
-       - every key of ConfigMap `site` as a variable, with its name **prefixed by `SITE_`**
-       - **`API_TOKEN`** from the `token` key of the Secret
-       - every key of a Secret named **`site-overrides`** (it does not exist today and may be
-         created later by another team) - the pod must start fine without it
-  hints:
-    - "Part 1: The volume type is `projected`; give it three `sources`."
-    - "Part 1: The pod name comes from `fieldRef: {fieldPath: metadata.name}` in a downwardAPI source."
-    - "Part 2: `envFrom` takes a list; each item can have `prefix` and either `configMapRef` or `secretRef`."
-    - "Part 2: Look at the key names in the ConfigMap first: `kubectl -n envs get cm site -o yaml`."
-    - "Part 2: `kubectl explain pod.spec.containers.envFrom.secretRef` lists the field that makes a missing Secret acceptable."
-  solution: |
-    **1. Files, from three sources**
-
-    ```yaml
-    volumes:
-    - name: cfg
-      projected:
-        sources:
-        - configMap: {name: app-conf, items: [{key: settings.ini, path: settings.ini}]}
-        - secret: {name: app-creds, items: [{key: token, path: token, mode: 0400}]}
-        - downwardAPI: {items: [{path: podname, fieldRef: {fieldPath: metadata.name}}]}
-    ```
-
-    **2. Environment, with a prefix and an optional source**
-
-    ```yaml
-    envFrom:
-    - prefix: SITE_
-      configMapRef: {name: site}
-    - secretRef: {name: site-overrides, optional: true}
-    env:
-    - name: API_TOKEN
-      valueFrom: {secretKeyRef: {name: site-creds, key: token}}
-    ```
-  setup: |
-    # --- part 1: Files, from three sources ---
-    k_ns proj
-    t="tok-$(head -c6 /dev/urandom | od -An -tx1 | tr -d ' \n')"
-    echo "$t" >"$KL_STATE/answer-302"
-    kubectl -n proj create configmap app-conf --from-literal=settings.ini='mode=production' >/dev/null
-    kubectl -n proj create secret generic app-creds --from-literal=token="$t" >/dev/null
-
-    # --- part 2: Environment, with a prefix and an optional source ---
-    k_ns envs
-    r="eu-$((RANDOM % 900 + 100))"
-    t="tok-$(head -c6 /dev/urandom | od -An -tx1 | tr -d ' \n')"
-    printf '%s\n%s\n' "$r" "$t" >"$KL_STATE/answer-312"
-    kubectl -n envs create configmap site --from-literal=REGION="$r" --from-literal=TIER=gold >/dev/null
-    kubectl -n envs create secret generic site-creds --from-literal=token="$t" >/dev/null
-  check: |
-    info "Part 1: Files, from three sources"
-    wait_pod proj portal 60
-    check "one projected volume mounted at /etc/portal" '[ "$(kubectl -n proj get pod portal -o json | jq "[.spec.volumes[]? | select(.projected and (.name | startswith(\"kube-api-access\") | not))] | length")" = 1 ] && [ "$(kubectl -n proj get pod portal -o json | jq "[.spec.containers[0].volumeMounts[]? | select(.mountPath==\"/etc/portal\")] | length")" = 1 ]'
-    check "directory holds exactly the three files" '[ "$(kubectl -n proj exec portal -- ls /etc/portal | sort | tr "\n" " ")" = "podname settings.ini token " ]'
-    check "settings.ini comes from the ConfigMap" '[ "$(kubectl -n proj exec portal -- cat /etc/portal/settings.ini)" = "mode=production" ]'
-    check "token comes from the Secret" '[ "$(kubectl -n proj exec portal -- cat /etc/portal/token)" = "$(cat $KL_STATE/answer-302)" ]'
-    check "token is mode 0400" '[ "$(kubectl -n proj exec portal -- stat -L -c %a /etc/portal/token)" = 400 ]'
-    check "podname holds the pod name" '[ "$(kubectl -n proj exec portal -- cat /etc/portal/podname)" = portal ]'
-
-    info "Part 2: Environment, with a prefix and an optional source"
-    wait_pod envs reporter 60
-    reg=$(sed -n 1p "$KL_STATE/answer-312" 2>/dev/null); tok=$(sed -n 2p "$KL_STATE/answer-312" 2>/dev/null)
-    check "SITE_REGION comes from the ConfigMap" '[ "$(kubectl -n envs exec reporter -- printenv SITE_REGION)" = "$reg" ]'
-    check "SITE_TIER comes from the ConfigMap" '[ "$(kubectl -n envs exec reporter -- printenv SITE_TIER)" = gold ]'
-    check "no unprefixed REGION variable" '! kubectl -n envs exec reporter -- printenv REGION'
-    check "API_TOKEN comes from the Secret" '[ "$(kubectl -n envs exec reporter -- printenv API_TOKEN)" = "$tok" ]'
-    check "site-overrides is referenced as optional" '[ "$(kubectl -n envs get pod reporter -o json | jq -r "[.spec.containers[0].envFrom[]? | select(.secretRef.name==\"site-overrides\") | .secretRef.optional] | first")" = true ]'
-  solve: |
-    # --- part 1: Files, from three sources ---
-    kubectl apply -f - <<'EOF'
-    apiVersion: v1
-    kind: Pod
-    metadata: {name: portal, namespace: proj}
-    spec:
-      containers:
-      - name: portal
-        image: busybox:1.37
-        command: ["sleep", "infinity"]
-        volumeMounts: [{name: cfg, mountPath: /etc/portal}]
-      volumes:
-      - name: cfg
-        projected:
-          sources:
-          - configMap: {name: app-conf, items: [{key: settings.ini, path: settings.ini}]}
-          - secret: {name: app-creds, items: [{key: token, path: token, mode: 0400}]}
-          - downwardAPI: {items: [{path: podname, fieldRef: {fieldPath: metadata.name}}]}
-    EOF
-
-    # --- part 2: Environment, with a prefix and an optional source ---
-    kubectl apply -f - <<'EOF'
-    apiVersion: v1
-    kind: Pod
-    metadata: {name: reporter, namespace: envs}
-    spec:
-      containers:
-      - name: reporter
-        image: busybox:1.37
-        command: ["sleep", "infinity"]
-        envFrom:
-        - prefix: SITE_
-          configMapRef: {name: site}
-        - secretRef: {name: site-overrides, optional: true}
-        env:
-        - name: API_TOKEN
-          valueFrom: {secretKeyRef: {name: site-creds, key: token}}
-    EOF
 
 - id: k8s-303
   title: Run something when a container starts
@@ -472,6 +476,8 @@ exercises:
   solve: |
     kubectl -n batch-team patch limitrange container-defaults --type=merge -p '{"spec":{"limits":[{"type":"Container","default":{"cpu":"200m"},"defaultRequest":{"cpu":"100m"}}]}}'
     kubectl -n batch-team delete pod -l app=worker
+
+# ===== Advanced =====
 
 - id: k8s-310
   title: Spread across racks

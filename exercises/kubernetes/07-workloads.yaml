@@ -4,6 +4,8 @@ profile: k8s
 order: 7
 exercises:
 
+# ===== Beginner =====
+
 - id: k8s-121
   title: Run a Job, then fix a failing one
   difficulty: 2
@@ -393,70 +395,6 @@ exercises:
             hostPath: {path: /var/log}
     EOF
 
-- id: k8s-130
-  title: DaemonSet rollout
-  difficulty: 3
-  kind: fix
-  tags: [daemonset, tolerations, rolling-update, troubleshooting]
-  tutorial: |
-    **Concept.** A DaemonSet's DESIRED count is the number of nodes its pods are eligible to run on. Scheduling rules on both the node and the pod side decide eligibility: control-plane nodes carry a taint that repels ordinary pods, so a DaemonSet needs a matching toleration to land there. DaemonSets also update with a strategy: `OnDelete` never replaces pods by itself, while `RollingUpdate` controls how many nodes may be without a ready pod at once. Changing the pod template (for example the image) triggers the rollout.
-
-    **Read up on:**
-    - `kubectl get nodes` and `kubectl describe node` — labels and taints
-    - `kubectl get pods -o wide` — which nodes have a pod
-    - `kubectl describe ds NAME` — events and node counts
-    - `kubectl explain pod.spec.tolerations` — key, operator, effect
-    - `kubectl explain daemonset.spec.updateStrategy` — type and rolling update settings
-    - `kubectl set image --help` and `kubectl rollout status ds/NAME` — change an image and follow progress
-  scenario: |
-    The metrics agent DaemonSet **`node-exporter`** (namespace **`monitoring`**, container
-    `exporter`, currently `nginx:1.28-alpine`) shows `DESIRED 1` — but the cluster has
-    **two** nodes and the agent must run on both.
-
-    1. Fix the DaemonSet so it is scheduled on **every** node, including the control plane.
-    2. Upgrade it to **`nginx:1.29-alpine`** (pretend it's an exporter), making sure that
-       at most **one node** is without a ready exporter at any time, and that pods are
-       actually replaced by the rollout.
-  hints:
-    - "Which node is missing, and what's special about it? Tolerate `node-role.kubernetes.io/control-plane:NoSchedule`."
-    - "The current update strategy is `OnDelete`. Use `spec.updateStrategy: {type: RollingUpdate, rollingUpdate: {maxUnavailable: 1}}`."
-    - "`kubectl set image ds/node-exporter -n monitoring exporter=nginx:1.29-alpine`, then `kubectl rollout status`."
-  solution: |
-    ```bash
-    kubectl get pods -n monitoring -o wide    # only on node01
-    kubectl patch ds node-exporter -n monitoring --type=json -p \
-      '[{"op":"add","path":"/spec/template/spec/tolerations","value":[{"key":"node-role.kubernetes.io/control-plane","operator":"Exists","effect":"NoSchedule"}]}]'
-    kubectl patch ds node-exporter -n monitoring -p '{"spec":{"updateStrategy":{"type":"RollingUpdate","rollingUpdate":{"maxUnavailable":1}}}}'
-    kubectl set image ds/node-exporter -n monitoring exporter=nginx:1.29-alpine
-    kubectl rollout status ds/node-exporter -n monitoring
-    ```
-  setup: |
-    k_ns monitoring
-    kubectl apply -f - >/dev/null <<'YAML'
-    apiVersion: apps/v1
-    kind: DaemonSet
-    metadata: {name: node-exporter, namespace: monitoring}
-    spec:
-      updateStrategy: {type: OnDelete}
-      selector: {matchLabels: {app: node-exporter}}
-      template:
-        metadata: {labels: {app: node-exporter}}
-        spec:
-          containers: [{name: exporter, image: "nginx:1.28-alpine"}]
-    YAML
-  check: |
-    check_eq "update strategy" "$(kj -n monitoring ds node-exporter '{.spec.updateStrategy.type} {.spec.updateStrategy.rollingUpdate.maxUnavailable}')" "RollingUpdate 1"
-    check "tolerates the control plane" 'kj -n monitoring ds node-exporter "{.spec.template.spec.tolerations}" | grep -q "control-plane"'
-    k_exists -n monitoring ds node-exporter && kubectl -n monitoring rollout status ds/node-exporter --timeout=90s >/dev/null 2>&1
-    live_images() { kubectl -n monitoring get pods -l app=node-exporter -o json | jq -r '.items[] | select(.metadata.deletionTimestamp == null) | .spec.containers[0].image' | sort | uniq -c | awk '{print $1" "$2}'; }
-    eventually 60 '[ "$(live_images)" = "2 nginx:1.29-alpine" ]'
-    check_eq "desired/ready" "$(kj -n monitoring ds node-exporter '{.status.desiredNumberScheduled}/{.status.numberReady}')" "2/2"
-    check_eq "both pods run 1.29" "$(live_images)" "2 nginx:1.29-alpine"
-  solve: |
-    kubectl patch ds node-exporter -n monitoring --type=json -p '[{"op":"add","path":"/spec/template/spec/tolerations","value":[{"key":"node-role.kubernetes.io/control-plane","operator":"Exists","effect":"NoSchedule"}]}]'
-    kubectl patch ds node-exporter -n monitoring -p '{"spec":{"updateStrategy":{"type":"RollingUpdate","rollingUpdate":{"maxUnavailable":1}}}}'
-    kubectl set image ds/node-exporter -n monitoring exporter=nginx:1.29-alpine
-
 - id: k8s-132
   title: Don't start before the database
   difficulty: 2
@@ -584,6 +522,175 @@ exercises:
         volumeMounts: [{name: html, mountPath: /usr/share/nginx/html}]
     EOF
 
+- id: k8s-135
+  title: Clean up after yourself
+  difficulty: 2
+  kind: fix
+  tags: [job, ttl, cleanup]
+  tutorial: |
+    **Concept.** Finished Jobs pile up unless something removes them. Jobs can be deleted in bulk by selecting on status, and Job specs can expire themselves automatically after completion.
+
+    **Read up on:**
+    - `kubectl delete --help` — `--field-selector` and `-l` options
+    - `kubectl get jobs --field-selector=` — test a selector with get first
+    - `kubectl explain cronjob.spec.jobTemplate.spec` — fields that apply to generated Jobs
+    - `kubectl patch --help` — nested changes
+  scenario: |
+    Namespace **`ci`** is full of hundreds of finished Jobs from the build pipeline.
+
+    1. Delete **all completed Jobs** in `ci` (leave the running `build-live` Job alone).
+    2. Change the CronJob **`nightly-build`** so its future Jobs are deleted
+       automatically **5 minutes** after they finish.
+  hints:
+    - "`kubectl delete jobs -n ci --field-selector status.successful=1`"
+    - "`spec.jobTemplate.spec.ttlSecondsAfterFinished`"
+  solution: |
+    ```bash
+    kubectl delete jobs -n ci --field-selector status.successful=1
+    kubectl patch cronjob nightly-build -n ci -p '{"spec":{"jobTemplate":{"spec":{"ttlSecondsAfterFinished":300}}}}'
+    ```
+  setup: |
+    k_ns ci
+    for i in $(seq 1 8); do kubectl -n ci create job build-$i --image=busybox:1.37 -- true >/dev/null; done
+    kubectl -n ci create job build-live --image=busybox:1.37 -- sleep 3600 >/dev/null
+    kubectl -n ci create cronjob nightly-build --image=busybox:1.37 --schedule="0 3 * * *" -- echo build >/dev/null
+    for i in $(seq 1 8); do kubectl -n ci wait --for=condition=complete job/build-$i --timeout=60s >/dev/null 2>&1; done
+  check: |
+    check_eq "no completed jobs left" "$(kubectl -n ci get jobs -o json | jq '[.items[] | select(.status.succeeded == 1)] | length')" "0"
+    check "build-live still exists" 'k_exists -n ci job build-live'
+    check_eq "cronjob ttl" "$(kj -n ci cronjob nightly-build '{.spec.jobTemplate.spec.ttlSecondsAfterFinished}')" "300"
+  solve: |
+    kubectl delete jobs -n ci --field-selector status.successful=1
+    kubectl patch cronjob nightly-build -n ci -p '{"spec":{"jobTemplate":{"spec":{"ttlSecondsAfterFinished":300}}}}'
+
+- id: k8s-139
+  title: Drain connections before shutdown
+  difficulty: 2
+  kind: build
+  tags: [lifecycle, preStop, graceful-shutdown]
+  tutorial: |
+    **Concept.** When a pod is deleted, Kubernetes runs preStop hooks, then signals the container, and force-kills it after the termination grace period. Hooks let in-flight traffic drain first.
+
+    **Read up on:**
+    - `kubectl explain pod.spec.containers.lifecycle.preStop` — hook types
+    - `kubectl explain pod.spec.terminationGracePeriodSeconds` — the hard limit
+    - Kubernetes docs: Container Lifecycle Hooks, Pod termination
+    - `kubectl create deployment --help` — generate YAML with `--dry-run=client -o yaml`
+  scenario: |
+    When a **`gateway`** pod is terminated, the load balancer needs ~10 seconds to stop
+    sending it traffic. Create deployment **`gateway`** in namespace **`edge`**
+    (`nginx:1.28-alpine`, 2 replicas) with:
+
+    - a **preStop** hook that sleeps **10 seconds** before nginx is told to stop
+    - a termination grace period of **45 seconds**
+  hints:
+    - "`lifecycle.preStop.exec.command: [\"sleep\", \"10\"]` (or the newer `preStop.sleep.seconds`)"
+    - "`terminationGracePeriodSeconds` is a pod-level field."
+  solution: |
+    ```yaml
+    spec:
+      terminationGracePeriodSeconds: 45
+      containers:
+      - name: nginx
+        image: nginx:1.28-alpine
+        lifecycle:
+          preStop:
+            sleep: {seconds: 10}
+    ```
+  setup: |
+    k_ns edge
+  check: |
+    wait_deploy edge gateway 60
+    check_eq "grace period" "$(kj -n edge deploy gateway '{.spec.template.spec.terminationGracePeriodSeconds}')" "45"
+    ps=$(kj -n edge deploy gateway '{.spec.template.spec.containers[0].lifecycle.preStop}')
+    check "preStop sleeps 10s" 'jq -e "(.sleep.seconds == 10) or (.exec.command | join(\" \") | test(\"sleep 10\"))" <<<"$ps"'
+    check "2 replicas ready" 'deploy_ready edge gateway && [ "$(kj -n edge deploy gateway "{.status.readyReplicas}")" = 2 ]'
+  solve: |
+    kubectl apply -f - <<'EOF'
+    apiVersion: apps/v1
+    kind: Deployment
+    metadata: {name: gateway, namespace: edge}
+    spec:
+      replicas: 2
+      selector: {matchLabels: {app: gateway}}
+      template:
+        metadata: {labels: {app: gateway}}
+        spec:
+          terminationGracePeriodSeconds: 45
+          containers:
+          - name: nginx
+            image: nginx:1.28-alpine
+            lifecycle:
+              preStop:
+                sleep: {seconds: 10}
+    EOF
+
+# ===== Intermediate =====
+
+- id: k8s-130
+  title: DaemonSet rollout
+  difficulty: 3
+  kind: fix
+  tags: [daemonset, tolerations, rolling-update, troubleshooting]
+  tutorial: |
+    **Concept.** A DaemonSet's DESIRED count is the number of nodes its pods are eligible to run on. Scheduling rules on both the node and the pod side decide eligibility: control-plane nodes carry a taint that repels ordinary pods, so a DaemonSet needs a matching toleration to land there. DaemonSets also update with a strategy: `OnDelete` never replaces pods by itself, while `RollingUpdate` controls how many nodes may be without a ready pod at once. Changing the pod template (for example the image) triggers the rollout.
+
+    **Read up on:**
+    - `kubectl get nodes` and `kubectl describe node` — labels and taints
+    - `kubectl get pods -o wide` — which nodes have a pod
+    - `kubectl describe ds NAME` — events and node counts
+    - `kubectl explain pod.spec.tolerations` — key, operator, effect
+    - `kubectl explain daemonset.spec.updateStrategy` — type and rolling update settings
+    - `kubectl set image --help` and `kubectl rollout status ds/NAME` — change an image and follow progress
+  scenario: |
+    The metrics agent DaemonSet **`node-exporter`** (namespace **`monitoring`**, container
+    `exporter`, currently `nginx:1.28-alpine`) shows `DESIRED 1` — but the cluster has
+    **two** nodes and the agent must run on both.
+
+    1. Fix the DaemonSet so it is scheduled on **every** node, including the control plane.
+    2. Upgrade it to **`nginx:1.29-alpine`** (pretend it's an exporter), making sure that
+       at most **one node** is without a ready exporter at any time, and that pods are
+       actually replaced by the rollout.
+  hints:
+    - "Which node is missing, and what's special about it? Tolerate `node-role.kubernetes.io/control-plane:NoSchedule`."
+    - "The current update strategy is `OnDelete`. Use `spec.updateStrategy: {type: RollingUpdate, rollingUpdate: {maxUnavailable: 1}}`."
+    - "`kubectl set image ds/node-exporter -n monitoring exporter=nginx:1.29-alpine`, then `kubectl rollout status`."
+  solution: |
+    ```bash
+    kubectl get pods -n monitoring -o wide    # only on node01
+    kubectl patch ds node-exporter -n monitoring --type=json -p \
+      '[{"op":"add","path":"/spec/template/spec/tolerations","value":[{"key":"node-role.kubernetes.io/control-plane","operator":"Exists","effect":"NoSchedule"}]}]'
+    kubectl patch ds node-exporter -n monitoring -p '{"spec":{"updateStrategy":{"type":"RollingUpdate","rollingUpdate":{"maxUnavailable":1}}}}'
+    kubectl set image ds/node-exporter -n monitoring exporter=nginx:1.29-alpine
+    kubectl rollout status ds/node-exporter -n monitoring
+    ```
+  setup: |
+    k_ns monitoring
+    kubectl apply -f - >/dev/null <<'YAML'
+    apiVersion: apps/v1
+    kind: DaemonSet
+    metadata: {name: node-exporter, namespace: monitoring}
+    spec:
+      updateStrategy: {type: OnDelete}
+      selector: {matchLabels: {app: node-exporter}}
+      template:
+        metadata: {labels: {app: node-exporter}}
+        spec:
+          containers: [{name: exporter, image: "nginx:1.28-alpine"}]
+    YAML
+  check: |
+    check_eq "update strategy" "$(kj -n monitoring ds node-exporter '{.spec.updateStrategy.type} {.spec.updateStrategy.rollingUpdate.maxUnavailable}')" "RollingUpdate 1"
+    check "tolerates the control plane" 'kj -n monitoring ds node-exporter "{.spec.template.spec.tolerations}" | grep -q "control-plane"'
+    k_exists -n monitoring ds node-exporter && kubectl -n monitoring rollout status ds/node-exporter --timeout=90s >/dev/null 2>&1
+    live_images() { kubectl -n monitoring get pods -l app=node-exporter -o json | jq -r '.items[] | select(.metadata.deletionTimestamp == null) | .spec.containers[0].image' | sort | uniq -c | awk '{print $1" "$2}'; }
+    eventually 60 '[ "$(live_images)" = "2 nginx:1.29-alpine" ]'
+    check_eq "desired/ready" "$(kj -n monitoring ds node-exporter '{.status.desiredNumberScheduled}/{.status.numberReady}')" "2/2"
+    check_eq "both pods run 1.29" "$(live_images)" "2 nginx:1.29-alpine"
+  solve: |
+    kubectl patch ds node-exporter -n monitoring --type=json -p '[{"op":"add","path":"/spec/template/spec/tolerations","value":[{"key":"node-role.kubernetes.io/control-plane","operator":"Exists","effect":"NoSchedule"}]}]'
+    kubectl patch ds node-exporter -n monitoring -p '{"spec":{"updateStrategy":{"type":"RollingUpdate","rollingUpdate":{"maxUnavailable":1}}}}'
+    kubectl set image ds/node-exporter -n monitoring exporter=nginx:1.29-alpine
+
 - id: k8s-134
   title: A native sidecar
   difficulty: 3
@@ -663,47 +770,6 @@ exercises:
             command: ["sh", "-c", "for i in 1 2 3; do echo row $i >> /logs/app.log; sleep 1; done"]
             volumeMounts: [{name: logs, mountPath: /logs}]
     EOF
-
-- id: k8s-135
-  title: Clean up after yourself
-  difficulty: 2
-  kind: fix
-  tags: [job, ttl, cleanup]
-  tutorial: |
-    **Concept.** Finished Jobs pile up unless something removes them. Jobs can be deleted in bulk by selecting on status, and Job specs can expire themselves automatically after completion.
-
-    **Read up on:**
-    - `kubectl delete --help` — `--field-selector` and `-l` options
-    - `kubectl get jobs --field-selector=` — test a selector with get first
-    - `kubectl explain cronjob.spec.jobTemplate.spec` — fields that apply to generated Jobs
-    - `kubectl patch --help` — nested changes
-  scenario: |
-    Namespace **`ci`** is full of hundreds of finished Jobs from the build pipeline.
-
-    1. Delete **all completed Jobs** in `ci` (leave the running `build-live` Job alone).
-    2. Change the CronJob **`nightly-build`** so its future Jobs are deleted
-       automatically **5 minutes** after they finish.
-  hints:
-    - "`kubectl delete jobs -n ci --field-selector status.successful=1`"
-    - "`spec.jobTemplate.spec.ttlSecondsAfterFinished`"
-  solution: |
-    ```bash
-    kubectl delete jobs -n ci --field-selector status.successful=1
-    kubectl patch cronjob nightly-build -n ci -p '{"spec":{"jobTemplate":{"spec":{"ttlSecondsAfterFinished":300}}}}'
-    ```
-  setup: |
-    k_ns ci
-    for i in $(seq 1 8); do kubectl -n ci create job build-$i --image=busybox:1.37 -- true >/dev/null; done
-    kubectl -n ci create job build-live --image=busybox:1.37 -- sleep 3600 >/dev/null
-    kubectl -n ci create cronjob nightly-build --image=busybox:1.37 --schedule="0 3 * * *" -- echo build >/dev/null
-    for i in $(seq 1 8); do kubectl -n ci wait --for=condition=complete job/build-$i --timeout=60s >/dev/null 2>&1; done
-  check: |
-    check_eq "no completed jobs left" "$(kubectl -n ci get jobs -o json | jq '[.items[] | select(.status.succeeded == 1)] | length')" "0"
-    check "build-live still exists" 'k_exists -n ci job build-live'
-    check_eq "cronjob ttl" "$(kj -n ci cronjob nightly-build '{.spec.jobTemplate.spec.ttlSecondsAfterFinished}')" "300"
-  solve: |
-    kubectl delete jobs -n ci --field-selector status.successful=1
-    kubectl patch cronjob nightly-build -n ci -p '{"spec":{"jobTemplate":{"spec":{"ttlSecondsAfterFinished":300}}}}'
 
 - id: k8s-136
   title: An indexed work queue
@@ -885,67 +951,7 @@ exercises:
     kubectl patch sts ledger -n fin -p '{"spec":{"updateStrategy":{"type":"RollingUpdate","rollingUpdate":{"partition":2}}}}'
     kubectl set image sts/ledger -n fin nginx=nginx:1.29-alpine
 
-- id: k8s-139
-  title: Drain connections before shutdown
-  difficulty: 2
-  kind: build
-  tags: [lifecycle, preStop, graceful-shutdown]
-  tutorial: |
-    **Concept.** When a pod is deleted, Kubernetes runs preStop hooks, then signals the container, and force-kills it after the termination grace period. Hooks let in-flight traffic drain first.
-
-    **Read up on:**
-    - `kubectl explain pod.spec.containers.lifecycle.preStop` — hook types
-    - `kubectl explain pod.spec.terminationGracePeriodSeconds` — the hard limit
-    - Kubernetes docs: Container Lifecycle Hooks, Pod termination
-    - `kubectl create deployment --help` — generate YAML with `--dry-run=client -o yaml`
-  scenario: |
-    When a **`gateway`** pod is terminated, the load balancer needs ~10 seconds to stop
-    sending it traffic. Create deployment **`gateway`** in namespace **`edge`**
-    (`nginx:1.28-alpine`, 2 replicas) with:
-
-    - a **preStop** hook that sleeps **10 seconds** before nginx is told to stop
-    - a termination grace period of **45 seconds**
-  hints:
-    - "`lifecycle.preStop.exec.command: [\"sleep\", \"10\"]` (or the newer `preStop.sleep.seconds`)"
-    - "`terminationGracePeriodSeconds` is a pod-level field."
-  solution: |
-    ```yaml
-    spec:
-      terminationGracePeriodSeconds: 45
-      containers:
-      - name: nginx
-        image: nginx:1.28-alpine
-        lifecycle:
-          preStop:
-            sleep: {seconds: 10}
-    ```
-  setup: |
-    k_ns edge
-  check: |
-    wait_deploy edge gateway 60
-    check_eq "grace period" "$(kj -n edge deploy gateway '{.spec.template.spec.terminationGracePeriodSeconds}')" "45"
-    ps=$(kj -n edge deploy gateway '{.spec.template.spec.containers[0].lifecycle.preStop}')
-    check "preStop sleeps 10s" 'jq -e "(.sleep.seconds == 10) or (.exec.command | join(\" \") | test(\"sleep 10\"))" <<<"$ps"'
-    check "2 replicas ready" 'deploy_ready edge gateway && [ "$(kj -n edge deploy gateway "{.status.readyReplicas}")" = 2 ]'
-  solve: |
-    kubectl apply -f - <<'EOF'
-    apiVersion: apps/v1
-    kind: Deployment
-    metadata: {name: gateway, namespace: edge}
-    spec:
-      replicas: 2
-      selector: {matchLabels: {app: gateway}}
-      template:
-        metadata: {labels: {app: gateway}}
-        spec:
-          terminationGracePeriodSeconds: 45
-          containers:
-          - name: nginx
-            image: nginx:1.28-alpine
-            lifecycle:
-              preStop:
-                sleep: {seconds: 10}
-    EOF
+# ===== Capstone: a real-world lab =====
 
 - id: k8s-140
   title: "Incident: the nightly batch pile-up"

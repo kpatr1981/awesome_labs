@@ -4,6 +4,172 @@ profile: offsec
 order: 6
 exercises:
 
+# ===== Intermediate =====
+
+- id: sec-051
+  title: A permission denied that isn't about permissions
+  difficulty: 3
+  kind: fix
+  tags: [apparmor, mac, hardening, troubleshooting]
+  tutorial: |
+    **Concept.** AppArmor is a mandatory access control layer: a profile lists what a program may touch, and the kernel refuses anything else, even when the ordinary Unix permissions would allow it. So a program can fail with "Permission denied" on a file its user can read. The usual reaction is to `chmod` the file, and that does nothing, because the file permissions were never the problem.
+
+    *The log is the answer.* Every refusal is written to the kernel log with `apparmor="DENIED"`. The message says which `operation` was attempted, which `name` it was on, and what mask was wanted. A profile is fixed one denial at a time.
+
+    *Least privilege is still the goal.* Disabling the profile or adding `/** rwx` makes the error stop and removes the protection. The right change is the narrowest rule that allows what the service actually needs.
+
+    **Read up on:**
+    - `sudo journalctl -k` or `sudo dmesg`, and reading `apparmor="DENIED"` lines: `operation`, `name`, `requested_mask`, `denied_mask`
+    - `aa-status` and the modes `enforce` and `complain`
+    - profile syntax: file rules such as `/etc/app/** r,`, modes `r`, `w`, `a`, `k`, `m`, `ix`; and `network inet stream,`
+    - `sudo apparmor_parser -r /etc/apparmor.d/PROFILE` to reload after an edit
+    - `aa-exec -p PROFILE -- COMMAND` to test a profile from the shell
+  scenario: |
+    The service **`kl-report`** (a small Python program at `/opt/kl-report/app.py`, run as root by systemd) won't start. It reads its config, writes a report, and serves a status page on `127.0.0.1:9190`. The file permissions all look right. The service is confined by the AppArmor profile **`kl-report`** in `/etc/apparmor.d/kl-report`.
+
+    ## Part 1: Find out why
+
+    Use the kernel log to find each thing the profile stopped. The service fails at the first denial, so you'll see them one at a time as you fix them. A crashing Python program also triggers some denied reads from its crash reporter (`/etc/default/apport`, `/usr/share/dpkg/...` and similar): the service doesn't need those, so don't add rules for them. Write each denied item the service actually needs to **`/lab/denials.txt`**, one per line:
+
+    - for files, the full path that was denied
+    - for networking, the word `network` followed by the family and socket type shown in the log, such as `network inet stream`
+
+    ## Part 2: Fix the profile
+
+    Edit `/etc/apparmor.d/kl-report` until the service runs. Reload the profile and restart the service as you go. The status page at `http://127.0.0.1:9190/status` must answer.
+
+    ## Part 3: Keep it locked down
+
+    The profile must stay in **enforce** mode and must still protect everything else. The service has no business reading **`/etc/kl-report/secret.key`** or writing anywhere under **`/etc/kl-report`**, and those must stay denied. Use specific rules for what the service needs: a rule covering the whole filesystem such as `/** r` is not acceptable. Don't change the file permissions, the unit file or the program.
+  hints:
+  - 'Part 1: `sudo systemctl status kl-report` shows the Python error, then `sudo journalctl -k | grep DENIED | tail` shows why.'
+  - 'Part 1: networking denials say `family="inet" sock_type="stream"`.'
+  - 'Part 2: add one rule per denial, then `sudo apparmor_parser -r /etc/apparmor.d/kl-report && sudo systemctl restart kl-report`.'
+  - 'Part 2: use a specific path for the report file or a pattern limited to `/var/lib/kl-report/reports/`.'
+  - 'Part 3: write rules naming the exact files and directories the service needs, and check `aa-status` still shows the profile in enforce mode.'
+  solution: |
+    ```bash
+    sudo journalctl -k | grep DENIED     # read which file or network access failed
+    sudo tee /etc/apparmor.d/kl-report >/dev/null <<'P'
+    abi <abi/3.0>,
+    include <tunables/global>
+    profile kl-report flags=(attach_disconnected) {
+      include <abstractions/base>
+      include <abstractions/python>
+      /usr/bin/python3* rix,
+      /opt/kl-report/** r,
+      /etc/kl-report/report.conf r,
+      owner /var/lib/kl-report/reports/ r,
+      /var/lib/kl-report/reports/* rw,
+      network inet stream,
+    }
+    P
+    sudo apparmor_parser -r /etc/apparmor.d/kl-report
+    sudo systemctl restart kl-report
+    curl -s http://127.0.0.1:9190/status
+    printf '/etc/kl-report/report.conf\n/var/lib/kl-report/reports/latest.txt\nnetwork inet stream\n' >/lab/denials.txt
+    ```
+  setup: |
+    TOKEN=$(rand_flag)
+    mkdir -p /opt/kl-report /etc/kl-report /var/lib/kl-report/reports
+    cat >/opt/kl-report/app.py <<'PY'
+    import configparser, socket, datetime, http.server, sys
+    cfg = configparser.ConfigParser()
+    cfg.read_file(open('/etc/kl-report/report.conf'))
+    token = cfg['report']['token']
+    with open('/var/lib/kl-report/reports/latest.txt', 'w') as f:
+        f.write(f'report generated {datetime.datetime.now().isoformat()}\ntoken={token}\n')
+    class H(http.server.BaseHTTPRequestHandler):
+        def log_message(self, *a): pass
+        def do_GET(self):
+            body = (token + '\n').encode()
+            self.send_response(200); self.send_header('Content-Length', str(len(body))); self.end_headers(); self.wfile.write(body)
+    http.server.HTTPServer(('127.0.0.1', 9190), H).serve_forever()
+    PY
+    printf '[report]\ntoken = %s\n' "$TOKEN" >/etc/kl-report/report.conf
+    head -c32 /dev/urandom | base64 >/etc/kl-report/secret.key
+    chmod 644 /etc/kl-report/report.conf /etc/kl-report/secret.key
+    cat >/etc/apparmor.d/kl-report <<'P'
+    abi <abi/3.0>,
+    include <tunables/global>
+    profile kl-report flags=(attach_disconnected) {
+      include <abstractions/base>
+      include <abstractions/python>
+      /usr/bin/python3* rix,
+      /opt/kl-report/** r,
+    }
+    P
+    cat >/etc/systemd/system/kl-report.service <<'U'
+    [Unit]
+    Description=Report service (hardened)
+    [Service]
+    ExecStart=/usr/bin/python3 /opt/kl-report/app.py
+    AppArmorProfile=kl-report
+    Restart=no
+    [Install]
+    WantedBy=multi-user.target
+    U
+    on_reset 'systemctl disable --now kl-report; rm -f /etc/systemd/system/kl-report.service; apparmor_parser -R /etc/apparmor.d/kl-report 2>/dev/null; rm -f /etc/apparmor.d/kl-report; rm -rf /opt/kl-report /etc/kl-report /var/lib/kl-report; systemctl daemon-reload'
+    apparmor_parser -r /etc/apparmor.d/kl-report || { echo "profile load failed" >&2; exit 1; }
+    systemctl daemon-reload
+    systemctl start kl-report 2>/dev/null
+    sleep 1
+    systemctl is-active -q kl-report && { echo "service unexpectedly runs: the fault is missing" >&2; exit 1; }
+    journalctl -k --since=-1min | grep -q 'apparmor="DENIED".*kl-report' || { echo "no AppArmor denial appeared" >&2; exit 1; }
+    echo "$TOKEN" >"$KL_STATE/token"
+  check: |
+    TOKEN=$(cat "$KL_STATE/token")
+    info "Part 1: Find out why"
+    d=$(tr -s ' ' </lab/denials.txt 2>/dev/null)
+    check "denials.txt lists the config file" 'grep -qx "/etc/kl-report/report.conf" <<<"$d"'
+    check "denials.txt lists the report file" 'grep -qx "/var/lib/kl-report/reports/latest.txt" <<<"$d"'
+    check "denials.txt lists the network denial" 'grep -qx "network inet stream" <<<"$d"'
+    info "Part 2: Fix the profile"
+    check "kl-report is active" 'systemctl is-active -q kl-report'
+    check "the status page answers with the token" '[ "$(curl -fsS -m 5 http://127.0.0.1:9190/status)" = "$TOKEN" ]'
+    check "the report file holds the token" 'grep -qF "$TOKEN" /var/lib/kl-report/reports/latest.txt'
+    info "Part 3: Keep it locked down"
+    if systemctl is-active -q kl-report; then
+      PID=$(systemctl show -p MainPID --value kl-report)
+      check "the running service is confined in enforce mode" '[ "$(cat /proc/$PID/attr/current)" = "kl-report (enforce)" ]'
+      py() { aa-exec -p kl-report -- /usr/bin/python3 -c "$1" 2>&1; }
+      R=$(py 'import sys
+    try:
+        open("/etc/kl-report/secret.key").read(); print("READ")
+    except PermissionError: print("DENIED")')
+      check "the secret key stays denied" '[ "$R" = DENIED ]'
+      W=$(py 'import sys
+    try:
+        open("/etc/kl-report/planted","w").write("x"); print("WROTE")
+    except PermissionError: print("DENIED")')
+      check "writing under /etc/kl-report stays denied" '[ "$W" = DENIED ]'
+      check "no filesystem-wide rule in the profile" '! grep -qE "^[[:space:]]*/\*\*" /etc/apparmor.d/kl-report'
+    else
+      fail "the service must run before the lockdown can be checked"
+    fi
+    kl_finish
+  solve: |
+    printf '/etc/kl-report/report.conf\n/var/lib/kl-report/reports/latest.txt\nnetwork inet stream\n' >/lab/denials.txt
+    sudo tee /etc/apparmor.d/kl-report >/dev/null <<'P'
+    abi <abi/3.0>,
+    include <tunables/global>
+    profile kl-report flags=(attach_disconnected) {
+      include <abstractions/base>
+      include <abstractions/python>
+      /usr/bin/python3* rix,
+      /opt/kl-report/** r,
+      /etc/kl-report/report.conf r,
+      /var/lib/kl-report/reports/ r,
+      /var/lib/kl-report/reports/* rw,
+      network inet stream,
+    }
+    P
+    sudo apparmor_parser -r /etc/apparmor.d/kl-report
+    sudo systemctl restart kl-report
+    sleep 1
+
+# ===== Advanced =====
+
 - id: sec-045
   title: Reconstruct the intrusion from the capture
   difficulty: 4
@@ -990,168 +1156,6 @@ exercises:
         print(ip)
     PY
     chmod +x /lab/detect.sh
-
-- id: sec-051
-  title: A permission denied that isn't about permissions
-  difficulty: 3
-  kind: fix
-  tags: [apparmor, mac, hardening, troubleshooting]
-  tutorial: |
-    **Concept.** AppArmor is a mandatory access control layer: a profile lists what a program may touch, and the kernel refuses anything else, even when the ordinary Unix permissions would allow it. So a program can fail with "Permission denied" on a file its user can read. The usual reaction is to `chmod` the file, and that does nothing, because the file permissions were never the problem.
-
-    *The log is the answer.* Every refusal is written to the kernel log with `apparmor="DENIED"`. The message says which `operation` was attempted, which `name` it was on, and what mask was wanted. A profile is fixed one denial at a time.
-
-    *Least privilege is still the goal.* Disabling the profile or adding `/** rwx` makes the error stop and removes the protection. The right change is the narrowest rule that allows what the service actually needs.
-
-    **Read up on:**
-    - `sudo journalctl -k` or `sudo dmesg`, and reading `apparmor="DENIED"` lines: `operation`, `name`, `requested_mask`, `denied_mask`
-    - `aa-status` and the modes `enforce` and `complain`
-    - profile syntax: file rules such as `/etc/app/** r,`, modes `r`, `w`, `a`, `k`, `m`, `ix`; and `network inet stream,`
-    - `sudo apparmor_parser -r /etc/apparmor.d/PROFILE` to reload after an edit
-    - `aa-exec -p PROFILE -- COMMAND` to test a profile from the shell
-  scenario: |
-    The service **`kl-report`** (a small Python program at `/opt/kl-report/app.py`, run as root by systemd) won't start. It reads its config, writes a report, and serves a status page on `127.0.0.1:9190`. The file permissions all look right. The service is confined by the AppArmor profile **`kl-report`** in `/etc/apparmor.d/kl-report`.
-
-    ## Part 1: Find out why
-
-    Use the kernel log to find each thing the profile stopped. The service fails at the first denial, so you'll see them one at a time as you fix them. A crashing Python program also triggers some denied reads from its crash reporter (`/etc/default/apport`, `/usr/share/dpkg/...` and similar): the service doesn't need those, so don't add rules for them. Write each denied item the service actually needs to **`/lab/denials.txt`**, one per line:
-
-    - for files, the full path that was denied
-    - for networking, the word `network` followed by the family and socket type shown in the log, such as `network inet stream`
-
-    ## Part 2: Fix the profile
-
-    Edit `/etc/apparmor.d/kl-report` until the service runs. Reload the profile and restart the service as you go. The status page at `http://127.0.0.1:9190/status` must answer.
-
-    ## Part 3: Keep it locked down
-
-    The profile must stay in **enforce** mode and must still protect everything else. The service has no business reading **`/etc/kl-report/secret.key`** or writing anywhere under **`/etc/kl-report`**, and those must stay denied. Use specific rules for what the service needs: a rule covering the whole filesystem such as `/** r` is not acceptable. Don't change the file permissions, the unit file or the program.
-  hints:
-  - 'Part 1: `sudo systemctl status kl-report` shows the Python error, then `sudo journalctl -k | grep DENIED | tail` shows why.'
-  - 'Part 1: networking denials say `family="inet" sock_type="stream"`.'
-  - 'Part 2: add one rule per denial, then `sudo apparmor_parser -r /etc/apparmor.d/kl-report && sudo systemctl restart kl-report`.'
-  - 'Part 2: use a specific path for the report file or a pattern limited to `/var/lib/kl-report/reports/`.'
-  - 'Part 3: write rules naming the exact files and directories the service needs, and check `aa-status` still shows the profile in enforce mode.'
-  solution: |
-    ```bash
-    sudo journalctl -k | grep DENIED     # read which file or network access failed
-    sudo tee /etc/apparmor.d/kl-report >/dev/null <<'P'
-    abi <abi/3.0>,
-    include <tunables/global>
-    profile kl-report flags=(attach_disconnected) {
-      include <abstractions/base>
-      include <abstractions/python>
-      /usr/bin/python3* rix,
-      /opt/kl-report/** r,
-      /etc/kl-report/report.conf r,
-      owner /var/lib/kl-report/reports/ r,
-      /var/lib/kl-report/reports/* rw,
-      network inet stream,
-    }
-    P
-    sudo apparmor_parser -r /etc/apparmor.d/kl-report
-    sudo systemctl restart kl-report
-    curl -s http://127.0.0.1:9190/status
-    printf '/etc/kl-report/report.conf\n/var/lib/kl-report/reports/latest.txt\nnetwork inet stream\n' >/lab/denials.txt
-    ```
-  setup: |
-    TOKEN=$(rand_flag)
-    mkdir -p /opt/kl-report /etc/kl-report /var/lib/kl-report/reports
-    cat >/opt/kl-report/app.py <<'PY'
-    import configparser, socket, datetime, http.server, sys
-    cfg = configparser.ConfigParser()
-    cfg.read_file(open('/etc/kl-report/report.conf'))
-    token = cfg['report']['token']
-    with open('/var/lib/kl-report/reports/latest.txt', 'w') as f:
-        f.write(f'report generated {datetime.datetime.now().isoformat()}\ntoken={token}\n')
-    class H(http.server.BaseHTTPRequestHandler):
-        def log_message(self, *a): pass
-        def do_GET(self):
-            body = (token + '\n').encode()
-            self.send_response(200); self.send_header('Content-Length', str(len(body))); self.end_headers(); self.wfile.write(body)
-    http.server.HTTPServer(('127.0.0.1', 9190), H).serve_forever()
-    PY
-    printf '[report]\ntoken = %s\n' "$TOKEN" >/etc/kl-report/report.conf
-    head -c32 /dev/urandom | base64 >/etc/kl-report/secret.key
-    chmod 644 /etc/kl-report/report.conf /etc/kl-report/secret.key
-    cat >/etc/apparmor.d/kl-report <<'P'
-    abi <abi/3.0>,
-    include <tunables/global>
-    profile kl-report flags=(attach_disconnected) {
-      include <abstractions/base>
-      include <abstractions/python>
-      /usr/bin/python3* rix,
-      /opt/kl-report/** r,
-    }
-    P
-    cat >/etc/systemd/system/kl-report.service <<'U'
-    [Unit]
-    Description=Report service (hardened)
-    [Service]
-    ExecStart=/usr/bin/python3 /opt/kl-report/app.py
-    AppArmorProfile=kl-report
-    Restart=no
-    [Install]
-    WantedBy=multi-user.target
-    U
-    on_reset 'systemctl disable --now kl-report; rm -f /etc/systemd/system/kl-report.service; apparmor_parser -R /etc/apparmor.d/kl-report 2>/dev/null; rm -f /etc/apparmor.d/kl-report; rm -rf /opt/kl-report /etc/kl-report /var/lib/kl-report; systemctl daemon-reload'
-    apparmor_parser -r /etc/apparmor.d/kl-report || { echo "profile load failed" >&2; exit 1; }
-    systemctl daemon-reload
-    systemctl start kl-report 2>/dev/null
-    sleep 1
-    systemctl is-active -q kl-report && { echo "service unexpectedly runs: the fault is missing" >&2; exit 1; }
-    journalctl -k --since=-1min | grep -q 'apparmor="DENIED".*kl-report' || { echo "no AppArmor denial appeared" >&2; exit 1; }
-    echo "$TOKEN" >"$KL_STATE/token"
-  check: |
-    TOKEN=$(cat "$KL_STATE/token")
-    info "Part 1: Find out why"
-    d=$(tr -s ' ' </lab/denials.txt 2>/dev/null)
-    check "denials.txt lists the config file" 'grep -qx "/etc/kl-report/report.conf" <<<"$d"'
-    check "denials.txt lists the report file" 'grep -qx "/var/lib/kl-report/reports/latest.txt" <<<"$d"'
-    check "denials.txt lists the network denial" 'grep -qx "network inet stream" <<<"$d"'
-    info "Part 2: Fix the profile"
-    check "kl-report is active" 'systemctl is-active -q kl-report'
-    check "the status page answers with the token" '[ "$(curl -fsS -m 5 http://127.0.0.1:9190/status)" = "$TOKEN" ]'
-    check "the report file holds the token" 'grep -qF "$TOKEN" /var/lib/kl-report/reports/latest.txt'
-    info "Part 3: Keep it locked down"
-    if systemctl is-active -q kl-report; then
-      PID=$(systemctl show -p MainPID --value kl-report)
-      check "the running service is confined in enforce mode" '[ "$(cat /proc/$PID/attr/current)" = "kl-report (enforce)" ]'
-      py() { aa-exec -p kl-report -- /usr/bin/python3 -c "$1" 2>&1; }
-      R=$(py 'import sys
-    try:
-        open("/etc/kl-report/secret.key").read(); print("READ")
-    except PermissionError: print("DENIED")')
-      check "the secret key stays denied" '[ "$R" = DENIED ]'
-      W=$(py 'import sys
-    try:
-        open("/etc/kl-report/planted","w").write("x"); print("WROTE")
-    except PermissionError: print("DENIED")')
-      check "writing under /etc/kl-report stays denied" '[ "$W" = DENIED ]'
-      check "no filesystem-wide rule in the profile" '! grep -qE "^[[:space:]]*/\*\*" /etc/apparmor.d/kl-report'
-    else
-      fail "the service must run before the lockdown can be checked"
-    fi
-    kl_finish
-  solve: |
-    printf '/etc/kl-report/report.conf\n/var/lib/kl-report/reports/latest.txt\nnetwork inet stream\n' >/lab/denials.txt
-    sudo tee /etc/apparmor.d/kl-report >/dev/null <<'P'
-    abi <abi/3.0>,
-    include <tunables/global>
-    profile kl-report flags=(attach_disconnected) {
-      include <abstractions/base>
-      include <abstractions/python>
-      /usr/bin/python3* rix,
-      /opt/kl-report/** r,
-      /etc/kl-report/report.conf r,
-      /var/lib/kl-report/reports/ r,
-      /var/lib/kl-report/reports/* rw,
-      network inet stream,
-    }
-    P
-    sudo apparmor_parser -r /etc/apparmor.d/kl-report
-    sudo systemctl restart kl-report
-    sleep 1
 
 - id: sec-052
   title: A seccomp profile from strace

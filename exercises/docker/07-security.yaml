@@ -4,6 +4,132 @@ profile: docker
 order: 7
 exercises:
 
+# ===== Beginner =====
+
+- id: docker-126
+  title: Retry flaky jobs, but not forever
+  difficulty: 2
+  kind: build
+  tags: [restart-policy]
+  tutorial: |
+    **Concept.** Restart policies decide what the daemon does when a container's main process exits. Some restart regardless of the exit code; some depend on it and can be capped.
+
+    **Read up on:**
+    - `docker run --help` — the `--restart` option and its policies
+    - Docker docs 'Start containers automatically' — comparison of policies
+    - `docker inspect` — `.RestartCount`, `.State.ExitCode`
+    - `docker ps -a` — watching the container state change
+  scenario: |
+    The **`sync-job`** container sometimes fails because the remote API is flaky. It
+    should be retried automatically when it **fails**, but **at most 3 times**, and never
+    restarted after a successful run.
+
+    Run **`sync-job`** (`busybox:1.37`, command `sh -c 'echo syncing; exit 1'`) with that
+    policy.
+  hints:
+    - "`--restart on-failure:N`"
+  solution: |
+    ```bash
+    docker run -d --name sync-job --restart on-failure:3 busybox:1.37 sh -c 'echo syncing; exit 1'
+    sleep 20; docker inspect sync-job -f '{{.RestartCount}}'   # 3
+    ```
+  check: |
+    check_eq "restart policy" "$(c_get sync-job '{{.HostConfig.RestartPolicy.Name}}:{{.HostConfig.RestartPolicy.MaximumRetryCount}}')" "on-failure:3"
+    c_exists sync-job && eventually 40 '[ "$(c_get sync-job "{{.RestartCount}}")" = 3 ] && ! c_running sync-job'
+    check_eq "it was retried exactly 3 times" "$(c_get sync-job '{{.RestartCount}}')" "3"
+  solve: |
+    docker run -d --name sync-job --restart on-failure:3 busybox:1.37 sh -c 'echo syncing; exit 1'
+
+- id: docker-127
+  title: Exit code 137
+  difficulty: 2
+  kind: build
+  tags: [oom, troubleshooting]
+  tutorial: |
+    **Concept.** Exit code 137 means the process received SIGKILL (128 + 9). That may come from the kernel OOM killer or from someone running kill or a timed-out stop, so you need to read the state the daemon recorded.
+
+    **Read up on:**
+    - `docker inspect --format` — fields under `.State`
+    - `docker ps -a` — stopped containers still hold their state
+    - `dmesg` or `journalctl -k` — kernel OOM messages
+    - Docker docs 'Runtime options with memory' — memory limits and OOM behaviour
+  scenario: |
+    The **`importer`** container died overnight with exit code 137.
+
+    Find out **why** and record it: write **`OOMKilled`** to **`/lab/importer-cause.txt`**
+    if the kernel's out-of-memory killer killed it, or **`SIGKILL`** if something else
+    killed it. Also write its **memory limit in MiB** (just the number) to
+    **`/lab/importer-limit.txt`**.
+  hints:
+    - "`docker inspect importer --format '{{.State.OOMKilled}} {{.State.ExitCode}}'`"
+    - "137 = 128 + 9 (SIGKILL). The OOM killer uses SIGKILL too — `.State.OOMKilled` tells them apart."
+  solution: |
+    ```bash
+    docker inspect importer --format '{{.State.OOMKilled}} {{.State.ExitCode}} {{.HostConfig.Memory}}'
+    echo OOMKilled > /lab/importer-cause.txt
+    echo $(( $(docker inspect importer --format '{{.HostConfig.Memory}}') / 1024 / 1024 )) > /lab/importer-limit.txt
+    ```
+  setup: |
+    lim=$(shuf -n1 -e 48 64 96); echo "$lim" > $KL_STATE/answer
+    # the kernel kills it; retry in the rare case dockerd misses the OOM event.
+    # Allocate well past the limit and give dockerd a moment to record the state,
+    # so OOMKilled is reliably flagged. Setup fails only if no try registers it.
+    ok=
+    for i in 1 2 3 4 5 6; do
+      docker rm -f importer >/dev/null 2>&1
+      docker run --name importer --memory ${lim}m --memory-swap ${lim}m python:3.12-alpine python -c "x = b'x' * (400*1024*1024)" >/dev/null 2>&1 || true
+      sleep 1
+      [ "$(docker inspect importer --format '{{.State.OOMKilled}}')" = true ] && { ok=1; break; }
+    done
+    [ -n "$ok" ]
+  check: |
+    check_eq "cause" "$(tr -d '[:space:]' < /lab/importer-cause.txt 2>/dev/null)" "OOMKilled"
+    check_eq "limit in MiB" "$(tr -d '[:space:]' < /lab/importer-limit.txt 2>/dev/null)" "$(cat $KL_STATE/answer)"
+  solve: |
+    if [ "$(docker inspect importer --format '{{.State.OOMKilled}}')" = true ]; then echo OOMKilled; else echo SIGKILL; fi > /lab/importer-cause.txt
+    echo $(( $(docker inspect importer --format '{{.HostConfig.Memory}}') / 1024 / 1024 )) > /lab/importer-limit.txt
+
+- id: docker-131
+  title: The docker group is root
+  difficulty: 2
+  kind: fix
+  tags: [security, docker-group]
+  tutorial: |
+    **Concept.** Access to the docker socket is effectively root on the host, because containers can mount any host path and run privileged. Controlling who is in the docker group is a security task.
+
+    **Read up on:**
+    - `id <user>` and `getent group docker` — see group membership
+    - `man gpasswd` and `man usermod` — removing a user from a group
+    - `ls -l /var/run/docker.sock` — who can talk to the daemon
+    - Docker docs 'Docker daemon attack surface'
+  scenario: |
+    An intern account **`intern`** was added to the **`docker`** group "so they can look
+    at logs". Membership of that group is equivalent to root on the host (anyone in it
+    can `docker run -v /:/host --privileged ...`).
+
+    Remove **`intern`** from the `docker` group — keep the account and its other groups.
+  hints:
+    - "`id intern`"
+    - "`sudo gpasswd -d intern docker`"
+  solution: |
+    ```bash
+    id intern
+    sudo gpasswd -d intern docker
+    id intern
+    ```
+  setup: |
+    groupadd -f developers
+    useradd -m -s /bin/bash -G developers,docker intern 2>/dev/null || usermod -aG developers,docker intern
+    on_reset 'userdel -r intern 2>/dev/null; groupdel developers 2>/dev/null'
+  check: |
+    check "account intern exists" 'id intern'
+    check_not "intern is not in the docker group" 'id -nG intern | grep -qw docker'
+    check "intern is still in developers" 'id -nG intern | grep -qw developers'
+  solve: |
+    sudo gpasswd -d intern docker
+
+# ===== Intermediate =====
+
 - id: docker-121
   title: Lock down a container's privileges and resources
   difficulty: 3
@@ -138,89 +264,6 @@ exercises:
     echo "$dev" > /lab/root-disk.txt
     docker run -d --name backup --device-write-bps $dev:10mb busybox:1.37 sleep infinity
 
-- id: docker-126
-  title: Retry flaky jobs, but not forever
-  difficulty: 2
-  kind: build
-  tags: [restart-policy]
-  tutorial: |
-    **Concept.** Restart policies decide what the daemon does when a container's main process exits. Some restart regardless of the exit code; some depend on it and can be capped.
-
-    **Read up on:**
-    - `docker run --help` — the `--restart` option and its policies
-    - Docker docs 'Start containers automatically' — comparison of policies
-    - `docker inspect` — `.RestartCount`, `.State.ExitCode`
-    - `docker ps -a` — watching the container state change
-  scenario: |
-    The **`sync-job`** container sometimes fails because the remote API is flaky. It
-    should be retried automatically when it **fails**, but **at most 3 times**, and never
-    restarted after a successful run.
-
-    Run **`sync-job`** (`busybox:1.37`, command `sh -c 'echo syncing; exit 1'`) with that
-    policy.
-  hints:
-    - "`--restart on-failure:N`"
-  solution: |
-    ```bash
-    docker run -d --name sync-job --restart on-failure:3 busybox:1.37 sh -c 'echo syncing; exit 1'
-    sleep 20; docker inspect sync-job -f '{{.RestartCount}}'   # 3
-    ```
-  check: |
-    check_eq "restart policy" "$(c_get sync-job '{{.HostConfig.RestartPolicy.Name}}:{{.HostConfig.RestartPolicy.MaximumRetryCount}}')" "on-failure:3"
-    c_exists sync-job && eventually 40 '[ "$(c_get sync-job "{{.RestartCount}}")" = 3 ] && ! c_running sync-job'
-    check_eq "it was retried exactly 3 times" "$(c_get sync-job '{{.RestartCount}}')" "3"
-  solve: |
-    docker run -d --name sync-job --restart on-failure:3 busybox:1.37 sh -c 'echo syncing; exit 1'
-
-- id: docker-127
-  title: Exit code 137
-  difficulty: 2
-  kind: build
-  tags: [oom, troubleshooting]
-  tutorial: |
-    **Concept.** Exit code 137 means the process received SIGKILL (128 + 9). That may come from the kernel OOM killer or from someone running kill or a timed-out stop, so you need to read the state the daemon recorded.
-
-    **Read up on:**
-    - `docker inspect --format` — fields under `.State`
-    - `docker ps -a` — stopped containers still hold their state
-    - `dmesg` or `journalctl -k` — kernel OOM messages
-    - Docker docs 'Runtime options with memory' — memory limits and OOM behaviour
-  scenario: |
-    The **`importer`** container died overnight with exit code 137.
-
-    Find out **why** and record it: write **`OOMKilled`** to **`/lab/importer-cause.txt`**
-    if the kernel's out-of-memory killer killed it, or **`SIGKILL`** if something else
-    killed it. Also write its **memory limit in MiB** (just the number) to
-    **`/lab/importer-limit.txt`**.
-  hints:
-    - "`docker inspect importer --format '{{.State.OOMKilled}} {{.State.ExitCode}}'`"
-    - "137 = 128 + 9 (SIGKILL). The OOM killer uses SIGKILL too — `.State.OOMKilled` tells them apart."
-  solution: |
-    ```bash
-    docker inspect importer --format '{{.State.OOMKilled}} {{.State.ExitCode}} {{.HostConfig.Memory}}'
-    echo OOMKilled > /lab/importer-cause.txt
-    echo $(( $(docker inspect importer --format '{{.HostConfig.Memory}}') / 1024 / 1024 )) > /lab/importer-limit.txt
-    ```
-  setup: |
-    lim=$(shuf -n1 -e 48 64 96); echo "$lim" > $KL_STATE/answer
-    # the kernel kills it; retry in the rare case dockerd misses the OOM event.
-    # Allocate well past the limit and give dockerd a moment to record the state,
-    # so OOMKilled is reliably flagged. Setup fails only if no try registers it.
-    ok=
-    for i in 1 2 3 4 5 6; do
-      docker rm -f importer >/dev/null 2>&1
-      docker run --name importer --memory ${lim}m --memory-swap ${lim}m python:3.12-alpine python -c "x = b'x' * (400*1024*1024)" >/dev/null 2>&1 || true
-      sleep 1
-      [ "$(docker inspect importer --format '{{.State.OOMKilled}}')" = true ] && { ok=1; break; }
-    done
-    [ -n "$ok" ]
-  check: |
-    check_eq "cause" "$(tr -d '[:space:]' < /lab/importer-cause.txt 2>/dev/null)" "OOMKilled"
-    check_eq "limit in MiB" "$(tr -d '[:space:]' < /lab/importer-limit.txt 2>/dev/null)" "$(cat $KL_STATE/answer)"
-  solve: |
-    if [ "$(docker inspect importer --format '{{.State.OOMKilled}}')" = true ]; then echo OOMKilled; else echo SIGKILL; fi > /lab/importer-cause.txt
-    echo $(( $(docker inspect importer --format '{{.HostConfig.Memory}}') / 1024 / 1024 )) > /lab/importer-limit.txt
-
 - id: docker-129
   title: Restore the security profiles
   difficulty: 3
@@ -276,45 +319,6 @@ exercises:
     docker rm -f payments-worker reverse-proxy
     docker run -d --name payments-worker busybox:1.37 sh -c 'while true; do echo processing; sleep 5; done'
     docker run -d --name reverse-proxy -p 8131:80 nginx:1.28-alpine
-
-- id: docker-131
-  title: The docker group is root
-  difficulty: 2
-  kind: fix
-  tags: [security, docker-group]
-  tutorial: |
-    **Concept.** Access to the docker socket is effectively root on the host, because containers can mount any host path and run privileged. Controlling who is in the docker group is a security task.
-
-    **Read up on:**
-    - `id <user>` and `getent group docker` — see group membership
-    - `man gpasswd` and `man usermod` — removing a user from a group
-    - `ls -l /var/run/docker.sock` — who can talk to the daemon
-    - Docker docs 'Docker daemon attack surface'
-  scenario: |
-    An intern account **`intern`** was added to the **`docker`** group "so they can look
-    at logs". Membership of that group is equivalent to root on the host (anyone in it
-    can `docker run -v /:/host --privileged ...`).
-
-    Remove **`intern`** from the `docker` group — keep the account and its other groups.
-  hints:
-    - "`id intern`"
-    - "`sudo gpasswd -d intern docker`"
-  solution: |
-    ```bash
-    id intern
-    sudo gpasswd -d intern docker
-    id intern
-    ```
-  setup: |
-    groupadd -f developers
-    useradd -m -s /bin/bash -G developers,docker intern 2>/dev/null || usermod -aG developers,docker intern
-    on_reset 'userdel -r intern 2>/dev/null; groupdel developers 2>/dev/null'
-  check: |
-    check "account intern exists" 'id intern'
-    check_not "intern is not in the docker group" 'id -nG intern | grep -qw docker'
-    check "intern is still in developers" 'id -nG intern | grep -qw developers'
-  solve: |
-    sudo gpasswd -d intern docker
 
 - id: docker-132
   title: A dashboard with the keys to the kingdom
@@ -622,6 +626,8 @@ exercises:
     sudo systemctl restart docker
     sleep 3
     docker start always-on
+
+# ===== Capstone: a real-world lab =====
 
 - id: docker-140
   title: "Audit: fix the legacy admin container"

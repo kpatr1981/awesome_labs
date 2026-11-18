@@ -4,6 +4,8 @@ profile: k8s
 order: 8
 exercises:
 
+# ===== Beginner =====
+
 - id: k8s-141
   title: Restart it when it hangs
   difficulty: 2
@@ -111,6 +113,269 @@ exercises:
           exec: {command: ["redis-cli", "ping"]}
           periodSeconds: 10
     EOF
+
+- id: k8s-145
+  title: Sensible defaults for every container
+  difficulty: 2
+  kind: build
+  tags: [limitrange]
+  tutorial: |
+    **Concept.** A LimitRange sets per-container defaults, minimums and maximums for a namespace. It is applied when a pod is admitted, so it affects new pods only.
+
+    **Read up on:**
+    - `kubectl explain limitrange.spec.limits` — default, defaultRequest, max, min
+    - `kubectl describe limitrange -n NS` — verify the values
+    - `kubectl run` a test pod and `kubectl get pod -o yaml` — see injected resources
+    - Kubernetes docs: Limit Ranges
+  scenario: |
+    Developers in namespace **`dev`** never set resources. Create a **LimitRange**
+    **`defaults`** so that every container that doesn't specify anything gets:
+
+    - requests: `cpu: 100m`, `memory: 128Mi`
+    - limits: `cpu: 500m`, `memory: 256Mi`
+
+    and no container may ask for more than **1 CPU / 1Gi** (limit).
+  hints:
+    - "`spec.limits[0]: {type: Container, defaultRequest: ..., default: ..., max: ...}`"
+  solution: |
+    ```yaml
+    apiVersion: v1
+    kind: LimitRange
+    metadata: {name: defaults, namespace: dev}
+    spec:
+      limits:
+      - type: Container
+        defaultRequest: {cpu: 100m, memory: 128Mi}
+        default: {cpu: 500m, memory: 256Mi}
+        max: {cpu: "1", memory: 1Gi}
+    ```
+  setup: |
+    k_ns dev
+  check: |
+    l=$(kubectl -n dev get limitrange defaults -o json 2>/dev/null | jq -c '.spec.limits[] | select(.type=="Container")')
+    check_eq "defaultRequest" "$(jq -r '"\(.defaultRequest.cpu) \(.defaultRequest.memory)"' <<<"$l")" "100m 128Mi"
+    check_eq "default" "$(jq -r '"\(.default.cpu) \(.default.memory)"' <<<"$l")" "500m 256Mi"
+    check_eq "max" "$(jq -r '"\(.max.cpu) \(.max.memory)"' <<<"$l")" "1 1Gi"
+    n=kl-$RANDOM; kubectl -n dev run $n --image=busybox:1.37 --restart=Never -- true >/dev/null 2>&1
+    check_eq "a plain pod gets the defaults" "$(kj -n dev pod $n '{.spec.containers[0].resources.requests.cpu} {.spec.containers[0].resources.limits.memory}')" "100m 256Mi"
+    kubectl -n dev delete pod $n --wait=false >/dev/null 2>&1
+  solve: |
+    kubectl apply -f - <<'EOF'
+    apiVersion: v1
+    kind: LimitRange
+    metadata: {name: defaults, namespace: dev}
+    spec:
+      limits:
+      - type: Container
+        defaultRequest: {cpu: 100m, memory: 128Mi}
+        default: {cpu: 500m, memory: 256Mi}
+        max: {cpu: "1", memory: 1Gi}
+    EOF
+
+- id: k8s-146
+  title: A budget for the team
+  difficulty: 2
+  kind: build
+  tags: [resourcequota]
+  tutorial: |
+    **Concept.** A ResourceQuota caps the total requests, limits and object counts in a namespace. Usage is tracked against the hard limits and new objects beyond them are rejected.
+
+    **Read up on:**
+    - `kubectl create quota --help` — examples of `--hard`
+    - `kubectl explain resourcequota.spec.hard` — supported keys
+    - `kubectl describe quota -n NS` — Used versus Hard
+    - Kubernetes docs: Resource Quotas, compute resource quota
+  scenario: |
+    Team **`marketing`** gets a fixed slice of the cluster. Create a ResourceQuota
+    **`team-budget`** in their namespace limiting the totals to:
+
+    - requests: **1 CPU**, **1Gi** memory
+    - limits: **2 CPU**, **2Gi** memory
+    - at most **10 pods** and **5 services**
+  hints:
+    - "`kubectl create quota NAME --hard=requests.cpu=1,requests.memory=1Gi,...`"
+  solution: |
+    ```bash
+    kubectl create quota team-budget -n marketing \
+      --hard=requests.cpu=1,requests.memory=1Gi,limits.cpu=2,limits.memory=2Gi,pods=10,services=5
+    kubectl describe quota team-budget -n marketing
+    ```
+  setup: |
+    k_ns marketing
+  check: |
+    h=$(kubectl -n marketing get quota team-budget -o json 2>/dev/null | jq -c .spec.hard)
+    for kv in requests.cpu=1 requests.memory=1Gi limits.cpu=2 limits.memory=2Gi pods=10 services=5; do
+      check "$kv" "[ \"\$(jq -r '.\"${kv%%=*}\"' <<<'$h')\" = '${kv#*=}' ]"
+    done
+  solve: |
+    kubectl create quota team-budget -n marketing --hard=requests.cpu=1,requests.memory=1Gi,limits.cpu=2,limits.memory=2Gi,pods=10,services=5
+
+- id: k8s-151
+  title: Guaranteed quality of service
+  difficulty: 2
+  kind: build
+  tags: [qos, resources]
+  tutorial: |
+    **Concept.** Every pod gets a QoS class derived from its requests and limits: Guaranteed, Burstable or BestEffort. The class influences eviction order under node pressure.
+
+    **Read up on:**
+    - Kubernetes docs: Pod Quality of Service Classes — the exact rules
+    - `kubectl explain pod.spec.containers.resources` — requests and limits
+    - `kubectl get pod NAME -o jsonpath='{.status.qosClass}'` — see the class assigned
+    - `kubectl describe pod` — QoS Class line
+  scenario: |
+    Under memory pressure the kubelet evicts **BestEffort** pods first and **Guaranteed**
+    pods last. The **`ledger`** pod (namespace **`fin`**) must be as safe as possible.
+
+    Create pod **`ledger`** (`busybox:1.37`, `sleep infinity`) with QoS class
+    **Guaranteed**, using **250m** CPU and **128Mi** memory.
+  hints:
+    - "Guaranteed = every container has CPU and memory requests **equal** to limits."
+  solution: |
+    ```yaml
+    resources:
+      requests: {cpu: 250m, memory: 128Mi}
+      limits:   {cpu: 250m, memory: 128Mi}
+    ```
+  setup: |
+    k_ns fin
+  check: |
+    wait_pod fin ledger 60
+    check_eq "QoS class" "$(kj -n fin pod ledger '{.status.qosClass}')" "Guaranteed"
+    check_eq "resources" "$(kj -n fin pod ledger '{.spec.containers[0].resources.limits.cpu} {.spec.containers[0].resources.limits.memory}')" "250m 128Mi"
+  solve: |
+    kubectl apply -f - <<'EOF'
+    apiVersion: v1
+    kind: Pod
+    metadata: {name: ledger, namespace: fin}
+    spec:
+      containers:
+      - name: ledger
+        image: busybox:1.37
+        command: ["sleep", "infinity"]
+        resources:
+          requests: {cpu: 250m, memory: 128Mi}
+          limits: {cpu: 250m, memory: 128Mi}
+    EOF
+
+- id: k8s-152
+  title: Read resource pressure
+  difficulty: 2
+  kind: build
+  tags: [metrics, top, nodes]
+  tutorial: |
+    **Concept.** metrics-server provides live CPU and memory figures per pod and per node. `kubectl top` reads those, can sort the output, and prints several columns, so choose by header and put the values into the requested format. Metrics lag a minute or so behind new pods.
+
+    **Read up on:**
+    - `kubectl top pods --help` — sorting (`--sort-by`) and namespace flags
+    - `kubectl top pods -n NS` — read the CPU column and its millicore units
+    - `kubectl top nodes --no-headers` — script-friendly output; columns are NAME CPU(cores) CPU% MEMORY(bytes) MEMORY%
+    - `awk` and `head` — extracting columns and a single name from text output
+    - `kubectl get apiservices` — is metrics-server available
+  scenario: |
+    Two questions about resource pressure on the cluster:
+
+    1. Namespace **`noisy`** has several pods. Find the pod using the **most CPU right now**
+       and write its name to **`/lab/top-cpu-pod.txt`**.
+    2. Write the **memory usage percentage** of each node (as reported by `kubectl top
+       nodes`) to **`/lab/node-memory.txt`**, one line per node in the form `NODE PERCENT`
+       (e.g. `node01 41%`).
+  hints:
+    - "`kubectl top pods -n noisy --sort-by=cpu` (metrics need ~1 minute after pods start)."
+    - "`kubectl top nodes --no-headers` — MEMORY% is the fifth column."
+    - "`awk '{print $1, $5}'` selects the node name and memory percentage."
+  solution: |
+    ```bash
+    kubectl top pods -n noisy --sort-by=cpu
+    kubectl top pods -n noisy --sort-by=cpu --no-headers | head -1 | awk '{print $1}' > /lab/top-cpu-pod.txt
+    kubectl top nodes --no-headers | awk '{print $1, $5}' > /lab/node-memory.txt
+    ```
+  setup: |
+    k_ns noisy
+    names=(indexer mailer resizer auditor)
+    hot=${names[$((RANDOM % 4))]}; echo "$hot" > $KL_STATE/answer
+    for n in "${names[@]}"; do
+      cmd='sleep infinity'; [ "$n" = "$hot" ] && cmd='while true; do :; done'
+      kubectl -n noisy run "$n" --image=busybox:1.37 --overrides="{\"spec\":{\"containers\":[{\"name\":\"$n\",\"image\":\"busybox:1.37\",\"command\":[\"sh\",\"-c\",\"$cmd\"],\"resources\":{\"limits\":{\"cpu\":\"300m\"}}}]}}" >/dev/null
+    done
+    eventually 120 'kubectl top pods -n noisy --no-headers 2>/dev/null | grep -q .'
+    eventually 120 'kubectl top nodes --no-headers 2>/dev/null | grep -q .'
+  check: |
+    eventually 60 'kubectl top nodes --no-headers 2>/dev/null | grep -q .'
+    check_eq "top CPU pod" "$(tr -d '[:space:]' < /lab/top-cpu-pod.txt 2>/dev/null)" "$(cat $KL_STATE/answer)"
+    want=$(kubectl top nodes --no-headers 2>/dev/null | awk '{print $1}' | sort | tr '\n' ' ')
+    check_eq "one line per node" "$(awk '{print $1}' /lab/node-memory.txt 2>/dev/null | sort | tr '\n' ' ')" "$want"
+    while read -r n p; do
+      cur=$(kubectl top node "$n" --no-headers 2>/dev/null | awk '{print $5}' | tr -d %); p=${p%\%}
+      check "$n percentage plausible ($p% vs $cur% now)" "[ ${p:-0} -gt 0 ] && [ \$(( ${p:-0} - ${cur:-0} )) -le 10 ] && [ \$(( ${cur:-0} - ${p:-0} )) -le 10 ]"
+    done < <(cat /lab/node-memory.txt 2>/dev/null)
+  solve: |
+    kubectl top pods -n noisy --sort-by=cpu --no-headers | head -1 | awk '{print $1}' > /lab/top-cpu-pod.txt
+    kubectl top nodes --no-headers | awk '{print $1, $5}' > /lab/node-memory.txt
+
+- id: k8s-159
+  title: Too big to be admitted
+  difficulty: 2
+  kind: fix
+  tags: [limitrange, admission, troubleshooting]
+  tutorial: |
+    **Concept.** A LimitRange also enforces maximums at admission. A pod whose container values exceed the namespace limits is refused, and the reason shows up in the ReplicaSet's events.
+
+    **Read up on:**
+    - `kubectl describe rs -n NS` — events with the forbidden message
+    - `kubectl describe limitrange -n NS` — min, max and defaults
+    - `kubectl set resources --help` — adjust requests and limits
+    - `kubectl get deploy -o yaml` — check current resources
+  scenario: |
+    The **`video-encoder`** deployment (namespace **`media`**) has 0 pods. Its ReplicaSet
+    events say *forbidden: maximum memory usage per Container is 512Mi, but limit is 2Gi*.
+
+    The team measured that the encoder really needs **only 400Mi** of memory (limit) and
+    **300Mi** request. Fix the **deployment** (not the namespace policy).
+  hints:
+    - "`kubectl describe rs -n media`"
+    - "`kubectl set resources deploy/video-encoder --limits=memory=400Mi --requests=memory=300Mi`"
+  solution: |
+    ```bash
+    kubectl describe rs -n media | grep -i forbidden
+    kubectl set resources deploy/video-encoder -n media --limits=memory=400Mi --requests=memory=300Mi
+    ```
+  setup: |
+    k_ns media
+    kubectl apply -f - >/dev/null <<'EOF'
+    apiVersion: v1
+    kind: LimitRange
+    metadata: {name: container-max, namespace: media}
+    spec:
+      limits:
+      - type: Container
+        max: {memory: 512Mi}
+    ---
+    apiVersion: apps/v1
+    kind: Deployment
+    metadata: {name: video-encoder, namespace: media}
+    spec:
+      selector: {matchLabels: {app: video-encoder}}
+      template:
+        metadata: {labels: {app: video-encoder}}
+        spec:
+          containers:
+          - name: encoder
+            image: busybox:1.37
+            command: ["sleep", "infinity"]
+            resources:
+              requests: {memory: 1Gi}
+              limits: {memory: 2Gi}
+    EOF
+  check: |
+    check_eq "LimitRange unchanged" "$(kj -n media limitrange container-max '{.spec.limits[0].max.memory}')" "512Mi"
+    check_eq "memory" "$(kj -n media deploy video-encoder '{.spec.template.spec.containers[0].resources.requests.memory} {.spec.template.spec.containers[0].resources.limits.memory}')" "300Mi 400Mi"
+    wait_deploy media video-encoder 60
+    check "encoder is running" 'deploy_ready media video-encoder'
+  solve: |
+    kubectl set resources deploy/video-encoder -n media --limits=memory=400Mi --requests=memory=300Mi
+
+# ===== Intermediate =====
 
 - id: k8s-143
   title: Killed before it could start
@@ -300,102 +565,6 @@ exercises:
     kubectl create pdb search-pdb -n catalog --selector=app=search --min-available=2
     kubectl patch pod indexer -n catalog --subresource resize --patch '{"spec":{"containers":[{"name":"indexer","resources":{"requests":{"cpu":"300m"},"limits":{"cpu":"600m"}}}]}}'
 
-- id: k8s-145
-  title: Sensible defaults for every container
-  difficulty: 2
-  kind: build
-  tags: [limitrange]
-  tutorial: |
-    **Concept.** A LimitRange sets per-container defaults, minimums and maximums for a namespace. It is applied when a pod is admitted, so it affects new pods only.
-
-    **Read up on:**
-    - `kubectl explain limitrange.spec.limits` — default, defaultRequest, max, min
-    - `kubectl describe limitrange -n NS` — verify the values
-    - `kubectl run` a test pod and `kubectl get pod -o yaml` — see injected resources
-    - Kubernetes docs: Limit Ranges
-  scenario: |
-    Developers in namespace **`dev`** never set resources. Create a **LimitRange**
-    **`defaults`** so that every container that doesn't specify anything gets:
-
-    - requests: `cpu: 100m`, `memory: 128Mi`
-    - limits: `cpu: 500m`, `memory: 256Mi`
-
-    and no container may ask for more than **1 CPU / 1Gi** (limit).
-  hints:
-    - "`spec.limits[0]: {type: Container, defaultRequest: ..., default: ..., max: ...}`"
-  solution: |
-    ```yaml
-    apiVersion: v1
-    kind: LimitRange
-    metadata: {name: defaults, namespace: dev}
-    spec:
-      limits:
-      - type: Container
-        defaultRequest: {cpu: 100m, memory: 128Mi}
-        default: {cpu: 500m, memory: 256Mi}
-        max: {cpu: "1", memory: 1Gi}
-    ```
-  setup: |
-    k_ns dev
-  check: |
-    l=$(kubectl -n dev get limitrange defaults -o json 2>/dev/null | jq -c '.spec.limits[] | select(.type=="Container")')
-    check_eq "defaultRequest" "$(jq -r '"\(.defaultRequest.cpu) \(.defaultRequest.memory)"' <<<"$l")" "100m 128Mi"
-    check_eq "default" "$(jq -r '"\(.default.cpu) \(.default.memory)"' <<<"$l")" "500m 256Mi"
-    check_eq "max" "$(jq -r '"\(.max.cpu) \(.max.memory)"' <<<"$l")" "1 1Gi"
-    n=kl-$RANDOM; kubectl -n dev run $n --image=busybox:1.37 --restart=Never -- true >/dev/null 2>&1
-    check_eq "a plain pod gets the defaults" "$(kj -n dev pod $n '{.spec.containers[0].resources.requests.cpu} {.spec.containers[0].resources.limits.memory}')" "100m 256Mi"
-    kubectl -n dev delete pod $n --wait=false >/dev/null 2>&1
-  solve: |
-    kubectl apply -f - <<'EOF'
-    apiVersion: v1
-    kind: LimitRange
-    metadata: {name: defaults, namespace: dev}
-    spec:
-      limits:
-      - type: Container
-        defaultRequest: {cpu: 100m, memory: 128Mi}
-        default: {cpu: 500m, memory: 256Mi}
-        max: {cpu: "1", memory: 1Gi}
-    EOF
-
-- id: k8s-146
-  title: A budget for the team
-  difficulty: 2
-  kind: build
-  tags: [resourcequota]
-  tutorial: |
-    **Concept.** A ResourceQuota caps the total requests, limits and object counts in a namespace. Usage is tracked against the hard limits and new objects beyond them are rejected.
-
-    **Read up on:**
-    - `kubectl create quota --help` — examples of `--hard`
-    - `kubectl explain resourcequota.spec.hard` — supported keys
-    - `kubectl describe quota -n NS` — Used versus Hard
-    - Kubernetes docs: Resource Quotas, compute resource quota
-  scenario: |
-    Team **`marketing`** gets a fixed slice of the cluster. Create a ResourceQuota
-    **`team-budget`** in their namespace limiting the totals to:
-
-    - requests: **1 CPU**, **1Gi** memory
-    - limits: **2 CPU**, **2Gi** memory
-    - at most **10 pods** and **5 services**
-  hints:
-    - "`kubectl create quota NAME --hard=requests.cpu=1,requests.memory=1Gi,...`"
-  solution: |
-    ```bash
-    kubectl create quota team-budget -n marketing \
-      --hard=requests.cpu=1,requests.memory=1Gi,limits.cpu=2,limits.memory=2Gi,pods=10,services=5
-    kubectl describe quota team-budget -n marketing
-    ```
-  setup: |
-    k_ns marketing
-  check: |
-    h=$(kubectl -n marketing get quota team-budget -o json 2>/dev/null | jq -c .spec.hard)
-    for kv in requests.cpu=1 requests.memory=1Gi limits.cpu=2 limits.memory=2Gi pods=10 services=5; do
-      check "$kv" "[ \"\$(jq -r '.\"${kv%%=*}\"' <<<'$h')\" = '${kv#*=}' ]"
-    done
-  solve: |
-    kubectl create quota team-budget -n marketing --hard=requests.cpu=1,requests.memory=1Gi,limits.cpu=2,limits.memory=2Gi,pods=10,services=5
-
 - id: k8s-147
   title: "must specify limits.cpu"
   difficulty: 3
@@ -541,109 +710,6 @@ exercises:
     kubectl autoscale deployment web -n autoscale --cpu-percent=50 --min=1 --max=5
     kubectl autoscale deployment burner -n autoscale --cpu-percent=50 --min=1 --max=4
     kubectl set resources deploy/reports -n autoscale --requests=cpu=100m
-
-- id: k8s-151
-  title: Guaranteed quality of service
-  difficulty: 2
-  kind: build
-  tags: [qos, resources]
-  tutorial: |
-    **Concept.** Every pod gets a QoS class derived from its requests and limits: Guaranteed, Burstable or BestEffort. The class influences eviction order under node pressure.
-
-    **Read up on:**
-    - Kubernetes docs: Pod Quality of Service Classes — the exact rules
-    - `kubectl explain pod.spec.containers.resources` — requests and limits
-    - `kubectl get pod NAME -o jsonpath='{.status.qosClass}'` — see the class assigned
-    - `kubectl describe pod` — QoS Class line
-  scenario: |
-    Under memory pressure the kubelet evicts **BestEffort** pods first and **Guaranteed**
-    pods last. The **`ledger`** pod (namespace **`fin`**) must be as safe as possible.
-
-    Create pod **`ledger`** (`busybox:1.37`, `sleep infinity`) with QoS class
-    **Guaranteed**, using **250m** CPU and **128Mi** memory.
-  hints:
-    - "Guaranteed = every container has CPU and memory requests **equal** to limits."
-  solution: |
-    ```yaml
-    resources:
-      requests: {cpu: 250m, memory: 128Mi}
-      limits:   {cpu: 250m, memory: 128Mi}
-    ```
-  setup: |
-    k_ns fin
-  check: |
-    wait_pod fin ledger 60
-    check_eq "QoS class" "$(kj -n fin pod ledger '{.status.qosClass}')" "Guaranteed"
-    check_eq "resources" "$(kj -n fin pod ledger '{.spec.containers[0].resources.limits.cpu} {.spec.containers[0].resources.limits.memory}')" "250m 128Mi"
-  solve: |
-    kubectl apply -f - <<'EOF'
-    apiVersion: v1
-    kind: Pod
-    metadata: {name: ledger, namespace: fin}
-    spec:
-      containers:
-      - name: ledger
-        image: busybox:1.37
-        command: ["sleep", "infinity"]
-        resources:
-          requests: {cpu: 250m, memory: 128Mi}
-          limits: {cpu: 250m, memory: 128Mi}
-    EOF
-
-- id: k8s-152
-  title: Read resource pressure
-  difficulty: 2
-  kind: build
-  tags: [metrics, top, nodes]
-  tutorial: |
-    **Concept.** metrics-server provides live CPU and memory figures per pod and per node. `kubectl top` reads those, can sort the output, and prints several columns, so choose by header and put the values into the requested format. Metrics lag a minute or so behind new pods.
-
-    **Read up on:**
-    - `kubectl top pods --help` — sorting (`--sort-by`) and namespace flags
-    - `kubectl top pods -n NS` — read the CPU column and its millicore units
-    - `kubectl top nodes --no-headers` — script-friendly output; columns are NAME CPU(cores) CPU% MEMORY(bytes) MEMORY%
-    - `awk` and `head` — extracting columns and a single name from text output
-    - `kubectl get apiservices` — is metrics-server available
-  scenario: |
-    Two questions about resource pressure on the cluster:
-
-    1. Namespace **`noisy`** has several pods. Find the pod using the **most CPU right now**
-       and write its name to **`/lab/top-cpu-pod.txt`**.
-    2. Write the **memory usage percentage** of each node (as reported by `kubectl top
-       nodes`) to **`/lab/node-memory.txt`**, one line per node in the form `NODE PERCENT`
-       (e.g. `node01 41%`).
-  hints:
-    - "`kubectl top pods -n noisy --sort-by=cpu` (metrics need ~1 minute after pods start)."
-    - "`kubectl top nodes --no-headers` — MEMORY% is the fifth column."
-    - "`awk '{print $1, $5}'` selects the node name and memory percentage."
-  solution: |
-    ```bash
-    kubectl top pods -n noisy --sort-by=cpu
-    kubectl top pods -n noisy --sort-by=cpu --no-headers | head -1 | awk '{print $1}' > /lab/top-cpu-pod.txt
-    kubectl top nodes --no-headers | awk '{print $1, $5}' > /lab/node-memory.txt
-    ```
-  setup: |
-    k_ns noisy
-    names=(indexer mailer resizer auditor)
-    hot=${names[$((RANDOM % 4))]}; echo "$hot" > $KL_STATE/answer
-    for n in "${names[@]}"; do
-      cmd='sleep infinity'; [ "$n" = "$hot" ] && cmd='while true; do :; done'
-      kubectl -n noisy run "$n" --image=busybox:1.37 --overrides="{\"spec\":{\"containers\":[{\"name\":\"$n\",\"image\":\"busybox:1.37\",\"command\":[\"sh\",\"-c\",\"$cmd\"],\"resources\":{\"limits\":{\"cpu\":\"300m\"}}}]}}" >/dev/null
-    done
-    eventually 120 'kubectl top pods -n noisy --no-headers 2>/dev/null | grep -q .'
-    eventually 120 'kubectl top nodes --no-headers 2>/dev/null | grep -q .'
-  check: |
-    eventually 60 'kubectl top nodes --no-headers 2>/dev/null | grep -q .'
-    check_eq "top CPU pod" "$(tr -d '[:space:]' < /lab/top-cpu-pod.txt 2>/dev/null)" "$(cat $KL_STATE/answer)"
-    want=$(kubectl top nodes --no-headers 2>/dev/null | awk '{print $1}' | sort | tr '\n' ' ')
-    check_eq "one line per node" "$(awk '{print $1}' /lab/node-memory.txt 2>/dev/null | sort | tr '\n' ' ')" "$want"
-    while read -r n p; do
-      cur=$(kubectl top node "$n" --no-headers 2>/dev/null | awk '{print $5}' | tr -d %); p=${p%\%}
-      check "$n percentage plausible ($p% vs $cur% now)" "[ ${p:-0} -gt 0 ] && [ \$(( ${p:-0} - ${cur:-0} )) -le 10 ] && [ \$(( ${cur:-0} - ${p:-0} )) -le 10 ]"
-    done < <(cat /lab/node-memory.txt 2>/dev/null)
-  solve: |
-    kubectl top pods -n noisy --sort-by=cpu --no-headers | head -1 | awk '{print $1}' > /lab/top-cpu-pod.txt
-    kubectl top nodes --no-headers | awk '{print $1, $5}' > /lab/node-memory.txt
 
 - id: k8s-154
   title: The drain that never finishes
@@ -795,67 +861,7 @@ exercises:
   solve: |
     kubectl patch hpa checkout -n shop --type=merge -p '{"spec":{"behavior":{"scaleDown":{"stabilizationWindowSeconds":300,"policies":[{"type":"Pods","value":1,"periodSeconds":60}]},"scaleUp":{"stabilizationWindowSeconds":0,"policies":[{"type":"Pods","value":4,"periodSeconds":15}]}}}}'
 
-- id: k8s-159
-  title: Too big to be admitted
-  difficulty: 2
-  kind: fix
-  tags: [limitrange, admission, troubleshooting]
-  tutorial: |
-    **Concept.** A LimitRange also enforces maximums at admission. A pod whose container values exceed the namespace limits is refused, and the reason shows up in the ReplicaSet's events.
-
-    **Read up on:**
-    - `kubectl describe rs -n NS` — events with the forbidden message
-    - `kubectl describe limitrange -n NS` — min, max and defaults
-    - `kubectl set resources --help` — adjust requests and limits
-    - `kubectl get deploy -o yaml` — check current resources
-  scenario: |
-    The **`video-encoder`** deployment (namespace **`media`**) has 0 pods. Its ReplicaSet
-    events say *forbidden: maximum memory usage per Container is 512Mi, but limit is 2Gi*.
-
-    The team measured that the encoder really needs **only 400Mi** of memory (limit) and
-    **300Mi** request. Fix the **deployment** (not the namespace policy).
-  hints:
-    - "`kubectl describe rs -n media`"
-    - "`kubectl set resources deploy/video-encoder --limits=memory=400Mi --requests=memory=300Mi`"
-  solution: |
-    ```bash
-    kubectl describe rs -n media | grep -i forbidden
-    kubectl set resources deploy/video-encoder -n media --limits=memory=400Mi --requests=memory=300Mi
-    ```
-  setup: |
-    k_ns media
-    kubectl apply -f - >/dev/null <<'EOF'
-    apiVersion: v1
-    kind: LimitRange
-    metadata: {name: container-max, namespace: media}
-    spec:
-      limits:
-      - type: Container
-        max: {memory: 512Mi}
-    ---
-    apiVersion: apps/v1
-    kind: Deployment
-    metadata: {name: video-encoder, namespace: media}
-    spec:
-      selector: {matchLabels: {app: video-encoder}}
-      template:
-        metadata: {labels: {app: video-encoder}}
-        spec:
-          containers:
-          - name: encoder
-            image: busybox:1.37
-            command: ["sleep", "infinity"]
-            resources:
-              requests: {memory: 1Gi}
-              limits: {memory: 2Gi}
-    EOF
-  check: |
-    check_eq "LimitRange unchanged" "$(kj -n media limitrange container-max '{.spec.limits[0].max.memory}')" "512Mi"
-    check_eq "memory" "$(kj -n media deploy video-encoder '{.spec.template.spec.containers[0].resources.requests.memory} {.spec.template.spec.containers[0].resources.limits.memory}')" "300Mi 400Mi"
-    wait_deploy media video-encoder 60
-    check "encoder is running" 'deploy_ready media video-encoder'
-  solve: |
-    kubectl set resources deploy/video-encoder -n media --limits=memory=400Mi --requests=memory=300Mi
+# ===== Capstone: a real-world lab =====
 
 - id: k8s-160
   title: "Incident: the namespace is out of budget"

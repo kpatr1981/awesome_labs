@@ -4,6 +4,158 @@ profile: docker
 order: 7
 exercises:
 
+# ===== Intermediate =====
+
+- id: linux-055
+  title: One capability for the service, and no more
+  difficulty: 3
+  kind: fix
+  tags: [capabilities, systemd, ambient, setcap, hardening]
+  tutorial: |
+    **Concept.** Root's power is split into about forty **capabilities**: `CAP_NET_BIND_SERVICE` to bind ports below 1024, `CAP_NET_RAW` for raw sockets, `CAP_SYS_ADMIN` for nearly everything else. A process has several sets: **effective** (what it can do now), **permitted** (what it may turn on), **bounding** (the ceiling for anything it executes later) and **ambient** (what survives `execve` into a normal program, for a non-root user).
+
+    There are two ways to give a program a capability, and one is much worse:
+
+    - **File capabilities** (`setcap cap_net_bind_service+ep /usr/bin/python3.12`) attach the capability to the *binary*. Every user who runs that binary gets it, for any script. On an interpreter that is a hole: any user can now run code with the capability.
+    - **Ambient capabilities** attach it to *one service*. In systemd, `User=` plus `AmbientCapabilities=` runs the service as a plain user holding only those capabilities, and `CapabilityBoundingSet=` caps everything it starts. `NoNewPrivileges=yes` stops it regaining anything through setuid or file-capability binaries.
+
+    **Read up on:**
+    - `man 7 capabilities`: the sets and how they change across `execve`
+    - `getcap`, `setcap -r`, and `getcap -r / 2>/dev/null` to find file capabilities
+    - `man systemd.exec`: `User=`, `AmbientCapabilities=`, `CapabilityBoundingSet=`, `NoNewPrivileges=`
+    - `grep Cap /proc/PID/status` and `capsh --decode=HEX`
+  scenario: |
+    **`kl-probe.service`** is a health prober: it serves its results over HTTP on
+    **127.0.0.1:443** (a privileged port) and pings `127.0.0.1` with a raw ICMP socket.
+    It runs as root. To "get it off root", someone added `User=kl-probe` and, when that broke
+    it, gave the Python interpreter itself capabilities with `setcap`.
+
+    ## Part 1: Close the hole
+
+    No file capabilities may be left on any Python binary on the host. Anyone could use them.
+
+    ## Part 2: Give the service exactly what it needs
+
+    `kl-probe` must run as the user **`kl-probe`**, and work: `curl -s 127.0.0.1:443` returns
+    `ping ok`. Its process must hold **exactly** `CAP_NET_BIND_SERVICE` and `CAP_NET_RAW` as
+    effective capabilities, have a bounding set of just those two, and be unable to gain
+    privileges. Keep the settings in the unit, so they survive a restart. Don't change
+    `/opt/kl-probe/probe.py`.
+  hints:
+    - "`getcap -r /usr 2>/dev/null` lists every file with capabilities. `setcap -r FILE` removes them."
+    - "`systemctl cat kl-probe` shows the unit, and `journalctl -u kl-probe -n 20` why it fails once the file capabilities are gone."
+    - "A drop-in is the tidy place: `sudo systemctl edit kl-probe` and add `AmbientCapabilities=`, `CapabilityBoundingSet=` and `NoNewPrivileges=yes` under `[Service]`."
+    - "`grep Cap /proc/$(systemctl show -p MainPID --value kl-probe)/status`: the two capabilities are bits 10 and 13, so the mask is `0000000000002400`."
+  solution: |
+    ```bash
+    getcap -r /usr 2>/dev/null
+    sudo setcap -r /usr/bin/python3.12
+    sudo mkdir -p /etc/systemd/system/kl-probe.service.d
+    sudo tee /etc/systemd/system/kl-probe.service.d/caps.conf >/dev/null <<'EOF'
+    [Service]
+    AmbientCapabilities=CAP_NET_BIND_SERVICE CAP_NET_RAW
+    CapabilityBoundingSet=CAP_NET_BIND_SERVICE CAP_NET_RAW
+    NoNewPrivileges=yes
+    EOF
+    sudo systemctl daemon-reload
+    sudo systemctl restart kl-probe
+    curl -s 127.0.0.1:443
+    grep Cap /proc/$(systemctl show -p MainPID --value kl-probe)/status
+    ```
+
+    The capabilities now belong to this one service, not to every Python script anyone runs.
+  setup: |
+    on_reset 'systemctl stop kl-probe 2>/dev/null; rm -rf /etc/systemd/system/kl-probe.service /etc/systemd/system/kl-probe.service.d /opt/kl-probe; for f in /usr/bin/python3*; do setcap -r "$f" 2>/dev/null; done; userdel kl-probe 2>/dev/null; systemctl daemon-reload; true'
+    # ports below 1024 must really need the capability
+    on_reset "sysctl -qw net.ipv4.ip_unprivileged_port_start=$(sysctl -n net.ipv4.ip_unprivileged_port_start)"
+    sysctl -qw net.ipv4.ip_unprivileged_port_start=1024
+    id kl-probe >/dev/null 2>&1 || useradd -r -s /usr/sbin/nologin kl-probe
+    mkdir -p /opt/kl-probe
+    cat > /opt/kl-probe/probe.py <<'EOF'
+    import http.server, os, socket, struct, time
+
+    def ping(host="127.0.0.1"):
+        s = socket.socket(socket.AF_INET, socket.SOCK_RAW, socket.IPPROTO_ICMP)
+        s.settimeout(2)
+        def csum(b):
+            if len(b) % 2:
+                b += b"\0"
+            t = sum(struct.unpack("!%dH" % (len(b) // 2), b))
+            t = (t >> 16) + (t & 0xFFFF)
+            return ~(t + (t >> 16)) & 0xFFFF
+        ident = os.getpid() & 0xFFFF
+        hdr = struct.pack("!BBHHH", 8, 0, 0, ident, 1)
+        pkt = struct.pack("!BBHHH", 8, 0, csum(hdr + b"kl"), ident, 1) + b"kl"
+        s.sendto(pkt, (host, 0))
+        while True:
+            data, _ = s.recvfrom(1024)
+            if data[20] == 0 and struct.unpack("!H", data[24:26])[0] == ident:
+                return True
+
+    class H(http.server.BaseHTTPRequestHandler):
+        def do_GET(self):
+            try:
+                ping()
+                msg = b"ping ok\n"
+            except Exception as e:
+                msg = ("ping failed: %s\n" % e).encode()
+            self.send_response(200)
+            self.end_headers()
+            self.wfile.write(msg)
+
+        def log_message(self, *a):
+            pass
+
+    ping()
+    http.server.HTTPServer(("127.0.0.1", 443), H).serve_forever()
+    EOF
+    chmod 644 /opt/kl-probe/probe.py
+    cat > /etc/systemd/system/kl-probe.service <<'EOF'
+    [Unit]
+    Description=KL health prober
+    [Service]
+    User=kl-probe
+    ExecStart=/usr/bin/python3 /opt/kl-probe/probe.py
+    Restart=on-failure
+    RestartSec=2
+    [Install]
+    WantedBy=multi-user.target
+    EOF
+    setcap cap_net_bind_service,cap_net_raw,cap_sys_admin,cap_dac_override+ep "$(readlink -f /usr/bin/python3)"
+    systemctl daemon-reload
+    systemctl restart kl-probe
+  check: |
+    info "Part 1: Close the hole"
+    caps=$(getcap /usr/bin/python3* /usr/local/bin/python3* "$(readlink -f /usr/bin/python3)" 2>/dev/null | sort -u)
+    check_eq "no Python binary has file capabilities" "$caps" ""
+    check_not "an ordinary user can't bind a privileged port with Python" "sudo -u nobody python3 -c 'import socket; socket.socket().bind((\"127.0.0.1\", 444))'"
+
+    info "Part 2: Give the service exactly what it needs"
+    systemctl restart kl-probe >/dev/null 2>&1
+    eventually 15 "curl -s -m 3 127.0.0.1:443 | grep -q 'ping ok'"
+    check_eq "curl 127.0.0.1:443 returns ping ok" "$(curl -s -m 3 127.0.0.1:443)" "ping ok"
+    pid=$(systemctl show -p MainPID --value kl-probe)
+    st=/proc/$pid/status
+    check_eq "it runs as the user kl-probe" "$(ps -o user= -p "$pid" 2>/dev/null)" kl-probe
+    check_eq "its effective capabilities are exactly the two" "$(awk '/^CapEff/{print $2}' $st 2>/dev/null)" 0000000000002400
+    check_eq "its bounding set is just those two" "$(awk '/^CapBnd/{print $2}' $st 2>/dev/null)" 0000000000002400
+    check_eq "it can't gain privileges" "$(awk '/^NoNewPrivs/{print $2}' $st 2>/dev/null)" 1
+    check "the settings live in the unit" "systemctl show -p AmbientCapabilities --value kl-probe | grep -q cap_net_raw && systemctl show -p NoNewPrivileges --value kl-probe | grep -qx yes"
+    check "probe.py is unchanged" "grep -q 'HTTPServer((\"127.0.0.1\", 443)' /opt/kl-probe/probe.py && grep -q SOCK_RAW /opt/kl-probe/probe.py"
+  solve: |
+    sudo setcap -r "$(readlink -f /usr/bin/python3)"
+    sudo mkdir -p /etc/systemd/system/kl-probe.service.d
+    sudo tee /etc/systemd/system/kl-probe.service.d/caps.conf >/dev/null <<'EOF'
+    [Service]
+    AmbientCapabilities=CAP_NET_BIND_SERVICE CAP_NET_RAW
+    CapabilityBoundingSet=CAP_NET_BIND_SERVICE CAP_NET_RAW
+    NoNewPrivileges=yes
+    EOF
+    sudo systemctl daemon-reload
+    sudo systemctl restart kl-probe
+
+# ===== Advanced =====
+
 - id: linux-050
   title: A container from a root filesystem and nothing else
   difficulty: 4
@@ -698,318 +850,6 @@ exercises:
     sudo bash -c 'runc run -d kl-web > /srv/kl-web.log 2>&1 < /dev/null'
     for i in $(seq 20); do curl -s -m 2 127.0.0.1:18053 >/dev/null && break; sleep 0.5; done
 
-- id: linux-054
-  title: Root in the container, nobody on the host
-  difficulty: 5
-  kind: fix
-  tags: [user-namespaces, uid-mapping, runc, idmap, containers]
-  tutorial: |
-    **Concept.** A **user namespace** gives a process its own set of user IDs, translated to host IDs by a map. With the map `0 100000 65536`, uid 0 *inside* is uid 100000 *outside*, uid 1000 inside is 101000 outside, and so on for 65536 IDs. The container's "root" can do root things to what its namespace owns, but to the host it's an unprivileged nobody: escape the container and you're uid 100000.
-
-    The catch is the files. The kernel stores *host* IDs on disk. A root filesystem unpacked by host root is owned by host uid 0, which is **not in the map**, so inside it shows up as the overflow user `nobody` (65534) and container root can't write it. Runtimes solve this by **shifting** the image: every file owned by uid N is chowned to `100000 + N`, which keeps the ownership structure (root files stay root's, the app user's files stay the app user's) instead of flattening everything to one owner. Newer kernels can do it without copying, with idmapped mounts.
-
-    In runc, a user namespace is a `{"type": "user"}` entry in `linux.namespaces` plus `linux.uidMappings` and `linux.gidMappings`, each a list of `{"containerID", "hostID", "size"}`.
-
-    **Read up on:**
-    - `man 7 user_namespaces`: `uid_map`, unmapped IDs and the overflow user
-    - `/proc/PID/uid_map` and the `Uid:` line of `/proc/PID/status`
-    - The OCI runtime spec, `config-linux.md`: "User namespace mappings"
-    - `chown -h` and why symlinks must be shifted too, and `find -printf '%U'`
-  scenario: |
-    **`/srv/kl-ns`** is a runc bundle for a small worker, **`kl-ns`**. It runs as root inside the
-    container, and so it runs as **real root on the host**: a break-out would own the machine.
-    The security team wants it in a user namespace: container uids **0 to 65535** mapped to
-    host uids **200000 to 265535**, and the same for gids.
-
-    Someone tried. Their attempt is `/srv/kl-ns/config.userns.json`, and the container it
-    starts keeps dying. Get the worker running in a user namespace.
-
-    ## Part 1: The mapping
-
-    `/srv/kl-ns/config.json` must put the container in a new user namespace with exactly
-    that uid and gid mapping. Start it as **`kl-ns`** in the background (`sudo runc run -d`).
-    On the host, its processes must run as uid **200000**.
-
-    ## Part 2: Files the container can own
-
-    The worker writes `/var/lib/worker/state` as root, and its helper runs as the image's
-    user **`app`** (uid 1000) and appends to `/home/app/worker.log`. Both must work, and so
-    must writes to the host directory **`/srv/kl-ns-data`**, bind-mounted at `/data`.
-
-    Shift the ownership, don't flatten it: every file must keep its owner from the image,
-    just moved into the mapped range. Nothing in the root filesystem may stay owned by a
-    host uid outside it, and nothing may be made world-writable.
-  hints:
-    - "`diff <(jq -S . /srv/kl-ns/config.json) <(jq -S . /srv/kl-ns/config.userns.json)` shows what the attempt changed. Then run it in the foreground and read the error: `cd /srv/kl-ns && sudo cp config.userns.json config.json && sudo runc run kl-ns`."
-    - "Check each mapping entry against the task. A mapping must also cover every uid the image uses."
-    - "Inside a user namespace, a file owned by an unmapped host uid shows as `nobody`. `ls -ln /srv/kl-ns/rootfs/var/lib` shows what the kernel stores."
-    - "Shift with a loop that keeps per-file owners: `find rootfs -print0 | while IFS= read -r -d '' f; do chown -h \"$((200000 + $(stat -c %u \"$f\"))):$((200000 + $(stat -c %g \"$f\")))\" \"$f\"; done`, or the same in Python with `os.lchown`, which is much faster."
-    - "`/srv/kl-ns-data` is a host directory: it belongs to the host uid that container root becomes. Look at what's already in it, too."
-  solution: |
-    The attempt mapped the right range to the wrong host IDs and only 1000 IDs, so uid 1000
-    wasn't mapped at all, and nobody shifted the files.
-
-    ```bash
-    cd /srv/kl-ns
-    sudo runc delete -f kl-ns 2>/dev/null
-    sudo jq '
-      .linux.namespaces |= (map(select(.type != "user")) + [{"type": "user"}])
-      | .linux.uidMappings = [{"containerID": 0, "hostID": 200000, "size": 65536}]
-      | .linux.gidMappings = [{"containerID": 0, "hostID": 200000, "size": 65536}]
-    ' config.json | sudo tee config.new >/dev/null && sudo mv config.new config.json
-    # shift every owner by 200000, symlinks included
-    sudo python3 - <<'EOF'
-    import os
-    for top in ["/srv/kl-ns/rootfs"]:
-        for d, dirs, files in os.walk(top):
-            for p in [d] + [os.path.join(d, n) for n in files + [x for x in dirs if os.path.islink(os.path.join(d, x))]]:
-                st = os.lstat(p)
-                if st.st_uid < 200000:
-                    os.lchown(p, st.st_uid + 200000, st.st_gid + 200000)
-    EOF
-    sudo chown -R 200000:200000 /srv/kl-ns-data
-    sudo bash -c 'runc run -d kl-ns > /srv/kl-ns.log 2>&1 < /dev/null'
-    ```
-
-    After the shift, `rootfs/etc/passwd` belongs to host uid 200000 (container root) and
-    `rootfs/home/app` to 201000 (container `app`), exactly mirroring the image.
-  setup: |
-    on_reset 'runc delete -f kl-ns >/dev/null 2>&1; rm -rf /srv/kl-ns /srv/kl-ns-data /srv/kl-ns.log'
-    runc delete -f kl-ns >/dev/null 2>&1
-    B=/srv/kl-ns
-    mkdir -p $B/rootfs /srv/kl-ns-data
-    docker rm -f kl-nssrc >/dev/null 2>&1
-    docker create --name kl-nssrc alpine:3.22 >/dev/null
-    docker export kl-nssrc | tar -x --numeric-owner -C $B/rootfs
-    docker rm -f kl-nssrc >/dev/null
-    echo 'app:x:1000:1000:app:/home/app:/bin/sh' >> $B/rootfs/etc/passwd
-    echo 'app:x:1000:' >> $B/rootfs/etc/group
-    mkdir -p $B/rootfs/home/app $B/rootfs/var/lib/worker
-    chown 1000:1000 $B/rootfs/home/app
-    chmod 755 $B/rootfs/home/app
-    cat > $B/rootfs/worker.sh <<'EOF'
-    #!/bin/sh
-    # the worker: root writes its state, the helper runs as app and writes its log
-    while true; do
-      date +%s > /var/lib/worker/state || exit 11
-      su app -s /bin/sh -c 'date +%s >> /home/app/worker.log' || exit 12
-      date +%s > /data/heartbeat || exit 13
-      sleep 2
-    done
-    EOF
-    chmod 755 $B/rootfs/worker.sh
-    (cd $B && runc spec >/dev/null)
-    jq '.process.terminal = false
-        | .process.capabilities |= with_entries(.value += ["CAP_SETUID", "CAP_SETGID"])
-        | .process.args = ["/worker.sh"]
-        | .root.readonly = false
-        | .hostname = "kl-ns"
-        | .mounts += [{"destination": "/data", "type": "bind", "source": "/srv/kl-ns-data", "options": ["rbind", "rw"]}]' \
-      $B/config.json > $B/c.tmp && mv $B/c.tmp $B/config.json
-    jq '.linux.namespaces += [{"type": "user"}]
-        | .linux.uidMappings = [{"containerID": 0, "hostID": 100000, "size": 1000}]
-        | .linux.gidMappings = [{"containerID": 0, "hostID": 100000, "size": 1000}]' \
-      $B/config.json > $B/config.userns.json
-    (cd $B && runc run -d kl-ns > /srv/kl-ns.log 2>&1 < /dev/null)
-    sleep 3
-    cat > $B/README.md <<'EOF'
-    The worker runs from this bundle with: cd /srv/kl-ns && sudo runc run -d kl-ns
-    config.userns.json is the user-namespace attempt. It didn't work.
-    EOF
-  check: |
-    B=/srv/kl-ns
-    cfg=$B/config.json
-    info "Part 1: The mapping"
-    check "config.json creates a user namespace" "jq -e '.linux.namespaces | map(.type) | index(\"user\")' $cfg"
-    check_eq "the uid mapping is 0 → 200000, 65536 ids" "$(jq -c '.linux.uidMappings' $cfg 2>/dev/null)" '[{"containerID":0,"hostID":200000,"size":65536}]'
-    check_eq "the gid mapping is 0 → 200000, 65536 ids" "$(jq -c '.linux.gidMappings' $cfg 2>/dev/null)" '[{"containerID":0,"hostID":200000,"size":65536}]'
-    check "kl-ns is running" "runc state kl-ns 2>/dev/null | jq -e '.status == \"running\"'"
-    pid=$(runc state kl-ns 2>/dev/null | jq -r .pid)
-    check_eq "its processes run as host uid 200000" "$(awk '/^Uid:/{print $2}' /proc/$pid/status 2>/dev/null)" 200000
-    check_eq "the kernel's map matches" "$(awk '{print $1, $2, $3}' /proc/$pid/uid_map 2>/dev/null)" "0 200000 65536"
-
-    info "Part 2: Files the container can own"
-    if [ -n "$pid" ] && [ "$pid" != null ]; then
-      s0=$(cat $B/rootfs/var/lib/worker/state 2>/dev/null); l0=$(wc -l < $B/rootfs/home/app/worker.log 2>/dev/null)
-      sleep 5
-      s1=$(cat $B/rootfs/var/lib/worker/state 2>/dev/null); l1=$(wc -l < $B/rootfs/home/app/worker.log 2>/dev/null)
-    fi
-    check "the worker keeps writing /var/lib/worker/state as root" "[ -n '$s1' ] && [ '$s1' != '$s0' ] && [ \"\$(stat -c %u $B/rootfs/var/lib/worker/state)\" = 200000 ]"
-    check "the helper keeps appending to worker.log as app" "[ -n '$l1' ] && [ '${l1:-0}' -gt '${l0:-0}' ] && [ \"\$(stat -c %u $B/rootfs/home/app/worker.log)\" = 201000 ]"
-    check "it keeps writing /data/heartbeat" "[ -f /srv/kl-ns-data/heartbeat ] && [ \$(( \$(date +%s) - \$(cat /srv/kl-ns-data/heartbeat) )) -le 6 ] && [ \"\$(stat -c %u /srv/kl-ns-data/heartbeat)\" = 200000 ]"
-    check_eq "the image's root files belong to container root" "$(stat -c %u:%g $B/rootfs/etc/passwd $B/rootfs/bin/busybox 2>/dev/null | sort -u | tr '\n' ' ')" "200000:200000 "
-    check_eq "/home/app still belongs to app, shifted" "$(stat -c %u:%g $B/rootfs/home/app 2>/dev/null)" "201000:201000"
-    check "symlinks were shifted too" "[ \"\$(stat -c %u $B/rootfs/bin/sh)\" = 200000 ]"
-    check_eq "nothing in the rootfs is owned outside the mapped range" "$(find $B/rootfs -xdev \( -uid -200000 -o -uid +265535 -o -gid -200000 -o -gid +265535 \) 2>/dev/null | wc -l)" 0
-    check_eq "nothing was made world-writable" "$(find $B/rootfs/var/lib/worker $B/rootfs/home/app /srv/kl-ns-data -perm -o+w ! -type l 2>/dev/null | wc -l)" 0
-  solve: |
-    cd /srv/kl-ns
-    sudo runc delete -f kl-ns 2>/dev/null
-    sudo jq '
-      .linux.namespaces |= (map(select(.type != "user")) + [{"type": "user"}])
-      | .linux.uidMappings = [{"containerID": 0, "hostID": 200000, "size": 65536}]
-      | .linux.gidMappings = [{"containerID": 0, "hostID": 200000, "size": 65536}]
-    ' config.json | sudo tee config.new >/dev/null && sudo mv config.new config.json
-    sudo python3 - <<'EOF'
-    import os
-    for d, dirs, files in os.walk("/srv/kl-ns/rootfs"):
-        for p in [d] + [os.path.join(d, n) for n in files + [x for x in dirs if os.path.islink(os.path.join(d, x))]]:
-            st = os.lstat(p)
-            if st.st_uid < 200000:
-                os.lchown(p, st.st_uid + 200000, st.st_gid + 200000)
-    EOF
-    sudo chown -R 200000:200000 /srv/kl-ns-data
-    sudo bash -c 'runc run -d kl-ns > /srv/kl-ns.log 2>&1 < /dev/null'
-    sleep 3
-
-- id: linux-055
-  title: One capability for the service, and no more
-  difficulty: 3
-  kind: fix
-  tags: [capabilities, systemd, ambient, setcap, hardening]
-  tutorial: |
-    **Concept.** Root's power is split into about forty **capabilities**: `CAP_NET_BIND_SERVICE` to bind ports below 1024, `CAP_NET_RAW` for raw sockets, `CAP_SYS_ADMIN` for nearly everything else. A process has several sets: **effective** (what it can do now), **permitted** (what it may turn on), **bounding** (the ceiling for anything it executes later) and **ambient** (what survives `execve` into a normal program, for a non-root user).
-
-    There are two ways to give a program a capability, and one is much worse:
-
-    - **File capabilities** (`setcap cap_net_bind_service+ep /usr/bin/python3.12`) attach the capability to the *binary*. Every user who runs that binary gets it, for any script. On an interpreter that is a hole: any user can now run code with the capability.
-    - **Ambient capabilities** attach it to *one service*. In systemd, `User=` plus `AmbientCapabilities=` runs the service as a plain user holding only those capabilities, and `CapabilityBoundingSet=` caps everything it starts. `NoNewPrivileges=yes` stops it regaining anything through setuid or file-capability binaries.
-
-    **Read up on:**
-    - `man 7 capabilities`: the sets and how they change across `execve`
-    - `getcap`, `setcap -r`, and `getcap -r / 2>/dev/null` to find file capabilities
-    - `man systemd.exec`: `User=`, `AmbientCapabilities=`, `CapabilityBoundingSet=`, `NoNewPrivileges=`
-    - `grep Cap /proc/PID/status` and `capsh --decode=HEX`
-  scenario: |
-    **`kl-probe.service`** is a health prober: it serves its results over HTTP on
-    **127.0.0.1:443** (a privileged port) and pings `127.0.0.1` with a raw ICMP socket.
-    It runs as root. To "get it off root", someone added `User=kl-probe` and, when that broke
-    it, gave the Python interpreter itself capabilities with `setcap`.
-
-    ## Part 1: Close the hole
-
-    No file capabilities may be left on any Python binary on the host. Anyone could use them.
-
-    ## Part 2: Give the service exactly what it needs
-
-    `kl-probe` must run as the user **`kl-probe`**, and work: `curl -s 127.0.0.1:443` returns
-    `ping ok`. Its process must hold **exactly** `CAP_NET_BIND_SERVICE` and `CAP_NET_RAW` as
-    effective capabilities, have a bounding set of just those two, and be unable to gain
-    privileges. Keep the settings in the unit, so they survive a restart. Don't change
-    `/opt/kl-probe/probe.py`.
-  hints:
-    - "`getcap -r /usr 2>/dev/null` lists every file with capabilities. `setcap -r FILE` removes them."
-    - "`systemctl cat kl-probe` shows the unit, and `journalctl -u kl-probe -n 20` why it fails once the file capabilities are gone."
-    - "A drop-in is the tidy place: `sudo systemctl edit kl-probe` and add `AmbientCapabilities=`, `CapabilityBoundingSet=` and `NoNewPrivileges=yes` under `[Service]`."
-    - "`grep Cap /proc/$(systemctl show -p MainPID --value kl-probe)/status`: the two capabilities are bits 10 and 13, so the mask is `0000000000002400`."
-  solution: |
-    ```bash
-    getcap -r /usr 2>/dev/null
-    sudo setcap -r /usr/bin/python3.12
-    sudo mkdir -p /etc/systemd/system/kl-probe.service.d
-    sudo tee /etc/systemd/system/kl-probe.service.d/caps.conf >/dev/null <<'EOF'
-    [Service]
-    AmbientCapabilities=CAP_NET_BIND_SERVICE CAP_NET_RAW
-    CapabilityBoundingSet=CAP_NET_BIND_SERVICE CAP_NET_RAW
-    NoNewPrivileges=yes
-    EOF
-    sudo systemctl daemon-reload
-    sudo systemctl restart kl-probe
-    curl -s 127.0.0.1:443
-    grep Cap /proc/$(systemctl show -p MainPID --value kl-probe)/status
-    ```
-
-    The capabilities now belong to this one service, not to every Python script anyone runs.
-  setup: |
-    on_reset 'systemctl stop kl-probe 2>/dev/null; rm -rf /etc/systemd/system/kl-probe.service /etc/systemd/system/kl-probe.service.d /opt/kl-probe; for f in /usr/bin/python3*; do setcap -r "$f" 2>/dev/null; done; userdel kl-probe 2>/dev/null; systemctl daemon-reload; true'
-    # ports below 1024 must really need the capability
-    on_reset "sysctl -qw net.ipv4.ip_unprivileged_port_start=$(sysctl -n net.ipv4.ip_unprivileged_port_start)"
-    sysctl -qw net.ipv4.ip_unprivileged_port_start=1024
-    id kl-probe >/dev/null 2>&1 || useradd -r -s /usr/sbin/nologin kl-probe
-    mkdir -p /opt/kl-probe
-    cat > /opt/kl-probe/probe.py <<'EOF'
-    import http.server, os, socket, struct, time
-
-    def ping(host="127.0.0.1"):
-        s = socket.socket(socket.AF_INET, socket.SOCK_RAW, socket.IPPROTO_ICMP)
-        s.settimeout(2)
-        def csum(b):
-            if len(b) % 2:
-                b += b"\0"
-            t = sum(struct.unpack("!%dH" % (len(b) // 2), b))
-            t = (t >> 16) + (t & 0xFFFF)
-            return ~(t + (t >> 16)) & 0xFFFF
-        ident = os.getpid() & 0xFFFF
-        hdr = struct.pack("!BBHHH", 8, 0, 0, ident, 1)
-        pkt = struct.pack("!BBHHH", 8, 0, csum(hdr + b"kl"), ident, 1) + b"kl"
-        s.sendto(pkt, (host, 0))
-        while True:
-            data, _ = s.recvfrom(1024)
-            if data[20] == 0 and struct.unpack("!H", data[24:26])[0] == ident:
-                return True
-
-    class H(http.server.BaseHTTPRequestHandler):
-        def do_GET(self):
-            try:
-                ping()
-                msg = b"ping ok\n"
-            except Exception as e:
-                msg = ("ping failed: %s\n" % e).encode()
-            self.send_response(200)
-            self.end_headers()
-            self.wfile.write(msg)
-
-        def log_message(self, *a):
-            pass
-
-    ping()
-    http.server.HTTPServer(("127.0.0.1", 443), H).serve_forever()
-    EOF
-    chmod 644 /opt/kl-probe/probe.py
-    cat > /etc/systemd/system/kl-probe.service <<'EOF'
-    [Unit]
-    Description=KL health prober
-    [Service]
-    User=kl-probe
-    ExecStart=/usr/bin/python3 /opt/kl-probe/probe.py
-    Restart=on-failure
-    RestartSec=2
-    [Install]
-    WantedBy=multi-user.target
-    EOF
-    setcap cap_net_bind_service,cap_net_raw,cap_sys_admin,cap_dac_override+ep "$(readlink -f /usr/bin/python3)"
-    systemctl daemon-reload
-    systemctl restart kl-probe
-  check: |
-    info "Part 1: Close the hole"
-    caps=$(getcap /usr/bin/python3* /usr/local/bin/python3* "$(readlink -f /usr/bin/python3)" 2>/dev/null | sort -u)
-    check_eq "no Python binary has file capabilities" "$caps" ""
-    check_not "an ordinary user can't bind a privileged port with Python" "sudo -u nobody python3 -c 'import socket; socket.socket().bind((\"127.0.0.1\", 444))'"
-
-    info "Part 2: Give the service exactly what it needs"
-    systemctl restart kl-probe >/dev/null 2>&1
-    eventually 15 "curl -s -m 3 127.0.0.1:443 | grep -q 'ping ok'"
-    check_eq "curl 127.0.0.1:443 returns ping ok" "$(curl -s -m 3 127.0.0.1:443)" "ping ok"
-    pid=$(systemctl show -p MainPID --value kl-probe)
-    st=/proc/$pid/status
-    check_eq "it runs as the user kl-probe" "$(ps -o user= -p "$pid" 2>/dev/null)" kl-probe
-    check_eq "its effective capabilities are exactly the two" "$(awk '/^CapEff/{print $2}' $st 2>/dev/null)" 0000000000002400
-    check_eq "its bounding set is just those two" "$(awk '/^CapBnd/{print $2}' $st 2>/dev/null)" 0000000000002400
-    check_eq "it can't gain privileges" "$(awk '/^NoNewPrivs/{print $2}' $st 2>/dev/null)" 1
-    check "the settings live in the unit" "systemctl show -p AmbientCapabilities --value kl-probe | grep -q cap_net_raw && systemctl show -p NoNewPrivileges --value kl-probe | grep -qx yes"
-    check "probe.py is unchanged" "grep -q 'HTTPServer((\"127.0.0.1\", 443)' /opt/kl-probe/probe.py && grep -q SOCK_RAW /opt/kl-probe/probe.py"
-  solve: |
-    sudo setcap -r "$(readlink -f /usr/bin/python3)"
-    sudo mkdir -p /etc/systemd/system/kl-probe.service.d
-    sudo tee /etc/systemd/system/kl-probe.service.d/caps.conf >/dev/null <<'EOF'
-    [Service]
-    AmbientCapabilities=CAP_NET_BIND_SERVICE CAP_NET_RAW
-    CapabilityBoundingSet=CAP_NET_BIND_SERVICE CAP_NET_RAW
-    NoNewPrivileges=yes
-    EOF
-    sudo systemctl daemon-reload
-    sudo systemctl restart kl-probe
-
 - id: linux-056
   title: Debug a container that has no shell
   difficulty: 4
@@ -1600,3 +1440,167 @@ exercises:
     docker run -d --name kl-worker -v /lab/init.py:/init.py:ro -v /opt/kl-pid1/app.py:/app.py:ro \
       -v /srv/kl-worker:/out python:3.12-alpine python3 /init.py python3 /app.py /out/flushed
     sleep 2
+
+- id: linux-054
+  title: Root in the container, nobody on the host
+  difficulty: 5
+  kind: fix
+  tags: [user-namespaces, uid-mapping, runc, idmap, containers]
+  tutorial: |
+    **Concept.** A **user namespace** gives a process its own set of user IDs, translated to host IDs by a map. With the map `0 100000 65536`, uid 0 *inside* is uid 100000 *outside*, uid 1000 inside is 101000 outside, and so on for 65536 IDs. The container's "root" can do root things to what its namespace owns, but to the host it's an unprivileged nobody: escape the container and you're uid 100000.
+
+    The catch is the files. The kernel stores *host* IDs on disk. A root filesystem unpacked by host root is owned by host uid 0, which is **not in the map**, so inside it shows up as the overflow user `nobody` (65534) and container root can't write it. Runtimes solve this by **shifting** the image: every file owned by uid N is chowned to `100000 + N`, which keeps the ownership structure (root files stay root's, the app user's files stay the app user's) instead of flattening everything to one owner. Newer kernels can do it without copying, with idmapped mounts.
+
+    In runc, a user namespace is a `{"type": "user"}` entry in `linux.namespaces` plus `linux.uidMappings` and `linux.gidMappings`, each a list of `{"containerID", "hostID", "size"}`.
+
+    **Read up on:**
+    - `man 7 user_namespaces`: `uid_map`, unmapped IDs and the overflow user
+    - `/proc/PID/uid_map` and the `Uid:` line of `/proc/PID/status`
+    - The OCI runtime spec, `config-linux.md`: "User namespace mappings"
+    - `chown -h` and why symlinks must be shifted too, and `find -printf '%U'`
+  scenario: |
+    **`/srv/kl-ns`** is a runc bundle for a small worker, **`kl-ns`**. It runs as root inside the
+    container, and so it runs as **real root on the host**: a break-out would own the machine.
+    The security team wants it in a user namespace: container uids **0 to 65535** mapped to
+    host uids **200000 to 265535**, and the same for gids.
+
+    Someone tried. Their attempt is `/srv/kl-ns/config.userns.json`, and the container it
+    starts keeps dying. Get the worker running in a user namespace.
+
+    ## Part 1: The mapping
+
+    `/srv/kl-ns/config.json` must put the container in a new user namespace with exactly
+    that uid and gid mapping. Start it as **`kl-ns`** in the background (`sudo runc run -d`).
+    On the host, its processes must run as uid **200000**.
+
+    ## Part 2: Files the container can own
+
+    The worker writes `/var/lib/worker/state` as root, and its helper runs as the image's
+    user **`app`** (uid 1000) and appends to `/home/app/worker.log`. Both must work, and so
+    must writes to the host directory **`/srv/kl-ns-data`**, bind-mounted at `/data`.
+
+    Shift the ownership, don't flatten it: every file must keep its owner from the image,
+    just moved into the mapped range. Nothing in the root filesystem may stay owned by a
+    host uid outside it, and nothing may be made world-writable.
+  hints:
+    - "`diff <(jq -S . /srv/kl-ns/config.json) <(jq -S . /srv/kl-ns/config.userns.json)` shows what the attempt changed. Then run it in the foreground and read the error: `cd /srv/kl-ns && sudo cp config.userns.json config.json && sudo runc run kl-ns`."
+    - "Check each mapping entry against the task. A mapping must also cover every uid the image uses."
+    - "Inside a user namespace, a file owned by an unmapped host uid shows as `nobody`. `ls -ln /srv/kl-ns/rootfs/var/lib` shows what the kernel stores."
+    - "Shift with a loop that keeps per-file owners: `find rootfs -print0 | while IFS= read -r -d '' f; do chown -h \"$((200000 + $(stat -c %u \"$f\"))):$((200000 + $(stat -c %g \"$f\")))\" \"$f\"; done`, or the same in Python with `os.lchown`, which is much faster."
+    - "`/srv/kl-ns-data` is a host directory: it belongs to the host uid that container root becomes. Look at what's already in it, too."
+  solution: |
+    The attempt mapped the right range to the wrong host IDs and only 1000 IDs, so uid 1000
+    wasn't mapped at all, and nobody shifted the files.
+
+    ```bash
+    cd /srv/kl-ns
+    sudo runc delete -f kl-ns 2>/dev/null
+    sudo jq '
+      .linux.namespaces |= (map(select(.type != "user")) + [{"type": "user"}])
+      | .linux.uidMappings = [{"containerID": 0, "hostID": 200000, "size": 65536}]
+      | .linux.gidMappings = [{"containerID": 0, "hostID": 200000, "size": 65536}]
+    ' config.json | sudo tee config.new >/dev/null && sudo mv config.new config.json
+    # shift every owner by 200000, symlinks included
+    sudo python3 - <<'EOF'
+    import os
+    for top in ["/srv/kl-ns/rootfs"]:
+        for d, dirs, files in os.walk(top):
+            for p in [d] + [os.path.join(d, n) for n in files + [x for x in dirs if os.path.islink(os.path.join(d, x))]]:
+                st = os.lstat(p)
+                if st.st_uid < 200000:
+                    os.lchown(p, st.st_uid + 200000, st.st_gid + 200000)
+    EOF
+    sudo chown -R 200000:200000 /srv/kl-ns-data
+    sudo bash -c 'runc run -d kl-ns > /srv/kl-ns.log 2>&1 < /dev/null'
+    ```
+
+    After the shift, `rootfs/etc/passwd` belongs to host uid 200000 (container root) and
+    `rootfs/home/app` to 201000 (container `app`), exactly mirroring the image.
+  setup: |
+    on_reset 'runc delete -f kl-ns >/dev/null 2>&1; rm -rf /srv/kl-ns /srv/kl-ns-data /srv/kl-ns.log'
+    runc delete -f kl-ns >/dev/null 2>&1
+    B=/srv/kl-ns
+    mkdir -p $B/rootfs /srv/kl-ns-data
+    docker rm -f kl-nssrc >/dev/null 2>&1
+    docker create --name kl-nssrc alpine:3.22 >/dev/null
+    docker export kl-nssrc | tar -x --numeric-owner -C $B/rootfs
+    docker rm -f kl-nssrc >/dev/null
+    echo 'app:x:1000:1000:app:/home/app:/bin/sh' >> $B/rootfs/etc/passwd
+    echo 'app:x:1000:' >> $B/rootfs/etc/group
+    mkdir -p $B/rootfs/home/app $B/rootfs/var/lib/worker
+    chown 1000:1000 $B/rootfs/home/app
+    chmod 755 $B/rootfs/home/app
+    cat > $B/rootfs/worker.sh <<'EOF'
+    #!/bin/sh
+    # the worker: root writes its state, the helper runs as app and writes its log
+    while true; do
+      date +%s > /var/lib/worker/state || exit 11
+      su app -s /bin/sh -c 'date +%s >> /home/app/worker.log' || exit 12
+      date +%s > /data/heartbeat || exit 13
+      sleep 2
+    done
+    EOF
+    chmod 755 $B/rootfs/worker.sh
+    (cd $B && runc spec >/dev/null)
+    jq '.process.terminal = false
+        | .process.capabilities |= with_entries(.value += ["CAP_SETUID", "CAP_SETGID"])
+        | .process.args = ["/worker.sh"]
+        | .root.readonly = false
+        | .hostname = "kl-ns"
+        | .mounts += [{"destination": "/data", "type": "bind", "source": "/srv/kl-ns-data", "options": ["rbind", "rw"]}]' \
+      $B/config.json > $B/c.tmp && mv $B/c.tmp $B/config.json
+    jq '.linux.namespaces += [{"type": "user"}]
+        | .linux.uidMappings = [{"containerID": 0, "hostID": 100000, "size": 1000}]
+        | .linux.gidMappings = [{"containerID": 0, "hostID": 100000, "size": 1000}]' \
+      $B/config.json > $B/config.userns.json
+    (cd $B && runc run -d kl-ns > /srv/kl-ns.log 2>&1 < /dev/null)
+    sleep 3
+    cat > $B/README.md <<'EOF'
+    The worker runs from this bundle with: cd /srv/kl-ns && sudo runc run -d kl-ns
+    config.userns.json is the user-namespace attempt. It didn't work.
+    EOF
+  check: |
+    B=/srv/kl-ns
+    cfg=$B/config.json
+    info "Part 1: The mapping"
+    check "config.json creates a user namespace" "jq -e '.linux.namespaces | map(.type) | index(\"user\")' $cfg"
+    check_eq "the uid mapping is 0 → 200000, 65536 ids" "$(jq -c '.linux.uidMappings' $cfg 2>/dev/null)" '[{"containerID":0,"hostID":200000,"size":65536}]'
+    check_eq "the gid mapping is 0 → 200000, 65536 ids" "$(jq -c '.linux.gidMappings' $cfg 2>/dev/null)" '[{"containerID":0,"hostID":200000,"size":65536}]'
+    check "kl-ns is running" "runc state kl-ns 2>/dev/null | jq -e '.status == \"running\"'"
+    pid=$(runc state kl-ns 2>/dev/null | jq -r .pid)
+    check_eq "its processes run as host uid 200000" "$(awk '/^Uid:/{print $2}' /proc/$pid/status 2>/dev/null)" 200000
+    check_eq "the kernel's map matches" "$(awk '{print $1, $2, $3}' /proc/$pid/uid_map 2>/dev/null)" "0 200000 65536"
+
+    info "Part 2: Files the container can own"
+    if [ -n "$pid" ] && [ "$pid" != null ]; then
+      s0=$(cat $B/rootfs/var/lib/worker/state 2>/dev/null); l0=$(wc -l < $B/rootfs/home/app/worker.log 2>/dev/null)
+      sleep 5
+      s1=$(cat $B/rootfs/var/lib/worker/state 2>/dev/null); l1=$(wc -l < $B/rootfs/home/app/worker.log 2>/dev/null)
+    fi
+    check "the worker keeps writing /var/lib/worker/state as root" "[ -n '$s1' ] && [ '$s1' != '$s0' ] && [ \"\$(stat -c %u $B/rootfs/var/lib/worker/state)\" = 200000 ]"
+    check "the helper keeps appending to worker.log as app" "[ -n '$l1' ] && [ '${l1:-0}' -gt '${l0:-0}' ] && [ \"\$(stat -c %u $B/rootfs/home/app/worker.log)\" = 201000 ]"
+    check "it keeps writing /data/heartbeat" "[ -f /srv/kl-ns-data/heartbeat ] && [ \$(( \$(date +%s) - \$(cat /srv/kl-ns-data/heartbeat) )) -le 6 ] && [ \"\$(stat -c %u /srv/kl-ns-data/heartbeat)\" = 200000 ]"
+    check_eq "the image's root files belong to container root" "$(stat -c %u:%g $B/rootfs/etc/passwd $B/rootfs/bin/busybox 2>/dev/null | sort -u | tr '\n' ' ')" "200000:200000 "
+    check_eq "/home/app still belongs to app, shifted" "$(stat -c %u:%g $B/rootfs/home/app 2>/dev/null)" "201000:201000"
+    check "symlinks were shifted too" "[ \"\$(stat -c %u $B/rootfs/bin/sh)\" = 200000 ]"
+    check_eq "nothing in the rootfs is owned outside the mapped range" "$(find $B/rootfs -xdev \( -uid -200000 -o -uid +265535 -o -gid -200000 -o -gid +265535 \) 2>/dev/null | wc -l)" 0
+    check_eq "nothing was made world-writable" "$(find $B/rootfs/var/lib/worker $B/rootfs/home/app /srv/kl-ns-data -perm -o+w ! -type l 2>/dev/null | wc -l)" 0
+  solve: |
+    cd /srv/kl-ns
+    sudo runc delete -f kl-ns 2>/dev/null
+    sudo jq '
+      .linux.namespaces |= (map(select(.type != "user")) + [{"type": "user"}])
+      | .linux.uidMappings = [{"containerID": 0, "hostID": 200000, "size": 65536}]
+      | .linux.gidMappings = [{"containerID": 0, "hostID": 200000, "size": 65536}]
+    ' config.json | sudo tee config.new >/dev/null && sudo mv config.new config.json
+    sudo python3 - <<'EOF'
+    import os
+    for d, dirs, files in os.walk("/srv/kl-ns/rootfs"):
+        for p in [d] + [os.path.join(d, n) for n in files + [x for x in dirs if os.path.islink(os.path.join(d, x))]]:
+            st = os.lstat(p)
+            if st.st_uid < 200000:
+                os.lchown(p, st.st_uid + 200000, st.st_gid + 200000)
+    EOF
+    sudo chown -R 200000:200000 /srv/kl-ns-data
+    sudo bash -c 'runc run -d kl-ns > /srv/kl-ns.log 2>&1 < /dev/null'
+    sleep 3

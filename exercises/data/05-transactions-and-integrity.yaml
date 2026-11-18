@@ -4,6 +4,8 @@ profile: docker
 order: 5
 exercises:
 
+# ===== Beginner =====
+
 - id: data-036
   title: The transfer that stopped halfway
   difficulty: 2
@@ -66,6 +68,197 @@ exercises:
     SQL
     { echo 'BEGIN;'; cat /lab/transfer.sql; echo 'COMMIT;'; } > /lab/transfer.new
     mv /lab/transfer.new /lab/transfer.sql
+
+# ===== Intermediate =====
+
+- id: data-039
+  title: Ten workers at the same moment
+  difficulty: 3
+  kind: fix
+  tags: [postgres, concurrency, lost-update, atomic, queue, skip-locked]
+  tutorial: |
+    **Concept.** Code that is correct for one client can be wrong for ten. The dangerous pattern is any gap between *looking at* a row and *changing* it: another session can act in that gap. Both fixes here close the gap by making the database do the look and the change in one statement.
+
+    **Lost updates.** Reading a value, changing it in the application and writing it back lets concurrent sessions overwrite each other's work. Doing the arithmetic inside the `UPDATE` makes the database apply every change in turn, because the row lock taken by `UPDATE` queues them up and each one sees the previous result.
+
+    **Claiming work.** Several workers can share one table as a queue if each claims a different row. `UPDATE ... RETURNING` claims a row and reports it in one statement. A subquery chooses the row, and that is where the race moves to. `SELECT ... FOR UPDATE` locks the chosen row, and `SKIP LOCKED` lets other workers pass over rows that are already taken instead of waiting.
+
+    **Read up on:**
+    - Lost updates — how read-modify-write races lose data
+    - `UPDATE ... SET col = col - 1` — expressions evaluated by the database
+    - Row locks taken by UPDATE, and what Read Committed sees when a row changed under it
+    - `SELECT ... FOR UPDATE SKIP LOCKED` — the queue-consumer locking clause
+    - `UPDATE ... RETURNING` — changing a row and reading it back in one statement
+    - Subqueries in `UPDATE ... WHERE id = (SELECT ...)` — selecting the row to claim
+  scenario: |
+    PostgreSQL runs in **`kl-pg`** (`docker exec -it kl-pg psql -U lab -d lab`).
+
+    The warehouse service runs fine in testing and misbehaves under real load. Both of the
+    scripts below get fired **ten at a time**.
+
+    ## Part 1: Ten buyers, one lost update
+
+    **`/lab/reserve.sh`** reserves one widget: it should lower `stock.qty` by exactly one.
+    Under load, buyers keep getting the same stock number and widgets are sold that were
+    never subtracted. The test fires ten reservations at the same moment and `qty` must
+    end up ten lower.
+
+    Fix the script so that concurrent reservations never overwrite each other.
+
+    ## Part 2: A job queue without double work
+
+    The table **`jobs`** has 20 rows with `status = 'pending'`. Write
+    **`/lab/claim.sh`**, the script each worker runs. One call must:
+
+    - claim the lowest-numbered pending job, set its status to `running`,
+    - print its `id` (and nothing else), or print nothing when the queue is empty.
+
+    Ten workers will call it at the same moment, and they must each end up with a
+    **different** job.
+  hints:
+    - "`reserve.sh` reads `qty` into a shell variable, waits, then writes back a value it computed itself. Anything that changed in between is lost, so let PostgreSQL do the subtraction inside the UPDATE statement."
+    - "You can test either script yourself by starting several copies with `&` and then `wait`."
+    - "One `UPDATE jobs SET status = 'running' WHERE id = (...) RETURNING id` can claim and report in one go. The subquery picks the next pending row, ordered by id, `LIMIT 1`."
+    - "Workers that hit the same row will wait on it or grab it twice. Look for a locking clause that skips rows other sessions hold."
+  solution: |
+    Replace the read-then-write with a single atomic statement, and claim jobs in one
+    statement that skips locked rows:
+
+    ```bash
+    cat > /lab/reserve.sh <<'EOF'
+    #!/bin/bash
+    docker exec kl-pg psql -h 127.0.0.1 -U lab -d lab -qAt -c "UPDATE stock SET qty = qty - 1 WHERE sku = 'widget'"
+    EOF
+
+    cat > /lab/claim.sh <<'EOF'
+    #!/bin/bash
+    docker exec kl-pg psql -h 127.0.0.1 -U lab -d lab -qAt -c "
+      UPDATE jobs SET status = 'running'
+       WHERE id = (SELECT id FROM jobs WHERE status = 'pending'
+                    ORDER BY id LIMIT 1 FOR UPDATE SKIP LOCKED)
+      RETURNING id"
+    EOF
+    ```
+  setup: |
+    pg_start
+
+    # --- part 1: Ten buyers, one lost update ---
+    pg_sql <<'SQL'
+    CREATE TABLE stock (sku text PRIMARY KEY, qty int NOT NULL);
+    INSERT INTO stock VALUES ('widget', 100);
+    SQL
+    lab_file /lab/reserve.sh 0755 <<'EOF'
+    #!/bin/bash
+    # reserve one widget
+    qty=$(docker exec kl-pg psql -h 127.0.0.1 -U lab -d lab -qAt -c "SELECT qty FROM stock WHERE sku = 'widget'")
+    sleep 0.3
+    docker exec kl-pg psql -h 127.0.0.1 -U lab -d lab -qAt -c "UPDATE stock SET qty = $((qty - 1)) WHERE sku = 'widget'"
+    EOF
+
+    # --- part 2: A job queue without double work ---
+    pg_sql <<'SQL'
+    CREATE TABLE jobs (id serial PRIMARY KEY, status text NOT NULL DEFAULT 'pending');
+    INSERT INTO jobs (status) SELECT 'pending' FROM generate_series(1, 20);
+    SQL
+  check: |
+    info "Part 1: Ten buyers, one lost update"
+    check "the script still exists" '[ -f /lab/reserve.sh ]'
+    check "the script lets the database do the arithmetic" 'grep -Eqi "qty *= *qty *- *1" /lab/reserve.sh'
+    pg_sql "UPDATE stock SET qty = 100 WHERE sku = 'widget'" >/dev/null
+    for i in $(seq 1 10); do bash /lab/reserve.sh >/dev/null 2>&1 & done
+    wait
+    check_eq "ten reservations lowered the stock by ten" "$(pg_sql "SELECT qty FROM stock WHERE sku = 'widget'")" 90
+
+    info "Part 2: A job queue without double work"
+    check "claim.sh exists" '[ -f /lab/claim.sh ]'
+    pg_sql "UPDATE jobs SET status = 'pending'" >/dev/null
+    rm -f "$KL_STATE"/claim.*
+    for i in $(seq 1 10); do bash /lab/claim.sh >"$KL_STATE/claim.$i" 2>&1 & done
+    wait
+    ids=$(cat "$KL_STATE"/claim.* 2>/dev/null | grep -E '^[0-9]+$' | sort -u | wc -l)
+    check_eq "ten workers claimed ten different jobs" "$ids" 10
+    check_eq "ten jobs are now running" "$(pg_sql "SELECT count(*) FROM jobs WHERE status = 'running'")" 10
+    check_eq "ten jobs are still pending" "$(pg_sql "SELECT count(*) FROM jobs WHERE status = 'pending'")" 10
+  solve: |
+    # --- part 1: Ten buyers, one lost update ---
+    cat > /lab/reserve.sh <<'EOF'
+    #!/bin/bash
+    docker exec kl-pg psql -h 127.0.0.1 -U lab -d lab -qAt -c "UPDATE stock SET qty = qty - 1 WHERE sku = 'widget'"
+    EOF
+
+    # --- part 2: A job queue without double work ---
+    cat > /lab/claim.sh <<'EOF'
+    #!/bin/bash
+    docker exec kl-pg psql -h 127.0.0.1 -U lab -d lab -qAt -c "
+      UPDATE jobs SET status = 'running'
+       WHERE id = (SELECT id FROM jobs WHERE status = 'pending'
+                    ORDER BY id LIMIT 1 FOR UPDATE SKIP LOCKED)
+      RETURNING id"
+    EOF
+
+- id: data-045
+  title: Replayed events, counted once
+  difficulty: 3
+  kind: build
+  tags: [postgres, idempotency, on-conflict, import]
+  tutorial: |
+    **Concept.** Message systems often deliver an event more than once. A load is idempotent when running it twice gives the same result as running it once. A unique key plus `ON CONFLICT` lets the database drop the repeats.
+
+    **Read up on:**
+    - `INSERT ... ON CONFLICT DO NOTHING` — skipping rows that violate a unique key
+    - `COPY ... FROM STDIN` and staging tables — bulk loading before merging
+    - Temporary tables — scratch tables that live for one session
+    - Idempotency keys — why retries need a stable identifier
+  scenario: |
+    PostgreSQL runs in **`kl-pg`** (`docker exec -it kl-pg psql -U lab -d lab`).
+
+    **`/lab/events.csv`** holds payment events as `key,amount` lines. The broker retried
+    some deliveries, so 20 of the keys appear twice with the same amount. The table
+    **`payments`** (primary key on `key`) is empty.
+
+    Load every event into `payments` so each key is stored **exactly once**. A plain
+    `COPY` into the table fails on the first repeat.
+  hints:
+    - "The file is on the VM and the database in the container. Stream it in with `docker exec -i`."
+    - "Load into a temporary staging table first, where duplicates do not matter."
+    - "Then `INSERT ... SELECT` into `payments` and tell PostgreSQL what to do on a key conflict."
+  solution: |
+    Stage the file, then merge with `ON CONFLICT DO NOTHING`:
+
+    ```bash
+    {
+      echo "CREATE TEMP TABLE stg (key text, amount int);"
+      echo "COPY stg FROM STDIN CSV;"
+      cat /lab/events.csv
+      echo '\.'
+      echo "INSERT INTO payments SELECT * FROM stg ON CONFLICT (key) DO NOTHING;"
+    } | docker exec -i kl-pg psql -U lab -d lab
+    ```
+  setup: |
+    pg_start
+    pg_sql <<'SQL'
+    CREATE TABLE payments (key text PRIMARY KEY, amount int NOT NULL);
+    SQL
+    {
+      for i in $(seq 1 80); do echo "pay-$i,$(( (i * 7) % 50 + 1 ))"; done
+      for i in $(seq 1 20); do echo "pay-$i,$(( (i * 7) % 50 + 1 ))"; done
+    } | lab_file /lab/events.csv
+    s=0
+    for i in $(seq 1 80); do s=$(( s + (i * 7) % 50 + 1 )); done
+    echo "$s" > "$KL_STATE/answer"
+  check: |
+    check_eq "80 distinct payments are stored" "$(pg_sql 'SELECT count(*) FROM payments')" 80
+    check_eq "the amounts add up to the expected total" "$(pg_sql 'SELECT coalesce(sum(amount), 0) FROM payments')" "$(cat "$KL_STATE/answer")"
+  solve: |
+    {
+      echo "CREATE TEMP TABLE stg (key text, amount int);"
+      echo "COPY stg FROM STDIN CSV;"
+      cat /lab/events.csv
+      echo '\.'
+      echo "INSERT INTO payments SELECT * FROM stg ON CONFLICT (key) DO NOTHING;"
+    } | docker exec -i kl-pg psql -h 127.0.0.1 -U lab -d lab -qAt
+
+# ===== Advanced =====
 
 - id: data-037
   title: Teach the database to say no
@@ -210,131 +403,6 @@ exercises:
     CREATE EXTENSION IF NOT EXISTS btree_gist;
     ALTER TABLE bookings ADD CONSTRAINT no_double_booking EXCLUDE USING gist (room WITH =, during WITH &&);
     SQL
-
-- id: data-039
-  title: Ten workers at the same moment
-  difficulty: 3
-  kind: fix
-  tags: [postgres, concurrency, lost-update, atomic, queue, skip-locked]
-  tutorial: |
-    **Concept.** Code that is correct for one client can be wrong for ten. The dangerous pattern is any gap between *looking at* a row and *changing* it: another session can act in that gap. Both fixes here close the gap by making the database do the look and the change in one statement.
-
-    **Lost updates.** Reading a value, changing it in the application and writing it back lets concurrent sessions overwrite each other's work. Doing the arithmetic inside the `UPDATE` makes the database apply every change in turn, because the row lock taken by `UPDATE` queues them up and each one sees the previous result.
-
-    **Claiming work.** Several workers can share one table as a queue if each claims a different row. `UPDATE ... RETURNING` claims a row and reports it in one statement. A subquery chooses the row, and that is where the race moves to. `SELECT ... FOR UPDATE` locks the chosen row, and `SKIP LOCKED` lets other workers pass over rows that are already taken instead of waiting.
-
-    **Read up on:**
-    - Lost updates — how read-modify-write races lose data
-    - `UPDATE ... SET col = col - 1` — expressions evaluated by the database
-    - Row locks taken by UPDATE, and what Read Committed sees when a row changed under it
-    - `SELECT ... FOR UPDATE SKIP LOCKED` — the queue-consumer locking clause
-    - `UPDATE ... RETURNING` — changing a row and reading it back in one statement
-    - Subqueries in `UPDATE ... WHERE id = (SELECT ...)` — selecting the row to claim
-  scenario: |
-    PostgreSQL runs in **`kl-pg`** (`docker exec -it kl-pg psql -U lab -d lab`).
-
-    The warehouse service runs fine in testing and misbehaves under real load. Both of the
-    scripts below get fired **ten at a time**.
-
-    ## Part 1: Ten buyers, one lost update
-
-    **`/lab/reserve.sh`** reserves one widget: it should lower `stock.qty` by exactly one.
-    Under load, buyers keep getting the same stock number and widgets are sold that were
-    never subtracted. The test fires ten reservations at the same moment and `qty` must
-    end up ten lower.
-
-    Fix the script so that concurrent reservations never overwrite each other.
-
-    ## Part 2: A job queue without double work
-
-    The table **`jobs`** has 20 rows with `status = 'pending'`. Write
-    **`/lab/claim.sh`**, the script each worker runs. One call must:
-
-    - claim the lowest-numbered pending job, set its status to `running`,
-    - print its `id` (and nothing else), or print nothing when the queue is empty.
-
-    Ten workers will call it at the same moment, and they must each end up with a
-    **different** job.
-  hints:
-    - "`reserve.sh` reads `qty` into a shell variable, waits, then writes back a value it computed itself. Anything that changed in between is lost, so let PostgreSQL do the subtraction inside the UPDATE statement."
-    - "You can test either script yourself by starting several copies with `&` and then `wait`."
-    - "One `UPDATE jobs SET status = 'running' WHERE id = (...) RETURNING id` can claim and report in one go. The subquery picks the next pending row, ordered by id, `LIMIT 1`."
-    - "Workers that hit the same row will wait on it or grab it twice. Look for a locking clause that skips rows other sessions hold."
-  solution: |
-    Replace the read-then-write with a single atomic statement, and claim jobs in one
-    statement that skips locked rows:
-
-    ```bash
-    cat > /lab/reserve.sh <<'EOF'
-    #!/bin/bash
-    docker exec kl-pg psql -h 127.0.0.1 -U lab -d lab -qAt -c "UPDATE stock SET qty = qty - 1 WHERE sku = 'widget'"
-    EOF
-
-    cat > /lab/claim.sh <<'EOF'
-    #!/bin/bash
-    docker exec kl-pg psql -h 127.0.0.1 -U lab -d lab -qAt -c "
-      UPDATE jobs SET status = 'running'
-       WHERE id = (SELECT id FROM jobs WHERE status = 'pending'
-                    ORDER BY id LIMIT 1 FOR UPDATE SKIP LOCKED)
-      RETURNING id"
-    EOF
-    ```
-  setup: |
-    pg_start
-
-    # --- part 1: Ten buyers, one lost update ---
-    pg_sql <<'SQL'
-    CREATE TABLE stock (sku text PRIMARY KEY, qty int NOT NULL);
-    INSERT INTO stock VALUES ('widget', 100);
-    SQL
-    lab_file /lab/reserve.sh 0755 <<'EOF'
-    #!/bin/bash
-    # reserve one widget
-    qty=$(docker exec kl-pg psql -h 127.0.0.1 -U lab -d lab -qAt -c "SELECT qty FROM stock WHERE sku = 'widget'")
-    sleep 0.3
-    docker exec kl-pg psql -h 127.0.0.1 -U lab -d lab -qAt -c "UPDATE stock SET qty = $((qty - 1)) WHERE sku = 'widget'"
-    EOF
-
-    # --- part 2: A job queue without double work ---
-    pg_sql <<'SQL'
-    CREATE TABLE jobs (id serial PRIMARY KEY, status text NOT NULL DEFAULT 'pending');
-    INSERT INTO jobs (status) SELECT 'pending' FROM generate_series(1, 20);
-    SQL
-  check: |
-    info "Part 1: Ten buyers, one lost update"
-    check "the script still exists" '[ -f /lab/reserve.sh ]'
-    check "the script lets the database do the arithmetic" 'grep -Eqi "qty *= *qty *- *1" /lab/reserve.sh'
-    pg_sql "UPDATE stock SET qty = 100 WHERE sku = 'widget'" >/dev/null
-    for i in $(seq 1 10); do bash /lab/reserve.sh >/dev/null 2>&1 & done
-    wait
-    check_eq "ten reservations lowered the stock by ten" "$(pg_sql "SELECT qty FROM stock WHERE sku = 'widget'")" 90
-
-    info "Part 2: A job queue without double work"
-    check "claim.sh exists" '[ -f /lab/claim.sh ]'
-    pg_sql "UPDATE jobs SET status = 'pending'" >/dev/null
-    rm -f "$KL_STATE"/claim.*
-    for i in $(seq 1 10); do bash /lab/claim.sh >"$KL_STATE/claim.$i" 2>&1 & done
-    wait
-    ids=$(cat "$KL_STATE"/claim.* 2>/dev/null | grep -E '^[0-9]+$' | sort -u | wc -l)
-    check_eq "ten workers claimed ten different jobs" "$ids" 10
-    check_eq "ten jobs are now running" "$(pg_sql "SELECT count(*) FROM jobs WHERE status = 'running'")" 10
-    check_eq "ten jobs are still pending" "$(pg_sql "SELECT count(*) FROM jobs WHERE status = 'pending'")" 10
-  solve: |
-    # --- part 1: Ten buyers, one lost update ---
-    cat > /lab/reserve.sh <<'EOF'
-    #!/bin/bash
-    docker exec kl-pg psql -h 127.0.0.1 -U lab -d lab -qAt -c "UPDATE stock SET qty = qty - 1 WHERE sku = 'widget'"
-    EOF
-
-    # --- part 2: A job queue without double work ---
-    cat > /lab/claim.sh <<'EOF'
-    #!/bin/bash
-    docker exec kl-pg psql -h 127.0.0.1 -U lab -d lab -qAt -c "
-      UPDATE jobs SET status = 'running'
-       WHERE id = (SELECT id FROM jobs WHERE status = 'pending'
-                    ORDER BY id LIMIT 1 FOR UPDATE SKIP LOCKED)
-      RETURNING id"
-    EOF
 
 - id: data-041
   title: Locks that wait forever, locks that deadlock
@@ -554,65 +622,3 @@ exercises:
     \endif
     COMMIT;
     EOF
-
-- id: data-045
-  title: Replayed events, counted once
-  difficulty: 3
-  kind: build
-  tags: [postgres, idempotency, on-conflict, import]
-  tutorial: |
-    **Concept.** Message systems often deliver an event more than once. A load is idempotent when running it twice gives the same result as running it once. A unique key plus `ON CONFLICT` lets the database drop the repeats.
-
-    **Read up on:**
-    - `INSERT ... ON CONFLICT DO NOTHING` — skipping rows that violate a unique key
-    - `COPY ... FROM STDIN` and staging tables — bulk loading before merging
-    - Temporary tables — scratch tables that live for one session
-    - Idempotency keys — why retries need a stable identifier
-  scenario: |
-    PostgreSQL runs in **`kl-pg`** (`docker exec -it kl-pg psql -U lab -d lab`).
-
-    **`/lab/events.csv`** holds payment events as `key,amount` lines. The broker retried
-    some deliveries, so 20 of the keys appear twice with the same amount. The table
-    **`payments`** (primary key on `key`) is empty.
-
-    Load every event into `payments` so each key is stored **exactly once**. A plain
-    `COPY` into the table fails on the first repeat.
-  hints:
-    - "The file is on the VM and the database in the container. Stream it in with `docker exec -i`."
-    - "Load into a temporary staging table first, where duplicates do not matter."
-    - "Then `INSERT ... SELECT` into `payments` and tell PostgreSQL what to do on a key conflict."
-  solution: |
-    Stage the file, then merge with `ON CONFLICT DO NOTHING`:
-
-    ```bash
-    {
-      echo "CREATE TEMP TABLE stg (key text, amount int);"
-      echo "COPY stg FROM STDIN CSV;"
-      cat /lab/events.csv
-      echo '\.'
-      echo "INSERT INTO payments SELECT * FROM stg ON CONFLICT (key) DO NOTHING;"
-    } | docker exec -i kl-pg psql -U lab -d lab
-    ```
-  setup: |
-    pg_start
-    pg_sql <<'SQL'
-    CREATE TABLE payments (key text PRIMARY KEY, amount int NOT NULL);
-    SQL
-    {
-      for i in $(seq 1 80); do echo "pay-$i,$(( (i * 7) % 50 + 1 ))"; done
-      for i in $(seq 1 20); do echo "pay-$i,$(( (i * 7) % 50 + 1 ))"; done
-    } | lab_file /lab/events.csv
-    s=0
-    for i in $(seq 1 80); do s=$(( s + (i * 7) % 50 + 1 )); done
-    echo "$s" > "$KL_STATE/answer"
-  check: |
-    check_eq "80 distinct payments are stored" "$(pg_sql 'SELECT count(*) FROM payments')" 80
-    check_eq "the amounts add up to the expected total" "$(pg_sql 'SELECT coalesce(sum(amount), 0) FROM payments')" "$(cat "$KL_STATE/answer")"
-  solve: |
-    {
-      echo "CREATE TEMP TABLE stg (key text, amount int);"
-      echo "COPY stg FROM STDIN CSV;"
-      cat /lab/events.csv
-      echo '\.'
-      echo "INSERT INTO payments SELECT * FROM stg ON CONFLICT (key) DO NOTHING;"
-    } | docker exec -i kl-pg psql -h 127.0.0.1 -U lab -d lab -qAt

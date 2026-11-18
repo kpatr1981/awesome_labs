@@ -4,6 +4,8 @@ profile: k8s
 order: 14
 exercises:
 
+# ===== Intermediate =====
+
 - id: k8s-261
   title: Back up etcd and add a worker
   difficulty: 3
@@ -72,6 +74,531 @@ exercises:
     H=$(openssl x509 -pubkey -in /etc/kubernetes/pki/ca.crt | openssl rsa -pubin -outform der 2>/dev/null | openssl dgst -sha256 -hex | sed 's/^.* //')
     echo "sha256:$H" > /lab/ca-hash.txt
     sudo kubeadm token create --ttl 2h --print-join-command > /lab/join.sh
+
+- id: k8s-266
+  title: Renew the control-plane certificates
+  difficulty: 3
+  kind: build
+  tags: [certificates, kubeadm, renewal]
+  tutorial: |
+    **Concept.** kubeadm certificates expire, and renewing the files does not affect running components, since static pods read certificates only at startup. Client kubeconfigs holding embedded certificates also need refreshing.
+
+    **Read up on:**
+    - `kubeadm certs renew --help` — renewing all or specific certs
+    - `kubeadm certs check-expiration` — before and after
+    - `crictl stop` / `crictl ps` — restart static pod containers
+    - `/etc/kubernetes/admin.conf` and `~/.kube/config` — copy for your user
+  scenario: |
+    Policy says control-plane certificates must be renewed every 6 months. Renew **all**
+    kubeadm-managed certificates and make sure the **running API server** actually uses
+    the new one (static pods only read certificates at start-up).
+
+    Also refresh **your** kubeconfig: `admin.conf` gets a new client certificate too.
+  hints:
+    - "`sudo kubeadm certs renew all`"
+    - "Restart the control-plane static pods: e.g. move their manifests out of `/etc/kubernetes/manifests` for ~20s and back, or stop their containers with `crictl`."
+    - "`echo | openssl s_client -connect 127.0.0.1:6443 2>/dev/null | openssl x509 -noout -dates` shows what the API server serves."
+  solution: |
+    ```bash
+    sudo kubeadm certs renew all
+    sudo kubeadm certs check-expiration
+    for c in kube-apiserver kube-controller-manager kube-scheduler etcd; do
+      sudo crictl stop $(sudo crictl ps --name $c -q)
+    done
+    sudo cp /etc/kubernetes/admin.conf ~/.kube/config && sudo chown $(id -u):$(id -g) ~/.kube/config
+    echo | openssl s_client -connect 127.0.0.1:6443 2>/dev/null | openssl x509 -noout -startdate
+    ```
+  setup: |
+    fp() { openssl x509 -noout -fingerprint -sha256 | cut -d= -f2; }
+    fp < /etc/kubernetes/pki/apiserver.crt > $KL_STATE/answer
+    sed -n 's/.*client-certificate-data: //p' /etc/kubernetes/admin.conf | base64 -d | fp >> $KL_STATE/answer
+  check: |
+    fp() { openssl x509 -noout -fingerprint -sha256 2>/dev/null | cut -d= -f2; }
+    old_api=$(sed -n 1p $KL_STATE/answer); old_admin=$(sed -n 2p $KL_STATE/answer)
+    new_api=$(fp < /etc/kubernetes/pki/apiserver.crt)
+    check "apiserver.crt was renewed" "[ -n '$new_api' ] && [ '$new_api' != '$old_api' ]"
+    served=$(echo | openssl s_client -connect 127.0.0.1:6443 2>/dev/null | fp)
+    check "the running API server serves the new certificate" "[ '$served' = '$new_api' ] && [ '$served' != '$old_api' ]"
+    check "your kubeconfig works" 'as_user "kubectl get nodes"'
+    mine=$(sed -n 's/.*client-certificate-data: //p' "$(lab_home)/.kube/config" | base64 -d | fp)
+    check "your kubeconfig has the renewed admin client cert" "[ -n '$mine' ] && [ '$mine' != '$old_admin' ]"
+  solve: |
+    sudo kubeadm certs renew all
+    for c in kube-apiserver kube-controller-manager kube-scheduler etcd; do sudo crictl stop $(sudo crictl ps --name $c -q) >/dev/null; done
+    sudo cp /etc/kubernetes/admin.conf ~/.kube/config && sudo chown $(id -u):$(id -g) ~/.kube/config
+    sleep 20
+    for i in $(seq 1 60); do kubectl get --raw=/readyz >/dev/null 2>&1 && break; sleep 3; done
+
+- id: k8s-269
+  title: Cluster networking & kubeconfig admin
+  difficulty: 3
+  kind: build
+  tags: [kubeconfig, contexts, kubeadm, networking, cidr, coredns, dns, stub-domain]
+  tutorial: |
+    **Concept.** Three small admin chores that all revolve around "where does the cluster say things live". (1) A **kubeconfig** holds clusters, users and contexts; several files can be merged through the `KUBECONFIG` environment variable, and kubectl can flatten the result into one portable file. (2) **Pod and service networks** are address ranges chosen at cluster setup and kept in cluster configuration; kubeadm stores its ClusterConfiguration in a ConfigMap in kube-system. (3) **CoreDNS** is configured by a Corefile in a ConfigMap, made of server blocks keyed by zone; a block can send queries for one zone to specific upstream servers, and CoreDNS must reload afterwards.
+
+    **Read up on:**
+    - `kubectl config view --help` — `--flatten` and `--minify`
+    - `kubectl config get-contexts` and `kubectl config current-context`
+    - `KUBECONFIG` env var — colon-separated paths and merge order (Kubernetes docs: Organizing Cluster Access)
+    - `kubectl get cm kubeadm-config -n kube-system -o yaml`
+    - `/etc/kubernetes/manifests/kube-apiserver.yaml` and `kube-controller-manager.yaml` — related flags
+    - `kubectl get cm coredns -n kube-system -o yaml` — the current Corefile
+    - CoreDNS docs: plugins `forward`, `cache` and `errors`
+    - `kubectl rollout restart --help`; `kubectl logs -n kube-system -l k8s-app=kube-dns` — syntax errors
+  scenario: |
+    You are taking over a cluster and need to document and adjust how it is wired.
+
+    1. A colleague sent you **`/lab/staging.kubeconfig`** for the staging cluster. Combine
+       it with your current config into **`/lab/merged.kubeconfig`** so that both contexts
+       are available from one file, with **your current cluster's context as the current
+       context**. The merged file must work on its own.
+    2. Write the cluster's **pod network CIDR** to **`/lab/pod-cidr.txt`** and its
+       **service CIDR** to **`/lab/service-cidr.txt`** (e.g. `10.244.0.0/16`).
+    3. Names under **`corp.internal`** must be resolved by the corporate DNS servers
+       **`10.0.0.53`** and **`10.0.0.54`**, not by the upstream resolvers. Add a dedicated
+       **server block** for that zone to CoreDNS's Corefile and roll CoreDNS.
+  hints:
+    - "`KUBECONFIG=a:b kubectl config view --flatten > merged` — the first file's current-context wins."
+    - "kubeadm stores its ClusterConfiguration in the ConfigMap `kubeadm-config` in `kube-system` (`networking.podSubnet` / `serviceSubnet`). Or: `kube-controller-manager --cluster-cidr` and `kube-apiserver --service-cluster-ip-range`."
+    - "Add to the Corefile: `corp.internal:53 { errors\\n cache 30\\n forward . 10.0.0.53 10.0.0.54 }` as its own block, then `kubectl -n kube-system rollout restart deploy coredns`."
+  solution: |
+    ```bash
+    # 1. merged kubeconfig
+    KUBECONFIG=~/.kube/config:/lab/staging.kubeconfig kubectl config view --flatten > /lab/merged.kubeconfig
+    kubectl --kubeconfig /lab/merged.kubeconfig config get-contexts
+    # 2. CIDRs
+    cc=$(kubectl -n kube-system get cm kubeadm-config -o jsonpath='{.data.ClusterConfiguration}')
+    awk '/podSubnet/{print $2}' <<<"$cc" > /lab/pod-cidr.txt
+    awk '/serviceSubnet/{print $2}' <<<"$cc" > /lab/service-cidr.txt
+    # 3. CoreDNS
+    kubectl -n kube-system edit cm coredns
+    ```
+    ```text
+    corp.internal:53 {
+        errors
+        cache 30
+        forward . 10.0.0.53 10.0.0.54
+    }
+    ```
+    ```bash
+    kubectl -n kube-system rollout restart deploy coredns
+    ```
+  setup: |
+    cat > /lab/staging.kubeconfig <<'EOF'
+    apiVersion: v1
+    kind: Config
+    clusters:
+    - name: staging
+      cluster: {server: "https://staging.example.com:6443", insecure-skip-tls-verify: true}
+    users:
+    - name: staging-ci
+      user: {token: "stg-token-not-real"}
+    contexts:
+    - name: ci@staging
+      context: {cluster: staging, user: staging-ci, namespace: ci}
+    current-context: ci@staging
+    EOF
+    chown $(lab_user): /lab/staging.kubeconfig
+    on_reset 'kl_restore_obj configmap coredns; kubectl -n kube-system rollout restart deploy coredns'
+  check: |
+    K=/lab/merged.kubeconfig
+    mine=$(as_user 'kubectl config current-context')
+    check "contains both contexts" "kubectl --kubeconfig $K config get-contexts -o name 2>/dev/null | grep -qx ci@staging && kubectl --kubeconfig $K config get-contexts -o name | grep -qx '$mine'"
+    check_eq "current context is yours" "$(kubectl --kubeconfig $K config current-context 2>/dev/null)" "$mine"
+    check "self-contained (works on its own)" "KUBECONFIG= kubectl --kubeconfig $K get nodes"
+    cc=$(kubectl -n kube-system get cm kubeadm-config -o jsonpath='{.data.ClusterConfiguration}')
+    check_eq "pod CIDR" "$(tr -d '[:space:]' < /lab/pod-cidr.txt 2>/dev/null)" "$(awk '/podSubnet/{print $2}' <<<"$cc")"
+    check_eq "service CIDR" "$(tr -d '[:space:]' < /lab/service-cidr.txt 2>/dev/null)" "$(awk '/serviceSubnet/{print $2}' <<<"$cc")"
+    cf=$(kubectl -n kube-system get cm coredns -o jsonpath='{.data.Corefile}')
+    check "corp.internal server block" 'grep -q "^corp.internal:53 *{" <<<"$cf"'
+    check "forwards to both servers" 'awk "/^corp.internal:53/,/^}/" <<<"$cf" | grep -q "forward . 10.0.0.53 10.0.0.54"'
+    wait_deploy kube-system coredns 90
+    check "coredns healthy" 'deploy_ready kube-system coredns'
+  solve: |
+    KUBECONFIG=$HOME/.kube/config:/lab/staging.kubeconfig kubectl config view --flatten > /lab/merged.kubeconfig
+    cc=$(kubectl -n kube-system get cm kubeadm-config -o jsonpath='{.data.ClusterConfiguration}')
+    awk '/podSubnet/{print $2}' <<<"$cc" > /lab/pod-cidr.txt
+    awk '/serviceSubnet/{print $2}' <<<"$cc" > /lab/service-cidr.txt
+    kubectl -n kube-system get cm coredns -o json | jq '.data.Corefile += "corp.internal:53 {\n    errors\n    cache 30\n    forward . 10.0.0.53 10.0.0.54\n}\n"' | kubectl replace -f -
+    kubectl -n kube-system rollout restart deploy coredns
+
+- id: k8s-273
+  title: A bigger NodePort range
+  difficulty: 3
+  kind: build
+  tags: [kube-apiserver, nodeport, flags]
+  tutorial: |
+    **Concept.** The API server restricts NodePort numbers to a configured range. Extending it needs a flag change in the API server's static pod manifest, after which the API restarts.
+
+    **Read up on:**
+    - `/etc/kubernetes/manifests/kube-apiserver.yaml` — existing flags
+    - Kubernetes docs: kube-apiserver reference, `--service-node-port-range`
+    - `crictl ps` and `kubectl get nodes` — wait for the API server to return
+    - `kubectl create service nodeport --help` — options for ports
+  scenario: |
+    A partner's legacy load balancer is hard-wired to NodePort **33333**, outside the
+    default range (30000–32767). Extend the API server's NodePort range to
+    **30000-33999**, then create a NodePort service **`partner`** in namespace
+    **`edge`** (selector `app=partner`, port 80) with node port **33333**.
+  hints:
+    - "API server flag `--service-node-port-range`."
+  solution: |
+    ```bash
+    sudo sed -i 's|    - kube-apiserver$|    - kube-apiserver\n    - --service-node-port-range=30000-33999|' /etc/kubernetes/manifests/kube-apiserver.yaml
+    # wait for the API server to restart
+    kubectl create service nodeport partner -n edge --tcp=80:80 --node-port=33333
+    ```
+  setup: |
+    k_ns edge
+  check: |
+    eventually 120 'api_up'
+    check "apiserver flag set" 'grep -q -- "--service-node-port-range=30000-33999" /etc/kubernetes/manifests/kube-apiserver.yaml'
+    check_eq "partner nodePort" "$(kj -n edge svc partner '{.spec.ports[0].nodePort}')" "33333"
+  solve: |
+    sudo sed -i 's|^    - kube-apiserver$|    - kube-apiserver\n    - --service-node-port-range=30000-33999|' /etc/kubernetes/manifests/kube-apiserver.yaml
+    sleep 30
+    for i in $(seq 1 60); do kubectl get --raw=/readyz >/dev/null 2>&1 && break; sleep 3; done
+    kubectl create service nodeport partner -n edge --tcp=80:80 --node-port=33333
+
+- id: k8s-276
+  title: Back up a namespace's manifests
+  difficulty: 3
+  kind: build
+  tags: [backup, yaml, restore]
+  tutorial: |
+    **Concept.** A re-appliable backup contains only the declared state, not live state like status, UIDs and resource versions. Exports must be cleaned up before reapplying and some auto-generated objects excluded.
+
+    **Read up on:**
+    - `kubectl get -o json` with several kinds (`kubectl get deploy,svc,cm`) — list output
+    - `jq` (`man jq`) — `del()` and `select()` to clean fields
+    - `kubectl apply -f --help`
+    - `kubectl get all -n NS` — verify after restoring
+  scenario: |
+    Before decommissioning namespace **`crm`**, export its **Deployments, Services and
+    ConfigMaps** (except the automatic `kube-root-ca.crt`) as clean, re-appliable YAML to
+    **`/lab/crm-backup.yaml`**. Then delete the namespace, and **restore** it from your file
+    — everything must come back and run.
+  hints:
+    - "`kubectl get deploy,svc,cm -n crm -o yaml` includes server-side fields (uid, resourceVersion, status, clusterIP...) that block re-creation. Strip them with `jq`/`yq` or `kubectl-neat`."
+    - "Recreate the namespace before applying."
+  solution: |
+    ```bash
+    kubectl get deploy,svc,cm -n crm -o json | jq '.items |= map(select(.metadata.name != "kube-root-ca.crt")
+      | del(.status, .metadata.uid, .metadata.resourceVersion, .metadata.creationTimestamp, .metadata.generation,
+            .metadata.managedFields, .metadata.annotations["deployment.kubernetes.io/revision"],
+            .spec.clusterIP, .spec.clusterIPs))' > /lab/crm-backup.yaml
+    kubectl delete ns crm
+    kubectl create ns crm
+    kubectl apply -f /lab/crm-backup.yaml
+    ```
+    (JSON is valid YAML.)
+  setup: |
+    k_ns crm
+    kubectl -n crm create configmap crm-settings --from-literal=region=eu >/dev/null
+    kubectl -n crm create deployment crm-api --image=traefik/whoami:v1.10 --replicas=2 >/dev/null
+    kubectl -n crm expose deploy crm-api --port=80 >/dev/null
+    kubectl -n crm create deployment crm-worker --image=busybox:1.37 -- sleep infinity >/dev/null
+    kj ns crm '{.metadata.uid}' > $KL_STATE/answer
+  check: |
+    check "backup file exists" 'test -s /lab/crm-backup.yaml'
+    check "namespace was recreated" '[ "$(kj ns crm "{.metadata.uid}")" != "$(cat $KL_STATE/answer)" ] && k_exists ns crm'
+    check_eq "configmap restored" "$(kj -n crm cm crm-settings '{.data.region}')" "eu"
+    wait_deploy crm crm-api 90; wait_deploy crm crm-worker 90
+    check "deployments running" 'deploy_ready crm crm-api && deploy_ready crm crm-worker'
+    check "service restored with endpoints" 'k_curl crm http://crm-api | grep -q Hostname'
+  solve: |
+    kubectl get deploy,svc,cm -n crm -o json | jq '.items |= map(select(.metadata.name != "kube-root-ca.crt") | del(.status, .metadata.uid, .metadata.resourceVersion, .metadata.creationTimestamp, .metadata.generation, .metadata.managedFields, .metadata.annotations["deployment.kubernetes.io/revision"], .spec.clusterIP, .spec.clusterIPs))' > /lab/crm-backup.yaml
+    kubectl delete ns crm --wait=true
+    kubectl create ns crm
+    kubectl apply -f /lab/crm-backup.yaml
+
+# ===== Advanced =====
+
+- id: k8s-267
+  title: Turn on audit logging
+  difficulty: 4
+  kind: build
+  tags: [audit, kube-apiserver, security]
+  tutorial: |
+    **Concept.** The API server can record who did what to which object. An audit policy lists rules by level (None, Metadata, Request, RequestResponse), and the first matching rule wins. The API server needs the policy and log path through flags and mounted volumes.
+
+    **Read up on:**
+    - Kubernetes docs: Auditing, policy format and levels
+    - `/etc/kubernetes/manifests/kube-apiserver.yaml` — where API server flags live
+    - Static pod `volumes` and `volumeMounts` — paths must be visible inside the container
+  scenario: |
+    Compliance requires an **audit trail**. Configure the API server to write audit
+    events to **`/var/log/kubernetes/audit/audit.log`** using the policy
+    **`/etc/kubernetes/audit/policy.yaml`** (write it), which must:
+
+    - log **Secret** and **ConfigMap** access at level **`Metadata`** (no payloads!)
+    - log everything else at level **`None`**
+
+    Keep **7** days of logs (`--audit-log-maxage`).
+  hints:
+    - "Policy: `apiVersion: audit.k8s.io/v1`, `kind: Policy`, `rules: [{level: Metadata, resources: [{group: \"\", resources: [secrets, configmaps]}]}, {level: None}]`"
+    - "apiserver flags: `--audit-policy-file`, `--audit-log-path`, `--audit-log-maxage`; and **hostPath volumes + volumeMounts** for both the policy file and the log directory."
+  solution: |
+    ```yaml
+    # /etc/kubernetes/audit/policy.yaml
+    apiVersion: audit.k8s.io/v1
+    kind: Policy
+    rules:
+    - level: Metadata
+      resources:
+      - group: ""
+        resources: [secrets, configmaps]
+    - level: None
+    ```
+    In `/etc/kubernetes/manifests/kube-apiserver.yaml`:
+    ```yaml
+        - --audit-policy-file=/etc/kubernetes/audit/policy.yaml
+        - --audit-log-path=/var/log/kubernetes/audit/audit.log
+        - --audit-log-maxage=7
+    ...
+        volumeMounts:
+        - {name: audit-policy, mountPath: /etc/kubernetes/audit, readOnly: true}
+        - {name: audit-log, mountPath: /var/log/kubernetes/audit}
+    ...
+      volumes:
+      - {name: audit-policy, hostPath: {path: /etc/kubernetes/audit, type: DirectoryOrCreate}}
+      - {name: audit-log, hostPath: {path: /var/log/kubernetes/audit, type: DirectoryOrCreate}}
+    ```
+  setup: |
+    on_reset 'rm -rf /var/log/kubernetes/audit'
+  check: |
+    eventually 120 'api_up'
+    kubectl -n default get secret kl-audit-probe >/dev/null 2>&1; kubectl -n default get cm kube-root-ca.crt >/dev/null 2>&1
+    sleep 3
+    L=/var/log/kubernetes/audit/audit.log
+    check "audit log is written" 'test -s $L'
+    check "secret access logged at Metadata" 'grep "\"resource\":\"secrets\"" $L | grep -q "\"level\":\"Metadata\""'
+    check_not "no request/response bodies" 'grep -q "\"level\":\"Request" $L'
+    check_not "other resources not logged" 'grep -q "\"resource\":\"pods\"" $L'
+    check "maxage 7" 'grep -q -- "--audit-log-maxage=7" /etc/kubernetes/manifests/kube-apiserver.yaml'
+  solve: |
+    sudo mkdir -p /etc/kubernetes/audit /var/log/kubernetes/audit
+    printf 'apiVersion: audit.k8s.io/v1\nkind: Policy\nrules:\n- level: Metadata\n  resources:\n  - group: ""\n    resources: [secrets, configmaps]\n- level: None\n' | sudo tee /etc/kubernetes/audit/policy.yaml >/dev/null
+    M=/etc/kubernetes/manifests/kube-apiserver.yaml
+    sudo cp $M /tmp/kube-apiserver.yaml
+    sudo python3 - <<'EOF'
+    import re
+    p="/tmp/kube-apiserver.yaml"; s=open(p).read()
+    s=s.replace("    - kube-apiserver\n","    - kube-apiserver\n    - --audit-policy-file=/etc/kubernetes/audit/policy.yaml\n    - --audit-log-path=/var/log/kubernetes/audit/audit.log\n    - --audit-log-maxage=7\n",1)
+    s=s.replace("    volumeMounts:\n","    volumeMounts:\n    - {name: audit-policy, mountPath: /etc/kubernetes/audit, readOnly: true}\n    - {name: audit-log, mountPath: /var/log/kubernetes/audit}\n",1)
+    s=s.replace("  volumes:\n","  volumes:\n  - {name: audit-policy, hostPath: {path: /etc/kubernetes/audit, type: DirectoryOrCreate}}\n  - {name: audit-log, hostPath: {path: /var/log/kubernetes/audit, type: DirectoryOrCreate}}\n",1)
+    open(p,"w").write(s)
+    EOF
+    sudo cp /tmp/kube-apiserver.yaml $M
+    sleep 30
+    for i in $(seq 1 60); do kubectl get --raw=/readyz >/dev/null 2>&1 && break; sleep 3; done
+
+- id: k8s-271
+  title: Tune node capacity
+  difficulty: 4
+  kind: build
+  tags: [kubelet, config, maxPods, systemReserved, allocatable, taints, control-plane, cleanup, field-selectors]
+  tutorial: |
+    **Concept.** How much a node can hold is decided in several places. Per-node limits such as the **number of pods** (`maxPods`) and the **reservations for the OS and Kubernetes daemons** (`systemReserved`, `kubeReserved`) come from the kubelet's configuration file and take effect after restarting the kubelet; the node reports the result as Capacity and Allocatable (allocatable = capacity minus reservations). **Taints** decide where the scheduler may place pods at all: control-plane nodes carry a NoSchedule taint by default, and removing a taint uses a trailing dash. Finally, capacity is wasted by leftovers: finished pods stay around until deleted, and since pod **phase** is a field you can filter on server-side, a field selector lets you delete them across namespaces (one value per selector expression).
+
+    **Read up on:**
+    - `/var/lib/kubelet/config.yaml` — the KubeletConfiguration file
+    - Kubernetes docs: Kubelet Configuration (v1beta1) reference; Reserve Compute Resources for System Daemons
+    - `systemctl restart kubelet` and `systemctl status kubelet`
+    - `kubectl describe node node01` — Capacity and Allocatable
+    - `kubectl describe node controlplane` — Taints section; `kubectl taint --help`
+    - `kubectl get pods -A --field-selector=status.phase=Failed` — preview first
+    - Kubernetes docs: Field Selectors, supported fields
+    - `kubectl scale --help`; `kubectl get pods -o wide` — NODE column
+  scenario: |
+    The lab cluster is small, so squeeze it sensibly:
+
+    1. node01 will run many tiny pods. Raise its kubelet's **maximum number of pods** from
+       the default 110 to **150**, persistently. `kubectl describe node node01` must show
+       `pods: 150` under Capacity.
+    2. Pods on node01 sometimes starve the OS daemons. Configure node01's kubelet to
+       **reserve 200m CPU and 256Mi memory** for system daemons (`systemReserved`), so that
+       the node's **allocatable** resources shrink accordingly.
+    3. Dozens of `Completed` and `Error` pods are lying around in several namespaces.
+       Delete **every pod in phase `Succeeded` or `Failed`** across all namespaces. Running
+       pods must not be touched.
+    4. Use the control plane's capacity too: remove the **control-plane NoSchedule taint**
+       from `controlplane`, then scale the deployment **`spread`** (namespace **`lab`**) to
+       4 replicas and confirm some of its pods land on the control plane.
+  hints:
+    - "`maxPods` and `systemReserved: {cpu: 200m, memory: 256Mi}` go in `/var/lib/kubelet/config.yaml` on node01; restart the kubelet once after editing."
+    - "`kubectl delete pods -A --field-selector=status.phase==Succeeded` and the same for `Failed`."
+    - "`kubectl taint node controlplane node-role.kubernetes.io/control-plane:NoSchedule-`, then `kubectl scale deploy spread -n lab --replicas=4`."
+  solution: |
+    ```bash
+    # 1 + 2: kubelet config on node01
+    ssh node01
+    echo 'maxPods: 150' | sudo tee -a /var/lib/kubelet/config.yaml
+    printf 'systemReserved:\n  cpu: 200m\n  memory: 256Mi\n' | sudo tee -a /var/lib/kubelet/config.yaml
+    sudo systemctl restart kubelet
+    exit
+    kubectl describe node node01 | grep -A6 -E 'Capacity|Allocatable'
+    # 3: finished pods
+    kubectl delete pods -A --field-selector=status.phase==Succeeded
+    kubectl delete pods -A --field-selector=status.phase==Failed
+    # 4: control plane taint
+    kubectl taint node controlplane node-role.kubernetes.io/control-plane:NoSchedule-
+    kubectl scale deploy spread -n lab --replicas=4
+    kubectl get pods -n lab -o wide
+    ```
+  setup: |
+    a=$(kj node node01 '{.status.allocatable.cpu}'); case $a in *m) a=${a%m};; *) a=$((a*1000));; esac
+    echo $a > $KL_STATE/answer
+    for n in batch-a batch-b; do k_ns $n
+      for i in 1 2 3; do kubectl -n $n run ok-$i --image=busybox:1.37 --restart=Never -- true >/dev/null; kubectl -n $n run bad-$i --image=busybox:1.37 --restart=Never -- false >/dev/null; done
+      kubectl -n $n run keep --image=busybox:1.37 -- sleep infinity >/dev/null
+    done
+    eventually 60 '[ "$(kubectl get pods -A --field-selector=status.phase==Failed -o name | wc -l)" -ge 6 ] && [ "$(kubectl get pods -A --field-selector=status.phase==Succeeded -o name | wc -l)" -ge 6 ]'
+    k_ns lab
+    kubectl apply -f - >/dev/null <<'EOF'
+    apiVersion: apps/v1
+    kind: Deployment
+    metadata: {name: spread, namespace: lab}
+    spec:
+      replicas: 1
+      selector: {matchLabels: {app: spread}}
+      template:
+        metadata: {labels: {app: spread}}
+        spec:
+          topologySpreadConstraints:
+          - {maxSkew: 1, topologyKey: kubernetes.io/hostname, whenUnsatisfiable: ScheduleAnyway, labelSelector: {matchLabels: {app: spread}}}
+          containers: [{name: s, image: "busybox:1.37", command: ["sleep", "infinity"]}]
+    EOF
+  check: |
+    before=$(cat $KL_STATE/answer)
+    if on_node01 'grep -qE "^maxPods: 150" /var/lib/kubelet/config.yaml'; then
+      eventually 60 '[ "$(kj node node01 "{.status.capacity.pods}")" = 150 ]'
+    fi
+    check_eq "node01 capacity pods" "$(kj node node01 '{.status.capacity.pods}')" "150"
+    if on_node01 'grep -q "^systemReserved:" /var/lib/kubelet/config.yaml'; then
+      eventually 60 '[ "$(kj node node01 "{.status.allocatable.cpu}")" != "$(kj node node01 "{.status.capacity.cpu}")" ]'
+    fi
+    a=$(kj node node01 '{.status.allocatable.cpu}'); case $a in *m) a=${a%m};; *) a=$((a*1000));; esac
+    check_eq "allocatable CPU dropped by 200m" "$a" "$((before - 200))"
+    check_eq "no Succeeded pods" "$(kubectl get pods -A --field-selector=status.phase==Succeeded -o name | wc -l | tr -d ' ')" "0"
+    check_eq "no Failed pods" "$(kubectl get pods -A --field-selector=status.phase==Failed -o name | wc -l | tr -d ' ')" "0"
+    check "running pods kept" 'k_exists -n batch-a pod keep && k_exists -n batch-b pod keep'
+    check_not "control-plane taint removed" 'kubectl get node controlplane -o json | jq -e ".spec.taints[]? | select(.key==\"node-role.kubernetes.io/control-plane\")"'
+    wait_deploy lab spread 90
+    check_eq "replicas" "$(kj -n lab deploy spread '{.status.readyReplicas}')" "4"
+    check "some pods on the control plane" 'kubectl -n lab get pods -l app=spread -o jsonpath="{.items[*].spec.nodeName}" | grep -qw controlplane'
+  check_worker: |
+    check "maxPods configured in the kubelet config file" 'grep -qE "^maxPods: 150" /var/lib/kubelet/config.yaml'
+    check "systemReserved configured" 'grep -A2 "^systemReserved:" /var/lib/kubelet/config.yaml | grep -q "cpu: 200m" && grep -A2 "^systemReserved:" /var/lib/kubelet/config.yaml | grep -q "memory: 256Mi"'
+  solve: |
+    ssh node01 "echo 'maxPods: 150' | sudo tee -a /var/lib/kubelet/config.yaml >/dev/null && printf 'systemReserved:\n  cpu: 200m\n  memory: 256Mi\n' | sudo tee -a /var/lib/kubelet/config.yaml >/dev/null && sudo systemctl restart kubelet"
+    kubectl delete pods -A --field-selector=status.phase==Succeeded
+    kubectl delete pods -A --field-selector=status.phase==Failed
+    kubectl taint node controlplane node-role.kubernetes.io/control-plane:NoSchedule-
+    kubectl scale deploy spread -n lab --replicas=4
+
+- id: k8s-278
+  title: Force pods of a namespace onto a node pool
+  difficulty: 4
+  kind: build
+  tags: [admission, PodNodeSelector, kube-apiserver]
+  tutorial: |
+    **Concept.** Admission plugins are enabled on the API server by a flag and can modify or reject requests. PodNodeSelector merges a namespace annotation into every pod's node selector.
+
+    **Read up on:**
+    - Kubernetes docs: Admission Controllers reference, PodNodeSelector
+    - `/etc/kubernetes/manifests/kube-apiserver.yaml` — `--enable-admission-plugins`
+    - `kubectl annotate --help` and `kubectl label --help`
+    - `kubectl get pods -o wide` and `kubectl get nodes --show-labels`
+  scenario: |
+    Every pod in namespace **`gpu-jobs`** must land on nodes labelled **`pool=gpu`** —
+    even if the developer forgets the nodeSelector. Use the **`PodNodeSelector`**
+    admission plugin:
+
+    1. enable it on the API server (keep the plugins that are already enabled)
+    2. annotate the namespace with
+       `scheduler.alpha.kubernetes.io/node-selector: pool=gpu`
+    3. label **node01** `pool=gpu`
+
+    A plain pod created in `gpu-jobs` must automatically get `nodeSelector: {pool: gpu}`.
+  hints:
+    - "`--enable-admission-plugins=NodeRestriction,PodNodeSelector` in the apiserver manifest."
+  solution: |
+    ```bash
+    sudo sed -i 's/--enable-admission-plugins=NodeRestriction$/--enable-admission-plugins=NodeRestriction,PodNodeSelector/' \
+      /etc/kubernetes/manifests/kube-apiserver.yaml
+    kubectl annotate ns gpu-jobs scheduler.alpha.kubernetes.io/node-selector=pool=gpu
+    kubectl label node node01 pool=gpu
+    kubectl run probe -n gpu-jobs --image=busybox:1.37 -- sleep 60
+    kubectl get pod probe -n gpu-jobs -o jsonpath='{.spec.nodeSelector}'
+    ```
+  setup: |
+    k_ns gpu-jobs
+  check: |
+    eventually 120 'api_up'
+    check "PodNodeSelector enabled" 'grep -- "--enable-admission-plugins=" /etc/kubernetes/manifests/kube-apiserver.yaml | grep -q PodNodeSelector'
+    check "NodeRestriction still enabled" 'grep -- "--enable-admission-plugins=" /etc/kubernetes/manifests/kube-apiserver.yaml | grep -q NodeRestriction'
+    check_eq "namespace annotation" "$(kj ns gpu-jobs '{.metadata.annotations.scheduler\.alpha\.kubernetes\.io/node-selector}')" "pool=gpu"
+    n=kl-$RANDOM; kubectl -n gpu-jobs run $n --image=busybox:1.37 -- sleep 60 >/dev/null 2>&1
+    check_eq "new pods get the selector" "$(kj -n gpu-jobs pod $n '{.spec.nodeSelector.pool}')" "gpu"
+    check_eq "node01 labelled" "$(kj node node01 '{.metadata.labels.pool}')" "gpu"
+  solve: |
+    sudo sed -i 's/--enable-admission-plugins=NodeRestriction$/--enable-admission-plugins=NodeRestriction,PodNodeSelector/' /etc/kubernetes/manifests/kube-apiserver.yaml
+    sleep 30
+    for i in $(seq 1 60); do kubectl get --raw=/readyz >/dev/null 2>&1 && break; sleep 3; done
+    kubectl annotate ns gpu-jobs scheduler.alpha.kubernetes.io/node-selector=pool=gpu
+    kubectl label node node01 pool=gpu
+
+- id: k8s-279
+  title: Remove a node and join it again
+  difficulty: 4
+  kind: build
+  tags: [kubeadm, join, reset, nodes]
+  tutorial: |
+    **Concept.** Re-provisioning a node means evicting its workloads, removing its Node object, wiping local kubeadm state and joining with a fresh bootstrap token, producing a new identity.
+
+    **Read up on:**
+    - `kubectl drain --help` — useful flags for DaemonSets and emptyDir
+    - `kubectl delete node --help`
+    - `kubeadm reset --help` and `kubeadm token create --help`
+    - `kubeadm join --help` — node name option
+    - `kubectl get node NAME -o jsonpath='{.metadata.uid}'` — compare identity
+  scenario: |
+    node01's kubelet identity is suspected to be compromised. Re-provision it:
+
+    1. drain node01 and **delete** it from the cluster
+    2. on node01, **wipe** its kubeadm state (`kubeadm reset`)
+    3. **join** it again with a fresh token (node name `node01`)
+
+    End state: node01 is `Ready`, with a **new** Node object (different UID) and a new
+    kubelet client certificate.
+  hints:
+    - "`kubectl drain node01 --ignore-daemonsets --delete-emptydir-data --force && kubectl delete node node01`"
+    - "On node01: `sudo kubeadm reset -f`, then the `kubeadm join ...` printed by `sudo kubeadm token create --print-join-command` (add `--node-name node01`)."
+  solution: |
+    ```bash
+    kubectl drain node01 --ignore-daemonsets --delete-emptydir-data --force
+    kubectl delete node node01
+    JOIN=$(sudo kubeadm token create --print-join-command)
+    ssh node01 "sudo kubeadm reset -f && sudo $JOIN --node-name node01"
+    kubectl get nodes -w
+    ```
+    `kubeadm reset` doesn't clean iptables or CNI config fully — in production follow its
+    printed advice.
+  setup: |
+    kj node node01 '{.metadata.uid}' > $KL_STATE/answer
+  check: |
+    eventually 120 '[ "$(kj node node01 "{.status.conditions[?(@.type==\"Ready\")].status}")" = True ]'
+    check "node01 is Ready" '[ "$(kj node node01 "{.status.conditions[?(@.type==\"Ready\")].status}")" = True ]'
+    check "it is a new Node object" '[ -n "$(kj node node01 "{.metadata.uid}")" ] && [ "$(kj node node01 "{.metadata.uid}")" != "$(cat $KL_STATE/answer)" ]'
+    check_not "node01 schedulable" '[ "$(kj node node01 "{.spec.unschedulable}")" = true ]'
+  solve: |
+    kubectl drain node01 --ignore-daemonsets --delete-emptydir-data --force --timeout=180s
+    kubectl delete node node01
+    JOIN=$(sudo kubeadm token create --print-join-command 2>/dev/null | tail -1)
+    ssh node01 "sudo kubeadm reset -f >/dev/null 2>&1; sudo $JOIN --node-name node01"
+    for i in $(seq 1 40); do [ "$(kubectl get node node01 -o jsonpath='{.status.conditions[?(@.type=="Ready")].status}' 2>/dev/null)" = True ] && break; sleep 5; done
 
 - id: k8s-262
   title: Restore etcd from a snapshot
@@ -229,139 +756,6 @@ exercises:
     kubectl uncordon node01
     for i in $(seq 1 40); do [ "$(kubectl get nodes --no-headers | grep -cw Ready)" = 2 ] && break; sleep 5; done
 
-- id: k8s-266
-  title: Renew the control-plane certificates
-  difficulty: 3
-  kind: build
-  tags: [certificates, kubeadm, renewal]
-  tutorial: |
-    **Concept.** kubeadm certificates expire, and renewing the files does not affect running components, since static pods read certificates only at startup. Client kubeconfigs holding embedded certificates also need refreshing.
-
-    **Read up on:**
-    - `kubeadm certs renew --help` — renewing all or specific certs
-    - `kubeadm certs check-expiration` — before and after
-    - `crictl stop` / `crictl ps` — restart static pod containers
-    - `/etc/kubernetes/admin.conf` and `~/.kube/config` — copy for your user
-  scenario: |
-    Policy says control-plane certificates must be renewed every 6 months. Renew **all**
-    kubeadm-managed certificates and make sure the **running API server** actually uses
-    the new one (static pods only read certificates at start-up).
-
-    Also refresh **your** kubeconfig: `admin.conf` gets a new client certificate too.
-  hints:
-    - "`sudo kubeadm certs renew all`"
-    - "Restart the control-plane static pods: e.g. move their manifests out of `/etc/kubernetes/manifests` for ~20s and back, or stop their containers with `crictl`."
-    - "`echo | openssl s_client -connect 127.0.0.1:6443 2>/dev/null | openssl x509 -noout -dates` shows what the API server serves."
-  solution: |
-    ```bash
-    sudo kubeadm certs renew all
-    sudo kubeadm certs check-expiration
-    for c in kube-apiserver kube-controller-manager kube-scheduler etcd; do
-      sudo crictl stop $(sudo crictl ps --name $c -q)
-    done
-    sudo cp /etc/kubernetes/admin.conf ~/.kube/config && sudo chown $(id -u):$(id -g) ~/.kube/config
-    echo | openssl s_client -connect 127.0.0.1:6443 2>/dev/null | openssl x509 -noout -startdate
-    ```
-  setup: |
-    fp() { openssl x509 -noout -fingerprint -sha256 | cut -d= -f2; }
-    fp < /etc/kubernetes/pki/apiserver.crt > $KL_STATE/answer
-    sed -n 's/.*client-certificate-data: //p' /etc/kubernetes/admin.conf | base64 -d | fp >> $KL_STATE/answer
-  check: |
-    fp() { openssl x509 -noout -fingerprint -sha256 2>/dev/null | cut -d= -f2; }
-    old_api=$(sed -n 1p $KL_STATE/answer); old_admin=$(sed -n 2p $KL_STATE/answer)
-    new_api=$(fp < /etc/kubernetes/pki/apiserver.crt)
-    check "apiserver.crt was renewed" "[ -n '$new_api' ] && [ '$new_api' != '$old_api' ]"
-    served=$(echo | openssl s_client -connect 127.0.0.1:6443 2>/dev/null | fp)
-    check "the running API server serves the new certificate" "[ '$served' = '$new_api' ] && [ '$served' != '$old_api' ]"
-    check "your kubeconfig works" 'as_user "kubectl get nodes"'
-    mine=$(sed -n 's/.*client-certificate-data: //p' "$(lab_home)/.kube/config" | base64 -d | fp)
-    check "your kubeconfig has the renewed admin client cert" "[ -n '$mine' ] && [ '$mine' != '$old_admin' ]"
-  solve: |
-    sudo kubeadm certs renew all
-    for c in kube-apiserver kube-controller-manager kube-scheduler etcd; do sudo crictl stop $(sudo crictl ps --name $c -q) >/dev/null; done
-    sudo cp /etc/kubernetes/admin.conf ~/.kube/config && sudo chown $(id -u):$(id -g) ~/.kube/config
-    sleep 20
-    for i in $(seq 1 60); do kubectl get --raw=/readyz >/dev/null 2>&1 && break; sleep 3; done
-
-- id: k8s-267
-  title: Turn on audit logging
-  difficulty: 4
-  kind: build
-  tags: [audit, kube-apiserver, security]
-  tutorial: |
-    **Concept.** The API server can record who did what to which object. An audit policy lists rules by level (None, Metadata, Request, RequestResponse), and the first matching rule wins. The API server needs the policy and log path through flags and mounted volumes.
-
-    **Read up on:**
-    - Kubernetes docs: Auditing, policy format and levels
-    - `/etc/kubernetes/manifests/kube-apiserver.yaml` — where API server flags live
-    - Static pod `volumes` and `volumeMounts` — paths must be visible inside the container
-  scenario: |
-    Compliance requires an **audit trail**. Configure the API server to write audit
-    events to **`/var/log/kubernetes/audit/audit.log`** using the policy
-    **`/etc/kubernetes/audit/policy.yaml`** (write it), which must:
-
-    - log **Secret** and **ConfigMap** access at level **`Metadata`** (no payloads!)
-    - log everything else at level **`None`**
-
-    Keep **7** days of logs (`--audit-log-maxage`).
-  hints:
-    - "Policy: `apiVersion: audit.k8s.io/v1`, `kind: Policy`, `rules: [{level: Metadata, resources: [{group: \"\", resources: [secrets, configmaps]}]}, {level: None}]`"
-    - "apiserver flags: `--audit-policy-file`, `--audit-log-path`, `--audit-log-maxage`; and **hostPath volumes + volumeMounts** for both the policy file and the log directory."
-  solution: |
-    ```yaml
-    # /etc/kubernetes/audit/policy.yaml
-    apiVersion: audit.k8s.io/v1
-    kind: Policy
-    rules:
-    - level: Metadata
-      resources:
-      - group: ""
-        resources: [secrets, configmaps]
-    - level: None
-    ```
-    In `/etc/kubernetes/manifests/kube-apiserver.yaml`:
-    ```yaml
-        - --audit-policy-file=/etc/kubernetes/audit/policy.yaml
-        - --audit-log-path=/var/log/kubernetes/audit/audit.log
-        - --audit-log-maxage=7
-    ...
-        volumeMounts:
-        - {name: audit-policy, mountPath: /etc/kubernetes/audit, readOnly: true}
-        - {name: audit-log, mountPath: /var/log/kubernetes/audit}
-    ...
-      volumes:
-      - {name: audit-policy, hostPath: {path: /etc/kubernetes/audit, type: DirectoryOrCreate}}
-      - {name: audit-log, hostPath: {path: /var/log/kubernetes/audit, type: DirectoryOrCreate}}
-    ```
-  setup: |
-    on_reset 'rm -rf /var/log/kubernetes/audit'
-  check: |
-    eventually 120 'api_up'
-    kubectl -n default get secret kl-audit-probe >/dev/null 2>&1; kubectl -n default get cm kube-root-ca.crt >/dev/null 2>&1
-    sleep 3
-    L=/var/log/kubernetes/audit/audit.log
-    check "audit log is written" 'test -s $L'
-    check "secret access logged at Metadata" 'grep "\"resource\":\"secrets\"" $L | grep -q "\"level\":\"Metadata\""'
-    check_not "no request/response bodies" 'grep -q "\"level\":\"Request" $L'
-    check_not "other resources not logged" 'grep -q "\"resource\":\"pods\"" $L'
-    check "maxage 7" 'grep -q -- "--audit-log-maxage=7" /etc/kubernetes/manifests/kube-apiserver.yaml'
-  solve: |
-    sudo mkdir -p /etc/kubernetes/audit /var/log/kubernetes/audit
-    printf 'apiVersion: audit.k8s.io/v1\nkind: Policy\nrules:\n- level: Metadata\n  resources:\n  - group: ""\n    resources: [secrets, configmaps]\n- level: None\n' | sudo tee /etc/kubernetes/audit/policy.yaml >/dev/null
-    M=/etc/kubernetes/manifests/kube-apiserver.yaml
-    sudo cp $M /tmp/kube-apiserver.yaml
-    sudo python3 - <<'EOF'
-    import re
-    p="/tmp/kube-apiserver.yaml"; s=open(p).read()
-    s=s.replace("    - kube-apiserver\n","    - kube-apiserver\n    - --audit-policy-file=/etc/kubernetes/audit/policy.yaml\n    - --audit-log-path=/var/log/kubernetes/audit/audit.log\n    - --audit-log-maxage=7\n",1)
-    s=s.replace("    volumeMounts:\n","    volumeMounts:\n    - {name: audit-policy, mountPath: /etc/kubernetes/audit, readOnly: true}\n    - {name: audit-log, mountPath: /var/log/kubernetes/audit}\n",1)
-    s=s.replace("  volumes:\n","  volumes:\n  - {name: audit-policy, hostPath: {path: /etc/kubernetes/audit, type: DirectoryOrCreate}}\n  - {name: audit-log, hostPath: {path: /var/log/kubernetes/audit, type: DirectoryOrCreate}}\n",1)
-    open(p,"w").write(s)
-    EOF
-    sudo cp /tmp/kube-apiserver.yaml $M
-    sleep 30
-    for i in $(seq 1 60); do kubectl get --raw=/readyz >/dev/null 2>&1 && break; sleep 3; done
-
 - id: k8s-268
   title: Encrypt secrets at rest
   difficulty: 5
@@ -438,395 +832,7 @@ exercises:
     for i in $(seq 1 60); do kubectl get --raw=/readyz >/dev/null 2>&1 && break; sleep 3; done
     kubectl get secrets -A -o json | kubectl replace -f -
 
-- id: k8s-269
-  title: Cluster networking & kubeconfig admin
-  difficulty: 3
-  kind: build
-  tags: [kubeconfig, contexts, kubeadm, networking, cidr, coredns, dns, stub-domain]
-  tutorial: |
-    **Concept.** Three small admin chores that all revolve around "where does the cluster say things live". (1) A **kubeconfig** holds clusters, users and contexts; several files can be merged through the `KUBECONFIG` environment variable, and kubectl can flatten the result into one portable file. (2) **Pod and service networks** are address ranges chosen at cluster setup and kept in cluster configuration; kubeadm stores its ClusterConfiguration in a ConfigMap in kube-system. (3) **CoreDNS** is configured by a Corefile in a ConfigMap, made of server blocks keyed by zone; a block can send queries for one zone to specific upstream servers, and CoreDNS must reload afterwards.
-
-    **Read up on:**
-    - `kubectl config view --help` — `--flatten` and `--minify`
-    - `kubectl config get-contexts` and `kubectl config current-context`
-    - `KUBECONFIG` env var — colon-separated paths and merge order (Kubernetes docs: Organizing Cluster Access)
-    - `kubectl get cm kubeadm-config -n kube-system -o yaml`
-    - `/etc/kubernetes/manifests/kube-apiserver.yaml` and `kube-controller-manager.yaml` — related flags
-    - `kubectl get cm coredns -n kube-system -o yaml` — the current Corefile
-    - CoreDNS docs: plugins `forward`, `cache` and `errors`
-    - `kubectl rollout restart --help`; `kubectl logs -n kube-system -l k8s-app=kube-dns` — syntax errors
-  scenario: |
-    You are taking over a cluster and need to document and adjust how it is wired.
-
-    1. A colleague sent you **`/lab/staging.kubeconfig`** for the staging cluster. Combine
-       it with your current config into **`/lab/merged.kubeconfig`** so that both contexts
-       are available from one file, with **your current cluster's context as the current
-       context**. The merged file must work on its own.
-    2. Write the cluster's **pod network CIDR** to **`/lab/pod-cidr.txt`** and its
-       **service CIDR** to **`/lab/service-cidr.txt`** (e.g. `10.244.0.0/16`).
-    3. Names under **`corp.internal`** must be resolved by the corporate DNS servers
-       **`10.0.0.53`** and **`10.0.0.54`**, not by the upstream resolvers. Add a dedicated
-       **server block** for that zone to CoreDNS's Corefile and roll CoreDNS.
-  hints:
-    - "`KUBECONFIG=a:b kubectl config view --flatten > merged` — the first file's current-context wins."
-    - "kubeadm stores its ClusterConfiguration in the ConfigMap `kubeadm-config` in `kube-system` (`networking.podSubnet` / `serviceSubnet`). Or: `kube-controller-manager --cluster-cidr` and `kube-apiserver --service-cluster-ip-range`."
-    - "Add to the Corefile: `corp.internal:53 { errors\\n cache 30\\n forward . 10.0.0.53 10.0.0.54 }` as its own block, then `kubectl -n kube-system rollout restart deploy coredns`."
-  solution: |
-    ```bash
-    # 1. merged kubeconfig
-    KUBECONFIG=~/.kube/config:/lab/staging.kubeconfig kubectl config view --flatten > /lab/merged.kubeconfig
-    kubectl --kubeconfig /lab/merged.kubeconfig config get-contexts
-    # 2. CIDRs
-    cc=$(kubectl -n kube-system get cm kubeadm-config -o jsonpath='{.data.ClusterConfiguration}')
-    awk '/podSubnet/{print $2}' <<<"$cc" > /lab/pod-cidr.txt
-    awk '/serviceSubnet/{print $2}' <<<"$cc" > /lab/service-cidr.txt
-    # 3. CoreDNS
-    kubectl -n kube-system edit cm coredns
-    ```
-    ```text
-    corp.internal:53 {
-        errors
-        cache 30
-        forward . 10.0.0.53 10.0.0.54
-    }
-    ```
-    ```bash
-    kubectl -n kube-system rollout restart deploy coredns
-    ```
-  setup: |
-    cat > /lab/staging.kubeconfig <<'EOF'
-    apiVersion: v1
-    kind: Config
-    clusters:
-    - name: staging
-      cluster: {server: "https://staging.example.com:6443", insecure-skip-tls-verify: true}
-    users:
-    - name: staging-ci
-      user: {token: "stg-token-not-real"}
-    contexts:
-    - name: ci@staging
-      context: {cluster: staging, user: staging-ci, namespace: ci}
-    current-context: ci@staging
-    EOF
-    chown $(lab_user): /lab/staging.kubeconfig
-    on_reset 'kl_restore_obj configmap coredns; kubectl -n kube-system rollout restart deploy coredns'
-  check: |
-    K=/lab/merged.kubeconfig
-    mine=$(as_user 'kubectl config current-context')
-    check "contains both contexts" "kubectl --kubeconfig $K config get-contexts -o name 2>/dev/null | grep -qx ci@staging && kubectl --kubeconfig $K config get-contexts -o name | grep -qx '$mine'"
-    check_eq "current context is yours" "$(kubectl --kubeconfig $K config current-context 2>/dev/null)" "$mine"
-    check "self-contained (works on its own)" "KUBECONFIG= kubectl --kubeconfig $K get nodes"
-    cc=$(kubectl -n kube-system get cm kubeadm-config -o jsonpath='{.data.ClusterConfiguration}')
-    check_eq "pod CIDR" "$(tr -d '[:space:]' < /lab/pod-cidr.txt 2>/dev/null)" "$(awk '/podSubnet/{print $2}' <<<"$cc")"
-    check_eq "service CIDR" "$(tr -d '[:space:]' < /lab/service-cidr.txt 2>/dev/null)" "$(awk '/serviceSubnet/{print $2}' <<<"$cc")"
-    cf=$(kubectl -n kube-system get cm coredns -o jsonpath='{.data.Corefile}')
-    check "corp.internal server block" 'grep -q "^corp.internal:53 *{" <<<"$cf"'
-    check "forwards to both servers" 'awk "/^corp.internal:53/,/^}/" <<<"$cf" | grep -q "forward . 10.0.0.53 10.0.0.54"'
-    wait_deploy kube-system coredns 90
-    check "coredns healthy" 'deploy_ready kube-system coredns'
-  solve: |
-    KUBECONFIG=$HOME/.kube/config:/lab/staging.kubeconfig kubectl config view --flatten > /lab/merged.kubeconfig
-    cc=$(kubectl -n kube-system get cm kubeadm-config -o jsonpath='{.data.ClusterConfiguration}')
-    awk '/podSubnet/{print $2}' <<<"$cc" > /lab/pod-cidr.txt
-    awk '/serviceSubnet/{print $2}' <<<"$cc" > /lab/service-cidr.txt
-    kubectl -n kube-system get cm coredns -o json | jq '.data.Corefile += "corp.internal:53 {\n    errors\n    cache 30\n    forward . 10.0.0.53 10.0.0.54\n}\n"' | kubectl replace -f -
-    kubectl -n kube-system rollout restart deploy coredns
-
-- id: k8s-271
-  title: Tune node capacity
-  difficulty: 4
-  kind: build
-  tags: [kubelet, config, maxPods, systemReserved, allocatable, taints, control-plane, cleanup, field-selectors]
-  tutorial: |
-    **Concept.** How much a node can hold is decided in several places. Per-node limits such as the **number of pods** (`maxPods`) and the **reservations for the OS and Kubernetes daemons** (`systemReserved`, `kubeReserved`) come from the kubelet's configuration file and take effect after restarting the kubelet; the node reports the result as Capacity and Allocatable (allocatable = capacity minus reservations). **Taints** decide where the scheduler may place pods at all: control-plane nodes carry a NoSchedule taint by default, and removing a taint uses a trailing dash. Finally, capacity is wasted by leftovers: finished pods stay around until deleted, and since pod **phase** is a field you can filter on server-side, a field selector lets you delete them across namespaces (one value per selector expression).
-
-    **Read up on:**
-    - `/var/lib/kubelet/config.yaml` — the KubeletConfiguration file
-    - Kubernetes docs: Kubelet Configuration (v1beta1) reference; Reserve Compute Resources for System Daemons
-    - `systemctl restart kubelet` and `systemctl status kubelet`
-    - `kubectl describe node node01` — Capacity and Allocatable
-    - `kubectl describe node controlplane` — Taints section; `kubectl taint --help`
-    - `kubectl get pods -A --field-selector=status.phase=Failed` — preview first
-    - Kubernetes docs: Field Selectors, supported fields
-    - `kubectl scale --help`; `kubectl get pods -o wide` — NODE column
-  scenario: |
-    The lab cluster is small, so squeeze it sensibly:
-
-    1. node01 will run many tiny pods. Raise its kubelet's **maximum number of pods** from
-       the default 110 to **150**, persistently. `kubectl describe node node01` must show
-       `pods: 150` under Capacity.
-    2. Pods on node01 sometimes starve the OS daemons. Configure node01's kubelet to
-       **reserve 200m CPU and 256Mi memory** for system daemons (`systemReserved`), so that
-       the node's **allocatable** resources shrink accordingly.
-    3. Dozens of `Completed` and `Error` pods are lying around in several namespaces.
-       Delete **every pod in phase `Succeeded` or `Failed`** across all namespaces. Running
-       pods must not be touched.
-    4. Use the control plane's capacity too: remove the **control-plane NoSchedule taint**
-       from `controlplane`, then scale the deployment **`spread`** (namespace **`lab`**) to
-       4 replicas and confirm some of its pods land on the control plane.
-  hints:
-    - "`maxPods` and `systemReserved: {cpu: 200m, memory: 256Mi}` go in `/var/lib/kubelet/config.yaml` on node01; restart the kubelet once after editing."
-    - "`kubectl delete pods -A --field-selector=status.phase==Succeeded` and the same for `Failed`."
-    - "`kubectl taint node controlplane node-role.kubernetes.io/control-plane:NoSchedule-`, then `kubectl scale deploy spread -n lab --replicas=4`."
-  solution: |
-    ```bash
-    # 1 + 2: kubelet config on node01
-    ssh node01
-    echo 'maxPods: 150' | sudo tee -a /var/lib/kubelet/config.yaml
-    printf 'systemReserved:\n  cpu: 200m\n  memory: 256Mi\n' | sudo tee -a /var/lib/kubelet/config.yaml
-    sudo systemctl restart kubelet
-    exit
-    kubectl describe node node01 | grep -A6 -E 'Capacity|Allocatable'
-    # 3: finished pods
-    kubectl delete pods -A --field-selector=status.phase==Succeeded
-    kubectl delete pods -A --field-selector=status.phase==Failed
-    # 4: control plane taint
-    kubectl taint node controlplane node-role.kubernetes.io/control-plane:NoSchedule-
-    kubectl scale deploy spread -n lab --replicas=4
-    kubectl get pods -n lab -o wide
-    ```
-  setup: |
-    a=$(kj node node01 '{.status.allocatable.cpu}'); case $a in *m) a=${a%m};; *) a=$((a*1000));; esac
-    echo $a > $KL_STATE/answer
-    for n in batch-a batch-b; do k_ns $n
-      for i in 1 2 3; do kubectl -n $n run ok-$i --image=busybox:1.37 --restart=Never -- true >/dev/null; kubectl -n $n run bad-$i --image=busybox:1.37 --restart=Never -- false >/dev/null; done
-      kubectl -n $n run keep --image=busybox:1.37 -- sleep infinity >/dev/null
-    done
-    eventually 60 '[ "$(kubectl get pods -A --field-selector=status.phase==Failed -o name | wc -l)" -ge 6 ] && [ "$(kubectl get pods -A --field-selector=status.phase==Succeeded -o name | wc -l)" -ge 6 ]'
-    k_ns lab
-    kubectl apply -f - >/dev/null <<'EOF'
-    apiVersion: apps/v1
-    kind: Deployment
-    metadata: {name: spread, namespace: lab}
-    spec:
-      replicas: 1
-      selector: {matchLabels: {app: spread}}
-      template:
-        metadata: {labels: {app: spread}}
-        spec:
-          topologySpreadConstraints:
-          - {maxSkew: 1, topologyKey: kubernetes.io/hostname, whenUnsatisfiable: ScheduleAnyway, labelSelector: {matchLabels: {app: spread}}}
-          containers: [{name: s, image: "busybox:1.37", command: ["sleep", "infinity"]}]
-    EOF
-  check: |
-    before=$(cat $KL_STATE/answer)
-    if on_node01 'grep -qE "^maxPods: 150" /var/lib/kubelet/config.yaml'; then
-      eventually 60 '[ "$(kj node node01 "{.status.capacity.pods}")" = 150 ]'
-    fi
-    check_eq "node01 capacity pods" "$(kj node node01 '{.status.capacity.pods}')" "150"
-    if on_node01 'grep -q "^systemReserved:" /var/lib/kubelet/config.yaml'; then
-      eventually 60 '[ "$(kj node node01 "{.status.allocatable.cpu}")" != "$(kj node node01 "{.status.capacity.cpu}")" ]'
-    fi
-    a=$(kj node node01 '{.status.allocatable.cpu}'); case $a in *m) a=${a%m};; *) a=$((a*1000));; esac
-    check_eq "allocatable CPU dropped by 200m" "$a" "$((before - 200))"
-    check_eq "no Succeeded pods" "$(kubectl get pods -A --field-selector=status.phase==Succeeded -o name | wc -l | tr -d ' ')" "0"
-    check_eq "no Failed pods" "$(kubectl get pods -A --field-selector=status.phase==Failed -o name | wc -l | tr -d ' ')" "0"
-    check "running pods kept" 'k_exists -n batch-a pod keep && k_exists -n batch-b pod keep'
-    check_not "control-plane taint removed" 'kubectl get node controlplane -o json | jq -e ".spec.taints[]? | select(.key==\"node-role.kubernetes.io/control-plane\")"'
-    wait_deploy lab spread 90
-    check_eq "replicas" "$(kj -n lab deploy spread '{.status.readyReplicas}')" "4"
-    check "some pods on the control plane" 'kubectl -n lab get pods -l app=spread -o jsonpath="{.items[*].spec.nodeName}" | grep -qw controlplane'
-  check_worker: |
-    check "maxPods configured in the kubelet config file" 'grep -qE "^maxPods: 150" /var/lib/kubelet/config.yaml'
-    check "systemReserved configured" 'grep -A2 "^systemReserved:" /var/lib/kubelet/config.yaml | grep -q "cpu: 200m" && grep -A2 "^systemReserved:" /var/lib/kubelet/config.yaml | grep -q "memory: 256Mi"'
-  solve: |
-    ssh node01 "echo 'maxPods: 150' | sudo tee -a /var/lib/kubelet/config.yaml >/dev/null && printf 'systemReserved:\n  cpu: 200m\n  memory: 256Mi\n' | sudo tee -a /var/lib/kubelet/config.yaml >/dev/null && sudo systemctl restart kubelet"
-    kubectl delete pods -A --field-selector=status.phase==Succeeded
-    kubectl delete pods -A --field-selector=status.phase==Failed
-    kubectl taint node controlplane node-role.kubernetes.io/control-plane:NoSchedule-
-    kubectl scale deploy spread -n lab --replicas=4
-
-- id: k8s-273
-  title: A bigger NodePort range
-  difficulty: 3
-  kind: build
-  tags: [kube-apiserver, nodeport, flags]
-  tutorial: |
-    **Concept.** The API server restricts NodePort numbers to a configured range. Extending it needs a flag change in the API server's static pod manifest, after which the API restarts.
-
-    **Read up on:**
-    - `/etc/kubernetes/manifests/kube-apiserver.yaml` — existing flags
-    - Kubernetes docs: kube-apiserver reference, `--service-node-port-range`
-    - `crictl ps` and `kubectl get nodes` — wait for the API server to return
-    - `kubectl create service nodeport --help` — options for ports
-  scenario: |
-    A partner's legacy load balancer is hard-wired to NodePort **33333**, outside the
-    default range (30000–32767). Extend the API server's NodePort range to
-    **30000-33999**, then create a NodePort service **`partner`** in namespace
-    **`edge`** (selector `app=partner`, port 80) with node port **33333**.
-  hints:
-    - "API server flag `--service-node-port-range`."
-  solution: |
-    ```bash
-    sudo sed -i 's|    - kube-apiserver$|    - kube-apiserver\n    - --service-node-port-range=30000-33999|' /etc/kubernetes/manifests/kube-apiserver.yaml
-    # wait for the API server to restart
-    kubectl create service nodeport partner -n edge --tcp=80:80 --node-port=33333
-    ```
-  setup: |
-    k_ns edge
-  check: |
-    eventually 120 'api_up'
-    check "apiserver flag set" 'grep -q -- "--service-node-port-range=30000-33999" /etc/kubernetes/manifests/kube-apiserver.yaml'
-    check_eq "partner nodePort" "$(kj -n edge svc partner '{.spec.ports[0].nodePort}')" "33333"
-  solve: |
-    sudo sed -i 's|^    - kube-apiserver$|    - kube-apiserver\n    - --service-node-port-range=30000-33999|' /etc/kubernetes/manifests/kube-apiserver.yaml
-    sleep 30
-    for i in $(seq 1 60); do kubectl get --raw=/readyz >/dev/null 2>&1 && break; sleep 3; done
-    kubectl create service nodeport partner -n edge --tcp=80:80 --node-port=33333
-
-- id: k8s-276
-  title: Back up a namespace's manifests
-  difficulty: 3
-  kind: build
-  tags: [backup, yaml, restore]
-  tutorial: |
-    **Concept.** A re-appliable backup contains only the declared state, not live state like status, UIDs and resource versions. Exports must be cleaned up before reapplying and some auto-generated objects excluded.
-
-    **Read up on:**
-    - `kubectl get -o json` with several kinds (`kubectl get deploy,svc,cm`) — list output
-    - `jq` (`man jq`) — `del()` and `select()` to clean fields
-    - `kubectl apply -f --help`
-    - `kubectl get all -n NS` — verify after restoring
-  scenario: |
-    Before decommissioning namespace **`crm`**, export its **Deployments, Services and
-    ConfigMaps** (except the automatic `kube-root-ca.crt`) as clean, re-appliable YAML to
-    **`/lab/crm-backup.yaml`**. Then delete the namespace, and **restore** it from your file
-    — everything must come back and run.
-  hints:
-    - "`kubectl get deploy,svc,cm -n crm -o yaml` includes server-side fields (uid, resourceVersion, status, clusterIP...) that block re-creation. Strip them with `jq`/`yq` or `kubectl-neat`."
-    - "Recreate the namespace before applying."
-  solution: |
-    ```bash
-    kubectl get deploy,svc,cm -n crm -o json | jq '.items |= map(select(.metadata.name != "kube-root-ca.crt")
-      | del(.status, .metadata.uid, .metadata.resourceVersion, .metadata.creationTimestamp, .metadata.generation,
-            .metadata.managedFields, .metadata.annotations["deployment.kubernetes.io/revision"],
-            .spec.clusterIP, .spec.clusterIPs))' > /lab/crm-backup.yaml
-    kubectl delete ns crm
-    kubectl create ns crm
-    kubectl apply -f /lab/crm-backup.yaml
-    ```
-    (JSON is valid YAML.)
-  setup: |
-    k_ns crm
-    kubectl -n crm create configmap crm-settings --from-literal=region=eu >/dev/null
-    kubectl -n crm create deployment crm-api --image=traefik/whoami:v1.10 --replicas=2 >/dev/null
-    kubectl -n crm expose deploy crm-api --port=80 >/dev/null
-    kubectl -n crm create deployment crm-worker --image=busybox:1.37 -- sleep infinity >/dev/null
-    kj ns crm '{.metadata.uid}' > $KL_STATE/answer
-  check: |
-    check "backup file exists" 'test -s /lab/crm-backup.yaml'
-    check "namespace was recreated" '[ "$(kj ns crm "{.metadata.uid}")" != "$(cat $KL_STATE/answer)" ] && k_exists ns crm'
-    check_eq "configmap restored" "$(kj -n crm cm crm-settings '{.data.region}')" "eu"
-    wait_deploy crm crm-api 90; wait_deploy crm crm-worker 90
-    check "deployments running" 'deploy_ready crm crm-api && deploy_ready crm crm-worker'
-    check "service restored with endpoints" 'k_curl crm http://crm-api | grep -q Hostname'
-  solve: |
-    kubectl get deploy,svc,cm -n crm -o json | jq '.items |= map(select(.metadata.name != "kube-root-ca.crt") | del(.status, .metadata.uid, .metadata.resourceVersion, .metadata.creationTimestamp, .metadata.generation, .metadata.managedFields, .metadata.annotations["deployment.kubernetes.io/revision"], .spec.clusterIP, .spec.clusterIPs))' > /lab/crm-backup.yaml
-    kubectl delete ns crm --wait=true
-    kubectl create ns crm
-    kubectl apply -f /lab/crm-backup.yaml
-
-- id: k8s-278
-  title: Force pods of a namespace onto a node pool
-  difficulty: 4
-  kind: build
-  tags: [admission, PodNodeSelector, kube-apiserver]
-  tutorial: |
-    **Concept.** Admission plugins are enabled on the API server by a flag and can modify or reject requests. PodNodeSelector merges a namespace annotation into every pod's node selector.
-
-    **Read up on:**
-    - Kubernetes docs: Admission Controllers reference, PodNodeSelector
-    - `/etc/kubernetes/manifests/kube-apiserver.yaml` — `--enable-admission-plugins`
-    - `kubectl annotate --help` and `kubectl label --help`
-    - `kubectl get pods -o wide` and `kubectl get nodes --show-labels`
-  scenario: |
-    Every pod in namespace **`gpu-jobs`** must land on nodes labelled **`pool=gpu`** —
-    even if the developer forgets the nodeSelector. Use the **`PodNodeSelector`**
-    admission plugin:
-
-    1. enable it on the API server (keep the plugins that are already enabled)
-    2. annotate the namespace with
-       `scheduler.alpha.kubernetes.io/node-selector: pool=gpu`
-    3. label **node01** `pool=gpu`
-
-    A plain pod created in `gpu-jobs` must automatically get `nodeSelector: {pool: gpu}`.
-  hints:
-    - "`--enable-admission-plugins=NodeRestriction,PodNodeSelector` in the apiserver manifest."
-  solution: |
-    ```bash
-    sudo sed -i 's/--enable-admission-plugins=NodeRestriction$/--enable-admission-plugins=NodeRestriction,PodNodeSelector/' \
-      /etc/kubernetes/manifests/kube-apiserver.yaml
-    kubectl annotate ns gpu-jobs scheduler.alpha.kubernetes.io/node-selector=pool=gpu
-    kubectl label node node01 pool=gpu
-    kubectl run probe -n gpu-jobs --image=busybox:1.37 -- sleep 60
-    kubectl get pod probe -n gpu-jobs -o jsonpath='{.spec.nodeSelector}'
-    ```
-  setup: |
-    k_ns gpu-jobs
-  check: |
-    eventually 120 'api_up'
-    check "PodNodeSelector enabled" 'grep -- "--enable-admission-plugins=" /etc/kubernetes/manifests/kube-apiserver.yaml | grep -q PodNodeSelector'
-    check "NodeRestriction still enabled" 'grep -- "--enable-admission-plugins=" /etc/kubernetes/manifests/kube-apiserver.yaml | grep -q NodeRestriction'
-    check_eq "namespace annotation" "$(kj ns gpu-jobs '{.metadata.annotations.scheduler\.alpha\.kubernetes\.io/node-selector}')" "pool=gpu"
-    n=kl-$RANDOM; kubectl -n gpu-jobs run $n --image=busybox:1.37 -- sleep 60 >/dev/null 2>&1
-    check_eq "new pods get the selector" "$(kj -n gpu-jobs pod $n '{.spec.nodeSelector.pool}')" "gpu"
-    check_eq "node01 labelled" "$(kj node node01 '{.metadata.labels.pool}')" "gpu"
-  solve: |
-    sudo sed -i 's/--enable-admission-plugins=NodeRestriction$/--enable-admission-plugins=NodeRestriction,PodNodeSelector/' /etc/kubernetes/manifests/kube-apiserver.yaml
-    sleep 30
-    for i in $(seq 1 60); do kubectl get --raw=/readyz >/dev/null 2>&1 && break; sleep 3; done
-    kubectl annotate ns gpu-jobs scheduler.alpha.kubernetes.io/node-selector=pool=gpu
-    kubectl label node node01 pool=gpu
-
-- id: k8s-279
-  title: Remove a node and join it again
-  difficulty: 4
-  kind: build
-  tags: [kubeadm, join, reset, nodes]
-  tutorial: |
-    **Concept.** Re-provisioning a node means evicting its workloads, removing its Node object, wiping local kubeadm state and joining with a fresh bootstrap token, producing a new identity.
-
-    **Read up on:**
-    - `kubectl drain --help` — useful flags for DaemonSets and emptyDir
-    - `kubectl delete node --help`
-    - `kubeadm reset --help` and `kubeadm token create --help`
-    - `kubeadm join --help` — node name option
-    - `kubectl get node NAME -o jsonpath='{.metadata.uid}'` — compare identity
-  scenario: |
-    node01's kubelet identity is suspected to be compromised. Re-provision it:
-
-    1. drain node01 and **delete** it from the cluster
-    2. on node01, **wipe** its kubeadm state (`kubeadm reset`)
-    3. **join** it again with a fresh token (node name `node01`)
-
-    End state: node01 is `Ready`, with a **new** Node object (different UID) and a new
-    kubelet client certificate.
-  hints:
-    - "`kubectl drain node01 --ignore-daemonsets --delete-emptydir-data --force && kubectl delete node node01`"
-    - "On node01: `sudo kubeadm reset -f`, then the `kubeadm join ...` printed by `sudo kubeadm token create --print-join-command` (add `--node-name node01`)."
-  solution: |
-    ```bash
-    kubectl drain node01 --ignore-daemonsets --delete-emptydir-data --force
-    kubectl delete node node01
-    JOIN=$(sudo kubeadm token create --print-join-command)
-    ssh node01 "sudo kubeadm reset -f && sudo $JOIN --node-name node01"
-    kubectl get nodes -w
-    ```
-    `kubeadm reset` doesn't clean iptables or CNI config fully — in production follow its
-    printed advice.
-  setup: |
-    kj node node01 '{.metadata.uid}' > $KL_STATE/answer
-  check: |
-    eventually 120 '[ "$(kj node node01 "{.status.conditions[?(@.type==\"Ready\")].status}")" = True ]'
-    check "node01 is Ready" '[ "$(kj node node01 "{.status.conditions[?(@.type==\"Ready\")].status}")" = True ]'
-    check "it is a new Node object" '[ -n "$(kj node node01 "{.metadata.uid}")" ] && [ "$(kj node node01 "{.metadata.uid}")" != "$(cat $KL_STATE/answer)" ]'
-    check_not "node01 schedulable" '[ "$(kj node node01 "{.spec.unschedulable}")" = true ]'
-  solve: |
-    kubectl drain node01 --ignore-daemonsets --delete-emptydir-data --force --timeout=180s
-    kubectl delete node node01
-    JOIN=$(sudo kubeadm token create --print-join-command 2>/dev/null | tail -1)
-    ssh node01 "sudo kubeadm reset -f >/dev/null 2>&1; sudo $JOIN --node-name node01"
-    for i in $(seq 1 40); do [ "$(kubectl get node node01 -o jsonpath='{.status.conditions[?(@.type=="Ready")].status}' 2>/dev/null)" = True ] && break; sleep 5; done
+# ===== Capstone: a real-world lab =====
 
 - id: k8s-280
   title: "Drill: recover from a bad Friday deploy"

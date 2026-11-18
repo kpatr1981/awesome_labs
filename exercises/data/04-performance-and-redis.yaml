@@ -4,6 +4,8 @@ profile: docker
 order: 4
 exercises:
 
+# ===== Intermediate =====
+
 - id: data-026
   title: A tuning session, from plan to bloat
   difficulty: 3
@@ -190,6 +192,129 @@ exercises:
     # --- part 4: Clean up after the updates ---
     docker exec -i kl-pg psql -h 127.0.0.1 -U lab -d lab -qAt -c "VACUUM jobs_log"
     docker exec -i kl-pg psql -h 127.0.0.1 -U lab -d lab -qAt -c "ALTER TABLE jobs_log RESET (autovacuum_enabled)"
+
+- id: data-034
+  title: End of day on the shop's Redis
+  difficulty: 3
+  kind: build
+  tags: [redis, hyperloglog, hash, hincrby]
+  tutorial: |
+    **Concept.** Picking the right Redis structure turns a job that would need a lot of client-side bookkeeping into a couple of commands. Two end-of-day jobs show the range.
+
+    A **HyperLogLog** estimates the number of distinct elements in a tiny, fixed amount of memory. It stores no elements, so you can't list them, but several can be merged to count distinct elements across all of them. That matters because daily unique counts can't simply be added: a visitor who came on two days would be counted twice. The estimate has a small standard error, which is the price of the tiny size.
+
+    A **hash** stores many field/value pairs under one key. Single fields can be read, changed or removed atomically, without rewriting the whole object, so `HINCRBY` is safe even with several writers. It also returns the new value, which is useful when a result triggers a further step.
+
+    **Read up on:**
+    - `PFADD` and `PFCOUNT` — adding elements and reading the estimate
+    - `PFMERGE destkey sourcekey...` — union of several HyperLogLogs
+    - Why a plain sum of daily counts overcounts returning visitors
+    - `HGET`, `HGETALL` and `HLEN` — inspecting a hash
+    - `HINCRBY key field increment` — atomic arithmetic, negative values too
+    - `HDEL` — remove a single field
+    - Shell loops over `redis-cli` — applying many commands from a file
+  scenario: |
+    Redis is running in **`kl-redis`** (`docker exec -it kl-redis redis-cli`).
+
+    The shop's end-of-day job has been down since the weekend, and today's two steps have
+    to be run by hand.
+
+    ## Part 1: Unique visitors for the week
+
+    The HyperLogLogs **`kl:visitors:mon`**, **`kl:visitors:tue`** and **`kl:visitors:wed`**
+    hold the visitor IDs seen on each day. Some visitors came on several days.
+
+    1. Create the key **`kl:visitors:week`** holding the union of the three days.
+    2. Write the number of **distinct** visitors it reports (and only that number) to
+       **`/lab/visitors.txt`**.
+
+    ## Part 2: Apply the day's orders to the stock hash
+
+    The hash **`kl:stock`** maps a SKU to the number of units in the warehouse. The file
+    **`/lab/orders.txt`** lists the day's sales, one `sku quantity` per line. A SKU can
+    appear on several lines.
+
+    Subtract every sale from the stock. A SKU whose stock drops to **exactly zero** must be
+    removed from the hash completely, not left with a `0`. Apply each line once.
+  hints:
+    - "`PFMERGE kl:visitors:week kl:visitors:mon kl:visitors:tue kl:visitors:wed`, then `PFCOUNT kl:visitors:week` prints the estimate."
+    - "`HINCRBY kl:stock sku -3` subtracts three and returns the new value."
+    - "`HINCRBY` returns the new value, so you can test for zero and `HDEL` the field. Or apply all lines first and clean up afterwards."
+  solution: |
+    ```bash
+    # Part 1
+    docker exec kl-redis redis-cli PFMERGE kl:visitors:week kl:visitors:mon kl:visitors:tue kl:visitors:wed
+    docker exec kl-redis redis-cli PFCOUNT kl:visitors:week > /lab/visitors.txt
+
+    # Part 2
+    while read -r sku qty; do
+      docker exec kl-redis redis-cli HINCRBY kl:stock "$sku" "-$qty"
+    done < /lab/orders.txt
+    docker exec kl-redis redis-cli HGETALL kl:stock      # find the fields at 0, then:
+    docker exec kl-redis redis-cli HDEL kl:stock sku-x
+    ```
+  setup: |
+    docker run -d --name kl-redis redis:7.4-alpine >/dev/null
+    eventually 20 '[ "$(docker exec kl-redis redis-cli ping)" = PONG ]'
+
+    # --- part 1: Unique visitors for the week ---
+    add() { local key=$1 lo=$2 hi=$3 n=$4 args=() i; for i in $(shuf -i "$lo-$hi" -n "$n"); do args+=("v$i"); done
+            docker exec kl-redis redis-cli PFADD "$key" "${args[@]}" >/dev/null; }
+    add kl:visitors:mon 1 400 150
+    add kl:visitors:tue 100 500 150
+    add kl:visitors:wed 300 600 100
+    docker exec kl-redis redis-cli PFCOUNT kl:visitors:mon kl:visitors:tue kl:visitors:wed | tr -d '[:space:]' > "$KL_STATE/visitors"
+
+    # --- part 2: Apply the day's orders to the stock hash ---
+    : > "$KL_STATE/expected"
+    : > /lab/orders.txt
+    out=0
+    for sku in sku-a sku-b sku-c sku-d sku-e sku-f; do
+      s=$((RANDOM % 10 + 6))
+      docker exec kl-redis redis-cli HSET kl:stock "$sku" "$s" >/dev/null
+      if [ "$sku" = sku-c ]; then
+        a=$((RANDOM % (s - 1) + 1))
+        echo "$sku $a" >> /lab/orders.txt
+        echo "$sku $((s - a))" >> /lab/orders.txt
+      else
+        a=$((RANDOM % 2 + 1)); b=$((RANDOM % (s - 3) + 1))
+        echo "$sku $a" >> /lab/orders.txt
+        echo "$sku $b" >> /lab/orders.txt
+        echo "$sku $((s - a - b))" >> "$KL_STATE/expected"
+      fi
+    done
+    shuf /lab/orders.txt -o /lab/orders.txt
+    chown "$(lab_user)": /lab/orders.txt
+  check: |
+    info "Part 1: Unique visitors for the week"
+    want=$(cat "$KL_STATE/visitors")
+    check_eq "visitors.txt holds the distinct count" "$(tr -d '[:space:]' 2>/dev/null </lab/visitors.txt)" "$want"
+    check_eq "kl:visitors:week reports the same union" "$(docker exec kl-redis redis-cli PFCOUNT kl:visitors:week | tr -d '[:space:]')" "$want"
+
+    info "Part 2: Apply the day's orders to the stock hash"
+    n=$(wc -l < "$KL_STATE/expected")
+    check_eq "only the remaining SKUs are left" "$(docker exec kl-redis redis-cli HLEN kl:stock | tr -d '[:space:]')" "$n"
+    bad=0
+    while read -r sku qty; do
+      [ "$(docker exec kl-redis redis-cli HGET kl:stock "$sku" | tr -d '[:space:]')" = "$qty" ] || bad=$((bad + 1))
+    done < "$KL_STATE/expected"
+    check_eq "stock levels are right" "$bad" 0
+  solve: |
+    # --- part 1: Unique visitors for the week ---
+    docker exec kl-redis redis-cli PFMERGE kl:visitors:week kl:visitors:mon kl:visitors:tue kl:visitors:wed
+    docker exec kl-redis redis-cli PFCOUNT kl:visitors:week > /lab/visitors.txt
+
+    # --- part 2: Apply the day's orders to the stock hash ---
+    while read -r sku qty; do
+      docker exec kl-redis redis-cli HINCRBY kl:stock "$sku" "-$qty" >/dev/null
+    done < /lab/orders.txt
+    for f in $(docker exec kl-redis redis-cli HKEYS kl:stock); do
+      if [ "$(docker exec kl-redis redis-cli HGET kl:stock "$f")" = 0 ]; then
+        docker exec kl-redis redis-cli HDEL kl:stock "$f" >/dev/null
+      fi
+    done
+
+# ===== Advanced =====
 
 - id: data-030
   title: Let the database do the work
@@ -414,124 +539,3 @@ exercises:
     check_eq "best trailing-week day" "$(tr -d '[:space:]' 2>/dev/null </lab/answer.txt)" "$(cat "$KL_STATE/answer")"
   solve: |
     docker exec kl-pg psql -h 127.0.0.1 -U lab -d lab -qAt -c "SELECT day FROM (SELECT day, row_number() OVER w AS rn, avg(amount) OVER w AS a FROM daily_sales WINDOW w AS (ORDER BY day ROWS BETWEEN 6 PRECEDING AND CURRENT ROW)) s WHERE rn >= 7 ORDER BY a DESC LIMIT 1" > /lab/answer.txt
-
-- id: data-034
-  title: End of day on the shop's Redis
-  difficulty: 3
-  kind: build
-  tags: [redis, hyperloglog, hash, hincrby]
-  tutorial: |
-    **Concept.** Picking the right Redis structure turns a job that would need a lot of client-side bookkeeping into a couple of commands. Two end-of-day jobs show the range.
-
-    A **HyperLogLog** estimates the number of distinct elements in a tiny, fixed amount of memory. It stores no elements, so you can't list them, but several can be merged to count distinct elements across all of them. That matters because daily unique counts can't simply be added: a visitor who came on two days would be counted twice. The estimate has a small standard error, which is the price of the tiny size.
-
-    A **hash** stores many field/value pairs under one key. Single fields can be read, changed or removed atomically, without rewriting the whole object, so `HINCRBY` is safe even with several writers. It also returns the new value, which is useful when a result triggers a further step.
-
-    **Read up on:**
-    - `PFADD` and `PFCOUNT` — adding elements and reading the estimate
-    - `PFMERGE destkey sourcekey...` — union of several HyperLogLogs
-    - Why a plain sum of daily counts overcounts returning visitors
-    - `HGET`, `HGETALL` and `HLEN` — inspecting a hash
-    - `HINCRBY key field increment` — atomic arithmetic, negative values too
-    - `HDEL` — remove a single field
-    - Shell loops over `redis-cli` — applying many commands from a file
-  scenario: |
-    Redis is running in **`kl-redis`** (`docker exec -it kl-redis redis-cli`).
-
-    The shop's end-of-day job has been down since the weekend, and today's two steps have
-    to be run by hand.
-
-    ## Part 1: Unique visitors for the week
-
-    The HyperLogLogs **`kl:visitors:mon`**, **`kl:visitors:tue`** and **`kl:visitors:wed`**
-    hold the visitor IDs seen on each day. Some visitors came on several days.
-
-    1. Create the key **`kl:visitors:week`** holding the union of the three days.
-    2. Write the number of **distinct** visitors it reports (and only that number) to
-       **`/lab/visitors.txt`**.
-
-    ## Part 2: Apply the day's orders to the stock hash
-
-    The hash **`kl:stock`** maps a SKU to the number of units in the warehouse. The file
-    **`/lab/orders.txt`** lists the day's sales, one `sku quantity` per line. A SKU can
-    appear on several lines.
-
-    Subtract every sale from the stock. A SKU whose stock drops to **exactly zero** must be
-    removed from the hash completely, not left with a `0`. Apply each line once.
-  hints:
-    - "`PFMERGE kl:visitors:week kl:visitors:mon kl:visitors:tue kl:visitors:wed`, then `PFCOUNT kl:visitors:week` prints the estimate."
-    - "`HINCRBY kl:stock sku -3` subtracts three and returns the new value."
-    - "`HINCRBY` returns the new value, so you can test for zero and `HDEL` the field. Or apply all lines first and clean up afterwards."
-  solution: |
-    ```bash
-    # Part 1
-    docker exec kl-redis redis-cli PFMERGE kl:visitors:week kl:visitors:mon kl:visitors:tue kl:visitors:wed
-    docker exec kl-redis redis-cli PFCOUNT kl:visitors:week > /lab/visitors.txt
-
-    # Part 2
-    while read -r sku qty; do
-      docker exec kl-redis redis-cli HINCRBY kl:stock "$sku" "-$qty"
-    done < /lab/orders.txt
-    docker exec kl-redis redis-cli HGETALL kl:stock      # find the fields at 0, then:
-    docker exec kl-redis redis-cli HDEL kl:stock sku-x
-    ```
-  setup: |
-    docker run -d --name kl-redis redis:7.4-alpine >/dev/null
-    eventually 20 '[ "$(docker exec kl-redis redis-cli ping)" = PONG ]'
-
-    # --- part 1: Unique visitors for the week ---
-    add() { local key=$1 lo=$2 hi=$3 n=$4 args=() i; for i in $(shuf -i "$lo-$hi" -n "$n"); do args+=("v$i"); done
-            docker exec kl-redis redis-cli PFADD "$key" "${args[@]}" >/dev/null; }
-    add kl:visitors:mon 1 400 150
-    add kl:visitors:tue 100 500 150
-    add kl:visitors:wed 300 600 100
-    docker exec kl-redis redis-cli PFCOUNT kl:visitors:mon kl:visitors:tue kl:visitors:wed | tr -d '[:space:]' > "$KL_STATE/visitors"
-
-    # --- part 2: Apply the day's orders to the stock hash ---
-    : > "$KL_STATE/expected"
-    : > /lab/orders.txt
-    out=0
-    for sku in sku-a sku-b sku-c sku-d sku-e sku-f; do
-      s=$((RANDOM % 10 + 6))
-      docker exec kl-redis redis-cli HSET kl:stock "$sku" "$s" >/dev/null
-      if [ "$sku" = sku-c ]; then
-        a=$((RANDOM % (s - 1) + 1))
-        echo "$sku $a" >> /lab/orders.txt
-        echo "$sku $((s - a))" >> /lab/orders.txt
-      else
-        a=$((RANDOM % 2 + 1)); b=$((RANDOM % (s - 3) + 1))
-        echo "$sku $a" >> /lab/orders.txt
-        echo "$sku $b" >> /lab/orders.txt
-        echo "$sku $((s - a - b))" >> "$KL_STATE/expected"
-      fi
-    done
-    shuf /lab/orders.txt -o /lab/orders.txt
-    chown "$(lab_user)": /lab/orders.txt
-  check: |
-    info "Part 1: Unique visitors for the week"
-    want=$(cat "$KL_STATE/visitors")
-    check_eq "visitors.txt holds the distinct count" "$(tr -d '[:space:]' 2>/dev/null </lab/visitors.txt)" "$want"
-    check_eq "kl:visitors:week reports the same union" "$(docker exec kl-redis redis-cli PFCOUNT kl:visitors:week | tr -d '[:space:]')" "$want"
-
-    info "Part 2: Apply the day's orders to the stock hash"
-    n=$(wc -l < "$KL_STATE/expected")
-    check_eq "only the remaining SKUs are left" "$(docker exec kl-redis redis-cli HLEN kl:stock | tr -d '[:space:]')" "$n"
-    bad=0
-    while read -r sku qty; do
-      [ "$(docker exec kl-redis redis-cli HGET kl:stock "$sku" | tr -d '[:space:]')" = "$qty" ] || bad=$((bad + 1))
-    done < "$KL_STATE/expected"
-    check_eq "stock levels are right" "$bad" 0
-  solve: |
-    # --- part 1: Unique visitors for the week ---
-    docker exec kl-redis redis-cli PFMERGE kl:visitors:week kl:visitors:mon kl:visitors:tue kl:visitors:wed
-    docker exec kl-redis redis-cli PFCOUNT kl:visitors:week > /lab/visitors.txt
-
-    # --- part 2: Apply the day's orders to the stock hash ---
-    while read -r sku qty; do
-      docker exec kl-redis redis-cli HINCRBY kl:stock "$sku" "-$qty" >/dev/null
-    done < /lab/orders.txt
-    for f in $(docker exec kl-redis redis-cli HKEYS kl:stock); do
-      if [ "$(docker exec kl-redis redis-cli HGET kl:stock "$f")" = 0 ]; then
-        docker exec kl-redis redis-cli HDEL kl:stock "$f" >/dev/null
-      fi
-    done

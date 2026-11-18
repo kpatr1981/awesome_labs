@@ -4,6 +4,8 @@ profile: k8s
 order: 6
 exercises:
 
+# ===== Beginner =====
+
 - id: k8s-101
   title: A volume that outlives the pod
   difficulty: 1
@@ -217,122 +219,6 @@ exercises:
     sleep 2
     kubectl apply -f /lab/pvc.json
 
-- id: k8s-104
-  title: Triage three storage faults
-  difficulty: 3
-  kind: fix
-  tags: [pv, pvc, access-modes, finalizers, resourcequota, triage]
-  tutorial: |
-    **Concept.** Storage problems rarely announce themselves; they show up as a claim stuck in `Pending`, a claim stuck in `Terminating`, or a request the API server refuses. Each has a different cause:
-
-    - A claim only binds to a volume that offers the access modes, size and class it asks for. Access modes (ReadWriteOnce, ReadWriteMany, ReadOnlyMany) describe how many nodes may mount a volume at once, and most claim fields cannot be edited in place.
-    - Kubernetes protects a claim that is in use: a finalizer keeps the PVC in `Terminating` until no pod uses it. Finalizers are a safety mechanism, so understand what they guard before touching them.
-    - A ResourceQuota caps aggregate consumption in a namespace, including storage and object counts. The API server rejects requests that would exceed it at admission time.
-
-    **Read up on:**
-    - `kubectl get pv,pvc -A -o wide` — compare access modes and classes side by side
-    - `kubectl describe pvc` — events say why a claim is Pending; Used By and finalizers explain Terminating
-    - `kubectl explain pvc.spec.accessModes` and `kubectl replace --help` — allowed values, and recreating an object
-    - `kubectl create quota --help` and `kubectl describe quota -n NS` — keys for `--hard`, Used versus Hard
-    - Kubernetes docs: Persistent Volumes (Access Modes), Storage Object in Use Protection, Resource Quotas
-  scenario: |
-    Three tickets landed on your desk, one per namespace. Fix all three.
-
-    1. **`cms`** — the PVC **`shared-assets`** stays `Pending` although a matching
-       hand-made PV **`assets-pv`** (5Gi, class `manual`) is `Available`. The volume will
-       only ever be mounted by a single pod at a time. Fix the **claim** (not the PV) so
-       it binds to `assets-pv`.
-    2. **`scratch`** — you ran `kubectl delete pvc tmp-scratch -n scratch` ten minutes ago
-       and it still shows `Terminating`. Nobody needs that data. Find what is holding it
-       and get the PVC deleted **properly** (don't strip finalizers by hand).
-    3. **`interns`** — this team keeps creating huge volumes. Limit the namespace to at
-       most **3 PVCs** and **2Gi of requested storage in total**. Then verify that a PVC
-       of 3Gi is **rejected** by the API.
-  hints:
-    - "1: compare `kubectl get pv assets-pv -o jsonpath='{.spec.accessModes}'` with the PVC's access modes; the claim's modes are immutable, so recreate it."
-    - "2: `kubectl describe pvc tmp-scratch -n scratch` shows *Used By*; the `kubernetes.io/pvc-protection` finalizer waits for that pod to go away."
-    - "3: ResourceQuota keys are `persistentvolumeclaims` and `requests.storage`; `kubectl create quota --hard=...` does it in one line."
-  solution: |
-    ```bash
-    # 1) claim asks ReadWriteMany, PV offers ReadWriteOnce -> recreate the claim as RWO
-    kubectl get pv assets-pv -o jsonpath='{.spec.accessModes}'
-    kubectl get pvc shared-assets -n cms -o jsonpath='{.spec.accessModes}'
-    kubectl get pvc shared-assets -n cms -o json | jq 'del(.status, .metadata.resourceVersion, .metadata.uid, .metadata.creationTimestamp) | .spec.accessModes=["ReadWriteOnce"]' > /lab/pvc.json
-    kubectl replace --force -f /lab/pvc.json
-
-    # 2) a pod still uses the claim -> remove the pod, the finalizer lets go by itself
-    kubectl describe pvc tmp-scratch -n scratch | grep -i 'used by'
-    kubectl delete pod scratch-runner -n scratch
-
-    # 3) quota
-    kubectl create quota storage -n interns --hard=persistentvolumeclaims=3,requests.storage=2Gi
-    ```
-  setup: |
-    k_ns cms
-    k_ns scratch
-    k_ns interns
-    on_reset 'kubectl delete pv assets-pv --ignore-not-found --wait=false'
-    kubectl apply -f - >/dev/null <<'EOF'
-    apiVersion: v1
-    kind: PersistentVolume
-    metadata: {name: assets-pv}
-    spec:
-      capacity: {storage: 5Gi}
-      accessModes: [ReadWriteOnce]
-      storageClassName: manual
-      hostPath: {path: /tmp/assets}
-    ---
-    apiVersion: v1
-    kind: PersistentVolumeClaim
-    metadata: {name: shared-assets, namespace: cms}
-    spec:
-      storageClassName: manual
-      accessModes: [ReadWriteMany]
-      resources: {requests: {storage: 5Gi}}
-    ---
-    apiVersion: v1
-    kind: PersistentVolumeClaim
-    metadata: {name: tmp-scratch, namespace: scratch}
-    spec:
-      accessModes: [ReadWriteOnce]
-      resources: {requests: {storage: 100Mi}}
-    ---
-    apiVersion: v1
-    kind: Pod
-    metadata: {name: scratch-runner, namespace: scratch}
-    spec:
-      terminationGracePeriodSeconds: 2
-      containers:
-      - {name: s, image: "busybox:1.37", command: ["sleep", "infinity"], volumeMounts: [{name: d, mountPath: /scratch}]}
-      volumes:
-      - {name: d, persistentVolumeClaim: {claimName: tmp-scratch}}
-    EOF
-    kubectl -n scratch wait --for=condition=Ready pod/scratch-runner --timeout=90s >/dev/null
-    kubectl -n scratch delete pvc tmp-scratch --wait=false >/dev/null
-  check: |
-    eventually 15 '[ "$(kj -n cms pvc shared-assets "{.status.phase}")" = Bound ]'
-    check_eq "shared-assets bound to assets-pv" "$(kj -n cms pvc shared-assets '{.status.phase} {.spec.volumeName}')" "Bound assets-pv"
-    check_eq "PV unchanged" "$(kj pv assets-pv '{.spec.accessModes[*]}')" "ReadWriteOnce"
-    eventually 30 '! k_exists -n scratch pvc tmp-scratch'
-    check "tmp-scratch PVC is gone" '! k_exists -n scratch pvc tmp-scratch'
-    check "the pod using it is gone" '! k_exists -n scratch pod scratch-runner'
-    q=$(kubectl -n interns get resourcequota -o json | jq -c '[.items[].spec.hard] | add')
-    check_eq "PVC count limit" "$(jq -r '.persistentvolumeclaims' <<<"$q")" "3"
-    check_eq "storage limit" "$(jq -r '."requests.storage"' <<<"$q")" "2Gi"
-    check_not "a 3Gi PVC is rejected" 'kubectl create --dry-run=server -f - <<EOF
-    apiVersion: v1
-    kind: PersistentVolumeClaim
-    metadata: {name: kl-big, namespace: interns}
-    spec:
-      accessModes: [ReadWriteOnce]
-      resources: {requests: {storage: 3Gi}}
-    EOF'
-  solve: |
-    kubectl get pvc shared-assets -n cms -o json | jq 'del(.status, .metadata.resourceVersion, .metadata.uid, .metadata.creationTimestamp) | .spec.accessModes=["ReadWriteOnce"]' > /lab/pvc.json
-    kubectl replace --force -f /lab/pvc.json
-    kubectl delete pod scratch-runner -n scratch
-    kubectl create quota storage -n interns --hard=persistentvolumeclaims=3,requests.storage=2Gi
-
 - id: k8s-105
   title: A storage class that keeps your data
   difficulty: 2
@@ -377,70 +263,6 @@ exercises:
     provisioner: rancher.io/local-path
     reclaimPolicy: Retain
     volumeBindingMode: WaitForFirstConsumer
-    EOF
-
-- id: k8s-106
-  title: Change the default storage class
-  difficulty: 3
-  kind: build
-  tags: [storageclass, default]
-  tutorial: |
-    **Concept.** The default StorageClass is chosen by an annotation on the class object. Claims that omit storageClassName get the default at creation time. Having two defaults is ambiguous and should be avoided.
-
-    **Read up on:**
-    - `kubectl get storageclass` — a `(default)` marker shows the current default
-    - `kubectl annotate --help` — adding or overwriting annotations
-    - `kubectl get sc NAME -o yaml` — find the relevant annotation under metadata
-    - Kubernetes docs: Change the default StorageClass
-  scenario: |
-    Company policy: PVCs that don't name a class must get **Retain** semantics. The
-    class **`safe-local`** (Retain, local-path) exists.
-
-    Make **`safe-local`** the cluster's **only** default storage class. Then create a PVC
-    **`probe`** in namespace **`policy`** (100Mi, no `storageClassName`) to prove that new
-    claims get it.
-  hints:
-    - "The default is marked by the annotation `storageclass.kubernetes.io/is-default-class: \"true\"`."
-    - "Remove it (or set it to `\"false\"`) on `local-path` — two defaults is ambiguous."
-  solution: |
-    ```bash
-    kubectl annotate sc local-path storageclass.kubernetes.io/is-default-class=false --overwrite
-    kubectl annotate sc safe-local storageclass.kubernetes.io/is-default-class=true --overwrite
-    kubectl create -f - <<'EOF'
-    apiVersion: v1
-    kind: PersistentVolumeClaim
-    metadata: {name: probe, namespace: policy}
-    spec:
-      accessModes: [ReadWriteOnce]
-      resources: {requests: {storage: 100Mi}}
-    EOF
-    kubectl get pvc probe -n policy -o jsonpath='{.spec.storageClassName}'   # safe-local
-    ```
-  setup: |
-    k_ns policy
-    on_reset 'kubectl annotate sc local-path storageclass.kubernetes.io/is-default-class=true --overwrite'
-    kubectl apply -f - >/dev/null <<'EOF'
-    apiVersion: storage.k8s.io/v1
-    kind: StorageClass
-    metadata: {name: safe-local}
-    provisioner: rancher.io/local-path
-    reclaimPolicy: Retain
-    volumeBindingMode: WaitForFirstConsumer
-    EOF
-  check: |
-    d=$(kubectl get sc -o json | jq -r '.items[] | select(.metadata.annotations["storageclass.kubernetes.io/is-default-class"]=="true") | .metadata.name' | tr '\n' ' ')
-    check_eq "default classes" "$d" "safe-local "
-    check_eq "new PVC got safe-local" "$(kj -n policy pvc probe '{.spec.storageClassName}')" "safe-local"
-  solve: |
-    kubectl annotate sc local-path storageclass.kubernetes.io/is-default-class=false --overwrite
-    kubectl annotate sc safe-local storageclass.kubernetes.io/is-default-class=true --overwrite
-    kubectl apply -f - <<'EOF'
-    apiVersion: v1
-    kind: PersistentVolumeClaim
-    metadata: {name: probe, namespace: policy}
-    spec:
-      accessModes: [ReadWriteOnce]
-      resources: {requests: {storage: 100Mi}}
     EOF
 
 - id: k8s-107
@@ -512,79 +334,6 @@ exercises:
       - {name: r, image: "busybox:1.37", command: ["sleep", "3600"], volumeMounts: [{name: d, mountPath: /data}]}
       volumes: [{name: d, persistentVolumeClaim: {claimName: journal}}]
     EOF
-
-- id: k8s-108
-  title: Reuse a retained volume
-  difficulty: 3
-  kind: fix
-  tags: [pv, retain, claimref, released]
-  tutorial: |
-    **Concept.** When a PVC bound to a Retain volume is deleted, the PV keeps its data but moves to the Released phase and still remembers the old claim. Kubernetes will not hand a Released volume to a new claim automatically.
-
-    **Read up on:**
-    - `kubectl get pv NAME -o yaml` — inspect `spec` and `status.phase` for hints about the old owner
-    - `kubectl explain pv.spec.claimRef` — what this field records
-    - `kubectl patch --help` — JSON patch and merge patch types
-    - Kubernetes docs: Persistent Volumes, Reclaiming
-  scenario: |
-    Someone deleted the PVC of the old reporting database. Its PV **`reports-pv`**
-    (reclaim policy Retain) still holds the data, but it's stuck in **`Released`**, so the
-    new PVC **`reports-data`** (namespace **`bi`**) stays `Pending`.
-
-    Make **`reports-data`** bind to **`reports-pv`** — keeping the data. Don't delete or
-    recreate the PV.
-  hints:
-    - "A Released PV still has `spec.claimRef` pointing at the deleted PVC (by UID)."
-    - "Clear the claimRef to make it `Available` again: `kubectl patch pv reports-pv --type=json -p '[{\"op\":\"remove\",\"path\":\"/spec/claimRef\"}]'`"
-  solution: |
-    ```bash
-    kubectl get pv reports-pv -o jsonpath='{.status.phase} {.spec.claimRef.name} {.spec.claimRef.uid}'
-    kubectl patch pv reports-pv --type=json -p '[{"op":"remove","path":"/spec/claimRef"}]'
-    kubectl get pvc reports-data -n bi -w
-    ```
-    In production, double-check that the data really belongs to the new claim before
-    re-binding a Released volume.
-  setup: |
-    k_ns bi
-    kubectl apply -f - >/dev/null <<'EOF'
-    apiVersion: v1
-    kind: PersistentVolume
-    metadata: {name: reports-pv}
-    spec:
-      capacity: {storage: 1Gi}
-      accessModes: [ReadWriteOnce]
-      persistentVolumeReclaimPolicy: Retain
-      storageClassName: manual
-      hostPath: {path: /tmp/reports-pv}
-    ---
-    apiVersion: v1
-    kind: PersistentVolumeClaim
-    metadata: {name: reports-old, namespace: bi}
-    spec:
-      storageClassName: manual
-      volumeName: reports-pv
-      accessModes: [ReadWriteOnce]
-      resources: {requests: {storage: 1Gi}}
-    EOF
-    eventually 30 '[ "$(kj -n bi pvc reports-old "{.status.phase}")" = Bound ]'
-    kubectl -n bi delete pvc reports-old >/dev/null
-    eventually 30 '[ "$(kj pv reports-pv "{.status.phase}")" = Released ]'
-    kubectl apply -f - >/dev/null <<'EOF'
-    apiVersion: v1
-    kind: PersistentVolumeClaim
-    metadata: {name: reports-data, namespace: bi}
-    spec:
-      storageClassName: manual
-      accessModes: [ReadWriteOnce]
-      resources: {requests: {storage: 1Gi}}
-    EOF
-    kj pv reports-pv '{.metadata.uid}' > $KL_STATE/answer
-  check: |
-    check_eq "same PV object" "$(kj pv reports-pv '{.metadata.uid}')" "$(cat $KL_STATE/answer)"
-    eventually 20 '[ "$(kj -n bi pvc reports-data "{.status.phase}")" = Bound ]'
-    check_eq "reports-data bound to reports-pv" "$(kj -n bi pvc reports-data '{.status.phase} {.spec.volumeName}')" "Bound reports-pv"
-  solve: |
-    kubectl patch pv reports-pv --type=json -p '[{"op":"remove","path":"/spec/claimRef"}]'
 
 - id: k8s-109
   title: A RAM disk for the cache
@@ -707,97 +456,6 @@ exercises:
         persistentVolumeClaim: {claimName: blog-data}
     EOF
 
-- id: k8s-111
-  title: A StatefulSet with its own disks
-  difficulty: 3
-  kind: build
-  tags: [statefulset, volumeClaimTemplates, headless]
-  tutorial: |
-    **Concept.** A StatefulSet gives each replica a stable name and, through volumeClaimTemplates, its own PVC created automatically. A headless Service (no cluster IP) provides stable per-pod DNS names.
-
-    **Read up on:**
-    - `kubectl explain statefulset.spec.volumeClaimTemplates` — a PVC template per replica
-    - `kubectl explain service.spec.clusterIP` — what a headless service is
-    - `kubectl get pvc,pods` — how claim names are derived from template and pod names
-    - Kubernetes docs: StatefulSet basics
-  scenario: |
-    Deploy a tiny replicated key-value store in namespace **`kv`**:
-
-    - headless service **`kv`** (port 6379)
-    - StatefulSet **`kv`** with **2 replicas** of `redis:7.4-alpine`, `serviceName: kv`
-    - each replica gets **its own 100Mi PVC** named `data-kv-0` / `data-kv-1`, mounted at
-      `/data`
-  hints:
-    - "`volumeClaimTemplates: [{metadata: {name: data}, spec: {...}}]` — PVC names are `<template>-<sts>-<ordinal>`."
-  solution: |
-    ```yaml
-    apiVersion: v1
-    kind: Service
-    metadata: {name: kv, namespace: kv}
-    spec:
-      clusterIP: None
-      selector: {app: kv}
-      ports: [{port: 6379}]
-    ---
-    apiVersion: apps/v1
-    kind: StatefulSet
-    metadata: {name: kv, namespace: kv}
-    spec:
-      serviceName: kv
-      replicas: 2
-      selector: {matchLabels: {app: kv}}
-      template:
-        metadata: {labels: {app: kv}}
-        spec:
-          containers:
-          - name: redis
-            image: redis:7.4-alpine
-            volumeMounts: [{name: data, mountPath: /data}]
-      volumeClaimTemplates:
-      - metadata: {name: data}
-        spec:
-          accessModes: [ReadWriteOnce]
-          resources: {requests: {storage: 100Mi}}
-    ```
-  setup: |
-    k_ns kv
-  check: |
-    check_eq "headless service" "$(kj -n kv svc kv '{.spec.clusterIP}')" "None"
-    k_exists -n kv sts kv && wait_pods kv app=kv 120 && eventually 60 '[ "$(kj -n kv sts kv "{.status.readyReplicas}")" = 2 ]'
-    check_eq "2 ready replicas" "$(kj -n kv sts kv '{.status.readyReplicas}')" "2"
-    for i in 0 1; do check "data-kv-$i bound" "[ \"\$(kj -n kv pvc data-kv-$i '{.status.phase}')\" = Bound ]"; done
-    check "kv-0 resolvable as kv-0.kv" 'kubectl -n kv exec kv-1 -- redis-cli -h kv-0.kv ping | grep -q PONG'
-  solve: |
-    kubectl apply -f - <<'EOF'
-    apiVersion: v1
-    kind: Service
-    metadata: {name: kv, namespace: kv}
-    spec:
-      clusterIP: None
-      selector: {app: kv}
-      ports: [{port: 6379}]
-    ---
-    apiVersion: apps/v1
-    kind: StatefulSet
-    metadata: {name: kv, namespace: kv}
-    spec:
-      serviceName: kv
-      replicas: 2
-      selector: {matchLabels: {app: kv}}
-      template:
-        metadata: {labels: {app: kv}}
-        spec:
-          containers:
-          - name: redis
-            image: redis:7.4-alpine
-            volumeMounts: [{name: data, mountPath: /data}]
-      volumeClaimTemplates:
-      - metadata: {name: data}
-        spec:
-          accessModes: [ReadWriteOnce]
-          resources: {requests: {storage: 100Mi}}
-    EOF
-
 - id: k8s-112
   title: Who's using that volume?
   difficulty: 2
@@ -870,103 +528,6 @@ exercises:
     PV=$(kubectl get pvc orders-db -n shop -o jsonpath='{.spec.volumeName}'); echo $PV > /lab/pv-name.txt
     kubectl get pv $PV -o jsonpath='{.spec.nodeAffinity.required.nodeSelectorTerms[0].matchExpressions[0].values[0]}' > /lab/pv-node.txt
     kubectl get pods -n shop -o json | jq -r '.items[] | select(any(.spec.volumes[]?; .persistentVolumeClaim.claimName=="orders-db")) | .metadata.name' > /lab/pv-pod.txt
-
-- id: k8s-113
-  title: A local disk on a specific node
-  difficulty: 3
-  kind: build
-  tags: [local-pv, storageclass, node-affinity]
-  tutorial: |
-    **Concept.** A local PersistentVolume represents a disk on one specific node and needs node affinity so the scheduler places pods there. With no dynamic provisioner, the class uses WaitForFirstConsumer so binding waits for the pod's placement.
-
-    **Read up on:**
-    - `kubectl explain pv.spec.local` — path for local volumes
-    - `kubectl explain pv.spec.nodeAffinity.required.nodeSelectorTerms` — matching node labels
-    - `kubectl get nodes --show-labels` — find a label that identifies a node
-    - Kubernetes docs: Volumes, local; Storage Classes, no-provisioner
-  scenario: |
-    node01 has a fast disk mounted at **`/mnt/disks/ssd1`**. Expose it as a **local
-    persistent volume** — the scheduler must automatically place pods using it on node01.
-
-    - StorageClass **`local-ssd`**: `provisioner: kubernetes.io/no-provisioner`,
-      `volumeBindingMode: WaitForFirstConsumer`
-    - PV **`ssd1`**: 1Gi, RWO, class `local-ssd`, **`local.path: /mnt/disks/ssd1`**, with a
-      node affinity for node01
-    - PVC **`fast`** + pod **`indexer`** (`busybox:1.37`, `sleep 3600`) in namespace
-      **`search`**, mounting it at `/index`
-  hints:
-    - "A `local` PV *requires* `spec.nodeAffinity.required.nodeSelectorTerms`."
-  solution: |
-    ```yaml
-    apiVersion: storage.k8s.io/v1
-    kind: StorageClass
-    metadata: {name: local-ssd}
-    provisioner: kubernetes.io/no-provisioner
-    volumeBindingMode: WaitForFirstConsumer
-    ---
-    apiVersion: v1
-    kind: PersistentVolume
-    metadata: {name: ssd1}
-    spec:
-      capacity: {storage: 1Gi}
-      accessModes: [ReadWriteOnce]
-      storageClassName: local-ssd
-      local: {path: /mnt/disks/ssd1}
-      nodeAffinity:
-        required:
-          nodeSelectorTerms:
-          - matchExpressions:
-            - {key: kubernetes.io/hostname, operator: In, values: [node01]}
-    ```
-  setup: |
-    k_ns search
-  setup_worker: |
-    mkdir -p /mnt/disks/ssd1
-    on_reset 'rm -rf /mnt/disks'
-  check: |
-    check_eq "PV local path" "$(kj pv ssd1 '{.spec.local.path}')" "/mnt/disks/ssd1"
-    check_eq "SC provisioner" "$(kj sc local-ssd '{.provisioner}')" "kubernetes.io/no-provisioner"
-    wait_pod search indexer 90
-    check_eq "fast bound to ssd1" "$(kj -n search pvc fast '{.status.phase} {.spec.volumeName}')" "Bound ssd1"
-    check "indexer runs on node01" '[ "$(kj -n search pod indexer "{.spec.nodeName}")" = node01 ] && pod_ready search indexer'
-  solve: |
-    kubectl apply -f - <<'EOF'
-    apiVersion: storage.k8s.io/v1
-    kind: StorageClass
-    metadata: {name: local-ssd}
-    provisioner: kubernetes.io/no-provisioner
-    volumeBindingMode: WaitForFirstConsumer
-    ---
-    apiVersion: v1
-    kind: PersistentVolume
-    metadata: {name: ssd1}
-    spec:
-      capacity: {storage: 1Gi}
-      accessModes: [ReadWriteOnce]
-      storageClassName: local-ssd
-      local: {path: /mnt/disks/ssd1}
-      nodeAffinity:
-        required:
-          nodeSelectorTerms:
-          - matchExpressions:
-            - {key: kubernetes.io/hostname, operator: In, values: [node01]}
-    ---
-    apiVersion: v1
-    kind: PersistentVolumeClaim
-    metadata: {name: fast, namespace: search}
-    spec:
-      storageClassName: local-ssd
-      accessModes: [ReadWriteOnce]
-      resources: {requests: {storage: 1Gi}}
-    ---
-    apiVersion: v1
-    kind: Pod
-    metadata: {name: indexer, namespace: search}
-    spec:
-      containers:
-      - {name: i, image: "busybox:1.37", command: ["sleep", "3600"], volumeMounts: [{name: d, mountPath: /index}]}
-      volumes: [{name: d, persistentVolumeClaim: {claimName: fast}}]
-    EOF
 
 - id: k8s-114
   title: Only one pod may write
@@ -1100,6 +661,449 @@ exercises:
       volumes:
       - name: content
         persistentVolumeClaim: {claimName: site-content}
+    EOF
+
+# ===== Intermediate =====
+
+- id: k8s-104
+  title: Triage three storage faults
+  difficulty: 3
+  kind: fix
+  tags: [pv, pvc, access-modes, finalizers, resourcequota, triage]
+  tutorial: |
+    **Concept.** Storage problems rarely announce themselves; they show up as a claim stuck in `Pending`, a claim stuck in `Terminating`, or a request the API server refuses. Each has a different cause:
+
+    - A claim only binds to a volume that offers the access modes, size and class it asks for. Access modes (ReadWriteOnce, ReadWriteMany, ReadOnlyMany) describe how many nodes may mount a volume at once, and most claim fields cannot be edited in place.
+    - Kubernetes protects a claim that is in use: a finalizer keeps the PVC in `Terminating` until no pod uses it. Finalizers are a safety mechanism, so understand what they guard before touching them.
+    - A ResourceQuota caps aggregate consumption in a namespace, including storage and object counts. The API server rejects requests that would exceed it at admission time.
+
+    **Read up on:**
+    - `kubectl get pv,pvc -A -o wide` — compare access modes and classes side by side
+    - `kubectl describe pvc` — events say why a claim is Pending; Used By and finalizers explain Terminating
+    - `kubectl explain pvc.spec.accessModes` and `kubectl replace --help` — allowed values, and recreating an object
+    - `kubectl create quota --help` and `kubectl describe quota -n NS` — keys for `--hard`, Used versus Hard
+    - Kubernetes docs: Persistent Volumes (Access Modes), Storage Object in Use Protection, Resource Quotas
+  scenario: |
+    Three tickets landed on your desk, one per namespace. Fix all three.
+
+    1. **`cms`** — the PVC **`shared-assets`** stays `Pending` although a matching
+       hand-made PV **`assets-pv`** (5Gi, class `manual`) is `Available`. The volume will
+       only ever be mounted by a single pod at a time. Fix the **claim** (not the PV) so
+       it binds to `assets-pv`.
+    2. **`scratch`** — you ran `kubectl delete pvc tmp-scratch -n scratch` ten minutes ago
+       and it still shows `Terminating`. Nobody needs that data. Find what is holding it
+       and get the PVC deleted **properly** (don't strip finalizers by hand).
+    3. **`interns`** — this team keeps creating huge volumes. Limit the namespace to at
+       most **3 PVCs** and **2Gi of requested storage in total**. Then verify that a PVC
+       of 3Gi is **rejected** by the API.
+  hints:
+    - "1: compare `kubectl get pv assets-pv -o jsonpath='{.spec.accessModes}'` with the PVC's access modes; the claim's modes are immutable, so recreate it."
+    - "2: `kubectl describe pvc tmp-scratch -n scratch` shows *Used By*; the `kubernetes.io/pvc-protection` finalizer waits for that pod to go away."
+    - "3: ResourceQuota keys are `persistentvolumeclaims` and `requests.storage`; `kubectl create quota --hard=...` does it in one line."
+  solution: |
+    ```bash
+    # 1) claim asks ReadWriteMany, PV offers ReadWriteOnce -> recreate the claim as RWO
+    kubectl get pv assets-pv -o jsonpath='{.spec.accessModes}'
+    kubectl get pvc shared-assets -n cms -o jsonpath='{.spec.accessModes}'
+    kubectl get pvc shared-assets -n cms -o json | jq 'del(.status, .metadata.resourceVersion, .metadata.uid, .metadata.creationTimestamp) | .spec.accessModes=["ReadWriteOnce"]' > /lab/pvc.json
+    kubectl replace --force -f /lab/pvc.json
+
+    # 2) a pod still uses the claim -> remove the pod, the finalizer lets go by itself
+    kubectl describe pvc tmp-scratch -n scratch | grep -i 'used by'
+    kubectl delete pod scratch-runner -n scratch
+
+    # 3) quota
+    kubectl create quota storage -n interns --hard=persistentvolumeclaims=3,requests.storage=2Gi
+    ```
+  setup: |
+    k_ns cms
+    k_ns scratch
+    k_ns interns
+    on_reset 'kubectl delete pv assets-pv --ignore-not-found --wait=false'
+    kubectl apply -f - >/dev/null <<'EOF'
+    apiVersion: v1
+    kind: PersistentVolume
+    metadata: {name: assets-pv}
+    spec:
+      capacity: {storage: 5Gi}
+      accessModes: [ReadWriteOnce]
+      storageClassName: manual
+      hostPath: {path: /tmp/assets}
+    ---
+    apiVersion: v1
+    kind: PersistentVolumeClaim
+    metadata: {name: shared-assets, namespace: cms}
+    spec:
+      storageClassName: manual
+      accessModes: [ReadWriteMany]
+      resources: {requests: {storage: 5Gi}}
+    ---
+    apiVersion: v1
+    kind: PersistentVolumeClaim
+    metadata: {name: tmp-scratch, namespace: scratch}
+    spec:
+      accessModes: [ReadWriteOnce]
+      resources: {requests: {storage: 100Mi}}
+    ---
+    apiVersion: v1
+    kind: Pod
+    metadata: {name: scratch-runner, namespace: scratch}
+    spec:
+      terminationGracePeriodSeconds: 2
+      containers:
+      - {name: s, image: "busybox:1.37", command: ["sleep", "infinity"], volumeMounts: [{name: d, mountPath: /scratch}]}
+      volumes:
+      - {name: d, persistentVolumeClaim: {claimName: tmp-scratch}}
+    EOF
+    kubectl -n scratch wait --for=condition=Ready pod/scratch-runner --timeout=90s >/dev/null
+    kubectl -n scratch delete pvc tmp-scratch --wait=false >/dev/null
+  check: |
+    eventually 15 '[ "$(kj -n cms pvc shared-assets "{.status.phase}")" = Bound ]'
+    check_eq "shared-assets bound to assets-pv" "$(kj -n cms pvc shared-assets '{.status.phase} {.spec.volumeName}')" "Bound assets-pv"
+    check_eq "PV unchanged" "$(kj pv assets-pv '{.spec.accessModes[*]}')" "ReadWriteOnce"
+    eventually 30 '! k_exists -n scratch pvc tmp-scratch'
+    check "tmp-scratch PVC is gone" '! k_exists -n scratch pvc tmp-scratch'
+    check "the pod using it is gone" '! k_exists -n scratch pod scratch-runner'
+    q=$(kubectl -n interns get resourcequota -o json | jq -c '[.items[].spec.hard] | add')
+    check_eq "PVC count limit" "$(jq -r '.persistentvolumeclaims' <<<"$q")" "3"
+    check_eq "storage limit" "$(jq -r '."requests.storage"' <<<"$q")" "2Gi"
+    check_not "a 3Gi PVC is rejected" 'kubectl create --dry-run=server -f - <<EOF
+    apiVersion: v1
+    kind: PersistentVolumeClaim
+    metadata: {name: kl-big, namespace: interns}
+    spec:
+      accessModes: [ReadWriteOnce]
+      resources: {requests: {storage: 3Gi}}
+    EOF'
+  solve: |
+    kubectl get pvc shared-assets -n cms -o json | jq 'del(.status, .metadata.resourceVersion, .metadata.uid, .metadata.creationTimestamp) | .spec.accessModes=["ReadWriteOnce"]' > /lab/pvc.json
+    kubectl replace --force -f /lab/pvc.json
+    kubectl delete pod scratch-runner -n scratch
+    kubectl create quota storage -n interns --hard=persistentvolumeclaims=3,requests.storage=2Gi
+
+- id: k8s-106
+  title: Change the default storage class
+  difficulty: 3
+  kind: build
+  tags: [storageclass, default]
+  tutorial: |
+    **Concept.** The default StorageClass is chosen by an annotation on the class object. Claims that omit storageClassName get the default at creation time. Having two defaults is ambiguous and should be avoided.
+
+    **Read up on:**
+    - `kubectl get storageclass` — a `(default)` marker shows the current default
+    - `kubectl annotate --help` — adding or overwriting annotations
+    - `kubectl get sc NAME -o yaml` — find the relevant annotation under metadata
+    - Kubernetes docs: Change the default StorageClass
+  scenario: |
+    Company policy: PVCs that don't name a class must get **Retain** semantics. The
+    class **`safe-local`** (Retain, local-path) exists.
+
+    Make **`safe-local`** the cluster's **only** default storage class. Then create a PVC
+    **`probe`** in namespace **`policy`** (100Mi, no `storageClassName`) to prove that new
+    claims get it.
+  hints:
+    - "The default is marked by the annotation `storageclass.kubernetes.io/is-default-class: \"true\"`."
+    - "Remove it (or set it to `\"false\"`) on `local-path` — two defaults is ambiguous."
+  solution: |
+    ```bash
+    kubectl annotate sc local-path storageclass.kubernetes.io/is-default-class=false --overwrite
+    kubectl annotate sc safe-local storageclass.kubernetes.io/is-default-class=true --overwrite
+    kubectl create -f - <<'EOF'
+    apiVersion: v1
+    kind: PersistentVolumeClaim
+    metadata: {name: probe, namespace: policy}
+    spec:
+      accessModes: [ReadWriteOnce]
+      resources: {requests: {storage: 100Mi}}
+    EOF
+    kubectl get pvc probe -n policy -o jsonpath='{.spec.storageClassName}'   # safe-local
+    ```
+  setup: |
+    k_ns policy
+    on_reset 'kubectl annotate sc local-path storageclass.kubernetes.io/is-default-class=true --overwrite'
+    kubectl apply -f - >/dev/null <<'EOF'
+    apiVersion: storage.k8s.io/v1
+    kind: StorageClass
+    metadata: {name: safe-local}
+    provisioner: rancher.io/local-path
+    reclaimPolicy: Retain
+    volumeBindingMode: WaitForFirstConsumer
+    EOF
+  check: |
+    d=$(kubectl get sc -o json | jq -r '.items[] | select(.metadata.annotations["storageclass.kubernetes.io/is-default-class"]=="true") | .metadata.name' | tr '\n' ' ')
+    check_eq "default classes" "$d" "safe-local "
+    check_eq "new PVC got safe-local" "$(kj -n policy pvc probe '{.spec.storageClassName}')" "safe-local"
+  solve: |
+    kubectl annotate sc local-path storageclass.kubernetes.io/is-default-class=false --overwrite
+    kubectl annotate sc safe-local storageclass.kubernetes.io/is-default-class=true --overwrite
+    kubectl apply -f - <<'EOF'
+    apiVersion: v1
+    kind: PersistentVolumeClaim
+    metadata: {name: probe, namespace: policy}
+    spec:
+      accessModes: [ReadWriteOnce]
+      resources: {requests: {storage: 100Mi}}
+    EOF
+
+- id: k8s-108
+  title: Reuse a retained volume
+  difficulty: 3
+  kind: fix
+  tags: [pv, retain, claimref, released]
+  tutorial: |
+    **Concept.** When a PVC bound to a Retain volume is deleted, the PV keeps its data but moves to the Released phase and still remembers the old claim. Kubernetes will not hand a Released volume to a new claim automatically.
+
+    **Read up on:**
+    - `kubectl get pv NAME -o yaml` — inspect `spec` and `status.phase` for hints about the old owner
+    - `kubectl explain pv.spec.claimRef` — what this field records
+    - `kubectl patch --help` — JSON patch and merge patch types
+    - Kubernetes docs: Persistent Volumes, Reclaiming
+  scenario: |
+    Someone deleted the PVC of the old reporting database. Its PV **`reports-pv`**
+    (reclaim policy Retain) still holds the data, but it's stuck in **`Released`**, so the
+    new PVC **`reports-data`** (namespace **`bi`**) stays `Pending`.
+
+    Make **`reports-data`** bind to **`reports-pv`** — keeping the data. Don't delete or
+    recreate the PV.
+  hints:
+    - "A Released PV still has `spec.claimRef` pointing at the deleted PVC (by UID)."
+    - "Clear the claimRef to make it `Available` again: `kubectl patch pv reports-pv --type=json -p '[{\"op\":\"remove\",\"path\":\"/spec/claimRef\"}]'`"
+  solution: |
+    ```bash
+    kubectl get pv reports-pv -o jsonpath='{.status.phase} {.spec.claimRef.name} {.spec.claimRef.uid}'
+    kubectl patch pv reports-pv --type=json -p '[{"op":"remove","path":"/spec/claimRef"}]'
+    kubectl get pvc reports-data -n bi -w
+    ```
+    In production, double-check that the data really belongs to the new claim before
+    re-binding a Released volume.
+  setup: |
+    k_ns bi
+    kubectl apply -f - >/dev/null <<'EOF'
+    apiVersion: v1
+    kind: PersistentVolume
+    metadata: {name: reports-pv}
+    spec:
+      capacity: {storage: 1Gi}
+      accessModes: [ReadWriteOnce]
+      persistentVolumeReclaimPolicy: Retain
+      storageClassName: manual
+      hostPath: {path: /tmp/reports-pv}
+    ---
+    apiVersion: v1
+    kind: PersistentVolumeClaim
+    metadata: {name: reports-old, namespace: bi}
+    spec:
+      storageClassName: manual
+      volumeName: reports-pv
+      accessModes: [ReadWriteOnce]
+      resources: {requests: {storage: 1Gi}}
+    EOF
+    eventually 30 '[ "$(kj -n bi pvc reports-old "{.status.phase}")" = Bound ]'
+    kubectl -n bi delete pvc reports-old >/dev/null
+    eventually 30 '[ "$(kj pv reports-pv "{.status.phase}")" = Released ]'
+    kubectl apply -f - >/dev/null <<'EOF'
+    apiVersion: v1
+    kind: PersistentVolumeClaim
+    metadata: {name: reports-data, namespace: bi}
+    spec:
+      storageClassName: manual
+      accessModes: [ReadWriteOnce]
+      resources: {requests: {storage: 1Gi}}
+    EOF
+    kj pv reports-pv '{.metadata.uid}' > $KL_STATE/answer
+  check: |
+    check_eq "same PV object" "$(kj pv reports-pv '{.metadata.uid}')" "$(cat $KL_STATE/answer)"
+    eventually 20 '[ "$(kj -n bi pvc reports-data "{.status.phase}")" = Bound ]'
+    check_eq "reports-data bound to reports-pv" "$(kj -n bi pvc reports-data '{.status.phase} {.spec.volumeName}')" "Bound reports-pv"
+  solve: |
+    kubectl patch pv reports-pv --type=json -p '[{"op":"remove","path":"/spec/claimRef"}]'
+
+- id: k8s-111
+  title: A StatefulSet with its own disks
+  difficulty: 3
+  kind: build
+  tags: [statefulset, volumeClaimTemplates, headless]
+  tutorial: |
+    **Concept.** A StatefulSet gives each replica a stable name and, through volumeClaimTemplates, its own PVC created automatically. A headless Service (no cluster IP) provides stable per-pod DNS names.
+
+    **Read up on:**
+    - `kubectl explain statefulset.spec.volumeClaimTemplates` — a PVC template per replica
+    - `kubectl explain service.spec.clusterIP` — what a headless service is
+    - `kubectl get pvc,pods` — how claim names are derived from template and pod names
+    - Kubernetes docs: StatefulSet basics
+  scenario: |
+    Deploy a tiny replicated key-value store in namespace **`kv`**:
+
+    - headless service **`kv`** (port 6379)
+    - StatefulSet **`kv`** with **2 replicas** of `redis:7.4-alpine`, `serviceName: kv`
+    - each replica gets **its own 100Mi PVC** named `data-kv-0` / `data-kv-1`, mounted at
+      `/data`
+  hints:
+    - "`volumeClaimTemplates: [{metadata: {name: data}, spec: {...}}]` — PVC names are `<template>-<sts>-<ordinal>`."
+  solution: |
+    ```yaml
+    apiVersion: v1
+    kind: Service
+    metadata: {name: kv, namespace: kv}
+    spec:
+      clusterIP: None
+      selector: {app: kv}
+      ports: [{port: 6379}]
+    ---
+    apiVersion: apps/v1
+    kind: StatefulSet
+    metadata: {name: kv, namespace: kv}
+    spec:
+      serviceName: kv
+      replicas: 2
+      selector: {matchLabels: {app: kv}}
+      template:
+        metadata: {labels: {app: kv}}
+        spec:
+          containers:
+          - name: redis
+            image: redis:7.4-alpine
+            volumeMounts: [{name: data, mountPath: /data}]
+      volumeClaimTemplates:
+      - metadata: {name: data}
+        spec:
+          accessModes: [ReadWriteOnce]
+          resources: {requests: {storage: 100Mi}}
+    ```
+  setup: |
+    k_ns kv
+  check: |
+    check_eq "headless service" "$(kj -n kv svc kv '{.spec.clusterIP}')" "None"
+    k_exists -n kv sts kv && wait_pods kv app=kv 120 && eventually 60 '[ "$(kj -n kv sts kv "{.status.readyReplicas}")" = 2 ]'
+    check_eq "2 ready replicas" "$(kj -n kv sts kv '{.status.readyReplicas}')" "2"
+    for i in 0 1; do check "data-kv-$i bound" "[ \"\$(kj -n kv pvc data-kv-$i '{.status.phase}')\" = Bound ]"; done
+    check "kv-0 resolvable as kv-0.kv" 'kubectl -n kv exec kv-1 -- redis-cli -h kv-0.kv ping | grep -q PONG'
+  solve: |
+    kubectl apply -f - <<'EOF'
+    apiVersion: v1
+    kind: Service
+    metadata: {name: kv, namespace: kv}
+    spec:
+      clusterIP: None
+      selector: {app: kv}
+      ports: [{port: 6379}]
+    ---
+    apiVersion: apps/v1
+    kind: StatefulSet
+    metadata: {name: kv, namespace: kv}
+    spec:
+      serviceName: kv
+      replicas: 2
+      selector: {matchLabels: {app: kv}}
+      template:
+        metadata: {labels: {app: kv}}
+        spec:
+          containers:
+          - name: redis
+            image: redis:7.4-alpine
+            volumeMounts: [{name: data, mountPath: /data}]
+      volumeClaimTemplates:
+      - metadata: {name: data}
+        spec:
+          accessModes: [ReadWriteOnce]
+          resources: {requests: {storage: 100Mi}}
+    EOF
+
+- id: k8s-113
+  title: A local disk on a specific node
+  difficulty: 3
+  kind: build
+  tags: [local-pv, storageclass, node-affinity]
+  tutorial: |
+    **Concept.** A local PersistentVolume represents a disk on one specific node and needs node affinity so the scheduler places pods there. With no dynamic provisioner, the class uses WaitForFirstConsumer so binding waits for the pod's placement.
+
+    **Read up on:**
+    - `kubectl explain pv.spec.local` — path for local volumes
+    - `kubectl explain pv.spec.nodeAffinity.required.nodeSelectorTerms` — matching node labels
+    - `kubectl get nodes --show-labels` — find a label that identifies a node
+    - Kubernetes docs: Volumes, local; Storage Classes, no-provisioner
+  scenario: |
+    node01 has a fast disk mounted at **`/mnt/disks/ssd1`**. Expose it as a **local
+    persistent volume** — the scheduler must automatically place pods using it on node01.
+
+    - StorageClass **`local-ssd`**: `provisioner: kubernetes.io/no-provisioner`,
+      `volumeBindingMode: WaitForFirstConsumer`
+    - PV **`ssd1`**: 1Gi, RWO, class `local-ssd`, **`local.path: /mnt/disks/ssd1`**, with a
+      node affinity for node01
+    - PVC **`fast`** + pod **`indexer`** (`busybox:1.37`, `sleep 3600`) in namespace
+      **`search`**, mounting it at `/index`
+  hints:
+    - "A `local` PV *requires* `spec.nodeAffinity.required.nodeSelectorTerms`."
+  solution: |
+    ```yaml
+    apiVersion: storage.k8s.io/v1
+    kind: StorageClass
+    metadata: {name: local-ssd}
+    provisioner: kubernetes.io/no-provisioner
+    volumeBindingMode: WaitForFirstConsumer
+    ---
+    apiVersion: v1
+    kind: PersistentVolume
+    metadata: {name: ssd1}
+    spec:
+      capacity: {storage: 1Gi}
+      accessModes: [ReadWriteOnce]
+      storageClassName: local-ssd
+      local: {path: /mnt/disks/ssd1}
+      nodeAffinity:
+        required:
+          nodeSelectorTerms:
+          - matchExpressions:
+            - {key: kubernetes.io/hostname, operator: In, values: [node01]}
+    ```
+  setup: |
+    k_ns search
+  setup_worker: |
+    mkdir -p /mnt/disks/ssd1
+    on_reset 'rm -rf /mnt/disks'
+  check: |
+    check_eq "PV local path" "$(kj pv ssd1 '{.spec.local.path}')" "/mnt/disks/ssd1"
+    check_eq "SC provisioner" "$(kj sc local-ssd '{.provisioner}')" "kubernetes.io/no-provisioner"
+    wait_pod search indexer 90
+    check_eq "fast bound to ssd1" "$(kj -n search pvc fast '{.status.phase} {.spec.volumeName}')" "Bound ssd1"
+    check "indexer runs on node01" '[ "$(kj -n search pod indexer "{.spec.nodeName}")" = node01 ] && pod_ready search indexer'
+  solve: |
+    kubectl apply -f - <<'EOF'
+    apiVersion: storage.k8s.io/v1
+    kind: StorageClass
+    metadata: {name: local-ssd}
+    provisioner: kubernetes.io/no-provisioner
+    volumeBindingMode: WaitForFirstConsumer
+    ---
+    apiVersion: v1
+    kind: PersistentVolume
+    metadata: {name: ssd1}
+    spec:
+      capacity: {storage: 1Gi}
+      accessModes: [ReadWriteOnce]
+      storageClassName: local-ssd
+      local: {path: /mnt/disks/ssd1}
+      nodeAffinity:
+        required:
+          nodeSelectorTerms:
+          - matchExpressions:
+            - {key: kubernetes.io/hostname, operator: In, values: [node01]}
+    ---
+    apiVersion: v1
+    kind: PersistentVolumeClaim
+    metadata: {name: fast, namespace: search}
+    spec:
+      storageClassName: local-ssd
+      accessModes: [ReadWriteOnce]
+      resources: {requests: {storage: 1Gi}}
+    ---
+    apiVersion: v1
+    kind: Pod
+    metadata: {name: indexer, namespace: search}
+    spec:
+      containers:
+      - {name: i, image: "busybox:1.37", command: ["sleep", "3600"], volumeMounts: [{name: d, mountPath: /index}]}
+      volumes: [{name: d, persistentVolumeClaim: {claimName: fast}}]
     EOF
 
 - id: k8s-117
@@ -1252,6 +1256,8 @@ exercises:
     kubectl delete sts queue -n mq --wait=true
     kubectl delete pvc data-queue-0 -n mq --wait=true
     kubectl apply -f /lab/queue.json
+
+# ===== Capstone: a real-world lab =====
 
 - id: k8s-120
   title: "Incident: the database cluster won't come up"

@@ -4,6 +4,8 @@ profile: docker
 order: 4
 exercises:
 
+# ===== Intermediate =====
+
 - id: net-026
   title: How many answers, which answer, how often
   difficulty: 3
@@ -496,6 +498,86 @@ exercises:
     sudo ip netns exec cl sysctl -qw net.ipv4.tcp_keepalive_time=$idle net.ipv4.tcp_keepalive_intvl=$interval net.ipv4.tcp_keepalive_probes=$probes
     sudo systemctl restart kl-ka-cl
 
+- id: net-034
+  title: Hand out the right lease
+  difficulty: 3
+  kind: fix
+  tags: [dhcp, dnsmasq]
+  tutorial: |
+    **Concept.** A DHCP server leases addresses from a pool and attaches options such as the default gateway, and it can pin a fixed address to a known MAC. dnsmasq expresses all of this in a few config directives, and it can check a file without serving.
+
+    **Read up on:**
+    - `dnsmasq --test --conf-file=FILE` — validate a config without starting the server
+    - `dhcp-range` — pool start, end and lease time (`30m`, `12h`)
+    - `dhcp-option=option:router,...` — the default gateway handed to clients
+    - `dhcp-host` — a fixed address reserved for one MAC
+  scenario: |
+    The DHCP config at **`/lab/dhcp/dnsmasq.conf`** is wrong, and the requirements are in
+    **`/lab/lease-spec.txt`**. Fix the config so that:
+
+    - the pool and lease time match the spec's `pool_start`, `pool_end` and `lease`,
+    - the default gateway handed out matches `router`,
+    - the host with MAC `reserved_mac` always gets `reserved_ip`.
+
+    It must pass `dnsmasq --test --conf-file=/lab/dhcp/dnsmasq.conf`.
+  hints:
+    - "`dnsmasq --test --conf-file=/lab/dhcp/dnsmasq.conf` reports whether the file is valid."
+    - "Three directives carry the answer: `dhcp-range`, `dhcp-option=option:router,...` and `dhcp-host`."
+  solution: |
+    Read the spec, then write the three directives:
+
+    ```bash
+    cat /lab/lease-spec.txt
+    cat > /lab/dhcp/dnsmasq.conf <<EOF
+    dhcp-range=POOL_START,POOL_END,LEASE
+    dhcp-option=option:router,ROUTER
+    dhcp-host=RESERVED_MAC,RESERVED_IP
+    EOF
+    dnsmasq --test --conf-file=/lab/dhcp/dnsmasq.conf
+    ```
+  setup: |
+    on_reset 'rm -rf /lab/dhcp /lab/lease-spec.txt'
+    lease=$(printf '%sm' $((( RANDOM % 4 + 1) * 15)))
+    a=$((RANDOM % 40 + 100)); b=$((a + RANDOM % 40 + 10))
+    router=10.60.0.$((RANDOM % 4 + 1))
+    mac=$(printf '02:00:00:%02x:%02x:%02x' $((RANDOM%256)) $((RANDOM%256)) $((RANDOM%256)))
+    rip=10.60.0.$((RANDOM % 40 + 200))
+    lab_file /lab/lease-spec.txt <<EOF
+    pool_start=10.60.0.$a
+    pool_end=10.60.0.$b
+    lease=$lease
+    router=$router
+    reserved_mac=$mac
+    reserved_ip=$rip
+    EOF
+    echo "dhcp-range=10.60.0.$a,10.60.0.$b,$lease" > "$KL_STATE/r_range"
+    echo "dhcp-option=option:router,$router" > "$KL_STATE/r_router"
+    echo "dhcp-host=$mac,$rip" > "$KL_STATE/r_host"
+    mkdir -p /lab/dhcp
+    cat >/lab/dhcp/dnsmasq.conf <<'EOF'
+    dhcp-range=10.60.0.10,10.60.0.20,12h
+    dhcp-option=option:router,10.60.0.254
+    EOF
+    chmod 755 /lab/dhcp
+    chown -R "$(lab_user):" /lab/dhcp /lab/lease-spec.txt
+  check: |
+    norm() { tr -d '[:space:]' 2>/dev/null <"$1"; }
+    conf=/lab/dhcp/dnsmasq.conf
+    check "the config is valid" 'dnsmasq --test --conf-file=$conf 2>&1 | grep -q "syntax check OK"'
+    check "the pool and lease match the spec" 'grep -qF "$(norm "$KL_STATE/r_range")" "$conf"'
+    check "the router option matches the spec" 'grep -qF "$(norm "$KL_STATE/r_router")" "$conf"'
+    check "the reservation matches the spec" 'grep -qiF "$(norm "$KL_STATE/r_host")" "$conf"'
+  solve: |
+    spec=/lab/lease-spec.txt
+    get() { grep "^$1=" "$spec" | cut -d= -f2; }
+    cat > /lab/dhcp/dnsmasq.conf <<EOF
+    dhcp-range=$(get pool_start),$(get pool_end),$(get lease)
+    dhcp-option=option:router,$(get router)
+    dhcp-host=$(get reserved_mac),$(get reserved_ip)
+    EOF
+
+# ===== Advanced =====
+
 - id: net-032
   title: Cap the bulk transfer
   difficulty: 4
@@ -594,6 +676,86 @@ exercises:
     sudo ip netns exec cl tc class add dev eth0 parent 1: classid 1:10 htb rate ${rate}mbit ceil ${rate}mbit
     sudo ip netns exec cl tc class add dev eth0 parent 1: classid 1:20 htb rate 900mbit
     sudo ip netns exec cl tc filter add dev eth0 parent 1: protocol ip u32 match ip dport 9000 0xffff flowid 1:10
+
+- id: net-035
+  title: Anycast across two servers
+  difficulty: 4
+  kind: build
+  tags: [routing, ecmp, anycast, sysctl, netns]
+  tutorial: |
+    **Concept.** With anycast, several servers share one address and the network sends each connection to one of them. Equal-cost routes choose a next hop by hashing packet fields, and which fields decides whether one client's connections spread out.
+
+    **Read up on:**
+    - `ip route` — multipath routes with several `nexthop` entries
+    - `sysctl net.ipv4.fib_multipath_hash_policy` — which header fields feed the hash
+    - `ip route get ADDR sport N dport M ip_proto tcp` — ask which path a flow would take
+    - `ip netns exec NS sysctl` — the setting is per namespace
+  scenario: |
+    Two servers, **`s1`** and **`s2`**, both own the anycast address **10.99.9.9** and run
+    a web server on port 80 that answers with its name. The client **`cl`** reaches
+    each of them over a separate link, using the source address **10.99.0.1**:
+
+    ```
+              (10.99.1.1)--- (10.99.1.2) s1  [10.99.9.9]
+    cl [10.99.0.1]
+              (10.99.2.1)--- (10.99.2.2) s2  [10.99.9.9]
+    ```
+
+    Today `cl` only has a route to 10.99.9.9 through `s1`. Configure `cl` so that
+    separate connections to the anycast address are spread over **both** servers, as
+    seen from `sudo ip netns exec cl curl -s --interface 10.99.0.1 http://10.99.9.9/`.
+
+    Don't change the servers.
+  hints:
+    - "A single route can list several next hops: `ip route replace PREFIX nexthop via A dev X nexthop via B dev Y`. Keep `src 10.99.0.1` on it."
+    - "Once there are two paths, test with 20 curl runs. If every answer is the same server, the hash does not include the ports yet."
+    - "Look at `net.ipv4.fib_multipath_hash_policy` inside the namespace."
+  solution: |
+    Replace the single route with a two-next-hop route and make the kernel hash the
+    layer-4 ports, so each new connection can take a different path.
+
+    ```bash
+    sudo ip -n cl route replace 10.99.9.9/32 src 10.99.0.1 \
+      nexthop via 10.99.1.2 dev eth0 nexthop via 10.99.2.2 dev eth1
+    sudo ip netns exec cl sysctl -w net.ipv4.fib_multipath_hash_policy=1
+    for i in $(seq 10); do
+      sudo ip netns exec cl curl -s --interface 10.99.0.1 http://10.99.9.9/
+    done
+    ```
+  setup: |
+    on_reset 'systemctl stop kl-any-s1 kl-any-s2 2>/dev/null; systemctl reset-failed kl-any-s1 kl-any-s2 2>/dev/null; rm -rf /srv/kl-any'
+    netns_new cl s1 s2
+    netns_link cl eth0 s1 eth0
+    netns_link cl eth1 s2 eth0
+    ip -n cl addr add 10.99.1.1/24 dev eth0
+    ip -n s1 addr add 10.99.1.2/24 dev eth0
+    ip -n cl addr add 10.99.2.1/24 dev eth1
+    ip -n s2 addr add 10.99.2.2/24 dev eth0
+    ip -n cl addr add 10.99.0.1/32 dev lo
+    for s in s1 s2; do
+      ip -n $s addr add 10.99.9.9/32 dev lo
+      ip netns exec $s sysctl -qw net.ipv4.conf.all.rp_filter=0 net.ipv4.conf.default.rp_filter=0 net.ipv4.conf.eth0.rp_filter=0
+      mkdir -p /srv/kl-any/$s
+      echo "$s" >/srv/kl-any/$s/index.html
+    done
+    chmod -R a+rX /srv/kl-any
+    ip netns exec cl sysctl -qw net.ipv4.conf.all.rp_filter=0 net.ipv4.conf.default.rp_filter=0 net.ipv4.conf.eth0.rp_filter=0 net.ipv4.conf.eth1.rp_filter=0
+    ip -n s1 route add 10.99.0.1/32 via 10.99.1.1
+    ip -n s2 route add 10.99.0.1/32 via 10.99.2.1
+    ip -n cl route add 10.99.9.9/32 src 10.99.0.1 via 10.99.1.2
+    for s in s1 s2; do
+      systemd-run --quiet --unit=kl-any-$s --working-directory=/srv/kl-any/$s ip netns exec $s python3 -m http.server 80 --bind 10.99.9.9
+    done
+    eventually 15 'ip netns exec cl curl -fsS -m2 --interface 10.99.0.1 http://10.99.9.9/'
+  check: |
+    hits() { for i in $(seq 24); do ip netns exec cl curl -s -m2 --interface 10.99.0.1 http://10.99.9.9/ 2>/dev/null; done | sort | uniq -c | awk '{print $2"="$1}' | tr '\n' ' '; }
+    check_eq "the route to the anycast address has two next hops" "$(ip -n cl route show 10.99.9.9 | grep -c nexthop)" 2
+    h=$(hits)
+    check "s1 answers some connections ($h)" 'echo "$h" | grep -Eq "s1=([1-9]|[1-9][0-9])"'
+    check "s2 answers some connections" 'echo "$h" | grep -Eq "s2=([1-9]|[1-9][0-9])"'
+  solve: |
+    sudo ip -n cl route replace 10.99.9.9/32 src 10.99.0.1 nexthop via 10.99.1.2 dev eth0 nexthop via 10.99.2.2 dev eth1
+    sudo ip netns exec cl sysctl -qw net.ipv4.fib_multipath_hash_policy=1
 
 - id: net-033
   title: Knock before you enter
@@ -724,160 +886,3 @@ exercises:
       }
     }
     EOF
-
-- id: net-034
-  title: Hand out the right lease
-  difficulty: 3
-  kind: fix
-  tags: [dhcp, dnsmasq]
-  tutorial: |
-    **Concept.** A DHCP server leases addresses from a pool and attaches options such as the default gateway, and it can pin a fixed address to a known MAC. dnsmasq expresses all of this in a few config directives, and it can check a file without serving.
-
-    **Read up on:**
-    - `dnsmasq --test --conf-file=FILE` — validate a config without starting the server
-    - `dhcp-range` — pool start, end and lease time (`30m`, `12h`)
-    - `dhcp-option=option:router,...` — the default gateway handed to clients
-    - `dhcp-host` — a fixed address reserved for one MAC
-  scenario: |
-    The DHCP config at **`/lab/dhcp/dnsmasq.conf`** is wrong, and the requirements are in
-    **`/lab/lease-spec.txt`**. Fix the config so that:
-
-    - the pool and lease time match the spec's `pool_start`, `pool_end` and `lease`,
-    - the default gateway handed out matches `router`,
-    - the host with MAC `reserved_mac` always gets `reserved_ip`.
-
-    It must pass `dnsmasq --test --conf-file=/lab/dhcp/dnsmasq.conf`.
-  hints:
-    - "`dnsmasq --test --conf-file=/lab/dhcp/dnsmasq.conf` reports whether the file is valid."
-    - "Three directives carry the answer: `dhcp-range`, `dhcp-option=option:router,...` and `dhcp-host`."
-  solution: |
-    Read the spec, then write the three directives:
-
-    ```bash
-    cat /lab/lease-spec.txt
-    cat > /lab/dhcp/dnsmasq.conf <<EOF
-    dhcp-range=POOL_START,POOL_END,LEASE
-    dhcp-option=option:router,ROUTER
-    dhcp-host=RESERVED_MAC,RESERVED_IP
-    EOF
-    dnsmasq --test --conf-file=/lab/dhcp/dnsmasq.conf
-    ```
-  setup: |
-    on_reset 'rm -rf /lab/dhcp /lab/lease-spec.txt'
-    lease=$(printf '%sm' $((( RANDOM % 4 + 1) * 15)))
-    a=$((RANDOM % 40 + 100)); b=$((a + RANDOM % 40 + 10))
-    router=10.60.0.$((RANDOM % 4 + 1))
-    mac=$(printf '02:00:00:%02x:%02x:%02x' $((RANDOM%256)) $((RANDOM%256)) $((RANDOM%256)))
-    rip=10.60.0.$((RANDOM % 40 + 200))
-    lab_file /lab/lease-spec.txt <<EOF
-    pool_start=10.60.0.$a
-    pool_end=10.60.0.$b
-    lease=$lease
-    router=$router
-    reserved_mac=$mac
-    reserved_ip=$rip
-    EOF
-    echo "dhcp-range=10.60.0.$a,10.60.0.$b,$lease" > "$KL_STATE/r_range"
-    echo "dhcp-option=option:router,$router" > "$KL_STATE/r_router"
-    echo "dhcp-host=$mac,$rip" > "$KL_STATE/r_host"
-    mkdir -p /lab/dhcp
-    cat >/lab/dhcp/dnsmasq.conf <<'EOF'
-    dhcp-range=10.60.0.10,10.60.0.20,12h
-    dhcp-option=option:router,10.60.0.254
-    EOF
-    chmod 755 /lab/dhcp
-    chown -R "$(lab_user):" /lab/dhcp /lab/lease-spec.txt
-  check: |
-    norm() { tr -d '[:space:]' 2>/dev/null <"$1"; }
-    conf=/lab/dhcp/dnsmasq.conf
-    check "the config is valid" 'dnsmasq --test --conf-file=$conf 2>&1 | grep -q "syntax check OK"'
-    check "the pool and lease match the spec" 'grep -qF "$(norm "$KL_STATE/r_range")" "$conf"'
-    check "the router option matches the spec" 'grep -qF "$(norm "$KL_STATE/r_router")" "$conf"'
-    check "the reservation matches the spec" 'grep -qiF "$(norm "$KL_STATE/r_host")" "$conf"'
-  solve: |
-    spec=/lab/lease-spec.txt
-    get() { grep "^$1=" "$spec" | cut -d= -f2; }
-    cat > /lab/dhcp/dnsmasq.conf <<EOF
-    dhcp-range=$(get pool_start),$(get pool_end),$(get lease)
-    dhcp-option=option:router,$(get router)
-    dhcp-host=$(get reserved_mac),$(get reserved_ip)
-    EOF
-- id: net-035
-  title: Anycast across two servers
-  difficulty: 4
-  kind: build
-  tags: [routing, ecmp, anycast, sysctl, netns]
-  tutorial: |
-    **Concept.** With anycast, several servers share one address and the network sends each connection to one of them. Equal-cost routes choose a next hop by hashing packet fields, and which fields decides whether one client's connections spread out.
-
-    **Read up on:**
-    - `ip route` — multipath routes with several `nexthop` entries
-    - `sysctl net.ipv4.fib_multipath_hash_policy` — which header fields feed the hash
-    - `ip route get ADDR sport N dport M ip_proto tcp` — ask which path a flow would take
-    - `ip netns exec NS sysctl` — the setting is per namespace
-  scenario: |
-    Two servers, **`s1`** and **`s2`**, both own the anycast address **10.99.9.9** and run
-    a web server on port 80 that answers with its name. The client **`cl`** reaches
-    each of them over a separate link, using the source address **10.99.0.1**:
-
-    ```
-              (10.99.1.1)--- (10.99.1.2) s1  [10.99.9.9]
-    cl [10.99.0.1]
-              (10.99.2.1)--- (10.99.2.2) s2  [10.99.9.9]
-    ```
-
-    Today `cl` only has a route to 10.99.9.9 through `s1`. Configure `cl` so that
-    separate connections to the anycast address are spread over **both** servers, as
-    seen from `sudo ip netns exec cl curl -s --interface 10.99.0.1 http://10.99.9.9/`.
-
-    Don't change the servers.
-  hints:
-    - "A single route can list several next hops: `ip route replace PREFIX nexthop via A dev X nexthop via B dev Y`. Keep `src 10.99.0.1` on it."
-    - "Once there are two paths, test with 20 curl runs. If every answer is the same server, the hash does not include the ports yet."
-    - "Look at `net.ipv4.fib_multipath_hash_policy` inside the namespace."
-  solution: |
-    Replace the single route with a two-next-hop route and make the kernel hash the
-    layer-4 ports, so each new connection can take a different path.
-
-    ```bash
-    sudo ip -n cl route replace 10.99.9.9/32 src 10.99.0.1 \
-      nexthop via 10.99.1.2 dev eth0 nexthop via 10.99.2.2 dev eth1
-    sudo ip netns exec cl sysctl -w net.ipv4.fib_multipath_hash_policy=1
-    for i in $(seq 10); do
-      sudo ip netns exec cl curl -s --interface 10.99.0.1 http://10.99.9.9/
-    done
-    ```
-  setup: |
-    on_reset 'systemctl stop kl-any-s1 kl-any-s2 2>/dev/null; systemctl reset-failed kl-any-s1 kl-any-s2 2>/dev/null; rm -rf /srv/kl-any'
-    netns_new cl s1 s2
-    netns_link cl eth0 s1 eth0
-    netns_link cl eth1 s2 eth0
-    ip -n cl addr add 10.99.1.1/24 dev eth0
-    ip -n s1 addr add 10.99.1.2/24 dev eth0
-    ip -n cl addr add 10.99.2.1/24 dev eth1
-    ip -n s2 addr add 10.99.2.2/24 dev eth0
-    ip -n cl addr add 10.99.0.1/32 dev lo
-    for s in s1 s2; do
-      ip -n $s addr add 10.99.9.9/32 dev lo
-      ip netns exec $s sysctl -qw net.ipv4.conf.all.rp_filter=0 net.ipv4.conf.default.rp_filter=0 net.ipv4.conf.eth0.rp_filter=0
-      mkdir -p /srv/kl-any/$s
-      echo "$s" >/srv/kl-any/$s/index.html
-    done
-    chmod -R a+rX /srv/kl-any
-    ip netns exec cl sysctl -qw net.ipv4.conf.all.rp_filter=0 net.ipv4.conf.default.rp_filter=0 net.ipv4.conf.eth0.rp_filter=0 net.ipv4.conf.eth1.rp_filter=0
-    ip -n s1 route add 10.99.0.1/32 via 10.99.1.1
-    ip -n s2 route add 10.99.0.1/32 via 10.99.2.1
-    ip -n cl route add 10.99.9.9/32 src 10.99.0.1 via 10.99.1.2
-    for s in s1 s2; do
-      systemd-run --quiet --unit=kl-any-$s --working-directory=/srv/kl-any/$s ip netns exec $s python3 -m http.server 80 --bind 10.99.9.9
-    done
-    eventually 15 'ip netns exec cl curl -fsS -m2 --interface 10.99.0.1 http://10.99.9.9/'
-  check: |
-    hits() { for i in $(seq 24); do ip netns exec cl curl -s -m2 --interface 10.99.0.1 http://10.99.9.9/ 2>/dev/null; done | sort | uniq -c | awk '{print $2"="$1}' | tr '\n' ' '; }
-    check_eq "the route to the anycast address has two next hops" "$(ip -n cl route show 10.99.9.9 | grep -c nexthop)" 2
-    h=$(hits)
-    check "s1 answers some connections ($h)" 'echo "$h" | grep -Eq "s1=([1-9]|[1-9][0-9])"'
-    check "s2 answers some connections" 'echo "$h" | grep -Eq "s2=([1-9]|[1-9][0-9])"'
-  solve: |
-    sudo ip -n cl route replace 10.99.9.9/32 src 10.99.0.1 nexthop via 10.99.1.2 dev eth0 nexthop via 10.99.2.2 dev eth1
-    sudo ip netns exec cl sysctl -qw net.ipv4.fib_multipath_hash_policy=1

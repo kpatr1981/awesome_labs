@@ -4,6 +4,8 @@ profile: docker
 order: 12
 exercises:
 
+# ===== Intermediate =====
+
 - id: docker-211
   title: Air-gap release day
   difficulty: 3
@@ -176,6 +178,115 @@ exercises:
       if [ "$t" != stable ] && [ "$(digest_of "$t")" = "$s" ]; then echo "$t" > /lab/alias.txt; fi
     done
 
+- id: docker-216
+  title: Who writes the file, and where it can land
+  difficulty: 3
+  kind: fix
+  tags: [exec, user, read-only, tmpfs, mount]
+  tutorial: |
+    **Concept.** Every write inside a container is subject to two questions: *who* is doing the writing, and *where* the writes are allowed to go.
+
+    **Who.** A file's owner is the process that created it. `docker exec` starts an extra process inside a running container's namespaces. By default it runs as the container's configured user, but the user, working directory and environment of that extra process can be chosen per call. Numeric ids are fine even when the container has no such user in its `/etc/passwd`, which matters when a volume or a sidecar expects a specific uid.
+
+    **Where.** A read-only root filesystem blocks writes everywhere in the container, which hardens it but breaks software that needs scratch space. The usual answer is not to give up on read-only, but to make only the necessary paths writable, using memory-backed mounts with a bounded size so that scratch space cannot grow without limit.
+
+    **Read up on:**
+    - `docker exec --help` — the options for user and environment
+    - `stat -c '%u:%g'` — read numeric ownership
+    - `docker inspect` — `.Config.User`, `.HostConfig.ReadonlyRootfs`, and why a container stopped and with which code
+    - `docker run --help` — `--read-only`, `--tmpfs` and `--mount`
+    - Docker docs 'tmpfs mounts' — options such as size
+    - `docker logs` — the application's own error
+  scenario: |
+    A filesystem review of the platform flagged two containers. Both come down to the same
+    question: which process is writing, and is it allowed to write there?
+
+    ## Part 1: Hand a file to a specific user
+
+    The **`svc`** container runs as root, and it has a world-writable directory `/data`.
+    **`/lab/handoff.txt`** gives a numeric `uid:gid` and a line of text.
+
+    Without restarting or recreating `svc`, create **`/data/handoff`** inside it so that the file
+    is **owned by that uid:gid** and contains the given text.
+
+    ## Part 2: Read-only root, but it still needs scratch space
+
+    **`/lab/start.sh`** launches the **`ingest`** container with a read-only root. It exits as soon
+    as it starts. Security insists that the root filesystem stays read-only.
+
+    Fix the setup so that `ingest` runs and its work directory is writable. That directory must
+    be an in-memory filesystem no larger than the size stated in **`/lab/limits.txt`** (MiB).
+    Start it with the script.
+  hints:
+    - "Part 1: the file ownership follows the process that creates it. Numeric ids work even if the container has no such user."
+    - "Part 2: read the container's logs to find the path it cannot create."
+    - "Part 2: only that path should be writable; the rest of the root stays read-only."
+    - "Part 2: a tmpfs mount takes a size option."
+  solution: |
+    ```bash
+    # Part 1: owner and text come from /lab/handoff.txt
+    docker exec -u <uid>:<gid> svc sh -c 'echo "<text>" > /data/handoff'
+    docker exec svc stat -c '%u:%g' /data/handoff
+    ```
+    For part 2, add a tmpfs for the work directory to the `docker run` in `start.sh`, for example:
+
+    ```bash
+    docker run -d --name ingest --read-only --tmpfs <dir>:rw,size=<N>m busybox:1.37 ...
+    ```
+    Then run `sh /lab/start.sh`.
+  setup: |
+    # --- part 1: Hand a file to a specific user ---
+    u=$((RANDOM % 1000 + 2000)); g=$((RANDOM % 1000 + 3000)); tok=$(rand_flag)
+    echo "$u:$g $tok" > "$KL_STATE/handoff.answer"
+    lab_file handoff.txt <<EOF
+    owner: $u:$g
+    text: $tok
+    EOF
+    docker run -d --name svc busybox:1.37 sh -c 'mkdir -p /data; chmod 777 /data; exec sleep 3600' >/dev/null
+    eventually 15 "docker exec svc sh -c 'test -d /data && [ \"\$(stat -c %a /data)\" = 777 ]'"
+    docker inspect -f '{{.Id}}' svc > "$KL_STATE/svc.id"
+
+    # --- part 2: Read-only root, but it still needs scratch space ---
+    d="/work$((RANDOM % 900 + 100))"; n=$((RANDOM % 25 + 8))
+    echo "$d $n" > "$KL_STATE/ingest.answer"
+    lab_file limits.txt <<EOF
+    work directory tmpfs size: ${n} MiB
+    EOF
+    lab_file start.sh 0755 <<EOF
+    #!/bin/sh
+    docker rm -f ingest >/dev/null 2>&1
+    docker run -d --name ingest --read-only busybox:1.37 \\
+      sh -c 'mkdir -p $d/queue && echo ready > $d/queue/ready && exec sleep 3600'
+    EOF
+    sh /lab/start.sh >/dev/null 2>&1 || true
+  check: |
+    info "Part 1: Hand a file to a specific user"
+    read -r own tok < "$KL_STATE/handoff.answer"
+    check "svc is still the original container" '[ "$(c_get svc "{{.Id}}")" = "$(cat "$KL_STATE/svc.id")" ] && c_running svc'
+    check_eq "owner of /data/handoff" "$(docker exec svc stat -c '%u:%g' /data/handoff 2>/dev/null)" "$own"
+    check "content of /data/handoff" 'docker exec svc cat /data/handoff | grep -qxF "$tok"'
+
+    info "Part 2: Read-only root, but it still needs scratch space"
+    read -r d n < "$KL_STATE/ingest.answer"
+    check "ingest is running" 'c_running ingest'
+    check "the root filesystem is still read-only" '[ "$(c_get ingest "{{.HostConfig.ReadonlyRootfs}}")" = true ]'
+    check "writes to / are refused" 'docker exec ingest sh -c "touch /probe 2>/dev/null && exit 1; exit 0"'
+    check "the work directory is writable and was used" '[ "$(docker exec ingest cat "$d/queue/ready")" = ready ]'
+    check "the work directory is a tmpfs of ${n} MiB" '[ "$(docker exec ingest df -k "$d" | awk "END{print \$2}")" = "$((n * 1024))" ]'
+  solve: |
+    # --- part 1: Hand a file to a specific user ---
+    own=$(awk -F': ' '/owner/{print $2}' /lab/handoff.txt)
+    txt=$(awk -F': ' '/text/{print $2}' /lab/handoff.txt)
+    docker exec -u "$own" svc sh -c "echo '$txt' > /data/handoff"
+
+    # --- part 2: Read-only root, but it still needs scratch space ---
+    d=$(grep -o '/work[0-9]*' /lab/start.sh | head -1)
+    n=$(grep -o '[0-9]*' /lab/limits.txt | head -1)
+    sed -i "s|--read-only busybox|--read-only --tmpfs $d:rw,size=${n}m busybox|" /lab/start.sh
+    sh /lab/start.sh
+
+# ===== Advanced =====
+
 - id: docker-215
   title: On call for the batch host
   difficulty: 4
@@ -320,112 +431,7 @@ exercises:
     n=$(awk -F': ' '{print $2}' /lab/policy.txt)
     docker update --restart "on-failure:$n" import
 
-- id: docker-216
-  title: Who writes the file, and where it can land
-  difficulty: 3
-  kind: fix
-  tags: [exec, user, read-only, tmpfs, mount]
-  tutorial: |
-    **Concept.** Every write inside a container is subject to two questions: *who* is doing the writing, and *where* the writes are allowed to go.
-
-    **Who.** A file's owner is the process that created it. `docker exec` starts an extra process inside a running container's namespaces. By default it runs as the container's configured user, but the user, working directory and environment of that extra process can be chosen per call. Numeric ids are fine even when the container has no such user in its `/etc/passwd`, which matters when a volume or a sidecar expects a specific uid.
-
-    **Where.** A read-only root filesystem blocks writes everywhere in the container, which hardens it but breaks software that needs scratch space. The usual answer is not to give up on read-only, but to make only the necessary paths writable, using memory-backed mounts with a bounded size so that scratch space cannot grow without limit.
-
-    **Read up on:**
-    - `docker exec --help` — the options for user and environment
-    - `stat -c '%u:%g'` — read numeric ownership
-    - `docker inspect` — `.Config.User`, `.HostConfig.ReadonlyRootfs`, and why a container stopped and with which code
-    - `docker run --help` — `--read-only`, `--tmpfs` and `--mount`
-    - Docker docs 'tmpfs mounts' — options such as size
-    - `docker logs` — the application's own error
-  scenario: |
-    A filesystem review of the platform flagged two containers. Both come down to the same
-    question: which process is writing, and is it allowed to write there?
-
-    ## Part 1: Hand a file to a specific user
-
-    The **`svc`** container runs as root, and it has a world-writable directory `/data`.
-    **`/lab/handoff.txt`** gives a numeric `uid:gid` and a line of text.
-
-    Without restarting or recreating `svc`, create **`/data/handoff`** inside it so that the file
-    is **owned by that uid:gid** and contains the given text.
-
-    ## Part 2: Read-only root, but it still needs scratch space
-
-    **`/lab/start.sh`** launches the **`ingest`** container with a read-only root. It exits as soon
-    as it starts. Security insists that the root filesystem stays read-only.
-
-    Fix the setup so that `ingest` runs and its work directory is writable. That directory must
-    be an in-memory filesystem no larger than the size stated in **`/lab/limits.txt`** (MiB).
-    Start it with the script.
-  hints:
-    - "Part 1: the file ownership follows the process that creates it. Numeric ids work even if the container has no such user."
-    - "Part 2: read the container's logs to find the path it cannot create."
-    - "Part 2: only that path should be writable; the rest of the root stays read-only."
-    - "Part 2: a tmpfs mount takes a size option."
-  solution: |
-    ```bash
-    # Part 1: owner and text come from /lab/handoff.txt
-    docker exec -u <uid>:<gid> svc sh -c 'echo "<text>" > /data/handoff'
-    docker exec svc stat -c '%u:%g' /data/handoff
-    ```
-    For part 2, add a tmpfs for the work directory to the `docker run` in `start.sh`, for example:
-
-    ```bash
-    docker run -d --name ingest --read-only --tmpfs <dir>:rw,size=<N>m busybox:1.37 ...
-    ```
-    Then run `sh /lab/start.sh`.
-  setup: |
-    # --- part 1: Hand a file to a specific user ---
-    u=$((RANDOM % 1000 + 2000)); g=$((RANDOM % 1000 + 3000)); tok=$(rand_flag)
-    echo "$u:$g $tok" > "$KL_STATE/handoff.answer"
-    lab_file handoff.txt <<EOF
-    owner: $u:$g
-    text: $tok
-    EOF
-    docker run -d --name svc busybox:1.37 sh -c 'mkdir -p /data; chmod 777 /data; exec sleep 3600' >/dev/null
-    eventually 15 "docker exec svc sh -c 'test -d /data && [ \"\$(stat -c %a /data)\" = 777 ]'"
-    docker inspect -f '{{.Id}}' svc > "$KL_STATE/svc.id"
-
-    # --- part 2: Read-only root, but it still needs scratch space ---
-    d="/work$((RANDOM % 900 + 100))"; n=$((RANDOM % 25 + 8))
-    echo "$d $n" > "$KL_STATE/ingest.answer"
-    lab_file limits.txt <<EOF
-    work directory tmpfs size: ${n} MiB
-    EOF
-    lab_file start.sh 0755 <<EOF
-    #!/bin/sh
-    docker rm -f ingest >/dev/null 2>&1
-    docker run -d --name ingest --read-only busybox:1.37 \\
-      sh -c 'mkdir -p $d/queue && echo ready > $d/queue/ready && exec sleep 3600'
-    EOF
-    sh /lab/start.sh >/dev/null 2>&1 || true
-  check: |
-    info "Part 1: Hand a file to a specific user"
-    read -r own tok < "$KL_STATE/handoff.answer"
-    check "svc is still the original container" '[ "$(c_get svc "{{.Id}}")" = "$(cat "$KL_STATE/svc.id")" ] && c_running svc'
-    check_eq "owner of /data/handoff" "$(docker exec svc stat -c '%u:%g' /data/handoff 2>/dev/null)" "$own"
-    check "content of /data/handoff" 'docker exec svc cat /data/handoff | grep -qxF "$tok"'
-
-    info "Part 2: Read-only root, but it still needs scratch space"
-    read -r d n < "$KL_STATE/ingest.answer"
-    check "ingest is running" 'c_running ingest'
-    check "the root filesystem is still read-only" '[ "$(c_get ingest "{{.HostConfig.ReadonlyRootfs}}")" = true ]'
-    check "writes to / are refused" 'docker exec ingest sh -c "touch /probe 2>/dev/null && exit 1; exit 0"'
-    check "the work directory is writable and was used" '[ "$(docker exec ingest cat "$d/queue/ready")" = ready ]'
-    check "the work directory is a tmpfs of ${n} MiB" '[ "$(docker exec ingest df -k "$d" | awk "END{print \$2}")" = "$((n * 1024))" ]'
-  solve: |
-    # --- part 1: Hand a file to a specific user ---
-    own=$(awk -F': ' '/owner/{print $2}' /lab/handoff.txt)
-    txt=$(awk -F': ' '/text/{print $2}' /lab/handoff.txt)
-    docker exec -u "$own" svc sh -c "echo '$txt' > /data/handoff"
-
-    # --- part 2: Read-only root, but it still needs scratch space ---
-    d=$(grep -o '/work[0-9]*' /lab/start.sh | head -1)
-    n=$(grep -o '[0-9]*' /lab/limits.txt | head -1)
-    sed -i "s|--read-only busybox|--read-only --tmpfs $d:rw,size=${n}m busybox|" /lab/start.sh
-    sh /lab/start.sh
+# ===== Capstone: a real-world lab =====
 
 - id: docker-220
   title: "Incident: the fan-out worker dies at startup"

