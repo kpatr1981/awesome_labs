@@ -107,7 +107,8 @@ type VMInfo struct {
 	Role   string
 	Status string // Running, Stopped, … or "" when not created
 	CPUs   int
-	Memory int64 // bytes, as Lima reports it
+	Memory int64  // bytes, as Lima reports it
+	Dir    string // Lima's instance directory, "" when not created (see disk.go)
 }
 
 // Running reports whether the VM is up.
@@ -138,7 +139,7 @@ func vmsFrom(all map[string]lima.Instance) []VMInfo {
 		for _, vm := range env.VMs {
 			known[vm.Name] = true
 			in := all[vm.Name]
-			out = append(out, VMInfo{Name: vm.Name, Env: env.Title, Role: vm.Role, Status: in.Status, CPUs: in.CPUs, Memory: in.Memory})
+			out = append(out, VMInfo{Name: vm.Name, Env: env.Title, Role: vm.Role, Status: in.Status, CPUs: in.CPUs, Memory: in.Memory, Dir: in.Dir})
 		}
 	}
 	var stray []string
@@ -150,7 +151,7 @@ func vmsFrom(all map[string]lima.Instance) []VMInfo {
 	sort.Strings(stray)
 	for _, name := range stray {
 		in := all[name]
-		out = append(out, VMInfo{Name: name, Status: in.Status, CPUs: in.CPUs, Memory: in.Memory})
+		out = append(out, VMInfo{Name: name, Status: in.Status, CPUs: in.CPUs, Memory: in.Memory, Dir: in.Dir})
 	}
 	return out
 }

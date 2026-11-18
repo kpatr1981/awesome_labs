@@ -35,6 +35,7 @@ type Exam struct {
 	AllowHints bool          `json:"allow_hints"`
 	Questions  []Question    `json:"questions"`
 	Finished   time.Time     `json:"finished,omitempty"`
+	Abandoned  bool          `json:"abandoned,omitempty"` // given up before the end, from the web interface
 }
 
 // Options configure a new exam.

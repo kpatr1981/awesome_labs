@@ -25,6 +25,7 @@ import (
 	"strings"
 	"time"
 
+	"awesome_labs/internal/config"
 	"awesome_labs/internal/exam"
 	"awesome_labs/internal/exercise"
 	"awesome_labs/internal/lab"
@@ -44,7 +45,7 @@ type Deps struct {
 	Exams    *exam.Store
 	Version  string
 	OnExit   string // delete, stop or keep: shown in the UI
-	AutoStop bool   // auto_stop: stop lab VMs that nothing needs (see idle.go)
+	AutoStop bool   // auto_stop at start: stop lab VMs that nothing needs (see idle.go); Settings can change it
 }
 
 // Options configure the listener.
@@ -66,6 +67,7 @@ type server struct {
 	ctx      context.Context // cancelled at shutdown: ops and terminals stop with it
 	jupyter  jupyter
 	act      activity
+	live     *live // settings the Settings screen changes while running
 	// dialJupyter reaches JupyterLab; nil uses the docker host (tests set it)
 	dialJupyter func(context.Context) (net.Conn, error)
 }
@@ -100,6 +102,13 @@ func Listen(d Deps, o Options) (*Server, error) {
 		terms:    newTerminals(),
 		md:       newMarkdown(),
 	}
+	days := 0
+	if d.Manager != nil {
+		if c, err := config.Load(d.Manager.StateDir); err == nil {
+			days = c.DeleteStoppedAfterDays
+		}
+	}
+	s.live = newLive(d.AutoStop, days)
 	s.jupyter.proxy = s.newJupyterProxy()
 	shown := host
 	if ip != nil && ip.IsUnspecified() {
@@ -119,6 +128,7 @@ func (srv *Server) Serve(ctx context.Context) (busy bool, err error) {
 	s.ctx = ctx
 	s.act.touch()
 	go s.reapIdle(ctx)
+	go s.reapStale(ctx)
 	fmt.Fprintf(o.Out, "awesome_labs web interface: %s\n", srv.url)
 	if !s.loopback {
 		fmt.Fprintf(o.Out, "  warning: listening on %s, beyond this machine. Anyone with the link gets a shell on the lab VMs.\n", srv.ln.Addr())
@@ -195,6 +205,13 @@ func (s *server) routes() http.Handler {
 	mux.HandleFunc("POST /api/jupyter/stop", s.handleJupyterStop)
 	mux.HandleFunc("GET /api/prepare", s.handlePrepareOffer)
 	mux.HandleFunc("POST /api/prepare", s.handlePrepare)
+	mux.HandleFunc("GET /api/exam", s.handleExam)
+	mux.HandleFunc("GET /api/exam/setup", s.handleExamSetup)
+	mux.HandleFunc("POST /api/exam", s.handleExamStart)
+	mux.HandleFunc("POST /api/exam/{action}", s.handleExamEnd) // finish, abandon
+	mux.HandleFunc("GET /api/weakspots", s.handleWeakSpots)
+	mux.HandleFunc("GET /api/settings", s.handleSettings)
+	mux.HandleFunc("PUT /api/settings", s.handleSetSettings)
 	mux.HandleFunc(lab.JupyterBase, s.handleJupyterProxy)
 	return s.guard(mux)
 }

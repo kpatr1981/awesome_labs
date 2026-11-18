@@ -394,6 +394,8 @@ func (s *server) handleEnvs(w http.ResponseWriter, r *http.Request) {
 		Status  string `json:"status"`
 		Saved   bool   `json:"saved"`
 		Tainted bool   `json:"tainted"`
+		// SavedDisk is the host disk its saved copies take, in bytes
+		SavedDisk int64 `json:"savedDisk"`
 	}
 	type vmJSON struct {
 		Name   string `json:"name"`
@@ -402,21 +404,26 @@ func (s *server) handleEnvs(w http.ResponseWriter, r *http.Request) {
 		Status string `json:"status"`
 		CPUs   int    `json:"cpus"`
 		Memory string `json:"memory"`
+		Disk   int64  `json:"disk"` // bytes its instance directory takes on the host
+		// StoppedSince is when a stopped VM went down (lab.VMInfo.StoppedSince)
+		StoppedSince time.Time `json:"stoppedSince,omitzero"`
 	}
 	out := map[string]any{"cache": s.Manager.CacheSummary(), "logPath": s.Manager.LogPath()}
 	envs, list, err := s.Manager.Overview(ctx)
 	if err != nil {
 		out["error"] = err.Error()
 	}
+	saved, _ := lab.SavedCopyUsage(ctx)
 	ej := []envJSON{}
 	for _, e := range envs {
-		ej = append(ej, envJSON{string(e.Env.Profile), e.Env.Title, e.Status, e.Saved, e.Tainted})
+		ej = append(ej, envJSON{string(e.Env.Profile), e.Env.Title, e.Status, e.Saved, e.Tainted, saved[string(e.Env.Profile)]})
 	}
 	vms := []vmJSON{}
 	for _, v := range list {
-		vms = append(vms, vmJSON{v.Name, v.Env, v.Role, v.Status, v.CPUs, v.MemoryLabel()})
+		vms = append(vms, vmJSON{v.Name, v.Env, v.Role, v.Status, v.CPUs, v.MemoryLabel(), v.DiskUsage(), v.StoppedSince()})
 	}
-	out["envs"], out["vms"] = ej, vms
+	_, days := s.live.get()
+	out["envs"], out["vms"], out["deleteStoppedAfterDays"] = ej, vms, days
 	writeJSON(w, http.StatusOK, out)
 }
 

@@ -105,6 +105,12 @@ function setupFilters() {
   };
 }
 
+// tiers: each module runs Beginner → Intermediate → Advanced and ends with its
+// capstone or incident (the big multi-part lab)
+const TIERS = ["Beginner", "Intermediate", "Advanced", "Capstone"];
+function capstoneTag(e) { return (e.tags || []).find((t) => t === "capstone" || t === "incident") || null; }
+function tierOf(e) { return capstoneTag(e) ? 3 : e.difficulty <= 2 ? 0 : e.difficulty === 3 ? 1 : 2; }
+
 function statusOf(id) {
   if (S.state.active && S.state.active.id === id) return "active";
   return S.progress[id] || "";
@@ -125,9 +131,11 @@ function renderList() {
     if (show === "started" && st !== "started") return false;
     if (show === "none" && st !== "") return false;
     if (!words.length) return true;
-    const hay = `${e.id} ${e.title} ${e.module} ${e.kind} ${(e.tags || []).join(" ")} ${diffWords[e.difficulty]}`.toLowerCase();
+    const hay = `${e.id} ${e.title} ${e.module} ${e.kind} ${(e.tags || []).join(" ")} ${diffWords[e.difficulty]} ${TIERS[tierOf(e)]}`.toLowerCase();
     return words.every((w) => hay.includes(w));
   });
+  // within a module, easy to hard by tier (stable: a module's own order otherwise)
+  S.filtered.sort((a, b) => (S.modRank.get(a.track + "/" + a.module) - S.modRank.get(b.track + "/" + b.module)) || (tierOf(a) - tierOf(b)));
   const list = $("#list");
   list.replaceChildren();
   const solved = S.filtered.filter((e) => S.progress[e.id] === "solved").length;
@@ -140,7 +148,7 @@ function renderList() {
     return;
   }
   const frag = document.createDocumentFragment();
-  let mod = null, head = null, modCount = 0, modSolved = 0;
+  let mod = null, head = null, modCount = 0, modSolved = 0, tier = -1;
   const flush = () => { if (head) head.lastChild.textContent = `${modSolved}/${modCount}`; };
   for (const e of S.filtered) {
     const key = e.track + "/" + e.module;
@@ -149,6 +157,11 @@ function renderList() {
       mod = key; modCount = modSolved = 0;
       head = h("div", { class: "mod-head" }, h("span", { title: e.module }, (track ? "" : S.trackName[e.track] + " · ") + e.module), h("span", { class: "mod-prog" }));
       frag.append(head);
+      tier = -1;
+    }
+    if (tierOf(e) !== tier) {
+      tier = tierOf(e);
+      frag.append(h("div", { class: "tier-head t" + tier }, TIERS[tier]));
     }
     modCount++;
     const st = statusOf(e.id);
@@ -157,7 +170,8 @@ function renderList() {
     frag.append(h("a", {
       class: "ex-row" + (S.ex && S.ex.id === e.id ? " sel" : ""), href: "#/ex/" + e.id, "data-id": e.id, title: e.title,
     }, h("span", { class: "mark " + st }, mark), h("span", { class: "id" }, e.id), h("span", { class: "title" }, e.title),
-      h("span", { class: "meta" }, h("span", { class: "kind" }, e.kind), dots(e.difficulty))));
+      h("span", { class: "meta" }, capstoneTag(e) ? h("span", { class: "cap-badge", title: capstoneTag(e) === "incident" ? "A multi-problem incident" : "The module's big real-world lab" }, capstoneTag(e)) : null,
+        h("span", { class: "kind" }, e.kind), dots(e.difficulty))));
   }
   flush();
   list.append(frag);
@@ -195,10 +209,15 @@ function go(path) { location.hash = "#/" + path; }
 function route() {
   const p = location.hash.replace(/^#\/?/, "");
   document.body.classList.remove("show-list");
+  for (const [id, r] of [["exam-link", "exam"], ["weak-link", "weak"], ["envs-link", "envs"]]) $("#" + id).classList.toggle("on", p === r);
+  if (p !== "exam") clearInterval(examTimer);
   if (p.startsWith("ex/")) return openExercise(decodeURIComponent(p.slice(3)));
   S.ex = null;
   markSelected();
   if (p === "envs") return renderEnvs();
+  if (p === "exam") return renderExam();
+  if (p === "weak") return renderWeak();
+  if (p === "settings") return renderSettings();
   if (p === "list") { document.body.classList.add("show-list"); return; }
   renderHome();
 }
@@ -210,7 +229,9 @@ function renderHome() {
   const page = h("div", { class: "page" });
   page.append(h("div", { class: "hero" },
     h("h1", {}, "Hands-on labs on real VMs"),
-    h("p", {}, "Pick an exercise, start its lab, solve it in the terminal below and check your work. Every exercise has a scenario, progressive hints and a full solution.")));
+    h("p", {}, "Pick an exercise, start its lab, solve it in the terminal below and check your work. Every exercise has a scenario, progressive hints and a full solution."),
+    h("div", { class: "quick" }, h("a", { class: "btn btn-sm", href: "#/exam" }, "⏱ Take an exam"), h("a", { class: "btn btn-sm", href: "#/weak" }, "Weak spots"),
+      h("a", { class: "btn btn-sm", href: "#/envs" }, "Environments & VMs"), h("a", { class: "btn btn-sm btn-ghost", href: "#/settings" }, "Settings"))));
   const a = S.state.active;
   if (a) {
     page.append(h("div", { class: "banner info" }, h("span", { class: "grow" }, "You're working on ", h("b", {}, a.id), " — " + a.title + " (started " + ago(a.since) + ")"),
@@ -237,7 +258,7 @@ function renderHome() {
   page.append(pg);
   page.append(h("p", { class: "muted small", style: "margin-top:28px" },
     `awesome_labs ${S.state.version} · `, h("a", { href: S.state.repo, target: "_blank", rel: "noopener noreferrer" }, S.state.repo.replace(/^https:\/\//, "")),
-    ` · when you stop the server (ctrl+c) the lab VMs are handled by on_exit: ${S.state.onExit}. Exams are started from the terminal UI (X); a running one is honoured here.`));
+    ` · when you stop the server (ctrl+c) the lab VMs are handled by on_exit: ${S.state.onExit} (`, h("a", { href: "#/settings" }, "Settings"), ")."));
   c.replaceChildren(page);
   c.scrollTop = 0;
 }
@@ -323,6 +344,8 @@ function renderExercise(scrollTop) {
   else if (ex.status === "started") badges.push(h("span", { class: "badge started" }, "● Started"));
   if (ex.destructive) badges.push(h("span", { class: "badge warn", title: "A reset can't undo this exercise; the environment is rebuilt before the next one" }, "rebuilds the environment"));
   if (ex.inExam) badges.push(h("span", { class: "badge" }, "exam question"));
+  const cap = (ex.tags || []).find((t) => t === "capstone" || t === "incident");
+  if (cap) badges.push(h("span", { class: "badge cap", title: cap === "incident" ? "A multi-problem incident" : "The module's big real-world lab" }, cap === "incident" ? "Incident" : "Capstone"));
   page.append(h("div", { class: "ex-head" }, h("div", { style: "flex:1;min-width:0" },
     h("div", { class: "eid" }, ex.id),
     h("h1", {}, ex.title),
@@ -525,7 +548,7 @@ async function revealHint(ex) {
 }
 async function revealSolution(ex) {
   if (ex.solution == null) {
-    const ok = await confirmDialog("Reveal the solution?", "It's recorded in your progress (and shown in weak spots in the terminal UI).", "Show it");
+    const ok = await confirmDialog("Reveal the solution?", "It's recorded in your progress (and counts in Weak spots).", "Show it");
     if (!ok) return;
   }
   try { S.ex = await api("POST", `/api/exercises/${encodeURIComponent(ex.id)}/solution`); S.tab = "solution"; renderExercise(false); }
@@ -560,11 +583,12 @@ async function renderEnvs() {
     h("p", {}, "Only one environment runs at a time: starting an exercise deletes the VMs of the others. A saved copy makes the next start take seconds instead of a full build.")));
   if (d.error) page.append(h("div", { class: "banner bad" }, d.error));
   const et = h("table", { class: "tbl" }, h("tr", {}, h("th", {}, "Environment"), h("th", {}, "Status"), h("th", {}, "Saved copy"), h("th", {})));
+  const days = d.deleteStoppedAfterDays;
   for (const e of d.envs) {
     const run = e.status === "ready" ? "run" : e.status === "not created" ? "none" : "stop";
     et.append(h("tr", {}, h("td", {}, h("b", {}, e.title), e.tainted ? h("div", { class: "small", style: "color:var(--red)" }, "rebuilt before the next exercise") : null),
       h("td", {}, h("span", { class: "st " + run }, e.status)),
-      h("td", { class: "muted" }, e.saved ? "✔ up to date" : "—"),
+      h("td", { class: "muted" }, e.saved ? "✔ up to date" : "—", e.savedDisk ? h("div", { class: "small" }, fmtBytes(e.savedDisk) + " on disk") : null),
       h("td", { class: "btns" },
         e.status !== "ready" ? act("Start", `/api/envs/${e.profile}/up`) : null,
         e.status !== "not created" && e.status !== "stopped" ? act("Stop", `/api/envs/${e.profile}/stop`) : null,
@@ -576,22 +600,234 @@ async function renderEnvs() {
   page.append(h("div", { class: "tbl-wrap" }, et));
   page.append(h("div", { class: "section-title", style: "display:flex;align-items:center;gap:8px" }, h("span", { style: "flex:1" }, "Virtual machines"),
     act("Stop all", "/api/vms/all/stop"), act("Delete all", "/api/vms/all/delete", "btn-danger", "Deletes every lab VM, running or stopped. Saved copies are kept.")));
-  const vt = h("table", { class: "tbl" }, h("tr", {}, h("th", {}, "VM"), h("th", {}, "Environment"), h("th", {}, "Status"), h("th", {}, "CPU"), h("th", {}, "Memory"), h("th", {})));
+  const vt = h("table", { class: "tbl" }, h("tr", {}, h("th", {}, "VM"), h("th", {}, "Environment"), h("th", {}, "Status"), h("th", {}, "CPU"), h("th", {}, "Memory"), h("th", { title: "Space its files really take on this machine" }, "Disk"), h("th", {})));
+  let stoppedDisk = 0;
   for (const v of d.vms || []) {
     const st = v.status || "not created";
+    if (v.status === "Stopped") stoppedDisk += v.disk || 0;
+    const since = v.status === "Stopped" && v.stoppedSince ? h("div", { class: "small muted" }, "stopped " + ago(v.stoppedSince)) : null;
     vt.append(h("tr", {}, h("td", { class: "mono" }, v.name), h("td", { class: "muted" }, v.env || "(stray)"),
-      h("td", {}, h("span", { class: "st " + (st === "Running" ? "run" : v.status ? "stop" : "none") }, st)),
-      h("td", { class: "muted" }, v.cpus || "–"), h("td", { class: "muted" }, v.memory),
+      h("td", {}, h("span", { class: "st " + (st === "Running" ? "run" : v.status ? "stop" : "none") }, st), since),
+      h("td", { class: "muted" }, v.cpus || "–"), h("td", { class: "muted" }, v.memory), h("td", { class: "muted" }, fmtBytes(v.disk)),
       h("td", { class: "btns" }, v.status === "Running" ? act("Stop", `/api/vms/${v.name}/stop`) : null,
         v.status ? act("Delete", `/api/vms/${v.name}/delete`, "btn-danger", "Deletes " + esc(v.name) + ". The next exercise on its environment re-creates it.") : null)));
   }
   page.append(h("div", { class: "tbl-wrap" }, vt));
+  page.append(h("p", { class: "muted small" }, stoppedDisk ? `Stopped lab VMs take ${fmtBytes(stoppedDisk)}. ` : "",
+    days > 0 ? `Lab VMs stopped for more than ${days} days are deleted automatically (saved copies are kept). ` : "Stopped lab VMs are kept until you delete them. ",
+    h("a", { href: "#/settings" }, days > 0 ? "Change in Settings" : "Delete them after a while (Settings)")));
   const L = S.logs.get("env");
   if (L) { page.append(h("div", { class: "section-title" }, "Last operation")); page.append(renderLog("env")); }
   page.append(h("div", { class: "section-title" }, "Image cache"), h("pre", { class: "log" }, d.cache || "empty"),
     h("p", { class: "muted small" }, "Detailed logs: " + d.logPath));
   c.replaceChildren(page);
 }
+
+// ---------- exam ----------
+const fmtClock = (s) => { s = Math.max(0, Math.round(s)); const hh = Math.floor(s / 3600), mm = Math.floor(s / 60) % 60, ss = s % 60;
+  return (hh ? hh + ":" + String(mm).padStart(2, "0") : String(mm).padStart(2, "0")) + ":" + String(ss).padStart(2, "0"); };
+let examTimer;
+async function renderExam() {
+  S.route = { name: "exam" };
+  clearInterval(examTimer);
+  let d, setup;
+  try { [d, setup] = await Promise.all([api("GET", "/api/exam"), api("GET", "/api/exam/setup")]); } catch (e) { toast(e.message, "bad"); return; }
+  if (S.route.name !== "exam") return;
+  const page = h("div", { class: "page" });
+  if (d.exam) page.append(...examRunning(d.exam));
+  else {
+    if (S.examResult) page.append(...examResult(S.examResult));
+    page.append(...examSetup(setup, !S.examResult && d.last ? d.last : null));
+  }
+  $("#content").replaceChildren(page);
+  await refreshState();
+}
+
+function qmark(q) { return q.passed ? h("span", { class: "mark solved" }, "✔") : q.checks ? h("span", { class: "mark bad" }, "✘") : h("span", { class: "mark" }, "·"); }
+
+function examRunning(e) {
+  const left = h("b", { class: "exam-clock" });
+  const deadline = Date.now() + e.remainingSeconds * 1000;
+  const tick = async () => {
+    const s = (deadline - Date.now()) / 1000;
+    left.textContent = fmtClock(s);
+    left.className = "exam-clock" + (s < 600 ? " low" : s < 1800 ? " mid" : "");
+    if (s <= 0) { clearInterval(examTimer); toast("Time's up — here is your result", "info"); await showExamEnd(null); }
+  };
+  tick(); examTimer = setInterval(tick, 1000);
+  const rows = e.questions.map((q, i) => h("a", { class: "q-row", href: "#/ex/" + q.id },
+    h("span", { class: "n" }, String(i + 1) + "."), qmark(q), h("span", { class: "id" }, q.id), dots(q.difficulty), h("span", { class: "title" }, q.title),
+    h("span", { class: "muted small" }, q.checks ? `${q.checks} check${q.checks > 1 ? "s" : ""}` : "not attempted")));
+  return [
+    h("div", { class: "hero" }, h("h1", {}, e.title),
+      h("p", {}, "Open a question, start its lab, solve it and check: your last check per question counts. ",
+        e.allowHints ? "Hints and solutions are allowed in this exam." : "Hints and solutions are locked until the exam ends.")),
+    h("div", { class: "exam-bar" }, h("span", {}, "Time left "), left, h("span", { class: "muted" }, `· passing so far ${e.passed}/${e.total} · pass mark ${Math.round(e.passMark)}%`),
+      h("span", { class: "grow" }),
+      h("button", { class: "btn btn-primary", onclick: () => finishExam(false) }, "Finish exam"),
+      h("button", { class: "btn btn-ghost btn-danger", onclick: () => finishExam(true) }, "Abandon")),
+    h("div", { class: "q-list" }, ...rows),
+  ];
+}
+
+async function finishExam(abandon) {
+  const ok = abandon
+    ? await confirmDialog("Abandon the exam?", "It's recorded in your exam history as abandoned, and hints and solutions unlock.", "Abandon", true)
+    : await confirmDialog("Finish the exam now?", "Checking stops counting and you get your result.", "Finish");
+  if (ok) await showExamEnd(abandon ? "abandon" : "finish");
+}
+async function showExamEnd(action) {
+  try {
+    const d = action ? await api("POST", "/api/exam/" + action) : await api("GET", "/api/exam");
+    S.examResult = d.last || null;
+  } catch (e) { toast(e.message, "bad"); }
+  await refreshState();
+  if (S.route.name === "exam") renderExam(); else go("exam");
+}
+
+function examResult(e, title) {
+  const pct = Math.round(e.percent);
+  const verdict = e.abandoned ? h("div", { class: "verdict" }, `ABANDONED · ${e.passed}/${e.total} · ${pct}%`)
+    : h("div", { class: "verdict " + (e.pass ? "ok" : "bad") }, `${e.pass ? "PASSED" : "NOT PASSED"} · ${e.passed}/${e.total} · ${pct}%`);
+  const rows = e.questions.map((q, i) => h("a", { class: "q-row", href: "#/ex/" + q.id },
+    h("span", { class: "n" }, String(i + 1) + "."), qmark(q), h("span", { class: "id" }, q.id), dots(q.difficulty), h("span", { class: "title" }, q.title),
+    h("span", { class: q.passed ? "res ok" : q.checks ? "res bad" : "res" }, q.passed ? "solved" : q.checks ? "not solved" : "not attempted")));
+  return [
+    h("div", { class: "section-title" }, title || "Result"),
+    h("h2", { class: "exam-title" }, e.title), verdict,
+    h("p", { class: "muted" }, `Time used ${fmtClock(e.timeUsedSeconds)} of ${fmtClock(e.durationSeconds)} · pass mark ${Math.round(e.passMark)}%`,
+      e.previousBest != null ? ` · your previous best on this pool: ${Math.round(e.previousBest)}%` : ""),
+    h("div", { class: "q-list" }, ...rows),
+    h("p", { class: "muted small" }, "Open a question to see its solution: they're unlocked now."),
+  ];
+}
+
+function examSetup(d, last) {
+  const pool = h("select", { id: "ex-pool" }, ...d.sources.map((s) => h("option", { value: s.index }, `${s.label}  (${s.count})`)));
+  const count = h("select", { id: "ex-count" }, ...d.counts.map((n) => h("option", { value: n }, `${n} questions`)));
+  const mins = h("select", { id: "ex-mins" }, ...d.minutes.map((n) => h("option", { value: n }, `${n} minutes`)));
+  const hints = h("input", { type: "checkbox", id: "ex-hints" });
+  pool.value = store.get("examPool", "0"); count.value = store.get("examCount", String(d.counts[1])); mins.value = store.get("examMins", String(d.minutes[1]));
+  if (pool.selectedIndex < 0) pool.selectedIndex = 0;
+  if (count.selectedIndex < 0) count.selectedIndex = 0;
+  if (mins.selectedIndex < 0) mins.selectedIndex = 0;
+  const start = async () => {
+    store.set("examPool", pool.value); store.set("examCount", count.value); store.set("examMins", mins.value);
+    try {
+      await api("POST", "/api/exam", { source: Number(pool.value), count: Number(count.value), minutes: Number(mins.value), hints: hints.checked });
+      S.examResult = null;
+      toast("Exam started — good luck! Open a question to begin.", "ok");
+      renderExam();
+    } catch (e) { toast(e.message, "bad"); }
+  };
+  const out = [
+    h("div", { class: "hero" }, h("h1", {}, "New exam"), h("p", {}, "A timed set of exercises drawn at random from one pool, graded by their checks.")),
+    h("div", { class: "form" },
+      h("label", {}, h("span", {}, "Pool"), pool),
+      h("label", {}, h("span", {}, "Questions"), count),
+      h("label", {}, h("span", {}, "Time limit"), mins),
+      h("label", { class: "check" }, hints, h("span", {}, "Allow hints and solutions (otherwise locked: exam conditions)")),
+      h("div", {}, h("button", { class: "btn btn-primary", onclick: start }, "Start exam"))),
+    h("ul", { class: "muted how" },
+      h("li", {}, "Questions are drawn at random: about a third easy, a third medium, a third hard. Exercises that rebuild their environment are left out."),
+      h("li", {}, "Each question gets a fresh lab when you start it — finish one before moving on."),
+      h("li", {}, "Your last check per question counts. Starting a question again resets its lab."),
+      h("li", {}, `Pass mark: ${Math.round(d.passMark * 100)}%. When time runs out, checking stops and you get your result.`)),
+  ];
+  if (last) out.push(...examResult(last, "Last exam"));
+  return out;
+}
+
+// ---------- weak spots ----------
+async function renderWeak() {
+  S.route = { name: "weak" };
+  let d;
+  try { d = await api("GET", "/api/weakspots"); } catch (e) { toast(e.message, "bad"); return; }
+  if (S.route.name !== "weak") return;
+  const page = h("div", { class: "page" }, h("div", { class: "hero" }, h("h1", {}, "Weak spots"),
+    h("p", {}, "The modules where you needed the most help — hints, solutions and failed checks — over the exercises you tried.")));
+  if (!d.any) page.append(h("div", { class: "locked" }, h("p", {}, "Nothing to go on yet: this fills in as you solve exercises.")));
+  else if (!d.modules.length) page.append(h("div", { class: "banner ok" }, "No weak spots: every exercise you tried passed first time, without help."));
+  else {
+    const t = h("table", { class: "tbl" }, h("tr", {}, h("th", {}, "Module"), h("th", {}, "Solved"), h("th", {}, "Hints"), h("th", {}, "Solutions"), h("th", {}, "Retries")));
+    for (const m of d.modules) t.append(h("tr", {}, h("td", {}, m.name), h("td", {}, `${m.solved}/${m.tried}`), h("td", {}, String(m.hints)), h("td", {}, String(m.solutions)), h("td", {}, String(m.retries))));
+    page.append(h("div", { class: "tbl-wrap" }, t));
+  }
+  if (d.retry.length) {
+    page.append(h("div", { class: "section-title" }, "Worth doing again without the solution"),
+      h("div", { class: "q-list" }, ...d.retry.map((r) => h("a", { class: "q-row two", href: "#/ex/" + r.id }, h("span", { class: "id" }, r.id), h("span", { class: "title" }, r.title)))),
+      h("p", { class: "muted small" }, "Reset progress on one (on its page) to try it fresh."));
+  }
+  $("#content").replaceChildren(page);
+}
+
+// ---------- settings ----------
+async function renderSettings() {
+  S.route = { name: "settings" };
+  let d;
+  try { d = await api("GET", "/api/settings"); } catch (e) { toast(e.message, "bad"); return; }
+  if (S.route.name !== "settings") return;
+  const page = h("div", { class: "page" }, h("div", { class: "hero" }, h("h1", {}, "Settings"),
+    h("p", {}, "Saved to ", h("code", {}, d.path), " — its comments and VM sizes are kept.")));
+  if (d.error) page.append(h("div", { class: "banner bad" }, d.error));
+  const inputs = {};
+  const applies = { now: "applies now", "next start": "from the next start", "terminal UI": "terminal UI" };
+  const form = h("div", { class: "settings" });
+  for (const st of d.settings) {
+    let input;
+    if (st.type === "bool") { input = h("input", { type: "checkbox" }); input.checked = !!st.value; }
+    else if (st.type === "int") { input = h("input", { type: "number", min: "0", step: "1", class: "num" }); input.value = st.value; }
+    else { input = h("select", {}, ...st.options.map((o) => h("option", { value: o }, o))); input.value = st.value; }
+    inputs[st.key] = { input, st };
+    form.append(h("div", { class: "setting" },
+      h("div", { class: "setting-head" }, h("label", {}, h("b", {}, st.label), " ", h("code", { class: "small muted" }, st.key)),
+        h("span", { class: "badge" + (st.applies === "now" ? " solved" : ""), title: st.applies === "terminal UI" ? "Only the terminal UI (awesome_labs tui) uses this" : null }, applies[st.applies] || st.applies)),
+      h("div", { class: "setting-row" }, input, h("span", { class: "muted small" }, st.help))));
+  }
+  const save = async () => {
+    const body = {};
+    for (const [k, { input, st }] of Object.entries(inputs)) {
+      const v = st.type === "bool" ? input.checked : st.type === "int" ? Number(input.value) : input.value;
+      if (v !== st.value) body[k] = v;
+    }
+    if (!Object.keys(body).length) return toast("Nothing changed", "info");
+    try {
+      const r = await api("PUT", "/api/settings", body);
+      toast("✔ " + r.saved + (body.on_exit ? ` — on_exit applies from the next start (this run: ${r.runningOnExit})` : ""), "ok", 6000);
+      renderSettings();
+    } catch (e) { toast(e.message, "bad"); }
+  };
+  page.append(form, h("div", { class: "actions" }, h("button", { class: "btn btn-primary", onclick: save }, "Save"),
+    h("span", { class: "muted small" }, `This run exits with on_exit: ${d.runningOnExit}.`)));
+  $("#content").replaceChildren(page);
+}
+
+// ---------- resume: the exercise set up on the (usually stopped) VMs ----------
+async function offerResume() {
+  const a = S.state.active;
+  if (!a || store.get("resumeDismissed", "") === a.id + a.since) return;
+  let ex;
+  try { ex = await api("GET", "/api/exercises/" + encodeURIComponent(a.id)); } catch { return; }
+  const box = $("#resume");
+  const close = () => { box.hidden = true; };
+  const cont = async () => {
+    close();
+    go("ex/" + a.id);
+    if (ex.running === false) {
+      S.openTermAfterBoot = a.id;
+      try { await api("POST", `/api/exercises/${encodeURIComponent(a.id)}/boot`); await refreshState(); toast("Booting the lab — the terminal opens when it's up", "info"); }
+      catch (e) { S.openTermAfterBoot = null; toast(e.message, "bad"); }
+    } else if (ex.terminals[0]) terms.open(ex.terminals[0].target, ex.terminals[0].label);
+  };
+  box.replaceChildren(
+    h("div", { class: "resume-text" }, h("b", {}, "Continue " + a.id), " — " + a.title + ": your lab is kept",
+      h("div", { class: "muted small" }, ex.running === false ? "Its VMs are stopped; Continue boots them and opens a terminal." : "Its VMs are running.")),
+    h("button", { class: "btn btn-primary btn-sm", onclick: cont }, ex.running === false ? "⏻ Continue" : "Continue"),
+    h("button", { class: "icon-btn", title: "Not now", onclick: () => { store.set("resumeDismissed", a.id + a.since); close(); } }, "×"));
+  box.hidden = false;
+}
+
+const fmtBytes = (n) => !n ? "–" : n >= 1 << 30 ? (n / (1 << 30)).toFixed(1) + " GiB" : n >= 1 << 20 ? Math.round(n / (1 << 20)) + " MiB" : Math.round(n / 1024) + " KiB";
 
 // ---------- operations stream ----------
 function connectOps() {
@@ -673,7 +909,12 @@ async function opDone(o) {
   await refreshProgress();
   if (S.route.name === "ex" && S.ex) await openExercise(S.ex.id, true);
   if (o.kind === "start" && !o.error && S.ex?.id === o.target && S.ex.terminals[0]) terms.open(S.ex.terminals[0].target, S.ex.terminals[0].label);
+  if (o.kind === "boot" && S.openTermAfterBoot === o.target) {
+    S.openTermAfterBoot = null;
+    if (!o.error && S.ex?.id === o.target && S.ex.terminals[0]) terms.open(S.ex.terminals[0].target, S.ex.terminals[0].label);
+  }
   if (S.route.name === "envs") renderEnvs();
+  if (S.route.name === "exam" && o.kind === "check") renderExam();
   if (S.route.name === "home") renderHome();
 }
 
@@ -699,6 +940,7 @@ async function refreshState() {
   try { S.state = { active: null, exam: null, op: null, ...(await api("GET", "/api/state")) }; } catch { return; }
   renderTop(); renderStatus();
   if (S.state.repo) $("#repo-link").href = S.state.repo;
+  if (!S.state.active) $("#resume").hidden = true;
 }
 async function refreshProgress() {
   try { S.progress = await api("GET", "/api/progress"); } catch { return; }
@@ -950,6 +1192,8 @@ document.addEventListener("keydown", (e) => {
   }
   S.trackName = Object.fromEntries(S.catalog.tracks.map((t) => [t.id, t.name]));
   for (const e of S.catalog.exercises) S.byId.set(e.id, e);
+  S.modRank = new Map();
+  for (const e of S.catalog.exercises) { const k = e.track + "/" + e.module; if (!S.modRank.has(k)) S.modRank.set(k, S.modRank.size); }
   // a list toggle for narrow screens
   const menu = h("a", { class: "btn btn-ghost list-btn", href: "#/list", title: "Exercise list" }, "☰ List");
   $(".topbar").insertBefore(menu, $(".top-spacer"));
@@ -961,6 +1205,7 @@ document.addEventListener("keydown", (e) => {
   window.addEventListener("hashchange", route);
   route();
   offerPrepare();
+  offerResume();
   setInterval(refreshState, 5000);
   window.addEventListener("beforeunload", (e) => { if (terms.list.some((t) => t.term && t.state === "live")) /* shells end with the page; notebooks don't */ { e.preventDefault(); e.returnValue = ""; } });
 })();

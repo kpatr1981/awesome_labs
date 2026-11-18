@@ -34,6 +34,10 @@ type Config struct {
 	CheckUpdates bool `yaml:"check_updates"`
 	// Theme is auto, dark or light. NO_COLOR turns colours off.
 	Theme string `yaml:"theme"`
+	// DeleteStoppedAfterDays deletes lab VMs (not the saved copies) that have
+	// been stopped for longer than this many days, freeing their disk. The web
+	// interface checks when it starts and once a day. 0 (the default) never does.
+	DeleteStoppedAfterDays int `yaml:"delete_stopped_after_days"`
 
 	Docker       VMSize `yaml:"docker"`
 	ControlPlane VMSize `yaml:"controlplane"`
@@ -65,6 +69,9 @@ func (c Config) Validate() error {
 	default:
 		return fmt.Errorf("theme: %q is not auto, dark or light", c.Theme)
 	}
+	if c.DeleteStoppedAfterDays < 0 {
+		return fmt.Errorf("delete_stopped_after_days: %d is negative (0 never deletes)", c.DeleteStoppedAfterDays)
+	}
 	return nil
 }
 
@@ -95,6 +102,11 @@ auto_stop: true
 # Colours: auto, dark or light. NO_COLOR=1 turns colours off.
 # theme: auto
 
+# Delete lab VMs that have been stopped for more than this many days, freeing
+# their disk (the saved copies are kept, so the next start still takes
+# seconds). The web interface checks when it starts and once a day. 0 = never.
+# delete_stopped_after_days: 0
+
 # VM sizes. Changes apply when a VM is created: run
 #   awesome_labs env rebuild docker|k8s
 # afterwards. Defaults shown; the Kubernetes nodes need at least 2 CPUs / 2GiB.
@@ -119,11 +131,25 @@ func Load(dir string) (Config, error) {
 	if err != nil {
 		return c, err
 	}
+	return parse(p, b)
+}
+
+// loadFile reads and validates a config file that must exist.
+func loadFile(p string) (Config, error) {
+	b, err := os.ReadFile(p)
+	if err != nil {
+		return Config{}, err
+	}
+	return parse(Path(filepath.Dir(p)), b)
+}
+
+func parse(name string, b []byte) (Config, error) {
+	var c Config
 	if err := yaml.Unmarshal(b, &c); err != nil {
-		return c, fmt.Errorf("%s: %w", p, err)
+		return c, fmt.Errorf("%s: %w", name, err)
 	}
 	if err := c.Validate(); err != nil {
-		return c, fmt.Errorf("%s: %w", p, err)
+		return c, fmt.Errorf("%s: %w", name, err)
 	}
 	return c, nil
 }

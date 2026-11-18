@@ -16,7 +16,7 @@ import (
 )
 
 func testServer() *server {
-	return &server{token: "secret", loopback: true, ops: newOpRunner(), terms: newTerminals(), md: newMarkdown(), ctx: context.Background()}
+	return &server{token: "secret", loopback: true, ops: newOpRunner(), terms: newTerminals(), md: newMarkdown(), ctx: context.Background(), live: newLive(true, 0)}
 }
 
 func TestGuard(t *testing.T) {

@@ -3,7 +3,6 @@ package tui
 import (
 	"fmt"
 	"os"
-	"sort"
 	"strings"
 
 	"github.com/atotto/clipboard"
@@ -12,6 +11,7 @@ import (
 	"github.com/muesli/termenv"
 
 	"awesome_labs/internal/exercise"
+	"awesome_labs/internal/insight"
 )
 
 // ---- copying code blocks (y) ----
@@ -229,81 +229,31 @@ func (m *model) filterPlaceholder() string {
 
 // ---- weak spots ----
 
-// weakSpots ranks the modules where you needed the most help: hints,
-// solutions and failed checks, over the exercises you tried.
-func weakSpots(cat *exercise.Catalog, get func(string) (hints, checks int, sawSolution, solved, started bool)) string {
-	type mod struct {
-		name                                  string
-		tried, solved, hints, sols, extraChks int
-		retry                                 []string
-	}
-	mods := map[string]*mod{}
-	var order []string
-	for _, e := range cat.Exercises {
-		h, c, sol, ok, st := get(e.ID)
-		if !st && !ok && h == 0 && !sol {
-			continue
-		}
-		k := trackName(e.Track) + " · " + e.Module
-		md := mods[k]
-		if md == nil {
-			md = &mod{name: k}
-			mods[k] = md
-			order = append(order, k)
-		}
-		md.tried++
-		md.hints += h
-		if sol {
-			md.sols++
-			md.retry = append(md.retry, e.ID)
-		}
-		if ok {
-			md.solved++
-			md.extraChks += max(0, c-1)
-		} else {
-			md.extraChks += c
-		}
-	}
-	if len(order) == 0 {
+// weakSpots renders the ranking of the modules where you needed the most help
+// (insight.WeakSpots, which the web interface shows too).
+func weakSpots(cat *exercise.Catalog, get func(string) insight.Effort) string {
+	r := insight.WeakSpots(cat, get)
+	if !r.Any {
 		return "Weak spots\n\nNothing to go on yet: this fills in as you solve exercises,\nfrom the hints, solutions and failed checks each one took."
 	}
-	score := func(md *mod) float64 {
-		return float64(md.hints+3*md.sols+md.extraChks+2*(md.tried-md.solved)) / float64(md.tried)
-	}
-	sort.SliceStable(order, func(i, j int) bool { return score(mods[order[i]]) > score(mods[order[j]]) })
 	var b strings.Builder
 	b.WriteString("Weak spots — where you needed the most help\n\n")
 	b.WriteString(fmt.Sprintf("  %-44s %7s %6s %10s %8s\n", "Module", "solved", "hints", "solutions", "retries"))
-	shown := 0
-	for _, k := range order {
-		md := mods[k]
-		if score(md) == 0 {
-			continue
-		}
-		b.WriteString(fmt.Sprintf("  %-44s %3d/%-3d %6d %10d %8d\n", trunc(md.name, 44), md.solved, md.tried, md.hints, md.sols, md.extraChks))
-		if shown++; shown == 10 {
-			break
-		}
+	for _, md := range r.Modules {
+		b.WriteString(fmt.Sprintf("  %-44s %3d/%-3d %6d %10d %8d\n", trunc(md.Name, 44), md.Solved, md.Tried, md.Hints, md.Solutions, md.Retries))
 	}
-	if shown == 0 {
+	if len(r.Modules) == 0 {
 		b.WriteString("  No weak spots: every exercise you tried passed first time, without help.\n")
 	}
-	var retry []string
-	for _, k := range order {
-		retry = append(retry, mods[k].retry...)
-	}
-	if len(retry) > 0 {
-		if len(retry) > 12 {
-			retry = retry[:12]
-		}
-		b.WriteString("\nWorth doing again without the solution (R resets one):\n  " + strings.Join(retry, " · ") + "\n")
+	if len(r.Retry) > 0 {
+		b.WriteString("\nWorth doing again without the solution (R resets one):\n  " + strings.Join(r.Retry, " · ") + "\n")
 	}
 	return b.String()
 }
 
 func (m *model) weakSpotsText() string {
-	return weakSpots(m.cat, func(id string) (int, int, bool, bool, bool) {
+	return weakSpots(m.cat, func(id string) insight.Effort {
 		p := m.prog.Get(id)
-		return p.HintsUsed, p.Checks, p.SawSolution, !p.Solved.IsZero(), !p.Started.IsZero()
+		return insight.Effort{Hints: p.HintsUsed, Checks: p.Checks, SawSolution: p.SawSolution, Solved: !p.Solved.IsZero(), Started: !p.Started.IsZero()}
 	})
 }

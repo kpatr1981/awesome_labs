@@ -24,6 +24,7 @@ type Instance struct {
 	Status string `json:"status"`
 	CPUs   int    `json:"cpus"`
 	Memory int64  `json:"memory"`
+	Dir    string `json:"dir"` // the instance's directory: its disks, logs and pid files
 }
 
 // Available reports whether limactl is on PATH.

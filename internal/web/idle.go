@@ -75,7 +75,7 @@ func (s *server) reapIdle(ctx context.Context) {
 			return
 		case <-t.C:
 		}
-		if !s.AutoStop {
+		if on, _ := s.live.get(); !on {
 			continue
 		}
 		_, active := s.Manager.Active()

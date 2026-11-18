@@ -14,8 +14,8 @@ import (
 )
 
 var (
-	examCounts  = []int{5, 10, 15, 20, 30}
-	examMinutes = []int{30, 60, 90, 120, 180}
+	examCounts  = exam.Counts
+	examMinutes = exam.Minutes
 	sBigOK      = lipgloss.NewStyle().Bold(true).Foreground(colOK).Padding(0, 1).Border(lipgloss.ThickBorder()).BorderForeground(colOK)
 	sBigBad     = lipgloss.NewStyle().Bold(true).Foreground(colBad).Padding(0, 1).Border(lipgloss.ThickBorder()).BorderForeground(colBad)
 )
@@ -91,63 +91,12 @@ func (m *model) viewPaths() string {
 
 // ---------------- exam setup ----------------
 
-type examSource struct {
-	label string
-	pool  []*exercise.Exercise
-}
+type examSource = exam.Source
 
 // examSources lists single-environment pools: whole tracks and every path
 // (paths that mix Docker and Kubernetes are split per environment).
 func (m *model) examSources() []examSource {
-	byProfile := func(list []*exercise.Exercise) map[exercise.Profile][]*exercise.Exercise {
-		r := map[exercise.Profile][]*exercise.Exercise{}
-		for _, e := range list {
-			r[e.Profile] = append(r[e.Profile], e)
-		}
-		return r
-	}
-	// One pool per track: several tracks share a lab VM, so a pool per profile
-	// would mix them.
-	all := map[string][]*exercise.Exercise{}
-	for _, e := range m.cat.Exercises {
-		all[e.Track] = append(all[e.Track], e)
-	}
-	src := []examSource{
-		{"Kubernetes — everything", all["kubernetes"]},
-		{"Docker — everything", all["docker"]},
-		{"Offensive Security — everything", all["offsec"]},
-		{"Linux — everything", all["linux"]},
-		{"Networking — everything", all["networking"]},
-		{"Cloud — everything", all["cloud"]},
-		{"Data — everything", all["data"]},
-		{"Defensive Security — everything", all["defensive"]},
-		{"Programming — everything", all["programming"]},
-		{"Data Science — everything", all["datascience"]},
-	}
-	for _, t := range m.tracks {
-		switch t {
-		case "", "kubernetes", "docker", "offsec", "linux", "networking", "cloud", "data", "defensive", "programming", "datascience":
-			continue
-		}
-		if len(all[t]) > 0 {
-			src = append(src, examSource{trackLabel(t) + " — everything", all[t]})
-		}
-	}
-	for _, p := range m.paths {
-		g := byProfile(p.Exercises)
-		if len(g) == 1 {
-			for _, list := range g {
-				src = append(src, examSource{p.Title, list})
-			}
-			continue
-		}
-		for _, prof := range []exercise.Profile{exercise.ProfileK8s, exercise.ProfileDocker, exercise.ProfileOffsec} {
-			if len(g[prof]) > 0 {
-				src = append(src, examSource{fmt.Sprintf("%s (%s)", p.Title, lab.EnvFor(prof).Title), g[prof]})
-			}
-		}
-	}
-	return src
+	return exam.Sources(m.cat, m.paths, func(p exercise.Profile) string { return lab.EnvFor(p).Title })
 }
 
 func (m *model) updateExamSetup(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
@@ -178,9 +127,9 @@ func (m *model) updateExamSetup(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 	case "enter":
 		s := srcs[m.setupSource]
 		e, err := exam.New(exam.Options{
-			Title:      fmt.Sprintf("%s — %d questions", s.label, examCounts[m.setupCount]),
-			Source:     s.label,
-			Pool:       s.pool,
+			Title:      fmt.Sprintf("%s — %d questions", s.Label, examCounts[m.setupCount]),
+			Source:     s.Label,
+			Pool:       s.Pool,
 			Count:      examCounts[m.setupCount],
 			Duration:   time.Duration(examMinutes[m.setupMins]) * time.Minute,
 			AllowHints: m.setupHints,
@@ -207,7 +156,7 @@ func (m *model) viewExamSetup() string {
 	t := sTitle.Render(" New exam") + "   "
 	b.WriteString(m.titleButtons(t, 1, button{label: "Start exam", key: "enter"}, button{label: "Cancel", key: "esc"}) + "\n\n")
 	rows := []struct{ label, value string }{
-		{"Pool", fmt.Sprintf("%s  (%d exercises)", srcs[m.setupSource].label, len(srcs[m.setupSource].pool))},
+		{"Pool", fmt.Sprintf("%s  (%d exercises)", srcs[m.setupSource].Label, len(srcs[m.setupSource].Pool))},
 		{"Questions", fmt.Sprint(examCounts[m.setupCount])},
 		{"Time limit", fmt.Sprintf("%d minutes", examMinutes[m.setupMins])},
 		{"Hints & solutions", map[bool]string{true: "allowed", false: "locked (exam conditions)"}[m.setupHints]},
