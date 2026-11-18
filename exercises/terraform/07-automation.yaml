@@ -4,6 +4,8 @@ profile: docker
 order: 7
 exercises:
 
+# ===== Beginner =====
+
 - id: tf-071
   title: Apply exactly the approved plan
   difficulty: 1
@@ -262,6 +264,8 @@ exercises:
     EOF
     chmod +x ci.sh
     DEPLOY_ENV=dev ./ci.sh </dev/null
+
+# ===== Intermediate =====
 
 - id: tf-074
   title: The plan that ignores main.tf
@@ -936,6 +940,8 @@ exercises:
     EOF
     terraform apply -auto-approve -input=false -no-color
     rm -f terraform.tfstate.backup
+
+# ===== Advanced =====
 
 - id: tf-080
   title: "Error acquiring the state lock"
@@ -1744,3 +1750,507 @@ exercises:
     echo "deploy finished"
     EOF
     ./ci.sh
+
+# ===== Capstone: a real-world lab =====
+
+- id: tf-092
+  title: "Capstone: promote a release from staging to production"
+  difficulty: 5
+  kind: build
+  tags: [terraform, capstone, pipeline, promotion, environments, backend-config, tf_data_dir, saved-plan, show-json, test, mock_provider, locking, scripting]
+  tutorial: |
+    **Concept.** Teams rarely deploy straight to production. A release goes
+    through **gates** first (lint, unit tests), then to **staging**, and is
+    **promoted** to production only when production is about to receive
+    exactly what staging already has. The production change is a **saved
+    plan** that a person approves, and the approved artifact is the only
+    thing that may ever be applied.
+
+    The pieces, all from this module:
+
+    - **One configuration, two environments.** An empty `backend "local" {}`
+      plus `-backend-config=backend/<env>.hcl` at init time. To keep both
+      environments initialised in one checkout at once, give each its own
+      working data directory with **`TF_DATA_DIR`** (the default is
+      `.terraform`).
+    - **Gates that report.** `terraform fmt -check -recursive`, `terraform
+      validate` (after `init -backend=false`), and `terraform test` with
+      **`mock_provider`** so unit tests never touch real files.
+    - **Machine-readable plans.** `terraform show -json PLANFILE` has
+      `resource_changes[].change.actions` (`["create"]`, `["update"]`,
+      `["delete"]`, `["delete","create"]` for a replacement, `["no-op"]`)
+      and `planned_values`, the resources as they will be afterwards.
+      `terraform show -json` without a file shows the current **state** the
+      same way, under `values`.
+    - **Saved plans are single-use.** Applying one after the state has
+      moved on fails with *Saved plan is stale*. The pipeline must report
+      that, never re-plan and apply something nobody approved.
+    - **Locks.** `-lock-timeout=DURATION` makes Terraform wait for a held
+      lock and then give up with *Error acquiring the state lock*, instead
+      of failing at once or hanging.
+    - **Every outcome distinct.** The CI system and the approval bot read
+      the exit status and a summary file, not the log.
+
+    **Read up on:**
+    - `TF_DATA_DIR`, `terraform init -backend-config=FILE`
+    - `terraform plan -detailed-exitcode -out=FILE`, `terraform show -json`
+      (plan and state), the JSON output format
+    - `terraform apply PLANFILE`, "Saved plan is stale"
+    - `-lock-timeout`, `terraform test`, `mock_provider`
+    - `jq -n` for writing JSON from a script
+  scenario: |
+    The web team ships its site from **`/lab/release`**: one configuration
+    with an empty `backend "local" {}` block, **`backend/staging.hcl`** and
+    **`backend/prod.hcl`** (states in `/lab/states/`), and
+    **`env/staging.tfvars`** / **`env/prod.tfvars`**. The release number
+    comes from the variable **`RELEASE`**. Each environment is served from
+    `/lab/www/<env>/`. Both are live at release `2026.11.1`. Nothing in the
+    checkout has been initialised.
+
+    **1. Unit tests.** Write **`tests/unit.tftest.hcl`**: it uses
+    **`mock_provider "local"`** and asserts that, for an environment and a
+    list of pages of your choosing, every page is written to
+    **`/lab/www/<env>/<page>.html`** and `release.txt` to
+    `/lab/www/<env>/release.txt` holding the release.
+
+    **2. The pipeline.** Write **`/lab/release/promote.sh`** (executable,
+    non-interactive, works from any directory). It runs in two modes and
+    always ends with **one outcome**: it prints it as its **last line**,
+    exits with its **status**, and writes **`out/summary.json`** containing
+    at least `{"outcome": "<outcome>", "exit": <status>}`.
+
+    **`./promote.sh plan`**, in this order:
+
+    1. lint: `fmt -check` (recursive, rewriting nothing) and `validate`;
+       then `terraform test`
+    2. staging: plan with `env/staging.tfvars` and the release, and apply
+       **that saved plan** if it has changes. Staging needs no approval
+    3. prod: plan with `env/prod.tfvars` to **`out/prod.tfplan`**, and write
+       its JSON to **`out/prod.json`**
+    4. decide, first match wins:
+
+    | outcome | exit | when |
+    |---|---|---|
+    | `lint-failed` | 10 | fmt or validate fails |
+    | `test-failed` | 11 | `terraform test` fails (nothing gets planned or applied) |
+    | `locked` | 12 | a state lock is still held after **10 seconds** (`-lock-timeout=10s` on everything that locks) |
+    | `error` | 1 | anything else fails (or `RELEASE` is unset) |
+    | `no-changes` | 0 | prod's plan has no changes |
+    | `blocked` | 3 | prod's plan **deletes** a resource outright (actions exactly `["delete"]`; replacing a file is fine) |
+    | `mismatch` | 4 | the resources prod would hold after its plan (addresses) aren't exactly the ones staging holds now |
+    | `pending` | 2 | otherwise: the plan waits for approval |
+
+    For `pending`, `summary.json` also has **`prod_changes`**: the sorted
+    addresses of prod's planned changes (every action except `no-op`).
+    Whenever the outcome isn't `pending`, **no `out/prod.tfplan` may be left
+    behind**, so nothing unapproved can be applied.
+
+    **`./promote.sh apply`** applies the approved **`out/prod.tfplan`**,
+    and only that, then removes it (a plan is applied once):
+
+    | outcome | exit | when |
+    |---|---|---|
+    | `no-plan` | 5 | there is no `out/prod.tfplan` |
+    | `promoted` | 0 | it was applied |
+    | `stale` | 6 | Terraform refuses it as stale (never re-plan) |
+    | `locked` | 12 | the prod state lock is still held after 10 seconds |
+    | `error` | 1 | anything else |
+
+    Your first `plan` run will fail its lint stage: fix the repository, not
+    the gate. Leave the backend block in the code empty.
+
+    The check runs your pipeline through a week of releases: two releases
+    planned back to back, approvals, an old approved artifact applied late,
+    a page added only to prod, a page removed, a job holding prod's lock,
+    a badly formatted file and a bug in the file paths.
+  hints:
+    - "Start by running the stages by hand: `terraform init -backend=false`, `terraform fmt -check -recursive` (what does it name?), `terraform validate`."
+    - "Two environments in one checkout: `TF_DATA_DIR=.tfdata/staging terraform init -input=false -backend-config=backend/staging.hcl`, and the same with `prod`. Use the same `TF_DATA_DIR` for every later command of that environment. `export TF_VAR_release=$RELEASE` passes the release."
+    - "`plan -detailed-exitcode` exits 0, 1 or 2. Keep the output of a failing command (`>out/last.log 2>&1`) and `grep -q 'Error acquiring the state lock'` (or `'Saved plan is stale'`) to tell the failures apart."
+    - "Blocked: `jq -e 'any(.resource_changes[]?; .change.actions == [\"delete\"])' out/prod.json`. Mismatch: compare `[.planned_values.root_module.resources[]?.address] | sort` from `out/prod.json` with `[.values.root_module.resources[]?.address] | sort` from staging's `terraform show -json`."
+    - "One `finish OUTCOME STATUS [CHANGES]` function that writes `out/summary.json` with `jq -n`, removes `out/prod.tfplan` unless the outcome is `pending`, prints the outcome and exits keeps every path consistent."
+    - "The test: `mock_provider \"local\" {}`, a `variables` block, and a `run` with `command = plan` asserting `local_file.page[\"home\"].filename == \"/lab/www/ci/home.html\"` and `local_file.release.content`."
+  solution: |
+    ```bash
+    cd /lab/release
+    terraform init -backend=false && terraform fmt -check -recursive   # main.tf
+    terraform fmt                                                      # fix the repository
+
+    mkdir -p tests
+    cat > tests/unit.tftest.hcl <<'EOF'
+    mock_provider "local" {}
+
+    variables {
+      env     = "ci"
+      release = "r1"
+      pages   = ["home", "faq"]
+    }
+
+    run "files_go_under_the_environment" {
+      command = plan
+
+      assert {
+        condition     = local_file.page["home"].filename == "/lab/www/ci/home.html" && local_file.page["faq"].filename == "/lab/www/ci/faq.html"
+        error_message = "pages must be written to /lab/www/<env>/<page>.html"
+      }
+
+      assert {
+        condition     = local_file.release.filename == "/lab/www/ci/release.txt" && local_file.release.content == "r1\n"
+        error_message = "release.txt must hold the release, under /lab/www/<env>/"
+      }
+    }
+    EOF
+    terraform test
+
+    cat > promote.sh <<'EOF'
+    #!/bin/bash
+    # Promotion pipeline.
+    #   ./promote.sh plan   lint, test, deploy staging, plan prod (RELEASE=...)
+    #   ./promote.sh apply  apply the approved out/prod.tfplan, once
+    set -uo pipefail
+    cd "$(dirname "$0")"
+    export TF_IN_AUTOMATION=1
+    mode=${1:-}
+    mkdir -p out
+
+    # finish OUTCOME STATUS [PROD_CHANGES_JSON]
+    finish() {
+      [ "$1" = pending ] || rm -f out/prod.tfplan
+      jq -n --arg mode "$mode" --arg o "$1" --argjson e "$2" --argjson c "${3:-null}" \
+        '{mode: $mode, outcome: $o, exit: $e} + (if $c == null then {} else {prod_changes: $c} end)' \
+        > out/summary.json
+      echo "$1"
+      exit "$2"
+    }
+    # failed: classify the failure logged in out/last.log
+    failed() {
+      grep -q 'Error acquiring the state lock' out/last.log && finish locked 12
+      grep -q 'Saved plan is stale' out/last.log && finish stale 6
+      finish error 1
+    }
+    # tf ENV ARGS...: terraform for one environment, in its own data directory
+    tf() { local env=$1; shift; TF_DATA_DIR=".tfdata/$env" terraform "$@"; }
+    init() { tf "$1" init -input=false -no-color -backend-config="backend/$1.hcl" >out/last.log 2>&1 || failed; }
+
+    plan_mode() {
+      terraform init -backend=false -input=false -no-color >out/last.log 2>&1 || failed
+      terraform fmt -check -recursive >/dev/null 2>&1 || finish lint-failed 10
+      terraform validate -no-color >/dev/null 2>&1 || finish lint-failed 10
+      terraform test -no-color >out/last.log 2>&1 || finish test-failed 11
+      [ -n "${RELEASE:-}" ] || finish error 1
+      export TF_VAR_release="$RELEASE"
+
+      init staging
+      tf staging plan -input=false -no-color -lock-timeout=10s -detailed-exitcode \
+        -var-file=env/staging.tfvars -out=out/staging.tfplan >out/last.log 2>&1
+      rc=$?
+      [ "$rc" = 1 ] && failed
+      if [ "$rc" = 2 ]; then
+        tf staging apply -input=false -no-color -lock-timeout=10s out/staging.tfplan >out/last.log 2>&1 || failed
+      fi
+      rm -f out/staging.tfplan
+
+      init prod
+      tf prod plan -input=false -no-color -lock-timeout=10s -detailed-exitcode \
+        -var-file=env/prod.tfvars -out=out/prod.tfplan >out/last.log 2>&1
+      rc=$?
+      [ "$rc" = 1 ] && failed
+      tf prod show -json out/prod.tfplan > out/prod.json || finish error 1
+      [ "$rc" = 0 ] && finish no-changes 0
+
+      changes=$(jq -c '[.resource_changes[]? | select(.change.actions != ["no-op"]) | .address] | sort' out/prod.json)
+      if jq -e 'any(.resource_changes[]?; .change.actions == ["delete"])' out/prod.json >/dev/null; then
+        finish blocked 3 "$changes"
+      fi
+      staging=$(tf staging show -json -no-color | jq -c '[.values.root_module.resources[]?.address] | sort') || finish error 1
+      prod=$(jq -c '[.planned_values.root_module.resources[]?.address] | sort' out/prod.json)
+      [ "$staging" = "$prod" ] || finish mismatch 4 "$changes"
+      finish pending 2 "$changes"
+    }
+
+    apply_mode() {
+      [ -s out/prod.tfplan ] || finish no-plan 5
+      init prod
+      if tf prod apply -input=false -no-color -lock-timeout=10s out/prod.tfplan >out/last.log 2>&1; then
+        finish promoted 0
+      fi
+      failed
+    }
+
+    case "$mode" in
+      plan) plan_mode ;;
+      apply) apply_mode ;;
+      *) echo "usage: $0 plan|apply" >&2; finish error 1 ;;
+    esac
+    EOF
+    chmod +x promote.sh
+
+    RELEASE=2026.11.2 ./promote.sh plan; echo "exit $?"   # pending 2
+    cat out/summary.json
+    ./promote.sh apply                                   # promoted
+    ```
+  setup: |
+    tf_start
+    rm -rf /lab/release /lab/states /lab/www /lab/.kl-seed /lab/.kl-holder
+    docker rm -f kl-prod-lock >/dev/null 2>&1 || true
+    on_reset 'docker rm -f kl-prod-lock >/dev/null 2>&1; true'
+    mkdir -p /lab/states /lab/www
+    chown "$(lab_user):" /lab/states /lab/www
+    lab_file /lab/release/versions.tf <<'EOF'
+    terraform {
+      required_version = ">= 1.10"
+
+      required_providers {
+        local = {
+          source  = "hashicorp/local"
+          version = "2.9.1"
+        }
+      }
+
+      backend "local" {}
+    }
+    EOF
+    # content's "=" isn't aligned: the lint stage must catch it
+    lab_file /lab/release/main.tf <<'EOF'
+    variable "env" {
+      type = string
+    }
+
+    variable "release" {
+      type = string
+    }
+
+    variable "pages" {
+      type = set(string)
+    }
+
+    resource "local_file" "page" {
+      for_each = var.pages
+      filename = "/lab/www/${var.env}/${each.key}.html"
+      content = "<h1>${each.key}</h1>\n<p>${var.env} ${var.release}</p>\n"
+    }
+
+    resource "local_file" "release" {
+      filename = "/lab/www/${var.env}/release.txt"
+      content  = "${var.release}\n"
+    }
+
+    output "release" {
+      value = var.release
+    }
+    EOF
+    for e in staging prod; do
+      printf 'path = "/lab/states/%s.tfstate"\n' "$e" | lab_file /lab/release/backend/$e.hcl
+      printf 'env   = "%s"\npages = ["index", "about"]\n' "$e" | lab_file /lab/release/env/$e.tfvars
+    done
+    printf '.terraform/\n.tfdata/\nout/\n*.tfplan\n' | lab_file /lab/release/.gitignore
+    # both environments are live at 2026.11.1, deployed from another checkout
+    mkdir -p /lab/.kl-seed
+    cp /lab/release/versions.tf /lab/release/main.tf /lab/.kl-seed/
+    chown -R "$(lab_user):" /lab/.kl-seed
+    as_user "cd /lab/.kl-seed && for e in staging prod; do
+      TF_DATA_DIR=.d-\$e terraform init -input=false -no-color -backend-config=/lab/release/backend/\$e.hcl >/dev/null &&
+      TF_DATA_DIR=.d-\$e terraform apply -auto-approve -input=false -no-color -var-file=/lab/release/env/\$e.tfvars -var release=2026.11.1 >/dev/null || exit 1
+    done"
+    rm -rf /lab/.kl-seed
+  check: |
+    d=/lab/release w=/lab/www
+    run() { out=$(as_user "cd /lab && $1 timeout 600 $d/promote.sh $2" 2>/dev/null); rc=$?; last=$(printf '%s\n' "$out" | tail -n1); }
+    sumj() { jq -c "$1" $d/out/summary.json 2>/dev/null; }
+    rel() { cat $w/$1/release.txt 2>/dev/null; }
+    check "promote.sh is executable" '[ -x $d/promote.sh ]'
+    check "promote.sh waits 10s for locks" 'grep -q -- "-lock-timeout=10s" $d/promote.sh'
+    check_not "the backend block in the code stays empty" 'grep -qE "^\s*path\s*=" $d/*.tf'
+    check "tests/unit.tftest.hcl mocks the local provider" 'grep -qE "^\s*mock_provider\s+\"local\"" $d/tests/unit.tftest.hcl'
+    [ -x $d/promote.sh ] || kl_finish
+    cp -p $d/main.tf "$KL_STATE/main.tf"
+    cp -p $d/env/prod.tfvars "$KL_STATE/prod.tfvars"
+    cp -p $d/env/staging.tfvars "$KL_STATE/staging.tfvars"
+    # two new release numbers, so the check can be run again
+    n=$((RANDOM % 9000 + 1000)); A="$(date +%Y.%m).$n" B="$(date +%Y.%m).$((n + 1))"
+    p0=$(rel prod)
+
+    # Monday: release A is planned, nobody approves it yet
+    rm -rf $d/out
+    run RELEASE=$A plan
+    check_eq "release $A: plan ends pending (last line, exit)" "$last $rc" "pending 2"
+    check_eq "...summary.json agrees" "$(sumj '[.outcome, .exit]')" '["pending",2]'
+    check_eq "...staging runs $A" "$(rel staging)" "$A"
+    check_eq "...prod still runs its old release" "$(rel prod)" "$p0"
+    check_eq "...out/prod.json is prod's plan" "$(jq -r '.variables.env.value' $d/out/prod.json 2>/dev/null)" "prod"
+    check_eq "...prod_changes lists prod's planned changes, sorted" "$(sumj .prod_changes)" "$(jq -c '[.resource_changes[]? | select(.change.actions != ["no-op"]) | .address] | sort' $d/out/prod.json 2>/dev/null)"
+    cp $d/out/prod.tfplan "$KL_STATE/old.tfplan" 2>/dev/null
+    # Tuesday: release B is planned and approved
+    run RELEASE=$B plan
+    check_eq "release $B: plan ends pending" "$last $rc" "pending 2"
+    run "" apply
+    check_eq "the approved plan is applied" "$last $rc" "promoted 0"
+    check_eq "...prod runs $B" "$(rel prod)" "$B"
+    check_eq "...every page in prod has it" "$(cat $w/prod/index.html 2>/dev/null)" "$(printf '<h1>index</h1>\n<p>prod %s</p>' "$B")"
+    check_not "...and the plan is used up" '[ -e $d/out/prod.tfplan ]'
+    run "" apply
+    check_eq "apply with no plan" "$last $rc" "no-plan 5"
+    # Wednesday: someone re-uploads Monday's approved artifact
+    cp "$KL_STATE/old.tfplan" $d/out/prod.tfplan 2>/dev/null; chown -R "$(lab_user):" $d/out
+    run "" apply
+    check_eq "an old artifact is refused" "$last $rc" "stale 6"
+    check_eq "...prod still runs $B" "$(rel prod)" "$B"
+    # Thursday: a page added to prod only
+    printf 'env   = "prod"\npages = ["index", "about", "beta"]\n' | lab_file $d/env/prod.tfvars
+    run RELEASE=$B plan
+    check_eq "a page only prod would get: mismatch" "$last $rc" "mismatch 4"
+    check_not "...nothing applied to prod, no plan left" '[ -e $w/prod/beta.html ] || [ -e $d/out/prod.tfplan ]'
+    cp -p "$KL_STATE/prod.tfvars" $d/env/prod.tfvars
+    # Friday: the about page is retired everywhere
+    for e in staging prod; do printf 'env   = "%s"\npages = ["index"]\n' $e | lab_file $d/env/$e.tfvars; done
+    run RELEASE=$B plan
+    check_eq "a page deleted in prod: blocked" "$last $rc" "blocked 3"
+    check "...prod keeps the page, no plan left" '[ -e $w/prod/about.html ] && ! [ -e $d/out/prod.tfplan ]'
+    check_not "...staging, which needs no approval, dropped it" '[ -e $w/staging/about.html ]'
+    cp -p "$KL_STATE/prod.tfvars" $d/env/prod.tfvars
+    cp -p "$KL_STATE/staging.tfvars" $d/env/staging.tfvars
+    # Saturday: a job holds prod's state lock
+    rm -rf /lab/.kl-holder
+    printf 'terraform {\n  backend "local" {\n    path = "/lab/states/prod.tfstate"\n  }\n}\n\ndata "external" "audit" {\n  program = ["sh", "-c", "sleep 600"]\n}\n' | lab_file /lab/.kl-holder/main.tf
+    tf_as_user /lab/.kl-holder init -input=false -no-color >/dev/null 2>&1
+    docker rm -f kl-prod-lock >/dev/null 2>&1
+    docker run -d --name kl-prod-lock --init -u "$(id -u "$(lab_user)"):$(id -g "$(lab_user)")" -e HOME=/tmp \
+      -v /lab:/lab -w /lab/.kl-holder kl-terraform:1 plan -input=false -no-color >/dev/null
+    if eventually 60 '[ -f /lab/states/.prod.tfstate.lock.info ]'; then
+      sleep 2
+      run RELEASE=$B plan
+      check_eq "prod's lock is held: locked" "$last $rc" "locked 12"
+      check_eq "...summary.json agrees" "$(sumj '[.outcome, .exit]')" '["locked",12]'
+    else
+      fail "the check could not lock prod's state"
+    fi
+    docker rm -f kl-prod-lock >/dev/null 2>&1
+    rm -rf /lab/.kl-holder
+    # a badly formatted file
+    printf '\nlocals {\nowner="web"\n}\n' >> $d/main.tf
+    run RELEASE=$B.9 plan
+    check_eq "a badly formatted file: lint-failed" "$last $rc" "lint-failed 10"
+    check "...and the gate doesn't rewrite it" 'grep -q "^owner=\"web\"" $d/main.tf'
+    cp -p "$KL_STATE/main.tf" $d/main.tf
+    # a bug in the file paths
+    sed -i 's#"/lab/www/${var.env}/${each.key}.html"#"/lab/www/${each.key}.html"#' $d/main.tf
+    run RELEASE=$B.9 plan
+    check_eq "pages written outside /lab/www/<env>/: test-failed" "$last $rc" "test-failed 11"
+    check_eq "...and staging was left alone" "$(rel staging)" "$B"
+    cp -p "$KL_STATE/main.tf" $d/main.tf
+    # back to normal
+    run RELEASE=$B plan
+    check_eq "staging and prod agree again: no-changes" "$last $rc" "no-changes 0"
+    check "...staging has its about page back" '[ -e $w/staging/about.html ]'
+    check_eq "...summary.json agrees" "$(sumj '[.outcome, .exit]')" '["no-changes",0]'
+  solve: |
+    cd /lab/release
+    terraform fmt -no-color
+    mkdir -p tests
+    cat > tests/unit.tftest.hcl <<'EOF'
+    mock_provider "local" {}
+
+    variables {
+      env     = "ci"
+      release = "r1"
+      pages   = ["home", "faq"]
+    }
+
+    run "files_go_under_the_environment" {
+      command = plan
+
+      assert {
+        condition     = local_file.page["home"].filename == "/lab/www/ci/home.html" && local_file.page["faq"].filename == "/lab/www/ci/faq.html"
+        error_message = "pages must be written to /lab/www/<env>/<page>.html"
+      }
+
+      assert {
+        condition     = local_file.release.filename == "/lab/www/ci/release.txt" && local_file.release.content == "r1\n"
+        error_message = "release.txt must hold the release, under /lab/www/<env>/"
+      }
+    }
+    EOF
+    cat > promote.sh <<'EOF'
+    #!/bin/bash
+    # Promotion pipeline.
+    #   ./promote.sh plan   lint, test, deploy staging, plan prod (RELEASE=...)
+    #   ./promote.sh apply  apply the approved out/prod.tfplan, once
+    set -uo pipefail
+    cd "$(dirname "$0")"
+    export TF_IN_AUTOMATION=1
+    mode=${1:-}
+    mkdir -p out
+
+    # finish OUTCOME STATUS [PROD_CHANGES_JSON]
+    finish() {
+      [ "$1" = pending ] || rm -f out/prod.tfplan
+      jq -n --arg mode "$mode" --arg o "$1" --argjson e "$2" --argjson c "${3:-null}" \
+        '{mode: $mode, outcome: $o, exit: $e} + (if $c == null then {} else {prod_changes: $c} end)' \
+        > out/summary.json
+      echo "$1"
+      exit "$2"
+    }
+    # failed: classify the failure logged in out/last.log
+    failed() {
+      grep -q 'Error acquiring the state lock' out/last.log && finish locked 12
+      grep -q 'Saved plan is stale' out/last.log && finish stale 6
+      finish error 1
+    }
+    # tf ENV ARGS...: terraform for one environment, in its own data directory
+    tf() { local env=$1; shift; TF_DATA_DIR=".tfdata/$env" terraform "$@"; }
+    init() { tf "$1" init -input=false -no-color -backend-config="backend/$1.hcl" >out/last.log 2>&1 || failed; }
+
+    plan_mode() {
+      terraform init -backend=false -input=false -no-color >out/last.log 2>&1 || failed
+      terraform fmt -check -recursive >/dev/null 2>&1 || finish lint-failed 10
+      terraform validate -no-color >/dev/null 2>&1 || finish lint-failed 10
+      terraform test -no-color >out/last.log 2>&1 || finish test-failed 11
+      [ -n "${RELEASE:-}" ] || finish error 1
+      export TF_VAR_release="$RELEASE"
+
+      init staging
+      tf staging plan -input=false -no-color -lock-timeout=10s -detailed-exitcode \
+        -var-file=env/staging.tfvars -out=out/staging.tfplan >out/last.log 2>&1
+      rc=$?
+      [ "$rc" = 1 ] && failed
+      if [ "$rc" = 2 ]; then
+        tf staging apply -input=false -no-color -lock-timeout=10s out/staging.tfplan >out/last.log 2>&1 || failed
+      fi
+      rm -f out/staging.tfplan
+
+      init prod
+      tf prod plan -input=false -no-color -lock-timeout=10s -detailed-exitcode \
+        -var-file=env/prod.tfvars -out=out/prod.tfplan >out/last.log 2>&1
+      rc=$?
+      [ "$rc" = 1 ] && failed
+      tf prod show -json out/prod.tfplan > out/prod.json || finish error 1
+      [ "$rc" = 0 ] && finish no-changes 0
+
+      changes=$(jq -c '[.resource_changes[]? | select(.change.actions != ["no-op"]) | .address] | sort' out/prod.json)
+      if jq -e 'any(.resource_changes[]?; .change.actions == ["delete"])' out/prod.json >/dev/null; then
+        finish blocked 3 "$changes"
+      fi
+      staging=$(tf staging show -json -no-color | jq -c '[.values.root_module.resources[]?.address] | sort') || finish error 1
+      prod=$(jq -c '[.planned_values.root_module.resources[]?.address] | sort' out/prod.json)
+      [ "$staging" = "$prod" ] || finish mismatch 4 "$changes"
+      finish pending 2 "$changes"
+    }
+
+    apply_mode() {
+      [ -s out/prod.tfplan ] || finish no-plan 5
+      init prod
+      if tf prod apply -input=false -no-color -lock-timeout=10s out/prod.tfplan >out/last.log 2>&1; then
+        finish promoted 0
+      fi
+      failed
+    }
+
+    case "$mode" in
+      plan) plan_mode ;;
+      apply) apply_mode ;;
+      *) echo "usage: $0 plan|apply" >&2; finish error 1 ;;
+    esac
+    EOF
+    chmod +x promote.sh
+    RELEASE=2026.11.2 ./promote.sh plan || true
+    ./promote.sh apply

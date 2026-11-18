@@ -4,6 +4,8 @@ profile: docker
 order: 6
 exercises:
 
+# ===== Beginner =====
+
 - id: tf-051
   title: "Unsupported Terraform Core version"
   difficulty: 1
@@ -658,6 +660,8 @@ exercises:
   solve: |
     cd /lab/hotfix
     terraform apply -target=local_file.hotfix -auto-approve -input=false -no-color
+
+# ===== Intermediate =====
 
 - id: tf-060
   title: Read the file after it is written
@@ -1488,6 +1492,8 @@ exercises:
     terraform init -input=false -no-color
     terraform test -no-color
 
+# ===== Advanced =====
+
 - id: tf-070
   title: "Incident: the status page that will not plan"
   difficulty: 4
@@ -1594,5 +1600,611 @@ exercises:
     sed -i 's/for_each = var.pages/for_each = toset(var.pages)/' main.tf
     sed -i 's/\.contents/.content/' main.tf
     sed -i 's/^  value = "token:${var.admin_token}"/&\n  sensitive = true/' main.tf
+    terraform init -input=false -no-color
+    terraform apply -auto-approve -input=false -no-color
+
+# ===== Capstone: a real-world lab =====
+
+- id: tf-091
+  title: "Capstone: the service catalog"
+  difficulty: 5
+  kind: build
+  tags: [terraform, capstone, yamldecode, optional, cidrsubnet, dynamic, replace_triggered_by, check, test, expect_failures, docker]
+  tutorial: |
+    **Concept.** This lab puts the module together the way a platform team
+    would. The service teams own a **data file**. Terraform decodes it, a
+    small **logic module** turns it into everything the resources need
+    (names, subnets, defaults), and the resources only read the module's
+    output. That split pays off three ways:
+
+    - **Typing.** Pass the decoded YAML into a variable typed with
+      `optional(type, default)` attributes, and the defaults are filled in
+      for every service that leaves them out. `yamldecode` alone gives you
+      no defaults.
+    - **Lifecycle.** A process that reads its config file only at start-up
+      won't notice a new file. `replace_triggered_by` can point at **one
+      instance** of another resource (`local_file.x[each.key]`), so only the
+      service whose file changed is restarted.
+    - **Testing.** A module with no resources can be tested with `command =
+      plan` in seconds. `assert` pins down each behaviour, and
+      `expect_failures` proves that bad input is rejected. A good suite
+      **fails** when someone breaks the logic, not just passes when it's
+      right.
+
+    A top-level `check` block then keeps watching for a policy problem
+    without blocking anybody.
+
+    **Read up on:**
+    - `yamldecode`, `optional()`, `map(object({...}))`
+    - `cidrsubnet`, `cidrhost`, variable `validation`
+    - `dynamic` blocks, `abspath`, the docker provider's `volumes`, `networks_advanced`, `ipam_config`
+    - `lifecycle { replace_triggered_by = [...] }` with `each.key`
+    - `check` / `assert`, `terraform test`, `run`, `expect_failures`
+  scenario: |
+    **Ticket PLAT-412.** The platform team wants every internal service
+    described in one file, **`/lab/catalog/services.yaml`**, which the
+    service teams edit and you **must not change** or copy into `.tf`
+    files. A service has a `netnum`, and optionally a `version` (default
+    **1**) and a list of `ports` (default **none**). `versions.tf` and the
+    nginx template **`templates/nginx.conf.tftpl`** are already there.
+
+    **1. The logic module, `/lab/catalog/modules/catalog`.** No resources.
+    It takes:
+
+    - **`base_cidr`** (string): must be an IPv4 **/16**; anything else is
+      rejected by a `validation` block
+    - **`services`**: a map of objects with `netnum` (number), `version`
+      (optional number, default `1`) and `ports` (optional list of
+      `{ internal, external }` numbers, default `[]`)
+
+    and has one output, **`services`**: a map with the same keys, each value
+    an object with **`name`** = `cat-<key>`, **`subnet`** = the
+    `netnum`-th **/24** inside `base_cidr`, **`gateway`** = the first host
+    of that subnet, and the filled-in **`version`** and **`ports`**.
+
+    **2. The root configuration, `/lab/catalog`.** Read `services.yaml`,
+    call the module with its `base_cidr` and `services`, and for **every
+    service** (`for_each`, keyed by the service name) create:
+
+    - a Docker network named after the service (`cat-web`, …) with the
+      service's subnet and gateway
+    - **`rendered/<service>.conf`**, the template rendered with `name` (the
+      service name) and `version`
+    - a container of the same name from **`nginx:1.27-alpine`**, on that
+      network only, publishing exactly the service's `ports`, with its
+      `rendered/<service>.conf` bind-mounted **read-only** at
+      **`/etc/nginx/conf.d/default.conf`**
+
+    nginx reads that file only when it starts, so a change to a service's
+    rendered config must **replace that service's container**, and only
+    that one.
+
+    Add a **`check "no_privileged_ports"`** block that warns whenever any
+    service publishes an external port **below 1024**.
+
+    **3. The tests.** Write **`modules/catalog/tests/catalog.tftest.hcl`**
+    so that `terraform test` (run in `modules/catalog`) passes, and
+    **fails** if the module ever gets any of these wrong: the subnet, the
+    `cat-` name, the default version, or the rejection of a `base_cidr`
+    that isn't a /16. Use only the module's variables and its `services`
+    output. The check runs your tests against broken copies of the module.
+
+    Apply, and leave the plan empty.
+  hints:
+    - "In the module, `subnet = cidrsubnet(var.base_cidr, 8, s.netnum)` and `gateway = cidrhost(<that subnet>, 1)`. For the validation, `can(cidrhost(var.base_cidr, 0))` and `endswith(var.base_cidr, \"/16\")` together do the job."
+    - "Root: `locals { catalog = yamldecode(file(\"${path.module}/services.yaml\")) }`, then `module \"catalog\" { source = \"./modules/catalog\"  base_cidr = local.catalog.base_cidr  services = local.catalog.services }`. The variable's type fills in the defaults."
+    - "Drive the three resource types with `for_each = module.catalog.services`. The network wants `ipam_config { subnet = each.value.subnet  gateway = each.value.gateway }`, the container `networks_advanced { name = docker_network.svc[each.key].name }` and `dynamic \"ports\" { for_each = each.value.ports ... }`."
+    - "The mount: `volumes { host_path = abspath(local_file.conf[each.key].filename)  container_path = \"/etc/nginx/conf.d/default.conf\"  read_only = true }`, and `lifecycle { replace_triggered_by = [local_file.conf[each.key]] }`."
+    - "The check: `alltrue(flatten([for s in module.catalog.services : [for p in s.ports : p.external >= 1024]]))`."
+    - "Tests: one `run` with `command = plan`, a `variables` block (a service with `netnum` and `version`, one without) and an `assert` per behaviour; a second `run` with `base_cidr = \"10.0.0.0/24\"` and `expect_failures = [var.base_cidr]`. Run `terraform init` in `modules/catalog` first."
+  solution: |
+    ```bash
+    cd /lab/catalog
+    mkdir -p modules/catalog/tests
+    cat > modules/catalog/main.tf <<'EOF'
+    variable "base_cidr" {
+      type        = string
+      description = "The catalog's address space, an IPv4 /16."
+
+      validation {
+        condition     = can(cidrhost(var.base_cidr, 0)) && endswith(var.base_cidr, "/16")
+        error_message = "base_cidr must be an IPv4 /16, such as 10.0.0.0/16."
+      }
+    }
+
+    variable "services" {
+      type = map(object({
+        netnum  = number
+        version = optional(number, 1)
+        ports = optional(list(object({
+          internal = number
+          external = number
+        })), [])
+      }))
+    }
+
+    output "services" {
+      value = {
+        for name, s in var.services : name => {
+          name    = "cat-${name}"
+          subnet  = cidrsubnet(var.base_cidr, 8, s.netnum)
+          gateway = cidrhost(cidrsubnet(var.base_cidr, 8, s.netnum), 1)
+          version = s.version
+          ports   = s.ports
+        }
+      }
+    }
+    EOF
+    cat > modules/catalog/tests/catalog.tftest.hcl <<'EOF'
+    variables {
+      base_cidr = "10.20.0.0/16"
+      services = {
+        shop = { netnum = 5, version = 7, ports = [{ internal = 80, external = 9000 }] }
+        cron = { netnum = 9 }
+      }
+    }
+
+    run "derives_names_and_subnets" {
+      command = plan
+
+      assert {
+        condition     = output.services["shop"].subnet == "10.20.5.0/24" && output.services["cron"].subnet == "10.20.9.0/24"
+        error_message = "each service gets the netnum-th /24 of base_cidr"
+      }
+      assert {
+        condition     = output.services["shop"].gateway == "10.20.5.1"
+        error_message = "the gateway is the subnet's first host"
+      }
+      assert {
+        condition     = output.services["shop"].name == "cat-shop"
+        error_message = "names are cat-<service>"
+      }
+      assert {
+        condition     = output.services["shop"].version == 7 && output.services["cron"].version == 1
+        error_message = "version defaults to 1"
+      }
+      assert {
+        condition     = length(output.services["cron"].ports) == 0 && length(output.services["shop"].ports) == 1
+        error_message = "ports default to none"
+      }
+    }
+
+    run "rejects_a_non_16" {
+      command = plan
+
+      variables {
+        base_cidr = "10.20.0.0/24"
+      }
+
+      expect_failures = [var.base_cidr]
+    }
+    EOF
+    cat > main.tf <<'EOF'
+    locals {
+      catalog = yamldecode(file("${path.module}/services.yaml"))
+    }
+
+    module "catalog" {
+      source    = "./modules/catalog"
+      base_cidr = local.catalog.base_cidr
+      services  = local.catalog.services
+    }
+
+    resource "docker_image" "nginx" {
+      name         = "nginx:1.27-alpine"
+      keep_locally = true
+    }
+
+    resource "docker_network" "svc" {
+      for_each = module.catalog.services
+      name     = each.value.name
+
+      ipam_config {
+        subnet  = each.value.subnet
+        gateway = each.value.gateway
+      }
+    }
+
+    resource "local_file" "conf" {
+      for_each = module.catalog.services
+      filename = "${path.module}/rendered/${each.key}.conf"
+      content = templatefile("${path.module}/templates/nginx.conf.tftpl", {
+        name    = each.key
+        version = each.value.version
+      })
+    }
+
+    resource "docker_container" "svc" {
+      for_each = module.catalog.services
+      name     = each.value.name
+      image    = docker_image.nginx.image_id
+
+      networks_advanced {
+        name = docker_network.svc[each.key].name
+      }
+
+      dynamic "ports" {
+        for_each = each.value.ports
+        content {
+          internal = ports.value.internal
+          external = ports.value.external
+        }
+      }
+
+      volumes {
+        host_path      = abspath(local_file.conf[each.key].filename)
+        container_path = "/etc/nginx/conf.d/default.conf"
+        read_only      = true
+      }
+
+      lifecycle {
+        replace_triggered_by = [local_file.conf[each.key]]
+      }
+    }
+
+    check "no_privileged_ports" {
+      assert {
+        condition     = alltrue(flatten([for s in module.catalog.services : [for p in s.ports : p.external >= 1024]]))
+        error_message = "A service publishes an external port below 1024."
+      }
+    }
+    EOF
+    (cd modules/catalog && terraform init && terraform test)
+    terraform init
+    terraform apply -auto-approve
+    curl localhost:8091; curl localhost:8092
+    ```
+  setup: |
+    tf_start
+    rm -rf /lab/catalog
+    for n in web api jobs; do docker rm -f cat-$n >/dev/null 2>&1; done
+    for n in web api jobs; do docker network rm cat-$n >/dev/null 2>&1; done
+    on_reset 'for n in web api jobs; do docker rm -f cat-$n; done >/dev/null 2>&1; for n in web api jobs; do docker network rm cat-$n; done >/dev/null 2>&1; true'
+    lab_file /lab/catalog/versions.tf <<'EOF'
+    terraform {
+      required_version = ">= 1.10"
+
+      required_providers {
+        docker = {
+          source  = "kreuzwerker/docker"
+          version = "~> 4.7.0"
+        }
+        local = {
+          source  = "hashicorp/local"
+          version = "~> 2.9"
+        }
+      }
+    }
+
+    provider "docker" {}
+    EOF
+    lab_file /lab/catalog/services.yaml <<'EOF'
+    # The service catalog. Owned by the service teams: Terraform reads it,
+    # nobody copies it into .tf files.
+    base_cidr: 10.91.0.0/16
+    services:
+      web:
+        netnum: 1
+        version: 3
+        ports:
+          - { internal: 80, external: 8091 }
+      api:
+        netnum: 2
+        ports:
+          - { internal: 80, external: 8092 }
+          - { internal: 81, external: 8093 }
+      jobs:
+        netnum: 3
+        version: 2
+    EOF
+    lab_file /lab/catalog/templates/nginx.conf.tftpl <<'EOF'
+    server {
+      listen 80;
+      listen 81;
+
+      location / {
+        default_type text/plain;
+        return 200 "${name} v${version}\n";
+      }
+    }
+    EOF
+    mkdir -p /lab/catalog/modules/catalog
+    chown -R "$(lab_user):" /lab/catalog
+    cp /lab/catalog/services.yaml "$KL_STATE/services.yaml"
+    sha256sum /lab/catalog/services.yaml > "$KL_STATE/sums"
+  check: |
+    d=/lab/catalog
+    m=$d/modules/catalog
+    check "services.yaml is unchanged" 'sha256sum -c --quiet "$KL_STATE/sums"'
+    check_not "the catalog's data is not copied into .tf files" 'grep -qE "809[123]|10\.91\." $d/*.tf $m/*.tf'
+
+    # --- the infrastructure ---
+    for s in web:1 api:2 jobs:3; do
+      n=${s%%:*}; i=${s#*:}
+      check_eq "network cat-$n is 10.91.$i.0/24 with gateway 10.91.$i.1" "$(docker network inspect -f '{{range .IPAM.Config}}{{.Subnet}} {{.Gateway}}{{end}}' cat-$n 2>/dev/null)" "10.91.$i.0/24 10.91.$i.1"
+      check_eq "container cat-$n is running, on network cat-$n only" "$(docker inspect -f '{{.State.Running}} {{range $k, $v := .NetworkSettings.Networks}}{{$k}} {{end}}' cat-$n 2>/dev/null)" "true cat-$n "
+      check_eq "cat-$n mounts rendered/$n.conf read-only" "$(docker inspect -f '{{range .Mounts}}{{if eq .Destination "/etc/nginx/conf.d/default.conf"}}{{.Source}} {{.RW}}{{end}}{{end}}' cat-$n 2>/dev/null)" "$d/rendered/$n.conf false"
+    done
+    check_eq "containers are one for_each, keyed by service name" "$(tf_addrs $d | grep -cE '^docker_container\.[a-z0-9_]+\["(web|api|jobs)"\]$')" 3
+    check_eq "networks are one for_each, keyed by service name" "$(tf_addrs $d | grep -cE '^docker_network\.[a-z0-9_]+\["(web|api|jobs)"\]$')" 3
+    page() { curl -fsS -m 2 "http://localhost:$1" 2>/dev/null; }
+    eventually 15 'curl -fsS -m 2 -o /dev/null http://localhost:8092' || true
+    check_eq "localhost:8091 is web, version 3" "$(page 8091)" "web v3"
+    check_eq "localhost:8092 is api, with the default version" "$(page 8092)" "api v1"
+    check_eq "localhost:8093 is api's second port" "$(page 8093)" "api v1"
+    check_eq "cat-jobs publishes no ports" "$(docker inspect -f '{{len .HostConfig.PortBindings}}' cat-jobs 2>/dev/null)" 0
+    check_eq "check.no_privileged_ports ran and passed" "$(jq -r '.check_results[]? | select(.config_addr == "check.no_privileged_ports") | .status' $d/terraform.tfstate 2>/dev/null)" pass
+
+    # --- what-if plans against edited copies of the catalog (restored afterwards) ---
+    sed 's/^    version: 3$/    version: 4/' "$KL_STATE/services.yaml" > $d/services.yaml
+    out=$(tf_as_user $d plan -lock=false -input=false -no-color 2>&1)
+    cat "$KL_STATE/services.yaml" > $d/services.yaml
+    check "a new web version replaces the web container" 'grep -qE "docker_container\.[a-z0-9_]+\[\"web\"\] (will|must) be replaced" <<<"$out"'
+    check "...and leaves the api and jobs containers alone" 'grep -q "Plan:" <<<"$out" && ! grep -qE "docker_container\.[a-z0-9_]+\[\"(api|jobs)\"\] (will|must) be" <<<"$out"'
+    { cat "$KL_STATE/services.yaml"; printf '    ports:\n      - { internal: 80, external: 80 }\n'; } > $d/services.yaml
+    out=$(tf_as_user $d plan -lock=false -input=false -no-color 2>&1)
+    cat "$KL_STATE/services.yaml" > $d/services.yaml
+    check "publishing port 80 trips check \"no_privileged_ports\"" 'grep -q "Check block assertion failed" <<<"$out" && grep -q "no_privileged_ports" <<<"$out"'
+
+    # --- the tests ---
+    t() { chown -R "$(lab_user):" "$1"; tf_as_user "$1" init -input=false -no-color >/dev/null 2>&1; tf_as_user "$1" test -no-color 2>&1; }
+    passed() { grep -qE "Success! [1-9][0-9]* passed, 0 failed" <<<"$1"; }
+    failed() { grep -qE "Failure! .*[1-9][0-9]* failed" <<<"$1"; }
+    check "modules/catalog/tests/catalog.tftest.hcl exists" '[ -s $m/tests/catalog.tftest.hcl ]'
+    check "the tests expect a validation failure" 'grep -q "expect_failures" $m/tests/*.tftest.hcl'
+    out=$(t $m)
+    check "terraform test passes in modules/catalog" 'passed "$out"'
+
+    w=/lab/.kl-catalog
+    rm -rf $w; mkdir -p $w/yours/tests $w/ref
+    cp $m/*.tf $w/yours/ 2>/dev/null
+    cat > $w/yours/tests/kl-reference.tftest.hcl <<'EOF'
+    variables {
+      base_cidr = "10.50.0.0/16"
+      services = {
+        shop = { netnum = 7, version = 2, ports = [{ internal = 80, external = 9000 }, { internal = 81, external = 9001 }] }
+        cron = { netnum = 200 }
+      }
+    }
+
+    run "reference" {
+      command = plan
+      assert {
+        condition     = output.services["shop"].subnet == "10.50.7.0/24" && output.services["cron"].subnet == "10.50.200.0/24"
+        error_message = "subnet"
+      }
+      assert {
+        condition     = output.services["shop"].gateway == "10.50.7.1" && output.services["cron"].gateway == "10.50.200.1"
+        error_message = "gateway"
+      }
+      assert {
+        condition     = output.services["shop"].name == "cat-shop" && output.services["cron"].name == "cat-cron"
+        error_message = "name"
+      }
+      assert {
+        condition     = output.services["shop"].version == 2 && output.services["cron"].version == 1
+        error_message = "version"
+      }
+      assert {
+        condition     = length(output.services["shop"].ports) == 2 && output.services["shop"].ports[1].external == 9001 && length(output.services["cron"].ports) == 0
+        error_message = "ports"
+      }
+    }
+
+    run "reference_rejects_24" {
+      command = plan
+      variables {
+        base_cidr = "10.50.0.0/24"
+      }
+      expect_failures = [var.base_cidr]
+    }
+
+    run "reference_rejects_garbage" {
+      command = plan
+      variables {
+        base_cidr = "not-a-cidr/16"
+      }
+      expect_failures = [var.base_cidr]
+    }
+    EOF
+    out=$(t $w/yours)
+    check "your module passes the reference tests" 'passed "$out"'
+
+    cp -r $m/tests $w/ref/ 2>/dev/null
+    cat > $w/ref.tf <<'EOF'
+    variable "base_cidr" {
+      type = string
+      validation {
+        condition     = can(cidrhost(var.base_cidr, 0)) && endswith(var.base_cidr, "/16")
+        error_message = "base_cidr must be an IPv4 /16."
+      }
+    }
+
+    variable "services" {
+      type = map(object({
+        netnum  = number
+        version = optional(number, 1)
+        ports   = optional(list(object({ internal = number, external = number })), [])
+      }))
+    }
+
+    output "services" {
+      value = {
+        for name, s in var.services : name => {
+          name    = "cat-${name}"
+          subnet  = cidrsubnet(var.base_cidr, 8, s.netnum)
+          gateway = cidrhost(cidrsubnet(var.base_cidr, 8, s.netnum), 1)
+          version = s.version
+          ports   = s.ports
+        }
+      }
+    }
+    EOF
+    cp $w/ref.tf $w/ref/main.tf
+    out=$(t $w/ref)
+    check "your tests pass against a correct module" 'passed "$out"'
+    for mut in 's/cidrsubnet(var.base_cidr, 8,/cidrsubnet(var.base_cidr, 4,/g|a wrong subnet size' \
+               's/"cat-${name}"/name/|a missing cat- prefix' \
+               's/optional(number, 1)/optional(number, 0)/|a wrong default version' \
+               's/condition     = can(cidrhost.*/condition     = var.base_cidr != ""/|no base_cidr validation'; do
+      sed "${mut%%|*}" $w/ref.tf > $w/ref/main.tf
+      out=$(t $w/ref)
+      check "your tests catch ${mut#*|}" 'failed "$out"'
+    done
+    rm -rf $w
+
+    check "the plan is empty" 'tf_clean $d'
+  solve: |
+    cd /lab/catalog
+    mkdir -p modules/catalog/tests
+    cat > modules/catalog/main.tf <<'EOF'
+    variable "base_cidr" {
+      type        = string
+      description = "The catalog's address space, an IPv4 /16."
+
+      validation {
+        condition     = can(cidrhost(var.base_cidr, 0)) && endswith(var.base_cidr, "/16")
+        error_message = "base_cidr must be an IPv4 /16, such as 10.0.0.0/16."
+      }
+    }
+
+    variable "services" {
+      type = map(object({
+        netnum  = number
+        version = optional(number, 1)
+        ports = optional(list(object({
+          internal = number
+          external = number
+        })), [])
+      }))
+    }
+
+    output "services" {
+      value = {
+        for name, s in var.services : name => {
+          name    = "cat-${name}"
+          subnet  = cidrsubnet(var.base_cidr, 8, s.netnum)
+          gateway = cidrhost(cidrsubnet(var.base_cidr, 8, s.netnum), 1)
+          version = s.version
+          ports   = s.ports
+        }
+      }
+    }
+    EOF
+    cat > modules/catalog/tests/catalog.tftest.hcl <<'EOF'
+    variables {
+      base_cidr = "10.20.0.0/16"
+      services = {
+        shop = { netnum = 5, version = 7, ports = [{ internal = 80, external = 9000 }] }
+        cron = { netnum = 9 }
+      }
+    }
+
+    run "derives_names_and_subnets" {
+      command = plan
+
+      assert {
+        condition     = output.services["shop"].subnet == "10.20.5.0/24" && output.services["cron"].subnet == "10.20.9.0/24"
+        error_message = "each service gets the netnum-th /24 of base_cidr"
+      }
+      assert {
+        condition     = output.services["shop"].gateway == "10.20.5.1"
+        error_message = "the gateway is the subnet's first host"
+      }
+      assert {
+        condition     = output.services["shop"].name == "cat-shop"
+        error_message = "names are cat-<service>"
+      }
+      assert {
+        condition     = output.services["shop"].version == 7 && output.services["cron"].version == 1
+        error_message = "version defaults to 1"
+      }
+      assert {
+        condition     = length(output.services["cron"].ports) == 0 && length(output.services["shop"].ports) == 1
+        error_message = "ports default to none"
+      }
+    }
+
+    run "rejects_a_non_16" {
+      command = plan
+
+      variables {
+        base_cidr = "10.20.0.0/24"
+      }
+
+      expect_failures = [var.base_cidr]
+    }
+    EOF
+    cat > main.tf <<'EOF'
+    locals {
+      catalog = yamldecode(file("${path.module}/services.yaml"))
+    }
+
+    module "catalog" {
+      source    = "./modules/catalog"
+      base_cidr = local.catalog.base_cidr
+      services  = local.catalog.services
+    }
+
+    resource "docker_image" "nginx" {
+      name         = "nginx:1.27-alpine"
+      keep_locally = true
+    }
+
+    resource "docker_network" "svc" {
+      for_each = module.catalog.services
+      name     = each.value.name
+
+      ipam_config {
+        subnet  = each.value.subnet
+        gateway = each.value.gateway
+      }
+    }
+
+    resource "local_file" "conf" {
+      for_each = module.catalog.services
+      filename = "${path.module}/rendered/${each.key}.conf"
+      content = templatefile("${path.module}/templates/nginx.conf.tftpl", {
+        name    = each.key
+        version = each.value.version
+      })
+    }
+
+    resource "docker_container" "svc" {
+      for_each = module.catalog.services
+      name     = each.value.name
+      image    = docker_image.nginx.image_id
+
+      networks_advanced {
+        name = docker_network.svc[each.key].name
+      }
+
+      dynamic "ports" {
+        for_each = each.value.ports
+        content {
+          internal = ports.value.internal
+          external = ports.value.external
+        }
+      }
+
+      volumes {
+        host_path      = abspath(local_file.conf[each.key].filename)
+        container_path = "/etc/nginx/conf.d/default.conf"
+        read_only      = true
+      }
+
+      lifecycle {
+        replace_triggered_by = [local_file.conf[each.key]]
+      }
+    }
+
+    check "no_privileged_ports" {
+      assert {
+        condition     = alltrue(flatten([for s in module.catalog.services : [for p in s.ports : p.external >= 1024]]))
+        error_message = "A service publishes an external port below 1024."
+      }
+    }
+    EOF
+    (cd modules/catalog && terraform init -input=false -no-color && terraform test -no-color)
     terraform init -input=false -no-color
     terraform apply -auto-approve -input=false -no-color
