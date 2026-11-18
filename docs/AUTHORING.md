@@ -69,7 +69,8 @@ lab user's name for every later script, and lint rejects any use of it.
 1. `setup` runs on a **freshly reset** environment. Make it deterministic; if you
    randomise answers, store the expected value in `$KL_STATE/answer`.
 2. `check` must **fail** right after setup and **pass** after `solve`. Run
-   `awesome_labs verify <id>` to prove it.
+   `awesome_labs verify -record verified.json <id>` to prove it (see
+   [Verifying and releasing](#verifying-and-releasing)).
 3. Checks must be **quick to fail**: use `wait_pod`, `wait_pods`, `wait_deploy`
    (they give up early when pods are clearly stuck), and guard long `eventually`
    loops with a precondition.
@@ -77,6 +78,50 @@ lab user's name for every later script, and lint rejects any use of it.
    snapshotted paths, sysctls, kube-system edits) must register a clean-up with
    `on_reset 'command'` in `setup`.
 5. Prefer pre-pulled images (`vms/kit/images.txt`). Don't use `:latest`.
+
+## Verifying and releasing
+
+**`verified.json`** (repo root, committed) records which exercises passed `verify` in
+their current form: one line per exercise id with a hash of what the run proved, the date
+and the awesome_labs version. The hash covers the scripts (`setup`, `setup_worker`,
+`check`, `check_worker`, `solve`), `deliverables`, `starter`, the profile, `notebook` and
+`destructive`. It leaves out what a learner reads (title, tutorial, scenario, hints,
+solution, tags, difficulty, kind) and where the exercise sits, so rewording an exercise or
+moving it within or between module files keeps its entry. Changing a script makes it
+stale. The shared kit (`vms/kit/lib.sh`, the bootstrap scripts) is in no hash: after
+changing it, verify the tracks that use what you changed.
+
+```bash
+awesome_labs verify -record verified.json tf-086 tf-087   # run them; each pass updates its entry
+awesome_labs verified                 # the gate: new or changed exercises; fails if any
+awesome_labs verified -ids            # just their ids, one per line (for scripts)
+awesome_labs verified -accept -note "verified on macOS" ans-090   # record a pass made elsewhere
+awesome_labs verified -prune          # drop entries for exercises that no longer exist
+awesome_labs counts                   # rewrite the exercise counts in README.md and docs/PENDING.md
+make docs                             # the same, after a build
+```
+
+Entries noted `baseline` were accepted without a new run: every exercise up to v0.20.0
+except tf-086..tf-092 had passed `verify` on real VMs before releasing. Use `-accept` only
+for a pass that really happened somewhere `-record` couldn't see.
+
+The counts live between markers, `<!-- count:docker -->184<!-- /count -->` (a track id, or
+`total`); `counts` rewrites every marker, keeps a thousands separator where the old number
+had one, and complains about a README track without one. Add a marker when you add a track.
+
+**`make release`** refuses to build while `awesome_labs verified` lists anything or the
+counts are stale (`counts -check`). `make release FORCE=1` builds anyway, with a loud
+warning about the unverified exercises; say so in the release notes.
+
+**CI** (`.github/workflows/ci.yml`, every push and pull request): gofmt, `go vet`, `go test`,
+build, `lint` and `counts -check`, all with a throwaway HOME. The verified gate only
+reports there, as a warning: an exercise can be merged before it has run on a VM.
+`.github/workflows/verify.yml` is **experimental**: started by hand (optionally with ids) or
+nightly, it enables KVM on a GitHub-hosted runner, installs Lima and QEMU with
+`awesome_labs install --yes` and runs `verify -record` on the unverified exercises. The
+runner is small (4 vCPUs, 16 GB, little disk, 6 hours), so the Kubernetes environment may
+not fit. It commits nothing: download the `verify-results` artifact (the updated
+`verified.json` and the log), check it and commit the record yourself.
 
 ## What the reset restores
 

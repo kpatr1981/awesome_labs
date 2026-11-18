@@ -57,8 +57,13 @@ usage:
   awesome_labs sync [docker|k8s|node01|offsec]   mirror a lab VM's /lab into a local folder (VS Code runs this)
   awesome_labs env status|up|prepare|stop|destroy|rebuild|reset|cache [docker|k8s|offsec]
   awesome_labs vms [stop|delete <name|all>]  list lab VMs, or stop/delete them
-  awesome_labs verify [-from id] [ids or prefixes...]
+  awesome_labs verify [-from id] [-record verified.json] [ids or prefixes...]
                                   author tool: setup -> check fails -> solve -> check passes
+                                  (-record notes each pass in the verified-content record)
+  awesome_labs verified [-file verified.json] [-accept [-except ids] [-note text] ids|all] [-prune]
+                                  author tool: the release gate: list exercises new or changed since their last pass
+  awesome_labs counts [-check] [files...]
+                                  author tool: rewrite the exercise counts in README.md and docs/PENDING.md
   awesome_labs lint                    validate all exercise files
   awesome_labs notebook <id>           author tool: print the starter notebook start writes for a notebook exercise
   awesome_labs doctor [--fix]          check this machine and awesome_labs for the usual trouble
@@ -105,7 +110,7 @@ func run(args []string) error {
 	// sync, which only work inside /lab of a running VM
 	cmd := args[0]
 	switch cmd {
-	case "-h", "--help", "help", "lint", "list", "show", "status", "paths", "shell", "code", "sync", "doctor", "version", "notebook":
+	case "-h", "--help", "help", "lint", "list", "show", "status", "paths", "shell", "code", "sync", "doctor", "version", "notebook", "verified", "counts":
 	default:
 		release, err := mgr.LockApp()
 		if err != nil {
@@ -341,6 +346,10 @@ func run(args []string) error {
 		return envCmd(ctx, mgr, rest)
 	case "verify":
 		return verify(ctx, cat, mgr, rest)
+	case "verified":
+		return verifiedCmd(cat, rest)
+	case "counts":
+		return countsCmd(cat, rest)
 	case "web":
 		notes, err := progress.OpenNotes(mgr.StateDir)
 		if err != nil {
@@ -581,6 +590,7 @@ func envCmd(ctx context.Context, mgr *lab.Manager, args []string) error {
 func verify(ctx context.Context, cat *exercise.Catalog, mgr *lab.Manager, args []string) error {
 	fset := flag.NewFlagSet("verify", flag.ContinueOnError)
 	from := fset.String("from", "", "start at this exercise id")
+	record := fset.String("record", "", "note each exercise that passes in this verified-content record (e.g. "+defaultRecord+")")
 	if err := fset.Parse(args); err != nil {
 		return err
 	}
@@ -635,6 +645,10 @@ func verify(ctx context.Context, cat *exercise.Catalog, mgr *lab.Manager, args [
 		fmt.Printf("%-28s %4.0fs\n", res, time.Since(t0).Seconds())
 		if res != "ok" {
 			failed = append(failed, ex.ID+" ("+res+")")
+		} else if *record != "" {
+			if err := recordPass(*record, ex); err != nil {
+				fmt.Fprintln(os.Stderr, "recording the pass:", err)
+			}
 		}
 	}
 	fmt.Printf("\n%d verified, %d failed\n", n, len(failed))
