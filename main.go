@@ -59,6 +59,8 @@ usage:
   awesome_labs vms [stop|delete <name|all>]  list lab VMs, or stop/delete them
   awesome_labs verify [-from id] [ids or prefixes...]
                                   author tool: setup -> check fails -> solve -> check passes
+  awesome_labs verify -local [-j N] [-from id] [-rebuild] [-force] [ids or prefixes...]
+                                  the same without VMs: each exercise in a throwaway container (docker profile)
   awesome_labs lint                    validate all exercise files
   awesome_labs notebook <id>           author tool: print the starter notebook start writes for a notebook exercise
   awesome_labs doctor [--fix]          check this machine and awesome_labs for the usual trouble
@@ -66,6 +68,8 @@ usage:
 
 environment:
   AWESOME_LABS_EXERCISES=dir           load exercises from disk instead of the built-in set
+  AWESOME_LABS_STATE_DIR=dir           keep progress, config and logs there instead of ~/.awesome_labs
+                                  (Lima's VMs are not moved; meant for verify -local and tests)
 `)
 }
 
@@ -107,6 +111,9 @@ func run(args []string) error {
 	switch cmd {
 	case "-h", "--help", "help", "lint", "list", "show", "status", "paths", "shell", "code", "sync", "doctor", "version", "notebook":
 	default:
+		if cmd == "verify" && localVerify(args[1:]) {
+			break // no VMs: verify -local runs beside the app
+		}
 		release, err := mgr.LockApp()
 		if err != nil {
 			return err
@@ -579,6 +586,9 @@ func envCmd(ctx context.Context, mgr *lab.Manager, args []string) error {
 
 // verify runs each exercise end to end: setup, check must fail, solve, check must pass.
 func verify(ctx context.Context, cat *exercise.Catalog, mgr *lab.Manager, args []string) error {
+	if localVerify(args) {
+		return verifyLocal(ctx, cat, mgr.StateDir, args)
+	}
 	fset := flag.NewFlagSet("verify", flag.ContinueOnError)
 	from := fset.String("from", "", "start at this exercise id")
 	if err := fset.Parse(args); err != nil {

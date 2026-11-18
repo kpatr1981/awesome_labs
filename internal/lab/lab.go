@@ -127,9 +127,15 @@ func NewManager(assets fs.FS) (*Manager, error) {
 		return nil, err
 	}
 	dir := filepath.Join(home, ".awesome_labs")
+	// AWESOME_LABS_STATE_DIR moves the state (progress, config, logs) elsewhere,
+	// e.g. for an author's `verify -local`; Lima's VMs stay where Lima keeps them.
+	custom := os.Getenv("AWESOME_LABS_STATE_DIR")
+	if custom != "" {
+		dir = custom
+	}
 	// The project used to be called kubelab: keep existing progress and settings.
 	old := filepath.Join(home, ".kubelab")
-	if _, err := os.Stat(dir); os.IsNotExist(err) {
+	if _, err := os.Stat(dir); custom == "" && os.IsNotExist(err) {
 		if _, err := os.Stat(old); err == nil {
 			if err := os.Rename(old, dir); err != nil {
 				return nil, err
