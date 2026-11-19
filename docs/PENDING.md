@@ -8,7 +8,7 @@ what to consolidate. The target doesn't lower the bar: a lab should carry a real
 scenario and teach a concept. The parts of this list that the existing exercises don't cover
 are not started.
 
-Exercise counts (<!-- count:total -->1,645<!-- /count --> total):
+Exercise counts (<!-- count:total -->1,653<!-- /count --> total):
 
 | Topic | Exercises | Target | Track | Module files |
 |---|---|---|---|---|
@@ -16,7 +16,7 @@ Exercise counts (<!-- count:total -->1,645<!-- /count --> total):
 | Kubernetes | <!-- count:kubernetes -->273<!-- /count --> | 250 | `kubernetes` | `exercises/kubernetes/` |
 | Offensive security | <!-- count:offsec -->83<!-- /count --> | 250 | `offsec` | `exercises/offsec/` |
 | Linux & systems | <!-- count:linux -->86<!-- /count --> | 250 | `linux` | `exercises/linux/` |
-| Networking | <!-- count:networking -->98<!-- /count --> | 250 | `networking` | `exercises/networking/` |
+| Networking | <!-- count:networking -->106<!-- /count --> | 250 | `networking` | `exercises/networking/` |
 | Cloud & platform | <!-- count:cloud -->88<!-- /count --> | 250 | `cloud` | `exercises/cloud/` |
 | Data | <!-- count:data -->78<!-- /count --> | 250 | `data` | `exercises/data/` |
 | Defensive security | <!-- count:defensive -->78<!-- /count --> | 250 | `defensive` | `exercises/defensive/` |
