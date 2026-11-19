@@ -36,6 +36,9 @@ Exercise counts (<!-- count:total -->1,630<!-- /count --> total):
 - [Data](#data)
 - [Security](#security)
 - [Reverse engineering](#reverse-engineering)
+- [Active Directory on Linux](#active-directory-on-linux)
+- [Industrial & IoT](#industrial--iot)
+- [Event streaming](#event-streaming)
 - [Programming](#programming)
 - [Practice modes](#practice-modes)
 - [awesome_labs features](#awesome_labs-features)
@@ -592,6 +595,87 @@ with a capstone.
   image pulled on first use.
 - **Start with** *Binary basics* and *Firmware analysis* — they need nothing heavier than
   the Docker VM and teach the triage every later module builds on.
+
+## Active Directory on Linux
+
+Real Active Directory skills without a Windows licence: a **Samba AD domain controller** in
+containers (or on the offsec VM), with Linux members joined to it. The same domain serves an
+administration module, an attack module and a defence module, so it feeds the offensive and
+defensive security tracks as well as Linux.
+
+| Module | What you'd practise | Runs on |
+|---|---|---|
+| **Stand up a domain** | provision a Samba AD DC (`samba-tool domain provision`), AD-integrated DNS and SRV records, users, groups and OUs, a second DC and replication between them | Docker VM; light |
+| **Join and log in** | `realm join` / `sssd` on Linux members, Kerberos tickets with `kinit`/`klist`, keytabs for services, `sudo` and SSH by AD group, fixing "clock skew too great" and a broken `krb5.conf` | Docker VM |
+| **Directory & policy** | LDAP queries (`ldapsearch`, `samba-tool`), password and lockout policies, delegated admin rights on an OU, Group Policy as far as Samba applies it, service accounts | Docker VM |
+| **Attacking the domain** | enumeration with BloodHound-style queries, kerberoasting and AS-REP roasting a weak service account, abusing unconstrained delegation and an over-broad ACL, pass-the-ticket — all inside the lab's own domain | Offsec VM |
+| **Defending the domain** | find the attack in the DC's logs and Kerberos events, tier the admin accounts, fix the delegation and ACLs, set strong service-account passwords or gMSA-style rotation, prove each attack path is now closed | Offsec VM; ties into defensive security |
+| **Troubleshooting** | a member that can't find the DC (DNS), replication that stopped, an expired machine password, SPN collisions, a trust that broke | Docker VM |
+
+- **Checks** use the domain itself: `kinit` as a user succeeds or fails, `samba-tool`/`ldapsearch`
+  show the object or ACL, a member resolves and authenticates, the attack tool no longer gets
+  a crackable ticket, a captured flag sits behind a group the learner had to reach.
+- **Determinism:** setup provisions the domain from a script with fixed names and per-run
+  passwords stored in `$KL_STATE`; weak passwords for the roasting labs come from the lab's
+  own wordlist.
+- **Tooling to add:** `samba` (AD DC), `krb5-user`, `sssd`/`realmd`, `ldap-utils`, and for the
+  attack module Impacket and a BloodHound-compatible collector. A Samba DC fits in about 512 MB,
+  so a DC, a second DC and two members run in containers on the Docker VM.
+- **Start with** *Stand up a domain* and *Join and log in*; the attack and defence modules
+  reuse that domain.
+
+## Industrial & IoT
+
+The protocols that run factories, buildings and devices, simulated in containers and on
+virtual interfaces, so it runs fully offline. Each module first builds or operates the
+system, then attacks it on the lab's own network, then secures it.
+
+| Module | What you'd practise | Runs on |
+|---|---|---|
+| **MQTT & device fleets** | a Mosquitto broker, topics and retained messages, QoS levels, ACLs per device, TLS with client certificates, a device that floods the broker, bridging two brokers | Docker VM; light |
+| **Modbus & PLCs** | read and write coils and registers on a simulated PLC (OpenPLC or a Python Modbus server) with `mbpoll`/pymodbus, find the register that opens a valve, then segment the network so only the HMI can write | Docker VM |
+| **OPC UA & SCADA** | browse an OPC UA server's address space, subscribe to values, secure it with certificates and user roles, find an HMI that talks to it unencrypted | Docker VM |
+| **CAN bus & vehicles** | `vcan` interfaces with `can-utils` (`candump`, `cansniffer`, `cansend`), reverse which ID drives the speedometer on a simulated car network (ICSim-style), replay and fuzz frames, then add message authentication | Docker VM (`vcan` kernel module) |
+| **Industrial network forensics** | Modbus, MQTT and CAN traffic in captures: find the write that changed a setpoint, the rogue device on the bus, the replayed command | Offsec VM; ties into packet capture labs |
+| **Securing an OT network** | zones and conduits, a one-way flow from OT to IT, an allow-list firewall for industrial protocols, monitoring that alerts on a write from the wrong host | Docker VM; ties into networking |
+
+- **Checks** read the simulated process itself: a register or coil holds the right value, the
+  simulated valve is closed, a write from the attacker's host now fails while the HMI's still
+  works, the CAN frame that unlocks the simulated car is in `/lab`, a broker refuses a device
+  without a valid certificate.
+- **Determinism:** the simulated devices are small Python services with per-run register maps
+  or CAN IDs stored in `$KL_STATE`, so answers can't be looked up.
+- **Tooling to add:** Mosquitto, pymodbus/`mbpoll`, an OPC UA library (asyncua), `can-utils`
+  and the `vcan` module (check that the VM kernel ships it, as `sch_netem` was checked), and
+  Wireshark dissectors already in tshark.
+- **Start with** *MQTT & device fleets* and *Modbus & PLCs*: light, visual and easy to check.
+
+## Event streaming
+
+Kafka-style event streaming, which the roadmap so far only touches through RabbitMQ.
+**Kafka in KRaft mode** (no ZooKeeper) or **Redpanda** for a lighter broker, with producers
+and consumers the lab ships, so each module is a running system with something wrong in it.
+
+| Module | What you'd practise | Runs on |
+|---|---|---|
+| **Topics & partitions** | create topics, partitions and replication factor, keys and ordering, `kafka-console-*` and `kcat`, retention by time and size, compaction on a changelog topic | Docker VM |
+| **Consumers & groups** | consumer groups and offsets, lag that keeps growing, rebalance storms from a slow consumer, resetting offsets to replay a day, a consumer that commits before processing and loses messages | Docker VM |
+| **Producers & delivery** | `acks`, retries and idempotent producers, duplicates after a retry, exactly-once with transactions, batching and compression trade-offs | Docker VM |
+| **Schemas & contracts** | a schema registry with Avro or JSON Schema, a producer change that breaks consumers, compatibility modes, evolving a schema safely | Docker VM |
+| **Operating a cluster** | three brokers in KRaft mode, a broker that dies and comes back, under-replicated partitions, reassigning partitions, disk filling up from retention, quotas for a noisy client | Docker VM (about 1.5 GB for three brokers) |
+| **Streaming pipelines** | Kafka Connect moving data between PostgreSQL and a topic (change data capture with Debezium), a stuck connector, a dead-letter topic for poison messages | Docker VM; ties into the data track |
+
+- **Checks** inspect the cluster and the data: consumer group lag is zero and offsets point
+  where they should, every message from the check's own producer arrives exactly once,
+  a topic has the right partitions and settings, a schema change is refused or accepted as
+  the compatibility mode says, the replicated table in PostgreSQL matches the source.
+- **Determinism:** the lab's producers write known message sets with per-run ids stored in
+  `$KL_STATE`, so the check can count exactly what arrived.
+- **Tooling to add:** the Kafka (KRaft) or Redpanda image, `kcat`, a schema registry
+  (Karapace or Apicurio to stay open source), Kafka Connect with Debezium, pre-pulled like
+  the other images.
+- **Start with** *Topics & partitions* and *Consumers & groups* on a single broker; the
+  three-broker cluster comes with *Operating a cluster*.
 
 ## Programming
 
