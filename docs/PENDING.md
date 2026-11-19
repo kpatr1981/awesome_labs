@@ -8,12 +8,12 @@ what to consolidate. The target doesn't lower the bar: a lab should carry a real
 scenario and teach a concept. The parts of this list that the existing exercises don't cover
 are not started.
 
-Exercise counts (<!-- count:total -->1,658<!-- /count --> total):
+Exercise counts (<!-- count:total -->1,668<!-- /count --> total):
 
 | Topic | Exercises | Target | Track | Module files |
 |---|---|---|---|---|
 | Docker | <!-- count:docker -->186<!-- /count --> | 250 | `docker` | `exercises/docker/` |
-| Kubernetes | <!-- count:kubernetes -->273<!-- /count --> | 250 | `kubernetes` | `exercises/kubernetes/` |
+| Kubernetes | <!-- count:kubernetes -->283<!-- /count --> | 250 | `kubernetes` | `exercises/kubernetes/` |
 | Offensive security | <!-- count:offsec -->83<!-- /count --> | 250 | `offsec` | `exercises/offsec/` |
 | Linux & systems | <!-- count:linux -->86<!-- /count --> | 250 | `linux` | `exercises/linux/` |
 | Networking | <!-- count:networking -->106<!-- /count --> | 250 | `networking` | `exercises/networking/` |

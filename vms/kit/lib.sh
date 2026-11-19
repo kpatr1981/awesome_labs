@@ -977,6 +977,18 @@ k_curl() {
   done
   return 1
 }
+# svc_get NS SERVICE [PATH] [PORT] -> body of an HTTP GET to the Service's ClusterIP, from this
+# node (kube-proxy routes it); retried while the Service's endpoints come up
+svc_get() {
+  local ip out i
+  ip=$(kubectl -n "$1" get svc "$2" -o jsonpath='{.spec.clusterIP}' 2>/dev/null)
+  [ -n "$ip" ] || return 1
+  for i in 1 2 3 4 5; do
+    out=$(curl -fsS -m 4 "http://$ip:${4:-80}${3:-/}" 2>/dev/null) && { printf '%s\n' "$out"; return 0; }
+    sleep 2
+  done
+  return 1
+}
 # restore a kube-system object saved at snapshot time
 kl_restore_obj() { # kl_restore_obj configmap coredns
   local f="$KL_STATE/pristine/obj/$1-$2.yaml"
@@ -1045,6 +1057,123 @@ wait_deploy() {
 }
 # deploy_images NS NAME -> images of the pod template
 deploy_images() { kj -n "$1" deploy "$2" '{.spec.template.spec.containers[*].image}'; }
+# ---------- helm helpers ----------
+# helm_chart DIR NAME [VERSION] [MESSAGE] -> write a small standard chart: nginx serving
+# .Values.message, with a fullname/labels helper, ConfigMap, Deployment, Service and NOTES
+helm_chart() {
+  local d=$1 n=$2 v=${3:-0.1.0} m=${4:-Hello from Helm}
+  mkdir -p "$d/templates"
+  cat >"$d/Chart.yaml" <<EOF
+apiVersion: v2
+name: $n
+description: A small web app that serves one page
+type: application
+version: $v
+appVersion: "1.28"
+EOF
+  cat >"$d/values.yaml" <<EOF
+# How many pods to run
+replicaCount: 1
+
+image:
+  repository: nginx
+  tag: 1.28-alpine
+
+# The page the app serves
+message: "$m"
+
+service:
+  type: ClusterIP
+  port: 80
+EOF
+  cat >"$d/templates/_helpers.tpl" <<'EOF'
+{{/* The name of every object: the release name, plus the chart name unless it's already in it */}}
+{{- define "__N__.fullname" -}}
+{{- if contains .Chart.Name .Release.Name -}}
+{{- .Release.Name | trunc 63 | trimSuffix "-" -}}
+{{- else -}}
+{{- printf "%s-%s" .Release.Name .Chart.Name | trunc 63 | trimSuffix "-" -}}
+{{- end -}}
+{{- end -}}
+
+{{/* Labels on every object; the Deployment's selector uses them too */}}
+{{- define "__N__.labels" -}}
+app.kubernetes.io/name: {{ .Chart.Name }}
+app.kubernetes.io/instance: {{ .Release.Name }}
+{{- end -}}
+EOF
+  cat >"$d/templates/configmap.yaml" <<'EOF'
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: {{ include "__N__.fullname" . }}
+  labels:
+    {{- include "__N__.labels" . | nindent 4 }}
+data:
+  index.html: {{ .Values.message | quote }}
+EOF
+  cat >"$d/templates/deployment.yaml" <<'EOF'
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: {{ include "__N__.fullname" . }}
+  labels:
+    {{- include "__N__.labels" . | nindent 4 }}
+spec:
+  replicas: {{ .Values.replicaCount }}
+  selector:
+    matchLabels:
+      {{- include "__N__.labels" . | nindent 6 }}
+  template:
+    metadata:
+      labels:
+        {{- include "__N__.labels" . | nindent 8 }}
+      annotations:
+        checksum/page: {{ .Values.message | sha256sum }}
+    spec:
+      containers:
+      - name: web
+        image: "{{ .Values.image.repository }}:{{ .Values.image.tag }}"
+        ports:
+        - containerPort: 80
+        readinessProbe:
+          httpGet:
+            path: /
+            port: 80
+        volumeMounts:
+        - name: page
+          mountPath: /usr/share/nginx/html
+      volumes:
+      - name: page
+        configMap:
+          name: {{ include "__N__.fullname" . }}
+EOF
+  cat >"$d/templates/service.yaml" <<'EOF'
+apiVersion: v1
+kind: Service
+metadata:
+  name: {{ include "__N__.fullname" . }}
+  labels:
+    {{- include "__N__.labels" . | nindent 4 }}
+spec:
+  type: {{ .Values.service.type }}
+  selector:
+    {{- include "__N__.labels" . | nindent 4 }}
+  ports:
+  - port: {{ .Values.service.port }}
+    targetPort: 80
+EOF
+  cat >"$d/templates/NOTES.txt" <<'EOF'
+{{ .Release.Name }} is installed in namespace {{ .Release.Namespace }}.
+
+Try it:
+  kubectl -n {{ .Release.Namespace }} port-forward svc/{{ include "__N__.fullname" . }} 8080:{{ .Values.service.port }}
+  curl http://localhost:8080/
+EOF
+  sed -i "s/__N__/$n/g" "$d"/templates/*
+  case "$d" in "$LAB"/*) chown -R "$(lab_user)": "$LAB" ;; esac
+}
+
 # ---------- docker compose helpers ----------
 # cc_ids PROJECT SERVICE -> ids of running containers of a compose service
 cc_ids() { docker ps -q --filter "label=com.docker.compose.project=$1" --filter "label=com.docker.compose.service=$2"; }

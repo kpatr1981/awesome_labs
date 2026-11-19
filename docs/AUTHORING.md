@@ -147,6 +147,8 @@ not fit. It commits nothing: download the `verify-results` artifact (the updated
 | `cc_running PROJECT SERVICE`, `cc_get`, `cc_exec` | docker compose |
 | `kj ARGS... JSONPATH`, `k_exists`, `pod_ready`, `deploy_ready`, `restarts` | kubectl |
 | `k_curl NS URL` | curl from a throw-away pod |
+| `svc_get NS SERVICE [PATH] [PORT]` | HTTP GET to a Service's ClusterIP from the node (retried) |
+| `helm_chart DIR NAME [VERSION] [MESSAGE]` | write a small standard chart (nginx serving `.Values.message`, fullname/labels helpers, ConfigMap, Deployment, Service, NOTES) |
 | `ing_get HOST PATH`, `ing_code`, `ing_tls` | through the Traefik ingress |
 | `on_node01 'cmd'` | run as root on node01 (from the control plane) |
 | `lab_file PATH <<EOF` | write a file owned by the lab user |
