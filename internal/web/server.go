@@ -82,6 +82,10 @@ type Server struct {
 
 // Listen opens the listener and makes this run's access token. Nothing has
 // touched the lab yet when it fails.
+// ExitAction is the on_exit to apply when the server stops: the one it started
+// with, or the last one saved on the Settings screen.
+func (srv *Server) ExitAction() string { return srv.s.live.exitAction() }
+
 func Listen(d Deps, o Options) (*Server, error) {
 	ln, err := net.Listen("tcp", o.Addr)
 	if err != nil {
@@ -108,7 +112,7 @@ func Listen(d Deps, o Options) (*Server, error) {
 			days = c.DeleteStoppedAfterDays
 		}
 	}
-	s.live = newLive(d.AutoStop, days)
+	s.live = newLive(d.AutoStop, days, d.OnExit)
 	s.jupyter.proxy = s.newJupyterProxy()
 	shown := host
 	if ip != nil && ip.IsUnspecified() {
@@ -133,7 +137,7 @@ func (srv *Server) Serve(ctx context.Context) (busy bool, err error) {
 	if !s.loopback {
 		fmt.Fprintf(o.Out, "  warning: listening on %s, beyond this machine. Anyone with the link gets a shell on the lab VMs.\n", srv.ln.Addr())
 	}
-	fmt.Fprintf(o.Out, "  ctrl+c stops it (on_exit: %s)\n", s.OnExit)
+	fmt.Fprintf(o.Out, "  ctrl+c stops it (on_exit: %s, changeable in Settings)\n", s.OnExit)
 	if o.Open {
 		openBrowser(srv.url)
 	}

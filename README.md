@@ -279,7 +279,7 @@ controlplane: {cpus: 2, memory: 3GiB}   #   awesome_labs env rebuild docker|k8s
 worker:       {cpus: 2, memory: 2560MiB}
 ```
 
-`on_exit` applies from the next start; the others at once. With
+Changes apply at once, `on_exit` included. With
 `delete_stopped_after_days: N` the server deletes lab VMs stopped for more than N days, at
 start and once a day, freeing their disk; saved copies are kept, so the next exercise still
 starts in seconds.

@@ -14,11 +14,19 @@ type live struct {
 	mu         sync.Mutex
 	autoStop   bool
 	deleteDays int
+	onExit     string        // what stopping the server does to the lab VMs
 	changed    chan struct{} // closed and replaced when deleteDays changes
 }
 
-func newLive(autoStop bool, deleteDays int) *live {
-	return &live{autoStop: autoStop, deleteDays: deleteDays, changed: make(chan struct{})}
+func newLive(autoStop bool, deleteDays int, onExit string) *live {
+	return &live{autoStop: autoStop, deleteDays: deleteDays, onExit: onExit, changed: make(chan struct{})}
+}
+
+// exitAction is the on_exit in effect now: the start's, or the last one saved.
+func (l *live) exitAction() string {
+	l.mu.Lock()
+	defer l.mu.Unlock()
+	return l.onExit
 }
 
 func (l *live) get() (autoStop bool, deleteDays int) {
@@ -31,6 +39,7 @@ func (l *live) set(c config.Config) {
 	l.mu.Lock()
 	defer l.mu.Unlock()
 	l.autoStop = c.AutoStopEnabled()
+	l.onExit = c.ExitAction()
 	if c.DeleteStoppedAfterDays != l.deleteDays {
 		l.deleteDays = c.DeleteStoppedAfterDays
 		close(l.changed)
@@ -65,7 +74,7 @@ func settingsOf(c config.Config) []settingJSON {
 	return []settingJSON{
 		{Key: "on_exit", Label: "When awesome_labs exits", Type: "choice", Options: []string{"stop", "delete", "keep"}, Value: c.ExitAction(),
 			Help:    "stop: stop the lab VMs, keeping the exercise you were on set up · delete: delete every lab VM (saved copies are kept) · keep: leave them running.",
-			Applies: "next start"},
+			Applies: "now"},
 		{Key: "auto_stop", Label: "Stop lab VMs nothing needs", Type: "bool", Value: c.AutoStopEnabled(),
 			Help:    "Stop running lab VMs after 10 minutes with no exercise set up, or 30 minutes with no page open; and after solving an exercise with awesome_labs check. Stopping keeps the lab.",
 			Applies: "now"},
@@ -87,7 +96,7 @@ func settingsOf(c config.Config) []settingJSON {
 func (s *server) handleSettings(w http.ResponseWriter, r *http.Request) {
 	dir := s.Manager.StateDir
 	c, err := config.Load(dir)
-	out := map[string]any{"path": config.Path(dir), "settings": settingsOf(c), "runningOnExit": s.OnExit}
+	out := map[string]any{"path": config.Path(dir), "settings": settingsOf(c), "runningOnExit": s.live.exitAction()}
 	if err != nil {
 		out["error"] = err.Error()
 	}
@@ -143,6 +152,6 @@ func (s *server) handleSetSettings(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	s.live.set(c)
-	writeJSON(w, http.StatusOK, map[string]any{"path": config.Path(s.Manager.StateDir), "settings": settingsOf(c), "runningOnExit": s.OnExit,
+	writeJSON(w, http.StatusOK, map[string]any{"path": config.Path(s.Manager.StateDir), "settings": settingsOf(c), "runningOnExit": s.live.exitAction(),
 		"saved": fmt.Sprintf("%d setting(s) saved", len(sets))})
 }

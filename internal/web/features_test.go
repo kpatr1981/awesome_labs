@@ -202,8 +202,8 @@ func TestSettingsEndpoint(t *testing.T) {
 	if !strings.Contains(string(b), "# What leaving the app does") {
 		t.Error("the template's comments were lost")
 	}
-	if out["runningOnExit"] != "stop" {
-		t.Errorf("this run's on_exit is what it started with: %v", out["runningOnExit"])
+	if out["runningOnExit"] != "delete" || s.live.exitAction() != "delete" {
+		t.Errorf("a saved on_exit applies to this run at once: %v / %v", out["runningOnExit"], s.live.exitAction())
 	}
 }
 

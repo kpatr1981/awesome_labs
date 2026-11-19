@@ -793,12 +793,12 @@ async function renderSettings() {
     if (!Object.keys(body).length) return toast("Nothing changed", "info");
     try {
       const r = await api("PUT", "/api/settings", body);
-      toast("✔ " + r.saved + (body.on_exit ? ` — on_exit applies from the next start (this run: ${r.runningOnExit})` : ""), "ok", 6000);
+      toast("✔ " + r.saved, "ok", 4000);
       renderSettings();
     } catch (e) { toast(e.message, "bad"); }
   };
   page.append(form, h("div", { class: "actions" }, h("button", { class: "btn btn-primary", onclick: save }, "Save"),
-    h("span", { class: "muted small" }, `This run exits with on_exit: ${d.runningOnExit}.`)));
+    h("span", { class: "muted small" }, `Stopping the server now: on_exit ${d.runningOnExit}.`)));
   $("#content").replaceChildren(page);
 }
 

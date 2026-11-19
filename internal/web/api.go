@@ -52,7 +52,7 @@ type examJSON struct {
 }
 
 func (s *server) handleState(w http.ResponseWriter, r *http.Request) {
-	out := map[string]any{"version": s.Version, "onExit": s.OnExit, "op": s.ops.current(), "repo": "https://github.com/" + update.Repo}
+	out := map[string]any{"version": s.Version, "onExit": s.live.exitAction(), "op": s.ops.current(), "repo": "https://github.com/" + update.Repo}
 	if a, ok := s.Manager.Active(); ok {
 		title := ""
 		if ex := s.Catalog.Get(a.ID); ex != nil {

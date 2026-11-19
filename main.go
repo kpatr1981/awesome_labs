@@ -47,7 +47,7 @@ usage:
   awesome_labs status                  the exercise you're working on and the running VMs
   awesome_labs list [filter]           list exercises
   awesome_labs paths [path-id]         learning paths and your progress
-  awesome_labs exam [status|history|abandon]  timed exams (start one from the UI with X)
+  awesome_labs exam [status|history|abandon]  timed exams (start one from the web page's Exam screen)
   awesome_labs show <id>               print scenario (add --solution for the solution)
   awesome_labs start <id>              prepare the lab for an exercise
   awesome_labs check <id>              check your work
@@ -410,7 +410,7 @@ func webCmd(d web.Deps, args []string) error {
 		fmt.Println("leaving the lab VMs as they are")
 		return err
 	}
-	switch d.OnExit {
+	switch srv.ExitAction() {
 	case "keep":
 		fmt.Println("leaving the lab VMs running (on_exit: keep)")
 	case "stop":
@@ -763,13 +763,17 @@ func examCmd(store *exam.Store, cat *exercise.Catalog, args []string) error {
 		for _, e := range store.History() {
 			p, n, sc := e.Score()
 			res := "FAIL"
-			if e.Pass() {
+			switch {
+			case e.Abandoned:
+				res = "ABANDONED"
+			case e.Pass():
 				res = "PASS"
 			}
 			fmt.Printf("%s  %-40s %2d/%-2d %3.0f%%  %s  %s\n", e.Started.Format("2006-01-02 15:04"), e.Title, p, n, sc*100, res, exam.FormatDuration(e.TimeUsed()))
 		}
 	case "abandon":
 		if e := store.Current(); e != nil {
+			e.Abandoned = true
 			return store.Finish(e)
 		}
 	default:
