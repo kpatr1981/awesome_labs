@@ -64,6 +64,25 @@ hidden data).
 Every script may use `$KL_STATE` for its own files, except `$KL_STATE/user`: that holds the
 lab user's name for every later script, and lint rejects any use of it.
 
+## Writing tutorials
+
+The `tutorial:` is a lesson for someone who has **never used the tool**, not a reading
+list. It must teach enough to solve the exercise without giving the answer away. Use
+this shape (see `net-115`, `git-001`, `k8s-003`, `k8s-373` or `net-100`):
+
+- **What you're learning.** One or two sentences.
+- **The idea**, or "X from zero" in a track's first exercise: the concept in plain
+  words, a small diagram or table where it helps.
+- **Commands you'll use**: the real commands on **other example values** than the
+  exercise uses (other names, addresses, ports), each followed by its typical output and
+  how to read it.
+- **Common mistakes**: the traps this exercise sets and the ones beginners fall into.
+- **Check your work**: how to confirm the result before running the check.
+
+Capstones and incidents get a method instead (a checklist or a symptom → cause table),
+pointing back to the exercises that taught each piece. Tutorials are not in
+`verified.json`'s hash, so rewriting one never needs a new verify run.
+
 ## The contract
 
 1. `setup` runs on a **freshly reset** environment. Make it deterministic; if you
