@@ -8,7 +8,7 @@ what to consolidate. The target doesn't lower the bar: a lab should carry a real
 scenario and teach a concept. The parts of this list that the existing exercises don't cover
 are not started.
 
-Exercise counts (<!-- count:total -->1,630<!-- /count --> total):
+Exercise counts (<!-- count:total -->1,645<!-- /count --> total):
 
 | Topic | Exercises | Target | Track | Module files |
 |---|---|---|---|---|
@@ -16,7 +16,7 @@ Exercise counts (<!-- count:total -->1,630<!-- /count --> total):
 | Kubernetes | <!-- count:kubernetes -->273<!-- /count --> | 250 | `kubernetes` | `exercises/kubernetes/` |
 | Offensive security | <!-- count:offsec -->83<!-- /count --> | 250 | `offsec` | `exercises/offsec/` |
 | Linux & systems | <!-- count:linux -->86<!-- /count --> | 250 | `linux` | `exercises/linux/` |
-| Networking | <!-- count:networking -->83<!-- /count --> | 250 | `networking` | `exercises/networking/` |
+| Networking | <!-- count:networking -->98<!-- /count --> | 250 | `networking` | `exercises/networking/` |
 | Cloud & platform | <!-- count:cloud -->88<!-- /count --> | 250 | `cloud` | `exercises/cloud/` |
 | Data | <!-- count:data -->78<!-- /count --> | 250 | `data` | `exercises/data/` |
 | Defensive security | <!-- count:defensive -->78<!-- /count --> | 250 | `defensive` | `exercises/defensive/` |
@@ -51,7 +51,8 @@ Exercise counts (<!-- count:total -->1,630<!-- /count --> total):
 1. **Quick wins, no new infrastructure:** Linux admin first, then Git and Shell. They run
    on the existing VMs and are easy to check.
 2. **Networking & IP routing**, which the rest of the networking group builds on.
-3. **TLS & PKI**, before OpenVPN and the mail TLS exercises.
+3. ~~**TLS & PKI**~~, before OpenVPN and the mail TLS exercises. Done in
+   `exercises/networking/10-tls-and-pki.yaml`, apart from cert-manager.
 4. **Degraded networks and VPN creation.**
 5. **DNS & email**, with DNS first, because MX records, SPF, DKIM and DMARC are all DNS.
 6. **Everything else**, in any order.
@@ -59,7 +60,7 @@ Exercise counts (<!-- count:total -->1,630<!-- /count --> total):
 ## Deepen every module
 
 Every module now runs beginner → intermediate → advanced and ends with a capstone or
-incident, but many are thin: **39 of the 141 modules have fewer than 10 exercises** and 103
+incident, but many are thin: **39 of the 142 modules have fewer than 10 exercises** and 103
 have fewer than 15. The next round of content should fill the modules before opening new
 ones.
 
@@ -93,7 +94,7 @@ Reaching every module target takes **836 new exercises**:
 | Kubernetes | 21 | 273 | 105 | 378 |
 | Offensive security | 7 | 83 | 40 | 123 |
 | Linux & systems | 9 | 86 | 69 | 155 |
-| Networking | 9 | 83 | 70 | 153 |
+| Networking | 10 | 98 | 70 | 168 |
 | Cloud & platform | 8 | 88 | 50 | 138 |
 | Data | 8 | 78 | 61 | 139 |
 | Defensive security | 8 | 78 | 63 | 141 |
@@ -192,6 +193,7 @@ Tracks still under 250 after that reach it with new modules on topics they don't
 | IPv6 routing with FRR | 4 | 15 | 5 / 4 / 2 |
 | Paths, tunnels & TLS | 20 | 15 | 0 / 0 / 4 |
 | TCP & sockets | 15 | 15 | 2 / 0 / 0 |
+| TLS & PKI | 15 | 15 | 0 / 0 / 0 |
 
 **Cloud & platform**
 
@@ -403,7 +405,7 @@ Rescue is the most valuable module: it breaks a throwaway guest and not the lab 
 | Track | What you'd practise | Runs on | Relies on |
 |---|---|---|---|
 | **Networking & IP routing** | Addressing to BGP, firewalls, packet analysis | Docker VM; k8s lab for Calico and MetalLB | Nothing; the foundation |
-| **TLS & PKI** | `openssl`, broken certificate chains, expiry, mTLS, running a small CA, cert-manager | Docker VM; k8s lab for cert-manager | Nothing |
+| **TLS & PKI** | Done in `exercises/networking/10-tls-and-pki.yaml`: keys and CSRs, SANs and wildcards, PKCS#12 and DER, SNI, picking intermediates, the system trust store, key pinning, `openssl ca` with a CRL, name constraints, OCSP, dual RSA/ECDSA certificates, root rollover with a cross-signed root. **Still to do:** cert-manager (k8s track) | Docker VM; k8s lab for cert-manager | Nothing |
 | **Web servers & proxies** | nginx and HAProxy config, caching, load balancing, timeouts, 502 and 504 hunts | Docker VM; light | TLS & PKI, loosely |
 | **Degraded networks (netem)** | Delay, loss, reordering, corruption and bandwidth caps | Docker VM and k8s lab | Networking |
 | **VPN creation** | WireGuard, OpenVPN, IPsec, mesh VPNs | Docker VM; k8s lab for Calico | Networking, TLS & PKI |

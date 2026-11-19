@@ -716,6 +716,182 @@ pg_sql() {
 }
 
 # ---------- docker helpers ----------
+# ---------- TLS & PKI helpers ----------
+# Keys are EC P-256, or RSA 2048 with TLS_KEY=rsa. An existing PREFIX.key is reused, so
+# several certificates can share a key. Certificates are signed with `openssl ca`, so
+# TLS_START/TLS_END (YYYYMMDDHHMMSSZ, e.g. from `date -u -d '-1 year' +%Y%m%d%H%M%SZ`) can
+# make expired or not-yet-valid ones; otherwise TLS_DAYS (default 365) from now.
+tls_key() {
+  [ -f "$1" ] && return 0
+  if [ "${TLS_KEY:-ec}" = rsa ]; then
+    openssl genpkey -algorithm RSA -pkeyopt rsa_keygen_bits:2048 -out "$1" 2>/dev/null
+  else
+    openssl genpkey -algorithm EC -pkeyopt ec_paramgen_curve:P-256 -out "$1" 2>/dev/null
+  fi
+}
+
+# tls_sign CA_PREFIX CSR OUT 'EXT' — sign CSR with CA_PREFIX.pem/.key; EXT is extension
+# lines joined by \n (printf %b). The CSR's subject is kept as it is.
+tls_sign() {
+  local ca=$1 csr=$2 out=$3 ext=$4 t
+  t=$(mktemp -d)
+  : >"$t/index.txt"
+  openssl rand -hex 16 >"$t/serial"
+  printf '[ca]\ndefault_ca=d\n[d]\ndatabase=%s/index.txt\nnew_certs_dir=%s\nserial=%s/serial\ndefault_md=sha256\npolicy=p\nunique_subject=no\nemail_in_dn=no\n[p]\ncommonName=supplied\n[x]\n%b\n' \
+    "$t" "$t" "$t" "$ext" >"$t/ca.cnf"
+  local dates=(-days "${TLS_DAYS:-365}")
+  [ -n "${TLS_START:-}" ] && dates=(-startdate "$TLS_START" -enddate "$TLS_END")
+  if ! openssl ca -batch -notext -preserveDN -config "$t/ca.cnf" -cert "$ca.pem" -keyfile "$ca.key" \
+    -in "$csr" -out "$out" -extensions x "${dates[@]}" >"$t/log" 2>&1; then
+    cat "$t/log" >&2
+    rm -rf "$t"
+    return 1
+  fi
+  rm -rf "$t"
+}
+
+# tls_ca PREFIX "SUBJECT" [DAYS] — a self-signed root CA (PREFIX.pem, PREFIX.key). A
+# SUBJECT without a slash is a common name.
+tls_ca() {
+  local subj=$2
+  [[ $subj == /* ]] || subj="/CN=$subj"
+  tls_key "$1.key"
+  openssl req -x509 -new -key "$1.key" -out "$1.pem" -days "${3:-3650}" -subj "$subj" \
+    -addext basicConstraints=critical,CA:TRUE -addext keyUsage=critical,keyCertSign,cRLSign \
+    -addext subjectKeyIdentifier=hash 2>/dev/null
+}
+
+# tls_int PREFIX "SUBJECT" CA_PREFIX ['EXTRA EXT'] — an intermediate CA (pathlen 0) signed
+# by CA_PREFIX, valid TLS_DAYS (default 1825).
+tls_int() {
+  local subj=$2
+  [[ $subj == /* ]] || subj="/CN=$subj"
+  tls_key "$1.key"
+  openssl req -new -key "$1.key" -subj "$subj" -out "$1.csr" 2>/dev/null
+  TLS_DAYS=${TLS_DAYS:-1825} tls_sign "$3" "$1.csr" "$1.pem" \
+    "basicConstraints=critical,CA:TRUE,pathlen:0\nkeyUsage=critical,keyCertSign,cRLSign\nsubjectKeyIdentifier=hash\nauthorityKeyIdentifier=keyid:always${4:+\n$4}"
+  local rc=$?
+  rm -f "$1.csr"
+  return $rc
+}
+
+# tls_leaf PREFIX "SUBJECT" CA_PREFIX "SAN" ['EXTRA EXT'] — a server certificate signed by
+# CA_PREFIX. SAN is like "DNS:a.lab.test,IP:127.0.0.1"; "" leaves the extension out.
+tls_leaf() {
+  local subj=$2 ext ku=digitalSignature
+  [[ $subj == /* ]] || subj="/CN=$subj"
+  tls_key "$1.key"
+  openssl pkey -in "$1.key" -noout -text 2>/dev/null | grep -q '^Private-Key.*primes' && ku="$ku,keyEncipherment"
+  openssl req -new -key "$1.key" -subj "$subj" -out "$1.csr" 2>/dev/null
+  ext="basicConstraints=CA:FALSE\nkeyUsage=critical,$ku\nextendedKeyUsage=${TLS_EKU:-serverAuth}\nsubjectKeyIdentifier=hash\nauthorityKeyIdentifier=keyid"
+  [ -n "$4" ] && ext="$ext\nsubjectAltName=$4"
+  tls_sign "$3" "$1.csr" "$1.pem" "$ext${5:+\n$5}"
+  local rc=$?
+  rm -f "$1.csr"
+  return $rc
+}
+
+# tls_pin FILE — the base64 SHA-256 of a certificate's or key's public key (SPKI pin)
+tls_pin() {
+  local pub
+  if grep -q 'BEGIN CERTIFICATE' "$1" 2>/dev/null; then
+    pub=$(openssl x509 -in "$1" -noout -pubkey 2>/dev/null)
+  else
+    pub=$(openssl pkey -in "$1" -pubout -passin pass: 2>/dev/null)
+  fi
+  [ -n "$pub" ] || return 1
+  printf '%s\n' "$pub" | openssl pkey -pubin -outform DER 2>/dev/null | openssl dgst -sha256 -binary | base64
+}
+
+# tls_ok PORT NAME CAFILE [s_client options...] — true when a client that trusts only
+# CAFILE completes a handshake with 127.0.0.1:PORT and verifies it as NAME. (s_client says
+# "Verify return code: 0" after a failed handshake too, so the cipher and certificate count.)
+tls_ok() {
+  local p=$1 n=$2 ca=$3 out
+  shift 3
+  out=$(echo | timeout 10 openssl s_client -connect "127.0.0.1:$p" -servername "$n" -verify_hostname "$n" \
+    -CAfile "$ca" -verify_return_error "$@" 2>&1)
+  grep -q 'Verify return code: 0 (ok)' <<<"$out" && grep -q 'BEGIN CERTIFICATE' <<<"$out" &&
+    ! grep -q 'Cipher is (NONE)' <<<"$out"
+}
+
+# tls_peer PORT [NAME] [s_client options...] — the certificate the server on 127.0.0.1:PORT
+# sends, as PEM; with no NAME (or ""), the client sends no SNI
+tls_peer() {
+  local p=$1 n=${2:-}
+  shift 2 2>/dev/null || shift $#
+  if [ -n "$n" ]; then set -- -servername "$n" "$@"; else set -- -noservername "$@"; fi
+  echo | timeout 10 openssl s_client -connect "127.0.0.1:$p" "$@" 2>/dev/null | openssl x509 2>/dev/null
+}
+
+# tls_serve PORT CHAIN KEY [CLIENT_CA] — an HTTPS server answering "ok" on 127.0.0.1:PORT,
+# in the background for up to 60s (pid in TLS_PID); fails when it can't load the files.
+# Stop it with tls_stop.
+tls_serve() {
+  python3 - "$@" >/dev/null 2>&1 <<'PY' &
+import http.server, ssl, sys, threading
+port, chain, key = int(sys.argv[1]), sys.argv[2], sys.argv[3]
+ctx = ssl.SSLContext(ssl.PROTOCOL_TLS_SERVER)
+ctx.load_cert_chain(chain, key)
+if len(sys.argv) > 4:
+    ctx.verify_mode = ssl.CERT_REQUIRED
+    ctx.load_verify_locations(sys.argv[4])
+class H(http.server.BaseHTTPRequestHandler):
+    def do_GET(self):
+        self.send_response(200)
+        self.end_headers()
+        self.wfile.write(b"ok\n")
+    def log_message(self, *a):
+        pass
+s = http.server.ThreadingHTTPServer(("127.0.0.1", port), H)
+s.socket = ctx.wrap_socket(s.socket, server_side=True, do_handshake_on_connect=False)
+threading.Timer(60, s.shutdown).start()
+s.serve_forever()
+PY
+  TLS_PID=$!
+  local i
+  for i in $(seq 50); do
+    kill -0 "$TLS_PID" 2>/dev/null || return 1
+    ss -ltnH "sport = :$1" 2>/dev/null | grep -q . && return 0
+    sleep 0.1
+  done
+  return 1
+}
+tls_stop() {
+  [ -n "${TLS_PID:-}" ] || return 0
+  kill "$TLS_PID" 2>/dev/null
+  wait "$TLS_PID" 2>/dev/null
+  TLS_PID=
+}
+
+# tls_nginx NAME PORT DIR — nginx in container kl-NAME on 127.0.0.1:PORT, with DIR (its
+# *.conf files and certificates) mounted at /etc/nginx/conf.d. Removed on reset.
+tls_nginx() {
+  docker rm -f "kl-$1" >/dev/null 2>&1
+  docker run -d --name "kl-$1" -p "127.0.0.1:$2:443" -v "$3:/etc/nginx/conf.d" nginx:1.27-alpine >/dev/null
+}
+
+# tls_wait PORT [SECONDS] — wait until a TLS server on 127.0.0.1:PORT completes a handshake
+# (a published Docker port accepts connections before the server in it is ready)
+tls_wait() {
+  local i
+  for i in $(seq $((${2:-10} * 2))); do
+    echo | timeout 3 openssl s_client -connect "127.0.0.1:$1" 2>/dev/null | grep -q 'BEGIN CERTIFICATE' && return 0
+    sleep 0.5
+  done
+  return 1
+}
+
+# port_wait PORT [SECONDS] — wait until something listens on PORT, without connecting to it
+port_wait() {
+  local i
+  for i in $(seq $((${2:-10} * 5))); do
+    ss -ltnH "sport = :$1" 2>/dev/null | grep -q . && return 0
+    sleep 0.2
+  done
+  return 1
+}
+
 c_running() { [ "$(docker inspect -f '{{.State.Running}}' "$1" 2>/dev/null)" = true ]; }
 c_exists() { docker inspect "$1" >/dev/null 2>&1; }
 c_get() { docker inspect -f "$2" "$1" 2>/dev/null; } # c_get NAME '{{go template}}'
