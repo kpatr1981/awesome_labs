@@ -23,7 +23,7 @@ var (
 	bootstrapPkgs = "strace lsof lvm2 dnsmasq-base wireguard-tools traceroute acl"
 	// what Ubuntu's cloud image has and its container image lacks
 	cloudPkgs = "sudo python3 iputils-ping openssh-client cron rsync wget unzip zip file procps psmisc " +
-		"kmod util-linux xz-utils bzip2 netcat-openbsd e2fsprogs locales tzdata man-db"
+		"kmod util-linux xz-utils bzip2 netcat-openbsd e2fsprogs locales tzdata man-db logrotate python3-yaml"
 )
 
 // LabUser is the lab user's name inside the harness.

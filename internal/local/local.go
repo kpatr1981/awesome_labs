@@ -284,7 +284,13 @@ func (h *Harness) startContainer(ctx context.Context, name, vol string, extra []
 		return nil, err
 	}
 	if err := h.run(ctx, io.Discard, bytes.NewReader(kit), "exec", "-i", "-u", "root", name, "bash", "-c",
-		"mkdir -p /opt/kubelab /var/lib/kubelab && tar -m --warning=no-timestamp -xf - -C /opt/kubelab"); err != nil {
+		"mkdir -p /opt/kubelab /var/lib/kubelab && tar -m --warning=no-timestamp -xf - -C /opt/kubelab"+
+			// the pristine snapshot vms/bootstrap/docker.sh takes at the end of a VM's bootstrap,
+			// which helpers such as frr_image read; the store's images are this container's own
+			" && mkdir -p /var/lib/kubelab/pristine"+
+			" && { /opt/kubelab/state.sh snapshot docker >/dev/null 2>&1 || true; }"+
+			" && docker images -q --no-trunc | sort -u >/var/lib/kubelab/pristine/images.txt"+
+			" && docker images --format '{{.Repository}}:{{.Tag}}' | grep -v '<none>' | sort -u >/var/lib/kubelab/pristine/image-refs.txt"); err != nil {
 		c.remove()
 		return nil, fmt.Errorf("copy kit: %w", err)
 	}
