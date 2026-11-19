@@ -39,6 +39,7 @@ Exercise counts (<!-- count:total -->1,630<!-- /count --> total):
 - [Active Directory on Linux](#active-directory-on-linux)
 - [Industrial & IoT](#industrial--iot)
 - [Event streaming](#event-streaming)
+- [AI engineering with tiny models](#ai-engineering-with-tiny-models)
 - [Programming](#programming)
 - [Practice modes](#practice-modes)
 - [awesome_labs features](#awesome_labs-features)
@@ -676,6 +677,49 @@ and consumers the lab ships, so each module is a running system with something w
   the other images.
 - **Start with** *Topics & partitions* and *Consumers & groups* on a single broker; the
   three-broker cluster comes with *Operating a cluster*.
+
+## AI engineering with tiny models
+
+Building, running and securing applications on language models, with **small local models
+only** — e.g. a 0.5–1.5B instruct model in GGUF (Qwen2.5-0.5B/1.5B, SmolLM2) under
+**llama.cpp's server** (an OpenAI-compatible API), and a small embedding model
+(all-MiniLM, bge-small) for search. No API keys and no internet: the models are pre-pulled
+like the other images, so the labs stay offline. The focus is the engineering around the
+model — retrieval, structured output, evaluation, security, operations — where small models
+behave just like big ones, and their mistakes make the lessons easier to see.
+
+| Module | Real-world example | What you'd practise |
+|---|---|---|
+| **Serving a model** | The platform team needs an internal LLM endpoint for three apps by Friday | run llama.cpp's server, quantization levels vs memory and speed, context size, concurrent requests and queueing, an API gateway with keys and rate limits in front, health checks, a model that OOMs the VM |
+| **Retrieval (RAG)** | An on-call runbook bot that answers "how do I fail over the database?" from the team's own runbooks — and keeps quoting the old procedure | chunking, embeddings, a vector index in **pgvector** (ties into the data track) or Qdrant, hybrid keyword + vector search, re-ranking, citing sources, finding why the wrong document wins, re-indexing on change |
+| **Structured output & extraction** | Accounts payable wants invoice e-mails turned into JSON (supplier, IBAN, total, due date) for the ERP | JSON Schema, grammar-constrained decoding (llama.cpp GBNF), validation and retries, normalising dates and amounts, routing low-confidence results to a human |
+| **Classification & triage** | Route support tickets to the right team and flag the urgent ones | zero-shot vs few-shot prompts vs a small classifier trained on embeddings (ties into data science), confusion matrices, when the boring model is the better choice |
+| **Tools & agents** | An ops assistant that may look up a ticket and restart a service — and must not do anything else | tool / function calling, an allow-list of tools and arguments, confirmation for risky actions, timeouts and step limits, an audit log of every call |
+| **Evaluation** | A prompt "improvement" shipped last week and answers got worse; nobody noticed | a golden set with expected answers, scoring retrieval (hit rate, MRR) and answers (exact match, rubric checks), regression tests in CI (ties into automation), comparing two prompts or models on cost, latency and quality |
+| **LLM security** | The runbook bot leaked a credential after someone hid instructions in a wiki page | the OWASP Top 10 for LLM applications: direct and indirect prompt injection, data exfiltration through tools and links, insecure output handling (XSS in a chat UI), PII redaction before text reaches the model, keeping secrets out of the context entirely |
+| **Operations & cost** | Finance asks what the chatbot costs per user, and on-call asks why it's slow at 9 am | token accounting, latency percentiles, caching identical and similar prompts, streaming, batching, logging prompts without logging personal data, a dashboard that shows it all (ties into observability) |
+| **Capstone: ship the assistant** | Take the half-built support assistant to production | retrieval over the help centre, structured ticket creation, an eval suite gating releases, injection defences, rate limits and monitoring — each graded |
+
+- **Checks grade the system, not the model's prose.** Model output varies, so checks look at
+  what the learner built: retrieval returns the right document ids for the check's own
+  hidden questions (deterministic, since embeddings are), every extraction validates against
+  the schema and matches the hidden invoices' fields, the eval harness computes the right
+  score on a labelled set, a tool call outside the allow-list is refused, a canary secret
+  can't appear in any answer because it never reaches the context, chat output is escaped.
+  Where a model answer is graded, it's with temperature 0, a fixed seed and a pinned
+  llama.cpp build and model file, and with generous criteria (the right document cited, the
+  right label), never exact wording.
+- **Determinism:** setup generates the corpora (runbooks, invoices, tickets) with per-run
+  facts stored in `$KL_STATE`, so the right answer exists only in this run's documents and
+  can't be guessed from a model's training data.
+- **Resources:** a 0.5B model at 4-bit is about 400 MB and runs at usable speed on the Docker
+  VM's 2 vCPUs; 1.5B is about 1 GB and slower. The embedding model is under 100 MB. They'd
+  live in their own pre-pulled image (`kl-llm`), fetched on first use, like Jupyter.
+- **Tooling to add:** llama.cpp (server and CLI), sentence-transformers or llama.cpp
+  embeddings, pgvector (already PostgreSQL), optionally Qdrant, and Python with an
+  OpenAI-compatible client, so the code learners write works unchanged against a hosted model.
+- **Start with** *Serving a model* and *Retrieval*; nearly every later module builds on a
+  served model and a working index.
 
 ## Programming
 
