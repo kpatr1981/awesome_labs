@@ -28,6 +28,7 @@ Exercise counts (<!-- count:total -->1,630<!-- /count --> total):
 | Algorithms | <!-- count:algorithms -->70<!-- /count --> | 250 | `algorithms` | `exercises/algorithms/` |
 
 - [Suggested order](#suggested-order)
+- [Deepen every module](#deepen-every-module)
 - [Shared lab foundations](#shared-lab-foundations)
 - [Linux & systems](#linux--systems)
 - [Networking](#networking)
@@ -49,6 +50,268 @@ Exercise counts (<!-- count:total -->1,630<!-- /count --> total):
 4. **Degraded networks and VPN creation.**
 5. **DNS & email**, with DNS first, because MX records, SPF, DKIM and DMARC are all DNS.
 6. **Everything else**, in any order.
+
+## Deepen every module
+
+Every module now runs beginner → intermediate → advanced and ends with a capstone or
+incident, but many are thin: **39 of the 141 modules have fewer than 10 exercises** and 103
+have fewer than 15. The next round of content should fill the modules before opening new
+ones.
+
+- **Target per module:** 20 exercises for a track's first module and 15 for the others,
+  split across the levels — see [Module targets](#module-targets).
+- **Empty levels first.** A module with no beginner exercises drops a learner straight
+  into the middle; two of them, *Networking essentials* and *Web exploitation —
+  fundamentals*, are the first modules of their track. Then modules with no advanced
+  exercises, then the rest by size.
+- **New exercises go under their level's header** (`# ===== Beginner =====` …), before the
+  capstone, so the order stays easy → hard. Ids are never reused or renumbered, so new ones
+  take the track's next free number.
+- **Same bar as before:** a real multi-step scenario that teaches a concept, each one
+  checked with `verify -local` (docker profile) while writing and with `verify -record` on
+  a lab VM before release, so the release gate stays green.
+
+### Module targets
+
+Each module gets a target by its role. **The first module of a track: 20 exercises** —
+8 beginner, 6 intermediate, 5 advanced and the capstone — since it's where newcomers start
+and needs the gentlest ramp. **Every other module: 15** — 5 beginner, 5 intermediate,
+4 advanced and the capstone or incident. The targets are floors for each level, not caps:
+a big module keeps what it has but still fills a level it's short on. Levels count the
+exercises before the capstone/incident (B = difficulty 1–2, I = 3, A = 4–5).
+
+Reaching every module target takes **836 new exercises**:
+
+| Track | Modules | Now | New exercises for the module targets | Then |
+|---|---|---|---|---|
+| Docker | 15 | 186 | 86 | 272 |
+| Kubernetes | 21 | 273 | 105 | 378 |
+| Offensive security | 7 | 83 | 40 | 123 |
+| Linux & systems | 9 | 86 | 69 | 155 |
+| Networking | 9 | 83 | 70 | 153 |
+| Cloud & platform | 8 | 88 | 50 | 138 |
+| Data | 8 | 78 | 61 | 139 |
+| Defensive security | 8 | 78 | 63 | 141 |
+| Programming | 7 | 86 | 38 | 124 |
+| Data science | 7 | 83 | 37 | 120 |
+| Git | 22 | 255 | 123 | 378 |
+| Terraform | 7 | 92 | 32 | 124 |
+| Ansible | 7 | 89 | 31 | 120 |
+| Algorithms | 6 | 70 | 31 | 101 |
+
+Tracks still under 250 after that reach it with new modules on topics they don't cover yet
+(the sections below), each built to the same 15-exercise shape.
+
+**Docker**
+
+| Module | Now | Target | Still needed (B / I / A) |
+|---|---|---|---|
+| Containers — first steps *(first module)* | 9 | 20 | 2 / 4 / 5 |
+| Images & Dockerfiles | 17 | 15 | 0 / 0 / 2 |
+| Volumes & storage | 16 | 15 | 0 / 0 / 3 |
+| Networking | 14 | 15 | 0 / 0 / 3 |
+| Docker Compose — essentials | 15 | 15 | 0 / 0 / 4 |
+| Registries & image distribution | 16 | 15 | 0 / 0 / 2 |
+| Security & resource limits | 14 | 15 | 2 / 0 / 4 |
+| The Docker daemon & the host | 13 | 15 | 1 / 0 / 4 |
+| Production patterns | 11 | 15 | 2 / 0 / 4 |
+| Troubleshooting in the real world | 11 | 15 | 5 / 0 / 3 |
+| Advanced builds & operations | 5 | 15 | 5 / 3 / 2 |
+| Registry & runtime internals | 4 | 15 | 5 / 3 / 3 |
+| Observability & logging | 6 | 15 | 5 / 1 / 3 |
+| Builds, runtime controls & Compose II | 20 | 15 | 0 / 0 / 4 |
+| Automating Docker — the Engine API & scripts | 15 | 15 | 2 / 0 / 0 |
+
+**Kubernetes**
+
+| Module | Now | Target | Still needed (B / I / A) |
+|---|---|---|---|
+| Pods & kubectl essentials *(first module)* | 13 | 20 | 2 / 0 / 5 |
+| Deployments & rollouts | 11 | 15 | 1 / 0 / 4 |
+| Services & DNS | 14 | 15 | 0 / 0 / 4 |
+| ConfigMaps & Secrets | 16 | 15 | 0 / 0 / 4 |
+| Scheduling | 14 | 15 | 0 / 0 / 4 |
+| Storage | 18 | 15 | 0 / 0 / 4 |
+| Jobs, CronJobs, DaemonSets & more | 16 | 15 | 0 / 0 / 4 |
+| Health, resources & autoscaling | 15 | 15 | 0 / 0 / 4 |
+| Ingress & Gateway API | 17 | 15 | 1 / 0 / 2 |
+| Network policies | 9 | 15 | 4 / 0 / 3 |
+| RBAC & pod security | 16 | 15 | 0 / 0 / 3 |
+| Troubleshooting applications | 13 | 15 | 3 / 0 / 3 |
+| Troubleshooting the cluster | 11 | 15 | 3 / 0 / 1 |
+| Cluster administration | 13 | 15 | 5 / 0 / 0 |
+| Helm, Kustomize, CRDs & the API | 15 | 15 | 2 / 0 / 3 |
+| Day-two operations | 6 | 15 | 4 / 2 / 3 |
+| Config & scheduling II | 9 | 15 | 4 / 2 / 0 |
+| Workloads & reliability II | 8 | 15 | 4 / 2 / 1 |
+| BGP & routing to the outside | 4 | 15 | 5 / 5 / 1 |
+| Advanced workloads & policy | 20 | 15 | 0 / 0 / 1 |
+| Failure policies & lifecycle controls | 15 | 15 | 2 / 0 / 0 |
+
+**Offensive security**
+
+| Module | Now | Target | Still needed (B / I / A) |
+|---|---|---|---|
+| Web exploitation — fundamentals *(first module)* | 9 | 20 | 8 / 2 / 1 |
+| Linux privilege escalation | 13 | 15 | 5 / 2 / 0 |
+| Network services & credentials | 6 | 15 | 3 / 3 / 3 |
+| Tokens & weak crypto | 9 | 15 | 1 / 2 / 3 |
+| Forensics & artifact analysis | 11 | 15 | 1 / 1 / 2 |
+| Web & API attacks | 20 | 15 | 0 / 0 / 1 |
+| Applied cryptography attacks | 15 | 15 | 2 / 0 / 0 |
+
+**Linux & systems**
+
+| Module | Now | Target | Still needed (B / I / A) |
+|---|---|---|---|
+| Linux essentials *(first module)* | 5 | 20 | 6 / 4 / 5 |
+| Systems & internals | 8 | 15 | 2 / 2 / 3 |
+| Everyday administration | 7 | 15 | 3 / 4 / 1 |
+| Processes & storage | 8 | 15 | 3 / 0 / 4 |
+| Networking & services | 7 | 15 | 5 / 1 / 2 |
+| Git beyond the basics | 5 | 15 | 5 / 3 / 2 |
+| Container internals | 11 | 15 | 5 / 4 / 0 |
+| Files, services & recovery | 20 | 15 | 0 / 0 / 3 |
+| Security & hardening | 15 | 15 | 2 / 0 / 0 |
+
+**Networking**
+
+| Module | Now | Target | Still needed (B / I / A) |
+|---|---|---|---|
+| Networking essentials *(first module)* | 4 | 20 | 8 / 5 / 3 |
+| Switching, services & tunnels | 9 | 15 | 2 / 2 / 2 |
+| Traffic & troubleshooting | 8 | 15 | 3 / 4 / 0 |
+| Services & scale | 8 | 15 | 5 / 1 / 1 |
+| DNS, NAT & firewalls | 5 | 15 | 5 / 3 / 2 |
+| Dynamic routing with FRR | 10 | 15 | 5 / 2 / 0 |
+| IPv6 routing with FRR | 4 | 15 | 5 / 4 / 2 |
+| Paths, tunnels & TLS | 20 | 15 | 0 / 0 / 4 |
+| TCP & sockets | 15 | 15 | 2 / 0 / 0 |
+
+**Cloud & platform**
+
+| Module | Now | Target | Still needed (B / I / A) |
+|---|---|---|---|
+| AWS CLI essentials *(first module)* | 6 | 20 | 5 / 5 / 4 |
+| AWS services in practice | 10 | 15 | 1 / 1 / 3 |
+| AWS automation & governance | 10 | 15 | 2 / 2 / 1 |
+| Data & messaging | 10 | 15 | 3 / 0 / 3 |
+| Compute & networking | 11 | 15 | 0 / 3 / 2 |
+| IAM & permissions | 6 | 15 | 4 / 3 / 2 |
+| Events, storage & governance | 20 | 15 | 0 / 0 / 4 |
+| Managed databases (RDS & Aurora) | 15 | 15 | 2 / 0 / 0 |
+
+**Data**
+
+| Module | Now | Target | Still needed (B / I / A) |
+|---|---|---|---|
+| Databases essentials *(first module)* | 4 | 20 | 7 / 4 / 5 |
+| Database operations | 8 | 15 | 3 / 1 / 3 |
+| Advanced SQL & data services | 8 | 15 | 4 / 2 / 1 |
+| Performance & Redis patterns | 5 | 15 | 5 / 3 / 2 |
+| Transactions & integrity | 7 | 15 | 4 / 3 / 1 |
+| Recovery & resilience | 11 | 15 | 5 / 4 / 0 |
+| SQL in depth & Redis data structures | 20 | 15 | 0 / 0 / 2 |
+| Logic in the database | 15 | 15 | 2 / 0 / 0 |
+
+**Defensive security**
+
+| Module | Now | Target | Still needed (B / I / A) |
+|---|---|---|---|
+| First response *(first module)* | 3 | 20 | 8 / 4 / 5 |
+| Hardening & investigation | 6 | 15 | 2 / 3 / 4 |
+| Detection & monitoring | 8 | 15 | 4 / 1 / 2 |
+| Response & recovery | 8 | 15 | 3 / 2 / 2 |
+| Forensics & evidence | 7 | 15 | 4 / 2 / 2 |
+| Network forensics & hardening | 11 | 15 | 5 / 4 / 0 |
+| Threat hunting & containment | 20 | 15 | 0 / 0 / 4 |
+| Web & TLS hardening | 15 | 15 | 2 / 0 / 0 |
+
+**Programming**
+
+| Module | Now | Target | Still needed (B / I / A) |
+|---|---|---|---|
+| Python and Go essentials *(first module)* | 6 | 20 | 6 / 4 / 4 |
+| Python and Go in practice | 11 | 15 | 1 / 0 / 3 |
+| Testing & tooling | 11 | 15 | 2 / 1 / 1 |
+| Data structures & algorithms | 11 | 15 | 0 / 2 / 3 |
+| Concurrency & I/O | 11 | 15 | 2 / 0 / 3 |
+| Pitfalls & idioms | 21 | 15 | 0 / 0 / 4 |
+| Secure coding | 15 | 15 | 2 / 0 / 0 |
+
+**Data science**
+
+| Module | Now | Target | Still needed (B / I / A) |
+|---|---|---|---|
+| Data wrangling with pandas *(first module)* | 8 | 20 | 5 / 2 / 5 |
+| Statistics & machine learning | 7 | 15 | 4 / 2 / 2 |
+| Features & evaluation | 11 | 15 | 2 / 2 / 0 |
+| Text & time series | 11 | 15 | 2 / 0 / 2 |
+| Pipelines & tuning | 11 | 15 | 1 / 1 / 2 |
+| Analysis & model diagnostics | 20 | 15 | 0 / 0 / 3 |
+| Customer & product analytics | 15 | 15 | 2 / 0 / 0 |
+
+**Git**
+
+| Module | Now | Target | Still needed (B / I / A) |
+|---|---|---|---|
+| Getting started *(first module)* | 11 | 20 | 0 / 6 / 5 |
+| Branching and merging | 11 | 15 | 0 / 0 / 4 |
+| Inspecting history | 11 | 15 | 0 / 3 / 4 |
+| Undoing changes | 11 | 15 | 2 / 0 / 3 |
+| Rebasing and rewriting | 11 | 15 | 5 / 3 / 0 |
+| Stashing and tagging | 11 | 15 | 0 / 3 / 4 |
+| Remotes and collaboration | 11 | 15 | 0 / 1 / 4 |
+| Recovery and detective work | 11 | 15 | 5 / 3 / 0 |
+| Plumbing and power tools | 11 | 15 | 2 / 0 / 3 |
+| Real-world workflows | 11 | 15 | 5 / 2 / 0 |
+| Configuration & aliases | 11 | 15 | 1 / 0 / 3 |
+| Ignore rules & attributes | 11 | 15 | 1 / 2 / 1 |
+| Hooks | 11 | 15 | 1 / 2 / 1 |
+| Submodules & subtrees | 11 | 15 | 2 / 2 / 0 |
+| Advanced merging | 11 | 15 | 4 / 0 / 2 |
+| Searching & comparing | 11 | 15 | 2 / 0 / 2 |
+| Large repositories | 11 | 15 | 1 / 0 / 3 |
+| Repository troubleshooting | 11 | 15 | 0 / 2 / 2 |
+| Identity, signing & trailers | 11 | 15 | 1 / 1 / 2 |
+| Git incidents | 10 | 15 | 5 / 5 / 4 |
+| Revisions, refs & scripting | 21 | 15 | 0 / 0 / 2 |
+| Hosting & serving repositories | 15 | 15 | 2 / 0 / 0 |
+
+**Terraform**
+
+| Module | Now | Target | Still needed (B / I / A) |
+|---|---|---|---|
+| Terraform basics *(first module)* | 11 | 20 | 0 / 4 / 5 |
+| Variables, expressions & meta-arguments | 11 | 15 | 0 / 1 / 3 |
+| Working with state | 11 | 15 | 3 / 0 / 1 |
+| Modules | 11 | 15 | 2 / 1 / 1 |
+| Docker infrastructure | 11 | 15 | 2 / 0 / 3 |
+| Functions, lifecycle & testing | 21 | 15 | 0 / 0 / 4 |
+| Terraform in automation | 16 | 15 | 2 / 0 / 0 |
+
+**Ansible**
+
+| Module | Now | Target | Still needed (B / I / A) |
+|---|---|---|---|
+| Inventory & ad-hoc commands *(first module)* | 11 | 20 | 1 / 4 / 4 |
+| Playbooks | 11 | 15 | 0 / 1 / 4 |
+| Templates, files & variables | 11 | 15 | 0 / 0 / 4 |
+| Roles & reuse | 11 | 15 | 2 / 0 / 2 |
+| Operations & incidents | 10 | 15 | 3 / 2 / 0 |
+| Control flow & extending Ansible | 20 | 15 | 0 / 0 / 2 |
+| Data structures & types | 15 | 15 | 2 / 0 / 0 |
+
+**Algorithms**
+
+| Module | Now | Target | Still needed (B / I / A) |
+|---|---|---|---|
+| Searching & sorting *(first module)* | 11 | 20 | 1 / 3 / 5 |
+| Data structures | 11 | 15 | 0 / 1 / 4 |
+| Graphs | 11 | 15 | 1 / 0 / 3 |
+| Dynamic programming | 11 | 15 | 0 / 1 / 4 |
+| Strings, greedy & maths | 11 | 15 | 0 / 3 / 3 |
+| Recursion & backtracking | 15 | 15 | 2 / 0 / 0 |
 
 ## Shared lab foundations
 
@@ -314,6 +577,28 @@ which other sites already cover well. SQL is under [Data](#data).
 
 New ways to use exercises, most of them reusing existing content.
 
+- **Tutorial mode (guided, from zero):** a *Guide me* switch on the exercise page that
+  walks a beginner through the exercise one step at a time instead of showing the whole
+  scenario: **explain** (what and why, from the Learn text), **do** (the command, with
+  ▸ Terminal), **what happened** (how to read the output), then a **step check** that
+  advances when it passes.
+  - **Steps reuse the checks:** each `check "…"` line already names one requirement, so a
+    step maps to one or more check lines; the guide re-runs the check and looks only at its
+    step's lines. No new grading code for most exercises.
+  - **An optional `guide:` field** in the exercise YAML holds hand-written steps
+    (explanation, command, the check lines it satisfies, what to look for in the output).
+    Without one, the guide builds rougher steps from the tutorial, hints and check
+    descriptions, so all exercises get a guide from the start.
+  - **"From zero":** a short primer per track (what a container, pod, commit or plan is),
+    linked from a step whenever it uses a concept the learner hasn't met yet (by tag).
+  - **Honest progress:** "solved with guide" is recorded like hints and solutions are, so
+    weak spots and exams stay meaningful; exams turn the guide off.
+  - **Start with** hand-written guides for the beginner exercises of each track's first
+    module (about 70), and the automatic fallback everywhere else. Guides are tested with
+    `verify`/`verify -local` like exercises.
+  - **Later, optional:** an *explain this output* button that asks an AI tutor about what's
+    in the learner's terminal. It needs an API key and network access, so it stays opt-in;
+    the labs themselves keep working offline.
 - **Attack, then defend:** exploit a target, then patch it and prove the exploit no longer
   works. Candidates: zone transfer leaks, open relays, and pivoting through a compromised
   VPN client and then restricting it with firewall rules.
