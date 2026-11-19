@@ -35,6 +35,7 @@ Exercise counts (<!-- count:total -->1,630<!-- /count --> total):
 - [Cloud & platform](#cloud--platform)
 - [Data](#data)
 - [Security](#security)
+- [Reverse engineering](#reverse-engineering)
 - [Programming](#programming)
 - [Practice modes](#practice-modes)
 - [awesome_labs features](#awesome_labs-features)
@@ -556,6 +557,41 @@ The track has 45 exercises so far.
   service account tokens, and then fixing each one.
 - **Advanced web:** SSTI, deserialization, race conditions, OAuth flaws, business logic
   bugs.
+
+## Reverse engineering
+
+A new track (`reversing`) on taking apart what you only have in compiled form: binaries,
+firmware images and ROMs. Everything it analyses is **built by the lab itself** — small
+programs compiled in setup, firmware images assembled from open-source parts, homebrew ROMs
+assembled from source — so no copyrighted ROM or vendor firmware is ever shipped or needed.
+Same shape as every other track: 15-exercise modules, beginner → advanced, each ending
+with a capstone.
+
+| Module | What you'd practise | Runs on |
+|---|---|---|
+| **Binary basics** | `file`, `strings`, `readelf`/`objdump`, sections and symbols, `ldd`, `strace`/`ltrace`; find a hard-coded key or URL in a stripped binary | Docker VM; light |
+| **Disassembly & decompilation** | x86-64 calling conventions, reading control flow in radare2/rizin and Ghidra (headless), renaming and annotating, finding the check a crackme makes | Docker or offsec VM; Ghidra is the heavy part |
+| **Dynamic analysis** | gdb (+ pwndbg/gef), breakpoints and watchpoints, patching registers at runtime, `LD_PRELOAD` hooks, Frida on a running process | Docker VM |
+| **Patching & keygens** | patch a jump to bypass a licence check, write a key generator from the reversed algorithm, binary diffing (`radiff2`, BinDiff-style) to find what a patch fixed | Docker VM |
+| **Firmware analysis** | `binwalk`/unblob extraction, squashfs/cramfs/jffs2, U-Boot and uImage headers, recovering hard-coded credentials and keys, running extracted services under `qemu-user` (ARM/MIPS), repacking a modified image | Docker VM (`qemu-user-static`) |
+| **ROMs & embedded** | file formats and headers (iNES, Game Boy cartridge header and checksums), 6502/Z80/ARM Thumb disassembly, memory maps, emulators with debuggers (e.g. mGBA's gdb stub), patching a homebrew ROM and fixing its checksum, IPS/BPS patches | Docker VM |
+| **Malware-style analysis** | triage a (harmless, lab-built) sample: unpacking UPX, string decryption, config extraction, YARA rules and `capa` to describe what it does — the defensive side of the same skills | Offsec VM; ties into defensive security |
+| **Protocols & file formats** | reverse an undocumented binary file format or network protocol from samples and a client binary (Kaitai Struct, Wireshark dissectors in Lua) and write a parser that the check feeds new samples | Docker VM; ties into networking |
+
+- **Checks** stay concrete: a recovered flag or key in `/lab`, a patched binary or ROM that
+  now behaves differently (the check runs it, or runs the ROM headless in the emulator with
+  a scripted input), a keygen whose keys the original binary accepts, a parser that handles
+  the check's own hidden samples, or a YARA rule that matches the hidden variants and none
+  of the clean files.
+- **Determinism:** setup compiles the targets with fixed flags (and `-ffile-prefix-map`,
+  no timestamps) or picks per-run keys stored in `$KL_STATE`, so answers can't be looked up.
+- **Tooling to add to the image:** binutils, gdb + gef, radare2/rizin, `qemu-user-static`,
+  binwalk/unblob, squashfs-tools, UPX, YARA, `capa`, cross toolchains for ARM/MIPS, and the
+  homebrew assemblers (cc65 for NES, RGBDS for Game Boy). Ghidra (headless, ~1 GB with its
+  JDK) is optional: only the decompilation module needs it, so it could live in its own
+  image pulled on first use.
+- **Start with** *Binary basics* and *Firmware analysis* — they need nothing heavier than
+  the Docker VM and teach the triage every later module builds on.
 
 ## Programming
 
