@@ -99,7 +99,7 @@ shows the plan.
 ## Download
 
 You can skip building: the [latest release](https://github.com/kpatr1981/awesome_labs/releases/latest)
-(v0.20.0) has static binaries for Linux and macOS on x86-64 and ARM. On Linux x86-64:
+(v0.21.0) has static binaries for Linux and macOS on x86-64 and ARM. On Linux x86-64:
 
 ```bash
 curl -fLo awesome_labs https://github.com/kpatr1981/awesome_labs/releases/latest/download/awesome_labs-linux-amd64
