@@ -1604,3 +1604,409 @@ exercises:
     sudo chown -R 200000:200000 /srv/kl-ns-data
     sudo bash -c 'runc run -d kl-ns > /srv/kl-ns.log 2>&1 < /dev/null'
     sleep 3
+
+# ===== Capstone: a real-world lab =====
+
+- id: linux-101
+  title: "Capstone: run the metering agent without Docker"
+  difficulty: 5
+  kind: build
+  tags: [capstone, image-layers, whiteouts, oci, runc, config.json, capabilities, ambient, cgroups, namespaces, systemd, signals]
+  tutorial: |
+    **Concept.** Take Docker away and a container is still the same few things: a root filesystem built from the image's layers, a process with an identity and a set of capabilities, some namespaces, some cgroup limits, and something that starts it at boot and stops it cleanly. Each one is a skill from this module; here you put them together by hand.
+
+    - **Layers without overlayfs.** A runtime that can't stack layers (a "vfs" storage driver, `umoci unpack`) *flattens* them: it extracts each layer over the previous ones, in order. The deletion markers then become operations: **`.wh.NAME`** means "remove `NAME` (file or whole directory) from what's there so far", and **`.wh..wh..opq`** means "empty this directory of everything the lower layers put in it" before this layer's own files go in. The markers themselves must never land in the result. Ownership in the image is numeric: extract as root with `--numeric-owner`.
+    - **The process in `config.json`.** `process.args`, `cwd`, `user`, `hostname`, `root.readonly`, extra `mounts`; leave the `network` namespace out to share the host's.
+    - **Capabilities for a non-root process.** The OCI config has five sets. For a process running as a normal uid to *use* a capability after `execve`, it has to be **ambient**, and the kernel only allows an ambient capability that is also **permitted and inheritable**. `bounding` caps everything else.
+    - **Limits.** `linux.resources.memory.limit` (bytes), `pids.limit`, and `cpu.quota`/`cpu.period` (microseconds), which runc writes to the container's cgroup as `memory.max`, `pids.max` and `cpu.max`.
+    - **Supervision.** `runc run ID` (without `-d`) stays in the foreground for as long as the container runs, forwards the signals it receives to the container's process, and removes the container when it exits. That is exactly what a systemd service wants as its main process: `systemctl stop` sends `SIGTERM`, the app handles it, and runc exits with the app's status.
+
+    **Read up on:**
+    - The OCI image spec, "Applying Changesets" and "Whiteouts"; `tar -t`, `tar --exclude`, `tar --numeric-owner`
+    - The OCI runtime spec, `config.md` (`process.capabilities`) and `config-linux.md` (`resources`)
+    - `man 7 capabilities`: "Ambient capability set", and the rule that ambient ⊆ permitted ∩ inheritable
+    - `runc spec`, `runc run`, `runc state`, `runc list`, `runc delete`
+    - `/proc/PID/status` (`Cap*`, `NoNewPrivs`), `/proc/PID/cgroup`, `/proc/PID/ns/*`
+    - `man systemd.service`: `ExecStart=`, `ExecStopPost=`; what `systemctl stop` sends
+  scenario: |
+    **Ticket EDGE-31** — from Priyanka, edge platform:
+
+    > Docker is coming off the edge gateways: no room for it, and their kernel has no
+    > overlayfs. The **metering agent** has to run with plain **runc**, started by systemd.
+    > The image was exported for you to **`/srv/kl-meter/image`**: `layer-1.tar`,
+    > `layer-2.tar`, `layer-3.tar`, applied in that order, and `NOTES.md` on what each one
+    > changed. Release 2 is the only one we ship: if anything of release 1's config is
+    > left, the agent refuses to start.
+
+    The agent is **`python3 /app/meter.py`**. It serves its status on **`127.0.0.1`**, on
+    the port its config (in the image) gives, and appends readings to
+    **`/spool/readings.log`**. On `SIGTERM` it writes `stopped cleanly` there and exits.
+
+    Requirements:
+
+    1. **The root filesystem**: a plain directory, **`/srv/kl-meter/bundle/rootfs`** (not a
+       mount), with the three layers applied in order and every deletion in them carried
+       out. No `.wh.` file may be left in it, and ownership from the image is kept
+       (`/home/meter` belongs to uid 1000).
+    2. **The process**: the bundle's **`config.json`** runs `python3 /app/meter.py` in
+       `/app`, as **uid 1000, gid 1000**, with hostname **`kl-meter`**, as the container
+       **`kl-meter`**.
+    3. **Capabilities**: it holds **only `CAP_NET_BIND_SERVICE`**, in its effective,
+       permitted, bounding and ambient sets, it can't gain privileges, and it uses the
+       **host's network**, so the status is reachable from the host. It has its own PID,
+       mount, IPC and UTS namespaces.
+    4. **The filesystem**: the root filesystem is **read-only**, `/tmp` is a writable
+       **tmpfs**, and the host directory **`/srv/kl-meter/spool`** is mounted read-write at
+       **`/spool`**. The agent must be able to write there, without the directory being
+       writable by others.
+    5. **Limits**: memory **96 MiB**, at most **16** processes, and **half a CPU**
+       (`50000` µs every `100000`).
+    6. **The service**: **`kl-meter.service`** runs the container with runc in the
+       foreground (runc is its main process), is **enabled** and **active**. The check
+       stops it: it must stop within a few seconds, with `stopped cleanly` written, and leave
+       no container behind; then it starts it again.
+  hints:
+    - "`tar -tvf /srv/kl-meter/image/layer-3.tar` and `NOTES.md` first. Then, for each layer in order: carry out its deletions on the rootfs (a `.wh.NAME` removes `NAME` with `rm -rf`, a `.wh..wh..opq` empties its directory), then extract it with `tar -x --numeric-owner --exclude='.wh.*'`. As root."
+    - "`cd /srv/kl-meter/bundle && sudo runc spec` gives you the template; change it with one `jq` program, as in the runc exercise: `terminal`, `args`, `cwd`, `user`, `noNewPrivileges`, `hostname`, `root.readonly`, `mounts`, `namespaces`, `resources`."
+    - "Try the container in the foreground first: `sudo runc run kl-meter` from the bundle shows the agent's errors directly. It asks the image's config for its port."
+    - "`can't raise ambient capability ... operation not permitted`: an ambient capability must also be permitted *and* inheritable. Put `CAP_NET_BIND_SERVICE` in all five sets of `process.capabilities`."
+    - "`/srv/kl-meter/spool` belongs to root. The agent is uid 1000 on the host too (there's no user namespace): `chown 1000:1000` it."
+    - "The unit: `ExecStart=/usr/bin/runc run --bundle /srv/kl-meter/bundle kl-meter`, plus `ExecStopPost=-/usr/bin/runc delete -f kl-meter` in case it dies badly, and an `[Install]` section. Read back the limits with `cat /sys/fs/cgroup$(cut -d: -f3 /proc/PID/cgroup)/memory.max`."
+  solution: |
+    ### 1. Flatten the layers
+
+    `NOTES.md` says layer 3 deletes `/app/build-token` and `/app/old-ui`, and replaces
+    `/app/conf.d` (an opaque marker). Deletions apply to what the earlier layers left, so
+    carry them out before extracting the layer:
+
+    ```bash
+    sudo bash <<'EOF'
+    set -e
+    R=/srv/kl-meter/bundle/rootfs
+    mkdir -p "$R"
+    for n in 1 2 3; do
+      L=/srv/kl-meter/image/layer-$n.tar
+      tar -tf "$L" | while IFS= read -r p; do
+        p=${p#./}; p=${p%/}; d=$(dirname "$p"); b=$(basename "$p")
+        case $b in
+          .wh..wh..opq) find "$R/$d" -mindepth 1 -maxdepth 1 -exec rm -rf {} + ;;
+          .wh.*)        rm -rf "${R:?}/$d/${b#.wh.}" ;;
+        esac
+      done
+      tar -x --numeric-owner --exclude='.wh.*' -f "$L" -C "$R"
+    done
+    EOF
+    ls /srv/kl-meter/bundle/rootfs/app /srv/kl-meter/bundle/rootfs/app/conf.d
+    ```
+
+    ### 2-5. The config
+
+    ```bash
+    cd /srv/kl-meter/bundle
+    sudo runc spec
+    c='["CAP_NET_BIND_SERVICE"]'
+    sudo jq --argjson c "$c" '
+      .process.terminal = false
+      | .process.args = ["python3", "/app/meter.py"]
+      | .process.cwd = "/app"
+      | .process.user = {"uid": 1000, "gid": 1000}
+      | .process.noNewPrivileges = true
+      | .process.capabilities = {"bounding": $c, "effective": $c, "permitted": $c, "inheritable": $c, "ambient": $c}
+      | .hostname = "kl-meter"
+      | .root.readonly = true
+      | .mounts += [
+          {"destination": "/tmp", "type": "tmpfs", "source": "tmpfs", "options": ["nosuid", "nodev", "mode=1777"]},
+          {"destination": "/spool", "type": "bind", "source": "/srv/kl-meter/spool", "options": ["rbind", "rw"]}
+        ]
+      | .linux.namespaces |= map(select(.type != "network"))
+      | .linux.resources.memory = {"limit": 100663296}
+      | .linux.resources.pids = {"limit": 16}
+      | .linux.resources.cpu = {"quota": 50000, "period": 100000}
+    ' config.json | sudo tee config.new >/dev/null && sudo mv config.new config.json
+    sudo chown 1000:1000 /srv/kl-meter/spool
+    sudo chmod 750 /srv/kl-meter/spool
+    ```
+
+    The image's config asks for port 99, which is why the agent needs
+    `CAP_NET_BIND_SERVICE` at all, and why it has to be ambient: the process runs as uid
+    1000, and a normal user's capabilities are dropped across `execve` unless they're
+    ambient.
+
+    ### 6. The service
+
+    ```bash
+    sudo tee /etc/systemd/system/kl-meter.service >/dev/null <<'EOF'
+    [Unit]
+    Description=Metering agent (runc)
+
+    [Service]
+    ExecStart=/usr/bin/runc run --bundle /srv/kl-meter/bundle kl-meter
+    ExecStopPost=-/usr/bin/runc delete -f kl-meter
+
+    [Install]
+    WantedBy=multi-user.target
+    EOF
+    sudo systemctl daemon-reload
+    sudo systemctl enable --now kl-meter
+    curl -s 127.0.0.1:99
+    sudo grep Cap /proc/$(sudo runc state kl-meter | jq .pid)/status
+    ```
+  setup: |
+    on_reset 'systemctl disable --now kl-meter 2>/dev/null; runc delete -f kl-meter >/dev/null 2>&1; rm -rf /etc/systemd/system/kl-meter.service /etc/systemd/system/kl-meter.service.d; systemctl daemon-reload; systemctl reset-failed 2>/dev/null; rm -rf /srv/kl-meter; true'
+    # privileged ports must really need the capability
+    on_reset "sysctl -qw net.ipv4.ip_unprivileged_port_start=$(sysctl -n net.ipv4.ip_unprivileged_port_start)"
+    sysctl -qw net.ipv4.ip_unprivileged_port_start=1024
+    runc delete -f kl-meter >/dev/null 2>&1
+    I=/srv/kl-meter/image
+    mkdir -p "$I" /srv/kl-meter/bundle /srv/kl-meter/spool
+    chmod 755 /srv/kl-meter/spool
+    W=$(mktemp -d)
+
+    # layer 1: the base image
+    docker rm -f kl-metersrc >/dev/null 2>&1
+    docker create --name kl-metersrc python:3.12-alpine >/dev/null
+    docker export kl-metersrc > "$I/layer-1.tar"
+    docker rm -f kl-metersrc >/dev/null
+
+    # layer 2: release 1 of the agent, its user, a build token and an old UI
+    mkdir -p $W/2/app/conf.d $W/2/app/old-ui $W/2/etc $W/2/home/meter
+    tar -xOf "$I/layer-1.tar" etc/passwd > $W/2/etc/passwd
+    tar -xOf "$I/layer-1.tar" etc/group > $W/2/etc/group
+    echo 'meter:x:1000:1000:meter:/home/meter:/sbin/nologin' >> $W/2/etc/passwd
+    echo 'meter:x:1000:' >> $W/2/etc/group
+    cat > $W/2/app/meter.py <<'EOF'
+    import http.server, json, os, signal, socket, sys, threading, time
+
+    SPOOL = "/spool/readings.log"
+    CONF = "/app/conf.d"
+
+    def log(msg):
+        with open(SPOOL, "a") as f:
+            f.write("%d %s\n" % (time.time(), msg))
+
+    if os.path.exists(os.path.join(CONF, "legacy.conf")):
+        sys.exit("meter: %s/legacy.conf is release 1 configuration, refusing to start" % CONF)
+    cfg = {}
+    for n in sorted(os.listdir(CONF)):
+        for line in open(os.path.join(CONF, n)):
+            if "=" in line:
+                k, v = line.strip().split("=", 1)
+                cfg[k] = v
+    port = int(cfg["port"])
+
+    def can_write(path):
+        try:
+            with open(path, "w") as f:
+                f.write("x")
+            os.unlink(path)
+            return True
+        except OSError:
+            return False
+
+    def fstype(path):
+        t = "none"
+        for line in open("/proc/mounts"):
+            p = line.split()
+            if p[1] == path:
+                t = p[2]
+        return t
+
+    class H(http.server.BaseHTTPRequestHandler):
+        def do_GET(self):
+            info = {
+                "site": cfg.get("site"), "version": open("/app/VERSION").read().strip(),
+                "hostname": socket.gethostname(), "cwd": os.getcwd(),
+                "root_writable": can_write("/kl-probe"),
+                "tmp_writable": can_write("/tmp/kl-probe"), "tmp_fs": fstype("/tmp"),
+            }
+            body = json.dumps(info).encode()
+            self.send_response(200)
+            self.end_headers()
+            self.wfile.write(body)
+
+        def log_message(self, *a):
+            pass
+
+    def stop(sig, frame):
+        log("stopped cleanly")
+        sys.exit(0)
+
+    def readings():
+        n = 0
+        while True:
+            n += 1
+            log("reading %d" % n)
+            time.sleep(1)
+
+    signal.signal(signal.SIGTERM, stop)
+    srv = http.server.HTTPServer(("127.0.0.1", port), H)
+    log("started, site %s, port %d" % (cfg.get("site"), port))
+    threading.Thread(target=readings, daemon=True).start()
+    srv.serve_forever()
+    EOF
+    echo "1.0" > $W/2/app/VERSION
+    printf 'site=dc1-test\n' > $W/2/app/conf.d/site.conf
+    printf 'port=8099\n' > $W/2/app/conf.d/port.conf
+    printf 'legacy_collector=on\n' > $W/2/app/conf.d/legacy.conf
+    echo "build-$(head -c8 /dev/urandom | od -An -tx1 | tr -d ' \n')" > $W/2/app/build-token
+    echo '<h1>meter 1.0</h1>' > $W/2/app/old-ui/index.html
+    chown -R 0:0 $W/2
+    chown 1000:1000 $W/2/home/meter
+    chmod 755 $W/2/home/meter
+    tar -C $W/2 --numeric-owner -cf "$I/layer-2.tar" app etc home
+
+    # layer 3: release 2
+    site="edge-$(head -c3 /dev/urandom | od -An -tx1 | tr -d ' \n')"
+    echo "$site" > "$KL_STATE/site"
+    mkdir -p $W/3/app/conf.d
+    : > $W/3/app/.wh.build-token
+    : > $W/3/app/.wh.old-ui
+    : > $W/3/app/conf.d/.wh..wh..opq
+    printf 'site=%s\n' "$site" > $W/3/app/conf.d/site.conf
+    printf 'port=99\n' > $W/3/app/conf.d/port.conf
+    echo "2.0" > $W/3/app/VERSION
+    chown -R 0:0 $W/3
+    tar -C $W/3 --numeric-owner -cf "$I/layer-3.tar" app
+    rm -rf "$W"
+
+    cat > "$I/NOTES.md" <<'EOF'
+    # metering agent image
+
+    - layer-1.tar: python:3.12-alpine
+    - layer-2.tar: release 1.0: the agent in /app, its config in /app/conf.d,
+      the user meter (uid 1000) and its home /home/meter, the old web UI in /app/old-ui
+    - layer-3.tar: release 2.0
+      - removes /app/build-token (it should never have shipped)
+      - removes the whole /app/old-ui directory
+      - replaces /app/conf.d entirely with the 2.0 configuration
+      - updates /app/VERSION
+    EOF
+    chmod -R a+rX "$I"
+  check: |
+    R=/srv/kl-meter/bundle/rootfs
+    site=$(cat "$KL_STATE/site")
+    st=$(runc state kl-meter 2>/dev/null)
+    pid=$(jq -r '.pid // empty' <<<"$st" 2>/dev/null)
+    [ "$pid" = 0 ] && pid=
+    j=$(curl -s -m 5 127.0.0.1:99 2>/dev/null)
+    f() { jq -r ".$1" <<<"$j" 2>/dev/null; }
+    s() { awk -v k="$1:" '$1 == k {print $2}' "/proc/${pid:-0}/status" 2>/dev/null; }
+
+    info "1. The root filesystem"
+    check "it holds the base image and the agent" '[ -x "$R/usr/local/bin/python3" ] && [ -f "$R/app/meter.py" ]'
+    check "it is a plain directory, not a mount" '[ -d "$R/app" ] && ! mountpoint -q "$R"'
+    check "no .wh. file is left in it" '[ -d "$R/app" ] && [ -z "$(find "$R" -xdev -name ".wh.*" 2>/dev/null)" ]'
+    check "the build token and the old UI are gone" '[ -d "$R/app" ] && [ ! -e "$R/app/build-token" ] && [ ! -e "$R/app/old-ui" ]'
+    check_eq "/app/conf.d holds only release 2's config" "$(ls "$R/app/conf.d" 2>/dev/null | tr '\n' ' ')" "port.conf site.conf "
+    check_eq "/app/VERSION is 2.0" "$(cat "$R/app/VERSION" 2>/dev/null)" 2.0
+    check_eq "/home/meter belongs to uid 1000, /app/meter.py to root" "$(stat -c %u:%g "$R/home/meter" "$R/app/meter.py" 2>/dev/null | tr '\n' ' ')" "1000:1000 0:0 "
+
+    info "2. The process"
+    check "kl-meter is running under runc" 'jq -e ".status == \"running\"" <<<"$st"'
+    check_eq "from the bundle /srv/kl-meter/bundle" "$(jq -r .bundle <<<"$st" 2>/dev/null)" /srv/kl-meter/bundle
+    check_eq "it runs python3 /app/meter.py" "$(tr '\0' ' ' < "/proc/${pid:-0}/cmdline" 2>/dev/null)" "python3 /app/meter.py "
+    check_eq "in /app" "$(f cwd)" /app
+    check_eq "as uid 1000" "$(s Uid)" 1000
+    check_eq "and gid 1000" "$(s Gid)" 1000
+    check_eq "with hostname kl-meter" "$(f hostname)" kl-meter
+    check_eq "and the release 2 config" "$(f site) $(f version)" "$site 2.0"
+
+    info "3. Capabilities"
+    for set in CapEff CapPrm CapBnd CapAmb; do
+      check_eq "$set is only CAP_NET_BIND_SERVICE" "$(s $set)" 0000000000000400
+    done
+    check_eq "it can't gain privileges" "$(s NoNewPrivs)" 1
+    check "it answers on 127.0.0.1:99 from the host" '[ -n "$j" ] && jq -e . <<<"$j"'
+    check "it uses the host's network namespace" '[ -n "$pid" ] && [ "$(readlink /proc/$pid/ns/net)" = "$(readlink /proc/1/ns/net)" ]'
+    for ns in pid mnt ipc uts; do
+      check "it has its own $ns namespace" '[ -n "$pid" ] && [ "$(readlink /proc/$pid/ns/$ns)" != "$(readlink /proc/1/ns/$ns)" ]'
+    done
+
+    info "4. The filesystem"
+    check_eq "the root filesystem is read-only" "$(f root_writable)" false
+    check_eq "/tmp is a writable tmpfs" "$(f tmp_writable) $(f tmp_fs)" "true tmpfs"
+    n0=$(grep -c reading /srv/kl-meter/spool/readings.log 2>/dev/null); sleep 3
+    n1=$(grep -c reading /srv/kl-meter/spool/readings.log 2>/dev/null)
+    check "the agent keeps writing /srv/kl-meter/spool/readings.log" '[ -n "$pid" ] && [ "${n1:-0}" -gt "${n0:-0}" ] && [ "$(stat -c %u /srv/kl-meter/spool/readings.log)" = 1000 ]'
+    check_not "the spool directory isn't writable by others" '[ -n "$(find /srv/kl-meter/spool -maxdepth 0 -perm -o+w)" ]'
+
+    info "5. Limits"
+    C=/sys/fs/cgroup$(awk -F: '$1 == "0" {print $3}' "/proc/${pid:-0}/cgroup" 2>/dev/null)
+    [ -n "$pid" ] || C=/nonexistent
+    check_eq "memory.max is 96 MiB" "$(cat "$C/memory.max" 2>/dev/null)" 100663296
+    check_eq "pids.max is 16" "$(cat "$C/pids.max" 2>/dev/null)" 16
+    check_eq "cpu.max is half a CPU" "$(cat "$C/cpu.max" 2>/dev/null)" "50000 100000"
+
+    info "6. The service"
+    mp=$(systemctl show -p MainPID --value kl-meter 2>/dev/null)
+    check_eq "kl-meter.service is enabled" "$(systemctl is-enabled kl-meter 2>/dev/null)" enabled
+    check "it is active, with runc as its main process, running kl-meter" 'systemctl is-active -q kl-meter && [ "$(ps -o comm= -p "${mp:-0}")" = runc ] && [ -n "$pid" ] && [ "$(ps -o ppid= -p "$pid" | tr -d " ")" = "$mp" ]'
+    if systemctl is-active -q kl-meter && [ -n "$pid" ]; then
+      t0=$SECONDS; timeout 30 systemctl stop kl-meter >/dev/null 2>&1; dt=$((SECONDS - t0))
+      check "systemctl stop finishes within 5 seconds (${dt}s)" '[ "$dt" -le 5 ]'
+      check "the agent wrote 'stopped cleanly'" 'tail -n 3 /srv/kl-meter/spool/readings.log | grep -q "stopped cleanly"'
+      check_not "no kl-meter container is left behind" 'runc state kl-meter'
+      systemctl start kl-meter >/dev/null 2>&1
+      check "it starts again" 'eventually 15 "curl -s -m 3 127.0.0.1:99 | jq -e .site"'
+    else
+      fail "systemctl stop finishes within 5 seconds, cleanly, and it starts again (kl-meter.service isn't running the container)"
+    fi
+  solve: |
+    # 1. flatten the layers, carrying out each layer's deletions before extracting it
+    sudo bash <<'EOF'
+    set -e
+    R=/srv/kl-meter/bundle/rootfs
+    mkdir -p "$R"
+    for n in 1 2 3; do
+      L=/srv/kl-meter/image/layer-$n.tar
+      tar -tf "$L" | while IFS= read -r p; do
+        p=${p#./}; p=${p%/}; d=$(dirname "$p"); b=$(basename "$p")
+        case $b in
+          .wh..wh..opq) find "$R/$d" -mindepth 1 -maxdepth 1 -exec rm -rf {} + ;;
+          .wh.*)        rm -rf "${R:?}/$d/${b#.wh.}" ;;
+        esac
+      done
+      tar -x --numeric-owner --exclude='.wh.*' -f "$L" -C "$R"
+    done
+    EOF
+
+    # 2-5. the config
+    cd /srv/kl-meter/bundle
+    sudo runc spec
+    c='["CAP_NET_BIND_SERVICE"]'
+    sudo jq --argjson c "$c" '
+      .process.terminal = false
+      | .process.args = ["python3", "/app/meter.py"]
+      | .process.cwd = "/app"
+      | .process.user = {"uid": 1000, "gid": 1000}
+      | .process.noNewPrivileges = true
+      | .process.capabilities = {"bounding": $c, "effective": $c, "permitted": $c, "inheritable": $c, "ambient": $c}
+      | .hostname = "kl-meter"
+      | .root.readonly = true
+      | .mounts += [
+          {"destination": "/tmp", "type": "tmpfs", "source": "tmpfs", "options": ["nosuid", "nodev", "mode=1777"]},
+          {"destination": "/spool", "type": "bind", "source": "/srv/kl-meter/spool", "options": ["rbind", "rw"]}
+        ]
+      | .linux.namespaces |= map(select(.type != "network"))
+      | .linux.resources.memory = {"limit": 100663296}
+      | .linux.resources.pids = {"limit": 16}
+      | .linux.resources.cpu = {"quota": 50000, "period": 100000}
+    ' config.json | sudo tee config.new >/dev/null && sudo mv config.new config.json
+    sudo chown 1000:1000 /srv/kl-meter/spool
+    sudo chmod 750 /srv/kl-meter/spool
+
+    # 6. the service
+    sudo tee /etc/systemd/system/kl-meter.service >/dev/null <<'EOF'
+    [Unit]
+    Description=Metering agent (runc)
+
+    [Service]
+    ExecStart=/usr/bin/runc run --bundle /srv/kl-meter/bundle kl-meter
+    ExecStopPost=-/usr/bin/runc delete -f kl-meter
+
+    [Install]
+    WantedBy=multi-user.target
+    EOF
+    sudo systemctl daemon-reload
+    sudo systemctl enable --now kl-meter
+    for i in $(seq 20); do curl -s -m 2 127.0.0.1:99 >/dev/null && break; sleep 0.5; done

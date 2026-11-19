@@ -555,3 +555,408 @@ exercises:
     L=$(aws elbv2 describe-listeners --load-balancer-arn "$LB" --query 'Listeners[0].ListenerArn' --output text)
     API=$(aws elbv2 describe-target-groups --names api-tg --query 'TargetGroups[0].TargetGroupArn' --output text)
     aws elbv2 create-rule --listener-arn "$L" --priority 10 --conditions Field=path-pattern,Values='/api/*' --actions Type=forward,TargetGroupArn="$API" >/dev/null
+
+# ===== Capstone: a real-world lab =====
+
+- id: cloud-090
+  title: "Capstone: cut billing over to its new zone"
+  difficulty: 5
+  kind: build
+  tags: [aws, capstone, ec2, ebs, snapshot, vpc, nat-gateway, vpc-endpoint, security-group, launch-template, elbv2, alb, elastic-ip, route53, weighted-routing]
+  tutorial: |
+    **Concept.** Moving a service between availability zones touches
+    every layer of the compute stack, and each layer has its own rule
+    about what can move and what has to be rebuilt:
+
+    - **disks.** An EBS volume lives in one zone and can only be attached
+      to an instance in that zone. To move data across zones you take a
+      **snapshot** (it is regional) and create a new volume from it in the
+      target zone, at least as large as the snapshot. The old volume stays
+      as the rollback.
+    - **egress.** A private subnet reaches the internet through a **NAT
+      gateway in a public subnet**, ideally in the same zone so that zone's
+      traffic doesn't depend on another zone. A **gateway endpoint** for
+      S3 adds a route to chosen route tables, so S3 traffic skips the NAT.
+    - **firewalls.** A security group is referenced by ID from instances
+      and other groups, so you fix its rules in place: revoke what is
+      wrong, authorize what is right. A rule can name another group as its
+      source instead of an address range.
+    - **launch templates.** Templates are versioned: a change is a **new
+      version**, and the **default version** is what launches use unless
+      told otherwise. Old versions stay, which makes a rollback one call.
+    - **load balancers.** A target group only routes to targets that are
+      registered and pass its health check, which can probe the
+      **traffic port** (the port each target was registered on) or a
+      fixed one. Listener rules are checked by priority before the default
+      action.
+    - **addresses and DNS.** An Elastic IP stays with the account. Route 53
+      can hold several **weighted** records of one name and type, each
+      with a `SetIdentifier`, but a plain record of that name and type
+      cannot live beside them: the switch is a `DELETE` of the plain record
+      (with its exact values) and the `CREATE`s, in **one** change batch,
+      which is applied atomically.
+
+    **Read up on:**
+    - `aws ec2 create-snapshot`, `create-volume --snapshot-id --availability-zone`, `attach-volume`, `aws ec2 wait`
+    - `aws ec2 create-nat-gateway`, `create-route --nat-gateway-id`, `create-vpc-endpoint --vpc-endpoint-type Gateway`
+    - `aws ec2 revoke-security-group-ingress`, `authorize-security-group-ingress --source-group`
+    - `aws ec2 create-launch-template-version`, `modify-launch-template --default-version`, `describe-launch-template-versions`
+    - `aws elbv2 modify-target-group`, `register-targets`, `describe-target-health`, `create-rule`
+    - `aws ec2 allocate-address`, `associate-address`, `aws route53 change-resource-record-sets` (`DELETE`, `CREATE`, weighted records)
+  scenario: |
+    The `aws` command talks to a local emulator. It runs in `/lab` and can
+    only see files under `/lab`, so give it absolute paths such as
+    `/lab/billing/...`.
+
+    **Ticket INFRA-731**, from Tomasz (SRE lead, payments): *"Billing is
+    leaving its single box in us-east-1a for the new layout in
+    us-east-1b. The previous on-call built half of it before being paged
+    away; the numbers we agreed on are in `/lab/billing/handover.txt`.
+    Please finish the cutover. Look everything up by its `Name` (or
+    `Role`) tag."*
+
+    1. **The database disk.** **`billing-db-2`** (us-east-1b) replaces
+       **`billing-db-1`** (us-east-1a). Move the data volume
+       **`billing-db-data`** with it: take a snapshot with the description
+       **`INFRA-731 pre-move`**, create from it a volume tagged
+       **`Name=billing-db-data-v2`** in `billing-db-2`'s zone with the size
+       from the handover notes, and attach it to `billing-db-2` as
+       **`/dev/sdf`**. Leave the old volume attached to `billing-db-1` for
+       a rollback.
+    2. **Private egress.** Servers in **`billing-private-b`** must reach the
+       internet through a NAT gateway in the public subnet of **their own
+       zone**, **`billing-public-b`**: the route table
+       **`billing-private-rt`** sends `0.0.0.0/0` to it. Their S3 traffic
+       must not go through the NAT: add a **gateway** endpoint for S3
+       (us-east-1) in **`billing-vpc`**, on `billing-private-rt` only.
+    3. **Database firewall.** **`billing-db-sg`** was opened up while
+       debugging. Afterwards it allows exactly **TCP 5432** from the group
+       **`billing-app-sg`** (as the source group) and nothing else. Keep the
+       group itself: `billing-db-2` uses it.
+    4. **Launch template.** Add a version to **`billing-api-lt`** with
+       instance type **`t3.medium`**, the **same image as version 1**, and
+       **`/lab/billing/userdata.sh`** as its user data, and make it the
+       default. Version 1 stays as it is. Give the new version its complete
+       data: the emulator doesn't copy fields from a source version.
+    5. **Load balancer.** Fix the health check of **`billing-api-tg`** to
+       the path in the handover notes, probed on the **traffic port**.
+       Register every **running** instance tagged **`Role=billing-api`** on
+       port **8080**, and nothing else. Then add a rule with priority
+       **10** to the HTTP listener of **`billing-alb`** that forwards
+       **`/billing/*`** to `billing-api-tg`; everything else keeps going to
+       `billing-web-tg`.
+    6. **Edge address and DNS.** Give **`billing-edge`** an Elastic IP and
+       write the bare address to **`/lab/billing/edge-ip.txt`**. In the
+       zone **`shop.example`**, **`pay.shop.example`** is a plain A record
+       to the old server. Replace it with two **weighted** A records, TTL
+       **60**: **`blue`**, weight **80**, to the old server's address, and
+       **`green`**, weight **20**, to the Elastic IP. No plain record may
+       be left.
+  hints:
+    - "Step 1: `describe-instances --filters Name=tag:Name,Values=billing-db-2 --query 'Reservations[0].Instances[0].[InstanceId,Placement.AvailabilityZone]'` gives the ID and zone. `aws ec2 wait snapshot-completed` and `wait volume-available` before the next step."
+    - "Step 2: the NAT gateway needs an allocation from `allocate-address --domain vpc` and goes in `billing-public-b`. The endpoint's service name is `com.amazonaws.us-east-1.s3`."
+    - "Step 3: `describe-security-groups --group-ids` shows what is there. Revoke each wrong rule with the same protocol, port and `--cidr`, then authorize 5432 with `--source-group`."
+    - "Step 4: read version 1's `ImageId` with `describe-launch-template-versions --versions 1`, build the data with `jq -nc --arg` and `base64 -w0 userdata.sh`, then `create-launch-template-version` and `modify-launch-template --default-version N`."
+    - "Step 5: `modify-target-group --health-check-path P --health-check-port traffic-port`; `register-targets --targets Id=i-...,Port=8080 Id=...`. The stopped `billing-api` instance stays out."
+    - "Step 6: write one change batch with a `DELETE` of the plain record (TTL and value exactly as listed) followed by two `CREATE`s with `SetIdentifier` and `Weight`, and apply it once."
+  solution: |
+    ```bash
+    cd /lab/billing
+    iid() { aws ec2 describe-instances --filters "Name=tag:$1,Values=$2" Name=instance-state-name,Values=running \
+      --query 'Reservations[].Instances[].InstanceId' --output text; }
+    sg() { aws ec2 describe-security-groups --filters "Name=group-name,Values=$1" --query 'SecurityGroups[0].GroupId' --output text; }
+    VPC=$(aws ec2 describe-vpcs --filters Name=tag:Name,Values=billing-vpc --query 'Vpcs[0].VpcId' --output text)
+
+    # 1. a volume can't change zone: snapshot, then a new volume in the new zone
+    OLD=$(aws ec2 describe-volumes --filters Name=tag:Name,Values=billing-db-data --query 'Volumes[0].VolumeId' --output text)
+    read DB2 AZ < <(aws ec2 describe-instances --filters Name=tag:Name,Values=billing-db-2 \
+      --query 'Reservations[0].Instances[0].[InstanceId,Placement.AvailabilityZone]' --output text)
+    SIZE=$(sed -n 's/.*billing-db-data-v2: \([0-9]*\) GiB.*/\1/p' handover.txt)
+    SNAP=$(aws ec2 create-snapshot --volume-id "$OLD" --description 'INFRA-731 pre-move' --query SnapshotId --output text)
+    aws ec2 wait snapshot-completed --snapshot-ids "$SNAP"
+    V2=$(aws ec2 create-volume --snapshot-id "$SNAP" --availability-zone "$AZ" --size "$SIZE" \
+      --tag-specifications 'ResourceType=volume,Tags=[{Key=Name,Value=billing-db-data-v2}]' --query VolumeId --output text)
+    aws ec2 wait volume-available --volume-ids "$V2"
+    aws ec2 attach-volume --volume-id "$V2" --instance-id "$DB2" --device /dev/sdf
+
+    # 2. NAT in the same zone's public subnet, S3 through a gateway endpoint
+    PUB=$(aws ec2 describe-subnets --filters Name=tag:Name,Values=billing-public-b --query 'Subnets[0].SubnetId' --output text)
+    RT=$(aws ec2 describe-route-tables --filters Name=tag:Name,Values=billing-private-rt --query 'RouteTables[0].RouteTableId' --output text)
+    NAT=$(aws ec2 create-nat-gateway --subnet-id "$PUB" \
+      --allocation-id "$(aws ec2 allocate-address --domain vpc --query AllocationId --output text)" \
+      --query NatGateway.NatGatewayId --output text)
+    aws ec2 wait nat-gateway-available --nat-gateway-ids "$NAT"
+    aws ec2 create-route --route-table-id "$RT" --destination-cidr-block 0.0.0.0/0 --nat-gateway-id "$NAT"
+    aws ec2 create-vpc-endpoint --vpc-id "$VPC" --vpc-endpoint-type Gateway \
+      --service-name com.amazonaws.us-east-1.s3 --route-table-ids "$RT"
+
+    # 3. fix the group in place
+    DB=$(sg billing-db-sg); APP=$(sg billing-app-sg)
+    aws ec2 describe-security-groups --group-ids "$DB" --query 'SecurityGroups[0].IpPermissions'
+    aws ec2 revoke-security-group-ingress --group-id "$DB" --protocol tcp --port 5432 --cidr 0.0.0.0/0
+    aws ec2 revoke-security-group-ingress --group-id "$DB" --protocol tcp --port 22 --cidr 0.0.0.0/0
+    aws ec2 authorize-security-group-ingress --group-id "$DB" --protocol tcp --port 5432 --source-group "$APP"
+
+    # 4. a new default version of the launch template
+    AMI=$(aws ec2 describe-launch-template-versions --launch-template-name billing-api-lt --versions 1 \
+      --query 'LaunchTemplateVersions[0].LaunchTemplateData.ImageId' --output text)
+    DATA=$(jq -nc --arg a "$AMI" --arg u "$(base64 -w0 userdata.sh)" '{ImageId: $a, InstanceType: "t3.medium", UserData: $u}')
+    V=$(aws ec2 create-launch-template-version --launch-template-name billing-api-lt --source-version 1 \
+      --launch-template-data "$DATA" --query LaunchTemplateVersion.VersionNumber --output text)
+    aws ec2 modify-launch-template --launch-template-name billing-api-lt --default-version "$V"
+
+    # 5. health check, targets, and the path rule
+    TG=$(aws elbv2 describe-target-groups --names billing-api-tg --query 'TargetGroups[0].TargetGroupArn' --output text)
+    P=$(sed -n 's/.*Health endpoint: GET \([^ ]*\) .*/\1/p' handover.txt)
+    aws elbv2 modify-target-group --target-group-arn "$TG" --health-check-path "$P" --health-check-port traffic-port
+    aws elbv2 register-targets --target-group-arn "$TG" --targets $(for i in $(iid Role billing-api); do echo "Id=$i,Port=8080"; done)
+    LB=$(aws elbv2 describe-load-balancers --names billing-alb --query 'LoadBalancers[0].LoadBalancerArn' --output text)
+    L=$(aws elbv2 describe-listeners --load-balancer-arn "$LB" --query 'Listeners[?Port==`80`].ListenerArn | [0]' --output text)
+    aws elbv2 create-rule --listener-arn "$L" --priority 10 \
+      --conditions Field=path-pattern,Values='/billing/*' --actions Type=forward,TargetGroupArn="$TG"
+
+    # 6. the edge address, then one atomic DNS change
+    read AID IP < <(aws ec2 allocate-address --domain vpc --query '[AllocationId,PublicIp]' --output text)
+    aws ec2 associate-address --instance-id "$(iid Name billing-edge)" --allocation-id "$AID"
+    echo "$IP" > edge-ip.txt
+    ZID=$(aws route53 list-hosted-zones-by-name --dns-name shop.example --query 'HostedZones[0].Id' --output text)
+    aws route53 list-resource-record-sets --hosted-zone-id "$ZID" \
+      --query "ResourceRecordSets[?Name=='pay.shop.example.' && Type=='A']" --output json > current.json
+    jq --arg ip "$IP" '.[0] as $p | {Changes: [
+      {Action: "DELETE", ResourceRecordSet: $p},
+      {Action: "CREATE", ResourceRecordSet: {Name: "pay.shop.example", Type: "A", SetIdentifier: "blue", Weight: 80, TTL: 60, ResourceRecords: $p.ResourceRecords}},
+      {Action: "CREATE", ResourceRecordSet: {Name: "pay.shop.example", Type: "A", SetIdentifier: "green", Weight: 20, TTL: 60, ResourceRecords: [{Value: $ip}]}}]}' \
+      current.json > cutover.json
+    aws route53 change-resource-record-sets --hosted-zone-id "$ZID" --change-batch file:///lab/billing/cutover.json
+    ```
+
+    On real AWS, attaching `billing-db-data` itself to `billing-db-2` fails
+    because the zones differ (the emulator doesn't enforce that), and
+    `UPSERT`ing weighted records beside the plain one is refused; the
+    `DELETE` must name the plain record's exact TTL and values.
+  setup: |
+    moto_start
+    mkdir -p /lab/billing
+    ami=$(aws ec2 describe-images --query 'Images[0].ImageId' --output text)
+    echo "$ami" > "$KL_STATE/ami"
+    nt() { echo "ResourceType=$1,Tags=[{Key=Name,Value=$2}$3]"; }
+
+    # --- the network: two public subnets, one private, no egress yet ---
+    vpc=$(aws ec2 create-vpc --cidr-block 10.80.0.0/16 --tag-specifications "$(nt vpc billing-vpc)" --query Vpc.VpcId --output text)
+    subnet() { aws ec2 create-subnet --vpc-id "$vpc" --cidr-block "$1" --availability-zone "$2" \
+      --tag-specifications "$(nt subnet "$3")" --query Subnet.SubnetId --output text; }
+    pa=$(subnet 10.80.1.0/24 us-east-1a billing-public-a)
+    pb=$(subnet 10.80.2.0/24 us-east-1b billing-public-b)
+    vb=$(subnet 10.80.12.0/24 us-east-1b billing-private-b)
+    echo "$pb" > "$KL_STATE/pb"
+    igw=$(aws ec2 create-internet-gateway --query InternetGateway.InternetGatewayId --output text)
+    aws ec2 attach-internet-gateway --internet-gateway-id "$igw" --vpc-id "$vpc"
+    prt=$(aws ec2 create-route-table --vpc-id "$vpc" --tag-specifications "$(nt route-table billing-public-rt)" --query RouteTable.RouteTableId --output text)
+    aws ec2 create-route --route-table-id "$prt" --destination-cidr-block 0.0.0.0/0 --gateway-id "$igw" >/dev/null
+    aws ec2 associate-route-table --route-table-id "$prt" --subnet-id "$pa" >/dev/null
+    aws ec2 associate-route-table --route-table-id "$prt" --subnet-id "$pb" >/dev/null
+    vrt=$(aws ec2 create-route-table --vpc-id "$vpc" --tag-specifications "$(nt route-table billing-private-rt)" --query RouteTable.RouteTableId --output text)
+    aws ec2 associate-route-table --route-table-id "$vrt" --subnet-id "$vb" >/dev/null
+    echo "$vrt" > "$KL_STATE/rt"
+    echo "$vpc" > "$KL_STATE/vpc"
+
+    # --- security groups, the database one opened up while debugging ---
+    app=$(aws ec2 create-security-group --group-name billing-app-sg --description "billing api" --vpc-id "$vpc" --query GroupId --output text)
+    db=$(aws ec2 create-security-group --group-name billing-db-sg --description "billing database" --vpc-id "$vpc" --query GroupId --output text)
+    aws ec2 authorize-security-group-ingress --group-id "$db" --protocol tcp --port 5432 --cidr 0.0.0.0/0 >/dev/null
+    aws ec2 authorize-security-group-ingress --group-id "$db" --protocol tcp --port 22 --cidr 0.0.0.0/0 >/dev/null
+    echo "$app" > "$KL_STATE/app-sg"
+    echo "$db" > "$KL_STATE/db-sg"
+
+    # --- the fleet ---
+    run() { aws ec2 run-instances --image-id "$ami" --instance-type t3.micro --subnet-id "$1" --security-group-ids "$2" \
+      --tag-specifications "$(nt instance "$3" ",{Key=Role,Value=$4}")" --query 'Instances[0].InstanceId' --output text; }
+    db1=$(run "$pa" "$db" billing-db-1 billing-db)
+    db2=$(run "$vb" "$db" billing-db-2 billing-db)
+    a1=$(run "$vb" "$app" billing-api-1 billing-api)
+    old=$(run "$vb" "$app" billing-api-0 billing-api)
+    a2=$(run "$vb" "$app" billing-api-2 billing-api)
+    run "$vb" "$app" billing-worker-1 billing-worker >/dev/null
+    edge=$(run "$pb" "$app" billing-edge billing-edge)
+    aws ec2 stop-instances --instance-ids "$old" >/dev/null
+    printf '%s\n' "$db1" > "$KL_STATE/db1"
+    printf '%s\n' "$db2" > "$KL_STATE/db2"
+    printf '%s:8080\n' "$a1" "$a2" | sort | tr '\n' ' ' > "$KL_STATE/targets"
+    echo "$edge" > "$KL_STATE/edge"
+
+    # --- the database volume in the old zone ---
+    vol=$(aws ec2 create-volume --availability-zone us-east-1a --size 50 \
+      --tag-specifications "$(nt volume billing-db-data)" --query VolumeId --output text)
+    aws ec2 attach-volume --volume-id "$vol" --instance-id "$db1" --device /dev/sdf >/dev/null
+    echo "$vol" > "$KL_STATE/vol"
+
+    # --- the handover notes and the new boot script ---
+    sizes=(80 100 120)
+    size=${sizes[RANDOM % 3]}
+    paths=(/billing/healthz /billing/status /internal/health)
+    hp=${paths[RANDOM % 3]}
+    echo "$size" > "$KL_STATE/size"
+    echo "$hp" > "$KL_STATE/hpath"
+    lab_file /lab/billing/handover.txt <<EOF
+    INFRA-731 handover (on-call, 02:10)
+    - billing-db-data-v2: $size GiB (the old 50 GiB volume is nearly full).
+    - The API listens on 8080. Health endpoint: GET $hp on the traffic port, 200 = healthy.
+    - billing-api-0 is the retired instance, stopped, do not put it back in service.
+    - pay.shop.example: start the new edge on 20% of the traffic.
+    EOF
+    lab_file /lab/billing/userdata.sh <<EOF
+    #!/bin/bash
+    echo "billing-api release r$RANDOM$RANDOM" > /etc/billing-release
+    systemctl enable --now billing-api
+    EOF
+    cp /lab/billing/userdata.sh "$KL_STATE/userdata.sh"
+
+    # --- the launch template, version 1 ---
+    printf '#!/bin/bash\nsystemctl enable --now billing-api-legacy\n' > "$KL_STATE/userdata-v1.sh"
+    aws ec2 create-launch-template --launch-template-name billing-api-lt --launch-template-data \
+      "$(jq -nc --arg a "$ami" --arg u "$(base64 -w0 "$KL_STATE/userdata-v1.sh")" '{ImageId: $a, InstanceType: "t3.micro", UserData: $u}')" >/dev/null
+
+    # --- the load balancer ---
+    web=$(aws elbv2 create-target-group --name billing-web-tg --protocol HTTP --port 80 --vpc-id "$vpc" --query 'TargetGroups[0].TargetGroupArn' --output text)
+    aws elbv2 create-target-group --name billing-api-tg --protocol HTTP --port 8080 --vpc-id "$vpc" \
+      --health-check-path / --health-check-port 80 >/dev/null
+    lb=$(aws elbv2 create-load-balancer --name billing-alb --subnets "$pa" "$pb" --query 'LoadBalancers[0].LoadBalancerArn' --output text)
+    aws elbv2 create-listener --load-balancer-arn "$lb" --protocol HTTP --port 80 \
+      --default-actions Type=forward,TargetGroupArn="$web" >/dev/null
+    echo "$web" > "$KL_STATE/web-tg"
+
+    # --- DNS: a plain record to the old server ---
+    oldip=198.51.100.$((RANDOM % 200 + 20))
+    echo "$oldip" > "$KL_STATE/oldip"
+    zid=$(aws route53 create-hosted-zone --name shop.example --caller-reference "ref-$RANDOM" --query 'HostedZone.Id' --output text)
+    echo "{\"Changes\":[{\"Action\":\"CREATE\",\"ResourceRecordSet\":{\"Name\":\"pay.shop.example\",\"Type\":\"A\",\"TTL\":86400,\"ResourceRecords\":[{\"Value\":\"$oldip\"}]}}]}" > /lab/.dns.json
+    aws route53 change-resource-record-sets --hosted-zone-id "$zid" --change-batch file:///lab/.dns.json >/dev/null
+    rm -f /lab/.dns.json
+    chown -R "$(lab_user):" /lab/billing
+  check: |
+    st=$KL_STATE
+
+    info "1. The database disk"
+    vol=$(cat "$st/vol")
+    snap=$(aws ec2 describe-snapshots --query "Snapshots[?VolumeId=='$vol' && Description=='INFRA-731 pre-move'].SnapshotId | [0]" --output text 2>/dev/null)
+    check_match "a snapshot of billing-db-data described 'INFRA-731 pre-move' exists" "$snap" '^snap-'
+    v2=$(aws ec2 describe-volumes --filters Name=tag:Name,Values=billing-db-data-v2 --output json 2>/dev/null)
+    check_eq "billing-db-data-v2 is made from it, in us-east-1b, with the size from the notes" "$(jq -r '.Volumes[0] | "\(.SnapshotId) \(.AvailabilityZone) \(.Size)"' <<<"${v2:-null}" 2>/dev/null)" "${snap:-none} us-east-1b $(cat "$st/size")"
+    check_eq "it is attached to billing-db-2 as /dev/sdf" "$(jq -r '.Volumes[0].Attachments[0] | "\(.InstanceId) \(.Device)"' <<<"${v2:-null}" 2>/dev/null)" "$(cat "$st/db2") /dev/sdf"
+    check_eq "the old volume is kept on billing-db-1" "$(aws ec2 describe-volumes --volume-ids "$vol" --query 'Volumes[0].Attachments[0].InstanceId' --output text 2>/dev/null)" "$(cat "$st/db1")"
+
+    info "2. Private egress"
+    rt=$(cat "$st/rt")
+    nat=$(aws ec2 describe-route-tables --route-table-ids "$rt" --query "RouteTables[0].Routes[?DestinationCidrBlock=='0.0.0.0/0'].NatGatewayId | [0]" --output text 2>/dev/null)
+    check_match "billing-private-rt sends 0.0.0.0/0 to a NAT gateway" "$nat" '^nat-'
+    natsub=
+    case "$nat" in nat-*) natsub=$(aws ec2 describe-nat-gateways --nat-gateway-ids "$nat" --query 'NatGateways[0].SubnetId' --output text 2>/dev/null) ;; esac
+    check_eq "the NAT gateway is in billing-public-b" "$natsub" "$(cat "$st/pb")"
+    ep=$(aws ec2 describe-vpc-endpoints --output json 2>/dev/null | jq -c --arg v "$(cat "$st/vpc")" '[.VpcEndpoints[]? | select(.VpcId == $v and .ServiceName == "com.amazonaws.us-east-1.s3")]' 2>/dev/null)
+    check_eq "an S3 gateway endpoint in billing-vpc serves billing-private-rt only" "$(jq -r '[.[] | "\(.VpcEndpointType) \(.RouteTableIds // [] | join(","))"] | join("; ")' <<<"${ep:-[]}" 2>/dev/null)" "Gateway $rt"
+
+    info "3. Database firewall"
+    sgs=$(aws ec2 describe-security-groups --filters Name=group-name,Values=billing-db-sg --output json 2>/dev/null)
+    check_eq "billing-db-sg is still the group billing-db-2 uses" "$(jq -r '[.SecurityGroups[]?.GroupId] | join(" ")' <<<"${sgs:-null}" 2>/dev/null)" "$(cat "$st/db-sg")"
+    rules=$(jq -c '[.SecurityGroups[]? | .IpPermissions[]? | "\(.IpProtocol) \(.FromPort)-\(.ToPort)" as $p
+      | (.IpRanges[]?.CidrIp, .Ipv6Ranges[]?.CidrIpv6, .UserIdGroupPairs[]?.GroupId) | "\($p) \(.)"] | sort' <<<"${sgs:-null}" 2>/dev/null)
+    check_eq "it allows only TCP 5432 from billing-app-sg" "$rules" "[\"tcp 5432-5432 $(cat "$st/app-sg")\"]"
+
+    info "4. Launch template"
+    def=$(aws ec2 describe-launch-templates --launch-template-names billing-api-lt --query 'LaunchTemplates[0].DefaultVersionNumber' --output text 2>/dev/null)
+    vs=$(aws ec2 describe-launch-template-versions --launch-template-name billing-api-lt --output json 2>/dev/null)
+    ver() { jq -c --argjson n "$1" '[.LaunchTemplateVersions[]? | select(.VersionNumber == $n) | .LaunchTemplateData][0]' <<<"${vs:-null}" 2>/dev/null; }
+    [[ $def =~ ^[0-9]+$ ]] || def=0
+    d=$(ver "$def")
+    check "a new version is the default" '[ "$def" -gt 1 ]'
+    check_eq "the default version runs t3.medium on version 1's image" "$(jq -r '"\(.InstanceType) \(.ImageId)"' <<<"${d:-null}" 2>/dev/null)" "t3.medium $(cat "$st/ami")"
+    check_eq "its user data is /lab/billing/userdata.sh" "$(jq -r '.UserData // empty' <<<"${d:-null}" 2>/dev/null | base64 -d 2>/dev/null | sha256sum)" "$(sha256sum <"$st/userdata.sh")"
+    check_eq "version 1 is unchanged" "$(ver 1 | jq -r '"\(.InstanceType) \(.UserData)"' 2>/dev/null)" "t3.micro $(base64 -w0 "$st/userdata-v1.sh")"
+
+    info "5. Load balancer"
+    tg=$(aws elbv2 describe-target-groups --names billing-api-tg --output json 2>/dev/null)
+    tga=$(jq -r '.TargetGroups[0].TargetGroupArn // "none"' <<<"${tg:-null}" 2>/dev/null)
+    check_eq "billing-api-tg checks the path from the notes on the traffic port" "$(jq -r '.TargetGroups[0] | "\(.HealthCheckPath) \(.HealthCheckPort)"' <<<"${tg:-null}" 2>/dev/null | sed 's/ 8080$/ traffic-port/')" "$(cat "$st/hpath") traffic-port"
+    check_eq "every running billing-api instance is registered on 8080, and nothing else" "$(aws elbv2 describe-target-health --target-group-arn "$tga" --query 'TargetHealthDescriptions[].[Target.Id,Target.Port]' --output text 2>/dev/null | tr '\t' ':' | sort | tr '\n' ' ')" "$(cat "$st/targets")"
+    lb=$(aws elbv2 describe-load-balancers --names billing-alb --query 'LoadBalancers[0].LoadBalancerArn' --output text 2>/dev/null)
+    l=$(aws elbv2 describe-listeners --load-balancer-arn "${lb:-none}" --query 'Listeners[0].ListenerArn' --output text 2>/dev/null)
+    rules=$(aws elbv2 describe-rules --listener-arn "${l:-none}" --output json 2>/dev/null)
+    check_eq "a priority 10 rule forwards /billing/* to billing-api-tg" "$(jq -r '[.Rules[]? | select((.Conditions | tostring) | contains("/billing/*")) | "\(.Priority) \(.Actions[0].TargetGroupArn)"] | join("; ")' <<<"${rules:-null}" 2>/dev/null)" "10 $tga"
+    check_eq "the default action still forwards to billing-web-tg" "$(jq -r '[.Rules[]? | select(.IsDefault == true) | .Actions[0].TargetGroupArn] | first // ""' <<<"${rules:-null}" 2>/dev/null)" "$(cat "$st/web-tg")"
+
+    info "6. Edge address and DNS"
+    edge=$(cat "$st/edge")
+    ip=$(aws ec2 describe-addresses --query "Addresses[?InstanceId=='$edge'].PublicIp | [0]" --output text 2>/dev/null)
+    check_match "billing-edge has an Elastic IP" "$ip" '^[0-9]+\.[0-9]+\.[0-9]+\.[0-9]+$'
+    check_eq "edge-ip.txt holds that address" "$(tr -d '[:space:]' 2>/dev/null </lab/billing/edge-ip.txt)" "$ip"
+    zid=$(aws route53 list-hosted-zones-by-name --dns-name shop.example --query 'HostedZones[0].Id' --output text 2>/dev/null)
+    rr=$(aws route53 list-resource-record-sets --hosted-zone-id "${zid:-none}" --output json 2>/dev/null)
+    check_eq "pay.shop.example: blue 80 to the old server, green 20 to the edge, TTL 60, no plain record" "$(jq -r '[.ResourceRecordSets[]? | select(.Name == "pay.shop.example." and .Type == "A")
+      | "\(.SetIdentifier // "plain") \(.Weight // "-") \(.TTL) \([.ResourceRecords[]?.Value] | join(","))"] | sort | join("; ")' <<<"${rr:-null}" 2>/dev/null)" "blue 80 60 $(cat "$st/oldip"); green 20 60 $ip"
+  solve: |
+    cd /lab/billing
+    iid() { aws ec2 describe-instances --filters "Name=tag:$1,Values=$2" Name=instance-state-name,Values=running \
+      --query 'Reservations[].Instances[].InstanceId' --output text; }
+    sg() { aws ec2 describe-security-groups --filters "Name=group-name,Values=$1" --query 'SecurityGroups[0].GroupId' --output text; }
+    VPC=$(aws ec2 describe-vpcs --filters Name=tag:Name,Values=billing-vpc --query 'Vpcs[0].VpcId' --output text)
+
+    # 1. the database disk
+    OLD=$(aws ec2 describe-volumes --filters Name=tag:Name,Values=billing-db-data --query 'Volumes[0].VolumeId' --output text)
+    read DB2 AZ < <(aws ec2 describe-instances --filters Name=tag:Name,Values=billing-db-2 \
+      --query 'Reservations[0].Instances[0].[InstanceId,Placement.AvailabilityZone]' --output text)
+    SIZE=$(sed -n 's/.*billing-db-data-v2: \([0-9]*\) GiB.*/\1/p' handover.txt)
+    SNAP=$(aws ec2 create-snapshot --volume-id "$OLD" --description 'INFRA-731 pre-move' --query SnapshotId --output text)
+    aws ec2 wait snapshot-completed --snapshot-ids "$SNAP"
+    V2=$(aws ec2 create-volume --snapshot-id "$SNAP" --availability-zone "$AZ" --size "$SIZE" \
+      --tag-specifications 'ResourceType=volume,Tags=[{Key=Name,Value=billing-db-data-v2}]' --query VolumeId --output text)
+    aws ec2 wait volume-available --volume-ids "$V2"
+    aws ec2 attach-volume --volume-id "$V2" --instance-id "$DB2" --device /dev/sdf
+
+    # 2. private egress
+    PUB=$(aws ec2 describe-subnets --filters Name=tag:Name,Values=billing-public-b --query 'Subnets[0].SubnetId' --output text)
+    RT=$(aws ec2 describe-route-tables --filters Name=tag:Name,Values=billing-private-rt --query 'RouteTables[0].RouteTableId' --output text)
+    NAT=$(aws ec2 create-nat-gateway --subnet-id "$PUB" \
+      --allocation-id "$(aws ec2 allocate-address --domain vpc --query AllocationId --output text)" \
+      --query NatGateway.NatGatewayId --output text)
+    aws ec2 wait nat-gateway-available --nat-gateway-ids "$NAT"
+    aws ec2 create-route --route-table-id "$RT" --destination-cidr-block 0.0.0.0/0 --nat-gateway-id "$NAT"
+    aws ec2 create-vpc-endpoint --vpc-id "$VPC" --vpc-endpoint-type Gateway \
+      --service-name com.amazonaws.us-east-1.s3 --route-table-ids "$RT"
+
+    # 3. database firewall
+    DB=$(sg billing-db-sg); APP=$(sg billing-app-sg)
+    aws ec2 revoke-security-group-ingress --group-id "$DB" --protocol tcp --port 5432 --cidr 0.0.0.0/0
+    aws ec2 revoke-security-group-ingress --group-id "$DB" --protocol tcp --port 22 --cidr 0.0.0.0/0
+    aws ec2 authorize-security-group-ingress --group-id "$DB" --protocol tcp --port 5432 --source-group "$APP"
+
+    # 4. launch template
+    AMI=$(aws ec2 describe-launch-template-versions --launch-template-name billing-api-lt --versions 1 \
+      --query 'LaunchTemplateVersions[0].LaunchTemplateData.ImageId' --output text)
+    DATA=$(jq -nc --arg a "$AMI" --arg u "$(base64 -w0 userdata.sh)" '{ImageId: $a, InstanceType: "t3.medium", UserData: $u}')
+    V=$(aws ec2 create-launch-template-version --launch-template-name billing-api-lt --source-version 1 \
+      --launch-template-data "$DATA" --query LaunchTemplateVersion.VersionNumber --output text)
+    aws ec2 modify-launch-template --launch-template-name billing-api-lt --default-version "$V"
+
+    # 5. load balancer
+    TG=$(aws elbv2 describe-target-groups --names billing-api-tg --query 'TargetGroups[0].TargetGroupArn' --output text)
+    P=$(sed -n 's/.*Health endpoint: GET \([^ ]*\) .*/\1/p' handover.txt)
+    aws elbv2 modify-target-group --target-group-arn "$TG" --health-check-path "$P" --health-check-port traffic-port
+    aws elbv2 register-targets --target-group-arn "$TG" --targets $(for i in $(iid Role billing-api); do echo "Id=$i,Port=8080"; done)
+    LB=$(aws elbv2 describe-load-balancers --names billing-alb --query 'LoadBalancers[0].LoadBalancerArn' --output text)
+    L=$(aws elbv2 describe-listeners --load-balancer-arn "$LB" --query 'Listeners[?Port==`80`].ListenerArn | [0]' --output text)
+    aws elbv2 create-rule --listener-arn "$L" --priority 10 \
+      --conditions Field=path-pattern,Values='/billing/*' --actions Type=forward,TargetGroupArn="$TG"
+
+    # 6. edge address and DNS
+    read AID IP < <(aws ec2 allocate-address --domain vpc --query '[AllocationId,PublicIp]' --output text)
+    aws ec2 associate-address --instance-id "$(iid Name billing-edge)" --allocation-id "$AID"
+    echo "$IP" > edge-ip.txt
+    ZID=$(aws route53 list-hosted-zones-by-name --dns-name shop.example --query 'HostedZones[0].Id' --output text)
+    aws route53 list-resource-record-sets --hosted-zone-id "$ZID" \
+      --query "ResourceRecordSets[?Name=='pay.shop.example.' && Type=='A']" --output json > current.json
+    jq --arg ip "$IP" '.[0] as $p | {Changes: [
+      {Action: "DELETE", ResourceRecordSet: $p},
+      {Action: "CREATE", ResourceRecordSet: {Name: "pay.shop.example", Type: "A", SetIdentifier: "blue", Weight: 80, TTL: 60, ResourceRecords: $p.ResourceRecords}},
+      {Action: "CREATE", ResourceRecordSet: {Name: "pay.shop.example", Type: "A", SetIdentifier: "green", Weight: 20, TTL: 60, ResourceRecords: [{Value: $ip}]}}]}' \
+      current.json > cutover.json
+    aws route53 change-resource-record-sets --hosted-zone-id "$ZID" --change-batch file:///lab/billing/cutover.json

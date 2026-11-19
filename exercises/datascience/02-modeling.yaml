@@ -521,3 +521,303 @@ exercises:
     # %%
     joblib.dump(model, "/lab/model.joblib")
     PY
+
+# ===== Capstone: a real-world lab =====
+
+- id: ds-082
+  title: "Capstone: who is about to cancel?"
+  difficulty: 5
+  kind: build
+  deliverables: [outliers.txt, strongest.txt, offer.txt, model.joblib]
+  tags: [capstone, statistics, outliers, correlation, ab-test, leakage, imbalance, pipeline]
+  tutorial: |
+    **Concept.** A churn project is a chain of small questions, and each one has a trap:
+
+    - **Is the data sane?** A billing glitch can multiply a few values by a hundred. The
+      1.5 × IQR rule flags them without being dragged around by them, because quartiles
+      barely move when a few values explode.
+    - **What predicts the outcome?** Correlation ranks signals, but only signals you would
+      actually *have* at prediction time count. A column filled in after the event mirrors
+      the target: it tops every ranking and makes a model look perfect, and the model is
+      useless the day it meets customers who haven't left yet.
+    - **Did the intervention work?** A difference between two groups means something only
+      if it is larger than chance would produce. A chi-square test on the contingency table
+      of group × outcome answers that, against a threshold you fixed beforehand.
+    - **Can we act on it?** When one customer in fifteen churns, a model can be 93% accurate
+      by predicting that nobody does. What the team needs is a list that catches most of
+      the leavers (recall) without burying the callers in false alarms (precision). Class
+      weights change what a mistake costs during training; a model that can draw curved
+      boundaries captures risk that only shows up in *combinations* of features.
+    - **Will it survive production?** Real records have gaps and categories the training
+      data never had. Put the imputing and encoding inside the saved pipeline, so that
+      `predict` applies exactly the same steps.
+
+    **Read up on:**
+    - `Series.quantile`, the 1.5 × IQR rule
+    - `DataFrame.corr` (`numeric_only`), "data leakage" in the scikit-learn user guide
+    - `pandas.crosstab`, `scipy.stats.chi2_contingency` and its `correction` argument
+    - `sklearn.metrics.classification_report`, precision and recall, `class_weight`
+    - `sklearn.compose.ColumnTransformer`, `SimpleImputer`, `OneHotEncoder(handle_unknown=...)`
+    - `RandomForestClassifier`, `HistGradientBoostingClassifier`, `joblib.dump`
+  scenario: |
+    **Ticket CS-207**, from Marta, head of customer success:
+
+    > We lose about one customer in fifteen every quarter. I'd like a weekly call list of
+    > customers who are about to cancel, so my team can phone them first. Before that,
+    > billing thinks some spend figures are broken, and the product team wants to know if
+    > last month's retention offer did anything.
+
+    Last quarter's customers are in **`/lab/churn.csv`**:
+
+    | column | meaning |
+    |---|---|
+    | `customer_id` | the customer |
+    | `tenure_months` | months since the customer signed up |
+    | `monthly_spend` | the current monthly bill |
+    | `support_tickets` | support tickets opened in the last 90 days |
+    | `logins_30d` | logins in the last 30 days |
+    | `plan` | `basic`, `plus` or `pro` |
+    | `region` | the customer's region |
+    | `retention_call` | 1 if the retention team phoned the customer; they phone the customers who have asked to cancel |
+    | `churned` | 1 if the customer left during the quarter |
+
+    Some values are missing. The offer experiment is in **`/lab/offer_test.csv`**: one row
+    per customer, with `group` (`control` or `offer`) and `churned`. Work in the notebook
+    **`/lab/ds-082.ipynb`**, and have it write:
+
+    1. **`/lab/outliers.txt`**: the number of `monthly_spend` values that are outliers by
+       the **1.5 × IQR rule** (below `Q1 − 1.5 × IQR` or above `Q3 + 1.5 × IQR`, with
+       pandas' default quantiles).
+    2. **`/lab/strongest.txt`**: of the numeric columns that are **known before a
+       customer leaves** (so not `customer_id`), the one with the strongest **linear**
+       relationship with `churned` (Pearson correlation, either sign).
+    3. **`/lab/offer.txt`**: on the first line the p-value of a **chi-square test of
+       independence without continuity correction** between `group` and `churned`, to 4
+       decimals; on the second line **`significant`** or **`not significant`**, at a
+       significance level of **0.05**.
+    4. **`/lab/model.joblib`**: the churn model, saved with `joblib`. Each week it will be
+       called as `model.predict(df)` on a DataFrame of current customers with just the six
+       columns **`tenure_months, monthly_spend, support_tickets, logins_30d, plan,
+       region`**, and must return 1 for the customers to call. It must:
+       - cope with **missing values** in any of them, and with the **`enterprise`** plan
+         that launches next month (and regions it hasn't seen);
+       - on a hidden set of current customers, catch **at least 70% of the customers who
+         leave** (recall on class 1) with a **precision of at least 40%**.
+
+    The notebook starts with the analyst's first attempt at a model. Find out why it can't
+    be used before you build yours.
+  hints:
+    - "Run the first attempt and look at its accuracy, then at `churn.corr(numeric_only=True)['churned']`. One column mirrors the target: when is it filled in?"
+    - "Outliers: `q1, q3 = s.quantile(0.25), s.quantile(0.75)`; count both sides. Missing values are never outliers."
+    - "The offer: `chi2_contingency(pd.crosstab(ab['group'], ab['churned']), correction=False)` returns the p-value second."
+    - "The model: route the numeric columns through a `SimpleImputer` and the text ones through a `SimpleImputer(strategy='most_frequent')` plus `OneHotEncoder(handle_unknown='ignore')` in a `ColumnTransformer`, inside one pipeline. Train it on the six columns only."
+    - "A linear model can't see that a short tenure is only risky *together with* many tickets; a tree ensemble can. Hold out part of `churn.csv` and read `classification_report`: without `class_weight` the model misses most churners."
+    - "`RandomForestClassifier(n_estimators=300, min_samples_leaf=20, class_weight='balanced_subsample')` gives a good balance of recall and precision here. Refit on all rows before saving."
+  solution: |
+    The first attempt scores 99% because `retention_call` is filled in for customers who
+    have already asked to leave: it is the answer, not a signal, and current customers
+    don't have it. Leave it out of the ranking and the model:
+
+    ```python
+    import joblib
+    import pandas as pd
+    from scipy.stats import chi2_contingency
+    from sklearn.compose import ColumnTransformer
+    from sklearn.ensemble import RandomForestClassifier
+    from sklearn.impute import SimpleImputer
+    from sklearn.metrics import classification_report
+    from sklearn.model_selection import train_test_split
+    from sklearn.pipeline import make_pipeline
+    from sklearn.preprocessing import OneHotEncoder
+
+    churn = pd.read_csv("/lab/churn.csv")
+
+    s = churn["monthly_spend"]
+    q1, q3 = s.quantile(0.25), s.quantile(0.75)
+    iqr = q3 - q1
+    open("/lab/outliers.txt", "w").write(f"{((s < q1 - 1.5 * iqr) | (s > q3 + 1.5 * iqr)).sum()}\n")
+
+    corr = churn.drop(columns=["customer_id", "retention_call"]).corr(numeric_only=True)["churned"].drop("churned")
+    open("/lab/strongest.txt", "w").write(corr.abs().idxmax() + "\n")
+
+    ab = pd.read_csv("/lab/offer_test.csv")
+    p = chi2_contingency(pd.crosstab(ab["group"], ab["churned"]), correction=False)[1]
+    open("/lab/offer.txt", "w").write(f"{p:.4f}\n" + ("significant\n" if p < 0.05 else "not significant\n"))
+
+    num = ["tenure_months", "monthly_spend", "support_tickets", "logins_30d"]
+    cat = ["plan", "region"]
+    pre = ColumnTransformer([
+        ("num", SimpleImputer(strategy="median"), num),
+        ("cat", make_pipeline(SimpleImputer(strategy="most_frequent"), OneHotEncoder(handle_unknown="ignore")), cat),
+    ])
+    model = make_pipeline(pre, RandomForestClassifier(n_estimators=300, min_samples_leaf=20,
+                                                      class_weight="balanced_subsample", random_state=0))
+    X_tr, X_te, y_tr, y_te = train_test_split(churn[num + cat], churn["churned"], test_size=0.3,
+                                              stratify=churn["churned"], random_state=0)
+    print(classification_report(y_te, model.fit(X_tr, y_tr).predict(X_te)))
+    model.fit(churn[num + cat], churn["churned"])
+    joblib.dump(model, "/lab/model.joblib")
+    ```
+
+    `class_weight` makes a missed churner cost as much as all the false alarms it takes to
+    catch it, which trades a little precision for a lot of recall. A balanced logistic
+    regression catches the churners too, but at a precision far below 40%: churn risk here
+    lives in combinations (few months *and* many tickets) that a straight line can't draw.
+  starter: |
+    # CS-207: the analyst's first attempt at a churn model. It is 99% accurate.
+    # Why can't Marta's team use it?
+    from sklearn.linear_model import LogisticRegression
+    from sklearn.model_selection import train_test_split
+
+    churn = pd.read_csv("/lab/churn.csv")
+    X = churn.drop(columns=["churned"]).select_dtypes("number").fillna(0)
+    y = churn["churned"]
+    X_train, X_test, y_train, y_test = train_test_split(X, y, test_size=0.3, random_state=0)
+    first_try = LogisticRegression(max_iter=5000).fit(X_train, y_train)
+    print("accuracy:", round(first_try.score(X_test, y_test), 3))
+  setup: |
+    ds_start
+    dspy - >"$KL_STATE/answer" <<'PY'
+    import numpy as np, pandas as pd
+    from scipy.stats import chi2_contingency
+    r = np.random.default_rng()
+
+    def customers(n):
+        tenure = r.integers(1, 73, n)
+        tickets = r.poisson(1.5, n)
+        logins = r.poisson(10, n)
+        plan = r.choice(["basic", "plus", "pro"], n, p=[0.5, 0.3, 0.2])
+        spend = np.select([plan == "basic", plan == "plus"], [25, 35], 45) + r.normal(0, 8, n)
+        z = (-5.0 + 6.0 * ((tickets >= 3) & (tenure < 24)) + 5.5 * (logins < 5) - 0.01 * tenure
+             + np.select([plan == "basic", plan == "pro"], [0.7, -0.7], 0))
+        churned = (r.random(n) < 1 / (1 + np.exp(-z))).astype(int)
+        return pd.DataFrame({
+            "tenure_months": tenure.astype(float), "monthly_spend": spend.round(2),
+            "support_tickets": tickets.astype(float), "logins_30d": logins.astype(float),
+            "plan": plan.astype(object), "region": r.choice(["north", "south", "east", "west"], n).astype(object),
+            "churned": churned,
+        })
+
+    feats = ["tenure_months", "monthly_spend", "support_tickets", "logins_30d", "plan", "region"]
+    while True:
+        df = customers(8000)
+        glitch = r.random(len(df)) < 0.006  # the billing glitch
+        df.loc[glitch, "monthly_spend"] = (df.loc[glitch, "monthly_spend"] * 100).round(2)
+        for c in feats:
+            df.loc[r.random(len(df)) < 0.03, c] = np.nan
+        train = df.iloc[:5000].copy()
+        train.insert(0, "customer_id", np.arange(70001, 75001))
+        train.insert(7, "retention_call", np.where(train["churned"] == 1, 1, (r.random(5000) < 0.02).astype(int)))
+        corr = train[["tenure_months", "monthly_spend", "support_tickets", "logins_30d", "churned"]].corr()["churned"].drop("churned").abs().sort_values()
+        if corr.iloc[-1] - corr.iloc[-2] >= 0.03:
+            break
+    train.to_csv("/lab/churn.csv", index=False)
+    test = df.iloc[5000:].copy()
+    test.loc[r.random(len(test)) < 0.15, "plan"] = "enterprise"
+    test.to_csv("/lab/.kl-test.csv", index=False)
+
+    while True:
+        n = 4000
+        g = r.choice(["control", "offer"], n)
+        lift = 0.035 if r.random() < 0.5 else 0.0
+        ab = pd.DataFrame({"customer_id": np.arange(80001, 80001 + n), "group": g,
+                           "churned": (r.random(n) < np.where(g == "offer", 0.12 - lift, 0.12)).astype(int)})
+        p = chi2_contingency(pd.crosstab(ab["group"], ab["churned"]), correction=False)[1]
+        if p < 0.02 or p > 0.1:
+            break
+    ab.to_csv("/lab/offer_test.csv", index=False)
+
+    s = pd.read_csv("/lab/churn.csv")["monthly_spend"]
+    q1, q3 = s.quantile(0.25), s.quantile(0.75)
+    print(int(((s < q1 - 1.5 * (q3 - q1)) | (s > q3 + 1.5 * (q3 - q1))).sum()))
+    print(corr.index[-1])
+    print(f"{p:.6f}")
+    print("significant" if p < 0.05 else "not significant")
+    PY
+    mv /lab/.kl-test.csv "$KL_STATE/test.csv"
+    chown -R "$(lab_user):" /lab
+  check: |
+    NB_HIDDEN="$KL_STATE/test.csv" nb_check ds-082.ipynb outliers.txt strongest.txt offer.txt model.joblib <<'PY'
+    import os, joblib
+    import numpy as np, pandas as pd
+    from sklearn.metrics import precision_score, recall_score
+    feats = ["tenure_months", "monthly_spend", "support_tickets", "logins_30d", "plan", "region"]
+    try:
+        m = joblib.load("/lab/model.joblib")
+    except Exception as e:
+        m = None
+        print(f"raw: no usable /lab/model.joblib ({type(e).__name__})")
+    if m is not None:
+        odd = pd.DataFrame({
+            "tenure_months": [np.nan, 3, 40, np.nan], "monthly_spend": [np.nan, 30.0, np.nan, 50.0],
+            "support_tickets": [np.nan, 4, 0, np.nan], "logins_30d": [np.nan, np.nan, 12, 2],
+            "plan": ["enterprise", "basic", np.nan, "enterprise"], "region": ["atlantis", np.nan, "north", "south"],
+        })
+        try:
+            p = np.asarray(m.predict(odd))
+            print("raw:", "ok" if len(p) == len(odd) else f"{len(p)} predictions for {len(odd)} customers")
+        except Exception as e:
+            print(f"raw: predict raised {type(e).__name__}: {str(e)[:90]}")
+        try:
+            d = pd.read_csv("/tmp/kl-hidden/test.csv")
+            p = np.asarray(m.predict(d[feats])).astype(float).astype(int)
+            print(f"recall: {recall_score(d['churned'], p):.3f}")
+            print(f"precision: {precision_score(d['churned'], p, zero_division=0):.3f}")
+        except Exception as e:
+            print(f"recall: raised {type(e).__name__}")
+    PY
+    info "The data"
+    check_eq "the notebook writes the outlier count to /lab/outliers.txt" "$(tr -d '[:space:]' 2>/dev/null <"$(nb_out outliers.txt)")" "$(sed -n 1p "$KL_STATE/answer")"
+    check_eq "the notebook writes the strongest signal known before churn to /lab/strongest.txt" "$(tr -d '[:space:]' 2>/dev/null <"$(nb_out strongest.txt)")" "$(sed -n 2p "$KL_STATE/answer")"
+    info "The retention offer"
+    want=$(sed -n 3p "$KL_STATE/answer"); got=$(sed -n 1p "$(nb_out offer.txt)" 2>/dev/null | tr -d '[:space:]')
+    check "the first line of /lab/offer.txt is the chi-square p-value" "awk -v a='${got:-x}' -v b='$want' 'BEGIN { d = a - b; if (d < 0) d = -d; exit !(a ~ /^[0-9.e-]+\$/ && d < 0.0005) }'"
+    check_eq "the second line of /lab/offer.txt is the decision at 0.05" "$(sed -n 2p "$(nb_out offer.txt)" 2>/dev/null | sed 's/[[:space:]]*$//')" "$(sed -n 4p "$KL_STATE/answer")"
+    info "The churn model"
+    check_eq "the saved model predicts from the six columns, with gaps and unseen plans" "$(sed -n 's/^raw: //p' <<<"$NB_RESULT")" ok
+    r=$(sed -n 's/^recall: //p' <<<"$NB_RESULT"); p=$(sed -n 's/^precision: //p' <<<"$NB_RESULT")
+    check "it catches at least 70% of the hidden customers who leave (recall ${r:-?})" "awk -v a='${r:-x}' 'BEGIN { exit !(a ~ /^[0-9.]+\$/ && a >= 0.70) }'"
+    check "its call list has a precision of at least 40% (${p:-?})" "awk -v a='${p:-x}' 'BEGIN { exit !(a ~ /^[0-9.]+\$/ && a >= 0.40) }'"
+  solve: |
+    nb_write ds-082.ipynb <<'PY'
+    import joblib
+    import pandas as pd
+    from scipy.stats import chi2_contingency
+    from sklearn.compose import ColumnTransformer
+    from sklearn.ensemble import RandomForestClassifier
+    from sklearn.impute import SimpleImputer
+    from sklearn.metrics import classification_report
+    from sklearn.model_selection import train_test_split
+    from sklearn.pipeline import make_pipeline
+    from sklearn.preprocessing import OneHotEncoder
+    churn = pd.read_csv("/lab/churn.csv")
+    # %%
+    s = churn["monthly_spend"]
+    q1, q3 = s.quantile(0.25), s.quantile(0.75)
+    iqr = q3 - q1
+    open("/lab/outliers.txt", "w").write(f"{((s < q1 - 1.5 * iqr) | (s > q3 + 1.5 * iqr)).sum()}\n")
+    # %%
+    # retention_call is filled in after a customer asks to leave: it is the answer, not a signal
+    corr = churn.drop(columns=["customer_id", "retention_call"]).corr(numeric_only=True)["churned"].drop("churned")
+    open("/lab/strongest.txt", "w").write(corr.abs().idxmax() + "\n")
+    corr
+    # %%
+    ab = pd.read_csv("/lab/offer_test.csv")
+    p = chi2_contingency(pd.crosstab(ab["group"], ab["churned"]), correction=False)[1]
+    open("/lab/offer.txt", "w").write(f"{p:.4f}\n" + ("significant\n" if p < 0.05 else "not significant\n"))
+    # %%
+    num = ["tenure_months", "monthly_spend", "support_tickets", "logins_30d"]
+    cat = ["plan", "region"]
+    pre = ColumnTransformer([
+        ("num", SimpleImputer(strategy="median"), num),
+        ("cat", make_pipeline(SimpleImputer(strategy="most_frequent"), OneHotEncoder(handle_unknown="ignore")), cat),
+    ])
+    model = make_pipeline(pre, RandomForestClassifier(n_estimators=300, min_samples_leaf=20,
+                                                      class_weight="balanced_subsample", random_state=0))
+    X_tr, X_te, y_tr, y_te = train_test_split(churn[num + cat], churn["churned"], test_size=0.3,
+                                              stratify=churn["churned"], random_state=0)
+    print(classification_report(y_te, model.fit(X_tr, y_tr).predict(X_te)))
+    # %%
+    model.fit(churn[num + cat], churn["churned"])
+    joblib.dump(model, "/lab/model.joblib")
+    PY

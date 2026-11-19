@@ -662,3 +662,356 @@ exercises:
   solve: |
     sudo sed -i '/^\[Unit\]/a After=kl-db.service\nRequires=kl-db.service' /etc/systemd/system/kl-web.service
     sudo systemctl daemon-reload
+
+# ===== Capstone: a real-world lab =====
+
+- id: linux-099
+  title: "Capstone: bring the ledger API up on its new network"
+  difficulty: 5
+  kind: fix
+  tags: [capstone, routing, netns, iptables, firewall, hosts, getent, ss, systemd, dependencies, oneshot, ports]
+  tutorial: |
+    **Concept.** "The service is down" on a networked host is never one problem. Work through it in the order a request travels, and prove each layer before you move on:
+
+    - **Who holds the port.** Only one socket can listen on an address and port. `ss` names the process, and that process's cgroup names the systemd unit behind it, which is what you stop and disable when something has to go for good. A supervised service simply comes back if you kill it.
+    - **What the name means.** The C library reads `/etc/hosts` top to bottom and stops at the **first** line that names the host. A correct line further down changes nothing.
+    - **How the packet gets there.** A route names the next hop for a network that isn't directly attached. The router must forward, its own packet filter can still drop what it forwards, and the far end needs a route *back*. A ping that gets through proves the routing, not the port: a filter can let ICMP through and drop one TCP port.
+    - **What makes it permanent.** A route added by hand is gone after a reboot. A small `Type=oneshot` unit with `RemainAfterExit=yes` can own it, and a service that can't work without it declares both a requirement and an ordering on that unit.
+    - **Who may connect.** Filtering on the *destination port* of new connections is how you shut one service off from one network. Filtering a whole source network also drops the *replies* to connections your host opens towards it.
+
+    **Read up on:**
+    - `ss -ltnp`, `ps -o unit= -p PID`, `systemctl status PID`; `systemctl disable --now`, `systemctl mask`
+    - `man 5 hosts`, `getent hosts NAME`
+    - `man ip-route`: `ip route get`, `ip route replace`; `ip -n NS ...` and `ip netns exec NS ...`
+    - `iptables -L CHAIN -n -v --line-numbers`, `iptables -D CHAIN N`; the `FORWARD` chain versus `INPUT`
+    - `man systemd.service`: `Type=oneshot`, `RemainAfterExit=`; `man systemd.unit`: `Requires=`, `After=`; drop-ins with `systemctl edit`
+    - `iptables -I INPUT -s NET -p tcp --dport PORT -j REJECT`, and why `-s NET -j DROP` alone would break outgoing connections to that network
+  scenario: |
+    **Ticket PAY-512** — from Omar, payments platform:
+
+    > The ledger API moved onto this host on Friday, and its database moved into the new
+    > ledger network. Nothing works yet, and the new API has to take customer traffic on
+    > Monday. I've done what I could. Please finish it and make sure it all survives a
+    > reboot. **Don't change the API's code or its settings file.**
+
+    The layout (the network team built the ledger network as namespaces on this host;
+    treat them as other machines you have root on):
+
+    | where | address |
+    |-------|---------|
+    | this host, interface `kln-host` | `10.77.1.1/24` |
+    | router, namespace `kln-rt` | `10.77.1.254/24` and `10.77.2.254/24` |
+    | database, namespace `kln-db` | `10.77.2.10/24`, TCP port `6432` |
+
+    - **`kl-ledger-api.service`** runs **`/opt/kl-ledger/api.py`** with its settings from
+      **`/etc/kl-ledger/api.env`**: it listens on **port 8443** on all addresses, and
+      talks to the database by the name **`ledger-db.pay.internal`**. It exits at once if it
+      can't reach the database.
+    - **`kl-old-ledger.service`** is the API it replaces.
+    - The database greets every connection with one line, which includes the address it
+      sees the client coming from.
+
+    Requirements:
+
+    1. **The old API is retired**: `kl-old-ledger` is not running and won't start at boot.
+    2. **The name**: `getent hosts ledger-db.pay.internal` returns **`10.77.2.10`**, and
+       `/etc/hosts` gives no other address for that name. (Omar added the new address
+       already, and it's "still going to the old one".)
+    3. **The path**: from this host, a TCP connection to **`10.77.2.10:6432`** goes through
+       the router and gets the greeting. The database must see the host's own address,
+       **`10.77.1.1`**: no NAT.
+    4. **The route survives a reboot**: a new unit **`kl-ledger-route.service`**
+       (`Type=oneshot`, staying active once it has run) adds the host's route to the
+       database network, and is **enabled**.
+    5. **The API's dependencies**: `kl-ledger-api` **requires** `kl-ledger-route` and is
+       **ordered after** it, and is **enabled**. The check stops both, deletes the route,
+       and starts only `kl-ledger-api`: it must come up.
+    6. **The API works**: `kl-ledger-api` is active, its own process listens on port
+       **8443**, and `curl http://127.0.0.1:8443/` returns `ledger ok:` followed by the
+       database's greeting.
+    7. **The ledger network stays out**: security wants nothing in `10.77.0.0/16` to open
+       a connection to port 8443 on this host. Use the host firewall; localhost keeps
+       working, and so does everything the API does.
+  hints:
+    - "Start where it fails: `systemctl status kl-ledger-api` and `journalctl -u kl-ledger-api -n 20`. Fix that, start it again, and read the next error. There are several, one per layer."
+    - "The old API restarts when it's killed. `sudo ss -ltnp 'sport = :8443'` gives a PID, and `ps -o unit= -p PID` gives the unit to `systemctl disable --now`."
+    - "`grep -n ledger-db /etc/hosts`: the resolver takes the first match, and `getent hosts` shows which one that is."
+    - "Routing: `ip route get 10.77.2.10` on the host, `ip -n kln-db route` on the database. Then `sudo ip netns exec kln-db ping -c1 10.77.1.1` works while the TCP connection still hangs: list the router's `FORWARD` chain with `sudo ip netns exec kln-rt iptables -L FORWARD -n -v --line-numbers`."
+    - "The route unit: `Type=oneshot`, `RemainAfterExit=yes`, `ExecStart=ip route replace 10.77.2.0/24 via 10.77.1.254 dev kln-host` (`replace` doesn't fail when the route is already there), and an `[Install]` section. The API's dependencies go in a drop-in: `[Unit]` with `Requires=` and `After=`. Then `daemon-reload`."
+    - "The firewall: match new connections by **destination port** as well as source, `sudo iptables -I INPUT -s 10.77.0.0/16 -p tcp --dport 8443 -j REJECT`. Test it with `sudo ip netns exec kln-db curl -m 3 http://10.77.1.1:8443/`."
+  solution: |
+    ### 1. The old API
+
+    It holds port 8443, and `Restart=always` brings it back when it's killed:
+
+    ```bash
+    sudo ss -ltnp 'sport = :8443'
+    ps -o unit= -p <PID>                 # kl-old-ledger.service
+    sudo systemctl disable --now kl-old-ledger
+    ```
+
+    ### 2. The name
+
+    The old datacentre's line comes first in `/etc/hosts`, and the first match wins:
+
+    ```bash
+    grep -n ledger-db /etc/hosts
+    sed '/^10\.77\.9\.10[[:space:]].*ledger-db\.pay\.internal/d' /etc/hosts > /tmp/hosts
+    sudo cp /tmp/hosts /etc/hosts
+    getent hosts ledger-db.pay.internal
+    ```
+
+    ### 3. The path
+
+    Three faults: the host has no route to `10.77.2.0/24` (that comes in step 4), the
+    database's default gateway is a wrong address, and the router drops port 6432 in its
+    `FORWARD` chain, a leftover from a maintenance freeze. Ping works the whole time.
+
+    ```bash
+    ip -n kln-db route                                 # default via 10.77.2.253
+    sudo ip -n kln-db route replace default via 10.77.2.254
+    sudo ip netns exec kln-rt iptables -L FORWARD -n -v --line-numbers
+    sudo ip netns exec kln-rt iptables -D FORWARD 1
+    ```
+
+    ### 4. The route, as a unit
+
+    ```bash
+    sudo tee /etc/systemd/system/kl-ledger-route.service >/dev/null <<'EOF'
+    [Unit]
+    Description=Route to the ledger network
+
+    [Service]
+    Type=oneshot
+    RemainAfterExit=yes
+    ExecStart=ip route replace 10.77.2.0/24 via 10.77.1.254 dev kln-host
+
+    [Install]
+    WantedBy=multi-user.target
+    EOF
+    ```
+
+    ### 5 and 6. The API's dependencies, and the API
+
+    ```bash
+    sudo mkdir -p /etc/systemd/system/kl-ledger-api.service.d
+    printf '[Unit]\nRequires=kl-ledger-route.service\nAfter=kl-ledger-route.service\n' \
+      | sudo tee /etc/systemd/system/kl-ledger-api.service.d/route.conf >/dev/null
+    sudo systemctl daemon-reload
+    sudo systemctl enable --now kl-ledger-route
+    sudo systemctl enable kl-ledger-api
+    sudo systemctl restart kl-ledger-api
+    exec 3<>/dev/tcp/10.77.2.10/6432; head -1 <&3      # LEDGER-DB ... peer=10.77.1.1
+    curl -s http://127.0.0.1:8443/
+    ```
+
+    ### 7. The ledger network stays out
+
+    Match the destination port, so the database's replies to the API still come in:
+
+    ```bash
+    sudo iptables -I INPUT -s 10.77.0.0/16 -p tcp --dport 8443 -j REJECT --reject-with tcp-reset
+    sudo ip netns exec kln-db curl -m 3 http://10.77.1.1:8443/     # refused
+    curl -s http://127.0.0.1:8443/                                 # still works
+    ```
+  setup: |
+    mkdir -p /opt/kl-ledger /opt/kl-old-ledger /etc/kl-ledger
+    on_reset 'systemctl disable --now kl-ledger-api kl-ledger-route kl-old-ledger 2>/dev/null; systemctl unmask kl-old-ledger 2>/dev/null; rm -rf /etc/systemd/system/kl-ledger-api.service /etc/systemd/system/kl-ledger-api.service.d /etc/systemd/system/kl-ledger-route.service /etc/systemd/system/kl-old-ledger.service /etc/kl-ledger /opt/kl-old-ledger; systemctl daemon-reload; systemctl reset-failed 2>/dev/null; true'
+    on_reset 'pkill -KILL -f /opt/kl-ledger/db.py 2>/dev/null; ip link del kln-host 2>/dev/null; iptables -F INPUT 2>/dev/null; rm -rf /opt/kl-ledger; true'
+
+    # --- the ledger network: host -- router -- database ---
+    netns_new kln-rt kln-db
+    ip link add kln-host type veth peer name kln-hpeer
+    ip link set kln-hpeer netns kln-rt name eth-host
+    ip addr add 10.77.1.1/24 dev kln-host
+    ip link set kln-host up
+    ip -n kln-rt link set eth-host up
+    ip -n kln-rt addr add 10.77.1.254/24 dev eth-host
+    netns_link kln-rt eth-db kln-db eth0
+    ip -n kln-rt addr add 10.77.2.254/24 dev eth-db
+    ip -n kln-db addr add 10.77.2.10/24 dev eth0
+    ip netns exec kln-rt sysctl -qw net.ipv4.ip_forward=1
+    # a wrong gateway on the database, and a leftover drop on the router
+    ip -n kln-db route add default via 10.77.2.253
+    ip netns exec kln-rt iptables -A FORWARD -p tcp --dport 6432 -m comment --comment "maintenance freeze 2026-10" -j DROP
+
+    # --- the database ---
+    tok="db-$(head -c6 /dev/urandom | od -An -tx1 | tr -d ' \n')"
+    echo "$tok" > "$KL_STATE/db.token"
+    echo "$tok" > /opt/kl-ledger/db.token
+    chmod 600 /opt/kl-ledger/db.token
+    cat > /opt/kl-ledger/db.py <<'EOS'
+    import socket
+    tok = open("/opt/kl-ledger/db.token").read().strip()
+    s = socket.socket()
+    s.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+    s.bind(("0.0.0.0", 6432))
+    s.listen(16)
+    while True:
+        c, a = s.accept()
+        try:
+            c.sendall(("LEDGER-DB %s peer=%s\n" % (tok, a[0])).encode())
+        except OSError:
+            pass
+        c.close()
+    EOS
+    setsid ip netns exec kln-db python3 /opt/kl-ledger/db.py </dev/null >/dev/null 2>&1 &
+    eventually 10 "ip netns exec kln-db ss -ltn 'sport = :6432' | grep -q LISTEN"
+
+    # --- the name: the old datacentre's line comes first ---
+    printf '\n# ledger database (dc1)\n10.77.9.10 ledger-db.pay.internal ledger-db\n' >> /etc/hosts
+    printf '# ledger database, new home (Omar, PAY-512)\n10.77.2.10 ledger-db.pay.internal\n' >> /etc/hosts
+
+    # --- the old API, still holding the port ---
+    echo "old ledger" > /opt/kl-old-ledger/index.html
+    cat > /etc/systemd/system/kl-old-ledger.service <<'EOS'
+    [Unit]
+    Description=Ledger API (old, replaced in PAY-512)
+
+    [Service]
+    ExecStart=/usr/bin/python3 -m http.server 8443 --directory /opt/kl-old-ledger
+    Restart=always
+    RestartSec=1
+
+    [Install]
+    WantedBy=multi-user.target
+    EOS
+
+    # --- the new API ---
+    cat > /opt/kl-ledger/api.py <<'EOS'
+    import http.server, os, socket, sys
+
+    port = int(os.environ["LEDGER_PORT"])
+    host, dbport = os.environ["LEDGER_DB"].rsplit(":", 1)
+
+    def db():
+        with socket.create_connection((host, int(dbport)), timeout=3) as s:
+            return s.makefile().readline().strip()
+
+    try:
+        db()
+    except OSError as e:
+        sys.exit("ledger-api: database %s unreachable: %s" % (os.environ["LEDGER_DB"], e))
+
+    class H(http.server.BaseHTTPRequestHandler):
+        def do_GET(self):
+            try:
+                code, body = 200, "ledger ok: %s\n" % db()
+            except OSError as e:
+                code, body = 503, "database unreachable: %s\n" % e
+            self.send_response(code)
+            self.end_headers()
+            self.wfile.write(body.encode())
+
+        def log_message(self, *a):
+            pass
+
+    print("ledger-api: listening on 0.0.0.0:%d" % port, flush=True)
+    http.server.HTTPServer(("0.0.0.0", port), H).serve_forever()
+    EOS
+    printf 'LEDGER_PORT=8443\nLEDGER_DB=ledger-db.pay.internal:6432\n' > /etc/kl-ledger/api.env
+    chmod 644 /opt/kl-ledger/api.py /etc/kl-ledger/api.env
+    sha256sum /opt/kl-ledger/api.py /etc/kl-ledger/api.env > "$KL_STATE/api.sum"
+    cat > /etc/systemd/system/kl-ledger-api.service <<'EOS'
+    [Unit]
+    Description=Ledger API
+
+    [Service]
+    EnvironmentFile=/etc/kl-ledger/api.env
+    ExecStart=/usr/bin/python3 /opt/kl-ledger/api.py
+
+    [Install]
+    WantedBy=multi-user.target
+    EOS
+    systemctl daemon-reload
+    systemctl enable --now kl-old-ledger 2>/dev/null
+    eventually 10 "ss -ltn 'sport = :8443' | grep -q LISTEN"
+    systemctl start kl-ledger-api 2>/dev/null || true
+  check: |
+    tok=$(cat "$KL_STATE/db.token" 2>/dev/null)
+
+    info "1. The old API is retired"
+    check "kl-old-ledger is not running" '! systemctl is-active -q kl-old-ledger'
+    check_match "kl-old-ledger won't start at boot" "$(systemctl is-enabled kl-old-ledger 2>/dev/null)" '^(disabled|masked)$'
+
+    info "2. The name"
+    got=$(timeout 5 getent hosts ledger-db.pay.internal 2>/dev/null | awk 'NR==1 {print $1}')
+    check_eq "ledger-db.pay.internal resolves to the new database" "$got" 10.77.2.10
+    check_eq "/etc/hosts gives no other address for it" "$(awk '$1 !~ /^#/ {for (i = 2; i <= NF; i++) if ($i == "ledger-db.pay.internal" && $1 != "10.77.2.10") print $1}' /etc/hosts)" ""
+
+    info "3. The path to the database"
+    check "the host sends 10.77.2.10 through the router" 'ip route get 10.77.2.10 | grep -q "via 10.77.1.254 dev kln-host"'
+    banner=$(timeout 6 bash -c 'exec 3<>/dev/tcp/10.77.2.10/6432 && head -1 <&3' 2>/dev/null)
+    check "a TCP connection to 10.77.2.10:6432 gets the greeting" '[ -n "$tok" ] && [[ $banner == "LEDGER-DB $tok "* ]]'
+    check_match "the database sees the host's own address, no NAT" "$banner" 'peer=10\.77\.1\.1$'
+
+    info "4. The route survives a reboot"
+    check_eq "kl-ledger-route.service is a oneshot" "$(systemctl show -p Type --value kl-ledger-route 2>/dev/null)" oneshot
+    check_eq "it stays active once it has run" "$(systemctl show -p RemainAfterExit --value kl-ledger-route 2>/dev/null)" yes
+    check_eq "it is enabled" "$(systemctl is-enabled kl-ledger-route 2>/dev/null)" enabled
+
+    info "5. The API's dependencies"
+    check "kl-ledger-api requires kl-ledger-route" 'systemctl show -p Requires -p BindsTo --value kl-ledger-api | grep -qw kl-ledger-route.service'
+    check "and is ordered after it" 'systemctl show -p After --value kl-ledger-api | grep -qw kl-ledger-route.service'
+    check_eq "kl-ledger-api is enabled" "$(systemctl is-enabled kl-ledger-api 2>/dev/null)" enabled
+    # a reboot, as far as these units are concerned
+    systemctl stop kl-ledger-api kl-ledger-route >/dev/null 2>&1
+    ip route del 10.77.2.0/24 >/dev/null 2>&1
+    systemctl reset-failed kl-ledger-api kl-ledger-route >/dev/null 2>&1
+    timeout 30 systemctl start kl-ledger-api >/dev/null 2>&1
+    sleep 1
+    systemctl is-active -q kl-ledger-api && eventually 10 "ss -ltn 'sport = :8443' | grep -q LISTEN"
+    check "starting only kl-ledger-api brings the route back and the API up" 'ip route get 10.77.2.10 | grep -q "via 10.77.1.254" && systemctl is-active -q kl-ledger-api'
+
+    info "6. The API works"
+    check "kl-ledger-api is active" 'systemctl is-active -q kl-ledger-api'
+    pid=$(systemctl show -p MainPID --value kl-ledger-api 2>/dev/null)
+    check "its own process listens on port 8443" '[ "${pid:-0}" != 0 ] && ss -ltnpH "sport = :8443" | grep -q "pid=$pid,"'
+    body=$(curl -s -m 8 http://127.0.0.1:8443/ 2>/dev/null)
+    check "curl 127.0.0.1:8443 returns ledger ok and the greeting" '[ -n "$tok" ] && [[ $body == "ledger ok: LEDGER-DB $tok peer=10.77.1.1" ]]'
+    check "api.py and api.env are unchanged" 'sha256sum -c --quiet "$KL_STATE/api.sum"'
+
+    info "7. The ledger network stays out"
+    if systemctl is-active -q kl-ledger-api && ip netns exec kln-db ping -c1 -W2 10.77.1.1 >/dev/null 2>&1; then
+      check_not "the database host can't open port 8443 on this host" 'ip netns exec kln-db curl -s -m 3 -o /dev/null http://10.77.1.1:8443/'
+      check "the database host still reaches the host otherwise (ping)" 'ip netns exec kln-db ping -c1 -W2 10.77.1.1'
+    else
+      fail "the database host can't open port 8443 on this host (the API isn't up, or the ledger network can't reach the host yet)"
+    fi
+  solve: |
+    # 1. the old API, which a plain kill won't stop
+    sudo systemctl disable --now kl-old-ledger
+
+    # 2. the first match in /etc/hosts wins (cp rewrites the file in place)
+    sed '/^10\.77\.9\.10[[:space:]].*ledger-db\.pay\.internal/d' /etc/hosts > /tmp/hosts
+    sudo cp /tmp/hosts /etc/hosts
+    rm -f /tmp/hosts
+
+    # 3. the database's way back, and the router's leftover drop
+    sudo ip -n kln-db route replace default via 10.77.2.254
+    sudo ip netns exec kln-rt iptables -D FORWARD 1
+
+    # 4. the route, owned by a unit
+    sudo tee /etc/systemd/system/kl-ledger-route.service >/dev/null <<'EOF'
+    [Unit]
+    Description=Route to the ledger network
+
+    [Service]
+    Type=oneshot
+    RemainAfterExit=yes
+    ExecStart=ip route replace 10.77.2.0/24 via 10.77.1.254 dev kln-host
+
+    [Install]
+    WantedBy=multi-user.target
+    EOF
+
+    # 5-6. the API needs the route, then start it
+    sudo mkdir -p /etc/systemd/system/kl-ledger-api.service.d
+    printf '[Unit]\nRequires=kl-ledger-route.service\nAfter=kl-ledger-route.service\n' | sudo tee /etc/systemd/system/kl-ledger-api.service.d/route.conf >/dev/null
+    sudo systemctl daemon-reload
+    sudo systemctl enable --now kl-ledger-route
+    sudo systemctl enable kl-ledger-api
+    sudo systemctl restart kl-ledger-api
+
+    # 7. shut the ledger network out of port 8443 only
+    sudo iptables -I INPUT -s 10.77.0.0/16 -p tcp --dport 8443 -j REJECT --reject-with tcp-reset

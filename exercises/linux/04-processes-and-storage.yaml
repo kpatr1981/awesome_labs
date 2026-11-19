@@ -676,3 +676,345 @@ exercises:
     fi
   solve: |
     sudo systemd-run --unit=kl-once --on-active=8s /opt/kl-once/stamp.sh
+
+# ===== Capstone: a real-world lab =====
+
+- id: linux-098
+  title: "Capstone: rescue the transcoding host"
+  difficulty: 5
+  kind: fix
+  tags: [capstone, signals, processes, nice, ionice, lsof, mount, tmpfs, fstab, bind-mount, systemd, environment, fifo]
+  tutorial: |
+    **Concept.** When a host is in trouble, every fix has a cost, and the skill is choosing the one that costs least: kill only what has to die, slow down what must keep running, and change storage without losing the data on it.
+
+    The tools from this module, and what each one is for here:
+
+    - **Signals and process trees.** A supervisor restarts what you kill, a process can ignore polite signals, and a shell script that backgrounds a function runs copies of *itself*. Look at the whole tree, act on the right names, and remember the one signal nothing can ignore.
+    - **Priorities.** CPU niceness and the I/O scheduling class are separate settings on a running process.
+    - **Who holds a filesystem.** A mount point is busy while any process has a file open on it *or its working directory inside it*. `lsof` and `fuser` answer that from the kernel's tables.
+    - **Mounts.** A tmpfs with a size cap limits a directory; mounting over a directory hides what was in it; a line in `/etc/fstab` brings a mount back after a reboot. A bind mount shows a directory at a second place, with options of its own.
+    - **Service configuration.** Values that vary or are secret belong in an environment file the unit points to, not in the world-readable unit.
+    - **Named pipes.** Opening a FIFO blocks until both ends exist, so the reader has to be running before you write.
+
+    **Read up on:**
+    - `ps -eo pid,ppid,ni,comm --forest`, `pkill -x`, `man 7 signal`
+    - `renice -n N -p PID`; `man ionice` — classes and priority levels (`-c`, `-n`, `-p`)
+    - `lsof MOUNTPOINT`, `fuser -vm MOUNTPOINT`; `umount` and what "target is busy" means
+    - `man mount` (tmpfs: `size`, `mode`, `uid`, `gid`; `--bind`, `remount,bind,ro`); `man fstab`; `findmnt` and `findmnt --fstab`
+    - `man systemd.exec` — `Environment=` versus `EnvironmentFile=`; `systemctl daemon-reload`
+    - `man mkfifo`, `[ -p FILE ]`
+  scenario: |
+    **Ticket MEDIA-140** — from Sam, video platform on-call, 03:10:
+
+    > The transcoding host is on its knees and the morning batch starts at 06:00. A
+    > colleague left a half-finished migration behind. I've written down what I found;
+    > please sort it out. **`transcode-api` serves customers: don't stop it, and don't
+    > lower its priority.**
+
+    1. **The runaway job tree.** **`transcode-sup`** keeps two **`transcode-wrk`** workers
+       running and starts new ones the moment one dies. Neither reacts to a plain `kill`.
+       Stop all of them so that **nothing named `transcode-sup` or `transcode-wrk` is
+       running** and nothing brings them back.
+    2. **The thumbnailer.** **`thumbnailer`** must keep running, but in the background:
+       niceness **10** and I/O class **best-effort** at priority **7** (the lowest).
+    3. **The old cache.** **`/srv/kl-old-cache`** has to be unmounted before the
+       migration can go on, but `umount` says it is busy. Whatever is holding it is a
+       leftover from the old setup: get rid of it and **unmount** the filesystem.
+    4. **The scratch area.** **`/srv/kl-transcode/scratch`** is a plain directory that keeps
+       growing. Turn it into a **tmpfs** on that same path with the size in
+       **`/lab/limits.txt`**, mode **0750**, owner and group **`kl-media`**, **all of the
+       existing files still there**, unchanged, and add it to **`/etc/fstab`** (same
+       options) so it comes back after a reboot.
+    5. **The renders.** Publish **`/srv/kl-media/renders`** for the web server at
+       **`/srv/kl-www/renders`** (it exists) as a **read-only bind mount**. The original
+       directory must stay writable.
+    6. **The transcoder service.** **`kl-transcode.service`** needs **`KL_QUEUE`** and
+       **`KL_API_KEY`**; the values are in **`/lab/transcode.conf`** (in a different
+       notation). Security also flagged that the API key is written in the unit itself.
+       Make it start with these rules: the values come from an **environment file**
+       referenced by the unit, that file is **not readable by other users**, and the key
+       appears **nowhere** in the unit or its drop-ins. Its queue, at the path `KL_QUEUE`
+       names, has to be a **named pipe**.
+    7. **The stuck job.** Once the transcoder is running, submit the job line in
+       **`/lab/job.txt`** through its queue. It must show up in
+       **`/srv/kl-transcode/accepted.log`**.
+  hints:
+    - "The tree: `ps -eo pid,ppid,stat,comm --forest | grep -e transcode -e thumb`. Count the `transcode-sup` processes. `pkill -f transcode` would also hit the API; `pkill -x` matches the exact name."
+    - "Neither ignores the one signal that can't be ignored. Take out every supervisor before the workers, or they start new ones."
+    - "The thumbnailer: `renice` and `ionice -c 2 -n 7`, both with `-p PID` and `sudo`. Read back with `ps -o ni= -p PID` and `ionice -p PID`."
+    - "The old cache: `sudo lsof /srv/kl-old-cache` lists every process with a file open there or its working directory inside it (`cwd`). `sudo fuser -vm` says the same."
+    - "Scratch: copy the files aside, mount the tmpfs (`size=Nm,mode=0750,uid=…,gid=…` with the numbers from `id kl-media`), copy them back. The fstab line is `tmpfs PATH tmpfs OPTIONS 0 0`; `findmnt --fstab PATH` reads it back. Renders: `mount --bind`, then `mount -o remount,bind,ro` on the new mount point."
+    - "The service: write `KL_QUEUE=…` and `KL_API_KEY=…` to a root-only file, replace the `Environment=` line with `EnvironmentFile=`, `daemon-reload`, `sudo mkfifo` the queue, restart. Only then `sudo sh -c 'cat /lab/job.txt > QUEUE'`: a write to a FIFO waits for the reader."
+  solution: |
+    ### 1. The runaway job tree
+
+    The supervisor backgrounds a loop per worker, so there are three `transcode-sup`
+    processes, and every one of them ignores TERM:
+
+    ```bash
+    ps -eo pid,ppid,stat,comm --forest | grep -e transcode
+    sudo pkill -KILL -x transcode-sup
+    sudo pkill -KILL -x transcode-wrk
+    ```
+
+    ### 2. The thumbnailer
+
+    ```bash
+    pid=$(pgrep -x thumbnailer)
+    sudo renice -n 10 -p "$pid"
+    sudo ionice -c 2 -n 7 -p "$pid"
+    ionice -p "$pid"
+    ```
+
+    ### 3. The old cache
+
+    One leftover has its working directory on the filesystem, another holds a file open:
+
+    ```bash
+    sudo lsof /srv/kl-old-cache
+    sudo kill -9 $(sudo lsof -t /srv/kl-old-cache)
+    sudo umount /srv/kl-old-cache
+    ```
+
+    ### 4. The scratch area
+
+    ```bash
+    n=$(sed 's/.*=//' /lab/limits.txt)
+    opts="size=${n}m,mode=0750,uid=$(id -u kl-media),gid=$(id -g kl-media)"
+    sudo cp -a /srv/kl-transcode/scratch /srv/kl-transcode/scratch.bak
+    sudo mount -t tmpfs -o "$opts" tmpfs /srv/kl-transcode/scratch
+    sudo cp -a /srv/kl-transcode/scratch.bak/* /srv/kl-transcode/scratch/
+    sudo rm -rf /srv/kl-transcode/scratch.bak
+    echo "tmpfs /srv/kl-transcode/scratch tmpfs $opts 0 0" | sudo tee -a /etc/fstab
+    findmnt --fstab /srv/kl-transcode/scratch
+    ```
+
+    ### 5. The renders
+
+    ```bash
+    sudo mount --bind /srv/kl-media/renders /srv/kl-www/renders
+    sudo mount -o remount,bind,ro /srv/kl-www/renders
+    findmnt /srv/kl-www/renders
+    ```
+
+    ### 6 and 7. The transcoder and the stuck job
+
+    ```bash
+    sudo install -d -m 700 /etc/kl-transcode
+    awk '/^queue:/{print "KL_QUEUE="$2} /^api_key:/{print "KL_API_KEY="$2}' /lab/transcode.conf \
+      | sudo tee /etc/kl-transcode/env >/dev/null
+    sudo chmod 600 /etc/kl-transcode/env
+    sudo sed -i 's#^Environment=KL_API_KEY=.*#EnvironmentFile=/etc/kl-transcode/env#' /etc/systemd/system/kl-transcode.service
+    sudo mkfifo -m 600 /srv/kl-transcode/queue
+    sudo systemctl daemon-reload
+    sudo systemctl restart kl-transcode
+    sudo sh -c 'cat /lab/job.txt > /srv/kl-transcode/queue'
+    sudo cat /srv/kl-transcode/accepted.log
+    ```
+  setup: |
+    mkdir -p /opt/kl-tc
+
+    # --- 1. the runaway tree, the API and the thumbnailer ---
+    on_reset 'pkill -KILL -x transcode-sup 2>/dev/null; pkill -KILL -x transcode-wrk 2>/dev/null; pkill -KILL -x transcode-api 2>/dev/null; pkill -KILL -x thumbnailer 2>/dev/null; true'
+    cat >/opt/kl-tc/transcode-wrk <<'EOS'
+    #!/bin/bash
+    trap '' TERM INT HUP
+    while :; do sleep 1; done
+    EOS
+    cat >/opt/kl-tc/transcode-sup <<'EOS'
+    #!/bin/bash
+    trap '' TERM INT HUP
+    keep() { while :; do /opt/kl-tc/transcode-wrk "$1"; sleep 0.2; done; }
+    keep 1 &
+    keep 2 &
+    wait
+    EOS
+    cat >/opt/kl-tc/transcode-api <<'EOS'
+    #!/bin/bash
+    while :; do sleep 1; done
+    EOS
+    cat >/opt/kl-tc/thumbnailer <<'EOS'
+    #!/bin/bash
+    n=0
+    while :; do n=$((n + 1)); sleep 0.05; done
+    EOS
+    chmod 755 /opt/kl-tc/transcode-* /opt/kl-tc/thumbnailer
+    for s in transcode-api thumbnailer transcode-sup; do
+      setsid /opt/kl-tc/$s </dev/null >/dev/null 2>&1 &
+    done
+    eventually 10 '[ "$(pgrep -cx transcode-wrk)" -ge 2 ] && pgrep -x thumbnailer && pgrep -x transcode-api'
+    pgrep -x transcode-api > "$KL_STATE/api.pid"
+
+    # --- 3. the old cache, held busy by two leftovers ---
+    on_reset 'for p in $(cat /var/lib/kubelab/oldcache.pids 2>/dev/null); do kill -9 $p 2>/dev/null; done; sleep 0.5; for i in 1 2 3; do umount /srv/kl-old-cache 2>/dev/null; done; rm -rf /srv/kl-old-cache; true'
+    mkdir -p /srv/kl-old-cache
+    mount -t tmpfs -o size=8m tmpfs /srv/kl-old-cache
+    mkdir -p /srv/kl-old-cache/sessions
+    echo "cache index $RANDOM" > /srv/kl-old-cache/index.db
+    setsid bash -c 'cd /srv/kl-old-cache/sessions && exec sleep 1000000' </dev/null >/dev/null 2>&1 &
+    setsid bash -c 'exec 5</srv/kl-old-cache/index.db; exec sleep 1000001' </dev/null >/dev/null 2>&1 &
+    eventually 10 '[ "$(lsof -t /srv/kl-old-cache 2>/dev/null | sort -u | wc -l)" -ge 2 ]'
+    lsof -t /srv/kl-old-cache 2>/dev/null | sort -u > "$KL_STATE/oldcache.pids"
+
+    # --- 4. the scratch area ---
+    cp /etc/fstab "$KL_STATE/fstab.orig"
+    on_reset 'for i in 1 2 3; do umount /srv/kl-transcode/scratch 2>/dev/null; done; cp /var/lib/kubelab/fstab.orig /etc/fstab; true'
+    on_reset 'userdel kl-media 2>/dev/null; groupdel kl-media 2>/dev/null; true'
+    useradd -r -M -s /usr/sbin/nologin kl-media
+    mkdir -p /srv/kl-transcode/scratch
+    n=$((12 + RANDOM % 20))
+    lab_file /lab/limits.txt <<<"scratch_size_mib=$n"
+    echo "$n" > "$KL_STATE/scratch.mib"
+    for f in seg-0001.ts seg-0002.ts seg-0003.ts manifest.m3u8; do
+      head -c $((3000 + RANDOM)) /dev/urandom | od -An -tx1 > "/srv/kl-transcode/scratch/$f"
+    done
+    chown -R kl-media:kl-media /srv/kl-transcode/scratch
+    chmod 755 /srv/kl-transcode/scratch
+    (cd /srv/kl-transcode/scratch && sha256sum ./*) > "$KL_STATE/scratch.sum"
+
+    # --- 5. the renders ---
+    on_reset 'for i in 1 2 3; do umount /srv/kl-www/renders 2>/dev/null; done; rm -rf /srv/kl-www /srv/kl-media; true'
+    mkdir -p /srv/kl-media/renders /srv/kl-www/renders
+    tok="render-$(head -c6 /dev/urandom | od -An -tx1 | tr -d ' \n')"
+    echo "$tok" > /srv/kl-media/renders/latest.txt
+    echo "$tok" > "$KL_STATE/render"
+
+    # --- 6-7. the transcoder ---
+    on_reset 'systemctl stop kl-transcode 2>/dev/null; rm -rf /etc/systemd/system/kl-transcode.service /etc/systemd/system/kl-transcode.service.d /etc/kl-transcode /run/kl-transcode.key; systemctl daemon-reload; systemctl reset-failed 2>/dev/null; rm -rf /srv/kl-transcode /opt/kl-tc; true'
+    cat >/opt/kl-tc/transcoder.sh <<'EOS'
+    #!/bin/bash
+    : "${KL_QUEUE:?KL_QUEUE is not set}" "${KL_API_KEY:?KL_API_KEY is not set}"
+    [ -p "$KL_QUEUE" ] || { echo "transcoder: $KL_QUEUE is not a named pipe" >&2; exit 1; }
+    umask 077
+    printf 'key=%s\n' "$(printf %s "$KL_API_KEY" | sha256sum | cut -c1-16)" > /run/kl-transcode.key
+    while :; do
+      while IFS= read -r job; do echo "accepted $job" >> /srv/kl-transcode/accepted.log; done < "$KL_QUEUE"
+    done
+    EOS
+    chmod 755 /opt/kl-tc/transcoder.sh
+    key="tk_$(head -c12 /dev/urandom | od -An -tx1 | tr -d ' \n')"
+    echo "$key" > "$KL_STATE/key"
+    printf 'key=%s\n' "$(printf %s "$key" | sha256sum | cut -c1-16)" > "$KL_STATE/key.seen"
+    cat >/etc/systemd/system/kl-transcode.service <<EOS
+    [Unit]
+    Description=kubelab transcoder
+
+    [Service]
+    Environment=KL_API_KEY=$key
+    ExecStart=/opt/kl-tc/transcoder.sh
+    Restart=on-failure
+    RestartSec=5
+    EOS
+    systemctl daemon-reload
+    systemctl start kl-transcode 2>/dev/null || true
+    lab_file /lab/transcode.conf <<EOS
+    # transcoder settings (from the old host)
+    queue: /srv/kl-transcode/queue
+    api_key: $key
+    EOS
+    job="job-$(head -c4 /dev/urandom | od -An -tx1 | tr -d ' \n') input=/srv/kl-media/in/keynote.mov preset=1080p"
+    echo "$job" > "$KL_STATE/job"
+    lab_file /lab/job.txt <<<"$job"
+  check: |
+    info "1. The runaway job tree"
+    check "no transcode-sup is running" 'eventually 6 "! pgrep -x transcode-sup"'
+    check "no transcode-wrk is running" 'eventually 6 "! pgrep -x transcode-wrk"'
+    sleep 1
+    check "nothing was respawned" '! pgrep -x transcode-sup && ! pgrep -x transcode-wrk'
+    api=$(cat "$KL_STATE/api.pid")
+    check "transcode-api is still running, same process" 'kill -0 "$api" && [ "$(ps -o comm= -p "$api")" = transcode-api ]'
+    check_eq "transcode-api still has niceness 0" "$(ps -o ni= -p "$api" 2>/dev/null | tr -d ' ')" 0
+
+    info "2. The thumbnailer"
+    t=$(pgrep -x thumbnailer | head -1)
+    if [ -n "$t" ]; then
+      check_eq "thumbnailer niceness" "$(ps -o ni= -p "$t" | tr -d ' ')" 10
+      check_match "thumbnailer I/O class" "$(ionice -p "$t" 2>/dev/null)" '^best-effort: prio 7$'
+    else
+      fail "thumbnailer is still running (do not stop it)"
+    fi
+
+    info "3. The old cache"
+    check_not "/srv/kl-old-cache is unmounted" 'findmnt -n /srv/kl-old-cache'
+    alive=0
+    for p in $(cat "$KL_STATE/oldcache.pids"); do kill -0 "$p" 2>/dev/null && alive=$((alive + 1)); done
+    check_eq "the leftovers holding it are gone" "$alive" 0
+
+    info "4. The scratch area"
+    d=/srv/kl-transcode/scratch
+    n=$(cat "$KL_STATE/scratch.mib")
+    check_eq "mounted as tmpfs" "$(findmnt -no FSTYPE "$d" 2>/dev/null)" tmpfs
+    check_eq "size cap in bytes" "$(stat -f -c '%b %S' "$d" 2>/dev/null | awk '{print $1*$2}')" "$((n * 1048576))"
+    check_eq "mode and owner" "$(stat -c '%a %U:%G' "$d" 2>/dev/null)" "750 kl-media:kl-media"
+    check "all existing files are there, unchanged" '(cd "$d" && sha256sum -c --quiet "$KL_STATE/scratch.sum")'
+    fl=$(awk -v p="$d" '$1 !~ /^#/ && ($2 == p || $2 == p "/")' /etc/fstab | tail -1)
+    fopts=$(awk '{print $4}' <<<"$fl")
+    fsize=$(tr , '\n' <<<"$fopts" | sed -n 's/^size=//p' | tail -1)
+    to_bytes() { case "$1" in *[kK]) echo $((${1%?} * 1024)) ;; *[mM]) echo $((${1%?} * 1048576)) ;; *[gG]) echo $((${1%?} * 1073741824)) ;; *[0-9]) echo "$1" ;; esac; }
+    check_eq "/etc/fstab mounts a tmpfs there" "$(awk '{print $3}' <<<"$fl")" tmpfs
+    check "the fstab entry has the same size and mode" '[ "$(to_bytes "$fsize")" = "$((n * 1048576))" ] && tr , "\n" <<<"$fopts" | grep -qxE "mode=0?750"'
+
+    info "5. The renders"
+    w=/srv/kl-www/renders
+    check "renders is its own mount point" 'findmnt -n "$w"'
+    check "the web view is read-only" 'findmnt -no OPTIONS "$w" | tr , "\n" | grep -qx ro'
+    check "it is a bind of the same files" '[ "$(cat "$w/latest.txt" 2>/dev/null)" = "$(cat "$KL_STATE/render")" ] && [ "$(stat -c %d:%i "$w/latest.txt")" = "$(stat -c %d:%i /srv/kl-media/renders/latest.txt)" ]'
+    check "the original renders directory is still writable" ': > /srv/kl-media/renders/.probe && rm -f /srv/kl-media/renders/.probe'
+
+    info "6. The transcoder service"
+    key=$(cat "$KL_STATE/key")
+    check "kl-transcode is active" 'systemctl is-active -q kl-transcode'
+    check_eq "it started with the right API key" "$(cat /run/kl-transcode.key 2>/dev/null)" "$(cat "$KL_STATE/key.seen")"
+    ef=$(systemctl show kl-transcode -p EnvironmentFiles --value 2>/dev/null | awk '{print $1}' | sed 's/^-//')
+    check "the unit references an environment file" '[ -n "$ef" ] && [ -f "$ef" ]'
+    check "the environment file is not readable by others" '[ -n "$ef" ] && [ -f "$ef" ] && [ $(( 8#$(stat -c %a "$ef") & 7 )) -eq 0 ]'
+    check "the key is nowhere in the unit or its drop-ins" '! grep -rqF "$key" /etc/systemd/system/kl-transcode.service /etc/systemd/system/kl-transcode.service.d /run/systemd/system/kl-transcode.service.d 2>/dev/null'
+    check "the queue /srv/kl-transcode/queue is a named pipe" '[ -p /srv/kl-transcode/queue ]'
+
+    info "7. The stuck job"
+    job=$(cat "$KL_STATE/job")
+    if systemctl is-active -q kl-transcode || [ -f /srv/kl-transcode/accepted.log ]; then
+      check "the job reached accepted.log" 'eventually 6 "grep -qxF \"accepted \$job\" /srv/kl-transcode/accepted.log"'
+    else
+      fail "the job reached accepted.log (the transcoder isn't running)"
+    fi
+  solve: |
+    # 1. every supervisor copy first, then the workers; none of them obeys TERM
+    sudo pkill -KILL -x transcode-sup
+    sudo pkill -KILL -x transcode-wrk
+
+    # 2. the thumbnailer
+    pid=$(pgrep -x thumbnailer | head -1)
+    sudo renice -n 10 -p "$pid"
+    sudo ionice -c 2 -n 7 -p "$pid"
+
+    # 3. the old cache
+    sudo kill -9 $(sudo lsof -t /srv/kl-old-cache)
+    sleep 1
+    sudo umount /srv/kl-old-cache
+
+    # 4. the scratch area
+    n=$(sed 's/.*=//' /lab/limits.txt)
+    opts="size=${n}m,mode=0750,uid=$(id -u kl-media),gid=$(id -g kl-media)"
+    sudo cp -a /srv/kl-transcode/scratch /srv/kl-transcode/scratch.bak
+    sudo mount -t tmpfs -o "$opts" tmpfs /srv/kl-transcode/scratch
+    sudo cp -a /srv/kl-transcode/scratch.bak/* /srv/kl-transcode/scratch/
+    sudo rm -rf /srv/kl-transcode/scratch.bak
+    echo "tmpfs /srv/kl-transcode/scratch tmpfs $opts 0 0" | sudo tee -a /etc/fstab >/dev/null
+
+    # 5. the renders
+    sudo mount --bind /srv/kl-media/renders /srv/kl-www/renders
+    sudo mount -o remount,bind,ro /srv/kl-www/renders
+
+    # 6. the transcoder
+    sudo install -d -m 700 /etc/kl-transcode
+    awk '/^queue:/{print "KL_QUEUE="$2} /^api_key:/{print "KL_API_KEY="$2}' /lab/transcode.conf | sudo tee /etc/kl-transcode/env >/dev/null
+    sudo chmod 600 /etc/kl-transcode/env
+    sudo sed -i 's#^Environment=KL_API_KEY=.*#EnvironmentFile=/etc/kl-transcode/env#' /etc/systemd/system/kl-transcode.service
+    sudo mkfifo -m 600 /srv/kl-transcode/queue
+    sudo systemctl daemon-reload
+    sudo systemctl restart kl-transcode
+
+    # 7. the stuck job, once the reader is up
+    sleep 1
+    sudo timeout 10 sh -c 'cat /lab/job.txt > /srv/kl-transcode/queue'

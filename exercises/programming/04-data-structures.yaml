@@ -1484,3 +1484,613 @@ exercises:
 
     func main() {}
     GO
+
+# ===== Capstone: a real-world lab =====
+
+- id: prog-084
+  title: "Capstone: the courier dispatch board"
+  difficulty: 5
+  kind: build
+  tags: [capstone, python, generators, bisect, binary-search, heapq, priority-queue, lru, ordereddict, ring-buffer, deque, defaultdict, sorting]
+  tutorial: |
+    **Concept.** A dispatch board is a handful of small data structures, each
+    picked so its one job stays cheap when the feed gets big:
+
+    - **A generator for the feed.** A function with `yield` hands out one
+      parsed record at a time, so the first job is ready after reading one
+      line, not after reading the whole day.
+    - **Binary search for bands.** Looking a value up in a sorted list of
+      boundaries takes about log2(n) comparisons. A loop over the list reads
+      every element up to the answer, and every boundary bug lives in
+      "less than" versus "less than or equal".
+    - **A heap for urgency.** `heapq` keeps the smallest entry on top. It
+      compares whole entries, so an entry needs a key that settles ties and
+      never falls through to comparing the payloads.
+    - **An ordered mapping for an LRU cache.** Moving a key to the end on
+      every use and dropping from the front when full gives O(1) eviction.
+    - **A bounded queue for "the last N".** A ring buffer (or a
+      `deque(maxlen=N)`) forgets the oldest value as each new one arrives.
+    - **Grouping and multi-key sorting.** `defaultdict(list)` collects items
+      per key; a sort key tuple settles ties field by field, and `sorted`
+      leaves its input alone where `list.sort` does not.
+
+    **Read up on:**
+    - `python3 -c "help(bisect.bisect_left)"` — and what it does on a sequence that isn't a list
+    - `python3 -c "help(heapq)"` and `itertools.count`
+    - `collections.OrderedDict.move_to_end`, `popitem(last=False)`
+    - `collections.deque` with `maxlen`
+    - `collections.defaultdict` — and why to return a plain `dict`
+    - sort keys: negating a number to sort it highest first; `sorted` versus `list.sort`
+
+    Try your code with `python3 -B -i dispatch.py`.
+  scenario: |
+    **DISP-512**, from Rania on the dispatch team of a bike-courier company:
+    *"The dispatch board is a 2,000-line script that re-reads the whole day's
+    job feed every minute, sends express parcels out after the cheap ones,
+    hammers the rider-profile service on every refresh, and shuffles the
+    loading list each time we print it. We're moving its logic into a small
+    library. The stubs and docstrings are in `/lab/dispatch.py`; two of them
+    still hold the old script's code."*
+
+    A job is the `Job(id, zone, priority, weight)` namedtuple defined in the
+    file. Hidden `unittest` tests import the module, one test per item:
+
+    1. **The feed.** **`read_jobs(lines)`** takes any iterable of text lines
+       like `J-1042, North ,2,3.5` and yields `Job("J-1042", "north", 2, 3.5)`:
+       fields stripped, zone lower-cased, priority an `int`, weight a
+       `float`. Blank lines and lines starting with `#` are skipped. It must
+       be **lazy**: the first job is available after reading only the lines
+       up to it. A data line without exactly four fields raises `ValueError`.
+    2. **Weight bands.** **`band_for(weight, limits)`**: `limits` is a sorted
+       list of upper limits in kg (inclusive). Return the index of the first
+       band whose limit is **≥** `weight`, or `-1` if the parcel is heavier
+       than every band (or there are none). The old code puts a 5 kg parcel
+       in the wrong band and reads the list one element at a time; it must
+       do a **binary search** (the test counts how many elements it reads
+       from a list of a million limits).
+    3. **The queue.** **`DispatchQueue`**: `push(priority, job)`, `pop()`
+       returns the job with the **lowest** priority number, `peek()` returns
+       it without removing it, jobs with equal priority come out in the
+       order they were pushed, jobs can be anything (including `dict`s), and
+       `pop()`/`peek()` on an empty queue raise `IndexError`. `len()` works.
+    4. **Rider profiles.** **`ProfileCache(capacity, loader)`**: `get(rider)`
+       returns the cached profile, or calls `loader(rider)` and caches the
+       result. It holds at most `capacity` profiles and drops the **least
+       recently used** one (a `get` counts as a use). It counts `hits` and
+       `misses`. A falsy profile such as `{}` is still a cached profile; if
+       `loader` raises, nothing is cached and the error propagates.
+    5. **Recent delivery times.** **`EtaWindow(size)`**: `add(minutes)`;
+       `recent()` returns the last `size` values, oldest first, as a new list;
+       `average()` is their mean, or `None` when nothing was added.
+    6. **Per-zone summary.** **`by_zone(jobs)`** returns a **plain `dict`**
+       with the zones in alphabetical order, each mapping to the list of its
+       job ids ordered by priority, then id.
+    7. **The loading list.** **`manifest(jobs)`** takes any iterable of jobs
+       and returns one line per job, `"<zone> P<priority> <weight>kg <id>\n"`
+       with the weight to one decimal (`north P1 12.0kg J-7`), sorted by
+       zone, then priority, then weight **heaviest first**, then id. It must
+       **not reorder the caller's list**. No jobs give `""`.
+  hints:
+    - "Item 1: write `read_jobs` as a `for line in lines:` loop that `yield`s; `line.split(\",\")` plus a length check gives the `ValueError`."
+    - "Item 2: `bisect.bisect_left(limits, weight)` is the index of the first limit `>= weight`; it equals `len(limits)` when every limit is smaller."
+    - "Item 3: push `(priority, next(counter), job)` so ties are settled by the counter and the job is never compared; `heap[0]` is the top for `peek`."
+    - "Item 4: an `OrderedDict`, `move_to_end(rider)` on a hit, `popitem(last=False)` when over capacity; test hits with `in`, not with the value's truthiness."
+    - "Item 5: `deque(maxlen=size)` forgets the oldest value by itself; return `list(...)` of it."
+    - "Items 6 and 7: `sorted(jobs, key=lambda j: (j.zone, j.priority, -j.weight, j.id))` both sorts and copies; `defaultdict(list)` then `dict(sorted(...items()))`."
+  solution: |
+    The full file is what `solve` writes. Item by item:
+
+    1. `read_jobs` is a generator: `for line in lines:` strip, `continue` on
+       blank or `#` lines, split on `,`, raise `ValueError` unless there are
+       four fields, and `yield Job(id, zone.lower(), int(p), float(w))`.
+    2. The old loop used `weight < limit` (a parcel on a limit went one band
+       up) and read every limit. Use the standard binary search:
+       ```python
+       i = bisect.bisect_left(limits, weight)
+       return i if i < len(limits) else -1
+       ```
+    3. Push `(priority, next(self._seq), job)` with `self._seq =
+       itertools.count()`: the counter settles ties in push order and the job
+       is never compared. `pop` is `heappop(...)[2]`; `peek` raises
+       `IndexError` on an empty heap, else returns `self._heap[0][2]`.
+    4. An `OrderedDict`: on `rider_id in self._data` count a hit and
+       `move_to_end`; otherwise count a miss, call the loader **first** (so a
+       failure caches nothing), store, and `popitem(last=False)` when over
+       capacity.
+    5. `self._buf = deque(maxlen=size)`; `recent()` is `list(self._buf)`;
+       `average()` is `None` when empty, else `sum / len`.
+    6. Sort by `(priority, id)`, append ids to a `defaultdict(list)` per
+       zone, and return `dict(sorted(groups.items()))`.
+    7. The old code called `jobs.sort(...)` (reordering the caller's list,
+       and failing on a generator) with a key that left ties to chance:
+       ```python
+       return "".join(f"{j.zone} P{j.priority} {j.weight:.1f}kg {j.id}\n"
+                      for j in sorted(jobs, key=lambda j: (j.zone, j.priority, -j.weight, j.id)))
+       ```
+  setup: |
+    lab_file /lab/dispatch.py <<'EOF'
+    """Dispatch board helpers (DISP-512)."""
+    from collections import namedtuple
+
+    Job = namedtuple("Job", "id zone priority weight")
+
+
+    def read_jobs(lines):
+        """Yield a Job for every data line of the feed, lazily."""
+        raise NotImplementedError
+
+
+    def band_for(weight, limits):
+        """Index of the first band whose upper limit is >= weight, or -1."""
+        for i, limit in enumerate(limits):
+            if weight < limit:
+                return i
+        return -1
+
+
+    class DispatchQueue:
+        """Most urgent (lowest priority number) first; ties in push order."""
+
+        def __init__(self):
+            self._heap = []
+
+        def push(self, priority, job):
+            raise NotImplementedError
+
+        def pop(self):
+            raise NotImplementedError
+
+        def peek(self):
+            raise NotImplementedError
+
+        def __len__(self):
+            return len(self._heap)
+
+
+    class ProfileCache:
+        """Keeps the `capacity` most recently used rider profiles."""
+
+        def __init__(self, capacity, loader):
+            self.capacity = capacity
+            self.loader = loader
+            self.hits = 0
+            self.misses = 0
+
+        def get(self, rider_id):
+            return self.loader(rider_id)
+
+
+    class EtaWindow:
+        """The last `size` delivery times, in minutes."""
+
+        def __init__(self, size):
+            self.size = size
+
+        def add(self, minutes):
+            raise NotImplementedError
+
+        def recent(self):
+            raise NotImplementedError
+
+        def average(self):
+            raise NotImplementedError
+
+
+    def by_zone(jobs):
+        """{zone: [job ids by priority, then id]}, zones alphabetical."""
+        raise NotImplementedError
+
+
+    def manifest(jobs):
+        """The loading list, one line per job."""
+        jobs.sort(key=lambda j: (j.zone, j.priority))
+        out = ""
+        for j in jobs:
+            out += f"{j.zone} P{j.priority} {j.weight:.1f}kg {j.id}\n"
+        return out
+    EOF
+  check: |
+    d=$(mktemp -d)
+    # pyt "description" <<'PY' ... PY -> run one hidden unittest file against /lab/dispatch.py
+    pyt() {
+      local rc out
+      cat >"$d/t.py"
+      out=$(cd /lab && PYTHONPATH=/lab timeout 120 python3 -B "$d/t.py" 2>&1); rc=$?
+      check "$1" '[ "$rc" -eq 0 ]'
+      [ "$rc" -eq 0 ] || grep -E '^(FAIL|ERROR):|^[A-Za-z.]*(Error|Exception)\b' <<<"$out" | head -n 6 | sed 's/^/      /'
+    }
+
+    pyt "1. read_jobs parses the feed, lazily" <<'PY'
+    import unittest
+    from dispatch import read_jobs, Job
+
+    class T(unittest.TestCase):
+        def test_parse(self):
+            lines = ["# feed v2\n", "J-1042, North ,2,3.5\n", "\n", "   \n",
+                     "  # comment\n", "J-7,SOUTH,0, 12\n", "J-9,east,1,0.25"]
+            self.assertEqual(list(read_jobs(lines)), [
+                Job("J-1042", "north", 2, 3.5), Job("J-7", "south", 0, 12.0),
+                Job("J-9", "east", 1, 0.25)])
+            j = next(read_jobs(["a,b,3,4\n"]))
+            self.assertIs(type(j.priority), int)
+            self.assertIs(type(j.weight), float)
+            self.assertEqual(list(read_jobs([])), [])
+
+        def test_lazy(self):
+            pulled = []
+            def feed():
+                for i in range(100000):
+                    pulled.append(i)
+                    yield "# header\n" if i == 0 else f"J-{i},z{i % 3},{i % 4},1.5\n"
+            it = read_jobs(feed())
+            self.assertEqual(next(it).id, "J-1")
+            self.assertLessEqual(len(pulled), 3)
+            self.assertEqual(next(it).id, "J-2")
+            self.assertLessEqual(len(pulled), 4)
+
+        def test_bad_line(self):
+            with self.assertRaises(ValueError):
+                list(read_jobs(["J-1,north,1\n"]))
+            with self.assertRaises(ValueError):
+                list(read_jobs(["J-1,north,1,2,3\n"]))
+
+    unittest.main()
+    PY
+
+    pyt "2. band_for finds the right band with a binary search" <<'PY'
+    import unittest
+    from dispatch import band_for
+
+    class Counting:
+        def __init__(self, n):
+            self.n, self.reads = n, 0
+        def __len__(self):
+            return self.n
+        def __getitem__(self, i):
+            if isinstance(i, slice):
+                raise TypeError("no slicing, please")
+            if i < 0:
+                i += self.n
+            if not 0 <= i < self.n:
+                raise IndexError(i)
+            self.reads += 1
+            return (i + 1) * 0.5
+
+    class T(unittest.TestCase):
+        def test_brute_force(self):
+            for limits in ([], [5], [2, 5, 10, 20], [1.5, 3, 3.5, 30, 31]):
+                for w in [0, 0.1, 1.5, 2, 2.01, 3, 4.9, 5, 5.5, 10, 19.99, 20, 20.5, 31, 99]:
+                    want = next((i for i, l in enumerate(limits) if l >= w), -1)
+                    self.assertEqual(band_for(w, limits), want, (w, limits))
+
+        def test_on_the_limit(self):
+            self.assertEqual(band_for(5, [2, 5, 10]), 1)
+            self.assertEqual(band_for(10, [2, 5, 10]), 2)
+            self.assertEqual(band_for(10.01, [2, 5, 10]), -1)
+
+        def test_binary_search(self):
+            for w, want in [(0.5, 0), (250000, 499999), (499999.75, 999999), (500001, -1)]:
+                seq = Counting(1000000)
+                self.assertEqual(band_for(w, seq), want)
+                self.assertLessEqual(seq.reads, 60, f"read {seq.reads} limits for one lookup")
+
+    unittest.main()
+    PY
+
+    pyt "3. DispatchQueue serves the most urgent job first, ties in arrival order" <<'PY'
+    import unittest
+    from dispatch import DispatchQueue
+
+    class T(unittest.TestCase):
+        def test_order_and_ties(self):
+            q = DispatchQueue()
+            for p, j in [(2, "std-1"), (0, "express-1"), (2, "std-2"), (1, "next-day"), (0, "express-2"), (2, "std-3")]:
+                q.push(p, j)
+            self.assertEqual(len(q), 6)
+            self.assertEqual([q.pop() for _ in range(6)],
+                             ["express-1", "express-2", "next-day", "std-1", "std-2", "std-3"])
+            self.assertEqual(len(q), 0)
+
+        def test_dicts_and_peek(self):
+            q = DispatchQueue()
+            for n in range(5):
+                q.push(1, {"id": n})
+            q.push(1.5, {"id": "late"})
+            self.assertEqual(q.peek(), {"id": 0})
+            self.assertEqual(len(q), 6)
+            self.assertEqual([q.pop()["id"] for _ in range(6)], [0, 1, 2, 3, 4, "late"])
+
+        def test_interleaved(self):
+            q = DispatchQueue()
+            q.push(3, "c"); q.push(1, "a")
+            self.assertEqual(q.pop(), "a")
+            q.push(1, "a2"); q.push(-1, "now")
+            self.assertEqual(q.peek(), "now")
+            self.assertEqual([q.pop() for _ in range(3)], ["now", "a2", "c"])
+
+        def test_empty(self):
+            q = DispatchQueue()
+            with self.assertRaises(IndexError):
+                q.pop()
+            with self.assertRaises(IndexError):
+                q.peek()
+            q.push(1, "x"); q.pop()
+            with self.assertRaises(IndexError):
+                q.pop()
+
+    unittest.main()
+    PY
+
+    pyt "4. ProfileCache keeps the most recently used profiles" <<'PY'
+    import unittest
+    from dispatch import ProfileCache
+
+    class T(unittest.TestCase):
+        def test_lru(self):
+            calls = []
+            def load(r):
+                calls.append(r)
+                return {"rider": r}
+            c = ProfileCache(2, load)
+            self.assertEqual(c.get("ana"), {"rider": "ana"})
+            c.get("ben")
+            c.get("ana")
+            c.get("cy")
+            self.assertEqual(calls, ["ana", "ben", "cy"])
+            c.get("ana"); c.get("cy")
+            self.assertEqual(calls, ["ana", "ben", "cy"])
+            c.get("ben")
+            self.assertEqual(calls, ["ana", "ben", "cy", "ben"])
+            self.assertEqual((c.hits, c.misses), (3, 4))
+
+        def test_falsy_profiles(self):
+            calls = []
+            def load(r):
+                calls.append(r)
+                return {} if r == "new" else 0
+            c = ProfileCache(3, load)
+            self.assertEqual(c.get("new"), {})
+            self.assertEqual(c.get("new"), {})
+            self.assertEqual(c.get("zero"), 0)
+            self.assertEqual(c.get("zero"), 0)
+            self.assertEqual(calls, ["new", "zero"])
+            self.assertEqual(c.hits, 2)
+
+        def test_failed_load(self):
+            n = {"calls": 0}
+            def load(r):
+                n["calls"] += 1
+                if n["calls"] == 1:
+                    raise ConnectionError("profile service down")
+                return {"rider": r}
+            c = ProfileCache(2, load)
+            with self.assertRaises(ConnectionError):
+                c.get("dee")
+            self.assertEqual(c.get("dee"), {"rider": "dee"})
+            self.assertEqual(c.get("dee"), {"rider": "dee"})
+            self.assertEqual(n["calls"], 2)
+
+        def test_bounded(self):
+            calls = []
+            c = ProfileCache(3, lambda r: calls.append(r) or r * 2)
+            for i in range(50):
+                c.get(i)
+            self.assertEqual([c.get(i) for i in (47, 48, 49)], [94, 96, 98])
+            self.assertEqual(len(calls), 50)
+            c.get(46)
+            self.assertEqual(calls[-1], 46)
+            self.assertEqual(len(calls), 51)
+
+    unittest.main()
+    PY
+
+    pyt "5. EtaWindow keeps the last N delivery times" <<'PY'
+    import unittest
+    from dispatch import EtaWindow
+
+    class T(unittest.TestCase):
+        def test_window(self):
+            w = EtaWindow(3)
+            self.assertEqual(w.recent(), [])
+            self.assertIsNone(w.average())
+            w.add(10); w.add(20)
+            self.assertEqual(w.recent(), [10, 20])
+            self.assertAlmostEqual(w.average(), 15)
+            for m in (30, 40, 50):
+                w.add(m)
+            self.assertEqual(w.recent(), [30, 40, 50])
+            self.assertAlmostEqual(w.average(), 40)
+
+        def test_wraps(self):
+            for size in (1, 2, 7):
+                w = EtaWindow(size)
+                for i in range(1, 60):
+                    w.add(i)
+                    want = list(range(max(1, i - size + 1), i + 1))
+                    self.assertEqual(w.recent(), want)
+                    self.assertAlmostEqual(w.average(), sum(want) / len(want))
+
+        def test_copy(self):
+            w = EtaWindow(4)
+            w.add(5); w.add(6)
+            r = w.recent()
+            r.append(999); r[0] = -1
+            self.assertEqual(w.recent(), [5, 6])
+            self.assertIsInstance(r, list)
+
+    unittest.main()
+    PY
+
+    pyt "6. by_zone groups job ids per zone" <<'PY'
+    import unittest
+    from dispatch import by_zone, Job
+
+    class T(unittest.TestCase):
+        def test_groups(self):
+            jobs = [Job("J-5", "south", 2, 1.0), Job("J-2", "north", 1, 2.0),
+                    Job("J-9", "east", 0, 3.0), Job("J-1", "north", 1, 1.0),
+                    Job("J-3", "south", 0, 4.0), Job("J-4", "north", 0, 9.0)]
+            got = by_zone(jobs)
+            self.assertEqual(got, {"east": ["J-9"], "north": ["J-4", "J-1", "J-2"],
+                                   "south": ["J-3", "J-5"]})
+            self.assertEqual(list(got), ["east", "north", "south"])
+
+        def test_plain_dict(self):
+            got = by_zone([Job("J-1", "west", 1, 1.0)])
+            self.assertIs(type(got), dict)
+            with self.assertRaises(KeyError):
+                got["nowhere"]
+            self.assertEqual(by_zone([]), {})
+
+        def test_iterable(self):
+            got = by_zone(j for j in [Job("b", "z", 1, 1.0), Job("a", "z", 1, 1.0)])
+            self.assertEqual(got, {"z": ["a", "b"]})
+
+    unittest.main()
+    PY
+
+    pyt "7. manifest sorts by zone, priority, weight and id without touching its input" <<'PY'
+    import unittest
+    from dispatch import manifest, read_jobs, Job
+
+    class T(unittest.TestCase):
+        def test_order(self):
+            jobs = [Job("J-3", "north", 1, 2.0), Job("J-1", "north", 1, 12.0),
+                    Job("J-8", "east", 2, 1.0), Job("J-2", "north", 0, 0.5),
+                    Job("J-6", "north", 1, 2.0), Job("J-4", "east", 2, 7.3)]
+            before = list(jobs)
+            self.assertEqual(manifest(jobs),
+                             "east P2 7.3kg J-4\n"
+                             "east P2 1.0kg J-8\n"
+                             "north P0 0.5kg J-2\n"
+                             "north P1 12.0kg J-1\n"
+                             "north P1 2.0kg J-3\n"
+                             "north P1 2.0kg J-6\n")
+            self.assertEqual(jobs, before, "manifest reordered the caller's list")
+
+        def test_empty_and_generator(self):
+            self.assertEqual(manifest([]), "")
+            self.assertEqual(manifest(read_jobs(["b,y,1,1\n", "a,x,1,1\n"])),
+                             "x P1 1.0kg a\ny P1 1.0kg b\n")
+            self.assertEqual(manifest(iter([Job("q", "z", 0, 3.0)])), "z P0 3.0kg q\n")
+
+        def test_shuffled_inputs_agree(self):
+            import random
+            jobs = [Job(f"J-{i % 13}", f"z{i % 3}", i % 4, float(i % 5)) for i in range(300)]
+            first = manifest(jobs)
+            r = random.Random(7)
+            for _ in range(5):
+                r.shuffle(jobs)
+                self.assertEqual(manifest(jobs), first)
+
+    unittest.main()
+    PY
+    rm -rf "$d"
+  solve: |
+    cat > /lab/dispatch.py <<'PY'
+    """Dispatch board helpers (DISP-512)."""
+    import bisect
+    import heapq
+    import itertools
+    from collections import OrderedDict, defaultdict, deque, namedtuple
+
+    Job = namedtuple("Job", "id zone priority weight")
+
+
+    def read_jobs(lines):
+        """Yield a Job for every data line of the feed, lazily."""
+        for line in lines:
+            line = line.strip()
+            if not line or line.startswith("#"):
+                continue
+            parts = [p.strip() for p in line.split(",")]
+            if len(parts) != 4:
+                raise ValueError(f"bad feed line: {line!r}")
+            yield Job(parts[0], parts[1].lower(), int(parts[2]), float(parts[3]))
+
+
+    def band_for(weight, limits):
+        """Index of the first band whose upper limit is >= weight, or -1."""
+        i = bisect.bisect_left(limits, weight)
+        return i if i < len(limits) else -1
+
+
+    class DispatchQueue:
+        """Most urgent (lowest priority number) first; ties in push order."""
+
+        def __init__(self):
+            self._heap = []
+            self._seq = itertools.count()
+
+        def push(self, priority, job):
+            heapq.heappush(self._heap, (priority, next(self._seq), job))
+
+        def pop(self):
+            return heapq.heappop(self._heap)[2]
+
+        def peek(self):
+            if not self._heap:
+                raise IndexError("peek from an empty queue")
+            return self._heap[0][2]
+
+        def __len__(self):
+            return len(self._heap)
+
+
+    class ProfileCache:
+        """Keeps the `capacity` most recently used rider profiles."""
+
+        def __init__(self, capacity, loader):
+            self.capacity = capacity
+            self.loader = loader
+            self.hits = 0
+            self.misses = 0
+            self._data = OrderedDict()
+
+        def get(self, rider_id):
+            if rider_id in self._data:
+                self.hits += 1
+                self._data.move_to_end(rider_id)
+                return self._data[rider_id]
+            self.misses += 1
+            profile = self.loader(rider_id)
+            self._data[rider_id] = profile
+            if len(self._data) > self.capacity:
+                self._data.popitem(last=False)
+            return profile
+
+
+    class EtaWindow:
+        """The last `size` delivery times, in minutes."""
+
+        def __init__(self, size):
+            self.size = size
+            self._buf = deque(maxlen=size)
+
+        def add(self, minutes):
+            self._buf.append(minutes)
+
+        def recent(self):
+            return list(self._buf)
+
+        def average(self):
+            return sum(self._buf) / len(self._buf) if self._buf else None
+
+
+    def _order(j):
+        return (j.zone, j.priority, -j.weight, j.id)
+
+
+    def by_zone(jobs):
+        """{zone: [job ids by priority, then id]}, zones alphabetical."""
+        groups = defaultdict(list)
+        for j in sorted(jobs, key=lambda j: (j.priority, j.id)):
+            groups[j.zone].append(j.id)
+        return dict(sorted(groups.items()))
+
+
+    def manifest(jobs):
+        """The loading list, one line per job."""
+        return "".join(f"{j.zone} P{j.priority} {j.weight:.1f}kg {j.id}\n"
+                       for j in sorted(jobs, key=_order))
+    PY

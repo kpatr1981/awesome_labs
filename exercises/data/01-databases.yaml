@@ -254,3 +254,221 @@ exercises:
     check "the cache still has its data" '[ "$(r dbsize)" -gt 1000 ]'
   solve: |
     docker exec kl-redis redis-cli CONFIG SET maxmemory-policy allkeys-lru
+
+# ===== Capstone: a real-world lab =====
+
+- id: data-091
+  title: "Capstone: month-end close after the bad cleanup"
+  difficulty: 5
+  kind: fix
+  tags: [capstone, postgres, backup, restore, pg_restore, index, sql, join, aggregate, redis, eviction]
+  tutorial: |
+    **Concept.** A real recovery is rarely just one restore command. You bring back exactly
+    what was lost, check that what you brought back is *complete*, and only then answer the
+    business question that was waiting for it.
+
+    **What `pg_restore -t` leaves behind.** A custom-format archive (`pg_dump -Fc`) is a list
+    of separate entries: the table, its data, and then each **constraint**, **index** and
+    **foreign key** as an entry of its own. `pg_restore -t name` selects only the table and
+    its data. The primary key, the indexes and the foreign keys stay in the archive, and
+    nothing warns you. `pg_restore -l` prints the archive's table of contents, and
+    `pg_restore -L file` restores exactly the entries listed in a (possibly edited) copy of
+    it, in the archive's order. You can also recreate the missing pieces by hand.
+
+    **Reports that survive an audit.** Revenue is a sum over the *detail* rows (`qty *
+    unit_price` per line item), so the filters on the order (status, date) must apply before
+    the sum. A calendar month is a half-open range: `>= '2026-10-01' AND < '2026-11-01'`.
+    `BETWEEN` and `<= '...-31'` both get the edges wrong for timestamps.
+
+    **Eviction that respects permanent keys.** Redis `maxmemory-policy` decides what goes when
+    memory is full. The `allkeys-*` policies can evict *any* key, while the `volatile-*`
+    policies only evict keys that have an expiry (TTL). Keys without a TTL are then safe, as
+    long as enough keys with one remain.
+
+    **Read up on:**
+    - `man pg_restore`: `-t`, `-l`, `-L`, `-d`, and the note on what `-t` does not include
+    - `docker cp` and `docker exec -i`: getting a file from the VM to a tool in the container
+    - `\d table` in psql: the indexes and constraints a table has
+    - `ALTER TABLE ... ADD PRIMARY KEY`, `ADD FOREIGN KEY`, `CREATE INDEX`, `ANALYZE`
+    - `EXPLAIN`: `Seq Scan` versus `Index Scan` / `Bitmap Index Scan`
+    - `JOIN`, `WHERE` before `GROUP BY`, `sum()`, `ORDER BY ... DESC`
+    - `psql -A -t -F,`: comma-separated output without headers
+    - Redis docs, key eviction: the `volatile-*` and `allkeys-*` policies; `CONFIG SET`
+  scenario: |
+    **Ticket SHOP-731**, from Ines (Finance), escalated by the on-call:
+
+    > Last night a cleanup script dropped the shop's **`order_items`** table, and the
+    > month-end close for **October** is due today. On top of that, the cache started
+    > refusing writes this morning. Please get us back in business.
+
+    PostgreSQL runs in **`kl-pg`** (`docker exec -it kl-pg psql -U lab -d lab`) and Redis in
+    **`kl-redis`** (`docker exec -it kl-redis redis-cli`). The tables are
+    `customers (id, name, country)`, `orders (id, customer_id, status, created_at)` and
+    `order_items (order_id, line_no, sku, qty, unit_price)`.
+
+    ## Part 1: Bring back order_items
+
+    Last night's backup, taken just before the cleanup, is **`/lab/backup.dump`**
+    (`pg_dump` custom format). Restore `order_items` from it:
+
+    1. **Every row** from the backup is back.
+    2. **`customers` and `orders` keep the rows added since the backup**: new customers
+       signed up and placed orders this morning.
+    3. `order_items` is complete again: its **primary key on `(order_id, line_no)`** and its
+       **foreign key to `orders`** are back.
+
+    ## Part 2: The slow query
+
+    4. The reporting query in **`/lab/slow-query.sql`** used to be fast. Make it use an
+       **index** instead of a sequential scan again. Don't change the query.
+
+    ## Part 3: The October numbers
+
+    5. Finance needs the **paid** revenue of **October 2026** per customer country. Revenue
+       is `qty * unit_price` summed over the line items of orders whose status is `paid` and
+       whose `created_at` falls in October. Write **`/lab/revenue-by-country.csv`**, one
+       `country,total` line per country (for example `GR,123456.78`, two decimals, no header),
+       **highest total first**.
+
+    ## Part 4: The cache
+
+    Redis has an 8MB limit and refuses every write with `OOM`. It holds rebuildable
+    `cache:*` entries, all with an expiry, and **`flag:*`** feature flags with **no expiry**
+    that must never be evicted.
+
+    6. When memory is full, Redis must evict only **keys that have an expiry**, the
+       **least recently used** first. Don't raise the 8MB limit and don't restart Redis.
+    7. Writes are accepted again, and all 40 `flag:*` keys survive a burst of new cache
+       writes.
+  hints:
+    - "Start with what the backup holds: `docker exec -i kl-pg pg_restore -l < /lab/backup.dump`. Count the entries that mention `order_items`. How many would `-t order_items` restore?"
+    - "A full restore would put `orders` back as it was last night and lose this morning's orders. Restore only the `order_items` entries: copy the dump into the container (`docker cp /lab/backup.dump kl-pg:/tmp/`), write the matching `pg_restore -l` lines to a list file, and pass it with `-L`. Or use `-t` and add the key, the foreign key and the index by hand: `pg_restore -s -f - /tmp/backup.dump` prints the backup's schema as SQL."
+    - "Check the result with `\\d order_items`, then `ANALYZE order_items` and `EXPLAIN` the slow query. Which column does it filter on?"
+    - "For the revenue: `JOIN` `order_items` to `orders` to `customers`, filter on `o.status = 'paid'` and a half-open October range in `WHERE`, `GROUP BY c.country`, `ORDER BY` the sum `DESC`. `psql -AtF, -c` writes it as CSV. Watch out for one very large October order that was refunded."
+    - "`CONFIG GET maxmemory-policy` shows `noeviction`. Of the policies that evict only keys with a TTL, which one goes by least recent use? `CONFIG SET` applies it live."
+  solution: |
+    `pg_restore -t` would bring back the table and its rows only. Restoring the archive's
+    `order_items` entries through a list brings the table, its data, its primary key, its
+    index and its foreign key, and leaves `customers` and `orders` alone:
+
+    ```bash
+    docker cp /lab/backup.dump kl-pg:/tmp/backup.dump
+    docker exec kl-pg sh -c 'pg_restore -l /tmp/backup.dump | grep order_items > /tmp/order_items.list'
+    docker exec kl-pg cat /tmp/order_items.list     # TABLE, TABLE DATA, CONSTRAINT, INDEX, FK CONSTRAINT
+    docker exec kl-pg pg_restore -U lab -d lab -L /tmp/order_items.list /tmp/backup.dump
+    docker exec kl-pg psql -U lab -d lab -c 'ANALYZE order_items'
+    docker exec kl-pg psql -U lab -d lab -c "EXPLAIN SELECT order_id, qty FROM order_items WHERE sku = 'SKU-0042'"
+    ```
+
+    (With `-t order_items` instead, add `PRIMARY KEY (order_id, line_no)`, `FOREIGN KEY
+    (order_id) REFERENCES orders` and `CREATE INDEX ... ON order_items (sku)` by hand.)
+
+    The October report filters the orders before summing their line items:
+
+    ```bash
+    docker exec kl-pg psql -U lab -d lab -AtF, -c "
+      SELECT c.country, sum(i.qty * i.unit_price)
+      FROM order_items i JOIN orders o ON o.id = i.order_id JOIN customers c ON c.id = o.customer_id
+      WHERE o.status = 'paid' AND o.created_at >= '2026-10-01' AND o.created_at < '2026-11-01'
+      GROUP BY c.country ORDER BY 2 DESC" > /lab/revenue-by-country.csv
+    ```
+
+    The cache evicts only keys with an expiry, so the flags (no TTL) are never chosen:
+
+    ```bash
+    docker exec kl-redis redis-cli CONFIG SET maxmemory-policy volatile-lru
+    docker exec kl-redis redis-cli SET probe ok EX 60
+    ```
+  setup: |
+    pg_start
+
+    # --- the shop as it was at last night's backup ---
+    pg_sql <<'SQL'
+    CREATE TABLE customers (id serial PRIMARY KEY, name text NOT NULL, country text NOT NULL);
+    CREATE TABLE orders (id serial PRIMARY KEY, customer_id int NOT NULL REFERENCES customers, status text NOT NULL, created_at timestamp NOT NULL);
+    CREATE TABLE order_items (
+      order_id int NOT NULL REFERENCES orders, line_no int NOT NULL, sku text NOT NULL,
+      qty int NOT NULL, unit_price numeric(10,2) NOT NULL, PRIMARY KEY (order_id, line_no));
+    INSERT INTO customers (name, country)
+    SELECT 'customer-' || g, (ARRAY['GR','DE','FR','IT','ES','NL'])[1 + floor(random() * 6)::int] FROM generate_series(1, 3000) g;
+    INSERT INTO orders (customer_id, status, created_at)
+    SELECT 1 + floor(random() * 3000)::int, (ARRAY['paid','paid','paid','refunded','pending'])[1 + floor(random() * 5)::int],
+           timestamp '2026-09-01' + random() * interval '76 days'
+    FROM generate_series(1, 60000);
+    INSERT INTO order_items (order_id, line_no, sku, qty, unit_price)
+    SELECT o.id, l, 'SKU-' || lpad((1 + floor(random() * 400))::int::text, 4, '0'), 1 + floor(random() * 5)::int, round((5 + random() * 195)::numeric, 2)
+    FROM orders o CROSS JOIN LATERAL generate_series(1, 1 + o.id % 4) l;
+    -- the biggest October order was refunded, and a big one landed on 1 November at midnight
+    INSERT INTO orders (customer_id, status, created_at) VALUES (1, 'refunded', '2026-10-15 12:00');
+    INSERT INTO order_items VALUES (currval('orders_id_seq'), 1, 'SKU-9999', 1, 9999999.00);
+    INSERT INTO orders (customer_id, status, created_at) VALUES (2, 'paid', '2026-11-01 00:00');
+    INSERT INTO order_items VALUES (currval('orders_id_seq'), 1, 'SKU-9998', 1, 500000.00);
+    CREATE INDEX order_items_sku_idx ON order_items (sku);
+    ANALYZE;
+    SQL
+    pg_sql "SELECT count(*) || ':' || md5(string_agg(order_id || ':' || line_no || ':' || sku || ':' || qty || ':' || unit_price, ',' ORDER BY order_id, line_no)) FROM order_items" > "$KL_STATE/items.sum"
+    docker exec kl-pg psql -U lab -d lab -AtF, -c "SELECT c.country, sum(i.qty * i.unit_price) FROM order_items i JOIN orders o ON o.id = i.order_id JOIN customers c ON c.id = o.customer_id WHERE o.status = 'paid' AND o.created_at >= '2026-10-01' AND o.created_at < '2026-11-01' GROUP BY c.country ORDER BY 2 DESC" > "$KL_STATE/revenue"
+    docker exec kl-pg pg_dump -U lab -Fc lab > /lab/backup.dump
+    chown "$(lab_user):" /lab/backup.dump
+
+    # --- this morning: new customers and orders, then the cleanup script ---
+    pg_sql <<'SQL'
+    INSERT INTO customers (name, country) SELECT 'new-' || g, 'GR' FROM generate_series(1, 9) g;
+    INSERT INTO orders (customer_id, status, created_at)
+    SELECT 3001 + g % 9, 'paid', timestamp '2026-11-18 09:00' + g * interval '3 minutes' FROM generate_series(1, 40) g;
+    DROP TABLE order_items;
+    SQL
+    pg_sql "SELECT (SELECT count(*) FROM customers) || ':' || (SELECT count(*) FROM orders)" > "$KL_STATE/rows"
+
+    lab_file /lab/slow-query.sql <<'EOF'
+    SELECT order_id, qty FROM order_items WHERE sku = 'SKU-0042';
+    EOF
+
+    # --- the cache: permanent flags first, then cache entries with a TTL until it is full ---
+    docker run -d --name kl-redis redis:7.4-alpine redis-server --maxmemory 8mb --maxmemory-policy noeviction >/dev/null
+    eventually 20 '[ "$(docker exec kl-redis redis-cli ping)" = PONG ]'
+    docker exec kl-redis redis-cli eval "for i=1,40 do redis.call('set','flag:feature-'..i,'on') end return 'ok'" 0 >/dev/null
+    for b in $(seq 0 200); do
+      out=$(docker exec kl-redis redis-cli eval "for i=1,200 do redis.call('set','cache:page:$b:'..i,string.rep('x',1024),'EX',86400) end return 'ok'" 0)
+      [ "$out" = ok ] || break
+    done
+    docker inspect -f '{{.State.StartedAt}}' kl-redis > "$KL_STATE/redis-started"
+  check: |
+    info "Part 1: Bring back order_items"
+    got=$(pg_sql "SELECT count(*) || ':' || md5(string_agg(order_id || ':' || line_no || ':' || sku || ':' || qty || ':' || unit_price, ',' ORDER BY order_id, line_no)) FROM order_items" 2>/dev/null)
+    check_eq "order_items holds every row from the backup" "$got" "$(cat "$KL_STATE/items.sum")"
+    check_eq "customers and orders kept the rows added since the backup" "$(pg_sql "SELECT (SELECT count(*) FROM customers) || ':' || (SELECT count(*) FROM orders)")" "$(cat "$KL_STATE/rows")"
+    keys=$(pg_sql "SELECT string_agg(pg_get_constraintdef(oid), '; ' ORDER BY contype DESC) FROM pg_constraint WHERE conrelid = to_regclass('order_items') AND contype IN ('p', 'f')" 2>/dev/null)
+    check_eq "order_items has its primary key and its foreign key to orders" "$keys" "PRIMARY KEY (order_id, line_no); FOREIGN KEY (order_id) REFERENCES orders(id)"
+
+    info "Part 2: The slow query"
+    plan=$(pg_sql "EXPLAIN SELECT order_id, qty FROM order_items WHERE sku = 'SKU-0042'" 2>/dev/null)
+    check "the query in /lab/slow-query.sql uses an index, not a sequential scan" '[[ $plan =~ Index ]] && ! grep -q "Seq Scan" <<<"$plan"'
+
+    info "Part 3: The October numbers"
+    check_eq "/lab/revenue-by-country.csv has October's paid revenue per country" "$(cat /lab/revenue-by-country.csv 2>/dev/null)" "$(cat "$KL_STATE/revenue")"
+
+    info "Part 4: The cache"
+    r() { docker exec kl-redis redis-cli "$@"; }
+    check_eq "only keys with an expiry are evicted, least recently used first" "$(r config get maxmemory-policy | tail -1)" volatile-lru
+    check_eq "the 8MB limit is unchanged and Redis was not restarted" "$(r config get maxmemory | tail -1) $(c_get kl-redis '{{.State.StartedAt}}')" "8388608 $(cat "$KL_STATE/redis-started")"
+    # one SET per command (a script may overshoot the limit once it has started)
+    v=$(head -c 1024 /dev/zero | tr '\0' y)
+    oks=$(for i in $(seq 1 2000); do echo "SET cache:check:$i $v EX 600"; done | docker exec -i kl-redis redis-cli 2>/dev/null | grep -c '^OK$')
+    check_eq "a burst of 2000 new cache writes is accepted" "$oks" 2000
+    nflags() { r eval "return #redis.call('keys', 'flag:*')" 0; }
+    check "all 40 flag:* keys survived the burst" '[ "$oks" = 2000 ] && [ "$(nflags)" = 40 ]'
+  solve: |
+    # --- part 1: restore every order_items entry of the archive, and nothing else ---
+    docker cp /lab/backup.dump kl-pg:/tmp/backup.dump
+    docker exec kl-pg sh -c 'pg_restore -l /tmp/backup.dump | grep order_items > /tmp/order_items.list'
+    docker exec kl-pg pg_restore -U lab -d lab -L /tmp/order_items.list /tmp/backup.dump
+
+    # --- part 2: the index came back with the list; refresh the statistics ---
+    docker exec kl-pg psql -U lab -d lab -c 'ANALYZE order_items' >/dev/null
+
+    # --- part 3: October's paid revenue per country ---
+    docker exec kl-pg psql -U lab -d lab -AtF, -c "SELECT c.country, sum(i.qty * i.unit_price) FROM order_items i JOIN orders o ON o.id = i.order_id JOIN customers c ON c.id = o.customer_id WHERE o.status = 'paid' AND o.created_at >= '2026-10-01' AND o.created_at < '2026-11-01' GROUP BY c.country ORDER BY 2 DESC" > /lab/revenue-by-country.csv
+
+    # --- part 4: evict only keys with a TTL ---
+    docker exec kl-redis redis-cli CONFIG SET maxmemory-policy volatile-lru >/dev/null

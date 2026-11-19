@@ -723,3 +723,319 @@ exercises:
     kubectl -n store expose deployment shop --type=LoadBalancer --port=80
     kubectl -n store expose deployment shop-local --type=LoadBalancer --port=80
     kubectl -n store patch svc shop-local -p '{"spec":{"externalTrafficPolicy":"Local"}}'
+
+# ===== Capstone: a real-world lab =====
+
+- id: k8s-372
+  title: "Capstone: a partner link over BGP"
+  difficulty: 5
+  kind: fix
+  tags: [capstone, calico, bgp, frr, routing, ippool, bgpfilter, troubleshooting, egress]
+  tutorial: |
+    **Concept.** Peering a cluster with the network is a contract with two sides, and each
+    direction of it is a separate decision:
+
+    - **The session.** Each side states its own AS and the AS it expects from the other.
+      Calico's own AS is `BGPConfiguration.spec.asNumber` (64512 when unset); a `BGPPeer`
+      states the router's. A BGPPeer applies to every node unless `node` or `nodeSelector`
+      narrows it down.
+    - **What the cluster announces.** Each node announces the pod blocks of every IP pool, and
+      the Service ranges listed in `BGPConfiguration` (`serviceClusterIPs`). `nextHopMode: Keep`
+      on the peer makes every block point at the node that owns it. A `BGPFilter` referenced by
+      the peer can drop routes on the way out (`exportV4`).
+    - **What the cluster accepts.** Whatever the router announces, BIRD installs into every
+      peering node's kernel (`ip route`, `proto bird`), unless the peer's filter rejects it on
+      the way in (`importV4`). Rules are tried in order; `matchOperator` is `Equal`, `NotEqual`,
+      `In` (inside the CIDR) or `NotIn`, and a route that matches no rule is accepted.
+    - **Who a pod is outside.** `natOutgoing` on a pool decides whether pods leaving the pod
+      network are hidden behind their node's address. A second pool without SNAT gives some
+      workloads an address the outside world can see, filter and route back to, and the
+      annotation `cni.projectcalico.org/ipv4pools` picks the pool, on a pod or on its
+      **namespace** (for every pod created there afterwards: existing pods keep their address).
+
+    Read the router first, then the Calico objects. There's no `calicoctl` here: these are CRDs,
+    spelled in full, e.g. `bgppeers.crd.projectcalico.org`, and they get no defaults, so a new
+    IPPool needs every field the default pool has.
+
+    **Read up on:**
+    - On the router: `show bgp summary`, `show bgp neighbors <ip>`, `show ip route`,
+      `show ip route 10.244.0.0/16 longer-prefixes`
+    - `kubectl explain bgppeers.spec --api-version=crd.projectcalico.org/v1`, likewise
+      `bgpfilters.spec.importV4`, `bgpconfigurations.spec` and `ippools.spec`
+    - `kubectl get ippools.crd.projectcalico.org default-ipv4-ippool -o yaml`
+    - `ip route` on each node (`ssh node01`)
+    - Calico docs: BGP filter, IP pools per namespace (`cni.projectcalico.org/ipv4pools`)
+  scenario: |
+    **NET-2207**, from Tomás (network team): *"Our partner Ledgerline goes live on Monday.
+    They only accept traffic from addresses they have on file, so their feed must reach them
+    from its own range, not from node addresses. And while you're at it: the edge peering has
+    been half broken since someone 'tidied up' Calico, and security says the cluster is
+    installing routes it has no business with."*
+
+    The edge router is FRR, Pod **`router`** in namespace **`edge`**, AS **65010**. It expects
+    this cluster to be **AS 64520** on both nodes, and announces **`198.51.100.0/24`** (the
+    internet side, where `198.51.100.1` answers HTTP with the client address it saw), and also
+    the network team's own **`203.0.113.0/24`** and **`192.0.2.0/24`**. Its address and the
+    nodes' are in **`/lab/topology.txt`**. Read it, but don't change it:
+
+    ```
+    kubectl -n edge exec -it router -c frr -- vtysh
+    ```
+
+    Namespace **`demo`** runs Deployment `web` with Service `web`, and a test pod `client`.
+    Namespace **`partners`** runs Deployment **`feed`** (2 replicas, an HTTP server on port 80
+    that answers with its pod name). Keep the BGPPeer **`edge-router`** (you may edit it).
+
+    1. **Sessions.** `controlplane` and `node01` both have an `Established` session to the
+       router.
+    2. **Pods, with honest next hops.** The router learns every pod block of the default pool
+       with **the node that owns it as its only next hop**, and reaches a `web` pod at its
+       address.
+    3. **Accept only the internet.** Every node installs `198.51.100.0/24` from the router,
+       and **neither** `203.0.113.0/24` **nor** `192.0.2.0/24`. Security owns the BGPFilter
+       **`edge-policy`**: fix it rather than drop it; the peer keeps using it.
+    4. **Services.** The router learns **`10.96.0.0/12`** from **both** nodes, with ECMP, and
+       gets an answer from the `web` Service's ClusterIP. No other setting of the
+       `BGPConfiguration` changes.
+    5. **A range for the partner.** Create the IPPool **`partner-pool`**: CIDR
+       **`10.245.8.0/24`**, block size **26**, IPIP **Always**, and **no SNAT**. The default pool
+       stays as it is. Every pod of namespace `partners`, now and in future, takes its address
+       from `partner-pool`: set it once for the namespace, not in the `feed` template. Both
+       `feed` pods have such addresses.
+    6. **The partner sees the pods.** `198.51.100.1` sees each `feed` pod with **its own pod
+       address**, and the router reaches each `feed` pod directly at that address. `client`
+       in `demo` is still seen as its node's address.
+  hints:
+    - "Start on the router: `show bgp summary` and `show bgp neighbors <node>`. Then `kubectl get bgpconfigurations.crd.projectcalico.org default -o yaml` and the same for `bgppeers` and `bgpfilters`."
+    - "1: Two things keep the sessions down: the AS the cluster states, and which nodes the peer applies to. Patch the BGPConfiguration with `--type=merge` so its other fields stay."
+    - "2: `show ip route 10.244.0.0/16 longer-prefixes` on the router. One field on the peer keeps the owner as next hop, and one rule in `edge-policy` hides the pod blocks."
+    - "3: `ip route | grep -E '203.0.113|192.0.2'` on both nodes. Rules in `importV4` are tried in order and unmatched routes are accepted; one `Reject` rule with the right `matchOperator` can keep only the internet range."
+    - "4: `serviceClusterIPs` is a list of `{cidr: ...}`. 5: copy `ipipMode`, `vxlanMode` and `nodeSelector` from the default pool; annotate the namespace with `cni.projectcalico.org/ipv4pools: '[\"partner-pool\"]'` and restart `feed`, since running pods keep their address."
+    - "6: `kubectl -n partners exec <feed pod> -- wget -qO- http://198.51.100.1/ | grep RemoteAddr`. Replies to a pod address only find their way back if the router knows the block and SNAT is off."
+  solution: |
+    **1 + 4.** The cluster still says AS 64512, and it announces no Service range:
+
+    ```bash
+    kubectl patch bgpconfigurations.crd.projectcalico.org default --type=merge \
+      -p '{"spec":{"asNumber":64520,"serviceClusterIPs":[{"cidr":"10.96.0.0/12"}]}}'
+    ```
+
+    **1 + 2.** The peer only applies to `controlplane` (`node`), and it doesn't keep the next
+    hop:
+
+    ```bash
+    kubectl patch bgppeers.crd.projectcalico.org edge-router --type=json -p \
+      '[{"op":"remove","path":"/spec/node"},{"op":"add","path":"/spec/nextHopMode","value":"Keep"}]'
+    ```
+
+    **2 + 3.** `edge-policy` rejected the pod CIDR on export and filtered nothing on import:
+
+    ```bash
+    kubectl apply -f - <<'EOF'
+    apiVersion: crd.projectcalico.org/v1
+    kind: BGPFilter
+    metadata: {name: edge-policy}
+    spec:
+      importV4:
+      - {action: Reject, matchOperator: NotIn, cidr: 198.51.100.0/24}
+    EOF
+    ip route | grep -E '198.51.100|203.0.113|192.0.2'; ssh node01 ip route | grep -E '198.51.100|203.0.113|192.0.2'
+    ```
+
+    **5.** A pool without SNAT, assigned to the whole namespace:
+
+    ```bash
+    kubectl apply -f - <<'EOF'
+    apiVersion: crd.projectcalico.org/v1
+    kind: IPPool
+    metadata: {name: partner-pool}
+    spec: {cidr: 10.245.8.0/24, blockSize: 26, ipipMode: Always, vxlanMode: Never, natOutgoing: false, nodeSelector: all()}
+    EOF
+    kubectl annotate namespace partners cni.projectcalico.org/ipv4pools='["partner-pool"]'
+    kubectl -n partners rollout restart deploy/feed
+    ```
+
+    **6.** Check from both sides:
+
+    ```bash
+    for p in $(kubectl -n partners get pods -l app=feed -o name); do
+      kubectl -n partners exec "$p" -- wget -qO- http://198.51.100.1/ | grep RemoteAddr
+    done
+    kubectl -n edge exec router -c frr -- wget -qO- http://<feed pod IP>/
+    ```
+  setup: |
+    kr_up
+    kr_guard_calico
+    CP=$(kr_nodes | sed -n 1p); W=$(kr_nodes | sed -n 2p); R=$(kr_ip)
+    kr_conf <<EOF
+    router bgp 65010
+     bgp router-id $R
+     no bgp ebgp-requires-policy
+     no bgp network import-check
+     neighbor $CP remote-as 64520
+     neighbor $W remote-as 64520
+     address-family ipv4 unicast
+      network 198.51.100.0/24
+      network 203.0.113.0/24
+      network 192.0.2.0/24
+      maximum-paths 8
+     exit-address-family
+    EOF
+    lab_file /lab/topology.txt <<EOF
+    router $R
+    router-as 65010
+    controlplane $CP
+    node01 $W
+    EOF
+    k_ns demo
+    kubectl -n demo create deployment web --image=traefik/whoami:v1.10 --replicas=2 >/dev/null
+    kubectl -n demo expose deployment web --port=80 >/dev/null
+    kubectl -n demo run client --image=busybox:1.37 --restart=Never --command -- sleep 3600 >/dev/null
+    k_ns partners
+    kapply <<'EOF'
+    apiVersion: apps/v1
+    kind: Deployment
+    metadata: {name: feed, namespace: partners}
+    spec:
+      replicas: 2
+      selector: {matchLabels: {app: feed}}
+      template:
+        metadata: {labels: {app: feed}}
+        spec:
+          terminationGracePeriodSeconds: 1
+          containers:
+          - name: feed
+            image: busybox:1.37
+            command: ["sh", "-c", "mkdir -p /www && hostname > /www/index.html && exec httpd -f -p 80 -h /www"]
+    EOF
+    wait_deploy demo web 120
+    wait_pod demo client 90
+    wait_deploy partners feed 120
+    # the "tidy-up": Calico's default AS, a peer for one node, a filter that hides the pods
+    kubectl patch bgpconfigurations.crd.projectcalico.org default --type=merge -p '{"spec":{"asNumber":64512}}' >/dev/null
+    kubectl get bgpconfigurations.crd.projectcalico.org default -o json | jq -c '.spec | del(.asNumber, .serviceClusterIPs)' >"$KL_STATE/bgpconf-372"
+    kapply <<EOF
+    apiVersion: crd.projectcalico.org/v1
+    kind: BGPFilter
+    metadata: {name: edge-policy}
+    spec:
+      exportV4:
+      - {action: Reject, matchOperator: In, cidr: 10.244.0.0/16}
+    ---
+    apiVersion: crd.projectcalico.org/v1
+    kind: BGPPeer
+    metadata: {name: edge-router}
+    spec:
+      peerIP: $R
+      asNumber: 65010
+      node: controlplane
+      filters: [edge-policy]
+    EOF
+  check: |
+    CP=$(kr_nodes | sed -n 1p); W=$(kr_nodes | sed -n 2p); R=$(kr_ip)
+    PEER=bgppeers.crd.projectcalico.org; P=ippools.crd.projectcalico.org; BC=bgpconfigurations.crd.projectcalico.org
+    BOTH=$(printf '%s\n' "$CP" "$W" | LC_ALL=C sort | paste -sd,)
+    ip_of() { [ "$1" = controlplane ] && echo "$CP" || echo "$W"; }
+    up() { kr_estab "$CP" && kr_estab "$W"; }
+
+    info "1. Sessions"
+    check_eq "the cluster is AS 64520" "$(kj $BC default '{.spec.asNumber}')" 64520
+    check "the peer edge-router still exists" 'k_exists $PEER edge-router'
+    router_ok() { [ "$(kr_json 'show bgp summary json' | jq -r --arg a "$CP" --arg b "$W" '"\(.ipv4Unicast.as) \(.ipv4Unicast.peers[$a].remoteAs) \(.ipv4Unicast.peers[$b].remoteAs)"')" = "65010 64520 64520" ]; }
+    check "the router is unchanged (AS 65010, expects 64520 from both nodes)" router_ok
+    if [ "$(kj $BC default '{.spec.asNumber}')" = 64520 ] && k_exists $PEER edge-router; then
+      eventually 45 up || true
+    fi
+    check "controlplane's session to the router is Established" 'kr_estab "$CP"'
+    check "node01's session to the router is Established" 'kr_estab "$W"'
+
+    info "2. Pods, with honest next hops"
+    BLOCKS=$(kubectl get blockaffinities.crd.projectcalico.org -o json | jq -r '.items[] | select(.spec.state == "confirmed") | select(.spec.cidr | startswith("10.244.")) | "\(.spec.cidr) \(.spec.node)"')
+    hops_ok() {
+      local c n
+      [ -n "$BLOCKS" ] || return 1
+      while read -r c n; do
+        [ "$(kr_hops "$c")" = "$(ip_of "$n")" ] || return 1
+      done <<<"$BLOCKS"
+    }
+    up && { eventually 30 hops_ok || true; }
+    check "every block of the default pool has its owner as the only next hop" hops_ok
+    POD=$(kj -n demo pod -l app=web '{.items[0].status.podIP}')
+    check_match "the router reaches a web pod" "$(kr_wget "http://$POD/" | grep Hostname)" 'Hostname: web-'
+
+    info "3. Accept only the internet"
+    rt() { if [ "$1" = controlplane ]; then ip -4 route show "$2" 2>/dev/null; else on_node01 "ip -4 route show $2" 2>/dev/null; fi; }
+    imports_ok() {
+      local n
+      for n in controlplane node01; do
+        rt "$n" 198.51.100.0/24 | grep -q "via $R" || return 1
+        [ -z "$(rt "$n" 203.0.113.0/24)$(rt "$n" 192.0.2.0/24)" ] || return 1
+      done
+    }
+    check "the peer still uses the BGPFilter edge-policy" 'kj $PEER edge-router "{.spec.filters[*]}" | tr " " "\n" | grep -qx edge-policy'
+    check "the router still announces 203.0.113.0/24 and 192.0.2.0/24" '[ "$(kr_json "show ip bgp 203.0.113.0/24 json" | jq ".paths | length")" -ge 1 ] && [ "$(kr_json "show ip bgp 192.0.2.0/24 json" | jq ".paths | length")" -ge 1 ]'
+    up && { eventually 30 imports_ok || true; }
+    check "both nodes install 198.51.100.0/24 via the router, and neither of the other two" imports_ok
+
+    info "4. Services"
+    CIP=$(kj -n demo svc web '{.spec.clusterIP}')
+    up && { eventually 30 '[ "$(kr_hops 10.96.0.0/12)" = "$BOTH" ]' || true; }
+    check_eq "10.96.0.0/12 reaches the router from both nodes" "$(kr_hops 10.96.0.0/12)" "$BOTH"
+    check_match "the router reaches the web Service" "$(kr_wget "http://$CIP/" | grep Hostname)" 'Hostname: web-'
+    check_eq "the other BGPConfiguration settings are unchanged" "$(kubectl get $BC default -o json | jq -c '.spec | del(.asNumber, .serviceClusterIPs)')" "$(cat "$KL_STATE/bgpconf-372" 2>/dev/null)"
+
+    info "5. A range for the partner"
+    check_eq "partner-pool: CIDR, block size, IPIP, SNAT" "$(kj $P partner-pool '{.spec.cidr} {.spec.blockSize} {.spec.ipipMode} {.spec.natOutgoing}')" "10.245.8.0/24 26 Always false"
+    check_eq "the default pool is unchanged" "$(kj $P default-ipv4-ippool '{.spec.cidr} {.spec.natOutgoing}')" "10.244.0.0/16 true"
+    ns_ok() { kubectl get ns partners -o json 2>/dev/null | jq -r '.metadata.annotations["cni.projectcalico.org/ipv4pools"] // ""' | grep -q '"partner-pool"'; }
+    check "namespace partners assigns partner-pool to its pods" ns_ok
+    check "the feed template doesn't pick a pool itself" '[ -z "$(kubectl -n partners get deploy feed -o json | jq -r ".spec.template.metadata.annotations[\"cni.projectcalico.org/ipv4pools\"] // empty")" ]'
+    ns_ok && wait_deploy partners feed 120
+    FEED=$(kubectl -n partners get pods -l app=feed -o json 2>/dev/null | jq -r '.items[] | select(.metadata.deletionTimestamp == null and .status.phase == "Running") | "\(.metadata.name) \(.status.podIP)"')
+    check "2 feed pods run, both with partner-pool addresses" '[ "$(grep -c . <<<"$FEED")" = 2 ] && ! grep -qv " 10\.245\.8\." <<<"$FEED"'
+
+    info "6. The partner sees the pods"
+    seen() { kubectl -n "$1" exec "$2" -- wget -qO- -T 3 http://198.51.100.1/ 2>/dev/null | sed -n 's/^RemoteAddr: \([^:]*\):.*/\1/p'; }
+    if [ -z "$FEED" ]; then
+      check "198.51.100.1 sees the feed pods with their own addresses" false
+    fi
+    mapfile -t FL < <(grep . <<<"$FEED")
+    for l in "${FL[@]}"; do
+      p=${l% *}; ip=${l#* }
+      case "$ip" in 10.245.8.*) up && { eventually 30 '[ "$(seen partners "$p")" = "$ip" ]' || true; } ;; esac
+      check_eq "198.51.100.1 sees $p as its own address" "$(seen partners "$p")" "$ip"
+      check_eq "the router reaches $p at $ip" "$(kr_wget "http://$ip/" | tr -d '[:space:]')" "$p"
+    done
+    CNODE=$(kj -n demo pod client '{.spec.nodeName}')
+    check_eq "client in demo is still seen as its node" "$(seen demo client)" "$(ip_of "$CNODE")"
+  solve: |
+    kubectl patch bgpconfigurations.crd.projectcalico.org default --type=merge \
+      -p '{"spec":{"asNumber":64520,"serviceClusterIPs":[{"cidr":"10.96.0.0/12"}]}}'
+    kubectl patch bgppeers.crd.projectcalico.org edge-router --type=json \
+      -p '[{"op":"remove","path":"/spec/node"},{"op":"add","path":"/spec/nextHopMode","value":"Keep"}]'
+    kubectl apply -f - <<'EOF'
+    apiVersion: crd.projectcalico.org/v1
+    kind: BGPFilter
+    metadata: {name: edge-policy}
+    spec:
+      importV4:
+      - {action: Reject, matchOperator: NotIn, cidr: 198.51.100.0/24}
+    EOF
+    kubectl apply -f - <<'EOF'
+    apiVersion: crd.projectcalico.org/v1
+    kind: IPPool
+    metadata: {name: partner-pool}
+    spec: {cidr: 10.245.8.0/24, blockSize: 26, ipipMode: Always, vxlanMode: Never, natOutgoing: false, nodeSelector: all()}
+    EOF
+    kubectl annotate namespace partners cni.projectcalico.org/ipv4pools='["partner-pool"]' --overwrite
+    kubectl -n partners rollout restart deploy/feed
+    kubectl -n partners rollout status deploy/feed --timeout=120s
+    # wait until the partner side answers every feed pod
+    for i in $(seq 40); do
+      ok=1
+      for p in $(kubectl -n partners get pods -l app=feed --field-selector=status.phase=Running -o name); do
+        kubectl -n partners exec "$p" -- wget -qO- -T 2 http://198.51.100.1/ >/dev/null 2>&1 || ok=
+      done
+      [ -n "$ok" ] && break
+      sleep 3
+    done

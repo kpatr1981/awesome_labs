@@ -578,3 +578,373 @@ exercises:
     check_eq "data is intact" "$(cat /srv/kl-lv/marker 2>/dev/null)" "$(cat "$KL_STATE/answer")"
   solve: |
     sudo lvextend -L 128M -r /dev/klvg/data
+
+# ===== Capstone: a real-world lab =====
+
+- id: linux-096
+  title: "Capstone: hand over the shared build host"
+  difficulty: 5
+  kind: fix
+  tags: [capstone, permissions, setgid, bash, quoting, systemd, cgroups, lsof, proc, nsenter, git, bisect]
+  tutorial: |
+    **Concept.** A shared host collects small problems: a directory whose permissions were never set up, a script that only works on tidy names, a service nobody remembers installing, a job that hogs the CPU and the disk. Each one is easy alone. The skill this lab trains is working through a list of them from the host, with the kernel's own views: permission bits, cgroups, `/proc`, namespaces and Git's history, and changing only what the ticket asks for.
+
+    A few rules carry over from the module:
+
+    - **A supervised process comes back.** Find the unit that owns it before you act on it.
+    - **Some fixes must not restart anything.** A limit on a cgroup and a file still held open both have ways to be dealt with while the process keeps its PID.
+    - **A container is a process.** Its sockets are visible from the host once you join its network namespace, and the address a socket is bound to matters as much as its port.
+    - **A bisect is only as good as its starting points.** The "good" end has to be a commit you know is good, and old history can hold bugs of its own.
+
+    **Read up on:**
+    - `chgrp`/`chown :GROUP`, `chmod` with a leading special digit, and setgid on directories
+    - `man bash` — Quoting and Word Splitting; globs versus `$(ls ...)`
+    - `systemctl set-property` and `man systemd.resource-control` (`CPUQuota=`); `/sys/fs/cgroup/.../cpu.max`
+    - `lsof +L1`, `lsof -t FILE`, `/proc/PID/fd` and `truncate`
+    - `ps -o unit= -p PID`, `systemctl status PID`, and `systemctl disable --now`
+    - `docker inspect -f '{{.State.Pid}}'`, `nsenter -t PID -n`, and `ss -ltn` (the Local Address column)
+    - `man git-bisect` — `start BAD GOOD`, `run`, `reset`; `git tag`
+  scenario: |
+    **Ticket PLAT-207** — from Jonas, build infrastructure:
+
+    > I'm handing the shared build host over to you before I go on leave. It works, mostly.
+    > Here is everything that's open on it. Please close it all: the build team starts
+    > using the share on Monday.
+
+    1. **The share.** `/srv/kl-builds` is for the group **`kl-build`**: owner **root**,
+       group **`kl-build`**, full access for owner and group and **none for others**, and
+       **new files and directories created inside belong to `kl-build`** automatically.
+    2. **The publish script.** **`/lab/publish.sh SRC RELEASE`** copies the build
+       artifacts (`*.tar.gz`, nothing else) from directory `SRC` into
+       `$KL_BUILDS/RELEASE/` (`KL_BUILDS` defaults to `/srv/kl-builds`) and writes a
+       **`MANIFEST`** there that `sha256sum -c MANIFEST` accepts. It falls over on names
+       with spaces, and both artifacts and release names have them. Fix it so it works
+       for any names; keep its arguments and the `KL_BUILDS` variable.
+    3. **Publish the release.** With your fixed script, publish the artifacts in
+       **`/lab/artifacts`** as release **`2026.11 rc1`** into `/srv/kl-builds` (use
+       `sudo`). Everything in the release belongs to `kl-build`.
+    4. **The indexer.** **`kl-indexer.service`** must keep running, but it eats a whole
+       CPU. Cap it at **25% of one CPU**, now and after every reboot.
+    5. **The build log disk.** **`/srv/kl-buildlogs`** is almost full, yet it looks empty.
+       Free the space **without restarting or stopping `kl-indexer`**: its PID must stay the
+       same.
+    6. **The mystery writer.** Something keeps writing **`/srv/kl-builds/.relay-cache`**,
+       and deleting the file doesn't help. Nobody wants it. Write the name of the
+       **systemd service** responsible to **`/lab/rogue.txt`**, stop it, and make sure it
+       won't start again after a reboot. Leave every other service alone.
+    7. **The artifact cache.** The container **`kl-cache`** publishes no ports. It listens on
+       two TCP ports: an admin port bound to loopback only, and the **cache port, bound to
+       all addresses**. Write the **cache port** number to **`/lab/cache-port.txt`**.
+    8. **The broken build tool.** In **`/lab/buildtool`**, `./test.sh` passed at the tag
+       **`v1.0`** and fails on `main` today (history before `v1.0` had bugs of its own).
+       Write the hash of the **first commit after `v1.0` that fails** to
+       **`/lab/bad-commit.txt`**, and leave the repository back on `main`.
+  hints:
+    - "The share: `chown :kl-build` and a four-digit mode whose leading digit is 2. Do it before publishing, or the release ends up in the wrong group."
+    - "The script: never loop over `$(ls ...)`; loop over `\"$src\"/*.tar.gz` and quote every expansion, including in `mkdir` and `cd`. Test it with a temporary `KL_BUILDS=$(mktemp -d)` and names with spaces."
+    - "The indexer: `systemctl set-property` applies a limit now and saves it. The deleted file is still open: `sudo lsof +L1 /srv/kl-buildlogs`, then `truncate -s 0` it through `/proc/PID/fd/N`."
+    - "The writer: `sudo lsof -t /srv/kl-builds/.relay-cache` gives the PID, `ps -o unit= -p PID` the unit. Stopping the process alone is useless, because the unit restarts it."
+    - "The cache: `sudo nsenter -t \"$(docker inspect -f '{{.State.Pid}}' kl-cache)\" -n ss -ltnH` lists both sockets; look at the address in front of each port."
+    - "The bisect: `git bisect start main v1.0`, then `git bisect run ./test.sh`, then `git rev-parse refs/bisect/bad` before `git bisect reset`. Starting from the first commit can land on the old bug."
+  solution: |
+    ### 1. The share
+
+    ```bash
+    sudo chown root:kl-build /srv/kl-builds
+    sudo chmod 2770 /srv/kl-builds
+    ```
+
+    ### 2. The publish script
+
+    ```bash
+    cat > /lab/publish.sh <<'EOF'
+    #!/bin/bash
+    # publish.sh SRC RELEASE - copy SRC's build artifacts into the share as RELEASE
+    src=$1
+    rel=$2
+    dest=${KL_BUILDS:-/srv/kl-builds}/$rel
+    mkdir -p "$dest"
+    for f in "$src"/*.tar.gz; do
+      [ -e "$f" ] || continue
+      cp -- "$f" "$dest"/
+    done
+    cd "$dest" && sha256sum -- *.tar.gz > MANIFEST
+    EOF
+    ```
+
+    ### 3. Publish the release
+
+    The setgid bit on the share makes the new release directory and its files belong to
+    `kl-build` (and the directory inherits setgid too):
+
+    ```bash
+    sudo /lab/publish.sh /lab/artifacts "2026.11 rc1"
+    ls -l "/srv/kl-builds/2026.11 rc1"
+    ```
+
+    ### 4. The indexer
+
+    ```bash
+    sudo systemctl set-property kl-indexer CPUQuota=25%
+    cat /sys/fs/cgroup/system.slice/kl-indexer.service/cpu.max    # 25000 100000
+    ```
+
+    ### 5. The build log disk
+
+    ```bash
+    pid=$(systemctl show -p MainPID --value kl-indexer)
+    sudo lsof -p "$pid" | grep deleted
+    fd=$(sudo ls -l /proc/$pid/fd | awk '/kl-buildlogs.*deleted/ {print $9}')
+    sudo truncate -s 0 /proc/$pid/fd/$fd
+    df -h /srv/kl-buildlogs
+    ```
+
+    ### 6. The mystery writer
+
+    ```bash
+    pid=$(sudo lsof -t /srv/kl-builds/.relay-cache)
+    ps -o unit= -p "$pid"                      # kl-statsd-relay.service
+    echo kl-statsd-relay > /lab/rogue.txt
+    sudo systemctl disable --now kl-statsd-relay
+    ```
+
+    ### 7. The artifact cache
+
+    ```bash
+    pid=$(docker inspect -f '{{.State.Pid}}' kl-cache)
+    sudo nsenter -t "$pid" -n ss -ltnH
+    sudo nsenter -t "$pid" -n ss -ltnH | awk '$4 ~ /^0\.0\.0\.0:/ {sub(/.*:/, "", $4); print $4}' > /lab/cache-port.txt
+    ```
+
+    ### 8. The broken build tool
+
+    ```bash
+    cd /lab/buildtool
+    git bisect start main v1.0
+    git bisect run ./test.sh
+    git rev-parse refs/bisect/bad > /lab/bad-commit.txt
+    git bisect reset
+    ```
+  setup: |
+    # --- 1-3. the share, the script, the artifacts ---
+    on_reset 'rm -rf /srv/kl-builds; groupdel kl-build 2>/dev/null; true'
+    groupadd kl-build
+    mkdir -p /srv/kl-builds
+    chmod 755 /srv/kl-builds
+    lab_file /lab/publish.sh 0755 <<'EOF'
+    #!/bin/bash
+    # publish.sh SRC RELEASE - copy SRC's build artifacts into the share as RELEASE
+    src=$1
+    rel=$2
+    dest=${KL_BUILDS:-/srv/kl-builds}/$rel
+    mkdir -p $dest
+    for f in $(ls $src | grep '\.tar\.gz$'); do
+      cp $src/$f $dest/
+    done
+    cd $dest && sha256sum *.tar.gz > MANIFEST
+    EOF
+    mkdir -p /lab/artifacts
+    for a in "app server" cli "docs bundle"; do
+      head -c $((3000 + RANDOM)) /dev/urandom > "/lab/artifacts/$a.tar.gz"
+    done
+    echo "build 4711 ok" > /lab/artifacts/build.log
+    echo "remember to tag" > "/lab/artifacts/release notes.txt"
+    chown -R "$(lab_user):" /lab/artifacts
+
+    # --- 4-5. the indexer: a CPU hog holding a deleted log ---
+    on_reset 'systemctl stop kl-indexer 2>/dev/null; rm -rf /etc/systemd/system/kl-indexer.service /etc/systemd/system/kl-indexer.service.d /etc/systemd/system.control/kl-indexer.service.d /run/systemd/system.control/kl-indexer.service.d /opt/kl-indexer; systemctl daemon-reload; systemctl reset-failed 2>/dev/null; umount /srv/kl-buildlogs 2>/dev/null; rmdir /srv/kl-buildlogs 2>/dev/null; true'
+    mkdir -p /opt/kl-indexer /srv/kl-buildlogs
+    mount -t tmpfs -o size=32m tmpfs /srv/kl-buildlogs
+    cat >/opt/kl-indexer/indexer.py <<'PY'
+    log = open("/srv/kl-buildlogs/indexer.log", "a")
+    log.write("x" * (27 * 1024 * 1024))
+    log.flush()
+    n = 0
+    while True:
+        n += 1
+    PY
+    cat >/etc/systemd/system/kl-indexer.service <<'EOF'
+    [Unit]
+    Description=kubelab build artifact indexer
+
+    [Service]
+    ExecStart=/usr/bin/python3 /opt/kl-indexer/indexer.py
+    EOF
+    systemctl daemon-reload
+    systemctl start kl-indexer
+    eventually 20 '[ "$(stat -c %s /srv/kl-buildlogs/indexer.log 2>/dev/null || echo 0)" -ge 28000000 ]'
+    rm -f /srv/kl-buildlogs/indexer.log
+    systemctl show -p MainPID --value kl-indexer > "$KL_STATE/indexer.pid"
+
+    # --- 6. the mystery writer ---
+    on_reset 'systemctl disable --now kl-statsd-relay 2>/dev/null; rm -rf /etc/systemd/system/kl-statsd-relay.service /usr/local/lib/kl-relay; systemctl daemon-reload; systemctl reset-failed 2>/dev/null; true'
+    mkdir -p /usr/local/lib/kl-relay
+    cat >/usr/local/lib/kl-relay/relay.py <<'PY'
+    import os, time
+    p = "/srv/kl-builds/.relay-cache"
+    f = None
+    while True:
+        if f is None or not os.path.exists(p):
+            f = open(p, "a")
+        f.write("metric 1\n" * 512)
+        f.flush()
+        time.sleep(1)
+    PY
+    cat >/etc/systemd/system/kl-statsd-relay.service <<'EOF'
+    [Unit]
+    Description=statsd relay
+
+    [Service]
+    ExecStart=/usr/bin/python3 /usr/local/lib/kl-relay/relay.py
+    Restart=always
+    RestartSec=1
+
+    [Install]
+    WantedBy=multi-user.target
+    EOF
+    systemctl daemon-reload
+    systemctl enable --now kl-statsd-relay 2>/dev/null
+    eventually 10 '[ -s /srv/kl-builds/.relay-cache ]'
+
+    # --- 7. the artifact cache ---
+    mkdir -p "$KL_STATE/kl-cache"
+    cport=$((20000 + RANDOM % 10000)); aport=$((30000 + RANDOM % 10000))
+    echo "$cport" > "$KL_STATE/cache-port"
+    echo "$cport $aport" > "$KL_STATE/kl-cache/ports"
+    cat >"$KL_STATE/kl-cache/app.py" <<'PY'
+    import socket, time
+    cport, aport = (int(x) for x in open("/srv/ports").read().split())
+    def listen(addr, port):
+        s = socket.socket()
+        s.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+        s.bind((addr, port))
+        s.listen()
+        return s
+    admin = listen("127.0.0.1", aport)
+    cache = listen("0.0.0.0", cport)
+    while True:
+        time.sleep(60)
+    PY
+    docker run -d --name kl-cache -v "$KL_STATE/kl-cache/app.py:/srv/app.py:ro" -v "$KL_STATE/kl-cache/ports:/srv/ports:ro" python:3.12-alpine python /srv/app.py >/dev/null
+    eventually 20 '[ "$(nsenter -t "$(docker inspect -f "{{.State.Pid}}" kl-cache)" -n ss -ltnH | wc -l)" -ge 2 ]'
+
+    # --- 8. the broken build tool ---
+    b=/lab/buildtool
+    g() { git -C "$b" -c user.name=Dev -c user.email=dev@example.test "$@"; }
+    git init -q -b main "$b"
+    printf 'def add(a, b):\n    return a + b\n' > "$b/calc.py"
+    cat >"$b/test.sh" <<'EOF'
+    #!/bin/bash
+    python3 -B -c 'import calc; raise SystemExit(0 if calc.add(2, 3) == 5 else 1)'
+    EOF
+    chmod 755 "$b/test.sh"
+    msgs=("Refactor helpers" "Tidy imports" "Bump version" "Update docs" "Small fixes" "Rework parser")
+    g add .; g commit -qm "Initial import"
+    bad=$((16 + RANDOM % 30))
+    for i in $(seq 2 48); do
+      echo "$i" > "$b/version"
+      [ "$i" = 4 ] && sed -i 's/return a + b$/return a - b/' "$b/calc.py"
+      [ "$i" = 7 ] && sed -i 's/return a - b$/return a + b/' "$b/calc.py"
+      [ "$i" = "$bad" ] && sed -i 's/return a + b$/return a + b + 1/' "$b/calc.py"
+      g add .; g commit -qm "${msgs[$((i % ${#msgs[@]}))]}"
+      [ "$i" = 12 ] && g tag v1.0
+      [ "$i" = "$bad" ] && g rev-parse HEAD > "$KL_STATE/bad-commit"
+    done
+    chown -R "$(lab_user):" "$b"
+  check: |
+    info "1. The share"
+    check_eq "/srv/kl-builds is owned by root:kl-build" "$(stat -c '%U:%G' /srv/kl-builds)" root:kl-build
+    check_eq "mode 2770 (setgid, nothing for others)" "$(stat -c %a /srv/kl-builds)" 2770
+    : > /srv/kl-builds/.probe; mkdir -p /srv/kl-builds/.probe.d
+    check "new files and directories belong to kl-build" '[ "$(stat -c %G /srv/kl-builds/.probe)" = kl-build ] && [ "$(stat -c %G /srv/kl-builds/.probe.d)" = kl-build ]'
+    rm -rf /srv/kl-builds/.probe /srv/kl-builds/.probe.d
+
+    info "2. The publish script"
+    t=$(mktemp -d); s="$t/build output"; mkdir -p "$s" "$t/share"
+    head -c 999 /dev/urandom > "$s/web front.tar.gz"; head -c 777 /dev/urandom > "$s/api.tar.gz"
+    echo skip > "$s/build log.txt"
+    KL_BUILDS="$t/share" bash /lab/publish.sh "$s" "test release 7" >/dev/null 2>&1
+    d="$t/share/test release 7"
+    check "copies every artifact, names with spaces included" 'cmp -s "$s/web front.tar.gz" "$d/web front.tar.gz" && cmp -s "$s/api.tar.gz" "$d/api.tar.gz"'
+    check "copies nothing but *.tar.gz and MANIFEST" '[ "$(ls -A "$d" | sort | tr "\n" ,)" = "MANIFEST,api.tar.gz,web front.tar.gz," ]'
+    check "MANIFEST passes sha256sum -c" '(cd "$d" && sha256sum -c --quiet MANIFEST)'
+    rm -rf "$t"
+
+    info "3. The release"
+    r="/srv/kl-builds/2026.11 rc1"
+    ok=1
+    for a in "app server" cli "docs bundle"; do cmp -s "/lab/artifacts/$a.tar.gz" "$r/$a.tar.gz" || ok=0; done
+    check "release '2026.11 rc1' holds all three artifacts" '[ "$ok" = 1 ]'
+    check "its MANIFEST passes sha256sum -c" '[ -f "$r/MANIFEST" ] && (cd "$r" && sha256sum -c --quiet MANIFEST)'
+    check "nothing else was published" '[ -d "$r" ] && [ -z "$(ls -A "$r" | grep -v -e "\.tar\.gz$" -e "^MANIFEST$")" ]'
+    check "everything in the release belongs to kl-build" '[ -d "$r" ] && [ -z "$(find "$r" ! -group kl-build)" ]'
+
+    info "4-5. The indexer"
+    pid=$(cat "$KL_STATE/indexer.pid")
+    check "kl-indexer is still running" 'systemctl is-active -q kl-indexer'
+    check_eq "kl-indexer kept its PID (never restarted)" "$(systemctl show -p MainPID --value kl-indexer)" "$pid"
+    check_eq "the 25% cap is active in its cgroup" "$(cat /sys/fs/cgroup/system.slice/kl-indexer.service/cpu.max 2>/dev/null)" "25000 100000"
+    check "the cap is saved for reboots" 'systemctl cat kl-indexer | grep -q "^CPUQuota=25%"'
+    avail=$(df --output=avail /srv/kl-buildlogs | tail -1 | tr -d ' ')
+    check "at least 24MB is free on /srv/kl-buildlogs" '[ "$avail" -ge 24000 ]'
+
+    info "6. The mystery writer"
+    check_eq "service named in /lab/rogue.txt" "$(sed 's/\.service$//' /lab/rogue.txt 2>/dev/null | tr -d '[:space:]')" kl-statsd-relay
+    check_not "kl-statsd-relay is stopped" 'systemctl is-active -q kl-statsd-relay'
+    check_not "kl-statsd-relay is disabled" 'systemctl is-enabled -q kl-statsd-relay'
+    check_not "nothing runs relay.py any more" 'pgrep -f /usr/local/lib/kl-relay/relay.py'
+
+    info "7. The artifact cache"
+    check_eq "cache port in /lab/cache-port.txt" "$(tr -d '[:space:]' 2>/dev/null </lab/cache-port.txt)" "$(cat "$KL_STATE/cache-port")"
+
+    info "8. The broken build tool"
+    want=$(cat "$KL_STATE/bad-commit"); got=$(tr -d '[:space:]' 2>/dev/null </lab/bad-commit.txt)
+    check "first bad commit after v1.0 in /lab/bad-commit.txt" '[ "${#got}" -ge 7 ] && [[ "$want" == "$got"* ]]'
+    bg() { git -c safe.directory='*' -C /lab/buildtool "$@"; }
+    check "repository is back on main, bisect finished" '[ "$(bg branch --show-current)" = main ] && [ ! -e /lab/buildtool/.git/BISECT_LOG ]'
+  solve: |
+    # 1. the share
+    sudo chown root:kl-build /srv/kl-builds
+    sudo chmod 2770 /srv/kl-builds
+
+    # 2. the publish script
+    cat > /lab/publish.sh <<'EOF'
+    #!/bin/bash
+    # publish.sh SRC RELEASE - copy SRC's build artifacts into the share as RELEASE
+    src=$1
+    rel=$2
+    dest=${KL_BUILDS:-/srv/kl-builds}/$rel
+    mkdir -p "$dest"
+    for f in "$src"/*.tar.gz; do
+      [ -e "$f" ] || continue
+      cp -- "$f" "$dest"/
+    done
+    cd "$dest" && sha256sum -- *.tar.gz > MANIFEST
+    EOF
+
+    # 3. publish the release
+    sudo /lab/publish.sh /lab/artifacts "2026.11 rc1"
+
+    # 4. cap the indexer
+    sudo systemctl set-property kl-indexer CPUQuota=25%
+
+    # 5. free the deleted log
+    pid=$(systemctl show -p MainPID --value kl-indexer)
+    fd=$(sudo ls -l /proc/$pid/fd | awk '/kl-buildlogs.*deleted/ {print $9}')
+    sudo truncate -s 0 /proc/$pid/fd/$fd
+
+    # 6. the mystery writer
+    pid=$(sudo lsof -t /srv/kl-builds/.relay-cache | head -1)
+    ps -o unit= -p "$pid" | tr -d ' ' | sed 's/\.service$//' > /lab/rogue.txt
+    sudo systemctl disable --now "$(cat /lab/rogue.txt)"
+
+    # 7. the cache port
+    pid=$(docker inspect -f '{{.State.Pid}}' kl-cache)
+    sudo nsenter -t "$pid" -n ss -ltnH | awk '$4 ~ /^0\.0\.0\.0:/ {sub(/.*:/, "", $4); print $4}' > /lab/cache-port.txt
+
+    # 8. bisect from the known-good tag
+    cd /lab/buildtool
+    git bisect start main v1.0 >/dev/null
+    git bisect run ./test.sh >/dev/null
+    git rev-parse refs/bisect/bad > /lab/bad-commit.txt
+    git bisect reset >/dev/null

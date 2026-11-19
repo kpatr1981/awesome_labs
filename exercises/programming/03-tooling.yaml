@@ -1645,3 +1645,894 @@ exercises:
     '''
     open(p, "w").write(s.replace(old, new))
     PY
+
+# ===== Capstone: a real-world lab =====
+
+- id: prog-083
+  title: "Capstone: the release-promotion tool"
+  difficulty: 5
+  kind: build
+  tags: [capstone, python, go, dataclasses, argparse, cli, subprocess, atomic-write, unittest, json, struct-tags, errors, generics]
+  tutorial: |
+    **Concept.** A tool that changes production state has to be boring in a
+    very precise way. Each habit from this module covers one way it can go
+    wrong:
+
+    - **Value types that can't be bent.** A frozen dataclass with
+      `order=True` compares field by field, so a version made of three
+      *integers* sorts `1.10.0` after `1.9.3`. Made of strings, it sorts the
+      other way, and the promotion of the year is refused as a "downgrade".
+      Mutable defaults need `field(default_factory=...)`.
+    - **A strict parser at the edge.** `re.fullmatch` must match the whole
+      string; `re.match` only anchors the start, so `1.4.2-rc1` slips
+      through.
+    - **A command line with a contract.** argparse gives usage errors status
+      2 (a `type=` function that raises `argparse.ArgumentTypeError` turns a
+      bad value into one). Runtime failures are status 1, with the reason on
+      stderr and nothing on stdout, so scripts can trust the output.
+    - **No shell between you and the program.** `subprocess.run([...])`
+      passes each argument as it is. A shell would read `&`, `;` and `$( )`
+      in a service name as commands.
+    - **Writes that can't half-happen.** Write a temporary file in the same
+      directory and `os.replace` it over the target: readers see the old
+      file or the new one, never a torn one. The target ends up being a
+      different file (a new inode), which is how you can tell.
+    - **Tests that would catch the bug.** A suite is only as good as the
+      broken versions it rejects: probe each rule at its edges.
+    - **On the Go side:** struct tags define the wire format (`-`,
+      `omitempty`), `DisallowUnknownFields` makes decoding strict, `%w`
+      keeps a sentinel error matchable by `errors.Is`, and type parameters
+      let one `GroupBy` or `MaxBy` serve every type.
+
+    **Read up on:**
+    - `help(dataclasses.dataclass)` — `frozen`, `order`; `dataclasses.field(default_factory=...)`
+    - `re.fullmatch` versus `re.match`, the `re.ASCII` flag
+    - `argparse` — `type=`, `ArgumentTypeError`, `action="store_true"`, exit status 2
+    - `subprocess.run` with a list, `stdout=`; `tempfile.mkstemp`, `os.replace`; `stat -c %i`
+    - `python3 -m unittest -v`, `self.subTest`, `assertRaises`
+    - `go doc encoding/json.Decoder.DisallowUnknownFields`, `go doc fmt.Errorf` (`%w`), `go doc errors.Is`
+    - Go type parameters: `[T any, K comparable]`
+  scenario: |
+    **REL-208**, from Tomás on release engineering: *"Yesterday's checkout
+    promotion to 1.10.0 was refused as a downgrade, the tool crashed on
+    import after Ines's cleanup, and Monday's half-written `deploy.json`
+    took prod down for six minutes. The CI side has its own problems: it
+    leaks the deploy token in its JSON and accepts any junk we send it. Make
+    promotion boring."*
+
+    ### `/lab/promote.py`
+
+    ```
+    promote.py [--dry-run] [--allow-downgrade] MANIFEST SERVICE VERSION
+    ```
+
+    The manifest is JSON like **`/lab/deploy.json`**:
+    `{"env": "prod", "services": {"checkout": "1.9.3", ...}}`.
+
+    1. **The model.** `Version` is a dataclass with integer fields `major`,
+       `minor`, `patch`. `Version.parse(text)` accepts exactly
+       `X.Y.Z` or `vX.Y.Z` (three ASCII-digit numbers) and raises
+       `ValueError` for anything else (`1.4`, `1.4.2.1`, `1.4.2-rc1`,
+       ` 1.4.2`, ...). `str()` gives `X.Y.Z`. Versions are **immutable**,
+       **hashable** and **ordered numerically**. `Release(service, version,
+       approvals=...)` imports and gives every instance its own list.
+    2. **The command line.** On success it prints `SERVICE OLD -> NEW`
+       (e.g. `checkout 1.9.3 -> 1.10.0`) and exits 0. An invalid `VERSION` is
+       a **usage error** (status 2). A missing or unreadable manifest, an
+       unknown service or a **downgrade** (unless `--allow-downgrade`)
+       exits **1**. Every failure prints nothing on stdout and leaves the
+       manifest untouched.
+    3. **Safe writes.** The manifest is **replaced atomically** (written to a
+       new file next to it, then renamed over it), everything else in it is
+       kept, and no other files are left in its directory. `--dry-run` does
+       everything except write, and prints `dry run: SERVICE OLD -> NEW`.
+    4. **The validation hook.** Before writing (and on a dry run), run the
+       program in `$PROMOTE_HOOK` (default `/lab/hooks/validate`) with
+       exactly two arguments, `SERVICE` and the normalised version
+       (`v1.10.0` becomes `1.10.0`), **without a shell**: service names such
+       as `ads & offers` are data. If it exits non-zero, the promotion stops
+       with status 1 and its message reaches stderr.
+    5. **The tests.** Write **`/lab/test_promote.py`**, a `unittest` suite
+       that imports `promote` and tests `Version.parse`, `str()` and
+       comparisons (only those: the check runs it against a module that holds
+       just `Version` and `Release`). It must pass against a correct `Version`
+       and fail against the broken variants the check plants.
+
+    ### `/lab/release.go`
+
+    What CI posts when a build is ready (package `main`; keep the names and
+    signatures):
+
+    6. **Wire format and validation.** A `Release` encodes as `service`,
+       `version`, `approved_by` and `notes`, the last two left out when
+       empty, and the `Token` **never**. `ParseRelease` rejects unknown keys
+       (`token` included), an empty `service`, and a `version` that isn't
+       `X.Y.Z`. Every error it returns satisfies
+       **`errors.Is(err, ErrInvalid)`** and names the offending field.
+    7. **Generic helpers.** `GroupBy(items, key)` returns the items per key,
+       in their original order. `MaxBy(items, less)` returns the largest item
+       (the **first** of equals) and `true`, or the zero value and `false`
+       for no items. `Latest(releases)` uses them to return the newest
+       release of each service by `CompareVersions`.
+
+    ```bash
+    cd /lab && python3 -m unittest -v test_promote
+    docker run --rm -v /lab:/src -w /src golang:1.24-alpine go run release.go
+    ```
+  hints:
+    - "Start with `cd /lab && python3 -B -c 'import promote'`: the traceback names the field. Then `sorted([Version.parse('1.10.0'), Version.parse('1.9.3')])` shows the ordering bug."
+    - "`@dataclass(frozen=True, order=True)`, a compiled `re.compile(r\"v?(\\d+)\\.(\\d+)\\.(\\d+)\", re.ASCII)` used with `fullmatch`, and `int` for each group."
+    - "argparse: `p.add_argument(\"version\", type=version_arg)` where `version_arg` raises `argparse.ArgumentTypeError`. Do all the checks (manifest, service, downgrade, hook) before touching the file; on failure, `print(..., file=sys.stderr)` and return 1."
+    - "Hook: `subprocess.run([HOOK, service, str(new)], stdout=sys.stderr)`. Write: `tempfile.mkstemp(dir=<manifest's directory>)`, `json.dump`, then `os.replace(tmp, manifest)`, removing the temporary file if anything fails."
+    - "Your suite should check that parsed fields are ints, `1.10.0 > 1.9.3`, the `v` prefix, and that `1.4.2.1`, `1.4.2-rc1` and `1.4` are rejected."
+    - "Go: tags such as `json:\"approved_by,omitempty\"` and `json:\"-\"`; `dec := json.NewDecoder(bytes.NewReader(data)); dec.DisallowUnknownFields()`; `fmt.Errorf(\"version %q: %w\", r.Version, ErrInvalid)`. `MaxBy` replaces the best only when `less(best, x)`."
+  solution: |
+    **`/lab/promote.py`** (the important parts):
+
+    ```python
+    _VERSION = re.compile(r"v?(\d+)\.(\d+)\.(\d+)", re.ASCII)
+
+    @dataclass(frozen=True, order=True)
+    class Version:
+        major: int
+        minor: int
+        patch: int
+
+        @classmethod
+        def parse(cls, text):
+            m = _VERSION.fullmatch(text)
+            if not m:
+                raise ValueError(f"not a version: {text!r}")
+            return cls(*map(int, m.groups()))
+
+        def __str__(self):
+            return f"{self.major}.{self.minor}.{self.patch}"
+
+    @dataclass
+    class Release:
+        service: str
+        version: Version
+        approvals: list[str] = field(default_factory=list)
+    ```
+
+    `main()` parses `version` with a `type=` function that raises
+    `argparse.ArgumentTypeError` (status 2), then checks the manifest, the
+    service and the downgrade rule, each failing with a message on stderr and
+    status 1. It runs `subprocess.run([HOOK, service, str(new)],
+    stdout=sys.stderr)`, and only then writes with `mkstemp` in the
+    manifest's directory, `json.dump` and `os.replace`, removing the
+    temporary file on any error.
+
+    **`/lab/test_promote.py`**:
+
+    ```python
+    import unittest
+    from promote import Version
+
+    class VersionTests(unittest.TestCase):
+        def test_parse_valid(self):
+            for text, want in [("1.4.2", (1, 4, 2)), ("v1.10.0", (1, 10, 0)), ("0.0.0", (0, 0, 0))]:
+                with self.subTest(text=text):
+                    v = Version.parse(text)
+                    self.assertEqual((v.major, v.minor, v.patch), want)
+                    self.assertEqual(str(v), text.lstrip("v"))
+
+        def test_parse_invalid(self):
+            for text in ["1.4", "1.4.2.1", "1.4.x", "1.4.2-rc1", "", "x1.4.2"]:
+                with self.subTest(text=text):
+                    with self.assertRaises(ValueError):
+                        Version.parse(text)
+
+        def test_order(self):
+            self.assertLess(Version.parse("1.9.3"), Version.parse("1.10.0"))
+            self.assertEqual(Version.parse("v2.0.0"), Version.parse("2.0.0"))
+    ```
+
+    **`/lab/release.go`**: tags, a strict decoder, wrapped errors, and the
+    helpers:
+
+    ```go
+    type Release struct {
+    	Service    string   `json:"service"`
+    	Version    string   `json:"version"`
+    	ApprovedBy []string `json:"approved_by,omitempty"`
+    	Notes      string   `json:"notes,omitempty"`
+    	Token      string   `json:"-"`
+    }
+
+    func ParseRelease(data []byte) (Release, error) {
+    	var r Release
+    	dec := json.NewDecoder(bytes.NewReader(data))
+    	dec.DisallowUnknownFields()
+    	if err := dec.Decode(&r); err != nil {
+    		return Release{}, fmt.Errorf("%w: %v", ErrInvalid, err)
+    	}
+    	if r.Service == "" {
+    		return Release{}, fmt.Errorf("service is required: %w", ErrInvalid)
+    	}
+    	if !validVersion(r.Version) {
+    		return Release{}, fmt.Errorf("version %q: %w", r.Version, ErrInvalid)
+    	}
+    	return r, nil
+    }
+
+    func MaxBy[T any](items []T, less func(a, b T) bool) (T, bool) {
+    	var best T
+    	if len(items) == 0 {
+    		return best, false
+    	}
+    	best = items[0]
+    	for _, x := range items[1:] {
+    		if less(best, x) {
+    			best = x
+    		}
+    	}
+    	return best, true
+    }
+
+    func Latest(rs []Release) map[string]Release {
+    	out := make(map[string]Release)
+    	for svc, group := range GroupBy(rs, func(r Release) string { return r.Service }) {
+    		out[svc], _ = MaxBy(group, func(a, b Release) bool { return CompareVersions(a.Version, b.Version) < 0 })
+    	}
+    	return out
+    }
+    ```
+
+    `GroupBy` appends each item to `out[key(item)]` in a `make`d map.
+  setup: |
+    lab_file /lab/deploy.json <<'EOF'
+    {
+      "env": "prod",
+      "services": {
+        "ads & offers": "0.9.1",
+        "checkout": "1.9.3",
+        "search": "2.0.0"
+      }
+    }
+    EOF
+    lab_file /lab/hooks/validate 0755 <<'EOF'
+    #!/bin/sh
+    # CI policy check for a promotion: validate SERVICE VERSION
+    if [ "$#" -ne 2 ]; then
+      echo "validate: want SERVICE VERSION, got $# arguments" >&2
+      exit 64
+    fi
+    if [ -e /lab/hooks/FREEZE ]; then
+      echo "validate: change freeze in effect: $(cat /lab/hooks/FREEZE)" >&2
+      exit 1
+    fi
+    echo "validate: $1 $2 ok" >&2
+    EOF
+    lab_file /lab/promote.py <<'EOF'
+    """Promote a service to a new version in a deployment manifest."""
+    import json
+    import os
+    import sys
+    from dataclasses import dataclass
+
+    HOOK = os.environ.get("PROMOTE_HOOK", "/lab/hooks/validate")
+
+
+    @dataclass
+    class Version:
+        major: int
+        minor: int
+        patch: int
+
+        @classmethod
+        def parse(cls, text):
+            major, minor, patch = text.lstrip("v").split(".")
+            return cls(major, minor, patch)
+
+        def __str__(self):
+            return f"{self.major}.{self.minor}.{self.patch}"
+
+
+    @dataclass
+    class Release:
+        service: str
+        version: Version
+        approvals: list[str] = []
+
+
+    def main():
+        manifest, service, version = sys.argv[1:4]
+        new = Version.parse(version)
+        with open(manifest) as f:
+            data = json.load(f)
+        old = Version.parse(data["services"][service])
+        if new < old:
+            print("refusing to downgrade")
+            return 1
+        if os.system(f"{HOOK} {service} {new}") != 0:
+            print("validation failed")
+            return 1
+        data["services"][service] = str(new)
+        with open(manifest, "w") as f:
+            json.dump(data, f, indent=2)
+        print(f"{service} {old} -> {new}")
+        return 0
+
+
+    if __name__ == "__main__":
+        sys.exit(main())
+    EOF
+    lab_file /lab/release.go <<'EOF'
+    package main
+
+    import (
+    	"encoding/json"
+    	"errors"
+    	"fmt"
+    	"strconv"
+    	"strings"
+    )
+
+    var ErrInvalid = errors.New("invalid release")
+
+    // Release is what CI posts when a build is ready to promote.
+    type Release struct {
+    	Service    string
+    	Version    string
+    	ApprovedBy []string
+    	Notes      string
+    	Token      string // deploy token: never sent, never accepted
+    }
+
+    // validVersion reports whether s is "X.Y.Z" with decimal numbers.
+    func validVersion(s string) bool {
+    	parts := strings.Split(s, ".")
+    	if len(parts) != 3 {
+    		return false
+    	}
+    	for _, p := range parts {
+    		if p == "" {
+    			return false
+    		}
+    		for _, c := range p {
+    			if c < '0' || c > '9' {
+    				return false
+    			}
+    		}
+    	}
+    	return true
+    }
+
+    // CompareVersions compares two valid versions: -1, 0 or +1.
+    func CompareVersions(a, b string) int {
+    	pa, pb := strings.Split(a, "."), strings.Split(b, ".")
+    	for i := 0; i < 3; i++ {
+    		x, _ := strconv.Atoi(pa[i])
+    		y, _ := strconv.Atoi(pb[i])
+    		if x != y {
+    			if x < y {
+    				return -1
+    			}
+    			return 1
+    		}
+    	}
+    	return 0
+    }
+
+    // ParseRelease decodes and validates a release posted by CI.
+    func ParseRelease(data []byte) (Release, error) {
+    	var r Release
+    	if err := json.Unmarshal(data, &r); err != nil {
+    		return r, err
+    	}
+    	if r.Service == "" {
+    		return r, errors.New("service is required")
+    	}
+    	if !validVersion(r.Version) {
+    		return r, fmt.Errorf("version %q: %v", r.Version, ErrInvalid)
+    	}
+    	return r, nil
+    }
+
+    // GroupBy returns the items per key, each group in the original order.
+    func GroupBy[T any, K comparable](items []T, key func(T) K) map[K][]T {
+    	return nil // TODO
+    }
+
+    // MaxBy returns the largest item (the first of equals) and true; false for no items.
+    func MaxBy[T any](items []T, less func(a, b T) bool) (T, bool) {
+    	var zero T
+    	return zero, false // TODO
+    }
+
+    // Latest returns the newest release of each service.
+    func Latest(rs []Release) map[string]Release {
+    	return nil // TODO
+    }
+
+    func main() {
+    	r, err := ParseRelease([]byte(`{"service": "checkout", "version": "1.10.0", "token": "s3cr3t"}`))
+    	fmt.Println(r, err)
+    	b, _ := json.Marshal(Release{Service: "search", Version: "2.1.0", Token: "s3cr3t"})
+    	fmt.Println(string(b))
+    }
+    EOF
+  check: |
+    w=$(mktemp -d)
+
+    mkdir "$w/ut"
+    cat >"$w/ut/hidden.py" <<'EOF'
+    import dataclasses
+    import unittest
+    from promote import Release, Version
+
+
+    class T(unittest.TestCase):
+        def test_parse(self):
+            self.assertEqual(Version.parse("1.4.2"), Version(1, 4, 2))
+            self.assertEqual(Version.parse("v10.0.17"), Version(10, 0, 17))
+            self.assertEqual(str(Version.parse("v1.10.0")), "1.10.0")
+            for bad in ["1.4", "1.4.2.1", "1.4.x", "1.4.2-rc1", "", " 1.4.2", "1.4.2\n", "V1.4.2", "1..2", "-1.4.2", "v"]:
+                with self.subTest(bad=bad):
+                    with self.assertRaises(ValueError):
+                        Version.parse(bad)
+
+        def test_order(self):
+            vs = [Version.parse(s) for s in ["1.10.0", "1.9.3", "0.9.10", "1.9.10", "2.0.0", "1.9.3"]]
+            self.assertEqual([str(v) for v in sorted(vs)], ["0.9.10", "1.9.3", "1.9.3", "1.9.10", "1.10.0", "2.0.0"])
+            self.assertGreater(Version.parse("1.10.0"), Version.parse("1.9.99"))
+            self.assertEqual(len({Version.parse("1.2.3"), Version.parse("v1.2.3"), Version(1, 2, 3)}), 1)
+
+        def test_frozen(self):
+            v = Version(1, 2, 3)
+            with self.assertRaises(dataclasses.FrozenInstanceError):
+                v.major = 2
+
+        def test_release(self):
+            a, b = Release("a", Version(1, 0, 0)), Release("b", Version(1, 0, 0))
+            a.approvals.append("ana")
+            self.assertEqual(b.approvals, [])
+            self.assertEqual(Release("c", Version(1, 0, 0), ["li"]).approvals, ["li"])
+    EOF
+    ut() { (cd "$w/ut" && PYTHONPATH=/lab PROMOTE_HOOK=/bin/true timeout 20 python3 -B -m unittest "hidden.T.$1"); }
+
+    cat >"$w/hook" <<'EOF'
+    #!/bin/sh
+    for a in "$@"; do printf '%s\n' "$a"; done >"$HOOKLOG"
+    if [ "$2" = "6.6.6" ]; then
+      echo "policy: 6.6.6 is blocked" >&2
+      exit 3
+    fi
+    exit 0
+    EOF
+    chmod 755 "$w/hook"
+    mkdir "$w/m"
+    fresh() {
+      rm -rf "$w/m" "$w/hook.log" "$w/PWNED"
+      mkdir "$w/m"
+      cat >"$w/m/deploy.json" <<'EOF'
+    {"env": "prod", "services": {"checkout": "1.9.3", "search": "2.0.0", "ads & offers": "0.9.1", "x$(touch PWNED)": "1.0.0"}}
+    EOF
+    }
+    pr() { (cd "$w" && PROMOTE_HOOK="$w/hook" HOOKLOG="$w/hook.log" timeout 20 python3 -B /lab/promote.py "$@" 2>"$w/err"); }
+    svc() { jq -r --arg s "$1" '.services[$s]' "$w/m/deploy.json" 2>/dev/null; }
+    sum() { sha256sum "$w/m/deploy.json" | cut -d' ' -f1; }
+    msg() { if [ -s "$w/err" ] && ! grep -q Traceback "$w/err"; then echo message; else echo no-message; fi; }
+
+    info "Requirement 1 of 7: the model"
+    check "Version.parse accepts X.Y.Z and vX.Y.Z and rejects everything else" 'ut test_parse'
+    check "versions are ordered numerically and hash alike" 'ut test_order'
+    check "versions are immutable" 'ut test_frozen'
+    check "Release imports and every release has its own approvals" 'ut test_release'
+
+    info "Requirement 2 of 7: the command line"
+    fresh; out=$(pr m/deploy.json checkout v1.10.0); rc=$?
+    check_eq "promotes by numeric version and reports the change" "$rc|$out|$(svc checkout)" "0|checkout 1.9.3 -> 1.10.0|1.10.0"
+    fresh; out=$(pr m/deploy.json checkout 1.10); rc=$?
+    check_eq "an invalid version is a usage error (status 2, nothing on stdout)" "$rc|$out|$(svc checkout)" "2||1.9.3"
+    fresh; out=$(pr m/deploy.json billing 1.0.0); rc=$?; m1=$(msg); out2=$(pr m/missing.json checkout 2.0.0); rc2=$?
+    check_eq "an unknown service or a missing manifest exits 1 with a message (no traceback) and nothing on stdout" "$rc|$out|$m1|$rc2|$out2|$(msg)" "1||message|1||message"
+    fresh; out=$(pr m/deploy.json search 1.9.9); rc=$?
+    check_eq "refuses a downgrade (status 1, a message, nothing on stdout, manifest unchanged)" "$rc|$out|$(msg)|$(svc search)" "1||message|2.0.0"
+    fresh; out=$(pr --allow-downgrade m/deploy.json search 1.9.9); rc=$?
+    check_eq "--allow-downgrade allows it" "$rc|$out|$(svc search)" "0|search 2.0.0 -> 1.9.9|1.9.9"
+
+    info "Requirement 3 of 7: safe writes"
+    fresh; ino=$(stat -c %i "$w/m/deploy.json"); pr m/deploy.json search 2.1.0 >/dev/null
+    check "replaces the manifest with a new file, renamed over the old one" '[ "$(svc search)" = 2.1.0 ] && [ "$(stat -c %i "$w/m/deploy.json")" != "$ino" ]'
+    check "keeps everything else in the manifest" 'jq -e ".env == \"prod\" and .services.checkout == \"1.9.3\" and .services[\"ads & offers\"] == \"0.9.1\" and .services.search == \"2.1.0\" and (.services | length) == 4" "$w/m/deploy.json"'
+    check_eq "leaves no other files next to the manifest" "$(svc search)|$(ls -A "$w/m")" "2.1.0|deploy.json"
+    fresh; before=$(sum); out=$(pr --dry-run m/deploy.json search 2.1.0); rc=$?
+    check_eq "--dry-run validates, reports and writes nothing" "$rc|$out|$(sum)|$(sed -n 2p "$w/hook.log" 2>/dev/null)" "0|dry run: search 2.0.0 -> 2.1.0|$before|2.1.0"
+
+    info "Requirement 4 of 7: the validation hook"
+    fresh; out=$(pr m/deploy.json "ads & offers" v1.0.0); rc=$?
+    check_eq "runs the hook with exactly SERVICE and the normalised VERSION" "$rc|$(cat "$w/hook.log" 2>/dev/null | tr '\n' '|')" "0|ads & offers|1.0.0|"
+    fresh; pr m/deploy.json 'x$(touch PWNED)' 1.0.1 >/dev/null
+    check "a service name with shell syntax is passed as data, never run" '[ ! -e "$w/PWNED" ] && [ "$(head -1 "$w/hook.log")" = "x\$(touch PWNED)" ] && [ "$(svc "x\$(touch PWNED)")" = 1.0.1 ]'
+    fresh; before=$(sum); out=$(pr m/deploy.json checkout 6.6.6); rc=$?
+    check_eq "a failing hook stops the promotion (status 1, a message, nothing on stdout, manifest unchanged)" "$rc|$out|$(msg)|$(sum)" "1||message|$before"
+    check "the hook's message reaches stderr" 'grep -q "6.6.6 is blocked" "$w/err"'
+
+    info "Requirement 5 of 7: the tests"
+    mkdir "$w/ref" "$w/m1" "$w/m2" "$w/m3"
+    cat >"$w/ref/promote.py" <<'EOF'
+    import re
+    from dataclasses import dataclass, field
+
+    _VERSION = re.compile(r"v?(\d+)\.(\d+)\.(\d+)", re.ASCII)
+
+
+    @dataclass(frozen=True, order=True)
+    class Version:
+        major: int
+        minor: int
+        patch: int
+
+        @classmethod
+        def parse(cls, text):
+            m = _VERSION.fullmatch(text)
+            if not m:
+                raise ValueError(f"not a version: {text!r}")
+            return cls(*map(int, m.groups()))
+
+        def __str__(self):
+            return f"{self.major}.{self.minor}.{self.patch}"
+
+
+    @dataclass
+    class Release:
+        service: str
+        version: Version
+        approvals: list = field(default_factory=list)
+    EOF
+    python3 - "$w" <<'PY'
+    import sys
+    w = sys.argv[1]
+    ref = open(f"{w}/ref/promote.py").read()
+    for name, old, new in [
+        ("m1", "cls(*map(int, m.groups()))", "cls(*m.groups())"),
+        ("m2", "_VERSION.fullmatch(text)", "_VERSION.match(text)"),
+        ("m3", 'r"v?(\\d+)', 'r"(\\d+)'),
+    ]:
+        assert ref.count(old) == 1, old
+        open(f"{w}/{name}/promote.py", "w").write(ref.replace(old, new))
+    PY
+    run_t() {
+      [ -s /lab/test_promote.py ] || return 1
+      cp /lab/test_promote.py "$w/$1/"
+      (cd "$w/$1" && PROMOTE_HOOK=/bin/true timeout 30 python3 -B -m unittest test_promote >/dev/null 2>&1)
+    }
+    check "/lab/test_promote.py exists" '[ -s /lab/test_promote.py ]'
+    check "the tests pass against a correct Version" 'run_t ref'
+    check "the tests catch versions that compare as text" 'run_t ref && ! run_t m1'
+    check "the tests catch a parser that accepts trailing text" 'run_t ref && ! run_t m2'
+    check "the tests catch a parser that rejects the v prefix" 'run_t ref && ! run_t m3'
+
+    mkdir "$w/go"
+    cp /lab/*.go "$w/go"/ 2>/dev/null
+    rm -f "$w/go"/*_test.go
+    cat >"$w/go/zz_hidden_test.go" <<'GO'
+    package main
+
+    import (
+    	"encoding/json"
+    	"errors"
+    	"reflect"
+    	"sort"
+    	"strings"
+    	"testing"
+    )
+
+    func keysOf(t *testing.T, b []byte) string {
+    	var m map[string]json.RawMessage
+    	if err := json.Unmarshal(b, &m); err != nil {
+    		t.Fatal(err)
+    	}
+    	var ks []string
+    	for k := range m {
+    		ks = append(ks, k)
+    	}
+    	sort.Strings(ks)
+    	return strings.Join(ks, ",")
+    }
+
+    func TestWireFormat(t *testing.T) {
+    	b, err := json.Marshal(Release{Service: "checkout", Version: "1.10.0", ApprovedBy: []string{"ana"}, Notes: "faster", Token: "s3cr3t"})
+    	if err != nil {
+    		t.Fatal(err)
+    	}
+    	if k := keysOf(t, b); k != "approved_by,notes,service,version" {
+    		t.Fatalf("keys = %s", k)
+    	}
+    	if strings.Contains(string(b), "s3cr3t") {
+    		t.Fatal("the token was encoded")
+    	}
+    	b, _ = json.Marshal(Release{Service: "s", Version: "1.0.0", Token: "x"})
+    	if k := keysOf(t, b); k != "service,version" {
+    		t.Fatalf("minimal release keys = %s", k)
+    	}
+    }
+
+    func TestParseStrict(t *testing.T) {
+    	r, err := ParseRelease([]byte(`{"service":"search","version":"2.1.0","approved_by":["ana","li"],"notes":"faster"}`))
+    	want := Release{Service: "search", Version: "2.1.0", ApprovedBy: []string{"ana", "li"}, Notes: "faster"}
+    	if err != nil || !reflect.DeepEqual(r, want) {
+    		t.Fatalf("got %+v, %v", r, err)
+    	}
+    	for _, in := range []string{
+    		`{"service":"s","version":"1.0.0","token":"x"}`,
+    		`{"service":"s","version":"1.0.0","Token":"x"}`,
+    		`{"service":"s","version":"1.0.0","owner":"x"}`,
+    	} {
+    		if r, err := ParseRelease([]byte(in)); err == nil || r.Token != "" {
+    			t.Fatalf("%s: accepted as %+v", in, r)
+    		}
+    	}
+    }
+
+    func TestParseErrors(t *testing.T) {
+    	for in, word := range map[string]string{
+    		`{"version":"1.0.0"}`:                         "service",
+    		`{"service":"","version":"1.0.0"}`:            "service",
+    		`{"service":"s"}`:                             "version",
+    		`{"service":"s","version":"1.0"}`:             "version",
+    		`{"service":"s","version":"v1.0.0"}`:          "version",
+    		`{"service":"s","version":"1.0.0","bogus":1}`: "bogus",
+    		`{nope`: "",
+    	} {
+    		_, err := ParseRelease([]byte(in))
+    		if !errors.Is(err, ErrInvalid) {
+    			t.Fatalf("%s: errors.Is(err, ErrInvalid) is false for %v", in, err)
+    		}
+    		if !strings.Contains(err.Error(), word) {
+    			t.Fatalf("%s: the error %q does not name %q", in, err, word)
+    		}
+    	}
+    }
+
+    func TestGroupBy(t *testing.T) {
+    	g := GroupBy([]string{"apple", "banana", "avocado", "cherry", "blueberry"}, func(s string) byte { return s[0] })
+    	if want := map[byte][]string{'a': {"apple", "avocado"}, 'b': {"banana", "blueberry"}, 'c': {"cherry"}}; !reflect.DeepEqual(g, want) {
+    		t.Fatalf("GroupBy strings = %v", g)
+    	}
+    	n := GroupBy([]int{1, 2, 3, 4, 5, 6}, func(i int) bool { return i%2 == 0 })
+    	if want := map[bool][]int{false: {1, 3, 5}, true: {2, 4, 6}}; !reflect.DeepEqual(n, want) {
+    		t.Fatalf("GroupBy ints = %v", n)
+    	}
+    	if len(GroupBy([]int(nil), func(i int) int { return i })) != 0 {
+    		t.Fatal("GroupBy(nil) is not empty")
+    	}
+    }
+
+    func TestMaxBy(t *testing.T) {
+    	if m, ok := MaxBy([]int{3, 9, 2, 9}, func(a, b int) bool { return a < b }); !ok || m != 9 {
+    		t.Fatalf("MaxBy ints = %v %v", m, ok)
+    	}
+    	type person struct {
+    		name string
+    		age  int
+    	}
+    	p, ok := MaxBy([]person{{"a", 30}, {"b", 41}, {"c", 41}, {"d", 7}}, func(x, y person) bool { return x.age < y.age })
+    	if !ok || p.name != "b" {
+    		t.Fatalf("MaxBy structs = %v %v, want the first of the oldest", p, ok)
+    	}
+    	if s, ok := MaxBy([]string{}, func(a, b string) bool { return a < b }); ok || s != "" {
+    		t.Fatalf("MaxBy(empty) = %q %v", s, ok)
+    	}
+    }
+
+    func TestLatest(t *testing.T) {
+    	got := Latest([]Release{
+    		{Service: "search", Version: "1.9.0"},
+    		{Service: "checkout", Version: "2.0.0"},
+    		{Service: "search", Version: "1.10.0", Notes: "new"},
+    		{Service: "search", Version: "1.2.11"},
+    		{Service: "checkout", Version: "2.0.0", Notes: "duplicate"},
+    	})
+    	want := map[string]Release{
+    		"search":   {Service: "search", Version: "1.10.0", Notes: "new"},
+    		"checkout": {Service: "checkout", Version: "2.0.0"},
+    	}
+    	if !reflect.DeepEqual(got, want) {
+    		t.Fatalf("Latest = %+v", got)
+    	}
+    	if len(Latest(nil)) != 0 {
+    		t.Fatal("Latest(nil) is not empty")
+    	}
+    }
+    GO
+    gres=$(timeout 300 docker run --rm -v "$w/go:/src" -v kl-gocache:/root/.cache -w /src golang:1.24-alpine sh -c '
+      go mod init lab >/dev/null 2>&1
+      for x in TestWireFormat TestParseStrict TestParseErrors TestGroupBy TestMaxBy TestLatest; do
+        if go test -count=1 -timeout 30s -run "^$x\$" . >/tmp/out 2>&1; then echo "$x=pass"; else echo "$x=fail"; grep -vE "^(FAIL|exit status|ok)" /tmp/out | head -4 | sed "s/^/      /"; fi
+      done' 2>&1)
+    gt() { grep -qx "$1=pass" <<<"$gres"; }
+
+    info "Requirement 6 of 7: wire format and validation"
+    check "encodes the agreed keys, leaves out empty ones and never the token" 'gt TestWireFormat'
+    check "ParseRelease decodes strictly" 'gt TestParseStrict'
+    check "every error wraps ErrInvalid and names the field" 'gt TestParseErrors'
+    info "Requirement 7 of 7: generic helpers"
+    check "GroupBy keeps each group in order, for any types" 'gt TestGroupBy'
+    check "MaxBy returns the first of the largest, and false for nothing" 'gt TestMaxBy'
+    check "Latest picks the newest release per service" 'gt TestLatest'
+    grep -v "=pass$" <<<"$gres" | sed 's/^\(Test[A-Za-z]*\)=fail$/    \1 failed:/' | head -30
+    rm -rf "$w"
+  solve: |
+    cat > /lab/promote.py <<'EOF'
+    """Promote a service to a new version in a deployment manifest."""
+    import argparse
+    import json
+    import os
+    import re
+    import subprocess
+    import sys
+    import tempfile
+    from dataclasses import dataclass, field
+
+    HOOK = os.environ.get("PROMOTE_HOOK", "/lab/hooks/validate")
+    _VERSION = re.compile(r"v?(\d+)\.(\d+)\.(\d+)", re.ASCII)
+
+
+    @dataclass(frozen=True, order=True)
+    class Version:
+        major: int
+        minor: int
+        patch: int
+
+        @classmethod
+        def parse(cls, text):
+            m = _VERSION.fullmatch(text)
+            if not m:
+                raise ValueError(f"not a version: {text!r}")
+            return cls(*map(int, m.groups()))
+
+        def __str__(self):
+            return f"{self.major}.{self.minor}.{self.patch}"
+
+
+    @dataclass
+    class Release:
+        service: str
+        version: Version
+        approvals: list[str] = field(default_factory=list)
+
+
+    def version_arg(text):
+        try:
+            return Version.parse(text)
+        except ValueError as e:
+            raise argparse.ArgumentTypeError(str(e))
+
+
+    def write_atomic(path, data):
+        d = os.path.dirname(os.path.abspath(path))
+        fd, tmp = tempfile.mkstemp(dir=d, prefix=".promote-")
+        try:
+            with os.fdopen(fd, "w") as f:
+                json.dump(data, f, indent=2)
+                f.write("\n")
+            os.replace(tmp, path)
+        except BaseException:
+            try:
+                os.unlink(tmp)
+            except FileNotFoundError:
+                pass
+            raise
+
+
+    def fail(msg):
+        print(f"promote: {msg}", file=sys.stderr)
+        return 1
+
+
+    def main():
+        p = argparse.ArgumentParser(description="Promote a service to a new version")
+        p.add_argument("manifest")
+        p.add_argument("service")
+        p.add_argument("version", type=version_arg)
+        p.add_argument("--dry-run", action="store_true")
+        p.add_argument("--allow-downgrade", action="store_true")
+        a = p.parse_args()
+
+        try:
+            with open(a.manifest) as f:
+                data = json.load(f)
+        except (OSError, ValueError) as e:
+            return fail(f"cannot read {a.manifest}: {e}")
+        services = data.get("services") if isinstance(data, dict) else None
+        if not isinstance(services, dict) or a.service not in services:
+            return fail(f"unknown service {a.service!r}")
+        try:
+            old = Version.parse(services[a.service])
+        except (TypeError, ValueError):
+            return fail(f"the manifest has no valid version for {a.service!r}")
+        new = a.version
+        if new < old and not a.allow_downgrade:
+            return fail(f"refusing to downgrade {a.service} from {old} to {new} (use --allow-downgrade)")
+
+        try:
+            hook = subprocess.run([HOOK, a.service, str(new)], stdout=sys.stderr, timeout=120)
+        except (OSError, subprocess.TimeoutExpired) as e:
+            return fail(f"cannot run the validation hook: {e}")
+        if hook.returncode != 0:
+            return fail(f"the validation hook refused {a.service} {new} (status {hook.returncode})")
+
+        line = f"{a.service} {old} -> {new}"
+        if a.dry_run:
+            print("dry run: " + line)
+            return 0
+        services[a.service] = str(new)
+        write_atomic(a.manifest, data)
+        print(line)
+        return 0
+
+
+    if __name__ == "__main__":
+        sys.exit(main())
+    EOF
+    cat > /lab/test_promote.py <<'EOF'
+    import unittest
+
+    from promote import Version
+
+
+    class VersionTests(unittest.TestCase):
+        def test_parse_valid(self):
+            for text, want in [("1.4.2", (1, 4, 2)), ("v1.10.0", (1, 10, 0)), ("0.0.0", (0, 0, 0))]:
+                with self.subTest(text=text):
+                    v = Version.parse(text)
+                    self.assertEqual((v.major, v.minor, v.patch), want)
+                    self.assertEqual(str(v), text.lstrip("v"))
+
+        def test_parse_invalid(self):
+            for text in ["1.4", "1.4.2.1", "1.4.x", "1.4.2-rc1", "", "x1.4.2"]:
+                with self.subTest(text=text):
+                    with self.assertRaises(ValueError):
+                        Version.parse(text)
+
+        def test_order(self):
+            self.assertLess(Version.parse("1.9.3"), Version.parse("1.10.0"))
+            self.assertEqual(Version.parse("v2.0.0"), Version.parse("2.0.0"))
+            got = sorted(Version.parse(s) for s in ["1.10.0", "1.9.3", "0.9.10"])
+            self.assertEqual([str(v) for v in got], ["0.9.10", "1.9.3", "1.10.0"])
+
+
+    if __name__ == "__main__":
+        unittest.main()
+    EOF
+    python3 - <<'PY'
+    p = "/lab/release.go"
+    s = open(p).read()
+    for old, new in [
+        ('import (\n\t"encoding/json"', 'import (\n\t"bytes"\n\t"encoding/json"'),
+        ("\tService    string\n\tVersion    string\n\tApprovedBy []string\n\tNotes      string\n\tToken      string // deploy token: never sent, never accepted\n",
+         '\tService    string   `json:"service"`\n\tVersion    string   `json:"version"`\n\tApprovedBy []string `json:"approved_by,omitempty"`\n\tNotes      string   `json:"notes,omitempty"`\n\tToken      string   `json:"-"` // deploy token: never sent, never accepted\n'),
+        ("""\tvar r Release
+    \tif err := json.Unmarshal(data, &r); err != nil {
+    \t\treturn r, err
+    \t}
+    \tif r.Service == "" {
+    \t\treturn r, errors.New("service is required")
+    \t}
+    \tif !validVersion(r.Version) {
+    \t\treturn r, fmt.Errorf("version %q: %v", r.Version, ErrInvalid)
+    \t}
+    """, """\tvar r Release
+    \tdec := json.NewDecoder(bytes.NewReader(data))
+    \tdec.DisallowUnknownFields()
+    \tif err := dec.Decode(&r); err != nil {
+    \t\treturn Release{}, fmt.Errorf("%w: %v", ErrInvalid, err)
+    \t}
+    \tif r.Service == "" {
+    \t\treturn Release{}, fmt.Errorf("service is required: %w", ErrInvalid)
+    \t}
+    \tif !validVersion(r.Version) {
+    \t\treturn Release{}, fmt.Errorf("version %q: %w", r.Version, ErrInvalid)
+    \t}
+    """),
+        ("\treturn nil // TODO\n}\n\n// MaxBy", "\tout := make(map[K][]T)\n\tfor _, it := range items {\n\t\tk := key(it)\n\t\tout[k] = append(out[k], it)\n\t}\n\treturn out\n}\n\n// MaxBy"),
+        ("\tvar zero T\n\treturn zero, false // TODO\n", "\tvar best T\n\tif len(items) == 0 {\n\t\treturn best, false\n\t}\n\tbest = items[0]\n\tfor _, x := range items[1:] {\n\t\tif less(best, x) {\n\t\t\tbest = x\n\t\t}\n\t}\n\treturn best, true\n"),
+        ("\treturn nil // TODO\n}\n\nfunc main", "\tout := make(map[string]Release)\n\tfor svc, group := range GroupBy(rs, func(r Release) string { return r.Service }) {\n\t\tout[svc], _ = MaxBy(group, func(a, b Release) bool { return CompareVersions(a.Version, b.Version) < 0 })\n\t}\n\treturn out\n}\n\nfunc main"),
+    ]:
+        assert s.count(old) == 1, old
+        s = s.replace(old, new)
+    open(p, "w").write(s)
+    PY

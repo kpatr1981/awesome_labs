@@ -1251,3 +1251,274 @@ exercises:
     cd /lab/repo
     root=$(git rev-list --max-parents=0 main)
     git replace --graft "$root" archive
+
+# ===== Capstone: a real-world lab =====
+
+- id: git-255
+  title: "Capstone: a release-facts tool the bot can trust"
+  difficulty: 5
+  kind: fix
+  tags: [git, capstone, scripting, plumbing, for-each-ref, first-parent, merge-base, numstat, commit-tree, update-ref]
+  tutorial: |
+    **Concept.** Git has two kinds of commands. **Porcelain** (`git branch`,
+    `git tag`, `git diff --stat`) is made for people: its output changes
+    with the user's config (colours, columns), with the terminal and between
+    versions. **Plumbing**, and porcelain with an explicit machine format,
+    is made for scripts: exact answers, stable output, meaningful exit
+    codes. A script that parses `git branch` works on its author's laptop
+    and breaks on the bot that runs it with `color.ui=always`.
+
+    The building blocks this module taught, in their script-safe forms:
+
+    - `git for-each-ref --contains <c> --sort=v:refname --format='%(refname:short)' refs/tags`
+      (or `git tag --no-column ...`): tags, in version order.
+    - `git log --first-parent --merges --reverse --format=%s A..B`: what
+      was merged *into* the mainline, not merges inside feature branches.
+    - `git rev-parse -q --verify "<x>^{commit}"` decides whether something
+      names a commit at all, and `git merge-base --is-ancestor C main` says
+      whether it is in main's history, through the exit status alone.
+    - `git diff --numstat A B` gives per-file numbers that are easy to add
+      up, unlike the wording of `--shortstat` ("1 insertion(+)", no
+      deletions part at all when there are none).
+    - `git hash-object -w`, `git update-index --add --cacheinfo` (with a
+      private `GIT_INDEX_FILE`), `git write-tree`, `git commit-tree [-p
+      PARENT]` and `git update-ref` build a commit on any branch, including
+      a brand-new branch with no parent, without touching `HEAD`, the real
+      index or the working tree.
+
+    **Read up on:**
+    - `git for-each-ref --contains`, `--sort=v:refname`, `column.ui`
+    - `git log --first-parent --merges`
+    - `git rev-parse --verify`, `git merge-base --is-ancestor`
+    - `git diff --numstat`
+    - `GIT_INDEX_FILE`, `git read-tree [--empty]`, `git write-tree`, `git commit-tree`, `git update-ref`
+    - `GIT_CONFIG_GLOBAL`
+  scenario: |
+    **Ticket REL-512** (from Jonas, release engineering): *"The release bot
+    calls `/lab/bin/relinfo` for every release, and it keeps giving wrong
+    answers: last week it said our CVE fix was in 1.1.1 (it's a
+    cherry-picked copy), it let a `maintenance`-only commit through the
+    deploy gate, and the size line came out half empty. It also prints
+    garbage on the bot, which runs with our team config, `/lab/bot.gitconfig`
+    (`color.ui` and `column.ui` set to `always`). Please make it correct,
+    whatever the user's config, and add the `publish` command we never got
+    round to."*
+
+    Fix **`/lab/bin/relinfo`**. It runs **inside a repository** (the
+    current directory) and must keep its name and commands:
+
+    1. **`relinfo tags-with COMMIT`** prints every tag whose history
+       contains that exact commit, one per line, in **version order**
+       (`v1.9` before `v1.10`).
+    2. **`relinfo merges FROM TO`** prints the subjects of the merge commits
+       made **on the mainline** (first parents) after `FROM` up to `TO`,
+       oldest first. Merges inside a feature branch do not count.
+    3. **`relinfo on-main COMMIT`** exits **0** if `COMMIT` is in `main`'s
+       history, **1** if it is a commit that is not, and **2** if `COMMIT`
+       does not name a commit at all (an unknown hash, a blob).
+    4. **`relinfo size FROM TO`** prints one line `<files> <insertions>
+       <deletions>` for the change from `FROM` to `TO`, for example `3 12
+       0`, and `0 0 0` when nothing changed.
+    5. **`relinfo publish FILE`** stores `FILE` (under its base name) on the
+       branch **`reports`** as a new commit with the message **`report:
+       <name>`**, and prints the new commit's full hash. The first publish
+       creates `reports` as a branch with **no history** (a root commit
+       holding just that file); later ones add a commit on top, keeping the
+       other reports and replacing a file of the same name.
+    6. `publish` must not touch **`HEAD`, the current branch, the index or
+       the working tree**: people run it in clones with work in progress.
+    7. Every command gives these answers under the bot's config: the check
+       runs your script with `GIT_CONFIG_GLOBAL` set to a copy of
+       `/lab/bot.gitconfig`.
+
+    **`/lab/app`** has a history like the ones the bot sees, to try it on
+    (the CVE fix is the commit `Fix CVE-2026-1234 in auth`). The check runs
+    your script against a **fresh repository** built the same way, not
+    against `/lab/app`.
+  hints:
+    - "See it break: `cd /lab/app && GIT_CONFIG_GLOBAL=/lab/bot.gitconfig /lab/bin/relinfo tags-with \"$(git rev-parse ':/Fix CVE')\"`. Columns, and `v1.10` before `v1.2`."
+    - "`git for-each-ref --contains \"$2\" --sort=v:refname --format='%(refname:short)' refs/tags`, or `git tag --no-column --sort=v:refname --contains \"$2\"`."
+    - "`merges`: `git log --first-parent --merges --reverse --format=%s \"$2..$3\"`. `on-main`: `git rev-parse -q --verify \"$2^{commit}\" >/dev/null || exit 2`, then `git merge-base --is-ancestor \"$2\" main`."
+    - "`size`: `git diff --numstat \"$2\" \"$3\" | awk '{f++; a+=$1; d+=$2} END {print f+0, a+0, d+0}'`."
+    - "`publish`: `export GIT_INDEX_FILE=$(mktemp -u)`; `git read-tree reports` if the branch exists, else `git read-tree --empty`; `git hash-object -w`, `git update-index --add --cacheinfo 100644,<blob>,<name>`, `git write-tree`."
+    - "`git commit-tree <tree> -m \"report: <name>\"` with `-p <old reports>` only when there is one, then `git update-ref refs/heads/reports <commit>` and `echo` the hash. Test it with staged and unstaged changes in `/lab/app` and compare `git status` before and after."
+  solution: |
+    ```bash
+    cat > /lab/bin/relinfo <<'EOF'
+    #!/bin/bash
+    # relinfo: release facts for the release bot. Run it inside a repository.
+    case ${1:-} in
+      tags-with)
+        git for-each-ref --contains "$2" --sort=v:refname --format='%(refname:short)' refs/tags ;;
+      merges)
+        git log --first-parent --merges --reverse --format=%s "$2..$3" ;;
+      on-main)
+        git rev-parse -q --verify "$2^{commit}" >/dev/null || exit 2
+        git merge-base --is-ancestor "$2" main ;;
+      size)
+        git diff --numstat "$2" "$3" | awk '{f++; a+=$1; d+=$2} END {print f+0, a+0, d+0}' ;;
+      publish)
+        name=$(basename "$2")
+        GIT_INDEX_FILE=$(mktemp -u); export GIT_INDEX_FILE
+        trap 'rm -f "$GIT_INDEX_FILE"' EXIT
+        parent=$(git rev-parse -q --verify refs/heads/reports)
+        if [ -n "$parent" ]; then git read-tree "$parent"; else git read-tree --empty; fi
+        blob=$(git hash-object -w -- "$2") || exit 1
+        git update-index --add --cacheinfo 100644,"$blob","$name"
+        tree=$(git write-tree)
+        commit=$(git commit-tree "$tree" ${parent:+-p "$parent"} -m "report: $name") || exit 1
+        git update-ref refs/heads/reports "$commit"
+        echo "$commit" ;;
+      *)
+        echo "usage: relinfo tags-with|merges|on-main|size|publish ..." >&2; exit 64 ;;
+    esac
+    EOF
+    ```
+    Try every command in `/lab/app` with `GIT_CONFIG_GLOBAL=/lab/bot.gitconfig`.
+    `git tag --no-column --sort=v:refname --contains "$2"` is a fine
+    `tags-with` too, and `git log --first-parent --merges` can be swapped
+    for `git rev-list --first-parent --merges --reverse` plus
+    `git log -1 --format=%s` per commit.
+  setup: |
+    rm -rf /lab/app /lab/bin /lab/bot.gitconfig "$KL_STATE/app-facts"
+    mkdir -p "$KL_STATE/app-facts"
+    # the history builder, shared with the check (which builds a fresh repository)
+    cat > "$KL_STATE/build.sh" <<'EOF'
+    #!/bin/bash
+    # build.sh DIR SALT FACTS: a release history; writes key commit hashes to FACTS/
+    set -e
+    d=$1 salt=$2 facts=$3
+    git init -q -b main "$d"
+    cd "$d"
+    n=0
+    at() {
+      local t; t=$(printf '2026-05-%02dT%02d:00:00+0000' $((1 + n / 12)) $((8 + n % 12))); n=$((n + 1))
+      GIT_AUTHOR_DATE="$t" GIT_COMMITTER_DATE="$t" git -c user.name="Release Dev" -c user.email=dev@example.test "$@"
+    }
+    cm() { mkdir -p notes; echo "$1 ($salt)" > "notes/$(tr -c 'a-zA-Z0-9\n' '-' <<<"$1").txt"; git add -A; at commit -qm "$1"; }
+    printf 'readme %s\nline two\nline three\n' "$salt" > README.md
+    cm "init"; at tag -a v1.0 -m "v1.0"
+    echo "parser $salt" > parser.txt; cm "add parser"; at tag -a v1.1 -m "v1.1"
+    git branch release-1.1
+    echo "safe $salt" > auth.txt; cm "Fix CVE-2026-1234 in auth"; git rev-parse HEAD > "$facts/fix"
+    git switch -qc login; cm "login form"; cm "login tests"
+    git switch -q main; at merge -q --no-ff -m "Merge login" login
+    echo "deps $salt" > deps.txt; cm "bump deps"; at tag -a v1.2 -m "v1.2"
+    git switch -qc search; cm "search box"
+    git switch -q main; cm "main tweak"
+    git switch -q search; at merge -q --no-ff -m "Sync main into search" main; cm "search results"
+    git switch -q main; at merge -q --no-ff -m "Merge search" search; at tag -a v1.9 -m "v1.9"
+    printf 'docs %s\n' "$salt" > README.md; cm "rewrite the README"; at tag -a v1.10 -m "v1.10"
+    git switch -qc payments; cm "payments"
+    git switch -q main; at merge -q --no-ff -m "Merge payments" payments; at tag -a v2.0 -m "v2.0"
+    git switch -q release-1.1; at cherry-pick -x "$(cat "$facts/fix")" >/dev/null; at tag -a v1.1.1 -m "v1.1.1"
+    git rev-parse HEAD > "$facts/pick"
+    git switch -qc maintenance main; cm "maintenance only"; git rev-parse HEAD > "$facts/maint"
+    git switch -qc main-old v1.1; cm "old main experiment"; git rev-parse HEAD > "$facts/mainold"
+    git switch -q main
+    git branch -q -D login search payments
+    git rev-parse HEAD:README.md > "$facts/blob"
+    EOF
+    bash "$KL_STATE/build.sh" /lab/app app "$KL_STATE/app-facts"
+    git -C /lab/app config user.name Learner
+    git -C /lab/app config user.email learner@example.test
+    cat > /lab/bot.gitconfig <<'EOF'
+    [user]
+        name = Release Bot
+        email = release-bot@example.test
+    [color]
+        ui = always
+    [column]
+        ui = always
+    EOF
+    cp /lab/bot.gitconfig "$KL_STATE/bot.gitconfig"
+    lab_file /lab/bin/relinfo 0755 <<'EOF'
+    #!/bin/bash
+    # relinfo: release facts for the release bot. Run it inside a repository.
+    #   relinfo tags-with COMMIT   tags whose history contains COMMIT, in version order
+    #   relinfo merges FROM TO     subjects of the merges made on the mainline after FROM up to TO, oldest first
+    #   relinfo on-main COMMIT     exit 0 if COMMIT is in main's history, 1 if not, 2 if it is not a commit
+    #   relinfo size FROM TO       "<files> <insertions> <deletions>" from FROM to TO
+    #   relinfo publish FILE       store FILE on the reports branch (see /lab/TASK.md)
+    case ${1:-} in
+      tags-with) git tag --contains "$2" ;;
+      merges)    git log --merges --format=%s "$2..$3" | tac ;;
+      on-main)   git branch --contains "$2" 2>/dev/null | grep -q main ;;
+      size)      git diff --stat "$2" "$3" | tail -1 | awk '{print $1, $4, $6}' ;;
+      publish)   echo "relinfo publish: not written yet" >&2; exit 1 ;;
+      *)         echo "usage: relinfo tags-with|merges|on-main|size|publish ..." >&2; exit 64 ;;
+    esac
+    EOF
+    chown -R "$(lab_user):" /lab/app /lab/bin /lab/bot.gitconfig
+  check: |
+    rm -rf /tmp/kl-relinfo.*
+    H=$(mktemp -d /tmp/kl-relinfo.XXXXXX)
+    F=$H.facts; mkdir -p "$F" "$H.r"
+    rmdir "$H"; bash "$KL_STATE/build.sh" "$H" "$RANDOM$RANDOM" "$F" >/dev/null 2>&1
+    cp "$KL_STATE/bot.gitconfig" "$H.gitconfig"
+    # work in progress, for publish to leave alone
+    echo "staged edit" >> "$H/README.md"; git -C "$H" add README.md
+    echo "unstaged edit" >> "$H/parser.txt"; echo scratch > "$H/untracked.txt"
+    echo "weekly report $RANDOM" > "$H.r/weekly.txt"; echo "on-call notes" > "$H.r/oncall.txt"
+    chown -R "$(lab_user):" "$H"; chmod -R a+rX "$H.r" "$H.gitconfig" "$F"
+    R() { sudo -u "$(lab_user)" -H env GIT_CONFIG_GLOBAL="$H.gitconfig" bash -c 'cd "$1" && shift && timeout 20 /lab/bin/relinfo "$@"' _ "$H" "$@" 2>/dev/null; }
+    rc() { R "$@" >/dev/null; echo $?; }
+    G() { sudo -u "$(lab_user)" -H git --no-optional-locks -C "$H" "$@"; }
+    fact() { cat "$F/$1"; }
+    check "/lab/bin/relinfo is executable" '[ -x /lab/bin/relinfo ]'
+    check_eq "tags-with: the tags that contain the fix, in version order" "$(R tags-with "$(fact fix)")" "$(printf 'v1.2\nv1.9\nv1.10\nv2.0')"
+    check_eq "tags-with: the cherry-picked copy is only in v1.1.1" "$(R tags-with "$(fact pick)")" "v1.1.1"
+    check_eq "merges v1.1 main: the merges made on main, oldest first" "$(R merges v1.1 main)" "$(printf 'Merge login\nMerge search\nMerge payments')"
+    check_eq "merges v1.2 v1.10: a merge inside a feature branch does not count" "$(R merges v1.2 v1.10)" "Merge search"
+    check_eq "on-main: main's tip, main~3 and the tag v1.2 are on main (exit 0)" "$(rc on-main main) $(rc on-main main~3) $(rc on-main v1.2)" "0 0 0"
+    check_eq "on-main: commits only on maintenance, main-old or release-1.1 are not (exit 1)" "$(rc on-main "$(fact maint)") $(rc on-main "$(fact mainold)") $(rc on-main "$(fact pick)")" "1 1 1"
+    check_eq "on-main: an unknown hash and a blob are not commits (exit 2)" "$(rc on-main 0123456789abcdef0123456789abcdef01234567) $(rc on-main "$(fact blob)")" "2 2"
+    ref_size() { git -c safe.directory='*' -C "$H" diff --numstat "$1" "$2" | awk '{f++; a+=$1; d+=$2} END {print f+0, a+0, d+0}'; }
+    check_eq "size v1.0 v1.1 (insertions only)" "$(R size v1.0 v1.1)" "$(ref_size v1.0 v1.1)"
+    check_eq "size v1.2 v2.0 (insertions and deletions)" "$(R size v1.2 v2.0)" "$(ref_size v1.2 v2.0)"
+    check_eq "size v2.0 v2.0 (nothing changed)" "$(R size v2.0 v2.0)" "0 0 0"
+    snap() { { G symbolic-ref HEAD; G rev-parse main; G status --porcelain=v1 -uall; G diff --cached; G diff; } 2>&1 | sha1sum; }
+    before=$(snap)
+    out=$(R publish "$H.r/weekly.txt")
+    c1=$(G rev-parse -q --verify refs/heads/reports)
+    check "publish creates the reports branch" '[ -n "$c1" ]'
+    check_eq "...as a root commit holding just weekly.txt" "$(G rev-list --count reports 2>/dev/null) $(G ls-tree --name-only reports 2>/dev/null | tr '\n' ' ')" "1 weekly.txt "
+    check_eq "...with the message 'report: weekly.txt'" "$(G log -1 --format=%B reports 2>/dev/null | sed '/^$/d')" "report: weekly.txt"
+    check_eq "...and prints the new commit's hash" "$(tail -n1 <<<"$out")" "${c1:-a hash}"
+    R publish "$H.r/oncall.txt" >/dev/null
+    check_eq "a second publish adds a commit on top and keeps weekly.txt" "$(G rev-parse -q --verify 'reports~1' 2>/dev/null) $(G ls-tree --name-only reports 2>/dev/null | tr '\n' ' ')" "${c1:-the first commit} oncall.txt weekly.txt "
+    echo "weekly report, corrected" > "$H.r/weekly.txt"
+    R publish "$H.r/weekly.txt" >/dev/null
+    check_eq "publishing weekly.txt again replaces it" "$(G rev-list --count reports 2>/dev/null) $(G show reports:weekly.txt 2>/dev/null) / $(G show reports:oncall.txt 2>/dev/null)" "3 weekly report, corrected / on-call notes"
+    check_eq "publish left HEAD, main, the index and the working tree alone" "$(snap)" "$before"
+    rm -rf "$H" "$H".*
+  solve: |
+    cat > /lab/bin/relinfo <<'EOF'
+    #!/bin/bash
+    # relinfo: release facts for the release bot. Run it inside a repository.
+    case ${1:-} in
+      tags-with)
+        git for-each-ref --contains "$2" --sort=v:refname --format='%(refname:short)' refs/tags ;;
+      merges)
+        git log --first-parent --merges --reverse --format=%s "$2..$3" ;;
+      on-main)
+        git rev-parse -q --verify "$2^{commit}" >/dev/null || exit 2
+        git merge-base --is-ancestor "$2" main ;;
+      size)
+        git diff --numstat "$2" "$3" | awk '{f++; a+=$1; d+=$2} END {print f+0, a+0, d+0}' ;;
+      publish)
+        name=$(basename "$2")
+        GIT_INDEX_FILE=$(mktemp -u); export GIT_INDEX_FILE
+        trap 'rm -f "$GIT_INDEX_FILE"' EXIT
+        parent=$(git rev-parse -q --verify refs/heads/reports)
+        if [ -n "$parent" ]; then git read-tree "$parent"; else git read-tree --empty; fi
+        blob=$(git hash-object -w -- "$2") || exit 1
+        git update-index --add --cacheinfo 100644,"$blob","$name"
+        tree=$(git write-tree)
+        commit=$(git commit-tree "$tree" ${parent:+-p "$parent"} -m "report: $name") || exit 1
+        git update-ref refs/heads/reports "$commit"
+        echo "$commit" ;;
+      *)
+        echo "usage: relinfo tags-with|merges|on-main|size|publish ..." >&2; exit 64 ;;
+    esac
+    EOF

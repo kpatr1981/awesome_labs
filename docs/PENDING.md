@@ -8,24 +8,24 @@ what to consolidate. The target doesn't lower the bar: a lab should carry a real
 scenario and teach a concept. The parts of this list that the existing exercises don't cover
 are not started.
 
-Exercise counts (<!-- count:total -->1,553<!-- /count --> total):
+Exercise counts (<!-- count:total -->1,630<!-- /count --> total):
 
 | Topic | Exercises | Target | Track | Module files |
 |---|---|---|---|---|
-| Docker | <!-- count:docker -->184<!-- /count --> | 250 | `docker` | `exercises/docker/` |
-| Kubernetes | <!-- count:kubernetes -->269<!-- /count --> | 250 | `kubernetes` | `exercises/kubernetes/` |
-| Offensive security | <!-- count:offsec -->80<!-- /count --> | 250 | `offsec` | `exercises/offsec/` |
-| Linux & systems | <!-- count:linux -->79<!-- /count --> | 250 | `linux` | `exercises/linux/` |
-| Networking | <!-- count:networking -->77<!-- /count --> | 250 | `networking` | `exercises/networking/` |
-| Cloud & platform | <!-- count:cloud -->82<!-- /count --> | 250 | `cloud` | `exercises/cloud/` |
-| Data | <!-- count:data -->72<!-- /count --> | 250 | `data` | `exercises/data/` |
-| Defensive security | <!-- count:defensive -->75<!-- /count --> | 250 | `defensive` | `exercises/defensive/` |
-| Programming | <!-- count:programming -->80<!-- /count --> | 250 | `programming` | `exercises/programming/` |
-| Data science | <!-- count:datascience -->78<!-- /count --> | 250 | `datascience` | `exercises/datascience/` |
-| Git | <!-- count:git -->235<!-- /count --> | 250 | `git` | `exercises/git/` |
+| Docker | <!-- count:docker -->186<!-- /count --> | 250 | `docker` | `exercises/docker/` |
+| Kubernetes | <!-- count:kubernetes -->273<!-- /count --> | 250 | `kubernetes` | `exercises/kubernetes/` |
+| Offensive security | <!-- count:offsec -->83<!-- /count --> | 250 | `offsec` | `exercises/offsec/` |
+| Linux & systems | <!-- count:linux -->86<!-- /count --> | 250 | `linux` | `exercises/linux/` |
+| Networking | <!-- count:networking -->83<!-- /count --> | 250 | `networking` | `exercises/networking/` |
+| Cloud & platform | <!-- count:cloud -->88<!-- /count --> | 250 | `cloud` | `exercises/cloud/` |
+| Data | <!-- count:data -->78<!-- /count --> | 250 | `data` | `exercises/data/` |
+| Defensive security | <!-- count:defensive -->78<!-- /count --> | 250 | `defensive` | `exercises/defensive/` |
+| Programming | <!-- count:programming -->86<!-- /count --> | 250 | `programming` | `exercises/programming/` |
+| Data science | <!-- count:datascience -->83<!-- /count --> | 250 | `datascience` | `exercises/datascience/` |
+| Git | <!-- count:git -->255<!-- /count --> | 250 | `git` | `exercises/git/` |
 | Terraform | <!-- count:terraform -->92<!-- /count --> | 250 | `terraform` | `exercises/terraform/` |
-| Ansible | <!-- count:ansible -->85<!-- /count --> | 250 | `ansible` | `exercises/ansible/` |
-| Algorithms | <!-- count:algorithms -->65<!-- /count --> | 250 | `algorithms` | `exercises/algorithms/` |
+| Ansible | <!-- count:ansible -->89<!-- /count --> | 250 | `ansible` | `exercises/ansible/` |
+| Algorithms | <!-- count:algorithms -->70<!-- /count --> | 250 | `algorithms` | `exercises/algorithms/` |
 
 - [Suggested order](#suggested-order)
 - [Shared lab foundations](#shared-lab-foundations)

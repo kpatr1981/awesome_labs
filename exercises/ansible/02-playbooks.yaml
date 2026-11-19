@@ -874,3 +874,340 @@ exercises:
             mode: "0644"
     EOF
     ansible-playbook site.yml
+
+# ===== Capstone: a real-world lab =====
+
+- id: ans-087
+  title: "Capstone: finish the status-page playbook"
+  difficulty: 5
+  kind: build
+  tags: [ansible, capstone, playbook, handlers, loops, when, delegate_to, run_once, cron, idempotence]
+  tutorial: |
+    **Concept.** A real playbook is several plays, each for the hosts it
+    concerns, and every task in it describes a **state**, not an action:
+
+    - **one play per audience.** Things every host needs (accounts) in a
+      play for `all`; a task only some of them need gets a `when:` on
+      `group_names`, or its own play.
+    - **loops, not copies.** One `user` task over a list of dictionaries.
+    - **config changes notify a handler.** A running service only picks up
+      a new configuration when it is reloaded, and a handler does that only
+      when the file really changed, once, at the end of the play.
+    - **one-off steps run once, somewhere else.** `delegate_to` runs a task
+      on another host from inside a play; `run_once` stops it running once
+      per host in the play.
+    - **no `shell` where a module exists.** `echo >> file` adds a line on
+      every run; `lineinfile` makes sure the line is there. The `cron`
+      module manages one named crontab entry.
+
+    The proof is the recap of a **second** run: `changed=0` everywhere, and
+    no handler fires.
+
+    **Read up on:**
+    - `ansible-playbook --syntax-check`, YAML indentation
+    - `ansible.builtin.apt`, `template`, `copy`, `file`, `service`
+    - `notify` and `handlers`
+    - `loop` over dictionaries, `when` with `group_names`
+    - `delegate_to`, `run_once`
+    - `ansible.builtin.lineinfile` (`create`), `ansible.builtin.cron`
+      (`name`, `minute`, `hour`, `job`)
+  scenario: |
+    **Ticket WEB-142**, from Tomás (SRE): *"Lena started the playbook for
+    the new status page before her leave, and it doesn't even load. Please
+    finish it so we can run it from CI."*
+
+    Lena's draft is **`/lab/status/site.yml`** (read her TODOs), with the
+    nginx site template **`templates/status.conf.j2`**. nginx is already
+    running on the web servers with the Debian default site on port 80. The
+    project's inventory has `web1`, `web2` (group `web`) and `db1` (group
+    `db`).
+
+    After **`ansible-playbook site.yml`** (no extra options):
+
+    1. **It loads.** `ansible-playbook --syntax-check site.yml` passes.
+    2. **The status page is live.** On web1 and web2, nginx answers on port
+       **8080** (the template rendered to
+       **`/etc/nginx/sites-enabled/default`** with `http_port: 8080`) with
+       the page **`/var/www/status/index.html`**, which contains
+       **`status: ok (<inventory hostname>)`**, for example
+       `status: ok (web1)`.
+    3. **Config changes go through a handler** that reloads nginx (the
+       already-running nginx must pick up the new port).
+    4. **The release is recorded once.** From the web play, the line
+       **`status-page 3.1`** is recorded in
+       **`/var/lib/status/releases.log`** on **db1**, exactly once, however
+       often the playbook runs. The web servers have no such file.
+    5. **Team accounts on every host**, created by **one looped** `user`
+       task:
+
+       | user | shell |
+       |------|-------|
+       | `alice` | `/bin/bash` |
+       | `bob` | `/bin/bash` |
+       | `svc-status` | `/usr/sbin/nologin` |
+
+    6. **A nightly backup on the database host.** db1 (only) has **`cron`**
+       installed and running, and root's crontab has a job named
+       **`status-backup`** that runs **`/usr/local/bin/status-backup`** at
+       **02:30** every day. The web servers don't get cron.
+    7. **A second run changes nothing.**
+
+    The packages are in the servers' apt cache: don't update the cache.
+  hints:
+    - "`ansible-playbook --syntax-check site.yml` points at the first YAML problem. Then `ansible-doc -l | grep apt` for the module name that does not exist."
+    - "nginx is already running, so writing the config is not enough: add a `handlers:` section with a task named exactly like the `notify:`, using `ansible.builtin.service` with `state: reloaded`."
+    - "The release step: `ansible.builtin.lineinfile` with `path`, `line`, `create: true`, plus `delegate_to: db1` and `run_once: true`. A `shell` with `>>` appends again on every run, once per web server."
+    - "A separate play for `all` with the `user` task: `loop:` over `{ name: ..., shell: ... }` items."
+    - "In the same play: `apt` for `cron`, `service` for `cron` with `state: started` and an `ansible.builtin.cron` task (`name: status-backup`, `minute: \"30\"`, `hour: \"2\"`, `job: ...`), each with `when: \"'db' in group_names\"`."
+    - "If an earlier run of the draft appended lines to `releases.log` on db1, clean it up once (`ansible db1 -b -m ansible.builtin.file -a 'path=/var/lib/status/releases.log state=absent'`) and run again."
+  solution: |
+    ```bash
+    cd /lab/status
+    ansible-playbook --syntax-check site.yml    # notify: is indented one space too far
+    cat > site.yml <<'EOF'
+    - name: Team accounts and database jobs
+      hosts: all
+      become: true
+      tasks:
+        - name: Team accounts
+          ansible.builtin.user:
+            name: "{{ item.name }}"
+            shell: "{{ item.shell }}"
+          loop:
+            - { name: alice, shell: /bin/bash }
+            - { name: bob, shell: /bin/bash }
+            - { name: svc-status, shell: /usr/sbin/nologin }
+
+        - name: Install cron
+          ansible.builtin.apt:
+            name: cron
+            state: present
+          when: "'db' in group_names"
+
+        - name: Start cron
+          ansible.builtin.service:
+            name: cron
+            state: started
+          when: "'db' in group_names"
+
+        - name: Nightly backup
+          ansible.builtin.cron:
+            name: status-backup
+            minute: "30"
+            hour: "2"
+            job: /usr/local/bin/status-backup
+          when: "'db' in group_names"
+
+    - name: Status page web tier
+      hosts: web
+      become: true
+      vars:
+        http_port: 8080
+      tasks:
+        - name: Install nginx
+          ansible.builtin.apt:
+            name: nginx
+            state: present
+
+        - name: Page directory
+          ansible.builtin.file:
+            path: /var/www/status
+            state: directory
+            mode: "0755"
+
+        - name: Status page
+          ansible.builtin.copy:
+            dest: /var/www/status/index.html
+            content: "status: ok ({{ inventory_hostname }})\n"
+            mode: "0644"
+
+        - name: Site config
+          ansible.builtin.template:
+            src: templates/status.conf.j2
+            dest: /etc/nginx/sites-enabled/default
+            mode: "0644"
+          notify: Reload nginx
+
+        - name: Start nginx
+          ansible.builtin.service:
+            name: nginx
+            state: started
+
+        - name: Record the release on the database host
+          ansible.builtin.lineinfile:
+            path: /var/lib/status/releases.log
+            line: status-page 3.1
+            create: true
+            mode: "0644"
+          delegate_to: db1
+          run_once: true
+
+      handlers:
+        - name: Reload nginx
+          ansible.builtin.service:
+            name: nginx
+            state: reloaded
+    EOF
+    ansible-playbook site.yml
+    ansible-playbook site.yml      # changed=0, no handler
+    ```
+  setup: |
+    ans_start web1 web2 db1
+    rm -rf /lab/status
+    ans_project /lab/status
+    lab_file /lab/status/.prep.yml <<'EOF'
+    - hosts: web
+      become: true
+      tasks:
+        - ansible.builtin.apt: { name: nginx, state: present }
+        - ansible.builtin.service: { name: nginx, state: started }
+    EOF
+    ans_play /lab/status .prep.yml >/dev/null
+    rm -f /lab/status/.prep.yml
+    lab_file /lab/status/templates/status.conf.j2 <<'EOF'
+    server {
+        listen {{ http_port }} default_server;
+        root /var/www/status;
+        index index.html;
+    }
+    EOF
+    lab_file /lab/status/site.yml <<'EOF'
+    # Status page - Lena's draft
+    # TODO: team accounts on every host: alice, bob (/bin/bash), svc-status (/usr/sbin/nologin)
+    # TODO: nightly backup on db1: cron job "status-backup", 02:30, /usr/local/bin/status-backup
+    # TODO: the page itself: /var/www/status/index.html -> "status: ok (<host>)"
+    - name: Status page web tier
+      hosts: web
+      become: true
+      vars:
+        http_port: 8080
+      tasks:
+        - name: Install nginx
+          ansible.builtin.apt_get:
+            name: nginx
+            state: present
+
+        - name: Site config
+          ansible.builtin.template:
+            src: templates/status.conf.j2
+            dest: /etc/nginx/sites-enabled/default
+            mode: "0644"
+           notify: Reload nginx
+
+        - name: Record the release on the database host
+          ansible.builtin.shell: echo "status-page 3.1" >> /var/lib/status/releases.log
+          delegate_to: db1
+
+      # TODO: handlers
+    EOF
+  check: |
+    d=/lab/status
+    check "1. site.yml passes --syntax-check" 'ans_as_user $d ansible-playbook --syntax-check site.yml'
+    for n in web1 web2; do
+      check_eq "2. $n answers on 8080 with its status page" "$(ans_get $n http://localhost:8080/)" "status: ok ($n)"
+    done
+    check "3. the template task notifies a handler" 'grep -Eq "^[[:space:]]*handlers:" $d/site.yml && grep -Eq "^[[:space:]]*notify:" $d/site.yml'
+    check_eq "4. db1 has the release recorded exactly once" "$(ans_on db1 'grep -cx "status-page 3.1" /var/lib/status/releases.log' 2>/dev/null)" "1"
+    check_not "4. the web servers have no releases.log" "ans_on web1 'test -e /var/lib/status/releases.log' || ans_on web2 'test -e /var/lib/status/releases.log'"
+    check "4. it is delegated, not a shell append" 'grep -q "delegate_to" $d/site.yml && ! grep -q ">>" $d/site.yml'
+    for n in web1 web2 db1; do
+      check_eq "5. $n team accounts" "$(ans_on $n 'for u in alice bob svc-status; do getent passwd $u | cut -d: -f1,7; done' 2>/dev/null | tr '\n' ' ')" "alice:/bin/bash bob:/bin/bash svc-status:/usr/sbin/nologin "
+    done
+    check_eq "5. one looped user task" "$(grep -Ec '(ansible\.builtin\.user:)|(^[[:space:]]*(-[[:space:]]+)?user:[[:space:]]*$)' $d/site.yml)" "1"
+    check "5. the user task loops" 'grep -Eq "^[[:space:]]*(loop|with_items):" $d/site.yml'
+    check "6. db1 runs cron" "ans_on db1 'pgrep -x cron'"
+    check "6. root's crontab on db1 has the status-backup job at 02:30" "ans_on db1 'crontab -l -u root' 2>/dev/null | grep -qx '#Ansible: status-backup' && ans_on db1 'crontab -l -u root' 2>/dev/null | grep -Eqx '30 2 \* \* \* /usr/local/bin/status-backup'"
+    check_not "6. the web servers have no cron" "ans_on web1 'dpkg -s cron >/dev/null 2>&1' || ans_on web2 'dpkg -s cron >/dev/null 2>&1'"
+    if ans_on db1 'test -e /var/lib/status/releases.log' && ! grep -q ">>" $d/site.yml; then
+      check "7. a second run changes nothing" 'ans_idempotent $d site.yml'
+      check_eq "7. the release is still recorded once" "$(ans_on db1 'grep -cx "status-page 3.1" /var/lib/status/releases.log' 2>/dev/null)" "1"
+    else
+      fail "7. a second run changes nothing (not re-run: the release step is not fixed yet)"
+    fi
+  solve: |
+    cd /lab/status
+    cat > site.yml <<'EOF'
+    - name: Team accounts and database jobs
+      hosts: all
+      become: true
+      tasks:
+        - name: Team accounts
+          ansible.builtin.user:
+            name: "{{ item.name }}"
+            shell: "{{ item.shell }}"
+          loop:
+            - { name: alice, shell: /bin/bash }
+            - { name: bob, shell: /bin/bash }
+            - { name: svc-status, shell: /usr/sbin/nologin }
+
+        - name: Install cron
+          ansible.builtin.apt:
+            name: cron
+            state: present
+          when: "'db' in group_names"
+
+        - name: Start cron
+          ansible.builtin.service:
+            name: cron
+            state: started
+          when: "'db' in group_names"
+
+        - name: Nightly backup
+          ansible.builtin.cron:
+            name: status-backup
+            minute: "30"
+            hour: "2"
+            job: /usr/local/bin/status-backup
+          when: "'db' in group_names"
+
+    - name: Status page web tier
+      hosts: web
+      become: true
+      vars:
+        http_port: 8080
+      tasks:
+        - name: Install nginx
+          ansible.builtin.apt:
+            name: nginx
+            state: present
+
+        - name: Page directory
+          ansible.builtin.file:
+            path: /var/www/status
+            state: directory
+            mode: "0755"
+
+        - name: Status page
+          ansible.builtin.copy:
+            dest: /var/www/status/index.html
+            content: "status: ok ({{ inventory_hostname }})\n"
+            mode: "0644"
+
+        - name: Site config
+          ansible.builtin.template:
+            src: templates/status.conf.j2
+            dest: /etc/nginx/sites-enabled/default
+            mode: "0644"
+          notify: Reload nginx
+
+        - name: Start nginx
+          ansible.builtin.service:
+            name: nginx
+            state: started
+
+        - name: Record the release on the database host
+          ansible.builtin.lineinfile:
+            path: /var/lib/status/releases.log
+            line: status-page 3.1
+            create: true
+            mode: "0644"
+          delegate_to: db1
+          run_once: true
+
+      handlers:
+        - name: Reload nginx
+          ansible.builtin.service:
+            name: nginx
+            state: reloaded
+    EOF
+    ansible-playbook site.yml

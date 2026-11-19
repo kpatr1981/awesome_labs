@@ -298,3 +298,307 @@ exercises:
     ARN=$(aws sqs get-queue-attributes --queue-url "$DLQ" --attribute-names QueueArn --query Attributes.QueueArn --output text)
     jq -n --arg arn "$ARN" '{RedrivePolicy: ({deadLetterTargetArn: $arn, maxReceiveCount: "3"} | tojson)}' > attrs.json
     aws sqs set-queue-attributes --queue-url "$URL" --attributes file:///lab/attrs.json
+
+# ===== Capstone: a real-world lab =====
+
+- id: cloud-086
+  title: "Capstone: open the order intake path"
+  difficulty: 5
+  kind: build
+  tags: [aws, capstone, s3, dynamodb, sqs, dead-letter-queue, iam, least-privilege, ec2, query]
+  tutorial: |
+    **Concept.** A small data pipeline on AWS usually has the same five
+    pieces, and wiring them up is mostly CLI work:
+
+    - **storage for the raw files** (S3). The key is the whole path, and a
+      recursive copy with filters decides which local files become objects.
+    - **a table for the parsed records** (DynamoDB). Every value is typed
+      (`S`, `N`, ...), and loading many items at once is a
+      `batch-write-item` with a JSON request file.
+    - **a work queue** (SQS) with a **dead-letter queue**, so a message that
+      keeps failing is parked instead of retried forever. The source queue
+      points at the DLQ by ARN in its `RedrivePolicy`, and the visibility
+      timeout must cover how long one job takes.
+    - **an identity for the worker** (IAM) that can do exactly its job.
+      Policies are versioned, only one version is the default, a managed
+      policy keeps at most five versions, and each action needs the right
+      resource ARN (bucket, object, table, queue).
+    - **the machine that runs it** (EC2), found by tags and state, and
+      labelled so others can tell what it does.
+
+    Look things up rather than guess them: ARNs, IDs and URLs all come out
+    of `describe`/`get` calls with `--query`.
+
+    **Read up on:**
+    - `aws s3 cp --recursive` with `--exclude` / `--include` (the order matters)
+    - `aws dynamodb create-table`, `batch-write-item` and its request format,
+      `describe-table` (`TableArn`), `scan`
+    - `aws sqs create-queue --attributes`, `get-queue-attributes`,
+      `RedrivePolicy`, `VisibilityTimeout`, `MessageRetentionPeriod`,
+      `send-message`
+    - `aws iam list-policy-versions`, `delete-policy-version`,
+      `create-policy-version --set-as-default`, the five-version limit
+    - `aws ec2 describe-instances --filters`, `create-tags`
+    - `jq -R` / `jq -n` for turning text into JSON
+  scenario: |
+    The `aws` command talks to a local emulator, and can only see files under `/lab`.
+
+    **Ticket ORD-217**, from Dana (orders team lead): *"The nightly order
+    export is moving off the old FTP box. The exports are already on disk in
+    `/lab/exports`. Please open the intake path so the intake worker can take
+    over tonight."*
+
+    1. **The exports in S3.** Create the bucket **`kl-intake`** and upload
+       every **`.csv`** file in `/lab/exports` to **`incoming/<file name>`**.
+       Nothing else goes into the bucket (no notes, no half-written `.part`
+       files).
+    2. **The orders table.** Create the DynamoDB table **`intake-orders`**
+       with partition key **`order_id`** (string) and on-demand billing, and
+       load **every row** of **`orders-2026-11-18.csv`** into it: one item
+       per row with the string attributes `order_id`, `customer` and
+       `status`, and **`total` as a number**.
+    3. **The job queue.** Create the queue **`intake-jobs`** with a
+       visibility timeout of **120** seconds, and its dead-letter queue
+       **`intake-jobs-dlq`**, which keeps messages for **14 days**
+       (1209600 seconds). A message received **5 times** without being
+       deleted moves to the dead-letter queue.
+    4. **Least privilege.** The worker's role **`intake-worker`** has the
+       managed policy **`intake-access`** attached, and its default version
+       allows everything. Give the policy a new default version that allows
+       **only**:
+       - `s3:ListBucket` on the bucket `kl-intake`
+       - `s3:GetObject` on the objects under `incoming/` in `kl-intake`
+       - `dynamodb:PutItem` on the table `intake-orders`
+       - `sqs:ReceiveMessage` and `sqs:DeleteMessage` on the queue `intake-jobs`
+
+       Use real ARNs (look them up), keep the policy attached, and keep
+       the **current default version** so security can roll back to it.
+       Keep your policy document under `/lab`.
+    5. **The worker.** Exactly one instance is **running** with the tags
+       **`Role=intake`** and **`Env=prod`**. Write its instance ID to
+       **`/lab/worker.txt`** and tag it **`Queue=intake-jobs`**. No other
+       instance gets that tag.
+    6. **The first job.** Send one message to `intake-jobs` whose body is
+       the JSON object
+       `{"bucket": "kl-intake", "key": "incoming/orders-2026-11-18.csv", "rows": N}`,
+       where `N` is the number of orders in that file (a number, not a
+       string).
+  hints:
+    - "Step 1: `aws s3 cp exports s3://kl-intake/incoming/ --recursive --exclude '*' --include '*.csv'`. Filters apply in order, so exclude everything first."
+    - "Step 2: `jq -Rn '[inputs | split(\",\") | ...]'` turns CSV lines (skip the header with `tail -n +2`) into the `{\"intake-orders\": [{\"PutRequest\": {\"Item\": {...}}}]}` shape for `batch-write-item --request-items file:///lab/...`. Numbers are `{\"N\": \"42.50\"}`, a string holding the number."
+    - "Step 3: create the dead-letter queue first, read its `QueueArn`, then create `intake-jobs` with `VisibilityTimeout` and a `RedrivePolicy` (a JSON string inside the attributes JSON) in one attributes file."
+    - "Step 4: `create-policy-version` fails with LimitExceeded: the policy already has five versions. `list-policy-versions` shows them; delete an old one that is not the default."
+    - "Step 4: the table ARN comes from `aws dynamodb describe-table --query Table.TableArn`, the queue ARN from `get-queue-attributes --attribute-names QueueArn`. Bucket and objects are separate resources."
+    - "Steps 5 and 6: filters are ANDed: `Name=tag:Role,Values=intake Name=tag:Env,Values=prod Name=instance-state-name,Values=running`. Build the message body with `jq -cn --argjson rows N '{...}'` so `rows` stays a number."
+  solution: |
+    ```bash
+    cd /lab
+
+    # 1. the exports in S3 (only the .csv files)
+    aws s3 mb s3://kl-intake
+    aws s3 cp exports s3://kl-intake/incoming/ --recursive --exclude '*' --include '*.csv'
+
+    # 2. the orders table, loaded in one batch (total is a number)
+    aws dynamodb create-table --table-name intake-orders \
+      --attribute-definitions AttributeName=order_id,AttributeType=S \
+      --key-schema AttributeName=order_id,KeyType=HASH --billing-mode PAY_PER_REQUEST
+    aws dynamodb wait table-exists --table-name intake-orders
+    tail -n +2 exports/orders-2026-11-18.csv | jq -Rn '{"intake-orders": [inputs | select(length > 0) | split(",")
+      | {PutRequest: {Item: {order_id: {S: .[0]}, customer: {S: .[1]}, status: {S: .[2]}, total: {N: .[3]}}}}]}' > items.json
+    aws dynamodb batch-write-item --request-items file:///lab/items.json
+
+    # 3. the dead-letter queue first, then the job queue that points at it
+    DLQ=$(aws sqs create-queue --queue-name intake-jobs-dlq --attributes MessageRetentionPeriod=1209600 --query QueueUrl --output text)
+    DLQ_ARN=$(aws sqs get-queue-attributes --queue-url "$DLQ" --attribute-names QueueArn --query Attributes.QueueArn --output text)
+    jq -n --arg arn "$DLQ_ARN" '{VisibilityTimeout: "120", RedrivePolicy: ({deadLetterTargetArn: $arn, maxReceiveCount: "5"} | tojson)}' > queue-attrs.json
+    Q=$(aws sqs create-queue --queue-name intake-jobs --attributes file:///lab/queue-attrs.json --query QueueUrl --output text)
+    Q_ARN=$(aws sqs get-queue-attributes --queue-url "$Q" --attribute-names QueueArn --query Attributes.QueueArn --output text)
+
+    # 4. least privilege: make room (five versions is the limit), keep the current default
+    POL=$(aws iam list-policies --scope Local --query "Policies[?PolicyName=='intake-access'].Arn" --output text)
+    aws iam list-policy-versions --policy-arn "$POL"
+    aws iam delete-policy-version --policy-arn "$POL" --version-id v1
+    TABLE_ARN=$(aws dynamodb describe-table --table-name intake-orders --query Table.TableArn --output text)
+    jq -n --arg t "$TABLE_ARN" --arg q "$Q_ARN" '{Version: "2012-10-17", Statement: [
+      {Effect: "Allow", Action: "s3:ListBucket", Resource: "arn:aws:s3:::kl-intake"},
+      {Effect: "Allow", Action: "s3:GetObject", Resource: "arn:aws:s3:::kl-intake/incoming/*"},
+      {Effect: "Allow", Action: "dynamodb:PutItem", Resource: $t},
+      {Effect: "Allow", Action: ["sqs:ReceiveMessage", "sqs:DeleteMessage"], Resource: $q}]}' > policy.json
+    aws iam create-policy-version --policy-arn "$POL" --policy-document file:///lab/policy.json --set-as-default
+
+    # 5. the worker
+    ID=$(aws ec2 describe-instances \
+      --filters Name=tag:Role,Values=intake Name=tag:Env,Values=prod Name=instance-state-name,Values=running \
+      --query 'Reservations[].Instances[].InstanceId' --output text)
+    echo "$ID" > worker.txt
+    aws ec2 create-tags --resources "$ID" --tags Key=Queue,Value=intake-jobs
+
+    # 6. the first job
+    N=$(tail -n +2 exports/orders-2026-11-18.csv | grep -c .)
+    aws sqs send-message --queue-url "$Q" \
+      --message-body "$(jq -cn --argjson rows "$N" '{bucket: "kl-intake", key: "incoming/orders-2026-11-18.csv", rows: $rows}')"
+    ```
+
+    The old FTP host wrote `.part` files while a transfer ran and left notes
+    beside the exports; a plain recursive copy would have published both.
+  setup: |
+    moto_start
+
+    # --- the exports on disk ---
+    names=(acme globex initech umbrella hooli stark wayne tyrell)
+    states=(paid shipped pending)
+    gen() {
+      local base=$1 rows=$2 i
+      echo "order_id,customer,status,total"
+      for i in $(seq 1 "$rows"); do
+        printf 'ORD-%06d,%s,%s,%d.%02d\n' $((base + i * 7)) "${names[RANDOM % 8]}" "${states[RANDOM % 3]}" $((RANDOM % 900 + 10)) $((RANDOM % 100))
+      done
+    }
+    mkdir -p /lab/exports
+    gen $((RANDOM % 9000 * 10 + 100000)) $((RANDOM % 4 + 5)) > /lab/exports/orders-2026-11-17.csv
+    gen $((RANDOM % 9000 * 10 + 300000)) $((RANDOM % 5 + 6)) > /lab/exports/orders-2026-11-18.csv
+    cp /lab/exports/orders-2026-11-18.csv "$KL_STATE/orders.csv"
+    head -n 3 /lab/exports/orders-2026-11-18.csv > /lab/exports/orders-2026-11-19.csv.part
+    printf 'FTP host retired 2026-11-18.\nPartial transfers end in .part and must not be imported.\n' > /lab/exports/notes.txt
+    chown -R "$(lab_user):" /lab/exports
+
+    # --- the worker's role and its over-broad policy (already five versions) ---
+    lab_file /lab/.trust.json <<'EOF'
+    {"Version":"2012-10-17","Statement":[{"Effect":"Allow","Principal":{"Service":"ec2.amazonaws.com"},"Action":"sts:AssumeRole"}]}
+    EOF
+    lab_file /lab/.p1.json <<'EOF'
+    {"Version":"2012-10-17","Statement":[{"Effect":"Allow","Action":"s3:GetObject","Resource":"arn:aws:s3:::ftp-mirror/*"}]}
+    EOF
+    lab_file /lab/.p2.json <<'EOF'
+    {"Version":"2012-10-17","Statement":[{"Effect":"Allow","Action":["s3:*","dynamodb:*"],"Resource":"*"}]}
+    EOF
+    lab_file /lab/.p3.json <<'EOF'
+    {"Version":"2012-10-17","Statement":[{"Effect":"Allow","Action":["s3:*","dynamodb:*","sqs:*"],"Resource":"*"}]}
+    EOF
+    lab_file /lab/.p4.json <<'EOF'
+    {"Version":"2012-10-17","Statement":[{"Effect":"Allow","Action":"*","Resource":"*"}]}
+    EOF
+    arn=$(aws iam create-policy --policy-name intake-access --policy-document file:///lab/.p1.json --query Policy.Arn --output text)
+    for p in 2 3 4 4; do
+      aws iam create-policy-version --policy-arn "$arn" --policy-document "file:///lab/.p$p.json" --set-as-default >/dev/null
+    done
+    aws iam create-role --role-name intake-worker --assume-role-policy-document file:///lab/.trust.json >/dev/null
+    aws iam attach-role-policy --role-name intake-worker --policy-arn "$arn"
+    echo "$arn" > "$KL_STATE/policy_arn"
+    aws iam get-policy --policy-arn "$arn" --query Policy.DefaultVersionId --output text > "$KL_STATE/old_default"
+    rm -f /lab/.trust.json /lab/.p[1-4].json
+
+    # --- the fleet ---
+    ami=$(aws ec2 describe-images --query 'Images[0].ImageId' --output text)
+    run() {
+      aws ec2 run-instances --image-id "$ami" --instance-type t3.micro \
+        --tag-specifications "ResourceType=instance,Tags=[{Key=Role,Value=$1},{Key=Env,Value=$2}]" \
+        --query 'Instances[0].InstanceId' --output text
+    }
+    run web prod >/dev/null
+    run intake staging >/dev/null
+    old=$(run intake prod)
+    run batch prod >/dev/null
+    run intake prod > "$KL_STATE/answer"
+    run intake dev >/dev/null
+    aws ec2 stop-instances --instance-ids "$old" >/dev/null
+  check: |
+    acct=$(aws sts get-caller-identity --query Account --output text 2>/dev/null)
+    rows=$(tail -n +2 "$KL_STATE/orders.csv" | grep -c .)
+
+    info "1. The exports in S3"
+    keys=$(aws s3api list-objects-v2 --bucket kl-intake --query 'Contents[].Key' --output text 2>/dev/null | tr '\t' '\n' | sort | tr '\n' ' ')
+    check_eq "kl-intake holds exactly the two .csv exports under incoming/" "$keys" "incoming/orders-2026-11-17.csv incoming/orders-2026-11-18.csv "
+    check_eq "incoming/orders-2026-11-18.csv matches the export" "$(aws s3 cp s3://kl-intake/incoming/orders-2026-11-18.csv - 2>/dev/null | sha256sum)" "$(sha256sum <"$KL_STATE/orders.csv")"
+
+    info "2. The orders table"
+    desc=$(aws dynamodb describe-table --table-name intake-orders --output json 2>/dev/null)
+    check_eq "intake-orders: partition key order_id (string), on-demand" "$(jq -r '[(.Table.KeySchema[] | select(.KeyType == "HASH") | .AttributeName), (.Table.AttributeDefinitions[] | select(.AttributeName == "order_id") | .AttributeType), .Table.BillingModeSummary.BillingMode] | join(" ")' <<<"${desc:-null}" 2>/dev/null)" "order_id S PAY_PER_REQUEST"
+    items=$(aws dynamodb scan --table-name intake-orders --output json 2>/dev/null)
+    got=$(jq -r '.Items[] | [.order_id.S, .customer.S, .status.S, (.total.N // .total.S // "" | tonumber? // "?" | tostring)] | join(",")' <<<"${items:-null}" 2>/dev/null | sort | tr '\n' ' ')
+    want=$(tail -n +2 "$KL_STATE/orders.csv" | jq -Rr 'select(length > 0) | split(",") | [.[0], .[1], .[2], (.[3] | tonumber | tostring)] | join(",")' | sort | tr '\n' ' ')
+    check_eq "the table holds every order of 2026-11-18 and nothing else" "$got" "$want"
+    check_eq "every total is stored as a number" "$(jq '[.Items[]? | select(.total.N != null)] | length' <<<"${items:-null}" 2>/dev/null)" "$rows"
+
+    info "3. The job queue"
+    q=$(aws sqs get-queue-url --queue-name intake-jobs --query QueueUrl --output text 2>/dev/null)
+    d=$(aws sqs get-queue-url --queue-name intake-jobs-dlq --query QueueUrl --output text 2>/dev/null)
+    qa=$( [ -n "$q" ] && aws sqs get-queue-attributes --queue-url "$q" --attribute-names All --output json 2>/dev/null)
+    da=$( [ -n "$d" ] && aws sqs get-queue-attributes --queue-url "$d" --attribute-names All --output json 2>/dev/null)
+    dlqarn=$(jq -r '.Attributes.QueueArn // ""' <<<"${da:-null}")
+    check_eq "intake-jobs: visibility timeout 120 seconds" "$(jq -r '.Attributes.VisibilityTimeout // ""' <<<"${qa:-null}")" 120
+    check_eq "intake-jobs-dlq keeps messages for 14 days" "$(jq -r '.Attributes.MessageRetentionPeriod // ""' <<<"${da:-null}")" 1209600
+    rp=$(jq -r '.Attributes.RedrivePolicy // "{}"' <<<"${qa:-null}")
+    check_eq "after 5 receives a message moves to intake-jobs-dlq" "$(jq -r '"\(.deadLetterTargetArn) \(.maxReceiveCount | tonumber)"' <<<"$rp" 2>/dev/null)" "${dlqarn:-missing-dlq} 5"
+
+    info "4. Least privilege for intake-worker"
+    arn=$(cat "$KL_STATE/policy_arn")
+    v=$(aws iam get-policy --policy-arn "$arn" --query Policy.DefaultVersionId --output text 2>/dev/null)
+    doc=$(aws iam get-policy-version --policy-arn "$arn" --version-id "$v" --query PolicyVersion.Document --output json 2>/dev/null)
+    pairs=$(jq -c '[.Statement | if type=="array" then . else [.] end | .[] | select(.Effect=="Allow")
+      | (.Action | if type=="array" then . else [.] end) as $a
+      | (.Resource | if type=="array" then . else [.] end) as $r
+      | $a[] as $x | $r[] as $y | "\($x) \($y)"] | sort | unique' <<<"${doc:-null}" 2>/dev/null)
+    want=$(jq -cn --arg t "arn:aws:dynamodb:us-east-1:$acct:table/intake-orders" --arg q "arn:aws:sqs:us-east-1:$acct:intake-jobs" '[
+      "s3:ListBucket arn:aws:s3:::kl-intake", "s3:GetObject arn:aws:s3:::kl-intake/incoming/*",
+      "dynamodb:PutItem \($t)", "sqs:ReceiveMessage \($q)", "sqs:DeleteMessage \($q)"] | sort')
+    check_eq "the default version of intake-access allows exactly the worker's job" "$pairs" "$want"
+    check "the previous default version is kept for rollback" 'aws iam get-policy-version --policy-arn "$arn" --version-id "$(cat "$KL_STATE/old_default")" && [ "$v" != "$(cat "$KL_STATE/old_default")" ]'
+    check "intake-access is still attached to intake-worker" 'aws iam list-attached-role-policies --role-name intake-worker --query "AttachedPolicies[].PolicyArn" --output text | grep -qF "$arn"'
+
+    info "5. The worker"
+    id=$(cat "$KL_STATE/answer")
+    check_eq "/lab/worker.txt names the running prod intake instance" "$(tr -d '[:space:]' 2>/dev/null </lab/worker.txt)" "$id"
+    check_eq "only that instance is tagged Queue=intake-jobs" "$(aws ec2 describe-instances --filters Name=tag:Queue,Values=intake-jobs --query 'Reservations[].Instances[].InstanceId' --output text 2>/dev/null)" "$id"
+
+    info "6. The first job"
+    want=$(jq -cnS --argjson n "$rows" '{bucket: "kl-intake", key: "incoming/orders-2026-11-18.csv", rows: $n}')
+    bodies=$(for u in $q $d; do
+      aws sqs receive-message --queue-url "$u" --max-number-of-messages 10 --visibility-timeout 0 --query 'Messages[].Body' --output json 2>/dev/null
+    done | jq -c '.[]? | fromjson? | select(type == "object")' 2>/dev/null | jq -cS . 2>/dev/null)
+    check "a job for incoming/orders-2026-11-18.csv with its row count is waiting" 'grep -qxF "$want" <<<"$bodies"'
+  solve: |
+    cd /lab
+
+    # 1. the exports in S3 (only the .csv files)
+    aws s3 mb s3://kl-intake
+    aws s3 cp exports s3://kl-intake/incoming/ --recursive --exclude '*' --include '*.csv'
+
+    # 2. the orders table, loaded in one batch (total is a number)
+    aws dynamodb create-table --table-name intake-orders \
+      --attribute-definitions AttributeName=order_id,AttributeType=S \
+      --key-schema AttributeName=order_id,KeyType=HASH --billing-mode PAY_PER_REQUEST
+    aws dynamodb wait table-exists --table-name intake-orders
+    tail -n +2 exports/orders-2026-11-18.csv | jq -Rn '{"intake-orders": [inputs | select(length > 0) | split(",")
+      | {PutRequest: {Item: {order_id: {S: .[0]}, customer: {S: .[1]}, status: {S: .[2]}, total: {N: .[3]}}}}]}' > items.json
+    aws dynamodb batch-write-item --request-items file:///lab/items.json
+
+    # 3. the dead-letter queue first, then the job queue that points at it
+    DLQ=$(aws sqs create-queue --queue-name intake-jobs-dlq --attributes MessageRetentionPeriod=1209600 --query QueueUrl --output text)
+    DLQ_ARN=$(aws sqs get-queue-attributes --queue-url "$DLQ" --attribute-names QueueArn --query Attributes.QueueArn --output text)
+    jq -n --arg arn "$DLQ_ARN" '{VisibilityTimeout: "120", RedrivePolicy: ({deadLetterTargetArn: $arn, maxReceiveCount: "5"} | tojson)}' > queue-attrs.json
+    Q=$(aws sqs create-queue --queue-name intake-jobs --attributes file:///lab/queue-attrs.json --query QueueUrl --output text)
+    Q_ARN=$(aws sqs get-queue-attributes --queue-url "$Q" --attribute-names QueueArn --query Attributes.QueueArn --output text)
+
+    # 4. least privilege: make room (five versions is the limit), keep the current default
+    POL=$(aws iam list-policies --scope Local --query "Policies[?PolicyName=='intake-access'].Arn" --output text)
+    aws iam delete-policy-version --policy-arn "$POL" --version-id v1
+    TABLE_ARN=$(aws dynamodb describe-table --table-name intake-orders --query Table.TableArn --output text)
+    jq -n --arg t "$TABLE_ARN" --arg q "$Q_ARN" '{Version: "2012-10-17", Statement: [
+      {Effect: "Allow", Action: "s3:ListBucket", Resource: "arn:aws:s3:::kl-intake"},
+      {Effect: "Allow", Action: "s3:GetObject", Resource: "arn:aws:s3:::kl-intake/incoming/*"},
+      {Effect: "Allow", Action: "dynamodb:PutItem", Resource: $t},
+      {Effect: "Allow", Action: ["sqs:ReceiveMessage", "sqs:DeleteMessage"], Resource: $q}]}' > policy.json
+    aws iam create-policy-version --policy-arn "$POL" --policy-document file:///lab/policy.json --set-as-default
+
+    # 5. the worker
+    ID=$(aws ec2 describe-instances \
+      --filters Name=tag:Role,Values=intake Name=tag:Env,Values=prod Name=instance-state-name,Values=running \
+      --query 'Reservations[].Instances[].InstanceId' --output text)
+    echo "$ID" > worker.txt
+    aws ec2 create-tags --resources "$ID" --tags Key=Queue,Value=intake-jobs
+
+    # 6. the first job
+    N=$(tail -n +2 exports/orders-2026-11-18.csv | grep -c .)
+    aws sqs send-message --queue-url "$Q" \
+      --message-body "$(jq -cn --argjson rows "$N" '{bucket: "kl-intake", key: "incoming/orders-2026-11-18.csv", rows: $rows}')"

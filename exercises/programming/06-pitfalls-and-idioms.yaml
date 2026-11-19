@@ -2303,3 +2303,488 @@ exercises:
             raise ValueError("length does not match the record count")
         return [(ts, sid, t / 100) for ts, sid, t in REC.iter_unpack(data[HDR.size:])]
     PY
+
+# ===== Capstone: a real-world lab =====
+
+- id: prog-086
+  title: "Capstone: the night-shift overtime export"
+  difficulty: 5
+  kind: fix
+  tags: [capstone, python, zoneinfo, dst, decimal, money, dataclasses, hash, default-arguments, closures, late-binding, itertools, groupby, decorators, functools]
+  tutorial: |
+    **Concept.** Code full of idioms that *look* right fails in ways that
+    are hard to see, because every line is plausible. A few classics, all
+    in one payroll script:
+
+    - **Aware datetimes in the same zone subtract as wall-clock times.**
+      Python ignores the UTC offset when both sides share a `tzinfo`, so a
+      night that has a clock change still looks 12 hours long. Convert to
+      UTC first.
+    - **Floats can't hold pennies**, and `round()` rounds halves to even.
+      `Decimal` built from **strings**, a single `quantize` at the end with
+      `ROUND_HALF_UP`, and dividing **last** keep money exact.
+    - **Plain classes compare by identity**, so equal-looking records are
+      all "different" to a set or a dict. A frozen dataclass is a value.
+    - **A default argument is created once.** `shifts=[]` is one list shared
+      by every call that doesn't pass its own.
+    - **Closures look variables up when they run**, so lambdas made in a
+      loop all see the loop variable's last value.
+    - **`itertools.groupby` groups runs**, not keys: unsorted input gives
+      the same key several times.
+    - **A decorator's wrapper replaces the function.** Without
+      `functools.wraps`, `*args, **kwargs` and `return`, it hides the name,
+      rejects keywords and drops the result.
+
+    **Read up on:**
+    - `datetime` — "aware" subtraction, `astimezone(timezone.utc)`, `zoneinfo.ZoneInfo`
+    - `decimal.Decimal`, `Decimal.quantize`, `ROUND_HALF_UP`
+    - `dataclasses.dataclass(frozen=True)` — `__eq__` and `__hash__`
+    - default argument values and the `None` idiom
+    - late binding in closures; default-argument binding, `functools.partial`
+    - `itertools.groupby` and `sorted`
+    - `functools.wraps`
+
+    Try it with `python3 -B -i overtime.py`.
+  scenario: |
+    **PAY-233**, from Siobhán in payroll at a hospital trust: *"Every night
+    nurse who worked the 28–29 March or 24–25 October shift was paid for 12
+    hours. Some lines are a penny off, shifts the rota system re-sends are
+    paid twice, wards' batches contain each other's shifts, every
+    allowance pays the bank-holiday rate, and people appear on the upload
+    two or three times. The contractor who wrote it has gone. Please fix
+    it."*
+
+    **`/lab/overtime.py`** is the export. Fix it, keeping every name and
+    signature. Hidden `unittest` tests check, one item each:
+
+    1. **Clock changes.** **`shift_minutes(start, end, zone="Europe/London")`**
+       takes local wall-clock times like `"2026-03-28 20:00"` and returns the
+       **real** minutes worked, also across the night the clocks change.
+    2. **Pennies.** **`pay(minutes, rate, multiplier="1")`** takes the rate
+       and multiplier as strings (or `Decimal`) and returns a **`Decimal`
+       with exactly two places**: rate × multiplier × minutes ÷ 60, computed
+       exactly (**divide last**) and rounded **once**, half **up**.
+    3. **Re-sent shifts.** **`Shift(staff, start, end)`** is a value: equal
+       when all three fields are equal, usable in sets and as dict keys, and
+       **immutable**. `unique_shifts` then keeps the first of each.
+    4. **Ward batches.** **`Batch(ward)`** without shifts starts with its
+       **own** empty list; `Batch(ward, shifts)` keeps using the list given.
+    5. **Allowances.** **`make_multipliers(rules)`** turns
+       `[("night", "1.5"), ...]` into `{name: function}` where each function
+       multiplies an amount by **its own** factor.
+    6. **One line per person.** **`minutes_by_staff(shifts, zone)`** returns
+       `[(staff, total minutes)]` with **one entry per person**, sorted by
+       staff, whatever order the shifts arrive in.
+    7. **The upload.** The **`@audited(log)`** decorator keeps the wrapped
+       function's `__name__`, docstring and `__wrapped__`, passes on **any
+       positional and keyword arguments**, returns its result, and logs
+       `"<name> called"`. With it fixed, **`export(...)`** (which uses
+       everything above) returns the right lines.
+  hints:
+    - "Item 1: `(e.astimezone(timezone.utc) - s.astimezone(timezone.utc))` is the real time; the same subtraction without `astimezone` is the wall-clock time."
+    - "Item 2: `(Decimal(rate) * Decimal(multiplier) * minutes / 60).quantize(Decimal(\"0.01\"), rounding=ROUND_HALF_UP)`. Dividing by 60 first leaves a repeating decimal, and then rounding can go the wrong way."
+    - "Item 3: `@dataclass(frozen=True)` writes `__init__`, `__eq__` and `__hash__` for you, and refuses assignments."
+    - "Item 4: `shifts=None`, then `self.shifts = [] if shifts is None else shifts`."
+    - "Item 5: bind the factor when the function is made: `lambda amount, factor=factor: ...` or `functools.partial`."
+    - "Items 6 and 7: `groupby(sorted(shifts, key=...), key=...)`; `@functools.wraps(fn)` on a `wrapper(*args, **kwargs)` that does `return fn(*args, **kwargs)`."
+  solution: |
+    ```python
+    import functools
+    from dataclasses import dataclass
+    from datetime import datetime, timezone
+    from decimal import Decimal, ROUND_HALF_UP
+    from itertools import groupby
+    from zoneinfo import ZoneInfo
+
+
+    def shift_minutes(start, end, zone="Europe/London"):
+        tz = ZoneInfo(zone)
+        s = datetime.strptime(start, FMT).replace(tzinfo=tz).astimezone(timezone.utc)
+        e = datetime.strptime(end, FMT).replace(tzinfo=tz).astimezone(timezone.utc)
+        return int((e - s).total_seconds() // 60)
+
+
+    def pay(minutes, rate, multiplier="1"):
+        amount = Decimal(rate) * Decimal(multiplier) * minutes / 60
+        return amount.quantize(Decimal("0.01"), rounding=ROUND_HALF_UP)
+
+
+    @dataclass(frozen=True)
+    class Shift:
+        staff: str
+        start: str
+        end: str
+
+
+    class Batch:
+        def __init__(self, ward, shifts=None):
+            self.ward = ward
+            self.shifts = [] if shifts is None else shifts
+
+
+    def make_multipliers(rules):
+        return {name: (lambda amount, factor=Decimal(factor): amount * factor)
+                for name, factor in rules}
+
+
+    def minutes_by_staff(shifts, zone="Europe/London"):
+        by_staff = lambda s: s.staff
+        return [(staff, sum(shift_minutes(s.start, s.end, zone) for s in group))
+                for staff, group in groupby(sorted(shifts, key=by_staff), key=by_staff)]
+
+
+    def audited(log):
+        def deco(fn):
+            @functools.wraps(fn)
+            def wrapper(*args, **kwargs):
+                log.append(fn.__name__ + " called")
+                return fn(*args, **kwargs)
+            return wrapper
+        return deco
+    ```
+
+    `unique_shifts`, `Batch.add` and `export` were right all along: they
+    only needed the pieces under them to work.
+  setup: |
+    lab_file /lab/overtime.py <<'EOF'
+    """Night-shift overtime export (PAY-233)."""
+    from datetime import datetime
+    from decimal import Decimal
+    from itertools import groupby
+    from zoneinfo import ZoneInfo
+
+    FMT = "%Y-%m-%d %H:%M"
+    AUDIT = []
+
+
+    def shift_minutes(start, end, zone="Europe/London"):
+        """Real minutes worked between two local wall-clock times in `zone`."""
+        tz = ZoneInfo(zone)
+        s = datetime.strptime(start, FMT).replace(tzinfo=tz)
+        e = datetime.strptime(end, FMT).replace(tzinfo=tz)
+        return int((e - s).total_seconds() // 60)
+
+
+    def pay(minutes, rate, multiplier="1"):
+        """Pay in pounds for `minutes` at hourly `rate` times `multiplier`."""
+        return round(minutes / 60 * float(rate) * float(multiplier), 2)
+
+
+    class Shift:
+        """One shift as the rota system sends it."""
+
+        def __init__(self, staff, start, end):
+            self.staff = staff
+            self.start = start
+            self.end = end
+
+
+    def unique_shifts(shifts):
+        """Drop shifts the rota system sent twice, keeping the first of each."""
+        return list(dict.fromkeys(shifts))
+
+
+    class Batch:
+        """The shifts of one ward, uploaded together."""
+
+        def __init__(self, ward, shifts=[]):
+            self.ward = ward
+            self.shifts = shifts
+
+        def add(self, shift):
+            self.shifts.append(shift)
+
+
+    def make_multipliers(rules):
+        """[(name, factor), ...] -> {name: function(amount) -> amount * factor}"""
+        out = {}
+        for name, factor in rules:
+            out[name] = lambda amount: amount * Decimal(factor)
+        return out
+
+
+    def minutes_by_staff(shifts, zone="Europe/London"):
+        """[(staff, total minutes)], one entry per person, sorted by staff."""
+        return [(staff, sum(shift_minutes(s.start, s.end, zone) for s in group))
+                for staff, group in groupby(shifts, key=lambda s: s.staff)]
+
+
+    def audited(log):
+        """Log "<name> called" to `log` on every call of the decorated function."""
+        def deco(fn):
+            def wrapper(*args):
+                log.append(fn.__name__ + " called")
+                fn(*args)
+            return wrapper
+        return deco
+
+
+    @audited(AUDIT)
+    def export(shifts, rate, multiplier="1", zone="Europe/London"):
+        """Lines "staff,minutes,pay" for the payroll upload, one per person."""
+        return [f"{staff},{minutes},{pay(minutes, rate, multiplier)}"
+                for staff, minutes in minutes_by_staff(unique_shifts(shifts), zone)]
+    EOF
+  check: |
+    d=$(mktemp -d)
+    # pyt "description" <<'PY' ... PY -> run one hidden unittest file against /lab/overtime.py
+    pyt() {
+      local rc out
+      cat >"$d/t.py"
+      out=$(cd /lab && PYTHONPATH=/lab timeout 60 python3 -B "$d/t.py" 2>&1); rc=$?
+      check "$1" '[ "$rc" -eq 0 ]'
+      [ "$rc" -eq 0 ] || grep -E '^(FAIL|ERROR):|^[A-Za-z.]*(Error|Exception)\b' <<<"$out" | head -n 6 | sed 's/^/      /'
+    }
+
+    pyt "1. shift_minutes counts real time across clock changes" <<'PY'
+    import unittest
+    from overtime import shift_minutes
+
+    class T(unittest.TestCase):
+        def test_london(self):
+            self.assertEqual(shift_minutes("2026-03-28 20:00", "2026-03-29 08:00"), 660)
+            self.assertEqual(shift_minutes("2026-10-24 20:00", "2026-10-25 08:00"), 780)
+            self.assertEqual(shift_minutes("2026-06-10 19:30", "2026-06-11 07:45"), 735)
+            self.assertEqual(shift_minutes("2026-03-29 03:00", "2026-03-29 03:40", "Europe/London"), 40)
+
+        def test_other_zones(self):
+            self.assertEqual(shift_minutes("2026-03-07 22:00", "2026-03-08 06:00", "America/New_York"), 420)
+            self.assertEqual(shift_minutes("2026-10-31 22:00", "2026-11-01 06:00", "America/New_York"), 540)
+            self.assertEqual(shift_minutes("2026-03-28 20:00", "2026-03-29 08:00", "UTC"), 720)
+            self.assertIs(type(shift_minutes("2026-01-05 20:00", "2026-01-06 08:00")), int)
+
+    unittest.main()
+    PY
+
+    pyt "2. pay is exact to the penny, rounded half up" <<'PY'
+    import unittest
+    from decimal import Decimal
+    from overtime import pay
+
+    class T(unittest.TestCase):
+        def test_values(self):
+            cases = [((60, "10.125"), "10.13"), ((60, "2.675"), "2.68"), ((450, "18.45", "1.5"), "207.56"),
+                     ((620, "18.45", "1.5"), "285.98"), ((20, "10.00"), "3.33"), ((90, "12.20", "2"), "36.60"),
+                     ((0, "18.45", "1.5"), "0.00"), ((735, Decimal("18.45"), Decimal("1.5")), "339.02")]
+            for args, want in cases:
+                got = pay(*args)
+                self.assertIsInstance(got, Decimal, args)
+                self.assertEqual(str(got), want, args)
+
+    unittest.main()
+    PY
+
+    pyt "3. Shift is a value type, so re-sent shifts are dropped" <<'PY'
+    import unittest
+    from overtime import Shift, unique_shifts
+
+    class T(unittest.TestCase):
+        def test_value(self):
+            a = Shift("okafor", "2026-03-28 20:00", "2026-03-29 08:00")
+            b = Shift("okafor", "2026-03-28 20:00", "2026-03-29 08:00")
+            c = Shift(staff="okafor", start="2026-03-28 20:00", end="2026-03-29 07:00")
+            self.assertEqual(a, b)
+            self.assertNotEqual(a, c)
+            self.assertEqual(len({a, b, c}), 2)
+            self.assertEqual({a: 1}[b], 1)
+            self.assertEqual((a.staff, c.end), ("okafor", "2026-03-29 07:00"))
+
+        def test_immutable(self):
+            a = Shift("brennan", "x", "y")
+            with self.assertRaises(AttributeError):
+                a.staff = "someone else"
+            self.assertEqual(a.staff, "brennan")
+
+        def test_unique(self):
+            s = [Shift("b", "1", "2"), Shift("a", "1", "2"), Shift("b", "1", "2"),
+                 Shift("a", "1", "3"), Shift("a", "1", "2")]
+            got = unique_shifts(s)
+            self.assertEqual(got, [Shift("b", "1", "2"), Shift("a", "1", "2"), Shift("a", "1", "3")])
+            self.assertIs(got[0], s[0])
+
+    unittest.main()
+    PY
+
+    pyt "4. each Batch has its own list of shifts" <<'PY'
+    import unittest
+    from overtime import Batch
+
+    class T(unittest.TestCase):
+        def test_own_list(self):
+            b1 = Batch("ward 7")
+            b1.add("s1")
+            b2 = Batch("ward 9")
+            self.assertEqual(b2.shifts, [])
+            b2.add("s2")
+            self.assertEqual(b1.shifts, ["s1"])
+            self.assertEqual(Batch("ICU").shifts, [])
+
+        def test_given_list(self):
+            mine = ["s0"]
+            b = Batch("A&E", mine)
+            b.add("s1")
+            self.assertIs(b.shifts, mine)
+            self.assertEqual(mine, ["s0", "s1"])
+            self.assertEqual(b.ward, "A&E")
+
+    unittest.main()
+    PY
+
+    pyt "5. every allowance uses its own multiplier" <<'PY'
+    import unittest
+    from decimal import Decimal
+    from overtime import make_multipliers
+
+    class T(unittest.TestCase):
+        def test_each_own_factor(self):
+            m = make_multipliers([("night", "1.5"), ("weekend", "1.25"), ("bank_holiday", "2")])
+            self.assertEqual(sorted(m), ["bank_holiday", "night", "weekend"])
+            self.assertEqual(m["night"](Decimal("10")), Decimal("15"))
+            self.assertEqual(m["weekend"](Decimal("10")), Decimal("12.5"))
+            self.assertEqual(m["bank_holiday"](Decimal("10")), Decimal("20"))
+            self.assertEqual(make_multipliers([]), {})
+
+    unittest.main()
+    PY
+
+    pyt "6. minutes_by_staff gives one entry per person, sorted" <<'PY'
+    import unittest
+    from overtime import Shift, minutes_by_staff
+
+    class T(unittest.TestCase):
+        def test_groups(self):
+            s = [Shift("okafor", "2026-06-01 20:00", "2026-06-02 08:00"),
+                 Shift("adeyemi", "2026-06-01 20:00", "2026-06-02 06:00"),
+                 Shift("okafor", "2026-06-03 20:00", "2026-06-04 04:00"),
+                 Shift("brennan", "2026-06-01 22:00", "2026-06-02 06:30"),
+                 Shift("adeyemi", "2026-06-05 20:00", "2026-06-05 23:15")]
+            self.assertEqual(minutes_by_staff(s), [("adeyemi", 795), ("brennan", 510), ("okafor", 1200)])
+            self.assertEqual(minutes_by_staff(iter(s), "Europe/London")[0], ("adeyemi", 795))
+            self.assertEqual(minutes_by_staff([]), [])
+
+    unittest.main()
+    PY
+
+    pyt "7. @audited keeps the function intact, and export is right" <<'PY'
+    import unittest
+    import overtime
+    from overtime import Shift, audited, export
+
+    class T(unittest.TestCase):
+        def test_decorator(self):
+            log = []
+
+            @audited(log)
+            def rota_total(a, b=0, *, scale=1):
+                """Add two numbers and scale them."""
+                return (a + b) * scale
+
+            self.assertEqual(rota_total(1, b=2, scale=3), 9)
+            self.assertEqual(rota_total(4), 4)
+            self.assertEqual(rota_total.__name__, "rota_total")
+            self.assertEqual(rota_total.__doc__, "Add two numbers and scale them.")
+            self.assertTrue(callable(getattr(rota_total, "__wrapped__", None)))
+            self.assertEqual(log, ["rota_total called", "rota_total called"])
+
+        def test_export(self):
+            shifts = [Shift("okafor", "2026-03-28 20:00", "2026-03-29 08:00"),
+                      Shift("brennan", "2026-06-10 19:30", "2026-06-11 07:45"),
+                      Shift("okafor", "2026-10-24 20:00", "2026-10-25 08:00"),
+                      Shift("brennan", "2026-06-10 19:30", "2026-06-11 07:45"),
+                      Shift("adeyemi", "2026-07-01 20:00", "2026-07-02 06:20")]
+            want = ["adeyemi,620,285.98", "brennan,735,339.02", "okafor,1440,664.20"]
+            n = len(overtime.AUDIT)
+            self.assertEqual(export(shifts, "18.45", "1.5"), want)
+            self.assertEqual(export(shifts, "18.45", multiplier="1.5", zone="Europe/London"), want)
+            self.assertEqual(overtime.AUDIT[n:], ["export called", "export called"])
+            self.assertEqual(export.__name__, "export")
+            self.assertIn("payroll upload", export.__doc__ or "")
+
+    unittest.main()
+    PY
+    rm -rf "$d"
+  solve: |
+    cat > /lab/overtime.py <<'PY'
+    """Night-shift overtime export (PAY-233)."""
+    import functools
+    from dataclasses import dataclass
+    from datetime import datetime, timezone
+    from decimal import Decimal, ROUND_HALF_UP
+    from itertools import groupby
+    from zoneinfo import ZoneInfo
+
+    FMT = "%Y-%m-%d %H:%M"
+    AUDIT = []
+
+
+    def shift_minutes(start, end, zone="Europe/London"):
+        """Real minutes worked between two local wall-clock times in `zone`."""
+        tz = ZoneInfo(zone)
+        s = datetime.strptime(start, FMT).replace(tzinfo=tz).astimezone(timezone.utc)
+        e = datetime.strptime(end, FMT).replace(tzinfo=tz).astimezone(timezone.utc)
+        return int((e - s).total_seconds() // 60)
+
+
+    def pay(minutes, rate, multiplier="1"):
+        """Pay in pounds for `minutes` at hourly `rate` times `multiplier`."""
+        amount = Decimal(rate) * Decimal(multiplier) * minutes / 60
+        return amount.quantize(Decimal("0.01"), rounding=ROUND_HALF_UP)
+
+
+    @dataclass(frozen=True)
+    class Shift:
+        """One shift as the rota system sends it."""
+        staff: str
+        start: str
+        end: str
+
+
+    def unique_shifts(shifts):
+        """Drop shifts the rota system sent twice, keeping the first of each."""
+        return list(dict.fromkeys(shifts))
+
+
+    class Batch:
+        """The shifts of one ward, uploaded together."""
+
+        def __init__(self, ward, shifts=None):
+            self.ward = ward
+            self.shifts = [] if shifts is None else shifts
+
+        def add(self, shift):
+            self.shifts.append(shift)
+
+
+    def make_multipliers(rules):
+        """[(name, factor), ...] -> {name: function(amount) -> amount * factor}"""
+        out = {}
+        for name, factor in rules:
+            out[name] = lambda amount, factor=Decimal(factor): amount * factor
+        return out
+
+
+    def minutes_by_staff(shifts, zone="Europe/London"):
+        """[(staff, total minutes)], one entry per person, sorted by staff."""
+        def by_staff(s):
+            return s.staff
+        return [(staff, sum(shift_minutes(s.start, s.end, zone) for s in group))
+                for staff, group in groupby(sorted(shifts, key=by_staff), key=by_staff)]
+
+
+    def audited(log):
+        """Log "<name> called" to `log` on every call of the decorated function."""
+        def deco(fn):
+            @functools.wraps(fn)
+            def wrapper(*args, **kwargs):
+                log.append(fn.__name__ + " called")
+                return fn(*args, **kwargs)
+            return wrapper
+        return deco
+
+
+    @audited(AUDIT)
+    def export(shifts, rate, multiplier="1", zone="Europe/London"):
+        """Lines "staff,minutes,pay" for the payroll upload, one per person."""
+        return [f"{staff},{minutes},{pay(minutes, rate, multiplier)}"
+                for staff, minutes in minutes_by_staff(unique_shifts(shifts), zone)]
+    PY

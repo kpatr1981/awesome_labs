@@ -548,3 +548,400 @@ exercises:
       i=$((i + 1))
     done
     kubectl -n spread rollout status deploy/edge --timeout=120s
+
+# ===== Capstone: a real-world lab =====
+
+- id: k8s-369
+  title: "Capstone: payroll before the freeze"
+  difficulty: 5
+  kind: build
+  tags: [capstone, rollout, history, rollback, topology-spread, tolerations, projected, downwardapi, envfrom, limitrange, resourcequota, lifecycle, poststart, jsonpath, reporting]
+  tutorial: |
+    **Concept.** Day-two work is rarely one problem at a time. A namespace that has lived
+    for a while carries its history with it, and each object keeps the answer to one of the
+    questions you will be asked:
+
+    - **Rollout history.** Every template change of a Deployment leaves a ReplicaSet behind,
+      numbered by the `deployment.kubernetes.io/revision` annotation and labelled with the
+      `kubernetes.io/change-cause` annotation the Deployment had at the time.
+      `kubectl rollout undo --to-revision=N` puts that old template back by reusing its
+      ReplicaSet; the Deployment object itself is never re-created. An undo replaces the
+      *whole* template, so it comes before any other change you make to it.
+    - **Spreading.** A hard topology spread constraint only lets a pod land where the skew
+      stays within `maxSkew`. Every node is a domain, also one whose taint keeps the pod off,
+      so a spread over all nodes needs a toleration for that taint. While a rollout runs, old
+      and new pods carry the same labels; `matchLabelKeys: [pod-template-hash]` makes the
+      constraint count only the pods of the current revision.
+    - **Configuration.** A `projected` volume merges ConfigMap keys, Secret keys and
+      downward-API items into one directory, with a mode per file. Downward-API items can
+      also carry the container's own requests and limits (`resourceFieldRef`, with a
+      `divisor`). `envFrom` imports every key of a source and can add a `prefix`; `fieldRef`
+      gives a variable pod fields such as `spec.nodeName`.
+    - **Defaults and quotas.** A LimitRange fills in requests and limits of containers that
+      declare none, **when the pod is created**. A ResourceQuota adds those requests up and
+      refuses the pod that would cross the limit: the ReplicaSet reports `FailedCreate`, the
+      Deployment simply stays short of replicas, and pods that already run keep holding
+      their share until they are replaced.
+    - **Hooks.** A failing `postStart` hook kills its container, so it looks exactly like a
+      crashing application. The reason is in the pod's events (`FailedPostStartHook`), not in
+      its logs. A hook runs inside the container: it can only use what the image ships.
+    - **Reporting.** `-o jsonpath` with `{range .items[*]}` turns the API into an inventory;
+      annotation keys with dots are written with escaped dots.
+
+    **Read up on:**
+    - `kubectl rollout history --help`, `kubectl rollout undo --help` (`--to-revision`)
+    - `kubectl explain pod.spec.topologySpreadConstraints` (`matchLabelKeys`, `nodeTaintsPolicy`)
+    - `kubectl explain pod.spec.volumes.projected.sources.downwardAPI.items.resourceFieldRef`
+    - `kubectl explain pod.spec.containers.envFrom`, `kubectl explain pod.spec.containers.env.valueFrom.fieldRef`
+    - `kubectl describe quota`, `kubectl describe limitrange`, `kubectl describe rs` (FailedCreate)
+    - `kubectl describe pod` — `FailedPostStartHook`
+    - Kubernetes docs: JSONPath Support
+  scenario: |
+    **PAY-1207**, from Marta (payroll team lead): *"Quarter-end payroll runs tonight and the
+    change freeze starts in two hours. Finance rejected our last releases, the workers never
+    all start, the payslip page is down, and the change board wants an inventory of what we
+    freeze. Can you get namespace `payroll` ready?"*
+
+    Namespace **`payroll`** holds the Deployments **`payroll-api`**, **`payroll-worker`** and
+    **`payslips`**, the ResourceQuota **`payroll-cpu`** and the LimitRange
+    **`container-defaults`**.
+
+    1. **Back to the audited release.** Finance only signs off releases it has audited. Roll
+       `payroll-api` back, through its rollout history, to the revision whose change cause
+       says **`audited by finance`** (don't re-create the Deployment), and write that
+       revision number to **`/lab/rollback.txt`**.
+    2. **One API replica per node.** `payroll-api` keeps **2 replicas**, and a **hard topology
+       spread constraint** on **`kubernetes.io/hostname`** with **max skew 1** puts them on
+       **different nodes**. Don't change any node's taints.
+    3. **Configuration as files.** Every `payroll-worker` pod has **one** volume, mounted at
+       **`/etc/payroll`**, that holds exactly these files:
+       - `payroll.ini`: key `payroll.ini` of ConfigMap **`payroll-files`**
+       - `db-password`: key `password` of Secret **`payroll-db`**, readable by its owner only (mode `0400`)
+       - `cpu-request`: the worker container's own CPU request, in millicores (`250` for `250m`)
+    4. **Configuration as environment.** In every worker, each key of ConfigMap
+       **`payroll-env`** is a variable whose name is prefixed with **`PAYROLL_`** (no
+       unprefixed copies), and **`NODE_NAME`** holds the name of the node the pod runs on.
+    5. **All three workers.** `payroll-worker` wants **3 replicas**, but only 2 ever start.
+       Each worker needs about 100m of CPU: change the namespace's container defaults to a
+       **request of `100m`** and a **limit of `200m`**, so that all 3 workers run, each
+       requesting 100m. The quota stays exactly as it is, and the worker manifest still
+       declares no resources of its own.
+    6. **The payslip page.** `payslips` dies on every start. Its `postStart` hook is meant to
+       publish the run id held in the container's **`RUN_ID`** variable, so that nginx serves
+       it at **`/run.txt`**. Make `payslips` Ready, with no restarts, serving that id, which
+       is still written by the hook.
+    7. **The freeze inventory.** Once everything else is done, write **`/lab/freeze.txt`**:
+       one line per Deployment in `payroll`, sorted by name, in the form
+       `<name> <image> <revision>`, where revision is the Deployment's current rollout
+       revision.
+  hints:
+    - "Look before you change: `kubectl -n payroll rollout history deploy/payroll-api`, `kubectl -n payroll describe quota`, `kubectl -n payroll describe rs -l app=payroll-worker` and `kubectl -n payroll describe pod -l app=payslips`."
+    - "1: `kubectl rollout undo --to-revision=N` reuses that revision's ReplicaSet. An undo replaces the whole pod template, so do it before you change anything else in `payroll-api`."
+    - "2: The control-plane node counts as a spread domain even though its taint keeps the pods off, so tolerate that taint. Add `matchLabelKeys: [pod-template-hash]` so that the constraint only counts the pods of the current revision."
+    - "3: One `projected` volume with three `sources`. The CPU request is a downwardAPI item with `resourceFieldRef: {containerName: worker, resource: requests.cpu, divisor: 1m}`."
+    - "4 and 5: `envFrom` takes a `prefix`; `NODE_NAME` comes from `fieldRef: {fieldPath: spec.nodeName}`. LimitRange defaults are only applied when a pod is created: change them before you roll the workers, and the old pods free their share of the quota as they go."
+    - "6 and 7: `kubectl describe pod` shows FailedPostStartHook: what does the hook's command need that `nginx:1.28-alpine` doesn't ship? For the inventory: `-o jsonpath='{range .items[*]}...{end}'`, and the revision is the annotation `deployment.kubernetes.io/revision` (write it as `deployment\\.kubernetes\\.io/revision`)."
+  solution: |
+    **1. Back to the audited release** (first: an undo replaces the whole template)
+
+    ```bash
+    kubectl -n payroll rollout history deploy/payroll-api
+    rev=$(kubectl -n payroll rollout history deploy/payroll-api | awk '/audited by finance/ {print $1}')
+    kubectl -n payroll rollout undo deploy/payroll-api --to-revision="$rev"
+    echo "$rev" > /lab/rollback.txt
+    ```
+
+    **2. One API replica per node**
+
+    ```bash
+    kubectl -n payroll patch deploy payroll-api --type=merge -p '{"spec":{"template":{"spec":{
+      "tolerations":[{"key":"node-role.kubernetes.io/control-plane","operator":"Exists","effect":"NoSchedule"}],
+      "topologySpreadConstraints":[{"maxSkew":1,"topologyKey":"kubernetes.io/hostname",
+        "whenUnsatisfiable":"DoNotSchedule","labelSelector":{"matchLabels":{"app":"payroll-api"}},
+        "matchLabelKeys":["pod-template-hash"]}]}}}}'
+    ```
+
+    **6. The payslip page**: the hook runs `/bin/bash`, which the alpine image doesn't have.
+
+    ```bash
+    kubectl -n payroll describe pod -l app=payslips | grep -A2 FailedPostStartHook
+    kubectl -n payroll patch deploy payslips --type=json \
+      -p '[{"op":"replace","path":"/spec/template/spec/containers/0/lifecycle/postStart/exec/command/0","value":"sh"}]'
+    ```
+
+    **5. All three workers**: the defaults gave every worker 400m, and the quota (1300m)
+    fits only two of them next to the other pods. Lower the defaults before rolling the
+    workers:
+
+    ```bash
+    kubectl -n payroll patch limitrange container-defaults --type=merge \
+      -p '{"spec":{"limits":[{"type":"Container","default":{"cpu":"200m"},"defaultRequest":{"cpu":"100m"}}]}}'
+    ```
+
+    **3 and 4. The worker configuration** (applying it rolls all three workers, which then
+    get the new defaults):
+
+    ```yaml
+    spec:
+      template:
+        spec:
+          containers:
+          - name: worker
+            image: busybox:1.37
+            command: ["sleep", "infinity"]
+            envFrom:
+            - prefix: PAYROLL_
+              configMapRef: {name: payroll-env}
+            env:
+            - name: NODE_NAME
+              valueFrom: {fieldRef: {fieldPath: spec.nodeName}}
+            volumeMounts: [{name: payroll, mountPath: /etc/payroll, readOnly: true}]
+          volumes:
+          - name: payroll
+            projected:
+              sources:
+              - configMap: {name: payroll-files, items: [{key: payroll.ini, path: payroll.ini}]}
+              - secret: {name: payroll-db, items: [{key: password, path: db-password, mode: 0400}]}
+              - downwardAPI:
+                  items:
+                  - path: cpu-request
+                    resourceFieldRef: {containerName: worker, resource: requests.cpu, divisor: 1m}
+    ```
+
+    **7. The freeze inventory** (after all rollouts have finished)
+
+    ```bash
+    kubectl -n payroll get deploy -o jsonpath='{range .items[*]}{.metadata.name}{" "}{.spec.template.spec.containers[0].image}{" "}{.metadata.annotations.deployment\.kubernetes\.io/revision}{"\n"}{end}' \
+      | sort > /lab/freeze.txt
+    ```
+  setup: |
+    NS=payroll
+    k_ns $NS
+    kubectl apply -f - >/dev/null <<'EOF'
+    apiVersion: v1
+    kind: ResourceQuota
+    metadata: {name: payroll-cpu, namespace: payroll}
+    spec:
+      hard: {requests.cpu: 1300m, pods: "15"}
+    ---
+    apiVersion: v1
+    kind: LimitRange
+    metadata: {name: container-defaults, namespace: payroll}
+    spec:
+      limits:
+      - type: Container
+        default: {cpu: 500m}
+        defaultRequest: {cpu: 400m}
+    EOF
+    kj -n $NS quota payroll-cpu '{.spec.hard}' >"$KL_STATE/quota-369"
+
+    hex() { head -c "$1" /dev/urandom | od -An -tx1 | tr -d ' \n'; }
+    ini="batch=pr-$(hex 4)"; pw="pw-$(hex 8)"; day=$((RANDOM % 9 + 20)); run="run-$(hex 4)"
+    printf '%s\n%s\n%s\n%s\n' "$ini" "$pw" "$day" "$run" >"$KL_STATE/answer-369"
+    kubectl -n $NS create configmap payroll-files --from-literal=payroll.ini="$ini" >/dev/null
+    kubectl -n $NS create configmap payroll-env --from-literal=CURRENCY=EUR --from-literal=CUTOFF_DAY="$day" >/dev/null
+    kubectl -n $NS create secret generic payroll-db --from-literal=password="$pw" >/dev/null
+
+    # payroll-api: four releases, one of them audited
+    rels=(2026.07 2026.08 2026.09 2026.10)
+    imgs=(nginx:1.27-alpine nginx:1.28-alpine nginx:1.29-alpine)
+    a=$((RANDOM % 3)); off=$((RANDOM % 3))
+    for i in 0 1 2 3; do
+      img=${imgs[$(((i + off) % 3))]}
+      if [ "$i" = "$a" ]; then cause="release ${rels[$i]} - audited by finance"
+      elif [ "$i" = 3 ]; then cause="release ${rels[$i]} - emergency change, audit pending"
+      else cause="release ${rels[$i]} - rejected by finance"; fi
+      [ "$i" = "$a" ] && echo "$((i + 1)) ${rels[$i]} $img" >"$KL_STATE/rollback-369"
+      kubectl apply -f - >/dev/null <<EOF
+    apiVersion: apps/v1
+    kind: Deployment
+    metadata:
+      name: payroll-api
+      namespace: payroll
+      annotations: {kubernetes.io/change-cause: "$cause"}
+    spec:
+      replicas: 2
+      revisionHistoryLimit: 10
+      selector: {matchLabels: {app: payroll-api}}
+      template:
+        metadata: {labels: {app: payroll-api}}
+        spec:
+          terminationGracePeriodSeconds: 2
+          containers:
+          - name: api
+            image: $img
+            env: [{name: RELEASE, value: "${rels[$i]}"}]
+            resources: {requests: {cpu: 50m, memory: 32Mi}}
+    EOF
+      kubectl -n $NS rollout status deploy/payroll-api --timeout=120s >/dev/null
+    done
+    kj -n $NS deploy payroll-api '{.metadata.uid}' >"$KL_STATE/uid-369"
+
+    # payslips first: the quota must see it before the workers ask for theirs
+    kubectl apply -f - >/dev/null <<EOF
+    apiVersion: apps/v1
+    kind: Deployment
+    metadata: {name: payslips, namespace: payroll}
+    spec:
+      replicas: 1
+      selector: {matchLabels: {app: payslips}}
+      template:
+        metadata: {labels: {app: payslips}}
+        spec:
+          terminationGracePeriodSeconds: 2
+          containers:
+          - name: nginx
+            image: nginx:1.28-alpine
+            env: [{name: RUN_ID, value: "$run"}]
+            resources: {requests: {cpu: 50m, memory: 32Mi}}
+            lifecycle:
+              postStart:
+                exec:
+                  command: ["/bin/bash", "-c", "echo \"\$RUN_ID\" > /usr/share/nginx/html/run.txt"]
+    EOF
+    eventually 60 '[ -n "$(kubectl -n payroll get pods -l app=payslips -o name)" ]' || true
+    kubectl apply -f - >/dev/null <<'EOF'
+    apiVersion: apps/v1
+    kind: Deployment
+    metadata: {name: payroll-worker, namespace: payroll}
+    spec:
+      replicas: 3
+      selector: {matchLabels: {app: payroll-worker}}
+      template:
+        metadata: {labels: {app: payroll-worker}}
+        spec:
+          terminationGracePeriodSeconds: 1
+          containers:
+          - name: worker
+            image: busybox:1.37
+            command: ["sleep", "infinity"]
+    EOF
+    eventually 90 '[ "$(kj -n payroll deploy payroll-worker "{.status.readyReplicas}")" = 2 ]' || true
+  check: |
+    NS=payroll
+    { read -r ini; read -r pw; read -r day; read -r run; } <"$KL_STATE/answer-369" 2>/dev/null
+    read -r arev arel aimg <"$KL_STATE/rollback-369" 2>/dev/null
+    dj() { kubectl -n $NS get deploy "$1" -o json 2>/dev/null; }
+    # cur_pods DEPLOY -> Running pods of the Deployment's current revision
+    cur_pods() {
+      local rev h
+      rev=$(dj "$1" | jq -r '.metadata.annotations["deployment.kubernetes.io/revision"] // empty')
+      [ -n "$rev" ] || return 0
+      h=$(kubectl -n $NS get rs -l "app=$1" -o json 2>/dev/null | jq -r --arg r "$rev" '.items[] | select(.metadata.annotations["deployment.kubernetes.io/revision"] == $r) | .metadata.labels["pod-template-hash"]' | head -1)
+      [ -n "$h" ] || return 0
+      kubectl -n $NS get pods -l "app=$1,pod-template-hash=$h" -o json 2>/dev/null |
+        jq -r '.items[] | select(.metadata.deletionTimestamp == null and .status.phase == "Running") | .metadata.name'
+    }
+    mcpu() { kubectl -n $NS get pod "$1" -o json 2>/dev/null | jq -r '.spec.containers[0].resources.requests.cpu // "0" | if endswith("m") then rtrimstr("m") else (tonumber * 1000 | floor | tostring) end'; }
+
+    info "1. Back to the audited release"
+    check_eq "payroll-api is still the original Deployment" "$(kj -n $NS deploy payroll-api '{.metadata.uid}')" "$(cat "$KL_STATE/uid-369" 2>/dev/null)"
+    check_eq "payroll-api runs the audited release (image, RELEASE)" "$(dj payroll-api | jq -r '.spec.template.spec.containers[0] | "\(.image) \([.env[]? | select(.name == "RELEASE") | .value] | first // "-")"')" "$aimg $arel"
+    check_eq "/lab/rollback.txt holds the audited revision" "$(tr -d '[:space:]' 2>/dev/null </lab/rollback.txt)" "$arev"
+
+    info "2. One API replica per node"
+    spread_ok() { dj payroll-api | jq -e 'any(.spec.template.spec.topologySpreadConstraints[]?; .topologyKey == "kubernetes.io/hostname" and .maxSkew == 1 and .whenUnsatisfiable == "DoNotSchedule")' >/dev/null 2>&1; }
+    check "a hard spread constraint on kubernetes.io/hostname with max skew 1" spread_ok
+    check "the control plane keeps its NoSchedule taint" 'kubectl get node controlplane -o json | jq -e "any(.spec.taints[]?; .key == \"node-role.kubernetes.io/control-plane\" and .effect == \"NoSchedule\")"'
+    spread_ok && wait_deploy $NS payroll-api 120
+    check "payroll-api has 2 Ready replicas" '[ "$(kj -n $NS deploy payroll-api "{.spec.replicas}")" = 2 ] && deploy_ready $NS payroll-api'
+    check_eq "its pods run on 2 different nodes" "$(for p in $(cur_pods payroll-api); do kj -n $NS pod "$p" '{.spec.nodeName}'; echo; done | grep . | sort -u | wc -l | tr -d ' ')" 2
+
+    info "3. Configuration as files"
+    lr_req=$(kj -n $NS limitrange container-defaults '{.spec.limits[0].defaultRequest.cpu}')
+    lr_lim=$(kj -n $NS limitrange container-defaults '{.spec.limits[0].default.cpu}')
+    [ "$lr_req" = 100m ] && wait_deploy $NS payroll-worker 150
+    W=$(cur_pods payroll-worker | head -1)
+    wx() { [ -n "$W" ] && kubectl -n $NS exec "$W" -- "$@" 2>/dev/null; }
+    vol_ok() { dj payroll-worker | jq -e '([.spec.template.spec.volumes[]? | select(.projected)] | length) == 1 and ([.spec.template.spec.containers[0].volumeMounts[]? | select(.mountPath == "/etc/payroll")] | length) == 1' >/dev/null 2>&1; }
+    check "one projected volume is mounted at /etc/payroll" vol_ok
+    check_eq "/etc/payroll holds exactly the three files" "$(wx ls /etc/payroll | sort | paste -sd' ')" "cpu-request db-password payroll.ini"
+    check_eq "payroll.ini comes from ConfigMap payroll-files" "$(wx cat /etc/payroll/payroll.ini)" "$ini"
+    check_eq "db-password comes from Secret payroll-db" "$(wx cat /etc/payroll/db-password)" "$pw"
+    check_eq "db-password has mode 0400" "$(wx stat -L -c %a /etc/payroll/db-password)" 400
+    check_eq "cpu-request holds the container's CPU request in millicores" "$(wx cat /etc/payroll/cpu-request)" "$(if [ -n "$W" ]; then mcpu "$W"; else echo no-worker; fi)"
+
+    info "4. Configuration as environment"
+    check_eq "PAYROLL_CURRENCY comes from ConfigMap payroll-env" "$(wx printenv PAYROLL_CURRENCY)" EUR
+    check_eq "PAYROLL_CUTOFF_DAY comes from ConfigMap payroll-env" "$(wx printenv PAYROLL_CUTOFF_DAY)" "$day"
+    check "no unprefixed copies of its keys" '[ -n "$(wx printenv PAYROLL_CURRENCY)" ] && [ -z "$(wx printenv CURRENCY)" ] && [ -z "$(wx printenv CUTOFF_DAY)" ]'
+    check_eq "NODE_NAME is the node the pod runs on" "$(wx printenv NODE_NAME)" "$(if [ -n "$W" ]; then kj -n $NS pod "$W" '{.spec.nodeName}'; else echo no-worker; fi)"
+
+    info "5. All three workers"
+    check_eq "the quota is unchanged" "$(kj -n $NS quota payroll-cpu '{.spec.hard}')" "$(cat "$KL_STATE/quota-369" 2>/dev/null)"
+    check "the worker manifest declares no resources" 'dj payroll-worker | jq -e "(.spec.template.spec.containers[0].resources // {}) == {}"'
+    check_eq "container defaults: request 100m, limit 200m" "$lr_req $lr_lim" "100m 200m"
+    check "3 workers are Ready" '[ "$(kj -n $NS deploy payroll-worker "{.spec.replicas}")" = 3 ] && deploy_ready $NS payroll-worker'
+    check "each of them requests 100m of CPU" 'n=0; for p in $(cur_pods payroll-worker); do [ "$(kj -n $NS pod "$p" "{.spec.containers[0].resources.requests.cpu}")" = 100m ] || exit 1; n=$((n + 1)); done; [ "$n" = 3 ]'
+
+    info "6. The payslip page"
+    check "payslips still has a postStart hook" '[ -n "$(kj -n $NS deploy payslips "{.spec.template.spec.containers[0].lifecycle.postStart.exec.command}")" ]'
+    check "no volume covers the html directory" 'dj payslips | jq -e "[.spec.template.spec.containers[0].volumeMounts[]? | select(.mountPath | startswith(\"/usr/share/nginx\"))] | length == 0"'
+    wait_deploy $NS payslips 90
+    S=$(cur_pods payslips | head -1)
+    check "payslips is Ready" 'deploy_ready $NS payslips'
+    check_eq "/run.txt answers the run id" "$(if [ -n "$S" ]; then kubectl -n $NS exec "$S" -- wget -qO- -T 3 http://127.0.0.1/run.txt 2>/dev/null; fi)" "$run"
+    check "its pod has no restarts" '[ -n "$S" ] && [ "$(restarts $NS "$S")" = 0 ]'
+
+    info "7. The freeze inventory"
+    want=$(kubectl -n $NS get deploy -o json 2>/dev/null | jq -r '.items[]? | "\(.metadata.name) \(.spec.template.spec.containers[0].image) \(.metadata.annotations["deployment.kubernetes.io/revision"])"' | LC_ALL=C sort | paste -sd';')
+    got=$(sed 's/[[:space:]][[:space:]]*/ /g; s/^ //; s/ $//' /lab/freeze.txt 2>/dev/null | grep -v '^$' | LC_ALL=C sort | paste -sd';')
+    check "/lab/freeze.txt exists" '[ -s /lab/freeze.txt ]'
+    check_eq "it lists every Deployment as <name> <image> <revision>" "$got" "$want"
+  solve: |
+    NS=payroll
+    # 1. roll back first: an undo replaces the whole template
+    rev=$(kubectl -n $NS rollout history deploy/payroll-api | awk '/audited by finance/ {print $1}')
+    kubectl -n $NS rollout undo deploy/payroll-api --to-revision="$rev"
+    echo "$rev" > /lab/rollback.txt
+    kubectl -n $NS rollout status deploy/payroll-api --timeout=120s
+
+    # 2. one replica per node: tolerate the control plane, count only the current revision
+    kubectl -n $NS patch deploy payroll-api --type=merge -p '{"spec":{"template":{"spec":{"tolerations":[{"key":"node-role.kubernetes.io/control-plane","operator":"Exists","effect":"NoSchedule"}],"topologySpreadConstraints":[{"maxSkew":1,"topologyKey":"kubernetes.io/hostname","whenUnsatisfiable":"DoNotSchedule","labelSelector":{"matchLabels":{"app":"payroll-api"}},"matchLabelKeys":["pod-template-hash"]}]}}}}'
+    kubectl -n $NS rollout status deploy/payroll-api --timeout=120s
+
+    # 6. the hook asked for bash; the alpine image only has sh
+    kubectl -n $NS patch deploy payslips --type=json -p '[{"op":"replace","path":"/spec/template/spec/containers/0/lifecycle/postStart/exec/command/0","value":"sh"}]'
+    kubectl -n $NS rollout status deploy/payslips --timeout=120s
+
+    # 5. smaller defaults before the workers roll
+    kubectl -n $NS patch limitrange container-defaults --type=merge -p '{"spec":{"limits":[{"type":"Container","default":{"cpu":"200m"},"defaultRequest":{"cpu":"100m"}}]}}'
+
+    # 3 + 4. the worker configuration
+    kubectl apply -f - <<'EOF'
+    apiVersion: apps/v1
+    kind: Deployment
+    metadata: {name: payroll-worker, namespace: payroll}
+    spec:
+      replicas: 3
+      selector: {matchLabels: {app: payroll-worker}}
+      template:
+        metadata: {labels: {app: payroll-worker}}
+        spec:
+          terminationGracePeriodSeconds: 1
+          containers:
+          - name: worker
+            image: busybox:1.37
+            command: ["sleep", "infinity"]
+            envFrom:
+            - prefix: PAYROLL_
+              configMapRef: {name: payroll-env}
+            env:
+            - name: NODE_NAME
+              valueFrom: {fieldRef: {fieldPath: spec.nodeName}}
+            volumeMounts: [{name: payroll, mountPath: /etc/payroll, readOnly: true}]
+          volumes:
+          - name: payroll
+            projected:
+              sources:
+              - configMap: {name: payroll-files, items: [{key: payroll.ini, path: payroll.ini}]}
+              - secret: {name: payroll-db, items: [{key: password, path: db-password, mode: 0400}]}
+              - downwardAPI:
+                  items:
+                  - path: cpu-request
+                    resourceFieldRef: {containerName: worker, resource: requests.cpu, divisor: 1m}
+    EOF
+    kubectl -n $NS rollout status deploy/payroll-worker --timeout=180s
+
+    # 7. the inventory, once every rollout has finished
+    kubectl -n $NS get deploy -o jsonpath='{range .items[*]}{.metadata.name}{" "}{.spec.template.spec.containers[0].image}{" "}{.metadata.annotations.deployment\.kubernetes\.io/revision}{"\n"}{end}' | sort > /lab/freeze.txt

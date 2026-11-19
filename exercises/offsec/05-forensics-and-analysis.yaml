@@ -620,3 +620,266 @@ exercises:
     check_eq "attacker IP identified in /lab/attacker_ip.txt" "$got" "$want"
   solve: |
     awk '/Failed password/{f[$(NF-3)]++} /Accepted password/{a[$(NF-3)]=1} END{for(i in f) if(f[i]>=10 && a[i]) print i}' /lab/auth.log > /lab/attacker_ip.txt
+
+# ===== Capstone: a real-world lab =====
+
+- id: offsec-for-011
+  title: "Capstone: reconstruct the bastion intrusion"
+  difficulty: 5
+  kind: build
+  tags: [offsec, capstone, forensics, pcap, tcpdump, logs, awk, sqlite, encoding, memory, strings, redaction, incident-response]
+  tutorial: |
+    **Concept.** A real investigation strings many artifacts into one story:
+    an auth log shows how the attacker got in, a packet capture shows what
+    they sent back out, an application database shows what they changed, a
+    staged note and a memory image hold the secrets they left behind. You
+    carve a flag out of each, then — before the bundle goes to an outside IR
+    firm — you redact the live secrets without breaking the file. This
+    capstone chains the whole module.
+
+    **Read up on:**
+    - `tcpdump -nn -A -r FILE` and `strings` / `strings -e l`
+    - `awk` associative arrays for correlating failed and accepted logins
+    - `sqlite3 FILE "SELECT ..."` against an embedded database
+    - undoing stacked encodings: `base64 -d`, `xxd -r -p`, ROT13 with `tr`
+    - `sed -E -i 's/.../.../g'` for in-place redaction that keeps line structure
+  scenario: |
+    **Ticket IR-611**, from Sam (incident response): *"Bastion host `bast-01`
+    was compromised last night. I've dropped everything we pulled into
+    `/lab`. Walk the intrusion from the auth log to the exfil, capture the
+    evidence flags at each step, and then hand me a redacted bundle I can send
+    to the external firm — line-for-line identical, just with the live tokens
+    pulled."*
+
+    ## Part 1: How they got in — `/lab/auth.log`
+    The SSH log holds ordinary users, a scanner that only ever failed, and one
+    source address that failed many times and **then** logged in. Find the
+    source IP with **at least 10 failed logins and also one success**, and
+    write that IP (only) to **`/lab/attacker_ip.txt`**.
+
+    ## Part 2: What left the wire — `/lab/capture.pcap`
+    A short packet capture caught the exfil. One plain-HTTP request carries a
+    session token in a request header. Find it and write the **`KL{...}`**
+    value to **`/lab/token.txt`**.
+
+    ## Part 3: What they changed — `/lab/crm.db`
+    The CRM database's `audit_log` records admin actions. API keys were
+    revoked several times, but exactly one is **currently issued** (action
+    `api_key_issued`). Write that **`KL{...}`** key to **`/lab/apikey.txt`**.
+
+    ## Part 4: The staged note — `/lab/intercepted.txt`
+    Its last line is a blob produced by three stacked encodings: the original
+    **`KL{...}`** text was ROT13'd, then hex-encoded, then base64-encoded.
+    Reverse the layers and write the original value to **`/lab/note.txt`**.
+
+    ## Part 5: Left in memory — `/lab/mem.dump`
+    A raw memory image of a crashed agent holds a session key as a wide
+    (UTF-16 little-endian) string next to the label `SESSKEY`. Plain `strings`
+    misses it. Carve it out and write the **`KL{...}`** value to
+    **`/lab/sesskey.txt`**.
+
+    ## Part 6: Redact before sharing (remediation) — `/lab/evidence-bundle.log`
+    The bundle for the external firm still contains live tokens as
+    `token=KL{...}`. Replace **every** `KL{...}` value with `[REDACTED]`. Do
+    **not** delete lines or alter any other line: the firm's tooling expects
+    the same line count and the same non-token lines.
+  hints:
+    - "Part 1: `awk '/Failed password/{f[$(NF-3)]++} /Accepted password/{a[$(NF-3)]=1} END{for(i in f) if(f[i]>=10 && a[i]) print i}' /lab/auth.log`."
+    - "Part 2: `tcpdump -nn -A -r /lab/capture.pcap | grep -i token` shows the header carrying the value."
+    - "Part 3: `sqlite3 /lab/crm.db \"SELECT detail FROM audit_log WHERE action='api_key_issued';\"` then `grep -oE 'KL\\{[0-9a-f]+\\}'`."
+    - "Part 4: the blob is base64 (outer), then hex, then ROT13: `tail -n1 ... | base64 -d | xxd -r -p | tr 'A-Za-z' 'N-ZA-Mn-za-m'`."
+    - "Part 5: `strings -el /lab/mem.dump | grep -oE 'KL\\{[0-9a-f]+\\}'` — `-e l` scans 16-bit little-endian text."
+    - "Part 6: `sed -E -i 's/KL\\{[0-9a-f]+\\}/[REDACTED]/g' /lab/evidence-bundle.log`; verify with `grep -c 'KL{'` (0) and `wc -l` (unchanged)."
+  solution: |
+    ```bash
+    # Part 1 — the source that failed >=10 times and then got in
+    awk '/Failed password/{f[$(NF-3)]++} /Accepted password/{a[$(NF-3)]=1} \
+         END{for(i in f) if(f[i]>=10 && a[i]) print i}' /lab/auth.log > /lab/attacker_ip.txt
+
+    # Part 2 — the session token on the wire
+    tcpdump -nn -A -r /lab/capture.pcap 2>/dev/null \
+      | grep -i 'x-session-token' | grep -oE 'KL\{[0-9a-f]+\}' | head -1 > /lab/token.txt
+
+    # Part 3 — the currently issued API key
+    sqlite3 /lab/crm.db "SELECT detail FROM audit_log WHERE action='api_key_issued';" \
+      | grep -oE 'KL\{[0-9a-f]+\}' > /lab/apikey.txt
+
+    # Part 4 — peel base64, hex, ROT13
+    tail -n1 /lab/intercepted.txt | base64 -d | xxd -r -p \
+      | tr 'A-Za-z' 'N-ZA-Mn-za-m' > /lab/note.txt
+
+    # Part 5 — carve the wide string
+    strings -el /lab/mem.dump | grep -oE 'KL\{[0-9a-f]+\}' | head -1 > /lab/sesskey.txt
+
+    # Part 6 — redact in place, keep every line
+    sed -E -i 's/KL\{[0-9a-f]+\}/[REDACTED]/g' /lab/evidence-bundle.log
+    ```
+  setup: |
+    export KL_STATE
+    # --- part 1: how they got in (auth.log) ---
+    python3 - <<'PY'
+    import os, random
+    octets = random.sample(range(10, 250), 6)
+    ip = lambda n: "198.51.100.%d" % n
+    target, scanner = ip(octets[0]), ip(octets[1])
+    legit = [ip(o) for o in octets[2:]]
+    open(os.environ["KL_STATE"] + "/attacker", "w").write(target + "\n")
+    ev = []
+    for _ in range(25):
+        ev.append(("Failed password for root", target))
+    for _ in range(31):
+        ev.append(("Failed password for admin", scanner))
+    for i, l in enumerate(legit):
+        for _ in range(random.randint(0, 3)):
+            ev.append(("Failed password for user%d" % i, l))
+    random.shuffle(ev)
+    for i, l in enumerate(legit):
+        ev.insert(random.randint(0, len(ev)), ("Accepted password for user%d" % i, l))
+    ev.append(("Accepted password for deploy", target))
+    lines = []
+    t = 36000
+    for n, (msg, src) in enumerate(ev):
+        t += random.randint(1, 40)
+        lines.append("Nov  9 %02d:%02d:%02d bastion sshd[%d]: %s from %s port %d ssh2" %
+                     (t // 3600, (t // 60) % 60, t % 60, 2000 + n, msg, src, random.randint(30000, 60000)))
+    open("/lab/auth.log", "w").write("\n".join(lines) + "\n")
+    PY
+    # --- part 2: what left the wire (pcap) ---
+    FLAG=$(rand_flag); export FLAG
+    echo "$FLAG" > "$KL_STATE/p2"
+    python3 - <<'PY'
+    import os, struct, random
+    flag = os.environ["FLAG"]
+    out = bytearray(struct.pack("<IHHiIII", 0xa1b2c3d4, 2, 4, 0, 0, 65535, 1))
+    ts = 1731000000
+    seq = 1000
+    def pkt(src, dst, sport, dport, payload):
+        global ts, seq
+        tcp = struct.pack(">HHIIBBHHH", sport, dport, seq, 1, 5 << 4, 0x18, 8192, 0, 0)
+        ip = struct.pack(">BBHHHBBH4s4s", 0x45, 0, 40 + len(payload), random.randint(1, 65000), 0x4000, 64, 6, 0,
+                         bytes(map(int, src.split("."))), bytes(map(int, dst.split("."))))
+        eth = bytes.fromhex("525400123456") + bytes.fromhex("525400654321") + b"\x08\x00"
+        frame = eth + ip + tcp + payload
+        out.extend(struct.pack("<IIII", ts, random.randint(0, 999999), len(frame), len(frame)))
+        out.extend(frame)
+        ts += random.randint(1, 4)
+        seq += len(payload)
+    def get(host, path, extra=""):
+        return ("GET %s HTTP/1.1\r\nHost: %s\r\nUser-Agent: curl/8.5\r\n%s\r\n" % (path, host, extra)).encode()
+    ws, srv = "10.20.0.15", "10.20.0.80"
+    pkt(ws, srv, 41000, 80, get("intranet.local", "/"))
+    pkt(ws, srv, 41001, 80, get("intranet.local", "/static/app.css"))
+    pkt(ws, srv, 41002, 80, get("intranet.local", "/news", "X-Request-Id: 7f3a19\r\n"))
+    body = b'{"sync":true}'
+    pkt(ws, srv, 41003, 8080,
+        b"POST /api/sync HTTP/1.1\r\nHost: sync.internal\r\nX-Session-Token: " + flag.encode() +
+        b"\r\nContent-Type: application/json\r\nContent-Length: " + str(len(body)).encode() + b"\r\n\r\n" + body)
+    pkt(srv, ws, 80, 41003, b"HTTP/1.1 200 OK\r\nContent-Length: 2\r\n\r\nok")
+    pkt(ws, srv, 41004, 80, get("intranet.local", "/favicon.ico"))
+    pkt(ws, srv, 41005, 80, get("intranet.local", "/holidays", "X-Request-Id: 91bc02\r\n"))
+    open("/lab/capture.pcap", "wb").write(out)
+    PY
+    # --- part 3: what they changed (crm.db) ---
+    FLAG=$(rand_flag); export FLAG
+    echo "$FLAG" > "$KL_STATE/p3"
+    python3 - <<'PY'
+    import os, sqlite3
+    flag = os.environ["FLAG"]
+    old = lambda: "KL{" + os.urandom(16).hex() + "}"
+    db = sqlite3.connect("/lab/crm.db")
+    db.execute("CREATE TABLE customers (id INTEGER PRIMARY KEY, name TEXT, plan TEXT)")
+    db.execute("CREATE TABLE audit_log (id INTEGER PRIMARY KEY, ts TEXT, actor TEXT, action TEXT, detail TEXT)")
+    db.executemany("INSERT INTO customers (name, plan) VALUES (?, ?)",
+                   [("Northwind", "pro"), ("Contoso", "basic"), ("Initech", "pro"), ("Globex", "free")])
+    rows = [
+        ("2026-09-01 09:00", "admin", "login", "ok"),
+        ("2026-09-03 11:12", "admin", "api_key_revoked", "key=" + old()),
+        ("2026-09-10 14:40", "svc-sync", "export", "customers.csv"),
+        ("2026-09-15 08:05", "admin", "api_key_revoked", "key=" + old()),
+        ("2026-09-20 16:30", "admin", "api_key_issued", "key=" + flag + " scope=read"),
+        ("2026-09-21 10:00", "ops", "login", "ok"),
+        ("2026-09-22 10:07", "admin", "plan_change", "Globex free"),
+        ("2026-10-02 12:00", "admin", "api_key_revoked", "key=" + old()),
+    ]
+    db.executemany("INSERT INTO audit_log (ts, actor, action, detail) VALUES (?, ?, ?, ?)", rows)
+    db.commit()
+    db.close()
+    PY
+    # --- part 4: the staged note (rot13 -> hex -> base64) ---
+    FLAG=$(rand_flag); export FLAG
+    echo "$FLAG" > "$KL_STATE/p4"
+    python3 - <<'PY'
+    import os, codecs, binascii, base64
+    flag = os.environ["FLAG"]
+    step1 = codecs.encode(flag, "rot13")
+    step2 = binascii.hexlify(step1.encode()).decode()
+    step3 = base64.b64encode(step2.encode()).decode()
+    with open("/lab/intercepted.txt", "w") as f:
+        f.write("# recovered from /srv/staging/.cache on host bast-01\n")
+        f.write(step3 + "\n")
+    PY
+    # --- part 5: left in memory (UTF-16LE SESSKEY) ---
+    FLAG=$(rand_flag); export FLAG
+    echo "$FLAG" > "$KL_STATE/p5"
+    python3 - <<'PY'
+    import os, random
+    flag = os.environ["FLAG"]
+    size = 524288
+    data = bytearray(os.urandom(size))
+    off = random.randrange(10000, size - 4000, 2)
+    blob = "SESSKEY=".encode("utf-16-le") + flag.encode("utf-16-le") + b"\x00\x00"
+    data[off:off + len(blob)] = blob
+    open("/lab/mem.dump", "wb").write(bytes(data))
+    PY
+    chown -R "$(lab_user)": /lab
+    # --- part 6: redact before sharing (evidence-bundle.log) ---
+    T1=$(rand_flag); T2=$(rand_flag); T3=$(rand_flag)
+    lab_file /lab/evidence-bundle.log <<EOF
+    2026-11-09T08:00:01Z INFO  ir bundle assembled host=bast-01
+    2026-11-09T08:00:07Z INFO  session captured user=alice token=$T1 ip=10.0.0.21
+    2026-11-09T08:01:12Z WARN  pcap truncated at 65535 bytes
+    2026-11-09T08:02:30Z INFO  session captured user=bob token=$T2 ip=10.0.0.34
+    2026-11-09T08:03:44Z INFO  artifact hashed sha256=4f1c...e9
+    2026-11-09T08:04:09Z ERROR disk pressure on /var/evidence
+    2026-11-09T08:05:51Z INFO  session refreshed user=alice token=$T3 ip=10.0.0.21
+    2026-11-09T08:06:20Z INFO  bundle sealed ready-to-ship
+    EOF
+    wc -l < /lab/evidence-bundle.log > "$KL_STATE/lines"
+    grep -v 'token=' /lab/evidence-bundle.log | md5sum | cut -d' ' -f1 > "$KL_STATE/md5"
+  check: |
+    info "Part 1: How they got in"
+    got=$(tr -d ' \t\r\n' < /lab/attacker_ip.txt 2>/dev/null)
+    want=$(tr -d ' \t\r\n' < "$KL_STATE/attacker")
+    check_eq "attacker IP identified in /lab/attacker_ip.txt" "$got" "$want"
+    info "Part 2: What left the wire"
+    got=$(grep -oE 'KL\{[0-9a-f]+\}' /lab/token.txt 2>/dev/null | head -1)
+    check_eq "session token recovered from the capture" "$got" "$(cat "$KL_STATE/p2")"
+    info "Part 3: What they changed"
+    got=$(grep -oE 'KL\{[0-9a-f]+\}' /lab/apikey.txt 2>/dev/null | head -1)
+    check_eq "currently issued API key recovered from the database" "$got" "$(cat "$KL_STATE/p3")"
+    info "Part 4: The staged note"
+    got=$(grep -oE 'KL\{[0-9a-f]+\}' /lab/note.txt 2>/dev/null | head -1)
+    check_eq "staged note decoded through all three layers" "$got" "$(cat "$KL_STATE/p4")"
+    info "Part 5: Left in memory"
+    got=$(grep -oE 'KL\{[0-9a-f]+\}' /lab/sesskey.txt 2>/dev/null | head -1)
+    check_eq "session key carved from the memory image" "$got" "$(cat "$KL_STATE/p5")"
+    info "Part 6: Redact before sharing"
+    check_not "a live token is still present in the bundle" "grep -q 'KL{' /lab/evidence-bundle.log"
+    check_eq "line count is unchanged" "$(wc -l < /lab/evidence-bundle.log 2>/dev/null | tr -d ' ')" "$(tr -d ' ' < "$KL_STATE/lines")"
+    check_eq "lines without tokens are untouched" "$(grep -v 'token=' /lab/evidence-bundle.log 2>/dev/null | md5sum | cut -d' ' -f1)" "$(cat "$KL_STATE/md5")"
+  solve: |
+    # --- part 1 ---
+    awk '/Failed password/{f[$(NF-3)]++} /Accepted password/{a[$(NF-3)]=1} END{for(i in f) if(f[i]>=10 && a[i]) print i}' /lab/auth.log > /lab/attacker_ip.txt
+    # --- part 2 ---
+    tcpdump -nn -A -r /lab/capture.pcap 2>/dev/null \
+      | grep -i 'x-session-token' | grep -oE 'KL\{[0-9a-f]+\}' | head -1 > /lab/token.txt
+    # --- part 3 ---
+    sqlite3 /lab/crm.db "SELECT detail FROM audit_log WHERE action='api_key_issued';" \
+      | grep -oE 'KL\{[0-9a-f]+\}' > /lab/apikey.txt
+    # --- part 4 ---
+    tail -n1 /lab/intercepted.txt | base64 -d | xxd -r -p \
+      | tr 'A-Za-z' 'N-ZA-Mn-za-m' > /lab/note.txt
+    # --- part 5 ---
+    strings -el /lab/mem.dump | grep -oE 'KL\{[0-9a-f]+\}' | head -1 > /lab/sesskey.txt
+    # --- part 6 ---
+    sed -E -i 's/KL\{[0-9a-f]+\}/[REDACTED]/g' /lab/evidence-bundle.log

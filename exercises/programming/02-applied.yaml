@@ -853,3 +853,857 @@ exercises:
 
     func main() {}
     EOF
+
+# ===== Capstone: a real-world lab =====
+
+- id: prog-082
+  title: "Capstone: the edge-log ingester and the hit counter"
+  difficulty: 5
+  kind: fix
+  tags: [capstone, python, go, parsing, sqlite, sql-injection, asyncio, mutable-default, http, json, mutex, context, leak]
+  tutorial: |
+    **Concept.** Most production bugs in small tools are the classic ones,
+    and they hide well because the tool *mostly* works:
+
+    - **Shared mutable defaults.** A default argument is evaluated once. If
+      the function mutates it, every call that relies on the default shares
+      one object, and data from one call bleeds into the next.
+    - **Splitting is not parsing.** `key="a value with spaces"` breaks
+      `str.split`. `shlex.split` respects quotes, and it raises `ValueError`
+      on a quote that never closes: that's a malformed line, so skip it.
+    - **SQL is code, values are data.** Pasting values into SQL text breaks
+      on the first apostrophe and lets input rewrite the query. Placeholders
+      (`?`) send the values separately, whatever they contain.
+    - **Concurrency for waiting.** `await` in a loop waits for each call
+      before starting the next. `asyncio.gather` overlaps the waits, keeps
+      the order, and with `return_exceptions=True` one failure doesn't throw
+      away the other results.
+    - **Go maps need `make` and a lock.** Writing to a nil map panics, and
+      concurrent map access without a `sync.Mutex` is a fatal runtime error,
+      not just a wrong count. Slicing past `len` panics too.
+    - **Handlers validate.** Decode errors and impossible values are a
+      **400**, the wrong method a **405**, and an empty list is `[]`, not
+      `null`.
+    - **Goroutines need a way out.** A producer that sends on a channel must
+      also watch `ctx.Done()`, or it blocks forever once nobody reads, and
+      whoever owns the channel closes it.
+
+    **Read up on:**
+    - Python docs: "Default Argument Values", `shlex.split`, `str.partition`
+    - Python docs: `sqlite3` placeholders, `executemany`, `commit`
+    - `asyncio.gather(..., return_exceptions=True)`, `dict.fromkeys` for order-keeping de-duplication
+    - `go doc sync.Mutex`, `go doc sort.Slice`, nil maps and slice bounds
+    - `go doc net/http.Error`, `json.NewDecoder`, `httptest.NewRecorder`
+    - `go doc context`, `time.NewTicker`, `select` with a send case
+  scenario: |
+    **OBS-512**, from Dana, the SRE on-call lead: *"During Tuesday's outage
+    the edge-log tooling let us down. The ingester crashed on the first URL
+    with an apostrophe, lines without a user agent showed somebody else's,
+    and the GeoIP enrichment took four minutes for 3000 clients. Meanwhile
+    the Go hit counter the proxies push to panicked twice under load and
+    leaks a goroutine every time a dashboard disconnects. Fix both before
+    the next incident."*
+
+    The proxies write key=value lines (see **`/lab/access.log`**):
+
+    ```
+    ts=2026-11-18T02:14:07Z client=10.0.4.17 method=GET path="/search?q=red shoes" status=200 ms=41 ua="curl/8.5.0"
+    ```
+
+    **`/lab/ingest.py`** (keep the function names and arguments; hidden tests
+    call them):
+
+    1. **`parse(line, defaults=None)`** returns a dict of strings: the
+       `defaults` (if given) overlaid with the line's pairs. Values may be in
+       double quotes, with spaces; tokens without `=` are ignored; a value
+       may itself contain `=`. A quote that never closes raises `ValueError`.
+       Calls are **independent**, and `defaults` is never modified.
+    2. **`load(conn, path)`** inserts every **complete** line into the `hits`
+       table (see `open_db`) and returns how many it inserted. A complete
+       line has non-empty `ts`, `client` and `path` and an integer `status`;
+       a missing `ua` is stored as `-`. Anything else (blank lines, junk,
+       unclosed quotes) is skipped without stopping the load.
+    3. **Values are data.** `load` and **`errors_for(conn, client)`** (the
+       `(path, count)` pairs of a client's 5xx answers, most first, then by
+       path) work for any value, apostrophes and SQL text included, and
+       nothing in a value can change a query.
+    4. **`resolve_all(clients, lookup)`** awaits the coroutine function
+       `lookup(client)` once per **distinct** client, all **concurrently**,
+       and returns `{client: result}`. A lookup that raises gives `None` for
+       that client; the others still resolve.
+
+    **`/lab/hits.go`** (package `main`; keep the type, function and method
+    names):
+
+    5. **`NewHits()`** returns a counter that is ready to use and **safe for
+       concurrent use**: `Add`, `Top` and the handlers may run from many
+       goroutines at once (use `sync`).
+    6. **`Top(k)`** returns the `k` busiest paths, most hits first, **ties
+       by path**; all of them when there are fewer than `k`, none when
+       `k <= 0`.
+    7. **The handlers.** `IngestHandler` takes a `POST` of
+       `{"path": "/x", "count": 3}`, adds it and answers **204**; invalid
+       JSON, an empty path or a count below 1 is **400**, any other method
+       **405**. `TopHandler` answers `GET /top?k=N` with **200**, JSON
+       content type and a JSON array of `{"path", "count"}` objects (`[]`
+       when empty); `k` defaults to 10, and a `k` that isn't a positive
+       integer is **400**.
+    8. **`Snapshots(ctx, k, every)`** sends `Top(k)` every `every` on the
+       returned channel. When `ctx` is cancelled, the goroutine behind it
+       **exits** and the channel is **closed**, even if nobody is reading.
+
+    Try the Go code with:
+
+    ```bash
+    docker run --rm -v /lab:/src -w /src golang:1.24-alpine go vet hits.go
+    ```
+  hints:
+    - "Call `parse('a=1')` and then `parse('b=2')` in `python3 -i ingest.py`: the second result still has `a`. Start from `dict(defaults or {})`."
+    - "Replace `line.split()` with `shlex.split(line)` and keep only tokens where `token.partition('=')` found a separator. In `load`, catch `ValueError` and `KeyError` per line, and check `int(rec['status'])` and the empty values."
+    - "Both queries take placeholders: `conn.execute('INSERT INTO hits VALUES (?, ?, ?, ?, ?)', row)` and `... WHERE client = ? ...', (client,)`."
+    - "`unique = list(dict.fromkeys(clients))`, then `await asyncio.gather(*(lookup(c) for c in unique), return_exceptions=True)` and map any `Exception` result to `None`."
+    - "Go: `&Hits{counts: make(map[string]int)}`, a `sync.Mutex` field locked in `Add` and `Top`, a tie-break in the `sort.Slice` less function, and clamp `k` to `0..len(all)` before slicing."
+    - "Handlers: check `r.Method`, the decode error and the values before `Add`; `strconv.Atoi` plus `n < 1` for `k`. In `Snapshots`, `defer close(ch)`, `defer t.Stop()`, and `select` on `ctx.Done()` both while waiting for the ticker and while sending."
+  solution: |
+    **`/lab/ingest.py`**: a fresh dict per call, `shlex`, per-line error
+    handling, placeholders, and `gather`:
+
+    ```python
+    def parse(line, defaults=None):
+        rec = dict(defaults or {})
+        for token in shlex.split(line):
+            key, sep, value = token.partition("=")
+            if sep:
+                rec[key] = value
+        return rec
+
+    def load(conn, path):
+        n = 0
+        with open(path) as f:
+            for line in f:
+                try:
+                    rec = parse(line, {"ua": "-"})
+                    if not all(rec.get(k) for k in ("ts", "client", "path", "status")):
+                        continue
+                    row = (rec["ts"], rec["client"], rec["path"], int(rec["status"]), rec["ua"])
+                except ValueError:
+                    continue
+                conn.execute("INSERT INTO hits VALUES (?, ?, ?, ?, ?)", row)
+                n += 1
+        conn.commit()
+        return n
+
+    def errors_for(conn, client):
+        return conn.execute(
+            "SELECT path, COUNT(*) FROM hits WHERE client = ? AND status >= 500 "
+            "GROUP BY path ORDER BY 2 DESC, 1", (client,)).fetchall()
+
+    async def resolve_all(clients, lookup):
+        unique = list(dict.fromkeys(clients))
+        results = await asyncio.gather(*(lookup(c) for c in unique), return_exceptions=True)
+        return {c: None if isinstance(r, Exception) else r for c, r in zip(unique, results)}
+    ```
+
+    **`/lab/hits.go`**: a made map behind a mutex, a total order with a
+    clamped `k`, validating handlers, and a producer that watches its
+    context:
+
+    ```go
+    type Hits struct {
+    	mu     sync.Mutex
+    	counts map[string]int
+    }
+
+    func NewHits() *Hits { return &Hits{counts: make(map[string]int)} }
+
+    sort.Slice(all, func(i, j int) bool {
+    	if all[i].Count != all[j].Count {
+    		return all[i].Count > all[j].Count
+    	}
+    	return all[i].Path < all[j].Path
+    })
+    k = max(0, min(k, len(all)))
+    return all[:k]
+
+    func (h *Hits) Snapshots(ctx context.Context, k int, every time.Duration) <-chan []PathCount {
+    	ch := make(chan []PathCount)
+    	go func() {
+    		defer close(ch)
+    		t := time.NewTicker(every)
+    		defer t.Stop()
+    		for {
+    			select {
+    			case <-ctx.Done():
+    				return
+    			case <-t.C:
+    				select {
+    				case ch <- h.Top(k):
+    				case <-ctx.Done():
+    					return
+    				}
+    			}
+    		}
+    	}()
+    	return ch
+    }
+    ```
+
+    `IngestHandler` answers 405 for anything but `POST` and 400 when
+    decoding fails, the path is empty or the count is below 1. `TopHandler`
+    parses `k` with `strconv.Atoi` (400 below 1), sets
+    `Content-Type: application/json` and encodes `Top(k)`, which is never a
+    nil slice, so an empty counter gives `[]`.
+  setup: |
+    lab_file /lab/access.log <<'EOF'
+    ts=2026-11-18T02:14:07Z client=10.0.4.17 method=GET path="/search?q=red shoes" status=200 ms=41 ua="curl/8.5.0"
+    ts=2026-11-18T02:14:07Z client=10.0.4.22 method=POST path=/api/cart status=503 ms=3001
+    ts=2026-11-18T02:14:08Z client=10.0.4.17 method=GET path="/search?q=O'Neill jacket" status=200 ms=38 ua="Mozilla/5.0 (X11; Linux x86_64)"
+    proxy edge-3 restarted
+    ts=2026-11-18T02:14:09Z client=10.0.4.22 method=POST path=/api/cart status=502 ms=12
+    ts=2026-11-18T02:14:09Z client=10.0.4.31 method=GET path="/promo status=200
+
+    ts=2026-11-18T02:14:10Z client=10.0.4.22 method=GET path=/login status=500 ms=7
+    ts=2026-11-18T02:14:11Z client=10.0.4.40 method=GET path=/health status=ok
+    ts=2026-11-18T02:14:12Z client=10.0.4.17 method=GET path=/api/cart status=200 ms=15
+    EOF
+    lab_file /lab/ingest.py <<'EOF'
+    import asyncio
+    import sqlite3
+
+
+    def parse(line, defaults={}):
+        """Turn 'k=v k2="quoted value"' into a dict of strings, on top of defaults."""
+        rec = defaults
+        for token in line.split():
+            key, _, value = token.partition("=")
+            rec[key] = value
+        return rec
+
+
+    def open_db(path):
+        conn = sqlite3.connect(path)
+        conn.execute("CREATE TABLE IF NOT EXISTS hits (ts TEXT, client TEXT, path TEXT, status INTEGER, ua TEXT)")
+        return conn
+
+
+    def load(conn, path):
+        """Insert every complete line of the log at `path`; return how many were inserted."""
+        n = 0
+        for line in open(path).read().splitlines():
+            rec = parse(line)
+            conn.execute(
+                f"INSERT INTO hits VALUES ('{rec['ts']}', '{rec['client']}', '{rec['path']}', "
+                f"{rec['status']}, '{rec.get('ua', '-')}')"
+            )
+            n += 1
+        conn.commit()
+        return n
+
+
+    def errors_for(conn, client):
+        """(path, count) of the 5xx answers this client got, most first, then by path."""
+        q = (f"SELECT path, COUNT(*) FROM hits WHERE client = '{client}' AND status >= 500 "
+             "GROUP BY path ORDER BY 2 DESC, 1")
+        return conn.execute(q).fetchall()
+
+
+    async def resolve_all(clients, lookup):
+        """{client: await lookup(client)} for each distinct client."""
+        out = {}
+        for c in clients:
+            out[c] = await lookup(c)
+        return out
+
+
+    if __name__ == "__main__":
+        db = open_db(":memory:")
+        print(load(db, "/lab/access.log"), "lines loaded")
+        print(errors_for(db, "10.0.4.22"))
+    EOF
+    lab_file /lab/hits.go <<'EOF'
+    package main
+
+    import (
+    	"context"
+    	"encoding/json"
+    	"net/http"
+    	"sort"
+    	"strconv"
+    	"time"
+    )
+
+    type PathCount struct {
+    	Path  string `json:"path"`
+    	Count int    `json:"count"`
+    }
+
+    // Hits counts requests per path. The proxies push to it from many goroutines.
+    type Hits struct {
+    	counts map[string]int
+    }
+
+    func NewHits() *Hits { return &Hits{} }
+
+    func (h *Hits) Add(path string, n int) { h.counts[path] += n }
+
+    // Top returns the k busiest paths, most hits first.
+    func (h *Hits) Top(k int) []PathCount {
+    	all := make([]PathCount, 0, len(h.counts))
+    	for p, c := range h.counts {
+    		all = append(all, PathCount{p, c})
+    	}
+    	sort.Slice(all, func(i, j int) bool { return all[i].Count > all[j].Count })
+    	return all[:k]
+    }
+
+    // IngestHandler handles POST /hits with {"path": "/x", "count": 3}.
+    func (h *Hits) IngestHandler(w http.ResponseWriter, r *http.Request) {
+    	var in PathCount
+    	json.NewDecoder(r.Body).Decode(&in)
+    	h.Add(in.Path, in.Count)
+    	w.WriteHeader(http.StatusNoContent)
+    }
+
+    // TopHandler handles GET /top?k=N.
+    func (h *Hits) TopHandler(w http.ResponseWriter, r *http.Request) {
+    	k, _ := strconv.Atoi(r.URL.Query().Get("k"))
+    	json.NewEncoder(w).Encode(h.Top(k))
+    }
+
+    // Snapshots sends Top(k) every interval until ctx is cancelled.
+    func (h *Hits) Snapshots(ctx context.Context, k int, every time.Duration) <-chan []PathCount {
+    	ch := make(chan []PathCount)
+    	go func() {
+    		t := time.NewTicker(every)
+    		for range t.C {
+    			ch <- h.Top(k)
+    		}
+    	}()
+    	return ch
+    }
+
+    func main() {
+    	h := NewHits()
+    	http.HandleFunc("/hits", h.IngestHandler)
+    	http.HandleFunc("/top", h.TopHandler)
+    	http.ListenAndServe(":8080", nil)
+    }
+    EOF
+  check: |
+    d=$(mktemp -d)
+    cat >"$d/hidden.py" <<'EOF'
+    import asyncio
+    import os
+    import shutil
+    import tempfile
+    import time
+    import unittest
+    import ingest
+
+    LOG = r'''ts=2026-11-18T02:00:00Z client=10.0.0.1 method=GET path="/search?q=red shoes" status=200 ua="Mozilla/5.0 (X11; Linux)"
+    ts=2026-11-18T02:00:01Z client=10.0.0.2 path=/api/cart status=503
+    garbage line without pairs
+
+    ts=2026-11-18T02:00:02Z client=10.0.0.1 path=/api/cart status=abc
+    ts=2026-11-18T02:00:03Z path=/api/cart status=500
+    ts=2026-11-18T02:00:04Z client=10.0.0.3 path="/unterminated status=500
+    ts= client=10.0.0.9 path=/x status=200
+    ts=2026-11-18T02:00:05Z client=10.0.0.2 path=/api/cart status=502 ms=9
+    ts=2026-11-18T02:00:06Z client=10.0.0.2 path=/login status=500
+    '''
+
+    QUOTES = r'''ts=2026-11-18T03:00:00Z client=10.0.0.7 path="/q?name=O'Brien" status=404 ua="Bob's browser"
+    ts=2026-11-18T03:00:01Z client="x'); DROP TABLE hits; --" path=/ status=500
+    ts=2026-11-18T03:00:02Z client="O'Neil" path=/a status=500
+    '''
+
+
+    class T(unittest.TestCase):
+        def setUp(self):
+            self.d = tempfile.mkdtemp()
+            self.conn = ingest.open_db(os.path.join(self.d, "hits.db"))
+
+        def tearDown(self):
+            self.conn.close()
+            shutil.rmtree(self.d)
+
+        def log(self, text):
+            p = os.path.join(self.d, "access.log")
+            with open(p, "w") as f:
+                f.write("\n".join(l.strip() for l in text.splitlines()) + "\n")
+            return p
+
+        def rows(self):
+            return self.conn.execute("SELECT ts, client, path, status, ua FROM hits ORDER BY ts").fetchall()
+
+        def test_parse_quotes(self):
+            self.assertEqual(
+                ingest.parse('ts=1 path="/a b" ua="x=y z" junk empty= q=a=b'),
+                {"ts": "1", "path": "/a b", "ua": "x=y z", "empty": "", "q": "a=b"})
+            self.assertEqual(ingest.parse(""), {})
+
+        def test_parse_independent(self):
+            d = {"ua": "-"}
+            self.assertEqual(ingest.parse("a=1", d), {"ua": "-", "a": "1"})
+            self.assertEqual(ingest.parse("ua=curl b=2", d), {"ua": "curl", "b": "2"})
+            self.assertEqual(d, {"ua": "-"}, "defaults was modified")
+            r1 = ingest.parse("x=1")
+            r2 = ingest.parse("y=2")
+            self.assertEqual((r1, r2), ({"x": "1"}, {"y": "2"}))
+
+        def test_parse_unclosed(self):
+            with self.assertRaises(ValueError):
+                ingest.parse('a="never closed')
+
+        def test_load(self):
+            self.assertEqual(ingest.load(self.conn, self.log(LOG)), 4)
+            self.assertEqual(self.rows(), [
+                ("2026-11-18T02:00:00Z", "10.0.0.1", "/search?q=red shoes", 200, "Mozilla/5.0 (X11; Linux)"),
+                ("2026-11-18T02:00:01Z", "10.0.0.2", "/api/cart", 503, "-"),
+                ("2026-11-18T02:00:05Z", "10.0.0.2", "/api/cart", 502, "-"),
+                ("2026-11-18T02:00:06Z", "10.0.0.2", "/login", 500, "-"),
+            ])
+
+        def test_values_are_data(self):
+            self.assertEqual(ingest.load(self.conn, self.log(QUOTES)), 3)
+            self.assertEqual(self.rows(), [
+                ("2026-11-18T03:00:00Z", "10.0.0.7", "/q?name=O'Brien", 404, "Bob's browser"),
+                ("2026-11-18T03:00:01Z", "x'); DROP TABLE hits; --", "/", 500, "-"),
+                ("2026-11-18T03:00:02Z", "O'Neil", "/a", 500, "-"),
+            ])
+            self.assertEqual(ingest.errors_for(self.conn, "O'Neil"), [("/a", 1)])
+            self.assertEqual(ingest.errors_for(self.conn, "x'); DROP TABLE hits; --"), [("/", 1)])
+            self.assertEqual(list(ingest.errors_for(self.conn, "x' OR '1'='1")), [])
+
+        def test_errors_for(self):
+            ingest.load(self.conn, self.log(LOG))
+            self.conn.executemany("INSERT INTO hits VALUES (?, ?, ?, ?, ?)", [
+                ("t1", "10.0.0.2", "/b", 500, "-"), ("t2", "10.0.0.2", "/b", 504, "-"),
+                ("t3", "10.0.0.2", "/a", 200, "-"), ("t4", "10.0.0.2", "/z", 599, "-")])
+            self.assertEqual(ingest.errors_for(self.conn, "10.0.0.2"),
+                             [("/api/cart", 2), ("/b", 2), ("/login", 1), ("/z", 1)])
+            self.assertEqual(list(ingest.errors_for(self.conn, "10.0.0.1")), [])
+
+        def test_resolve_concurrent(self):
+            calls = []
+
+            async def lookup(c):
+                calls.append(c)
+                await asyncio.sleep(0.2)
+                return "cc-" + c
+
+            clients = ["10.1.0.%d" % i for i in range(20)] * 3
+            t = time.monotonic()
+            got = asyncio.run(ingest.resolve_all(clients, lookup))
+            took = time.monotonic() - t
+            self.assertEqual(got, {c: "cc-" + c for c in clients})
+            self.assertEqual(sorted(calls), sorted(set(clients)), "each distinct client must be looked up once")
+            self.assertLess(took, 0.8, "the lookups did not run concurrently")
+
+        def test_resolve_failures(self):
+            async def lookup(c):
+                await asyncio.sleep(0.05)
+                if c.endswith(".13"):
+                    raise LookupError("no such address")
+                return "nl"
+
+            got = asyncio.run(ingest.resolve_all(["10.0.0.1", "10.0.0.13", "10.0.0.2"], lookup))
+            self.assertEqual(got, {"10.0.0.1": "nl", "10.0.0.13": None, "10.0.0.2": "nl"})
+            self.assertEqual(asyncio.run(ingest.resolve_all([], lookup)), {})
+    EOF
+    ut() { (cd "$d" && PYTHONPATH=/lab timeout 30 python3 -B -m unittest "hidden.T.$1"); }
+
+    mkdir "$d/go"
+    cp /lab/*.go "$d/go"/ 2>/dev/null
+    cat >"$d/go/zz_hidden_test.go" <<'GO'
+    package main
+
+    import (
+    	"context"
+    	"encoding/json"
+    	"fmt"
+    	"net/http/httptest"
+    	"reflect"
+    	"runtime"
+    	"strings"
+    	"sync"
+    	"testing"
+    	"time"
+    )
+
+    func TestConcurrentAdd(t *testing.T) {
+    	h := NewHits()
+    	var wg sync.WaitGroup
+    	stop := make(chan struct{})
+    	go func() {
+    		for {
+    			select {
+    			case <-stop:
+    				return
+    			default:
+    				h.Top(3)
+    			}
+    		}
+    	}()
+    	for g := 0; g < 50; g++ {
+    		wg.Add(1)
+    		go func() {
+    			defer wg.Done()
+    			for i := 0; i < 2000; i++ {
+    				h.Add("/a", 1)
+    				h.Add(fmt.Sprintf("/p%d", i%4), 2)
+    			}
+    		}()
+    	}
+    	wg.Wait()
+    	close(stop)
+    	want := []PathCount{{"/a", 100000}, {"/p0", 50000}, {"/p1", 50000}, {"/p2", 50000}, {"/p3", 50000}}
+    	if got := h.Top(10); !reflect.DeepEqual(got, want) {
+    		t.Fatalf("Top(10) = %v, want %v", got, want)
+    	}
+    }
+
+    func TestTop(t *testing.T) {
+    	if got := NewHits().Top(5); len(got) != 0 {
+    		t.Fatalf("empty counter: Top(5) = %v", got)
+    	}
+    	h := NewHits()
+    	h.Add("/b", 3)
+    	h.Add("/a", 2)
+    	h.Add("/c", 5)
+    	h.Add("/d", 1)
+    	h.Add("/a", 1)
+    	if got, want := h.Top(2), []PathCount{{"/c", 5}, {"/a", 3}}; !reflect.DeepEqual(got, want) {
+    		t.Fatalf("Top(2) = %v, want %v", got, want)
+    	}
+    	for i := 0; i < 20; i++ {
+    		if got, want := h.Top(10), []PathCount{{"/c", 5}, {"/a", 3}, {"/b", 3}, {"/d", 1}}; !reflect.DeepEqual(got, want) {
+    			t.Fatalf("Top(10) = %v, want %v", got, want)
+    		}
+    	}
+    	if got := h.Top(0); len(got) != 0 {
+    		t.Fatalf("Top(0) = %v", got)
+    	}
+    	if got := h.Top(-3); len(got) != 0 {
+    		t.Fatalf("Top(-3) = %v", got)
+    	}
+    }
+
+    func TestIngest(t *testing.T) {
+    	h := NewHits()
+    	send := func(method, body string) int {
+    		w := httptest.NewRecorder()
+    		h.IngestHandler(w, httptest.NewRequest(method, "/hits", strings.NewReader(body)))
+    		return w.Code
+    	}
+    	for _, b := range []string{`{"path":"/x","count":3}`, `{"path":"/x","count":2}`} {
+    		if c := send("POST", b); c != 204 {
+    			t.Fatalf("POST %s: status %d, want 204", b, c)
+    		}
+    	}
+    	for _, b := range []string{`{nope`, ``, `{"path":"","count":1}`, `{"count":1}`, `{"path":"/y","count":0}`, `{"path":"/y","count":-4}`} {
+    		if c := send("POST", b); c != 400 {
+    			t.Fatalf("POST %q: status %d, want 400", b, c)
+    		}
+    	}
+    	if c := send("GET", ""); c != 405 {
+    		t.Fatalf("GET: status %d, want 405", c)
+    	}
+    	if got := h.Top(10); !reflect.DeepEqual(got, []PathCount{{"/x", 5}}) {
+    		t.Fatalf("after the posts Top(10) = %v, want [{/x 5}]", got)
+    	}
+    }
+
+    func TestTopHandler(t *testing.T) {
+    	h := NewHits()
+    	get := func(q string) *httptest.ResponseRecorder {
+    		w := httptest.NewRecorder()
+    		h.TopHandler(w, httptest.NewRequest("GET", "/top"+q, nil))
+    		return w
+    	}
+    	if w := get("?k=3"); w.Code != 200 || strings.TrimSpace(w.Body.String()) != "[]" {
+    		t.Fatalf("empty counter: status %d, body %q, want 200 and []", w.Code, w.Body.String())
+    	}
+    	for i := 0; i < 15; i++ {
+    		h.Add(fmt.Sprintf("/p%02d", i), i+1)
+    	}
+    	w := get("?k=2")
+    	if w.Code != 200 || !strings.Contains(w.Header().Get("Content-Type"), "application/json") {
+    		t.Fatalf("status %d, content type %q", w.Code, w.Header().Get("Content-Type"))
+    	}
+    	var raw []map[string]any
+    	if err := json.Unmarshal(w.Body.Bytes(), &raw); err != nil || len(raw) != 2 ||
+    		raw[0]["path"] != "/p14" || raw[0]["count"] != float64(15) || raw[1]["path"] != "/p13" {
+    		t.Fatalf("?k=2: body %q", w.Body.String())
+    	}
+    	var all []PathCount
+    	if w := get(""); json.Unmarshal(w.Body.Bytes(), &all) != nil || len(all) != 10 {
+    		t.Fatalf("without k: body %q, want 10 entries", w.Body.String())
+    	}
+    	for _, q := range []string{"?k=abc", "?k=0", "?k=-2"} {
+    		if w := get(q); w.Code != 400 {
+    			t.Fatalf("%s: status %d, want 400", q, w.Code)
+    		}
+    	}
+    }
+
+    func TestSnapshots(t *testing.T) {
+    	h := NewHits()
+    	h.Add("/a", 2)
+    	h.Add("/b", 1)
+    	ctx, cancel := context.WithCancel(context.Background())
+    	defer cancel()
+    	ch := h.Snapshots(ctx, 1, 20*time.Millisecond)
+    	select {
+    	case s := <-ch:
+    		if !reflect.DeepEqual(s, []PathCount{{"/a", 2}}) {
+    			t.Fatalf("first snapshot %v", s)
+    		}
+    	case <-time.After(time.Second):
+    		t.Fatal("no snapshot within a second")
+    	}
+    	h.Add("/b", 5)
+    	deadline := time.After(time.Second)
+    wait:
+    	for {
+    		select {
+    		case s := <-ch:
+    			if reflect.DeepEqual(s, []PathCount{{"/b", 6}}) {
+    				break wait
+    			}
+    		case <-deadline:
+    			t.Fatal("the snapshots never showed the new count")
+    		}
+    	}
+    	cancel()
+    	timeout := time.After(time.Second)
+    	for {
+    		select {
+    		case _, ok := <-ch:
+    			if !ok {
+    				return
+    			}
+    		case <-timeout:
+    			t.Fatal("the channel was not closed after the context was cancelled")
+    		}
+    	}
+    }
+
+    func TestSnapshotsNoLeak(t *testing.T) {
+    	time.Sleep(50 * time.Millisecond)
+    	before := runtime.NumGoroutine()
+    	h := NewHits()
+    	h.Add("/a", 1)
+    	for i := 0; i < 30; i++ {
+    		ctx, cancel := context.WithCancel(context.Background())
+    		h.Snapshots(ctx, 1, 5*time.Millisecond)
+    		time.Sleep(10 * time.Millisecond)
+    		cancel()
+    	}
+    	deadline := time.Now().Add(3 * time.Second)
+    	for runtime.NumGoroutine() > before+2 {
+    		if time.Now().After(deadline) {
+    			t.Fatalf("leaked: %d goroutines, started with %d", runtime.NumGoroutine(), before)
+    		}
+    		time.Sleep(20 * time.Millisecond)
+    	}
+    }
+    GO
+    gres=$(timeout 300 docker run --rm -v "$d/go:/src" -v kl-gocache:/root/.cache -w /src golang:1.24-alpine sh -c '
+      go mod init lab >/dev/null 2>&1
+      for x in TestConcurrentAdd TestTop TestIngest TestTopHandler TestSnapshots TestSnapshotsNoLeak; do
+        if go test -count=1 -timeout 30s -run "^$x\$" . >/tmp/out 2>&1; then echo "$x=pass"; else echo "$x=fail"; grep -vE "^(FAIL|exit status|ok)" /tmp/out | head -4 | sed "s/^/      /"; fi
+      done' 2>&1)
+    gt() { grep -qx "$1=pass" <<<"$gres"; }
+
+    info "Requirement 1 of 8: parse"
+    check "handles quoted values, = inside values and tokens without =" 'ut test_parse_quotes'
+    check "calls are independent and defaults is never modified" 'ut test_parse_independent'
+    check "an unclosed quote raises ValueError" 'ut test_parse_unclosed'
+    info "Requirement 2 of 8: load"
+    check "loads complete lines, skips the rest and stores a missing ua as -" 'ut test_load'
+    info "Requirement 3 of 8: values are data"
+    check "apostrophes and SQL text are stored and queried as plain values" 'ut test_values_are_data'
+    check "errors_for lists 5xx paths, most first, then by path" 'ut test_errors_for'
+    info "Requirement 4 of 8: resolve_all"
+    check "looks up each distinct client once, concurrently" 'ut test_resolve_concurrent'
+    check "a failing lookup gives None and the others still resolve" 'ut test_resolve_failures'
+    info "Requirement 5 of 8: a counter that is safe for concurrent use"
+    check "Add and Top from many goroutines lose nothing and don't crash" 'gt TestConcurrentAdd'
+    check "uses the sync package" 'grep -qE "\"sync(/atomic)?\"" /lab/hits.go'
+    info "Requirement 6 of 8: Top"
+    check "orders by count, then path, and handles any k" 'gt TestTop'
+    info "Requirement 7 of 8: the handlers"
+    check "IngestHandler: 204, 400 for bad input, 405 for other methods" 'gt TestIngest'
+    check "TopHandler: JSON array, [] when empty, k defaults to 10, 400 for a bad k" 'gt TestTopHandler'
+    info "Requirement 8 of 8: Snapshots"
+    check "sends fresh snapshots and closes the channel on cancel" 'gt TestSnapshots'
+    check "leaves no goroutine behind when nobody reads" 'gt TestSnapshotsNoLeak'
+    grep -v "=pass$" <<<"$gres" | sed 's/^\(Test[A-Za-z]*\)=fail$/    \1 failed:/' | head -30
+    rm -rf "$d"
+  solve: |
+    python3 - <<'PY'
+    p = "/lab/ingest.py"
+    s = open(p).read()
+    start, end = s.index("def parse("), s.index('\nif __name__ == "__main__":')
+    s = s[:start] + '''def parse(line, defaults=None):
+        """Turn 'k=v k2="quoted value"' into a dict of strings, on top of defaults."""
+        rec = dict(defaults or {})
+        for token in shlex.split(line):
+            key, sep, value = token.partition("=")
+            if sep:
+                rec[key] = value
+        return rec
+
+
+    def open_db(path):
+        conn = sqlite3.connect(path)
+        conn.execute("CREATE TABLE IF NOT EXISTS hits (ts TEXT, client TEXT, path TEXT, status INTEGER, ua TEXT)")
+        return conn
+
+
+    def load(conn, path):
+        """Insert every complete line of the log at `path`; return how many were inserted."""
+        n = 0
+        with open(path) as f:
+            for line in f:
+                try:
+                    rec = parse(line, {"ua": "-"})
+                    if not all(rec.get(k) for k in ("ts", "client", "path", "status")):
+                        continue
+                    row = (rec["ts"], rec["client"], rec["path"], int(rec["status"]), rec["ua"])
+                except ValueError:
+                    continue
+                conn.execute("INSERT INTO hits VALUES (?, ?, ?, ?, ?)", row)
+                n += 1
+        conn.commit()
+        return n
+
+
+    def errors_for(conn, client):
+        """(path, count) of the 5xx answers this client got, most first, then by path."""
+        return conn.execute(
+            "SELECT path, COUNT(*) FROM hits WHERE client = ? AND status >= 500 "
+            "GROUP BY path ORDER BY 2 DESC, 1", (client,)).fetchall()
+
+
+    async def resolve_all(clients, lookup):
+        """{client: await lookup(client)} for each distinct client."""
+        unique = list(dict.fromkeys(clients))
+        results = await asyncio.gather(*(lookup(c) for c in unique), return_exceptions=True)
+        return {c: None if isinstance(r, Exception) else r for c, r in zip(unique, results)}
+
+    ''' + s[end:]
+    s = s.replace("import asyncio\nimport sqlite3\n", "import asyncio\nimport shlex\nimport sqlite3\n")
+    open(p, "w").write(s)
+    PY
+    cat > /lab/hits.go <<'EOF'
+    package main
+
+    import (
+    	"context"
+    	"encoding/json"
+    	"net/http"
+    	"sort"
+    	"strconv"
+    	"sync"
+    	"time"
+    )
+
+    type PathCount struct {
+    	Path  string `json:"path"`
+    	Count int    `json:"count"`
+    }
+
+    // Hits counts requests per path. The proxies push to it from many goroutines.
+    type Hits struct {
+    	mu     sync.Mutex
+    	counts map[string]int
+    }
+
+    func NewHits() *Hits { return &Hits{counts: make(map[string]int)} }
+
+    func (h *Hits) Add(path string, n int) {
+    	h.mu.Lock()
+    	defer h.mu.Unlock()
+    	h.counts[path] += n
+    }
+
+    // Top returns the k busiest paths, most hits first, ties by path.
+    func (h *Hits) Top(k int) []PathCount {
+    	h.mu.Lock()
+    	all := make([]PathCount, 0, len(h.counts))
+    	for p, c := range h.counts {
+    		all = append(all, PathCount{p, c})
+    	}
+    	h.mu.Unlock()
+    	sort.Slice(all, func(i, j int) bool {
+    		if all[i].Count != all[j].Count {
+    			return all[i].Count > all[j].Count
+    		}
+    		return all[i].Path < all[j].Path
+    	})
+    	k = max(0, min(k, len(all)))
+    	return all[:k]
+    }
+
+    // IngestHandler handles POST /hits with {"path": "/x", "count": 3}.
+    func (h *Hits) IngestHandler(w http.ResponseWriter, r *http.Request) {
+    	if r.Method != http.MethodPost {
+    		http.Error(w, "use POST", http.StatusMethodNotAllowed)
+    		return
+    	}
+    	var in PathCount
+    	if err := json.NewDecoder(r.Body).Decode(&in); err != nil || in.Path == "" || in.Count < 1 {
+    		http.Error(w, `want {"path": "/x", "count": N} with N >= 1`, http.StatusBadRequest)
+    		return
+    	}
+    	h.Add(in.Path, in.Count)
+    	w.WriteHeader(http.StatusNoContent)
+    }
+
+    // TopHandler handles GET /top?k=N.
+    func (h *Hits) TopHandler(w http.ResponseWriter, r *http.Request) {
+    	k := 10
+    	if s := r.URL.Query().Get("k"); s != "" {
+    		n, err := strconv.Atoi(s)
+    		if err != nil || n < 1 {
+    			http.Error(w, "k must be a positive integer", http.StatusBadRequest)
+    			return
+    		}
+    		k = n
+    	}
+    	w.Header().Set("Content-Type", "application/json")
+    	json.NewEncoder(w).Encode(h.Top(k))
+    }
+
+    // Snapshots sends Top(k) every interval until ctx is cancelled, then closes the channel.
+    func (h *Hits) Snapshots(ctx context.Context, k int, every time.Duration) <-chan []PathCount {
+    	ch := make(chan []PathCount)
+    	go func() {
+    		defer close(ch)
+    		t := time.NewTicker(every)
+    		defer t.Stop()
+    		for {
+    			select {
+    			case <-ctx.Done():
+    				return
+    			case <-t.C:
+    				select {
+    				case ch <- h.Top(k):
+    				case <-ctx.Done():
+    					return
+    				}
+    			}
+    		}
+    	}()
+    	return ch
+    }
+
+    func main() {
+    	h := NewHits()
+    	http.HandleFunc("/hits", h.IngestHandler)
+    	http.HandleFunc("/top", h.TopHandler)
+    	http.ListenAndServe(":8080", nil)
+    }
+    EOF

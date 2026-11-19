@@ -1620,3 +1620,391 @@ exercises:
     docker restart kl-waf >/dev/null
     code() { curl -s -o /dev/null -w '%{http_code}' -m 5 -H 'Host: forum.corp.test' "$@"; }
     for _ in $(seq 1 60); do [ "$(code http://127.0.0.1:8088/)" = 200 ] && break; sleep 2; done
+
+# ===== Capstone: a real-world lab =====
+
+- id: sec-092
+  title: "Capstone: from the capture to a closed door"
+  difficulty: 5
+  kind: fix
+  tags: [capstone, pcap, tshark, incident-response, c2, beaconing, nftables, containment, credential-rotation]
+  tutorial: |
+    **Concept.** A packet capture tells you what happened. The response is only finished when the same thing **can't happen again**, and you prove that the way the attacker would find out: by trying it from their side. This lab runs the whole loop on one network: read the capture, then contain and harden the live hosts it shows.
+
+    **Reading the capture.** Start wide and narrow down. A scan stands out by *breadth*: one source trying many ports. What the scan found open is the attack surface. Plain HTTP keeps every request and response, so you can read which URL was abused, decode its parameters, and carve out exactly what the server sent back. Then look for traffic that shouldn't exist at all. **Servers answer connections, they don't start them**, so a server opening connections to the outside on a steady timer is the first thing to explain.
+
+    **Contain.** An implant run by a service manager comes back if you only kill its process; you have to stop what restarts it. Keep a copy before you remove anything. **Egress filtering** is the backstop: a server whose firewall only lets out replies to connections it accepted can't reach a C2 server, whatever runs on it next.
+
+    **Harden.** Find the hole in the evidence, not by guessing. An admin interface listening on every address is reachable by everyone who can reach the host. If only the management workstation needs it, only the management workstation should get through. The attacker's address can be dropped outright.
+
+    **Rotate.** Anything the attacker read is theirs now. A leaked API key is replaced, and the old one must stop working, while the clients that hold the new one carry on.
+
+    **Read up on:**
+    - `tshark -Y` display filters with `tcp.flags.syn`, `tcp.flags.ack`, `ip.src`, `tcp.dstport`; `-T fields -e`
+    - `http.response_for.uri`, `http.file_data contains "..."`, `--export-objects http,DIR`, `-z follow,tcp,ascii,N`
+    - URL decoding: `python3 -c 'import urllib.parse as u; print(u.unquote("%2Fetc"))'`
+    - `frame.time_epoch` and differencing consecutive times per destination in `awk`
+    - `ip netns list`, `ip netns pids NS`, `ip netns exec NS CMD`; `ps -o pid,args -p PID`
+    - `systemctl status PID` to find the unit behind a process; `Restart=` in `man systemd.service`
+    - `man nft`: `policy drop`, `ct state established,related`, `ip saddr`, `tcp dport`, `iif lo`, input versus output hooks
+  scenario: |
+    **NET-5120**, raised by Marco Feld (SRE lead):
+
+    > The reporting API on **web** was breached yesterday, and I suspect it's still talking to
+    > someone. The network team captured traffic at the switch while it was happening:
+    > **`/lab/incident.pcap`**. Tell me what they did, then lock it down. The API must stay up for
+    > our clients the whole time.
+
+    The network is a set of network namespaces on this VM, all on one switch. Run a command on a
+    host with **`sudo ip netns exec HOST COMMAND`**:
+
+    | host | address | role |
+    |---|---|---|
+    | `web` | 10.80.0.10 | the reporting API on TCP **8080**, and an admin console on TCP **9000** |
+    | `mgmt` | 10.80.0.5 | the operations workstation, the only legitimate user of the admin console |
+    | `n1`, `n2` | 10.80.0.21, 10.80.0.22 | API clients |
+
+    API clients authenticate with the header `X-Api-Key`; the key is the `API_TOKEN` line in
+    **`/etc/kl-rpt/api.env`**, which the API reads on every request. Don't change the program
+    serving it. Everything the capture shows is still running.
+
+    Write your findings to **`/lab/report.txt`** as `key=value` lines.
+
+    ## 1. Recon and the way in
+
+    - `attacker_ip`: the outside host that scanned `web`
+    - `open_ports`: the TCP ports its scan found open, ascending and comma-separated
+    - `stolen_file`: the full path of the file on `web` that the attacker read through the admin
+      console (decoded, for example `/etc/foo.conf`)
+
+    Save that file exactly as the server sent it to the attacker to **`/lab/loot.env`**.
+
+    ## 2. The implant
+
+    Since the break-in, `web` has been calling out on a timer. Record:
+
+    - `c2` and `c2_port`: where it connects
+    - `interval`: its average interval in seconds, rounded to a whole number (accepted within 1)
+    - `beacons`: how many check-ins are in the capture (accepted within 1)
+    - `task`: the value of the `arg` field in the one response that wasn't a plain wait
+
+    ## 3. Contain
+
+    - Find the implant's program on `web`, keep a copy in **`/lab/quarantine/`** (any name), then
+      stop it **so it stays stopped** and delete the program.
+    - Give `web` an **egress policy**: it must not be able to open any new connection, to the C2 server
+      or anywhere else, while its answers to clients still get out. The output chain's default
+      policy must be `drop`.
+
+    ## 4. Harden
+
+    With nftables **inside `web`**:
+
+    - nothing from the attacker's address gets in, on any port
+    - the admin console (9000) answers **only `mgmt`**
+    - the API (8080) answers everyone else
+
+    ## 5. Rotate the stolen key
+
+    Put a new `API_TOKEN` in `/etc/kl-rpt/api.env`. The old key must be refused (`401`), and a client
+    sending the new key must get the report from `n1`.
+  hints:
+    - "Recon: list `tcp.flags.syn==1 && tcp.flags.ack==0` packets to 10.80.0.10 with `ip.src` and `tcp.dstport`, keep unique pairs, and count ports per source. The open ports are the source ports of the SYN-ACKs `web` sent back to that host."
+    - "The way in: response frames have `http.response_for.uri`, the URL they answer. Filter the attacker's `200` responses from port 9000, decode the query string, and carve the body with `--export-objects http,DIR -Y \"ip.addr==ATTACKER\"`."
+    - "Implant: which packets have `ip.src==10.80.0.10` and the SYN flag without ACK? Take `frame.time_epoch` per destination and average the gaps. For the task, find the response containing `collect` and read its stream with `-z follow,tcp,ascii,N`."
+    - "Contain: `sudo ip netns pids web | xargs ps -o pid,args -p` shows what runs there. If a process comes back after `kill`, `systemctl status PID` names the unit that restarts it: stop the unit."
+    - "Harden: one `inet` table in `web` with an input chain (`policy drop`; `iif lo`, the attacker dropped, `ct state established,related`, 8080 from anywhere, 9000 from 10.80.0.5) and an output chain (`policy drop`; `oif lo` and `ct state established,related`). Load it with `sudo ip netns exec web nft -f FILE`."
+    - "Test like the attacker: `sudo ip netns exec n1 curl -m 3 http://10.80.0.10:9000/status` must fail, from `mgmt` it must work. Rotate with `sudo sed -i` on `api.env` and try both keys from `n1`."
+  solution: |
+    **1. Recon and the way in.**
+
+    ```bash
+    cd /lab; C=incident.pcap; WEB=10.80.0.10
+    tshark -r $C -Y "tcp.flags.syn==1 && tcp.flags.ack==0 && ip.dst==$WEB" -T fields -e ip.src -e tcp.dstport 2>/dev/null |
+      sort -u | awk '{print $1}' | uniq -c | sort -rn        # the scanner tries many ports
+    ATT=...
+    tshark -r $C -Y "tcp.flags.syn==1 && tcp.flags.ack==1 && ip.src==$WEB && ip.dst==$ATT" -T fields -e tcp.srcport 2>/dev/null | sort -un | paste -sd,
+    tshark -r $C -Y "ip.dst==$ATT && tcp.srcport==9000 && http.response.code==200" -T fields -e http.response_for.uri 2>/dev/null
+    # .../debug/view?file=%2Fetc%2Fkl-rpt%2Fapi.env  ->  /etc/kl-rpt/api.env
+    mkdir -p /tmp/objs && tshark -r $C --export-objects http,/tmp/objs -Y "ip.addr==$ATT" >/dev/null 2>&1
+    cp "$(grep -l '^API_TOKEN=' /tmp/objs/* | head -1)" /lab/loot.env
+    ```
+
+    **2. The implant.** The only connections `web` starts itself:
+
+    ```bash
+    tshark -r $C -Y "tcp.flags.syn==1 && tcp.flags.ack==0 && ip.src==$WEB" -T fields \
+      -e frame.time_epoch -e ip.dst -e tcp.dstport 2>/dev/null |
+      awk '{k=$2" "$3; if (k in l) {s[k]+=$1-l[k]; n[k]++} l[k]=$1} END {for (k in n) print k, n[k]+1, s[k]/n[k]}'
+    S=$(tshark -r $C -Y "ip.src==$C2 && http.file_data contains \"collect\"" -T fields -e tcp.stream 2>/dev/null | head -1)
+    tshark -r $C -q -z follow,tcp,ascii,$S 2>/dev/null | grep arg
+    ```
+
+    Write the values to `/lab/report.txt`.
+
+    **3. Contain.**
+
+    ```bash
+    sudo ip netns pids web | xargs ps -o pid,args -p      # python3 /var/tmp/.sysupd/agent.py ...
+    systemctl status <PID>                                # kl-sysupd.service, Restart=always
+    mkdir -p /lab/quarantine && cp /var/tmp/.sysupd/agent.py /lab/quarantine/
+    sudo systemctl stop kl-sysupd
+    sudo rm -rf /var/tmp/.sysupd
+    ```
+
+    **3–4. The firewall on web.**
+
+    ```bash
+    sudo ip netns exec web nft -f - <<EOF
+    table inet ir {
+      chain input {
+        type filter hook input priority filter; policy drop;
+        iif lo accept
+        ip saddr $ATT drop
+        ct state established,related accept
+        tcp dport 8080 accept
+        ip saddr 10.80.0.5 tcp dport 9000 accept
+      }
+      chain output {
+        type filter hook output priority filter; policy drop;
+        oif lo accept
+        ct state established,related accept
+      }
+    }
+    EOF
+    ```
+
+    **5. Rotate the stolen key.**
+
+    ```bash
+    NEW=$(openssl rand -hex 16)
+    sudo sed -i "s/^API_TOKEN=.*/API_TOKEN=$NEW/" /etc/kl-rpt/api.env
+    sudo ip netns exec n1 curl -s -H "X-Api-Key: $NEW" http://10.80.0.10:8080/api/report
+    ```
+  setup: |
+    on_reset 'systemctl stop kl-rpt kl-c2 kl-sysupd 2>/dev/null; systemctl reset-failed kl-rpt kl-c2 kl-sysupd 2>/dev/null; rm -rf /etc/kl-rpt /var/tmp/.sysupd /var/lib/kubelab/s92; true'
+    tshark_ready || { echo "tshark install failed" >&2; exit 1; }
+    hex() { head -c "$1" /dev/urandom | od -An -tx1 | tr -d ' \n'; }
+    S=/var/lib/kubelab/s92
+    mkdir -p /srv/kl/s92 /etc/kl-rpt /var/tmp/.sysupd "$S"
+    WEB=10.80.0.10; MGMT=10.80.0.5
+    ATT=198.51.100.$((RANDOM % 200 + 20)); C2=203.0.113.$((RANDOM % 200 + 20)); CP=$((8000 + RANDOM % 900))
+    IV=$((RANDOM % 3 + 3)); COUNT=10
+    TASK=$(hex 5); TN=$((RANDOM % 4 + 3))
+    TOK=$(hex 16); MARK=RPT-$(hex 4)
+    printf 'API_TOKEN=%s\nREPORT_DB=postgres://rpt:%s@db.internal:5432/reports\n' "$TOK" "$(hex 6)" > /etc/kl-rpt/api.env
+    chmod 600 /etc/kl-rpt/api.env
+    sha256sum /etc/kl-rpt/api.env | cut -d' ' -f1 > "$S/loot.sha"
+    printf '{"report": "%s", "rows": [["north", 1200], ["south", 950]]}\n' "$MARK" > /srv/kl/s92/report.json
+
+    # --- the reporting API and its admin console ---
+    cat > /srv/kl/s92/rpt.py <<'PY'
+    import threading, urllib.parse as u
+    from http.server import BaseHTTPRequestHandler as B, ThreadingHTTPServer as S
+    REPORT = open('/srv/kl/s92/report.json', 'rb').read()
+    def token():
+        for l in open('/etc/kl-rpt/api.env'):
+            if l.startswith('API_TOKEN='):
+                return l.split('=', 1)[1].strip()
+    class Base(B):
+        protocol_version = 'HTTP/1.1'
+        def log_message(self, *a): pass
+        def out(self, code, body, ctype='application/json'):
+            self.send_response(code); self.send_header('Content-Type', ctype)
+            self.send_header('Content-Length', str(len(body))); self.end_headers(); self.wfile.write(body)
+    class Api(Base):
+        def do_GET(self):
+            if self.path == '/health':
+                return self.out(200, b'ok\n', 'text/plain')
+            if self.path.startswith('/api/report'):
+                if not self.headers.get('X-Api-Key') or self.headers.get('X-Api-Key') != token():
+                    return self.out(401, b'{"error": "bad key"}\n')
+                return self.out(200, REPORT)
+            self.out(404, b'not found\n', 'text/plain')
+    class Admin(Base):
+        def do_GET(self):
+            p = u.urlparse(self.path); q = u.parse_qs(p.query)
+            if p.path == '/':
+                return self.out(200, b'<html><h1>rpt admin console</h1><a href="/status">status</a></html>\n', 'text/html')
+            if p.path == '/status':
+                return self.out(200, b'{"status": "ok", "workers": 4}\n')
+            if p.path == '/debug/view':
+                try:
+                    return self.out(200, open((q.get('file') or [''])[0], 'rb').read(), 'application/octet-stream')
+                except OSError:
+                    return self.out(404, b'no such file\n', 'text/plain')
+            self.out(404, b'not found\n', 'text/plain')
+    threading.Thread(target=S(('0.0.0.0', 9000), Admin).serve_forever, daemon=True).start()
+    S(('0.0.0.0', 8080), Api).serve_forever()
+    PY
+    # --- the C2 server, and the implant that will call it ---
+    cat > /srv/kl/s92/c2.py <<'PY'
+    import json, os, sys
+    from http.server import BaseHTTPRequestHandler as B, ThreadingHTTPServer as S
+    state = {'n': 0}
+    task, tn = os.environ['TASK'], int(os.environ['TN'])
+    class H(B):
+        protocol_version = 'HTTP/1.0'
+        def log_message(self, *a): pass
+        def do_GET(self):
+            body = b'{"status": "up"}'
+            if self.path.startswith('/api/v1/sync'):
+                state['n'] += 1
+                body = json.dumps({'task': 'collect', 'arg': task} if state['n'] == tn else {'task': 'wait'}).encode()
+            self.send_response(200); self.send_header('Content-Type', 'application/json')
+            self.send_header('Content-Length', str(len(body))); self.end_headers(); self.wfile.write(body)
+    S(('0.0.0.0', int(sys.argv[1])), H).serve_forever()
+    PY
+    cat > /var/tmp/.sysupd/agent.py <<'PY'
+    import random, sys, time, urllib.request
+    c2, port, iv = sys.argv[1], sys.argv[2], float(sys.argv[3])
+    url = 'http://%s:%s/api/v1/sync' % (c2, port)
+    while True:
+        try:
+            urllib.request.urlopen(urllib.request.Request(url, headers={'User-Agent': 'Mozilla/5.0'}), timeout=3).read()
+        except Exception:
+            pass
+        time.sleep(iv * random.uniform(0.9, 1.1))
+    PY
+    chmod 644 /var/tmp/.sysupd/agent.py
+    sha256sum /var/tmp/.sysupd/agent.py | cut -d' ' -f1 > "$S/agent.sha"
+
+    lan_up web=$WEB/24 mgmt=$MGMT/24 n1=10.80.0.21/24 n2=10.80.0.22/24 att=$ATT/24 c2=$C2/24
+    systemd-run --quiet --unit=kl-rpt ip netns exec web python3 /srv/kl/s92/rpt.py
+    systemd-run --quiet --unit=kl-c2 -E TASK="$TASK" -E TN="$TN" ip netns exec c2 python3 /srv/kl/s92/c2.py "$CP"
+    eventually 15 "ip netns exec n1 curl -fsS -m 2 -o /dev/null http://$WEB:8080/health" || { echo "the API did not start" >&2; exit 1; }
+    eventually 15 "ip netns exec n1 curl -fsS -m 2 -o /dev/null http://$WEB:9000/status" || { echo "the console did not start" >&2; exit 1; }
+    eventually 15 "ip netns exec n1 curl -fsS -m 2 -o /dev/null http://$C2:$CP/" || { echo "the C2 server did not start" >&2; exit 1; }
+
+    # --- the capture: normal use, the attack, then the beacon ---
+    cap_start /lab/incident.pcap
+    TOTAL=$((IV * COUNT + 14))
+    ip netns exec n1 bash -c "end=\$((SECONDS+$TOTAL)); while [ \$SECONDS -lt \$end ]; do curl -s -o /dev/null -m 2 -H 'X-Api-Key: $TOK' http://$WEB:8080/api/report; sleep 2.5; done" >/dev/null 2>&1 </dev/null &
+    J1=$!
+    ip netns exec n2 bash -c "end=\$((SECONDS+$TOTAL)); while [ \$SECONDS -lt \$end ]; do curl -s -o /dev/null -m 2 -H 'X-Api-Key: $TOK' http://$WEB:8080/api/report; curl -s -o /dev/null -m 2 http://$WEB:8080/health; sleep 3.3; done" >/dev/null 2>&1 </dev/null &
+    J2=$!
+    ip netns exec mgmt bash -c "end=\$((SECONDS+$TOTAL)); while [ \$SECONDS -lt \$end ]; do curl -s -o /dev/null -m 2 http://$WEB:9000/status; sleep 5; done" >/dev/null 2>&1 </dev/null &
+    J3=$!
+    sleep 2
+    ip netns exec att nmap -sS -Pn -n --max-retries 1 -p 21,22,80,443,3306,5432,8080,8443,9000,9090 $WEB >/dev/null 2>&1
+    sleep 1
+    ip netns exec att curl -s -o /dev/null -m 3 -A 'Mozilla/5.0' http://$WEB:9000/
+    ip netns exec att curl -s -o /dev/null -m 3 -A 'Mozilla/5.0' http://$WEB:9000/status
+    ip netns exec att curl -s -o /dev/null -m 3 -A 'Mozilla/5.0' "http://$WEB:9000/debug/view?file=%2Fetc%2Fkl-rpt%2Fconfig.yaml"
+    ip netns exec att curl -s -o /dev/null -m 3 -A 'Mozilla/5.0' "http://$WEB:9000/debug/view?file=%2Fetc%2Fkl-rpt%2Fapi.env"
+    sleep 1
+    ip netns exec att curl -s -o /dev/null -m 3 -A 'Mozilla/5.0' -H "X-Api-Key: $TOK" http://$WEB:8080/api/report
+    sleep 2
+    systemd-run --quiet --unit=kl-sysupd -p Restart=always -p RestartSec=1 ip netns exec web python3 /var/tmp/.sysupd/agent.py "$C2" "$CP" "$IV"
+    wait $J1 $J2 $J3
+    cap_stop
+    N=$(tshark -r /lab/incident.pcap -Y "tcp.flags.syn==1 && tcp.flags.ack==0 && ip.dst==$C2 && ip.src==$WEB" 2>/dev/null | wc -l)
+    [ "$N" -ge 5 ] || { echo "too few beacons captured ($N)" >&2; exit 1; }
+    systemctl is-active -q kl-sysupd || { echo "the implant is not running" >&2; exit 1; }
+    cat > "$S/exp" <<E
+    ATT=$ATT
+    C2=$C2
+    CP=$CP
+    IV=$IV
+    N=$N
+    TASK=$TASK
+    TOK=$TOK
+    MARK=$MARK
+    E
+    chmod 600 "$S/exp"
+  check: |
+    S=$KL_STATE/s92
+    . "$S/exp"
+    WEB=10.80.0.10
+    f() { sed -n "s/^$1=//p" /lab/report.txt 2>/dev/null | head -1 | tr -d ' \r'; }
+    near() { [ -n "$1" ] && [ "$1" -eq "$1" ] 2>/dev/null && d=$(( $1 - $2 )) && [ ${d#-} -le "$3" ]; }
+    from() { local ns=$1; shift; ip netns exec "$ns" curl -fsS -m 3 "$@" 2>/dev/null; }
+    code() { local ns=$1; shift; ip netns exec "$ns" curl -s -o /dev/null -w '%{http_code}' -m 3 "$@" 2>/dev/null; }
+    agent() { pgrep -f '/var/tmp/.sysupd/agent.py' >/dev/null || { sleep 2; pgrep -f '/var/tmp/.sysupd/agent.py' >/dev/null; }; }
+    info "1. Recon and the way in"
+    check_eq "attacker_ip" "$(f attacker_ip)" "$ATT"
+    check_eq "open_ports" "$(f open_ports)" "8080,9000"
+    check_eq "stolen_file" "$(f stolen_file)" "/etc/kl-rpt/api.env"
+    check_eq "/lab/loot.env is what the server sent" "$(sha256sum /lab/loot.env 2>/dev/null | cut -d' ' -f1)" "$(cat "$S/loot.sha")"
+    info "2. The implant"
+    check_eq "c2" "$(f c2)" "$C2"
+    check_eq "c2_port" "$(f c2_port)" "$CP"
+    check "interval (within 1)" 'near "$(f interval)" "$IV" 1'
+    check "beacons (within 1)" 'near "$(f beacons)" "$N" 1'
+    check_eq "task" "$(f task)" "$TASK"
+    info "3. Contain"
+    check "/lab/quarantine holds an exact copy of the implant" 'find /lab/quarantine -type f -exec sha256sum {} + 2>/dev/null | grep -q "^$(cat "$S/agent.sha") "'
+    check_not "the implant is stopped and stays stopped" 'agent'
+    check_not "its program is deleted" '[ -e /var/tmp/.sysupd/agent.py ]'
+    check "web's output chain drops by default" 'ip netns exec web nft list ruleset 2>/dev/null | grep -qE "hook output .*policy drop"'
+    if from n1 -o /dev/null "http://$C2:$CP/"; then
+      check_not "web can't reach the C2 server" 'ip netns exec web curl -sS -m 3 -o /dev/null "http://$C2:$CP/"'
+    else
+      fail "the C2 server must still be up to prove web can't reach it (reset the exercise)"
+    fi
+    info "4. Harden"
+    check_not "the attacker can't reach the API" 'from att -o /dev/null "http://$WEB:8080/health"'
+    check_not "the attacker can't reach the admin console" 'from att -o /dev/null "http://$WEB:9000/status"'
+    check_not "other hosts can't reach the admin console" 'from n1 -o /dev/null "http://$WEB:9000/status" || from n2 -o /dev/null "http://$WEB:9000/status"'
+    check "mgmt still reaches the admin console" 'from mgmt "http://$WEB:9000/status" | grep -q status'
+    check "n2 still reaches the API" 'from n2 "http://$WEB:8080/health" | grep -q ok'
+    info "5. Rotate the stolen key"
+    NEW=$(sed -n 's/^API_TOKEN=//p' /etc/kl-rpt/api.env 2>/dev/null | head -1 | tr -d ' \r')
+    check "api.env holds a new API_TOKEN" '[ -n "$NEW" ] && [ "$NEW" != "$TOK" ]'
+    check_eq "the stolen key is refused" "$(code n1 -H "X-Api-Key: $TOK" "http://$WEB:8080/api/report")" 401
+    check "n1 gets the report with the new key" '[ -n "$NEW" ] && [ "$NEW" != "$TOK" ] && from n1 -H "X-Api-Key: $NEW" "http://$WEB:8080/api/report" | grep -qF "$MARK"'
+    kl_finish
+  solve: |
+    cd /lab
+    C=incident.pcap; WEB=10.80.0.10
+    # --- 1. recon and the way in ---
+    ATT=$(tshark -r $C -Y "tcp.flags.syn==1 && tcp.flags.ack==0 && ip.dst==$WEB" -T fields -e ip.src -e tcp.dstport 2>/dev/null |
+      sort -u | awk '{print $1}' | uniq -c | sort -rn | head -1 | awk '{print $2}')
+    PORTS=$(tshark -r $C -Y "tcp.flags.syn==1 && tcp.flags.ack==1 && ip.src==$WEB && ip.dst==$ATT" -T fields -e tcp.srcport 2>/dev/null | sort -un | paste -sd,)
+    URI=$(tshark -r $C -Y "ip.dst==$ATT && tcp.srcport==9000 && http.response.code==200 && http.file_data contains \"API_TOKEN\"" -T fields -e http.response_for.uri 2>/dev/null | head -1)
+    STOLEN=$(python3 -c 'import sys, urllib.parse as u; print(u.parse_qs(u.urlparse(sys.argv[1]).query)["file"][0])' "$URI")
+    rm -rf /tmp/objs; mkdir -p /tmp/objs
+    tshark -r $C --export-objects http,/tmp/objs -Y "ip.addr==$ATT" >/dev/null 2>&1
+    cp "$(grep -l '^API_TOKEN=' /tmp/objs/* | head -1)" /lab/loot.env
+
+    # --- 2. the implant ---
+    tshark -r $C -Y "tcp.flags.syn==1 && tcp.flags.ack==0 && ip.src==$WEB" -T fields \
+      -e frame.time_epoch -e ip.dst -e tcp.dstport 2>/dev/null > /tmp/out.txt
+    read -r C2 CP N M < <(awk '{k=$2" "$3; if (k in l) {s[k]+=$1-l[k]; n[k]++} l[k]=$1} END {for (k in n) print k, n[k]+1, s[k]/n[k]}' /tmp/out.txt | sort -k3 -rn | head -1)
+    IV=$(printf '%.0f' "$M")
+    SN=$(tshark -r $C -Y "ip.src==$C2 && http.file_data contains \"collect\"" -T fields -e tcp.stream 2>/dev/null | head -1)
+    TASK=$(tshark -r $C -q -z follow,tcp,ascii,$SN 2>/dev/null | grep -oE '"arg": *"[^"]*"' | sed 's/.*"arg": *"//;s/"$//')
+    printf 'attacker_ip=%s\nopen_ports=%s\nstolen_file=%s\nc2=%s\nc2_port=%s\ninterval=%s\nbeacons=%s\ntask=%s\n' \
+      "$ATT" "$PORTS" "$STOLEN" "$C2" "$CP" "$IV" "$N" "$TASK" > /lab/report.txt
+
+    # --- 3. contain ---
+    PID=$(sudo ip netns pids web | xargs -r ps -o pid=,args= -p | awk '/agent\.py/ {print $1; exit}')
+    PROG=$(ps -o args= -p "$PID" | awk '{print $2}')
+    UNIT=$(systemctl status "$PID" --no-pager 2>/dev/null | grep -oE '[a-z0-9-]+\.service' | head -1)
+    mkdir -p /lab/quarantine
+    cp "$PROG" /lab/quarantine/agent.py
+    sudo systemctl stop "$UNIT"
+    sudo rm -rf "$(dirname "$PROG")"
+
+    # --- 3-4. the firewall on web ---
+    sudo ip netns exec web nft -f - <<EOF
+    table inet ir {
+      chain input {
+        type filter hook input priority filter; policy drop;
+        iif lo accept
+        ip saddr $ATT drop
+        ct state established,related accept
+        tcp dport 8080 accept
+        ip saddr 10.80.0.5 tcp dport 9000 accept
+      }
+      chain output {
+        type filter hook output priority filter; policy drop;
+        oif lo accept
+        ct state established,related accept
+      }
+    }
+    EOF
+
+    # --- 5. rotate the stolen key ---
+    NEW=$(openssl rand -hex 16)
+    sudo sed -i "s/^API_TOKEN=.*/API_TOKEN=$NEW/" /etc/kl-rpt/api.env

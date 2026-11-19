@@ -472,3 +472,696 @@ exercises:
     ENTRYPOINT ["/app"]
     EOF
     docker build -t kl-go-app:1.0 /lab
+
+# ===== Capstone: a real-world lab =====
+
+- id: prog-081
+  title: "Capstone: the nightly settlement run"
+  difficulty: 5
+  kind: fix
+  tags: [capstone, python, go, decimal, csv, http, resilience, concurrency, deadlock, docker, multi-stage]
+  tutorial: |
+    **Concept.** A money pipeline has to be right to the cent, keep going when
+    the input or the network misbehaves, and fail loudly when it can't. Every
+    stage of this one is a skill from the module:
+
+    - **Money is not a float.** `0.29 * 100` is `28.999999999999996` in binary
+      floating point, and a value that is exactly `451.625` is stored as a
+      little less. `decimal.Decimal` built from the *string* keeps it exact,
+      and `quantize` rounds it with the rule you name. Its default rule is
+      *banker's rounding* (half to even), which is not what finance means by
+      "round half up". In Go, either parse the digits yourself or round
+      (`math.Round`) instead of truncating with `int64(f * 100)`.
+    - **Bad rows are data, not crashes.** A CSV export from a real system has
+      blank lines, short rows, typos in numbers and codes nobody expected.
+      Decide per row: use it, or skip it and count it, so somebody can follow
+      up.
+    - **The network fails in several ways.** A service can refuse (5xx), hang,
+      or be gone. A client needs a timeout on every attempt, a bounded number
+      of retries with a pause between them, and a clear exit status when it
+      gives up. A half-written report is worse than none.
+    - **Unbuffered channels block.** A worker that sends a result waits until
+      someone receives it. If the only receiver is waiting for the workers to
+      finish first, nobody ever moves. Inside an HTTP server the runtime can't
+      detect it (the server's own goroutines are still alive), so the request
+      simply hangs.
+    - **Ship only the binary.** A multi-stage build compiles in a Go image and
+      copies a static binary into `scratch`: no shell, no packages, a few MB,
+      and a numeric non-root user.
+
+    **Read up on:**
+    - Python docs: `decimal` — `Decimal(str)`, `quantize`, `ROUND_HALF_UP`, `InvalidOperation`
+    - `csv.reader` — what it yields for an empty line and for a short row
+    - `urllib.request.urlopen(timeout=...)`, `HTTPError`, `URLError`, `TimeoutError`
+    - `sys.exit`, `print(..., file=sys.stderr)` — exit statuses and diagnostics
+    - `go doc sync.WaitGroup`, unbuffered channels, and who closes `results`
+    - `go doc strconv`, `go doc math.Round`
+    - Docker docs: multi-stage builds, `CGO_ENABLED=0`, `USER` in a `scratch` image
+  scenario: |
+    **PAY-233**, from Marta on the payments team: *"Last night's settlement
+    paid globex-travel one cent short, dropped a whole payment for hooli, and
+    the job crashed twice when the rate service had a bad moment. The bank's
+    portal can't read the totals either: `/total` on the payout API just
+    spins. Settlement runs again tonight at 02:00."*
+
+    The pipeline has two parts:
+
+    ```bash
+    python3 /lab/settle.py /lab/payments.csv > report.json   # the batch job
+    ```
+
+    and **`/lab/api/main.go`**, the payout API the bank's portal calls. It
+    serves the report mounted at `/data/report.json` (or the path in the
+    environment variable `REPORT`).
+
+    The **rate service** at `http://127.0.0.1:9191/rates` answers
+    `{"base": "EUR", "rates": {"EUR": "1", "USD": "0.9150", ...}}`, rates as
+    strings. Tonight it's flaky: it often answers **503** and sometimes
+    **hangs** without answering.
+
+    **Fix `/lab/settle.py`** (keep the command line as it is):
+
+    1. **Right to the cent.** Each payment's `amount` is converted to EUR with
+       the rate of its `currency`. A merchant's total is the **exact** sum of
+       its converted payments, rounded **once**, to cents, **half up**
+       (`x.xx5` goes up). The report's `total` is the sum of the rounded
+       merchant totals. Refunds are negative amounts. The script prints one
+       JSON object, amounts as strings with two decimals:
+
+       ```json
+       {"base": "EUR", "merchants": {"acme-books": "152.77", ...}, "total": "777.09", "skipped": 3}
+       ```
+
+    2. **Bad rows are skipped and counted.** The first line is the header
+       `id,merchant,currency,amount`. Empty lines are ignored. Any other row
+       that doesn't have exactly 4 fields, whose amount isn't a number, or
+       whose currency the rate service doesn't list is left out of the totals
+       and counted in `skipped`. Every good row counts, the last one too.
+    3. **It survives the rate service.** Each attempt has a **timeout of at
+       most 3 seconds**; 5xx answers, timeouts and connection errors are
+       retried after a short pause.
+    4. **It gives up cleanly.** At most **5 attempts** in all. If none
+       succeeds, it exits **non-zero**, explains why on stderr and prints
+       **nothing** on stdout.
+
+    **Fix and ship the payout API** in `/lab/api`:
+
+    5. **`/total` answers.** `GET /total` answers
+       `{"merchants": N, "total": "X.YY"}` for the report, **exactly** to the
+       cent, for reports of any size, and status **500** if the report is
+       missing or holds an amount that isn't a number. Keep the worker pool
+       (goroutines and channels) and the handler names `healthHandler` and
+       `totalHandler`: hidden tests call them.
+    6. **A production image.** Write **`/lab/api/Dockerfile`** and build
+       **`kl-settle-api:1.0`**: compiled in a `golang:1.24-alpine` stage,
+       shipped `FROM scratch` with only the binary, **smaller than 15MB**,
+       running as a **non-root** user, listening on port 8080.
+    7. **End to end.** With the report that `settle.py` prints for
+       `/lab/payments.csv` mounted read-only at `/data/report.json`, a
+       container of `kl-settle-api:1.0` answers `ok` on `/health` and the
+       report's total on `/total`.
+
+    The check runs your script against its own files and rate tables, and the
+    API's handlers against its own reports.
+  hints:
+    - "Run `python3 /lab/settle.py /lab/payments.csv` and compare with the sample rows by hand: which rows does the loop visit, and what happens on the empty line?"
+    - "`Decimal(row[3])` raises `decimal.InvalidOperation` on `not-a-number`; build the rates with `Decimal(v)` from the strings too. Never go through `float`."
+    - "`total.quantize(Decimal(\"0.01\"), rounding=ROUND_HALF_UP)`. Without `rounding=`, `451.625` becomes `451.62`. Round each merchant once, after adding up all of its rows."
+    - "Retry as in the flaky-service exercise: `urlopen(URL, timeout=3)` in a `for attempt in range(5)` loop, `except OSError`, `time.sleep` between tries; after the loop, a message on stderr and `sys.exit(1)` before anything is printed."
+    - "In `totalHandler`, the workers block on `results <- ...` while the handler blocks in `wg.Wait()`. Move `wg.Wait(); close(results)` into its own goroutine. `int64(f * 100)` truncates: `math.Round(f * 100)` or parsing the digits fixes it."
+    - "The Dockerfile is the one from the smallest-Go-image exercise, with `COPY main.go .` in `/lab/api`. For the end-to-end test: `docker run -d -p 127.0.0.1:8081:8080 -v $PWD/report.json:/data/report.json:ro kl-settle-api:1.0`, and make the report readable for the non-root user."
+  solution: |
+    **`/lab/settle.py`**: retries with a timeout, `Decimal` all the way, one
+    half-up rounding per merchant, and bad rows counted instead of crashing.
+
+    ```python
+    import csv, json, sys, time, urllib.request
+    from decimal import Decimal, InvalidOperation, ROUND_HALF_UP
+
+    RATES_URL = "http://127.0.0.1:9191/rates"
+    CENT = Decimal("0.01")
+
+    def get_rates():
+        for attempt in range(5):
+            try:
+                with urllib.request.urlopen(RATES_URL, timeout=3) as r:
+                    return {k: Decimal(v) for k, v in json.load(r)["rates"].items()}
+            except OSError:          # HTTPError, URLError and timeouts
+                time.sleep(0.3 * (attempt + 1))
+        return None
+
+    def main(path):
+        rates = get_rates()
+        if rates is None:
+            print("settle: the rate service is unavailable, no report written", file=sys.stderr)
+            return 1
+        merchants, skipped = {}, 0
+        with open(path, newline="") as f:
+            reader = csv.reader(f)
+            next(reader, None)                       # header
+            for row in reader:
+                if not row:
+                    continue                         # empty line
+                if len(row) != 4 or row[2] not in rates:
+                    skipped += 1
+                    continue
+                try:
+                    amount = Decimal(row[3])
+                except InvalidOperation:
+                    skipped += 1
+                    continue
+                if not amount.is_finite():
+                    skipped += 1
+                    continue
+                merchants[row[1]] = merchants.get(row[1], Decimal(0)) + amount * rates[row[2]]
+        totals = {m: v.quantize(CENT, rounding=ROUND_HALF_UP) for m, v in merchants.items()}
+        print(json.dumps({
+            "base": "EUR",
+            "merchants": {m: str(v) for m, v in totals.items()},
+            "total": str(sum(totals.values(), Decimal(0)).quantize(CENT)),
+            "skipped": skipped,
+        }))
+        return 0
+
+    sys.exit(main(sys.argv[1]))
+    ```
+
+    **`/lab/api/main.go`**: round instead of truncating, and let the handler
+    read results while the workers run:
+
+    ```go
+    return int64(math.Round(f * 100)), nil   // was: int64(f * 100)
+    ...
+    go func() {
+    	wg.Wait()
+    	close(results)
+    }()
+    ```
+
+    **`/lab/api/Dockerfile`**:
+
+    ```dockerfile
+    FROM golang:1.24-alpine AS build
+    WORKDIR /src
+    COPY main.go .
+    RUN CGO_ENABLED=0 go build -ldflags='-s -w' -o /settle-api main.go
+
+    FROM scratch
+    COPY --from=build /settle-api /settle-api
+    USER 65534
+    EXPOSE 8080
+    ENTRYPOINT ["/settle-api"]
+    ```
+
+    ```bash
+    docker build -t kl-settle-api:1.0 /lab/api
+    python3 /lab/settle.py /lab/payments.csv > /lab/report.json
+    chmod 644 /lab/report.json
+    docker run -d --name settle-api -p 127.0.0.1:8081:8080 \
+      -v /lab/report.json:/data/report.json:ro kl-settle-api:1.0
+    curl -s localhost:8081/total       # {"merchants":4,"total":"777.09"}
+    ```
+  setup: |
+    on_reset 'systemctl stop kl-rates 2>/dev/null; systemctl reset-failed kl-rates 2>/dev/null; rm -rf /srv/kl-rates'
+    mkdir -p /srv/kl-rates
+    cat >/srv/kl-rates/server.py <<'PY'
+    import http.server, json, threading, time
+    RATES = {
+        "a": {"EUR": "1", "USD": "0.9150", "GBP": "1.1625", "SEK": "0.0874"},
+        "b": {"EUR": "1", "USD": "1.0700", "GBP": "1.2000", "SEK": "0.0900"},
+    }
+    state = {"mode": "flaky", "rates": "a", "n": 0}
+    lock = threading.Lock()
+    class H(http.server.BaseHTTPRequestHandler):
+        def log_message(self, *a): pass
+        def send(self, code, body=b""):
+            self.send_response(code)
+            self.send_header("Content-Type", "application/json")
+            self.send_header("Content-Length", str(len(body)))
+            self.end_headers()
+            self.wfile.write(body)
+        def do_GET(self):
+            if self.path.startswith("/__ctl/"):
+                parts = self.path.split("/")[2:]
+                with lock:
+                    if parts == ["count"]:
+                        return self.send(200, str(state["n"]).encode())
+                    if len(parts) == 2 and parts[0] in ("mode", "rates"):
+                        state[parts[0]], state["n"] = parts[1], 0
+                        return self.send(200)
+                return self.send(404)
+            if self.path != "/rates":
+                return self.send(404)
+            with lock:
+                state["n"] += 1
+                n, mode, rates = state["n"], state["mode"], state["rates"]
+            if mode == "always" or (mode == "flaky" and n <= 2):
+                return self.send(503, b'{"error": "upstream unavailable"}')
+            if mode == "hang" and n == 1:
+                time.sleep(30)
+                return
+            self.send(200, json.dumps({"base": "EUR", "rates": RATES[rates]}).encode())
+    http.server.ThreadingHTTPServer(("127.0.0.1", 9191), H).serve_forever()
+    PY
+    systemd-run --quiet --unit=kl-rates python3 /srv/kl-rates/server.py
+    eventually 15 'curl -s -m2 -o /dev/null http://127.0.0.1:9191/__ctl/count'
+    lab_file /lab/payments.csv <<'EOF'
+    id,merchant,currency,amount
+    1001,acme-books,EUR,120.00
+    1002,acme-books,USD,35.50
+    1003,globex-travel,GBP,410.00
+    1004,globex-travel,EUR,-25.00
+    1005,initech,SEK,1299.00
+    1006,initech,USD,not-a-number
+    1007,acme-books,EUR,0.29
+    1008,hooli,CHF,80.00
+    1009,initech,EUR,4.35
+
+    1010,globex-travel,USD,12.99,DUPLICATE
+    1011,hooli,USD,59.90
+    EOF
+    lab_file /lab/settle.py <<'EOF'
+    import csv
+    import json
+    import sys
+    import urllib.request
+
+    RATES_URL = "http://127.0.0.1:9191/rates"
+
+
+    def get_rates():
+        with urllib.request.urlopen(RATES_URL) as r:
+            return json.load(r)["rates"]
+
+
+    def main(path):
+        rates = get_rates()
+        with open(path, newline="") as f:
+            rows = list(csv.reader(f))
+
+        merchants = {}
+        for row in rows[1:-1]:
+            _id, merchant, currency, amount = row
+            eur = float(amount) * float(rates[currency])
+            merchants[merchant] = merchants.get(merchant, 0) + eur
+
+        print(json.dumps({
+            "base": "EUR",
+            "merchants": {m: f"{v:.2f}" for m, v in merchants.items()},
+            "total": f"{sum(merchants.values()):.2f}",
+            "skipped": 0,
+        }))
+
+
+    main(sys.argv[1])
+    EOF
+    lab_file /lab/api/main.go <<'EOF'
+    package main
+
+    import (
+    	"encoding/json"
+    	"fmt"
+    	"net/http"
+    	"os"
+    	"strconv"
+    	"sync"
+    )
+
+    // report is what settle.py prints.
+    type report struct {
+    	Merchants map[string]string `json:"merchants"`
+    }
+
+    func reportPath() string {
+    	if p := os.Getenv("REPORT"); p != "" {
+    		return p
+    	}
+    	return "/data/report.json"
+    }
+
+    // toCents turns an amount such as "12.34" into 1234.
+    func toCents(s string) (int64, error) {
+    	f, err := strconv.ParseFloat(s, 64)
+    	if err != nil {
+    		return 0, err
+    	}
+    	return int64(f * 100), nil
+    }
+
+    func formatCents(c int64) string {
+    	sign := ""
+    	if c < 0 {
+    		sign, c = "-", -c
+    	}
+    	return fmt.Sprintf("%s%d.%02d", sign, c/100, c%100)
+    }
+
+    type result struct {
+    	cents int64
+    	err   error
+    }
+
+    func healthHandler(w http.ResponseWriter, r *http.Request) {
+    	fmt.Fprint(w, "ok")
+    }
+
+    // totalHandler adds up the merchant totals of the report with a pool of workers.
+    func totalHandler(w http.ResponseWriter, r *http.Request) {
+    	data, err := os.ReadFile(reportPath())
+    	if err != nil {
+    		http.Error(w, "no report", http.StatusInternalServerError)
+    		return
+    	}
+    	var rep report
+    	if err := json.Unmarshal(data, &rep); err != nil {
+    		http.Error(w, "unreadable report", http.StatusInternalServerError)
+    		return
+    	}
+
+    	jobs := make(chan string)
+    	results := make(chan result)
+    	var wg sync.WaitGroup
+    	for i := 0; i < 4; i++ {
+    		wg.Add(1)
+    		go func() {
+    			defer wg.Done()
+    			for amount := range jobs {
+    				c, err := toCents(amount)
+    				results <- result{c, err}
+    			}
+    		}()
+    	}
+    	go func() {
+    		for _, amount := range rep.Merchants {
+    			jobs <- amount
+    		}
+    		close(jobs)
+    	}()
+
+    	wg.Wait()
+    	close(results)
+
+    	var total int64
+    	var bad error
+    	for res := range results {
+    		if res.err != nil {
+    			bad = res.err
+    		}
+    		total += res.cents
+    	}
+    	if bad != nil {
+    		http.Error(w, "bad amount in report: "+bad.Error(), http.StatusInternalServerError)
+    		return
+    	}
+    	w.Header().Set("Content-Type", "application/json")
+    	json.NewEncoder(w).Encode(map[string]any{
+    		"merchants": len(rep.Merchants),
+    		"total":     formatCents(total),
+    	})
+    }
+
+    func main() {
+    	http.HandleFunc("/health", healthHandler)
+    	http.HandleFunc("/total", totalHandler)
+    	http.ListenAndServe(":8080", nil)
+    }
+    EOF
+  check: |
+    ctl() { curl -s -m3 "http://127.0.0.1:9191/__ctl/$1"; }
+    settle() { timeout 30 python3 -B /lab/settle.py "$@" 2>/dev/null | jq -cS . 2>/dev/null; }
+    t=$(mktemp -d)
+    chmod 755 "$t"
+    cat >"$t/round.csv" <<'EOF'
+    id,merchant,currency,amount
+    1,north,USD,1.50
+    2,south,SEK,12.50
+    3,north,USD,1.50
+    4,east,GBP,0.10
+    5,west,USD,-3.00
+    6,south,EUR,10.00
+    7,east,GBP,0.20
+    8,solo,USD,1.50
+    9,west,EUR,10.00
+    10,east,EUR,0.05
+    EOF
+    cat >"$t/bad.csv" <<'EOF'
+    id,merchant,currency,amount
+    1,acme,EUR,10.00
+    2,acme,USD,12,50
+    3,globex,GBP,4.00
+    4,acme,USD,abc
+
+    5,initech,XYZ,5.00
+    6,globex,EUR
+    7,initech,EUR,7.00,extra
+    8,acme,SEK,100.00
+    EOF
+
+    info "Requirement 1 of 7: right to the cent"
+    ctl mode/ok >/dev/null; ctl rates/b >/dev/null
+    check_eq "converts exactly and rounds each merchant once, half up" "$(settle "$t/round.csv")" \
+      '{"base":"EUR","merchants":{"east":"0.41","north":"3.21","solo":"1.61","south":"11.13","west":"6.79"},"skipped":0,"total":"23.15"}'
+    ctl rates/a >/dev/null
+    check_eq "the report for /lab/payments.csv is right" "$(settle /lab/payments.csv)" \
+      '{"base":"EUR","merchants":{"acme-books":"152.77","globex-travel":"451.63","hooli":"54.81","initech":"117.88"},"skipped":3,"total":"777.09"}'
+
+    info "Requirement 2 of 7: bad rows are skipped and counted"
+    check_eq "skips short, long, unparseable and unknown-currency rows, keeps the last row" "$(settle "$t/bad.csv")" \
+      '{"base":"EUR","merchants":{"acme":"18.74","globex":"4.65"},"skipped":5,"total":"23.39"}'
+
+    info "Requirement 3 of 7: it survives the rate service"
+    ctl mode/flaky >/dev/null
+    check_eq "retries through 503 answers" "$(settle "$t/bad.csv")" \
+      '{"base":"EUR","merchants":{"acme":"18.74","globex":"4.65"},"skipped":5,"total":"23.39"}'
+    ctl mode/hang >/dev/null
+    check_eq "gives up on a hung attempt within 3 seconds and retries" "$(timeout 25 python3 -B /lab/settle.py "$t/bad.csv" 2>/dev/null | jq -r .total 2>/dev/null)" "23.39"
+
+    info "Requirement 4 of 7: it gives up cleanly"
+    ctl mode/always >/dev/null
+    out=$(timeout 40 python3 -B /lab/settle.py "$t/bad.csv" 2>"$t/err"); rc=$?
+    n=$(ctl count)
+    check "retries, then exits non-zero when every attempt fails" '[ "$rc" -ne 0 ] && [ "$rc" -ne 124 ] && [ "$n" -ge 2 ]'
+    check "prints nothing on stdout and a message (not a traceback) on stderr" '[ -z "$out" ] && [ -s "$t/err" ] && ! grep -q Traceback "$t/err" && [ "$rc" -ne 124 ]'
+    check "makes at most 5 attempts, and more than 1" '[ "$n" -ge 2 ] && [ "$n" -le 5 ]'
+    ctl mode/ok >/dev/null
+
+    info "Requirement 5 of 7: /total answers, exactly"
+    mkdir "$t/go"
+    cp /lab/api/*.go "$t/go"/ 2>/dev/null
+    cat >"$t/go/zz_hidden_test.go" <<'GO'
+    package main
+
+    import (
+    	"encoding/json"
+    	"fmt"
+    	"net/http/httptest"
+    	"os"
+    	"path/filepath"
+    	"testing"
+    	"time"
+    )
+
+    func useReport(t *testing.T, body string) {
+    	p := filepath.Join(t.TempDir(), "report.json")
+    	if err := os.WriteFile(p, []byte(body), 0o644); err != nil {
+    		t.Fatal(err)
+    	}
+    	t.Setenv("REPORT", p)
+    }
+
+    func useMerchants(t *testing.T, m map[string]string) {
+    	b, _ := json.Marshal(map[string]any{"base": "EUR", "merchants": m, "total": "0.00", "skipped": 0})
+    	useReport(t, string(b))
+    }
+
+    func total(t *testing.T) (int, string, int) {
+    	t.Helper()
+    	w := httptest.NewRecorder()
+    	done := make(chan struct{})
+    	go func() {
+    		totalHandler(w, httptest.NewRequest("GET", "/total", nil))
+    		close(done)
+    	}()
+    	select {
+    	case <-done:
+    	case <-time.After(5 * time.Second):
+    		t.Fatal("/total did not answer within 5 seconds")
+    	}
+    	if w.Code != 200 {
+    		return w.Code, "", 0
+    	}
+    	var out struct {
+    		Merchants int    `json:"merchants"`
+    		Total     string `json:"total"`
+    	}
+    	if err := json.Unmarshal(w.Body.Bytes(), &out); err != nil {
+    		t.Fatalf("body %q: %v", w.Body.String(), err)
+    	}
+    	return w.Code, out.Total, out.Merchants
+    }
+
+    func TestTotalAnswers(t *testing.T) {
+    	for _, n := range []int{1, 3, 200} {
+    		m := map[string]string{}
+    		for i := 0; i < n; i++ {
+    			m[fmt.Sprintf("m%03d", i)] = "2.00"
+    		}
+    		useMerchants(t, m)
+    		code, tot, cnt := total(t)
+    		if want := fmt.Sprintf("%d.00", 2*n); code != 200 || tot != want || cnt != n {
+    			t.Fatalf("%d merchants: status %d, total %q, merchants %d; want 200, %q, %d", n, code, tot, cnt, want, n)
+    		}
+    	}
+    	useMerchants(t, map[string]string{})
+    	if code, tot, cnt := total(t); code != 200 || tot != "0.00" || cnt != 0 {
+    		t.Fatalf("empty report: status %d, total %q, merchants %d", code, tot, cnt)
+    	}
+    }
+
+    func TestTotalExact(t *testing.T) {
+    	useMerchants(t, map[string]string{"a": "0.29", "b": "1.15", "c": "4.35", "d": "-1.10", "e": "1000000.07", "f": "0.57"})
+    	if code, tot, _ := total(t); code != 200 || tot != "1000005.33" {
+    		t.Fatalf("status %d, total %q, want 1000005.33", code, tot)
+    	}
+    	useMerchants(t, map[string]string{"x": "8.20", "y": "-9.30"})
+    	if code, tot, _ := total(t); code != 200 || tot != "-1.10" {
+    		t.Fatalf("status %d, total %q, want -1.10", code, tot)
+    	}
+    }
+
+    func TestTotalBroken(t *testing.T) {
+    	t.Setenv("REPORT", filepath.Join(t.TempDir(), "missing.json"))
+    	if code, _, _ := total(t); code != 500 {
+    		t.Fatalf("missing report: status %d, want 500", code)
+    	}
+    	useMerchants(t, map[string]string{"a": "1.00", "b": "one euro", "c": "2.00"})
+    	if code, _, _ := total(t); code != 500 {
+    		t.Fatalf("bad amount: status %d, want 500", code)
+    	}
+    }
+
+    func TestHealth(t *testing.T) {
+    	w := httptest.NewRecorder()
+    	healthHandler(w, httptest.NewRequest("GET", "/health", nil))
+    	if w.Code != 200 || w.Body.String() != "ok" {
+    		t.Fatalf("status %d, body %q", w.Code, w.Body.String())
+    	}
+    }
+    GO
+    gout=$(timeout 240 docker run --rm -v "$t/go:/src" -v kl-gocache:/root/.cache -w /src golang:1.24-alpine \
+      sh -c 'go mod init settleapi >/dev/null 2>&1; go test -v -count=1 ./...' 2>&1)
+    gt() { grep -q -- "--- PASS: $1 " <<<"$gout"; }
+    check "/total answers for reports of any size" 'gt TestTotalAnswers && gt TestHealth'
+    check "/total is exact to the cent" 'gt TestTotalExact'
+    check "/total answers 500 for a missing report or a bad amount" 'gt TestTotalBroken'
+    check "still uses a pool of goroutines and channels" 'grep -q "go func" /lab/api/main.go && grep -q "chan " /lab/api/main.go'
+    grep -E -- "--- FAIL|cannot|undefined|panic" <<<"$gout" | head -5 | sed 's/^/    /'
+
+    info "Requirement 6 of 7: a production image"
+    img=kl-settle-api:1.0
+    if ! img_exists "$img"; then
+      fail "image $img exists"
+    else
+      pass "image $img exists"
+      check "smaller than 15MB" '[ "$(docker image inspect -f "{{.Size}}" "$img")" -lt 15000000 ]'
+      user=$(docker image inspect -f '{{.Config.User}}' "$img")
+      check "runs as a non-root user" '[ -n "$user" ] && [ "${user%%:*}" != root ] && [ "${user%%:*}" != 0 ]'
+      check_not "is built FROM scratch (no shell inside)" 'docker run --rm --entrypoint /bin/sh "$img" -c true'
+    fi
+
+    info "Requirement 7 of 7: end to end"
+    ctl mode/ok >/dev/null; ctl rates/a >/dev/null
+    timeout 30 python3 -B /lab/settle.py /lab/payments.csv >"$t/report.json" 2>/dev/null
+    chmod 644 "$t/report.json"
+    docker rm -f kl-settle-check >/dev/null 2>&1
+    docker run -d --name kl-settle-check -p 127.0.0.1:18081:8080 -v "$t/report.json:/data/report.json:ro" "$img" >/dev/null 2>&1
+    check "the container answers ok on /health" 'eventually 15 "[ \"\$(curl -fsS -m2 http://127.0.0.1:18081/health)\" = ok ]"'
+    check_eq "the container serves the total of tonight's report" \
+      "$(curl -fsS -m5 http://127.0.0.1:18081/total 2>/dev/null | jq -cS . 2>/dev/null)" '{"merchants":4,"total":"777.09"}'
+    docker rm -f kl-settle-check >/dev/null 2>&1
+    ctl mode/flaky >/dev/null
+    rm -rf "$t"
+  solve: |
+    cat > /lab/settle.py <<'EOF'
+    import csv
+    import json
+    import sys
+    import time
+    import urllib.request
+    from decimal import Decimal, InvalidOperation, ROUND_HALF_UP
+
+    RATES_URL = "http://127.0.0.1:9191/rates"
+    CENT = Decimal("0.01")
+
+
+    def get_rates():
+        for attempt in range(5):
+            try:
+                with urllib.request.urlopen(RATES_URL, timeout=3) as r:
+                    return {k: Decimal(v) for k, v in json.load(r)["rates"].items()}
+            except OSError:  # HTTPError, URLError and timeouts
+                time.sleep(0.3 * (attempt + 1))
+        return None
+
+
+    def main(path):
+        rates = get_rates()
+        if rates is None:
+            print("settle: the rate service is unavailable, no report written", file=sys.stderr)
+            return 1
+        merchants, skipped = {}, 0
+        with open(path, newline="") as f:
+            reader = csv.reader(f)
+            next(reader, None)
+            for row in reader:
+                if not row:
+                    continue
+                if len(row) != 4 or row[2] not in rates:
+                    skipped += 1
+                    continue
+                try:
+                    amount = Decimal(row[3])
+                except InvalidOperation:
+                    skipped += 1
+                    continue
+                if not amount.is_finite():
+                    skipped += 1
+                    continue
+                merchants[row[1]] = merchants.get(row[1], Decimal(0)) + amount * rates[row[2]]
+        totals = {m: v.quantize(CENT, rounding=ROUND_HALF_UP) for m, v in merchants.items()}
+        print(json.dumps({
+            "base": "EUR",
+            "merchants": {m: str(v) for m, v in totals.items()},
+            "total": str(sum(totals.values(), Decimal(0)).quantize(CENT)),
+            "skipped": skipped,
+        }))
+        return 0
+
+
+    sys.exit(main(sys.argv[1]))
+    EOF
+    python3 - <<'PY'
+    p = "/lab/api/main.go"
+    s = open(p).read()
+    for old, new in [
+        ('\t"fmt"\n', '\t"fmt"\n\t"math"\n'),
+        ("\treturn int64(f * 100), nil\n", "\treturn int64(math.Round(f * 100)), nil\n"),
+        ("\twg.Wait()\n\tclose(results)\n", "\tgo func() {\n\t\twg.Wait()\n\t\tclose(results)\n\t}()\n"),
+    ]:
+        assert s.count(old) == 1, old
+        s = s.replace(old, new)
+    open(p, "w").write(s)
+    PY
+    cat > /lab/api/Dockerfile <<'EOF'
+    FROM golang:1.24-alpine AS build
+    WORKDIR /src
+    COPY main.go .
+    RUN CGO_ENABLED=0 go build -ldflags='-s -w' -o /settle-api main.go
+
+    FROM scratch
+    COPY --from=build /settle-api /settle-api
+    USER 65534
+    EXPOSE 8080
+    ENTRYPOINT ["/settle-api"]
+    EOF
+    docker build -q -t kl-settle-api:1.0 /lab/api

@@ -1024,3 +1024,409 @@ exercises:
     s = cross_val_score(inner, d[list("abcd")], d["y"], cv=outer)
     open("/lab/nested.txt", "w").write(f"{s.mean():.4f}\n")
     PY
+
+# ===== Capstone: a real-world lab =====
+
+- id: ds-085
+  title: "Capstone: ship the lead-scoring model"
+  difficulty: 5
+  kind: fix
+  deliverables: [model.joblib, model_card.json]
+  tags: [capstone, pipeline, columntransformer, imputation, gridsearchcv, nested-cv, f1, joblib]
+  tutorial: |
+    **Concept.** A model is ready to ship when three things are true:
+
+    - **One object does everything.** Imputing, scaling and encoding are *fitted* steps:
+      they learn medians, means and the list of categories from the training data. Inside
+      a `Pipeline` (with a `ColumnTransformer` routing numeric and text columns to
+      different steps) they are fitted on exactly the rows the model is fitted on, saved
+      with it, and applied the same way to every new record, gaps and unseen categories
+      included.
+    - **Its settings were chosen fairly.** `GridSearchCV` tries every combination of the
+      grid with cross-validation and keeps the best by the metric you name. Parameters of
+      a step are addressed as `step__parameter`. With a minority class, a metric such as
+      F1 and a `class_weight` option belong in the search.
+    - **Its reported score is honest.** The best cross-validated score *chose* the winner,
+      so it is optimistic. Nested cross-validation runs the whole search inside each outer
+      fold and scores the winner on the outer fold it never saw; the mean of those outer
+      scores is the number to report.
+
+    Finally, save the winning pipeline **after** refitting it on all the data, and write
+    down what you shipped.
+
+    **Read up on:**
+    - `sklearn.pipeline.Pipeline`, `sklearn.compose.ColumnTransformer`
+    - `SimpleImputer`, `StandardScaler`, `OneHotEncoder(handle_unknown="ignore")`
+    - `GridSearchCV`: `param_grid`, `scoring="f1"`, `best_params_`, `best_score_`, `best_estimator_`
+    - `StratifiedKFold(shuffle=True, random_state=...)`, `cross_val_score`
+    - "Nested versus non-nested cross-validation" in the scikit-learn examples
+    - `sklearn.utils.validation.check_is_fitted`, `joblib.dump`, `json.dump`
+  scenario: |
+    **Ticket GROW-118**, from Sofia in sales operations:
+
+    > Our reps waste half their week on leads that never buy. The first lead-scoring model
+    > never made it past the ML platform team's review. Can you get it shipped this
+    > sprint?
+
+    The platform team's review checklist: **one artifact** that takes raw records,
+    **settings chosen by cross-validation**, a **performance figure that did not help
+    choose them**, and a **model card**.
+
+    **`/lab/leads.csv`** has last year's leads: `lead_id`, the numeric `visits`,
+    `pages_per_visit`, `minutes_on_site` and `company_size`, the text columns `industry`
+    and `country`, and `converted` (1 if the lead bought). Some values are missing, and
+    the company is opening new countries. Your notebook **`/lab/ds-085.ipynb`** starts with
+    the first attempt, which doesn't even run. Make its three functions do this (the six
+    feature columns are `NUM + CAT`):
+
+    1. **`build_pipeline()`** returns a new, **unfitted** `Pipeline` with two steps: a
+       `ColumnTransformer` named **`pre`**, which sends the `NUM` columns through a
+       median `SimpleImputer` then a `StandardScaler`, and the `CAT` columns through a
+       most-frequent `SimpleImputer` then a `OneHotEncoder` that **ignores unknown
+       categories**; then **`LogisticRegression(max_iter=1000)`** named **`clf`**.
+    2. **`tune(X, y)`** returns a **fitted `GridSearchCV`** of `build_pipeline()` over
+       **`C` in `[0.01, 0.1, 1, 10]`** and **`class_weight` in `[None, "balanced"]`**,
+       with `StratifiedKFold(5, shuffle=True, random_state=0)` and **`scoring="f1"`**.
+    3. **`nested_f1(X, y)`** returns the **nested cross-validation** estimate of F1: the
+       mean of the five outer-fold F1 scores of that same (unfitted) search, with outer
+       folds `StratifiedKFold(5, shuffle=True, random_state=1)`.
+
+    The check runs your notebook, then calls the three on leads of its own, so keep their
+    names and arguments. Then have the notebook, on all of `leads.csv`:
+
+    - save the winning pipeline of `tune`, **refitted on all the leads**, with `joblib`
+      to **`/lab/model.joblib`**. It will be called as `model.predict(df)` and
+      `model.predict_proba(df)` on new leads with the six feature columns, with gaps and
+      countries it has never seen;
+    - write the model card **`/lab/model_card.json`**: a JSON object with **`C`** and
+      **`class_weight`** (the winning values; `null` for `None`), **`cv_f1`** (the best
+      cross-validated F1 of the search) and **`nested_f1`** (the nested estimate).
+  hints:
+    - "Run the notebook and read the first error: a `StandardScaler` can't scale `'software'`. Each kind of column needs its own steps, in a `ColumnTransformer`."
+    - "`ColumnTransformer([('num', make_pipeline(SimpleImputer(strategy='median'), StandardScaler()), NUM), ('cat', make_pipeline(SimpleImputer(strategy='most_frequent'), OneHotEncoder(handle_unknown='ignore')), CAT)])` as the step `pre`."
+    - "The grid must name the step: `{'clf__C': [...], 'clf__class_weight': [...]}`."
+    - "`nested_f1` returns `best_score_` today, which is the score that picked the winner. Make a search object like `tune`'s without fitting it, and give it to `cross_val_score` with the outer folds and `scoring='f1'`."
+    - "With `refit=True` (the default), `search.best_estimator_` is already refitted on all the rows `tune` got. Save it after `tune(X, y)` returns, not before."
+    - "`json.dump({'C': ..., 'class_weight': ..., 'cv_f1': ..., 'nested_f1': ...}, open('/lab/model_card.json', 'w'))`: Python's `None` becomes `null`. Convert NumPy numbers with `float(...)`."
+  solution: |
+    The pipeline needs separate steps for numbers and text, the grid has to address the
+    `clf` step, and the honest score comes from an outer cross-validation around the whole
+    search:
+
+    ```python
+    import json
+    import joblib
+    import pandas as pd
+    from sklearn.compose import ColumnTransformer
+    from sklearn.impute import SimpleImputer
+    from sklearn.linear_model import LogisticRegression
+    from sklearn.model_selection import GridSearchCV, StratifiedKFold, cross_val_score
+    from sklearn.pipeline import Pipeline, make_pipeline
+    from sklearn.preprocessing import OneHotEncoder, StandardScaler
+
+    NUM = ["visits", "pages_per_visit", "minutes_on_site", "company_size"]
+    CAT = ["industry", "country"]
+    GRID = {"clf__C": [0.01, 0.1, 1, 10], "clf__class_weight": [None, "balanced"]}
+
+    def build_pipeline():
+        pre = ColumnTransformer([
+            ("num", make_pipeline(SimpleImputer(strategy="median"), StandardScaler()), NUM),
+            ("cat", make_pipeline(SimpleImputer(strategy="most_frequent"), OneHotEncoder(handle_unknown="ignore")), CAT),
+        ])
+        return Pipeline([("pre", pre), ("clf", LogisticRegression(max_iter=1000))])
+
+    def search():
+        return GridSearchCV(build_pipeline(), GRID, cv=StratifiedKFold(5, shuffle=True, random_state=0), scoring="f1")
+
+    def tune(X, y):
+        return search().fit(X, y)
+
+    def nested_f1(X, y):
+        outer = StratifiedKFold(5, shuffle=True, random_state=1)
+        return float(cross_val_score(search(), X, y, cv=outer, scoring="f1").mean())
+
+    leads = pd.read_csv("/lab/leads.csv")
+    X, y = leads[NUM + CAT], leads["converted"]
+    gs = tune(X, y)
+    joblib.dump(gs.best_estimator_, "/lab/model.joblib")
+    json.dump({"C": gs.best_params_["clf__C"], "class_weight": gs.best_params_["clf__class_weight"],
+               "cv_f1": float(gs.best_score_), "nested_f1": nested_f1(X, y)},
+              open("/lab/model_card.json", "w"), indent=2)
+    ```
+
+    The nested estimate is usually a little below `best_score_`: picking the best of eight
+    configurations on the same folds flatters the winner.
+  starter: |
+    # GROW-118: the first attempt. The check calls build_pipeline, tune and nested_f1 on
+    # leads of its own, so keep their names and arguments.
+    import joblib
+    from sklearn.linear_model import LogisticRegression
+    from sklearn.model_selection import GridSearchCV, StratifiedKFold, cross_val_score
+    from sklearn.pipeline import Pipeline
+    from sklearn.preprocessing import StandardScaler
+
+    NUM = ["visits", "pages_per_visit", "minutes_on_site", "company_size"]
+    CAT = ["industry", "country"]
+
+
+    def build_pipeline():
+        return Pipeline([("scale", StandardScaler()), ("clf", LogisticRegression(max_iter=1000))])
+
+
+    def tune(X, y):
+        grid = {"C": [0.01, 0.1, 1, 10], "class_weight": [None, "balanced"]}
+        gs = GridSearchCV(build_pipeline(), grid, cv=StratifiedKFold(5, shuffle=True, random_state=0), scoring="f1")
+        return gs.fit(X, y)
+
+
+    def nested_f1(X, y):
+        return tune(X, y).best_score_
+    # %%
+    leads = pd.read_csv("/lab/leads.csv")
+    X, y = leads[NUM + CAT], leads["converted"]
+    search = tune(X, y)
+    print(search.best_params_, "cross-validated F1:", round(search.best_score_, 4))
+  setup: |
+    ds_start
+    dspy - >"$KL_STATE/card.json" <<'PY'
+    import json
+    import numpy as np, pandas as pd
+    from sklearn.compose import ColumnTransformer
+    from sklearn.impute import SimpleImputer
+    from sklearn.linear_model import LogisticRegression
+    from sklearn.model_selection import GridSearchCV, StratifiedKFold, cross_val_score
+    from sklearn.pipeline import Pipeline, make_pipeline
+    from sklearn.preprocessing import OneHotEncoder, StandardScaler
+    r = np.random.default_rng()
+
+    def leads(n):
+        visits = r.poisson(4, n) + 1
+        pages = r.gamma(2, 2, n).round(1)
+        minutes = r.gamma(2, 6, n).round(1)
+        size = np.exp(r.normal(4, 1.5, n)).round()
+        ind = r.choice(["software", "retail", "finance", "health", "logistics"], n)
+        cty = r.choice(["GR", "DE", "FR", "IT", "ES", "NL"], n)
+        z = (-10.0 + 0.7 * visits + 0.13 * minutes + 0.25 * pages + 0.45 * np.log(size)
+             + pd.Series(ind).map({"software": 1.5, "retail": -1.0, "finance": 0.8, "health": 0.0, "logistics": -0.5}).to_numpy()
+             + pd.Series(cty).map({"GR": 0.5, "DE": 0.6, "FR": -0.3, "IT": -0.5, "ES": 0.0, "NL": 0.3}).to_numpy())
+        d = pd.DataFrame({"visits": visits.astype(float), "pages_per_visit": pages, "minutes_on_site": minutes,
+                          "company_size": size, "industry": ind.astype(object), "country": cty.astype(object),
+                          "converted": (r.random(n) < 1 / (1 + np.exp(-z))).astype(int)})
+        for c in ["company_size", "industry", "minutes_on_site"]:
+            d.loc[r.random(n) < 0.05, c] = np.nan
+        return d
+
+    d = leads(2500)
+    d.insert(0, "lead_id", np.arange(31001, 33501))
+    d.to_csv("/lab/leads.csv", index=False, float_format="%.6g")
+    t = leads(2000)
+    new = r.random(len(t)) < 0.1
+    t.loc[new, "country"] = r.choice(["CY", "MT", "PT"], int(new.sum()))
+    t.to_csv("/lab/.kl-test.csv", index=False)
+
+    NUM = ["visits", "pages_per_visit", "minutes_on_site", "company_size"]
+    CAT = ["industry", "country"]
+    def search():
+        pre = ColumnTransformer([
+            ("num", make_pipeline(SimpleImputer(strategy="median"), StandardScaler()), NUM),
+            ("cat", make_pipeline(SimpleImputer(strategy="most_frequent"), OneHotEncoder(handle_unknown="ignore")), CAT)])
+        return GridSearchCV(Pipeline([("pre", pre), ("clf", LogisticRegression(max_iter=1000))]),
+                            {"clf__C": [0.01, 0.1, 1, 10], "clf__class_weight": [None, "balanced"]},
+                            cv=StratifiedKFold(5, shuffle=True, random_state=0), scoring="f1")
+    d = pd.read_csv("/lab/leads.csv")
+    X, y = d[NUM + CAT], d["converted"]
+    gs = search().fit(X, y)
+    nested = cross_val_score(search(), X, y, cv=StratifiedKFold(5, shuffle=True, random_state=1), scoring="f1").mean()
+    print(json.dumps({"C": gs.best_params_["clf__C"], "class_weight": gs.best_params_["clf__class_weight"],
+                      "cv_f1": float(gs.best_score_), "nested_f1": float(nested)}))
+    PY
+    mv /lab/.kl-test.csv "$KL_STATE/test.csv"
+    chown -R "$(lab_user):" /lab
+  check: |
+    NB_HIDDEN="$KL_STATE/test.csv $KL_STATE/card.json" nb_check ds-085.ipynb model.joblib model_card.json <<'PY'
+    import json, os, joblib
+    import numpy as np, pandas as pd
+    from sklearn.compose import ColumnTransformer
+    from sklearn.exceptions import NotFittedError
+    from sklearn.impute import SimpleImputer
+    from sklearn.linear_model import LogisticRegression
+    from sklearn.model_selection import GridSearchCV, StratifiedKFold, cross_val_score
+    from sklearn.pipeline import Pipeline, make_pipeline
+    from sklearn.preprocessing import OneHotEncoder, StandardScaler
+    from sklearn.utils.validation import check_is_fitted
+
+    def kl_try(f):
+        try:
+            return f()
+        except Exception as e:
+            return f"raised {type(e).__name__}: {str(e)[:80]}"
+
+    kl_num = ["visits", "pages_per_visit", "minutes_on_site", "company_size"]
+    kl_cat = ["industry", "country"]
+    kl_grid = {"clf__C": [0.01, 0.1, 1, 10], "clf__class_weight": [None, "balanced"]}
+    def kl_pipe():
+        pre = ColumnTransformer([
+            ("num", make_pipeline(SimpleImputer(strategy="median"), StandardScaler()), kl_num),
+            ("cat", make_pipeline(SimpleImputer(strategy="most_frequent"), OneHotEncoder(handle_unknown="ignore")), kl_cat)])
+        return Pipeline([("pre", pre), ("clf", LogisticRegression(max_iter=1000))])
+    def kl_search():
+        return GridSearchCV(kl_pipe(), kl_grid, cv=StratifiedKFold(5, shuffle=True, random_state=0), scoring="f1")
+
+    g = np.random.default_rng(11)
+    n = 600
+    kl_X = pd.DataFrame({"visits": (g.poisson(4, n) + 1).astype(float), "pages_per_visit": g.gamma(2, 2, n).round(1),
+                         "minutes_on_site": g.gamma(2, 6, n).round(1), "company_size": np.exp(g.normal(4, 1.5, n)).round(),
+                         "industry": g.choice(["software", "retail", "finance"], n).astype(object),
+                         "country": g.choice(["GR", "DE", "IT"], n).astype(object)})
+    z = -6 + 0.6 * kl_X.visits + 0.1 * kl_X.minutes_on_site + 0.4 * np.log(kl_X.company_size) + (kl_X.industry == "software") * 1.2
+    kl_y = pd.Series((g.random(n) < 1 / (1 + np.exp(-z))).astype(int), name="converted")
+    for c in ["company_size", "industry"]:
+        kl_X.loc[g.random(n) < 0.06, c] = np.nan
+    kl_odd = pd.DataFrame({"visits": [np.nan, 3.0], "pages_per_visit": [np.nan, 1.5], "minutes_on_site": [np.nan, np.nan],
+                           "company_size": [np.nan, 40.0], "industry": ["mining", np.nan], "country": ["CY", np.nan]})
+
+    def kl_build():
+        p = build_pipeline()
+        if not isinstance(p, Pipeline):
+            return "build_pipeline must return a Pipeline"
+        if list(p.named_steps)[-1] != "clf" or not isinstance(p.named_steps["clf"], LogisticRegression):
+            return "the last step must be a LogisticRegression named clf"
+        if "pre" not in p.named_steps or not isinstance(p.named_steps["pre"], ColumnTransformer):
+            return "the first step must be a ColumnTransformer named pre"
+        try:
+            check_is_fitted(p)
+            return "the pipeline is already fitted"
+        except NotFittedError:
+            return "ok"
+    print("build:", kl_try(kl_build))
+
+    def kl_robust():
+        p = build_pipeline().fit(kl_X.copy(), kl_y)
+        pr = np.asarray(p.predict_proba(kl_odd.copy()))
+        return "ok" if pr.shape == (2, 2) and not np.isnan(pr).any() else "no probabilities for rows with gaps and new categories"
+    print("robust:", kl_try(kl_robust))
+
+    kl_ref = kl_search().fit(kl_X, kl_y)
+    def kl_tune():
+        gs = tune(kl_X.copy(), kl_y.copy())
+        if not hasattr(gs, "best_params_"):
+            return "tune must return the fitted GridSearchCV"
+        bp = {k: gs.best_params_.get(k, "missing") for k in kl_grid}
+        if bp != kl_ref.best_params_:
+            return f"best {bp}, expected {kl_ref.best_params_}"
+        return "ok" if abs(gs.best_score_ - kl_ref.best_score_) < 1e-6 else f"best F1 {gs.best_score_:.4f}, expected {kl_ref.best_score_:.4f}"
+    print("tune:", kl_try(kl_tune))
+
+    def kl_nested():
+        want = cross_val_score(kl_search(), kl_X, kl_y, cv=StratifiedKFold(5, shuffle=True, random_state=1), scoring="f1").mean()
+        got = float(nested_f1(kl_X.copy(), kl_y.copy()))
+        return "ok" if abs(got - want) < 1e-4 else f"got {got:.4f}, expected about {want:.4f}"
+    print("nested:", kl_try(kl_nested))
+
+    card = json.load(open("/tmp/kl-hidden/card.json"))
+    def kl_model_load():
+        if not os.path.exists("/lab/model.joblib"):
+            return None, "no /lab/model.joblib"
+        m = joblib.load("/lab/model.joblib")
+        return (m, "ok") if isinstance(m, Pipeline) else (None, "the saved object is not a Pipeline")
+    try:
+        kl_m, why = kl_model_load()
+    except Exception as e:
+        kl_m, why = None, f"can't load /lab/model.joblib ({type(e).__name__})"
+    kl_test = pd.read_csv("/tmp/kl-hidden/test.csv")
+    def kl_raw():
+        if kl_m is None:
+            return why
+        p = np.asarray(kl_m.predict(kl_test[kl_num + kl_cat]))
+        pr = np.asarray(kl_m.predict_proba(kl_odd.copy()))
+        return "ok" if len(p) == len(kl_test) and pr.shape == (2, 2) else "wrong number of predictions"
+    print("raw:", kl_try(kl_raw))
+
+    def kl_winner():
+        if kl_m is None:
+            return why
+        leads = pd.read_csv("/lab/leads.csv")
+        ref = kl_pipe().set_params(clf__C=card["C"], clf__class_weight=card["class_weight"])
+        ref.fit(leads[kl_num + kl_cat], leads["converted"])
+        a = np.asarray(kl_m.predict_proba(kl_test[kl_num + kl_cat]))
+        b = ref.predict_proba(kl_test[kl_num + kl_cat])
+        return "ok" if a.shape == b.shape and np.allclose(a, b, atol=1e-6) else "it is not the winning pipeline refitted on all the leads"
+    print("winner:", kl_try(kl_winner))
+
+    def kl_card():
+        if not os.path.exists("/lab/model_card.json"):
+            return "no /lab/model_card.json"
+        c = json.load(open("/lab/model_card.json"))
+        if not isinstance(c, dict):
+            return "the card must be a JSON object"
+        bad = [k for k in ["C", "class_weight", "cv_f1", "nested_f1"] if k not in c]
+        if bad:
+            return "missing " + ", ".join(bad)
+        if c["class_weight"] != card["class_weight"] or abs(float(c["C"]) - card["C"]) > 1e-9:
+            return f"C={c['C']}, class_weight={c['class_weight']} are not the winning values"
+        if abs(float(c["cv_f1"]) - card["cv_f1"]) > 1e-3:
+            return f"cv_f1 {c['cv_f1']} is not the search's best score"
+        if abs(float(c["nested_f1"]) - card["nested_f1"]) > 1e-3:
+            return f"nested_f1 {c['nested_f1']} is not the nested estimate"
+        return "ok"
+    print("card:", kl_try(kl_card))
+    PY
+    info "1. build_pipeline"
+    check_eq "returns an unfitted Pipeline: a ColumnTransformer pre, then a LogisticRegression clf" "$(sed -n 's/^build: //p' <<<"$NB_RESULT")" ok
+    check_eq "once fitted, it scores rows with gaps and unseen categories" "$(sed -n 's/^robust: //p' <<<"$NB_RESULT")" ok
+    info "2. tune"
+    check_eq "the search finds the best C and class weight by F1" "$(sed -n 's/^tune: //p' <<<"$NB_RESULT")" ok
+    info "3. nested_f1"
+    check_eq "the nested estimate comes from outer folds the search never saw" "$(sed -n 's/^nested: //p' <<<"$NB_RESULT")" ok
+    info "What ships"
+    check_eq "/lab/model.joblib takes raw leads, gaps and new countries included" "$(sed -n 's/^raw: //p' <<<"$NB_RESULT")" ok
+    check_eq "/lab/model.joblib is the winning pipeline, refitted on all the leads" "$(sed -n 's/^winner: //p' <<<"$NB_RESULT")" ok
+    check_eq "/lab/model_card.json records the winning C, class weight, cv_f1 and nested_f1" "$(sed -n 's/^card: //p' <<<"$NB_RESULT")" ok
+  solve: |
+    nb_write ds-085.ipynb <<'PY'
+    import json
+    import joblib
+    import pandas as pd
+    from sklearn.compose import ColumnTransformer
+    from sklearn.impute import SimpleImputer
+    from sklearn.linear_model import LogisticRegression
+    from sklearn.model_selection import GridSearchCV, StratifiedKFold, cross_val_score
+    from sklearn.pipeline import Pipeline, make_pipeline
+    from sklearn.preprocessing import OneHotEncoder, StandardScaler
+
+    NUM = ["visits", "pages_per_visit", "minutes_on_site", "company_size"]
+    CAT = ["industry", "country"]
+    GRID = {"clf__C": [0.01, 0.1, 1, 10], "clf__class_weight": [None, "balanced"]}
+
+
+    def build_pipeline():
+        pre = ColumnTransformer([
+            ("num", make_pipeline(SimpleImputer(strategy="median"), StandardScaler()), NUM),
+            ("cat", make_pipeline(SimpleImputer(strategy="most_frequent"), OneHotEncoder(handle_unknown="ignore")), CAT),
+        ])
+        return Pipeline([("pre", pre), ("clf", LogisticRegression(max_iter=1000))])
+
+
+    def search():
+        return GridSearchCV(build_pipeline(), GRID, cv=StratifiedKFold(5, shuffle=True, random_state=0), scoring="f1")
+
+
+    def tune(X, y):
+        return search().fit(X, y)
+
+
+    def nested_f1(X, y):
+        outer = StratifiedKFold(5, shuffle=True, random_state=1)
+        return float(cross_val_score(search(), X, y, cv=outer, scoring="f1").mean())
+    # %%
+    leads = pd.read_csv("/lab/leads.csv")
+    X, y = leads[NUM + CAT], leads["converted"]
+    gs = tune(X, y)
+    print(gs.best_params_, "cross-validated F1:", round(gs.best_score_, 4))
+    joblib.dump(gs.best_estimator_, "/lab/model.joblib")
+    # %%
+    card = {"C": gs.best_params_["clf__C"], "class_weight": gs.best_params_["clf__class_weight"],
+            "cv_f1": float(gs.best_score_), "nested_f1": nested_f1(X, y)}
+    json.dump(card, open("/lab/model_card.json", "w"), indent=2)
+    card
+    PY

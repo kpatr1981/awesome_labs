@@ -1621,3 +1621,310 @@ exercises:
       docker exec $n redis-cli CONFIG SET min-replicas-max-lag 10
       docker exec $n redis-cli CONFIG REWRITE
     done
+
+# ===== Capstone: a real-world lab =====
+
+- id: data-096
+  title: "Capstone: the restore drill that found the gaps"
+  difficulty: 5
+  kind: fix
+  tags: [capstone, postgres, wal, archive, archive_timeout, pitr, backup, recovery, replication, replication-slot, max_slot_wal_keep_size]
+  tutorial: |
+    **Concept.** A recovery plan is only as good as its weakest link, and the links fail
+    silently: an archive that stopped accepting WAL, a standby that can't log in any more, a
+    slot that quietly keeps WAL forever. A restore drill finds them, and a real incident in
+    the middle of one shows why they matter: **point-in-time recovery needs every WAL
+    segment between the base backup and the target**, in the archive.
+
+    **When archiving fails.** `archive_command` runs for each completed WAL segment. While it
+    fails, the server keeps the segment in `pg_wal` (marked `.ready` in
+    `pg_wal/archive_status`) and retries, so nothing is lost yet, but `pg_wal` grows and the
+    archive has a hole. `pg_stat_archiver` shows `last_archived_wal`, `last_failed_wal`
+    and their times. `archive_command` is reloadable; once it works the archiver catches up in
+    order. A quiet server may take a long time to fill a 16 MB segment, so
+    `archive_timeout` forces a segment switch after at most that many seconds: it bounds how
+    much committed work can be missing from the archive (the recovery point objective).
+
+    **Recovering beside production.** Lay the base backup down in a new volume, add
+    `recovery.signal`, a `restore_command` and a `recovery_target_time`, and start a second
+    server. It replays to the target and, by default, **pauses** read-only there. If the
+    archive ends before the target, recovery fails instead. Copy the lost rows back into
+    production and leave everything written since untouched.
+
+    **A standby that can't log in.** A standby connects with the `primary_conninfo` it was
+    given. After a password rotation on the primary its WAL receiver is refused, it falls
+    behind, and its replication slot makes the primary keep all WAL since. `primary_conninfo`
+    is reloadable, so no rebuild is needed. `max_slot_wal_keep_size` caps how much WAL any
+    slot may hold, so a standby that stays gone can't fill the primary's disk.
+
+    **Read up on:**
+    - `pg_stat_archiver`, `pg_switch_wal()`, `pg_walfile_name()`, `pg_wal/archive_status`
+    - `archive_command`, `archive_timeout`, `ALTER SYSTEM`, `pg_reload_conf()`, `postgresql.auto.conf`
+    - Continuous archiving and point-in-time recovery (PostgreSQL manual); `pg_basebackup -Ft`
+    - `recovery.signal`, `restore_command`, `recovery_target_time`, `pg_get_wal_replay_pause_state()`
+    - `COPY ... TO STDOUT` / `COPY ... FROM STDIN`, `INSERT ... WHERE NOT EXISTS`
+    - `pg_stat_replication` (`usename`, `state`), `pg_replication_slots`, `primary_conninfo`, `docker logs`
+    - `max_slot_wal_keep_size`
+  scenario: |
+    **Ticket DR-318**, from Kostas (SRE lead):
+
+    > The auditors are here on Thursday for the yearly restore drill, so I asked for a dry
+    > run. It found holes everywhere: the WAL archive, the standby, and then, halfway through
+    > the drill, someone deleted half the shipments for real. `/lab/INCIDENT.md` has the
+    > details. Please close every gap on this list.
+
+    The primary **`kl-pg`** (data in the volume `kl-pg-data`) runs on the Docker network
+    `kl-repl` with the streaming standby **`kl-replica`**. Connect with
+    `docker exec -it <name> psql -U lab -d lab`. The runbook says:
+
+    - **WAL archive:** the volume **`kl-archive`**, mounted in `kl-pg` at `/archive`. Each
+      segment goes **directly into `/archive`** under its own name (`/archive/<segment>`).
+    - **Base backup:** the volume **`kl-backup`**, directory `/backup/base`, taken with
+      `pg_basebackup -Ft -z -X stream` before the drill started.
+    - **Replication:** `kl-replica` connects as the role **`replicator`** through the slot
+      **`replica_slot`**. The password was rotated last week; the current one is in
+      **`/lab/secrets/replicator.password`**.
+
+    ## Part 1: The archive
+
+    1. WAL archiving fails. Make it work again **as the runbook says**: every completed WAL
+       segment reaches `/archive/<segment>` in `kl-archive`, and the segments that piled up
+       while it was failing are archived too.
+    2. The RPO is one minute: a WAL segment must be switched and archived **at least every
+       60 seconds**, even when the server is quiet. The setting must survive a restart.
+
+    ## Part 2: The real incident
+
+    3. Start a second PostgreSQL container named **`kl-pitr`** (`postgres:16-alpine`) from the
+       base backup and the WAL archive, **recovered to the moment given in
+       `/lab/INCIDENT.md`**: its `shipments` table holds every shipment as it was just before
+       the `DELETE` and nothing that happened after it. Leave it **read-only, paused at the
+       target**, for the auditors. `kl-pg` keeps running throughout.
+    4. Put the deleted shipments back into **`kl-pg`**, exactly as they were, without losing
+       or undoing anything written after the `DELETE`.
+
+    ## Part 3: The standby
+
+    5. `kl-replica` hasn't replayed anything for a week. Make it stream from `kl-pg` again
+       **as `replicator`, through `replica_slot`**, without rebuilding or re-creating it: a write
+       on `kl-pg` must reach it within seconds.
+    6. Make sure no replication slot can ever make `kl-pg` keep more than **1 GB** of WAL, a
+       setting that survives restarts.
+  hints:
+    - "Part 1: `SELECT * FROM pg_stat_archiver` and `docker logs kl-pg | grep archive` show what fails. `SHOW archive_command` and `docker exec kl-pg ls /archive` show where it tries to write and what's really there."
+    - "Part 1: fix it with `ALTER SYSTEM SET archive_command = '...'`, set `archive_timeout` the same way, then `SELECT pg_reload_conf()`. Watch `docker exec kl-pg ls /var/lib/postgresql/data/pg_wal/archive_status`: the `.ready` files turn into `.done` as the backlog is archived."
+    - "Part 2: recovery fails if the archive ends before the target, so finish Part 1 first. Then follow the standard PITR steps: extract `base.tar.gz` into a new volume and `pg_wal.tar.gz` into its `pg_wal`, `touch recovery.signal`, and add `restore_command = 'cp /archive/%f %p'` and `recovery_target_time = '... +00'` to `postgresql.auto.conf`. Mount `kl-archive` into `kl-pitr`."
+    - "Part 2: `SELECT pg_get_wal_replay_pause_state()` on `kl-pitr` says `paused` when it reached the target. `COPY shipments TO STDOUT` from there, load it into a temporary table on `kl-pg`, and insert only the ids that `kl-pg` no longer has."
+    - "Part 3: `docker logs kl-replica` says why it can't connect. `ALTER SYSTEM SET primary_conninfo = 'host=kl-pg user=replicator password=... application_name=replica'` on `kl-replica` and `SELECT pg_reload_conf()` there restarts its WAL receiver; `primary_slot_name` stays as it is."
+    - "Part 3: `ALTER SYSTEM SET max_slot_wal_keep_size = '1GB'` on `kl-pg`, then reload. Check the replica with `SELECT application_name, usename, state FROM pg_stat_replication` on `kl-pg`."
+  solution: |
+    ## Part 1: The archive
+
+    Someone pointed `archive_command` at `/archive/wal/`, a directory that doesn't exist, and
+    `archive_timeout` was never set.
+
+    ```bash
+    docker exec kl-pg psql -U lab -d lab \
+      -c "ALTER SYSTEM SET archive_command = 'test ! -f /archive/%f && cp %p /archive/%f'" \
+      -c "ALTER SYSTEM SET archive_timeout = '60s'" \
+      -c 'SELECT pg_reload_conf()'
+    docker exec kl-pg ls /var/lib/postgresql/data/pg_wal/archive_status   # wait until no .ready is left
+    ```
+
+    ## Part 2: The real incident
+
+    ```bash
+    T=$(sed -n 's/.*`\(20[0-9-]* [0-9:]*\) UTC`.*/\1/p' /lab/INCIDENT.md | head -1)
+    docker run --rm -v kl-backup:/backup -v kl-pitr-data:/var/lib/postgresql/data postgres:16-alpine sh -c "
+      cd /var/lib/postgresql/data &&
+      tar xzf /backup/base/base.tar.gz &&
+      tar xzf /backup/base/pg_wal.tar.gz -C pg_wal &&
+      touch recovery.signal &&
+      echo \"restore_command = 'cp /archive/%f %p'\" >> postgresql.auto.conf &&
+      echo \"recovery_target_time = '$T+00'\" >> postgresql.auto.conf"
+    docker run -d --name kl-pitr -v kl-pitr-data:/var/lib/postgresql/data \
+      -v kl-archive:/archive:ro postgres:16-alpine
+    docker exec kl-pitr psql -U lab -d lab -c 'SELECT pg_get_wal_replay_pause_state()'   # paused
+
+    docker exec kl-pitr psql -U lab -d lab -c 'COPY shipments TO STDOUT' > /lab/before.copy
+    docker exec -i kl-pg psql -U lab -d lab -v ON_ERROR_STOP=1 \
+      -c 'CREATE TEMP TABLE before (LIKE shipments)' \
+      -c 'COPY before FROM STDIN' \
+      -c 'INSERT INTO shipments SELECT * FROM before b WHERE NOT EXISTS (SELECT 1 FROM shipments s WHERE s.id = b.id)' \
+      < /lab/before.copy
+    ```
+
+    ## Part 3: The standby
+
+    `docker logs kl-replica` shows `password authentication failed for user "replicator"`:
+    it still uses the old password.
+
+    ```bash
+    pw=$(cat /lab/secrets/replicator.password)
+    docker exec kl-replica psql -U lab -d lab \
+      -c "ALTER SYSTEM SET primary_conninfo = 'host=kl-pg port=5432 user=replicator password=$pw application_name=replica'" \
+      -c 'SELECT pg_reload_conf()'
+    docker exec kl-pg psql -U lab -d lab \
+      -c "ALTER SYSTEM SET max_slot_wal_keep_size = '1GB'" -c 'SELECT pg_reload_conf()' \
+      -c 'SELECT application_name, usename, state FROM pg_stat_replication'
+    ```
+  setup: |
+    docker network create kl-repl >/dev/null
+    docker volume create kl-archive >/dev/null
+    docker volume create kl-backup >/dev/null
+    docker run --rm -v kl-archive:/archive -v kl-backup:/backup alpine:3.22 chown 70:70 /archive /backup
+    docker run -d --name kl-pg --network kl-repl -e POSTGRES_USER=lab -e POSTGRES_PASSWORD=lab -e POSTGRES_DB=lab \
+      -v kl-pg-data:/var/lib/postgresql/data -v kl-archive:/archive -v kl-backup:/backup \
+      postgres:16-alpine -c wal_level=replica -c archive_mode=on >/dev/null
+    eventually 60 "pg_x kl-pg 'select 1'"
+    docker exec kl-pg sh -c "echo 'host replication lab,replicator all scram-sha-256' >> /var/lib/postgresql/data/pg_hba.conf"
+    pg_x kl-pg "ALTER SYSTEM SET archive_command = 'test ! -f /archive/%f && cp %p /archive/%f'" >/dev/null
+    pg_x kl-pg 'SELECT pg_reload_conf()' >/dev/null
+    pg_x kl-pg "CREATE ROLE replicator LOGIN REPLICATION PASSWORD 'winter-2025'"
+    pg_x kl-pg "CREATE TABLE shipments (id int PRIMARY KEY, order_ref text NOT NULL, carrier text NOT NULL,
+                status text NOT NULL DEFAULT 'label', weight_g int NOT NULL, created_at timestamptz NOT NULL DEFAULT clock_timestamp())"
+    ins() { pg_x kl-pg "INSERT INTO shipments (id, order_ref, carrier, weight_g)
+                        SELECT g, 'ORD-' || (100000 + g * 37), (ARRAY['dhl', 'ups', 'acs', 'elta'])[1 + g % 4], (g * 7919) % 20000 + 100
+                        FROM generate_series($1, $2) g"; }
+    ins 1 400
+
+    # --- the standby, streaming as replicator through its slot ---
+    pg_standby kl-replica kl-repl kl-pg replica replica_slot
+    pg_x kl-replica "ALTER SYSTEM SET primary_conninfo = 'host=kl-pg port=5432 user=replicator password=winter-2025 application_name=replica'" >/dev/null
+    pg_x kl-replica 'SELECT pg_reload_conf()' >/dev/null
+    eventually 30 "[ \"\$(pg_x kl-pg \"SELECT count(*) FROM pg_stat_replication WHERE usename = 'replicator' AND state = 'streaming'\")\" = 1 ]" \
+      || { echo "setup: the standby does not stream as replicator" >&2; exit 1; }
+    docker inspect -f '{{.Id}}' kl-replica > "$KL_STATE/replica-id"
+
+    # --- the base backup, while the archive still worked ---
+    docker exec kl-pg su-exec postgres pg_basebackup -U lab -D /backup/base -Ft -z -X stream -c fast
+
+    # --- last week: the password rotation, and the "archive reorganisation" ---
+    pg_x kl-pg "ALTER ROLE replicator PASSWORD 'spring-2026'" >/dev/null
+    pg_x kl-pg "SELECT pg_terminate_backend(pid) FROM pg_stat_replication" >/dev/null
+    lab_file /lab/secrets/replicator.password 0600 <<'EOF'
+    spring-2026
+    EOF
+    pg_x kl-pg "ALTER SYSTEM SET archive_command = 'test ! -f /archive/wal/%f && cp %p /archive/wal/%f'" >/dev/null
+    pg_x kl-pg 'SELECT pg_reload_conf()' >/dev/null
+
+    # --- the business before the mistake ---
+    for b in 0 1 2 3; do
+      ins $((401 + b * 50)) $((450 + b * 50))
+      pg_x kl-pg "UPDATE shipments SET status = 'in_transit' WHERE id % 9 = $b AND id <= 400"
+      pg_x kl-pg 'SELECT pg_switch_wal()' >/dev/null
+      sleep 1
+    done
+    sleep 2.2
+    t=$(pg_x kl-pg "SELECT to_char(date_trunc('second', clock_timestamp() AT TIME ZONE 'UTC'), 'YYYY-MM-DD HH24:MI:SS')")
+    sleep 2
+    # the mistake: meant to delete only elta's cancelled labels
+    pg_x kl-pg "COPY (SELECT * FROM shipments WHERE carrier = 'elta' ORDER BY id) TO STDOUT" > "$KL_STATE/deleted.copy"
+    pg_x kl-pg "DELETE FROM shipments WHERE carrier = 'elta'"
+    sleep 1.5
+    # the business after the mistake, which must survive
+    ins 601 650
+    pg_x kl-pg "UPDATE shipments SET status = 'delivered' WHERE id IN (12, 206, 488, 590, 613)"
+    pg_x kl-pg 'SELECT pg_switch_wal()' >/dev/null
+    eventually 20 "[ \"\$(pg_x kl-pg 'SELECT failed_count > 0 FROM pg_stat_archiver')\" = t ]" \
+      || { echo "setup: archiving did not fail" >&2; exit 1; }
+    [ "$(docker exec kl-pg sh -c 'ls /var/lib/postgresql/data/pg_wal/archive_status | grep -c "ready$"')" -ge 3 ] \
+      || { echo "setup: no WAL is waiting for the archive" >&2; exit 1; }
+
+    # what a correct repair leaves, computed without changing kl-pg
+    { echo "BEGIN; CREATE TEMP TABLE d (LIKE shipments); COPY d FROM STDIN;"; cat "$KL_STATE/deleted.copy"; echo '\.'
+      echo "SELECT count(*) || ' ' || md5(string_agg(s::text, '|' ORDER BY id)) FROM (SELECT * FROM shipments UNION ALL SELECT * FROM d) s; ROLLBACK;"
+    } | docker exec -i kl-pg psql -h 127.0.0.1 -U lab -d lab -qAt -v ON_ERROR_STOP=1 >"$KL_STATE/expected"
+    wc -l <"$KL_STATE/deleted.copy" >"$KL_STATE/deleted.n"
+    lab_file /lab/INCIDENT.md <<EOF
+    # Incident: shipments deleted during the drill
+
+    - At \`$t UTC\` an engineer ran \`DELETE FROM shipments WHERE carrier = 'elta'\` on
+      \`kl-pg\`. They meant to add \`AND status = 'cancelled'\`. Nothing else wrote to the
+      database in the two seconds before it.
+    - Since then the warehouse kept working: new shipments were created and some were
+      delivered. All of that must be kept.
+    - Base backup: volume \`kl-backup\`, directory \`/backup/base\`. WAL archive: volume
+      \`kl-archive\` (see the runbook in the ticket).
+    EOF
+  check: |
+    probe() { # probe -> a fresh row on kl-pg, and the name of the WAL segment that holds it
+      local m; m=$(date +%s%N)
+      pg_x kl-pg "CREATE TABLE IF NOT EXISTS kl_probe (m text); INSERT INTO kl_probe VALUES ('$m')" >/dev/null 2>&1 || return 1
+      echo "$m"
+    }
+    info "Part 1: The archive"
+    ok=$(pg_x kl-pg "SELECT coalesce(last_archived_time > coalesce(last_failed_time, '-infinity'), false) FROM pg_stat_archiver" 2>/dev/null)
+    if [ "$ok" = t ] && m=$(probe); then
+      w=$(pg_x kl-pg "SELECT pg_walfile_name(pg_current_wal_lsn())")
+      pg_x kl-pg 'SELECT pg_switch_wal()' >/dev/null
+      check "a new WAL segment reaches /archive/<segment>, and no unarchived WAL is left" \
+        "eventually 30 'docker exec kl-pg test -f /archive/$w && [ \"\$(docker exec kl-pg sh -c \"ls /var/lib/postgresql/data/pg_wal/archive_status | grep -c ready\\\$\")\" = 0 ]'"
+    else
+      fail "a new WAL segment reaches /archive/<segment>, and no unarchived WAL is left"
+    fi
+    check "archive_timeout is between 1 and 60 seconds and saved in postgresql.auto.conf" \
+      '[ "$(pg_x kl-pg "SELECT setting::int BETWEEN 1 AND 60 FROM pg_settings WHERE name = '"'archive_timeout'"'")" = t ] && docker exec kl-pg grep -Eq "^archive_timeout" /var/lib/postgresql/data/postgresql.auto.conf'
+
+    info "Part 2: The real incident"
+    n=$(cat "$KL_STATE/deleted.n")
+    check "kl-pitr is running" 'c_running kl-pitr'
+    check_eq "kl-pitr has the 600 shipments that existed before the DELETE, the $n deleted ones included" \
+      "$(pg_x kl-pitr "SELECT count(*) || chr(47) || max(id) || chr(47) || count(*) FILTER (WHERE carrier = 'elta') FROM shipments" 2>/dev/null)" "600/600/$n"
+    check_eq "kl-pitr has none of the deliveries made after the DELETE" "$(pg_x kl-pitr "SELECT count(*) FROM shipments WHERE status = 'delivered'" 2>/dev/null)" 0
+    check_eq "kl-pitr is read-only, paused at the target" "$(pg_x kl-pitr 'SELECT pg_is_in_recovery()' 2>/dev/null)" t
+    check "kl-pg is running" 'c_running kl-pg'
+    check_eq "kl-pg has every shipment, with every change made after the DELETE" \
+      "$(pg_x kl-pg "SELECT count(*) || ' ' || md5(string_agg(s::text, '|' ORDER BY id)) FROM shipments s" 2>/dev/null)" "$(cat "$KL_STATE/expected")"
+
+    info "Part 3: The standby"
+    check_eq "kl-replica is the original container, still a standby" \
+      "$(docker inspect -f '{{.Id}}' kl-replica 2>/dev/null):$(pg_x kl-replica 'SELECT pg_is_in_recovery()' 2>/dev/null)" "$(cat "$KL_STATE/replica-id"):t"
+    st=$(pg_x kl-pg "SELECT count(*) FROM pg_stat_replication r JOIN pg_replication_slots s ON s.active_pid = r.pid WHERE r.usename = 'replicator' AND s.slot_name = 'replica_slot'" 2>/dev/null)
+    if [ "${st:-0}" = 1 ] && m=$(probe); then
+      check "kl-replica streams as replicator through replica_slot, and a write on kl-pg reaches it" \
+        "eventually 30 '[ \"\$(pg_x kl-replica \"SELECT count(*) FROM kl_probe WHERE m = '\''$m'\''\")\" = 1 ]'"
+    else
+      fail "kl-replica streams as replicator through replica_slot, and a write on kl-pg reaches it"
+    fi
+    check "max_slot_wal_keep_size is 1 GB or less and saved in postgresql.auto.conf" \
+      '[ "$(pg_x kl-pg "SELECT setting::bigint BETWEEN 1 AND 1024 FROM pg_settings WHERE name = '"'max_slot_wal_keep_size'"'")" = t ] && docker exec kl-pg grep -Eq "^max_slot_wal_keep_size" /var/lib/postgresql/data/postgresql.auto.conf'
+  solve: |
+    psql_in() { local c=$1; shift; docker exec -i "$c" psql -h 127.0.0.1 -U lab -d lab -v ON_ERROR_STOP=1 -qAt "$@"; }
+
+    # --- part 1: The archive ---
+    psql_in kl-pg -c "ALTER SYSTEM SET archive_command = 'test ! -f /archive/%f && cp %p /archive/%f'" \
+      -c "ALTER SYSTEM SET archive_timeout = '60s'" -c 'SELECT pg_reload_conf()' >/dev/null
+    for i in $(seq 90); do
+      [ "$(docker exec kl-pg sh -c 'ls /var/lib/postgresql/data/pg_wal/archive_status | grep -c "ready$"')" = 0 ] && break
+      sleep 1
+    done
+
+    # --- part 2: The real incident ---
+    T=$(sed -n 's/.*`\(20[0-9-]* [0-9:]*\) UTC`.*/\1/p' /lab/INCIDENT.md | head -1)
+    docker run --rm -v kl-backup:/backup -v kl-pitr-data:/var/lib/postgresql/data postgres:16-alpine sh -c "
+      cd /var/lib/postgresql/data &&
+      tar xzf /backup/base/base.tar.gz &&
+      tar xzf /backup/base/pg_wal.tar.gz -C pg_wal &&
+      touch recovery.signal &&
+      echo \"restore_command = 'cp /archive/%f %p'\" >> postgresql.auto.conf &&
+      echo \"recovery_target_time = '$T+00'\" >> postgresql.auto.conf"
+    docker run -d --name kl-pitr -v kl-pitr-data:/var/lib/postgresql/data -v kl-archive:/archive:ro postgres:16-alpine >/dev/null
+    for i in $(seq 60); do
+      [ "$(psql_in kl-pitr -c 'SELECT pg_get_wal_replay_pause_state()' 2>/dev/null)" = paused ] && break
+      sleep 2
+    done
+    psql_in kl-pitr -c 'COPY shipments TO STDOUT' > /lab/before.copy
+    psql_in kl-pg -c 'CREATE TEMP TABLE before (LIKE shipments)' -c 'COPY before FROM STDIN' \
+      -c 'INSERT INTO shipments SELECT * FROM before b WHERE NOT EXISTS (SELECT 1 FROM shipments s WHERE s.id = b.id)' \
+      < /lab/before.copy
+
+    # --- part 3: The standby ---
+    pw=$(cat /lab/secrets/replicator.password)
+    psql_in kl-replica -c "ALTER SYSTEM SET primary_conninfo = 'host=kl-pg port=5432 user=replicator password=$pw application_name=replica'" \
+      -c 'SELECT pg_reload_conf()' >/dev/null
+    psql_in kl-pg -c "ALTER SYSTEM SET max_slot_wal_keep_size = '1GB'" -c 'SELECT pg_reload_conf()' >/dev/null
+    for i in $(seq 30); do
+      [ "$(psql_in kl-pg -c "SELECT count(*) FROM pg_stat_replication WHERE usename = 'replicator' AND state = 'streaming'")" = 1 ] && break
+      sleep 1
+    done

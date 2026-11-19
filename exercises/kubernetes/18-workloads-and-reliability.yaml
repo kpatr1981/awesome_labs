@@ -810,3 +810,272 @@ exercises:
             emptyDir: {}
     EOF
     kubectl -n init1 rollout status deploy portal --timeout=150s
+
+# ===== Capstone: a real-world lab =====
+
+- id: k8s-371
+  title: "Capstone: checkout failed the game day"
+  difficulty: 5
+  kind: fix
+  tags: [capstone, incident, probes, startupprobe, readinessprobe, livenessprobe, oomkilled, qos, resources, initcontainers, termination, prestop, graceperiod, pdb]
+  tutorial: |
+    **Concept.** A pod that never becomes Ready can be failing at several layers at once, and
+    each layer hides the next one. Work through them in the order the kubelet does:
+
+    1. **Init containers.** Nothing else starts until every init container has exited 0. An
+       init container killed by its memory limit shows `Init:OOMKilled` or
+       `Init:CrashLoopBackOff`; `kubectl describe pod` gives the last state (`OOMKilled`, exit
+       code 137) and the limit it hit.
+    2. **Start-up.** A liveness probe that fires before the application listens restarts it
+       forever. A `startupProbe` holds liveness and readiness back until it has succeeded once,
+       with its own budget of `failureThreshold × periodSeconds`, so the liveness probe can stay
+       strict.
+    3. **Readiness.** A probe that asks a path the application doesn't serve keeps the pod out
+       of its Service's endpoints, even though nothing restarts.
+    4. **Shutdown.** On deletion the kubelet runs the `preStop` hook, then sends SIGTERM, all
+       within `terminationGracePeriodSeconds`. If the hook needs longer than the grace period,
+       the container is killed in the middle of it.
+    5. **Guarantees.** A pod is **Guaranteed** only if every container, init containers
+       included, has CPU and memory limits equal to its requests. Guaranteed pods are the last
+       to be evicted under node pressure.
+    6. **Disruption budgets.** A PodDisruptionBudget only protects the pods its selector
+       matches: `expectedPods: 0` means it protects nothing, and `disruptionsAllowed` tells you
+       what a drain may take.
+
+    Fix one layer, look again: the next problem only shows once the previous one is gone.
+
+    **Read up on:**
+    - `kubectl describe pod` — init container state, `Last State`, probe failure events
+    - `kubectl explain pod.spec.containers.startupProbe`, `kubectl explain pod.spec.containers.readinessProbe.httpGet`
+    - `kubectl explain pod.spec.containers.lifecycle.preStop`, `kubectl explain pod.spec.terminationGracePeriodSeconds`
+    - Kubernetes docs: Pod Quality of Service Classes (init containers count)
+    - `kubectl get pdb`, `kubectl explain poddisruptionbudget.spec`
+    - `kubectl get endpointslices -l kubernetes.io/service-name=NAME`
+  scenario: |
+    **REL-311**, from the reliability team: *"Game day went badly. We restarted `checkout`
+    and it never came back; we drained a node and the budget didn't protect anything; and the
+    load balancer logs show requests cut off while pods were shutting down. Please fix it for
+    real, before Black Friday."*
+
+    Namespace **`checkout`** runs Deployment **`checkout`** (3 replicas, on node01), Service
+    **`checkout`** and the PodDisruptionBudget **`checkout-pdb`**. The nginx configuration
+    (ConfigMap `checkout-conf`, leave it as it is) answers **`/healthz`** and **`/ready`** on
+    port **80**. The app container **`app`** takes up to 20 seconds to boot before nginx
+    listens.
+
+    1. **The price-cache warm-up.** The init container **`warm`** loads a 30 MB price cache
+       into memory and never gets to the end. Make it complete in every pod. It keeps a
+       memory limit, and its command stays as it is.
+    2. **Booting without being killed.** `app` is restarted before it finishes booting. Keep
+       its liveness probe as strict as it is (an HTTP probe of `/healthz` on port 80 that
+       detects a hang within **15 seconds**), and give the boot up to **60 seconds**, checked
+       at least every **5 seconds**. The app command stays as it is.
+    3. **Traffic for ready pods.** The readiness probe must stay an HTTP probe and check
+       **`/ready`** on port 80. All **3** pods must be Ready, without restarts, and behind the
+       Service.
+    4. **Guaranteed.** Platform policy for checkout: every pod has the QoS class
+       **Guaranteed**.
+    5. **A budget that protects.** `checkout-pdb` must cover the 3 checkout pods and allow
+       **exactly one** of them to be disrupted at a time. Keep its name.
+    6. **A clean shutdown.** The `preStop` hook deregisters the pod from the load balancer,
+       which takes 12 seconds, and then writes a marker for it on node01. Give every deleted
+       pod the time to finish that hook, but no more than **2 minutes**. Don't change the
+       hook. (The check deletes a pod to test it, last.)
+  hints:
+    - "Peel the layers off one by one with `kubectl -n checkout describe pod`: first the init container's last state, then the probe events of `app`."
+    - "1: Exit code 137 with `OOMKilled`: a 30 MB string in a shell needs well above 30 MiB. 256Mi is plenty."
+    - "2: Don't slow down the liveness probe; add a `startupProbe` (same `/healthz` check) with `periodSeconds` at most 5 and `periodSeconds × failureThreshold` of at least 60."
+    - "3: Compare the readiness probe's path with what the ConfigMap serves. 4: Guaranteed means requests equal limits for CPU **and** memory in every container, `warm` included."
+    - "5: `kubectl -n checkout get pdb checkout-pdb -o yaml` against `kubectl -n checkout get pods --show-labels`. With 3 pods, allowing one disruption means `minAvailable: 2` or `maxUnavailable: 1`."
+    - "6: The grace period covers the preStop hook too: it must be longer than the hook's 12 seconds."
+  solution: |
+    The layers, in the order they show up:
+
+    1. `warm` is OOMKilled: its limit is 16Mi.
+    2. Once it completes, `app` is killed by its liveness probe while it boots: it needs a
+       startup probe.
+    3. Once it runs, it never becomes Ready: the readiness probe asks `/readyz`.
+    4. Guaranteed needs requests = limits for CPU and memory in `warm` and `app`.
+    5. The budget selects `app=checkout-api`, which matches nothing.
+    6. The preStop hook takes 12 s, the grace period is 5 s.
+
+    One patch for the Deployment, so there is only one rollout:
+
+    ```bash
+    kubectl -n checkout patch deploy checkout --type=strategic -p '{"spec":{"template":{"spec":{
+      "terminationGracePeriodSeconds":30,
+      "initContainers":[{"name":"warm",
+        "resources":{"requests":{"cpu":"200m","memory":"256Mi"},"limits":{"cpu":"200m","memory":"256Mi"}}}],
+      "containers":[{"name":"app",
+        "resources":{"requests":{"cpu":"100m","memory":"64Mi"},"limits":{"cpu":"100m","memory":"64Mi"}},
+        "readinessProbe":{"httpGet":{"path":"/ready","port":80},"periodSeconds":3},
+        "startupProbe":{"httpGet":{"path":"/healthz","port":80},"periodSeconds":2,"failureThreshold":40}}]}}}}'
+    kubectl -n checkout rollout status deploy checkout --timeout=300s
+    ```
+
+    And the budget:
+
+    ```bash
+    kubectl -n checkout patch pdb checkout-pdb --type=merge -p '{"spec":{"selector":{"matchLabels":{"app":"checkout"}}}}'
+    kubectl -n checkout get pdb checkout-pdb   # ALLOWED DISRUPTIONS 1
+    ```
+  setup_worker: |
+    mkdir -p /var/tmp/kl-drain
+    on_reset 'rm -rf /var/tmp/kl-drain'
+  setup: |
+    NS=checkout
+    k_ns $NS
+    boot=$((RANDOM % 7 + 12))
+    sed "s/__BOOT__/$boot/" <<'EOF' | kapply
+    apiVersion: v1
+    kind: ConfigMap
+    metadata: {name: checkout-conf, namespace: checkout}
+    data:
+      default.conf: |
+        server {
+          listen 80;
+          default_type text/plain;
+          location = /healthz { return 200 'ok'; }
+          location = /ready { return 200 'ready'; }
+          location / { return 200 'checkout'; }
+        }
+    ---
+    apiVersion: apps/v1
+    kind: Deployment
+    metadata: {name: checkout, namespace: checkout}
+    spec:
+      replicas: 3
+      selector: {matchLabels: {app: checkout}}
+      template:
+        metadata: {labels: {app: checkout}}
+        spec:
+          nodeSelector: {kubernetes.io/hostname: node01}
+          terminationGracePeriodSeconds: 5
+          initContainers:
+          - name: warm
+            image: busybox:1.37
+            command: ["sh", "-c"]
+            args:
+            - |
+              x=$(head -c 30000000 /dev/zero | tr '\0' a)
+              echo "price cache warmed: ${#x} bytes"
+            resources:
+              requests: {memory: 8Mi}
+              limits: {memory: 16Mi}
+          containers:
+          - name: app
+            image: nginx:1.27-alpine
+            command: ["sh", "-c", "echo booting; sleep __BOOT__; exec nginx -g 'daemon off;'"]
+            ports: [{containerPort: 80}]
+            volumeMounts:
+            - {name: conf, mountPath: /etc/nginx/conf.d/default.conf, subPath: default.conf}
+            - {name: drain, mountPath: /drain}
+            readinessProbe:
+              httpGet: {path: /readyz, port: 80}
+              periodSeconds: 3
+            livenessProbe:
+              httpGet: {path: /healthz, port: 80}
+              initialDelaySeconds: 2
+              periodSeconds: 3
+              failureThreshold: 2
+            lifecycle:
+              preStop:
+                exec:
+                  command: ["sh", "-c", "sleep 12; echo drained > /drain/$(hostname)"]
+          volumes:
+          - name: conf
+            configMap: {name: checkout-conf}
+          - name: drain
+            hostPath: {path: /var/tmp/kl-drain, type: DirectoryOrCreate}
+    ---
+    apiVersion: v1
+    kind: Service
+    metadata: {name: checkout, namespace: checkout}
+    spec:
+      selector: {app: checkout}
+      ports: [{port: 80, targetPort: 80}]
+    ---
+    apiVersion: policy/v1
+    kind: PodDisruptionBudget
+    metadata: {name: checkout-pdb, namespace: checkout}
+    spec:
+      minAvailable: 2
+      selector: {matchLabels: {app: checkout-api}}
+    EOF
+  check: |
+    NS=checkout
+    dj() { kubectl -n $NS get deploy checkout -o json 2>/dev/null; }
+    d() { dj | jq -e "$1" >/dev/null 2>&1; }
+    # cur_pods -> Running pods of the Deployment's current revision
+    cur_pods() {
+      local rev h
+      rev=$(dj | jq -r '.metadata.annotations["deployment.kubernetes.io/revision"] // empty')
+      [ -n "$rev" ] || return 0
+      h=$(kubectl -n $NS get rs -l app=checkout -o json 2>/dev/null | jq -r --arg r "$rev" '.items[] | select(.metadata.annotations["deployment.kubernetes.io/revision"] == $r) | .metadata.labels["pod-template-hash"]' | head -1)
+      [ -n "$h" ] || return 0
+      kubectl -n $NS get pods -l "app=checkout,pod-template-hash=$h" -o json 2>/dev/null |
+        jq -r '.items[] | select(.metadata.deletionTimestamp == null and .status.phase == "Running") | .metadata.name'
+    }
+    APP='.spec.template.spec.containers[] | select(.name == "app")'
+    WARM='.spec.template.spec.initContainers[]? | select(.name == "warm")'
+
+    info "1. The price-cache warm-up"
+    warm_ok() { d "$WARM"' | (.resources.limits.memory // "") as $m | $m != "" and $m != "16Mi"'; }
+    check "warm keeps a memory limit, raised above 16Mi" warm_ok
+    check "warm's command is unchanged" 'd "$WARM"" | (.command + (.args // [])) | join(\" \") | contains(\"head -c 30000000\")"'
+
+    info "2. Booting without being killed"
+    start_ok() { d "$APP"' | .startupProbe != null and (.startupProbe.periodSeconds // 10) <= 5 and (.startupProbe.periodSeconds // 10) * (.startupProbe.failureThreshold // 3) >= 60'; }
+    live_ok() { d "$APP"' | .livenessProbe.httpGet.path == "/healthz" and (.livenessProbe.httpGet.port | tostring) == "80" and (.livenessProbe.periodSeconds // 10) * (.livenessProbe.failureThreshold // 3) <= 15'; }
+    check "app has a startup probe: at most every 5 s, at least 60 s of boot" start_ok
+    check "the liveness probe still checks /healthz on 80 within 15 s" live_ok
+    check "app's command is unchanged" 'd "$APP"" | .command | join(\" \") | contains(\"exec nginx\")"'
+
+    info "3. Traffic for ready pods"
+    ready_ok() { d "$APP"' | .readinessProbe.httpGet.path == "/ready" and (.readinessProbe.httpGet.port | tostring) == "80"'; }
+    check "the readiness probe is an HTTP check of /ready on port 80" ready_ok
+    if warm_ok && start_ok && ready_ok; then
+      wait_deploy $NS checkout 240
+    fi
+    P=$(cur_pods)
+    check "3 checkout pods are Ready" '[ "$(kj -n $NS deploy checkout "{.spec.replicas}")" = 3 ] && deploy_ready $NS checkout'
+    check "no restarts in the running pods" '[ -n "$P" ] && for p in $P; do [ "$(restarts $NS "$p")" = 0 ] || exit 1; done'
+    check "warm finished its 30 MB in every pod" '[ -n "$P" ] && for p in $P; do kubectl -n $NS logs "$p" -c warm | grep -q "warmed: 30000000 bytes" || exit 1; done'
+    behind() { [ "$(kubectl -n $NS get endpointslices -l kubernetes.io/service-name=checkout -o json | jq '[.items[].endpoints[]? | select(.conditions.ready == true)] | length')" = 3 ]; }
+    deploy_ready $NS checkout && eventually 20 behind
+    check "the Service sends traffic to all 3 pods" behind
+
+    info "4. Guaranteed"
+    check "every checkout pod is Guaranteed" '[ -n "$P" ] && for p in $P; do [ "$(kj -n $NS pod "$p" "{.status.qosClass}")" = Guaranteed ] || exit 1; done'
+
+    info "5. A budget that protects"
+    pdb() { kubectl -n $NS get pdb checkout-pdb -o json 2>/dev/null; }
+    covers() { pdb | jq -e '.status.expectedPods == 3 and .status.disruptionsAllowed == 1' >/dev/null 2>&1; }
+    deploy_ready $NS checkout && eventually 30 covers
+    check_eq "checkout-pdb sees the 3 checkout pods" "$(pdb | jq -r '.status.expectedPods // 0')" 3
+    check_eq "it allows exactly one disruption" "$(pdb | jq -r '.status.disruptionsAllowed // 0')" 1
+
+    info "6. A clean shutdown"
+    tg=$(kj -n $NS deploy checkout '{.spec.template.spec.terminationGracePeriodSeconds}')
+    check "the grace period covers the 12 s hook, and is at most 120 s" '[ "${tg:-30}" -ge 15 ] && [ "${tg:-30}" -le 120 ]'
+    check "the preStop hook is unchanged" 'd "$APP"" | .lifecycle.preStop.exec.command | join(\" \") | contains(\"sleep 12\") and contains(\"/drain/\")"'
+    drain_test() {
+      local p
+      p=$(cur_pods | head -1)
+      [ -n "$p" ] || return 1
+      on_node01 "rm -f /var/tmp/kl-drain/$p"
+      kubectl -n $NS delete pod "$p" --wait=true --timeout=90s >/dev/null 2>&1
+      on_node01 "test -f /var/tmp/kl-drain/$p"
+    }
+    check "a deleted pod finishes its preStop hook" '[ "${tg:-30}" -ge 15 ] && deploy_ready $NS checkout && drain_test'
+  solve: |
+    kubectl -n checkout patch deploy checkout --type=strategic -p '{"spec":{"template":{"spec":{
+      "terminationGracePeriodSeconds":30,
+      "initContainers":[{"name":"warm",
+        "resources":{"requests":{"cpu":"200m","memory":"256Mi"},"limits":{"cpu":"200m","memory":"256Mi"}}}],
+      "containers":[{"name":"app",
+        "resources":{"requests":{"cpu":"100m","memory":"64Mi"},"limits":{"cpu":"100m","memory":"64Mi"}},
+        "readinessProbe":{"httpGet":{"path":"/ready","port":80},"periodSeconds":3},
+        "startupProbe":{"httpGet":{"path":"/healthz","port":80},"periodSeconds":2,"failureThreshold":40}}]}}}}'
+    kubectl -n checkout patch pdb checkout-pdb --type=merge -p '{"spec":{"selector":{"matchLabels":{"app":"checkout"}}}}'
+    kubectl -n checkout rollout status deploy checkout --timeout=300s

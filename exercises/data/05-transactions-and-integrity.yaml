@@ -622,3 +622,355 @@ exercises:
     \endif
     COMMIT;
     EOF
+
+# ===== Capstone: a real-world lab =====
+
+- id: data-095
+  title: "Capstone: the customers who were charged twice"
+  difficulty: 5
+  kind: fix
+  tags: [capstone, postgres, transaction, locks, idempotency, on-conflict, skip-locked, constraint, exclusion, deadlock, concurrency]
+  tutorial: |
+    **Concept.** "Charged twice" is rarely one bug. It is a retry that wasn't idempotent, two
+    workers that grabbed the same job, a row that was inserted twice, and a lock that someone
+    forgot about. Every fix in this lab closes a gap between *deciding* and *writing*, either
+    by letting one statement do both, by taking locks in a fixed order, or by letting a
+    constraint refuse what must never exist.
+
+    **The forgotten lock.** A session that is *idle in transaction* holds every lock it took
+    until it ends. `ALTER TABLE` and even a `DELETE` of the rows it touched queue behind it.
+    `pg_stat_activity` (`state`, `application_name`, `xact_start`) and `pg_blocking_pids()`
+    show who it is; `pg_terminate_backend()` ends it and **rolls its work back**. End that
+    session, not every idle one.
+
+    **Idempotent writes.** A webhook can arrive twice, even at the same moment. A unique key
+    makes the second insert collide; `ON CONFLICT DO NOTHING` turns the collision into a
+    no-op. But a *follow-up* statement that runs anyway (crediting the invoice) still counts
+    the retry. `INSERT ... RETURNING` inside a `WITH` clause feeds only the rows that were
+    really inserted into the next statement, all in one atomic statement.
+
+    **Claiming work.** "Pick some rows, then update them" lets two workers pick the same rows.
+    Doing the pick in the same statement as the update, with `FOR UPDATE SKIP LOCKED`, lets
+    each worker skip what another has already locked.
+
+    **Rules that hold under concurrency.** An exclusion constraint (`EXCLUDE USING gist`)
+    refuses a row that overlaps an existing one under the operators you choose, for example
+    the same customer and an overlapping period; integer equality inside GiST needs
+    `btree_gist`. A `CHECK` constraint refuses a negative balance whichever client writes it,
+    and the failed statement aborts its whole transaction.
+
+    **Deadlocks.** Two transactions that lock the same two rows in opposite orders can each
+    wait for the other. PostgreSQL aborts one of them. The cure is to take the locks in one
+    global order, for instance with `SELECT ... ORDER BY id FOR UPDATE` before the updates.
+
+    **Read up on:**
+    - `pg_stat_activity`, `pg_blocking_pids()`, `pg_terminate_backend()`, "idle in transaction"
+    - `DELETE ... USING` for duplicates; `ALTER TABLE ... ADD CONSTRAINT ... UNIQUE`
+    - `INSERT ... ON CONFLICT DO NOTHING`, `RETURNING`, and data-modifying statements in `WITH`
+    - psql variables: `-v name=value`, `:name`, `:'name'`; `-v ON_ERROR_STOP=1` and exit codes
+    - `UPDATE ... FROM`, `SELECT ... FOR UPDATE SKIP LOCKED`
+    - `tstzrange`, `&&`, `EXCLUDE USING gist (col WITH =, period WITH &&)`, `CREATE EXTENSION btree_gist`
+    - Deadlocks and lock ordering (PostgreSQL docs, "Explicit Locking"); `CHECK` constraints
+  scenario: |
+    **Ticket PAY-2210**, from Dimitra (head of payments), priority **urgent**:
+
+    > Since Monday some customers have been charged twice, a few subscriptions were billed
+    > for overlapping months, and the store-credit service keeps dying with "deadlock
+    > detected". Support is drowning. Please fix the data and the scripts so it can't happen
+    > again.
+
+    PostgreSQL runs in **`kl-pg`** (`docker exec -it kl-pg psql -U lab -d lab`). The billing
+    scripts are run like this (each variable is passed with `-v`):
+
+    ```bash
+    docker exec -i kl-pg psql -h 127.0.0.1 -U lab -d lab -v ON_ERROR_STOP=1 \
+      -v ref=ch_abc -v inv=7 -v amount=12.50 < /lab/record-payment.sql
+    ```
+
+    Keep each script's name and variables.
+
+    ## Part 1: The session that holds everything
+
+    1. A session with `application_name` **`billing-migration`** started a change this
+       morning and was left open. **End that session, and only that one**: the two
+       **`api-pool`** connections must stay connected. Its half-done change must **not** be
+       kept.
+
+    ## Part 2: Webhooks that arrive twice
+
+    The payment provider retries its webhooks, and **`payments`** recorded some of them twice
+    (same `provider_ref`). Each retry also credited the invoice again
+    (`invoices.paid_amount`).
+
+    2. Delete the duplicate payments, **keeping the lowest `id`** of each `provider_ref`;
+       make every invoice's **`paid_amount` equal the sum of its remaining payments**; and
+       make the database **refuse a second payment with the same `provider_ref`**.
+    3. Fix **`/lab/record-payment.sql`** (variables `ref`, `inv`, `amount`), which inserts the
+       payment and credits the invoice. When the **same webhook is delivered twice at the same
+       moment**, both runs must **succeed** (exit code 0), and there must be **one** payment and
+       **one** credit on the invoice.
+
+    ## Part 3: Two workers, one invoice
+
+    4. **`/lab/claim-invoices.sh WORKER`** claims up to **5** invoices with `status = 'due'`
+       (lowest ids first) for one charging worker: it sets `status = 'charging'` and
+       `worker = WORKER`, and prints the claimed ids, one per line. Six workers run it at the
+       same moment, and now they charge the same invoices. Fix it so that every worker gets
+       **different** invoices and each printed id really is that worker's.
+
+    ## Part 4: Overlapping subscriptions
+
+    5. **`subscriptions (id, customer_id, plan, period)`** must never have two periods of the
+       same customer that overlap, but retries inserted some. Where a customer's periods
+       overlap, **keep the lowest `id`** and delete the rest. Then make the database
+       **refuse any overlapping period for the same customer**; back-to-back periods and other
+       customers' periods must still be accepted.
+
+    ## Part 5: Store credit
+
+    **`/lab/move-credit.sql`** (variables `from`, `to`, `amount`) moves store credit, in
+    cents, between two rows of **`wallets`** in one transaction. Between the two updates it
+    runs the fraud check, **`SELECT pg_sleep(1);`**, which must stay inside the transaction.
+
+    6. Two transfers in **opposite directions** between the same wallets, started at the same
+       moment, must **both finish** without a deadlock, with the right balances.
+    7. No wallet may ever go **below zero**: the database must refuse it, and a transfer
+       larger than the balance must **change nothing**.
+  hints:
+    - "`SELECT pid, application_name, state, xact_start FROM pg_stat_activity WHERE datname = 'lab';` Ending a session with `pg_terminate_backend(pid)` rolls back its open transaction. Try `SET lock_timeout = '2s';` before statements that might wait."
+    - "Duplicates: `DELETE FROM payments a USING payments b WHERE a.provider_ref = b.provider_ref AND a.id > b.id`. Then recompute `paid_amount` with `UPDATE invoices i SET paid_amount = coalesce((SELECT sum(amount) FROM payments p WHERE p.invoice_id = i.id), 0)`."
+    - "`ON CONFLICT DO NOTHING` alone isn't enough for `record-payment.sql`: the credit still runs for the retry. Put the insert in a `WITH ins AS (INSERT ... ON CONFLICT (provider_ref) DO NOTHING RETURNING amount)` and `UPDATE invoices ... FROM ins` in the same statement, so the credit only happens when a row was inserted. Test it by starting it twice with `&` and `wait`."
+    - "The claim script reads ids, then updates them. Do both in one statement: `WITH c AS (SELECT id FROM invoices WHERE status = 'due' ORDER BY id LIMIT 5 FOR UPDATE SKIP LOCKED) UPDATE invoices i SET ... FROM c WHERE i.id = c.id RETURNING i.id`."
+    - "Overlaps: `DELETE FROM subscriptions s USING subscriptions o WHERE s.customer_id = o.customer_id AND s.period && o.period AND s.id > o.id`. Then `CREATE EXTENSION btree_gist` and `ALTER TABLE subscriptions ADD CONSTRAINT ... EXCLUDE USING gist (customer_id WITH =, period WITH &&)`."
+    - "`move-credit.sql` locks `:from` first and `:to` second, so opposite transfers lock in opposite orders. Lock both rows in id order at the start: `SELECT id FROM wallets WHERE id IN (:from, :to) ORDER BY id FOR UPDATE;`. And `ALTER TABLE wallets ADD CONSTRAINT ... CHECK (balance >= 0)`: with `ON_ERROR_STOP` the failed debit aborts the transaction."
+  solution: |
+    ```bash
+    docker exec -i kl-pg psql -U lab -d lab -v ON_ERROR_STOP=1 <<'SQL'
+    -- Part 1: end the abandoned session; its open transaction is rolled back
+    SELECT pg_terminate_backend(pid) FROM pg_stat_activity WHERE application_name = 'billing-migration';
+
+    -- Part 2: one payment per provider_ref, invoices credited once, retries refused
+    DELETE FROM payments a USING payments b WHERE a.provider_ref = b.provider_ref AND a.id > b.id;
+    ALTER TABLE payments ADD CONSTRAINT payments_provider_ref_key UNIQUE (provider_ref);
+    UPDATE invoices i SET paid_amount = coalesce((SELECT sum(amount) FROM payments p WHERE p.invoice_id = i.id), 0);
+
+    -- Part 4: keep the first of each overlapping group, then forbid overlaps
+    DELETE FROM subscriptions s USING subscriptions o
+     WHERE s.customer_id = o.customer_id AND s.period && o.period AND s.id > o.id;
+    CREATE EXTENSION IF NOT EXISTS btree_gist;
+    ALTER TABLE subscriptions ADD CONSTRAINT subscriptions_no_overlap
+      EXCLUDE USING gist (customer_id WITH =, period WITH &&);
+
+    -- Part 5: no negative balances
+    ALTER TABLE wallets ADD CONSTRAINT wallets_balance_non_negative CHECK (balance >= 0);
+    SQL
+
+    # Part 2: insert and credit in one statement; a retry inserts nothing, so credits nothing
+    cat > /lab/record-payment.sql <<'EOF'
+    WITH ins AS (
+      INSERT INTO payments (provider_ref, invoice_id, amount) VALUES (:'ref', :inv, :amount)
+      ON CONFLICT (provider_ref) DO NOTHING
+      RETURNING invoice_id, amount
+    )
+    UPDATE invoices i SET paid_amount = i.paid_amount + ins.amount FROM ins WHERE i.id = ins.invoice_id;
+    EOF
+
+    # Part 3: pick and claim in one statement, skipping rows other workers hold
+    cat > /lab/claim-invoices.sh <<'EOF'
+    #!/bin/bash
+    # claim up to 5 due invoices for worker $1 and print their ids
+    w=$1
+    docker exec kl-pg psql -h 127.0.0.1 -U lab -d lab -qAt -c "
+      WITH c AS (SELECT id FROM invoices WHERE status = 'due' ORDER BY id LIMIT 5 FOR UPDATE SKIP LOCKED)
+      UPDATE invoices i SET status = 'charging', worker = '$w' FROM c WHERE i.id = c.id RETURNING i.id"
+    EOF
+
+    # Part 5: lock both wallets in id order before touching either
+    cat > /lab/move-credit.sql <<'EOF'
+    BEGIN;
+    SELECT id FROM wallets WHERE id IN (:from, :to) ORDER BY id FOR UPDATE;
+    UPDATE wallets SET balance = balance - :amount WHERE id = :from;
+    SELECT pg_sleep(1);
+    UPDATE wallets SET balance = balance + :amount WHERE id = :to;
+    COMMIT;
+    EOF
+    ```
+  setup: |
+    pg_start
+    pg_sql <<'SQL'
+    -- invoices 1-20 are being paid, 101-140 wait for the charging workers
+    CREATE TABLE invoices (id int PRIMARY KEY, customer_id int NOT NULL, total numeric(10,2) NOT NULL,
+                           paid_amount numeric(10,2) NOT NULL DEFAULT 0, status text NOT NULL, worker text);
+    INSERT INTO invoices (id, customer_id, total, status) SELECT g, g, 100 + g * 10, 'open' FROM generate_series(1, 20) g;
+    INSERT INTO invoices (id, customer_id, total, status) SELECT g, g - 100, 50, 'due' FROM generate_series(101, 140) g;
+    CREATE TABLE payments (id serial PRIMARY KEY, provider_ref text NOT NULL, invoice_id int NOT NULL REFERENCES invoices,
+                           amount numeric(10,2) NOT NULL, received_at timestamptz NOT NULL DEFAULT now());
+    INSERT INTO payments (provider_ref, invoice_id, amount)
+      SELECT 'ch_' || substr(md5('p' || g), 1, 12), 1 + g % 20, 10 + g % 7 + (g % 4) * 0.25 FROM generate_series(1, 40) g;
+
+    CREATE TABLE subscriptions (id serial PRIMARY KEY, customer_id int NOT NULL, plan text NOT NULL, period tstzrange NOT NULL);
+    INSERT INTO subscriptions (customer_id, plan, period)
+      SELECT c, CASE WHEN c % 3 = 0 THEN 'pro' ELSE 'basic' END,
+             tstzrange(timestamptz '2026-09-01 00:00+00' + m * interval '1 month', timestamptz '2026-09-01 00:00+00' + (m + 1) * interval '1 month')
+      FROM generate_series(1, 30) c, generate_series(0, 2) m ORDER BY c, m;
+
+    CREATE TABLE wallets (id int PRIMARY KEY, owner text NOT NULL, balance int NOT NULL);
+    INSERT INTO wallets SELECT g, 'customer-' || g, CASE WHEN g = 3 THEN 50 ELSE 1000 END FROM generate_series(1, 10) g;
+    SQL
+    # what Part 2 must come back to: the first 40 payments, each invoice credited once
+    pg_sql "SELECT string_agg(i.id || '=' || coalesce(s.t, 0)::numeric(10,2), ',' ORDER BY i.id) FROM invoices i LEFT JOIN (SELECT invoice_id, sum(amount) t FROM payments GROUP BY 1) s ON s.invoice_id = i.id" > "$KL_STATE/paid"
+    pg_sql <<'SQL'
+    -- the provider's retries, recorded and credited again
+    INSERT INTO payments (provider_ref, invoice_id, amount) SELECT provider_ref, invoice_id, amount FROM payments WHERE id % 6 = 0 ORDER BY id;
+    UPDATE invoices i SET paid_amount = s.t FROM (SELECT invoice_id, sum(amount) t FROM payments GROUP BY 1) s WHERE i.id = s.invoice_id;
+    -- subscription retries: the same month again, and an overlapping "upgrade"
+    INSERT INTO subscriptions (customer_id, plan, period)
+      SELECT customer_id, plan, period FROM subscriptions WHERE customer_id IN (3, 8, 22) AND lower(period) = '2026-11-01 00:00+00' ORDER BY customer_id;
+    INSERT INTO subscriptions (customer_id, plan, period)
+      VALUES (15, 'pro', tstzrange('2026-10-15 00:00+00', '2026-11-15 00:00+00'));
+    SQL
+
+    lab_file /lab/record-payment.sql <<'EOF'
+    -- record one payment from the provider's webhook (variables: ref, inv, amount)
+    INSERT INTO payments (provider_ref, invoice_id, amount) VALUES (:'ref', :inv, :amount);
+    UPDATE invoices SET paid_amount = paid_amount + :amount WHERE id = :inv;
+    EOF
+    lab_file /lab/claim-invoices.sh 0755 <<'EOF'
+    #!/bin/bash
+    # claim up to 5 due invoices for worker $1 and print their ids
+    w=$1
+    ids=$(docker exec kl-pg psql -h 127.0.0.1 -U lab -d lab -qAt -c "SELECT id FROM invoices WHERE status = 'due' ORDER BY id LIMIT 5" | paste -sd,)
+    [ -n "$ids" ] || exit 0
+    sleep 0.5
+    docker exec kl-pg psql -h 127.0.0.1 -U lab -d lab -qAt -c "UPDATE invoices SET status = 'charging', worker = '$w' WHERE id IN ($ids) RETURNING id"
+    EOF
+    lab_file /lab/move-credit.sql <<'EOF'
+    -- move store credit (cents) between two wallets (variables: from, to, amount)
+    BEGIN;
+    UPDATE wallets SET balance = balance - :amount WHERE id = :from;
+    SELECT pg_sleep(1);   -- the fraud check, keep it inside the transaction
+    UPDATE wallets SET balance = balance + :amount WHERE id = :to;
+    COMMIT;
+    EOF
+
+    # --- the sessions: two idle pool connections, and the abandoned migration ---
+    for _ in 1 2; do
+      docker exec -d kl-pg sh -c 'sleep 1000000 | psql "host=127.0.0.1 user=lab dbname=lab application_name=api-pool"'
+    done
+    echo "BEGIN; UPDATE subscriptions SET plan = plan || '-v2' WHERE customer_id IN (3, 15);" | docker exec -i kl-pg sh -c 'cat > /tmp/migration.sql'
+    docker exec -d kl-pg sh -c '(cat /tmp/migration.sql; sleep 1000000) | psql "host=127.0.0.1 user=lab dbname=lab application_name=billing-migration"'
+    eventually 30 '[ "$(pg_sql "SELECT count(*) FROM pg_stat_activity WHERE application_name = '\''api-pool'\''")" = 2 ] && [ "$(pg_sql "SELECT count(*) FROM pg_stat_activity WHERE application_name = '\''billing-migration'\'' AND state = '\''idle in transaction'\''")" = 1 ]'
+  check: |
+    q() { pg_sql "SET lock_timeout = '3s'; $1" 2>/dev/null; }
+    info "Part 1: The session that holds everything"
+    s=$(pg_sql "SELECT count(*) FILTER (WHERE application_name = 'billing-migration') || ':' || count(*) FILTER (WHERE application_name = 'api-pool') FROM pg_stat_activity")
+    check_eq "billing-migration was ended, both api-pool connections remain, and its change was not kept" \
+      "$s:$(q "SELECT count(*) FROM subscriptions WHERE plan LIKE '%-v2'")" "0:2:0"
+
+    info "Part 2: Webhooks that arrive twice"
+    check_eq "duplicate payments are gone, the lowest id of each was kept" "$(q "SELECT count(*) || ':' || sum(id) FROM payments")" "40:820"
+    paid=$(q "SELECT string_agg(id || '=' || paid_amount, ',' ORDER BY id) FROM invoices")
+    wrong=$(comm -3 <(tr , '\n' <<<"$paid" | LC_ALL=C sort) <(tr , '\n' <"$KL_STATE/paid" | LC_ALL=C sort) | tr -d '\t' | cut -d= -f1 | sort -u | grep -c .)
+    check_eq "every invoice's paid_amount is the sum of its payments" "$wrong invoices wrong" "0 invoices wrong"
+    check_not "a second payment with the same provider_ref is refused" \
+      'pg_sql "SET lock_timeout = '\''3s'\''; BEGIN; INSERT INTO payments (provider_ref, invoice_id, amount) SELECT provider_ref, invoice_id, 1 FROM payments ORDER BY id LIMIT 1; ROLLBACK" 2>/dev/null'
+    rp() { timeout 30 docker exec -i kl-pg psql -h 127.0.0.1 -U lab -d lab -v ON_ERROR_STOP=1 -qAt -v "ref=$1" -v inv=20 -v amount=12.50 < /lab/record-payment.sql >/dev/null 2>&1; }
+    before=$(pg_sql "SELECT paid_amount FROM invoices WHERE id = 20")
+    ref=chk-$RANDOM$RANDOM
+    rp "$ref" & a=$!
+    rp "$ref" & b=$!
+    wait $a; ra=$?
+    wait $b; rb=$?
+    got=$(q "SELECT (SELECT count(*) FROM payments WHERE provider_ref = '$ref') || ':' || (paid_amount - $before) FROM invoices WHERE id = 20")
+    q "DELETE FROM payments WHERE provider_ref LIKE 'chk-%'; UPDATE invoices SET paid_amount = $before WHERE id = 20" >/dev/null
+    check_eq "the same webhook twice at once: both runs succeed, one payment, one credit" "$ra:$rb:$got" "0:0:1:12.50"
+
+    info "Part 3: Two workers, one invoice"
+    q "UPDATE invoices SET status = 'due', worker = NULL WHERE id > 100" >/dev/null
+    rm -f "$KL_STATE"/claim.*
+    for w in 1 2 3 4 5 6; do timeout 30 bash /lab/claim-invoices.sh "w$w" >"$KL_STATE/claim.w$w" 2>/dev/null & done
+    wait
+    n=$(cat "$KL_STATE"/claim.w* | grep -Ec '^[0-9]+$')
+    u=$(cat "$KL_STATE"/claim.w* | grep -E '^[0-9]+$' | sort -u | grep -c .)
+    mism=0
+    for w in 1 2 3 4 5 6; do
+      [ "$(grep -E '^[0-9]+$' "$KL_STATE/claim.w$w" | sort -n | paste -sd,)" = "$(q "SELECT string_agg(id::text, ',' ORDER BY id) FROM invoices WHERE worker = 'w$w'")" ] || mism=$((mism + 1))
+    done
+    check_eq "six workers at once claim 30 different invoices, each printed id is that worker's" \
+      "$n printed, $u different, $mism workers wrong, $(q "SELECT count(*) FROM invoices WHERE status = 'charging'") charging" "30 printed, 30 different, 0 workers wrong, 30 charging"
+
+    info "Part 4: Overlapping subscriptions"
+    check_eq "overlapping subscriptions are gone, the lowest id of each was kept" "$(q "SELECT count(*) || ':' || sum(id) FROM subscriptions")" "90:4095"
+    ins() { echo "SET lock_timeout = '3s'; BEGIN; INSERT INTO subscriptions (customer_id, plan, period) VALUES ($1, 'basic', tstzrange('$2', '$3')); ROLLBACK"; }
+    check_not "an overlapping period for the same customer is refused" 'pg_sql "$(ins 5 "2026-10-20 00:00+00" "2026-10-25 00:00+00")" 2>/dev/null'
+    check "a back-to-back period and another customer's period are accepted" \
+      'pg_sql "$(ins 5 "2026-12-01 00:00+00" "2027-01-01 00:00+00")" && pg_sql "$(ins 99 "2026-10-20 00:00+00" "2026-10-25 00:00+00")"'
+
+    info "Part 5: Store credit"
+    mc() { timeout 30 docker exec -i kl-pg psql -h 127.0.0.1 -U lab -d lab -v ON_ERROR_STOP=1 -qAt -v "from=$1" -v "to=$2" -v "amount=$3" < /lab/move-credit.sql; }
+    check "move-credit.sql still runs the fraud check inside one transaction" \
+      'grep -q "pg_sleep(1)" /lab/move-credit.sql && grep -qiw begin /lab/move-credit.sql && grep -qiw commit /lab/move-credit.sql'
+    q "UPDATE wallets SET balance = 1000 WHERE id IN (1, 2)" >/dev/null
+    mc 1 2 100 >"$KL_STATE/mc.1" 2>&1 & a=$!
+    mc 2 1 30 >"$KL_STATE/mc.2" 2>&1 & b=$!
+    wait $a; ra=$?
+    wait $b; rb=$?
+    dl=$(cat "$KL_STATE"/mc.* | grep -ci deadlock)
+    check_eq "two opposite transfers at once both finish, no deadlock, right balances" \
+      "$ra:$rb:$dl deadlocks:$(q "SELECT string_agg(balance::text, ',' ORDER BY id) FROM wallets WHERE id IN (1, 2)")" "0:0:0 deadlocks:930,1070"
+    q "UPDATE wallets SET balance = 50 WHERE id = 3; UPDATE wallets SET balance = 1000 WHERE id = 4" >/dev/null
+    mc 3 4 80 >/dev/null 2>&1
+    check_not "the database refuses a negative wallet balance" \
+      'pg_sql "SET lock_timeout = '\''3s'\''; BEGIN; UPDATE wallets SET balance = -1 WHERE id = 5; ROLLBACK" 2>/dev/null'
+    check_eq "a transfer larger than the balance changes nothing" "$(q "SELECT string_agg(balance::text, ',' ORDER BY id) FROM wallets WHERE id IN (3, 4)")" "50,1000"
+    q "UPDATE wallets SET balance = 50 WHERE id = 3; UPDATE wallets SET balance = 1000 WHERE id = 4" >/dev/null
+  solve: |
+    psql_lab() { docker exec -i kl-pg psql -h 127.0.0.1 -U lab -d lab -v ON_ERROR_STOP=1 -qAt "$@"; }
+
+    # --- part 1: The session that holds everything ---
+    psql_lab -c "SELECT pg_terminate_backend(pid) FROM pg_stat_activity WHERE application_name = 'billing-migration'" >/dev/null
+
+    # --- part 2: Webhooks that arrive twice ---
+    psql_lab <<'SQL'
+    DELETE FROM payments a USING payments b WHERE a.provider_ref = b.provider_ref AND a.id > b.id;
+    ALTER TABLE payments ADD CONSTRAINT payments_provider_ref_key UNIQUE (provider_ref);
+    UPDATE invoices i SET paid_amount = coalesce((SELECT sum(amount) FROM payments p WHERE p.invoice_id = i.id), 0);
+    SQL
+    cat > /lab/record-payment.sql <<'EOF'
+    WITH ins AS (
+      INSERT INTO payments (provider_ref, invoice_id, amount) VALUES (:'ref', :inv, :amount)
+      ON CONFLICT (provider_ref) DO NOTHING
+      RETURNING invoice_id, amount
+    )
+    UPDATE invoices i SET paid_amount = i.paid_amount + ins.amount FROM ins WHERE i.id = ins.invoice_id;
+    EOF
+
+    # --- part 3: Two workers, one invoice ---
+    cat > /lab/claim-invoices.sh <<'EOF'
+    #!/bin/bash
+    # claim up to 5 due invoices for worker $1 and print their ids
+    w=$1
+    docker exec kl-pg psql -h 127.0.0.1 -U lab -d lab -qAt -c "
+      WITH c AS (SELECT id FROM invoices WHERE status = 'due' ORDER BY id LIMIT 5 FOR UPDATE SKIP LOCKED)
+      UPDATE invoices i SET status = 'charging', worker = '$w' FROM c WHERE i.id = c.id RETURNING i.id"
+    EOF
+
+    # --- part 4: Overlapping subscriptions ---
+    psql_lab <<'SQL'
+    DELETE FROM subscriptions s USING subscriptions o
+     WHERE s.customer_id = o.customer_id AND s.period && o.period AND s.id > o.id;
+    CREATE EXTENSION IF NOT EXISTS btree_gist;
+    ALTER TABLE subscriptions ADD CONSTRAINT subscriptions_no_overlap EXCLUDE USING gist (customer_id WITH =, period WITH &&);
+    SQL
+
+    # --- part 5: Store credit ---
+    psql_lab -c "ALTER TABLE wallets ADD CONSTRAINT wallets_balance_non_negative CHECK (balance >= 0)"
+    cat > /lab/move-credit.sql <<'EOF'
+    -- move store credit (cents) between two wallets (variables: from, to, amount)
+    BEGIN;
+    SELECT id FROM wallets WHERE id IN (:from, :to) ORDER BY id FOR UPDATE;
+    UPDATE wallets SET balance = balance - :amount WHERE id = :from;
+    SELECT pg_sleep(1);   -- the fraud check, keep it inside the transaction
+    UPDATE wallets SET balance = balance + :amount WHERE id = :to;
+    COMMIT;
+    EOF

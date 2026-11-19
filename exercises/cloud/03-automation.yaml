@@ -703,3 +703,367 @@ exercises:
     EOF
     aws cloudformation create-stack --stack-name app-stack --template-body file:///lab/stack.yaml \
       --parameters ParameterKey=Env,ParameterValue="$(tr -d '[:space:]' < /lab/env.txt)"
+
+# ===== Capstone: a real-world lab =====
+
+- id: cloud-088
+  title: "Capstone: a nightly governance sweep"
+  difficulty: 5
+  kind: build
+  tags: [aws, capstone, automation, scripting, kms, ssm, parameter-store, ec2, tags, cloudwatch, alarms, sns, idempotency]
+  tutorial: |
+    **Concept.** Governance that relies on people remembering doesn't
+    last. Teams write a **sweep**: a script that runs every night, finds
+    what drifted from policy, fixes what is safe to fix, and reports what it
+    did, both as a file and as a **metric** an alarm can watch.
+
+    A good sweep is:
+
+    - **idempotent.** Running it twice changes nothing the second time, and
+      reports zero findings. Every fix is "make it so", never "do it again".
+    - **precise.** It selects exactly what policy describes and touches
+      nothing else. Tag keys are case-sensitive, terminated instances can't
+      be tagged, a name *containing* `password` is not a name *ending* in
+      `_password`, and a SecureString under someone else's key is not a
+      plain-text secret.
+    - **safe with data.** Re-encrypting a parameter keeps its value, and
+      fixing a key means enabling it, never replacing it (data encrypted
+      under it would be lost).
+    - **ordered.** Fix the key before encrypting with it.
+    - **observable.** One datapoint per run, zero included, so the alarm
+      sees "all clear" as well as "drift", and missing data (the sweep did
+      not run) is a separate decision.
+
+    Scripting pitfalls with this lab's `aws` command: it is a container
+    started with `-i`, so inside a `while read` loop it swallows the rest of
+    the loop's input (give it `</dev/null`); a variable set inside a
+    pipeline's loop is lost when the loop ends; and the script runs from
+    any directory, so every path must be absolute.
+
+    **Read up on:**
+    - `aws ec2 describe-instances --filters Name=instance-state-name,...`,
+      `create-tags` with many resources
+    - `aws ssm describe-parameters --parameter-filters Key=Path,Option=Recursive,Values=...`,
+      `put-parameter --type SecureString --key-id --overwrite`
+    - `aws kms describe-key`, `enable-key`, `get-key-rotation-status`,
+      `enable-key-rotation`
+    - `aws cloudwatch put-metric-data`, `put-metric-alarm --treat-missing-data`,
+      `get-metric-statistics`
+    - `jq -n --argjson` / `jq -R` for building the report, `mapfile`
+  scenario: |
+    The `aws` command talks to a local emulator. It runs in `/lab` and can only
+    see files under `/lab`.
+
+    **Ticket GOV-505**, from Marta (security engineering): *"Every audit we
+    find the same three things: servers nobody owns, passwords in Parameter
+    Store as plain text, and the platform key switched off by someone
+    debugging. Tom started a nightly sweep in `/lab/gov/sweep.sh` before he
+    moved teams. It only half-works. Please finish it, and wire up the
+    alarm."*
+
+    **The sweep: `/lab/gov/sweep.sh`** (executable, non-interactive, works
+    from any directory, exits **0**). In one run it must:
+
+    1. **Key.** Make sure the KMS key behind **`alias/platform`** is
+       **enabled** and has **automatic rotation** on. Never create another
+       key or point the alias elsewhere: data is encrypted under this one.
+    2. **Owners.** Tag every instance that is **not terminated** and has no
+       **`Owner`** tag with **`Owner=unassigned`**. The key is
+       case-sensitive (`owner` doesn't count). Existing owners are kept.
+    3. **Plain-text secrets.** Every parameter under **`/app/`** (at any
+       depth) whose name ends in **`_password`** or **`_secret`** and that
+       is **not** a SecureString is rewritten as a **SecureString under
+       `alias/platform`** with **exactly the same value**. Nothing else is
+       touched: not other parameters, not parameters outside `/app/`, not
+       SecureStrings that already use another key.
+    4. **Report.** Write **`/lab/gov/out/report.json`**:
+
+       ```json
+       {"untagged": ["i-..."], "encrypted": ["/app/..."], "key": "fixed", "findings": 4}
+       ```
+
+       `untagged` and `encrypted` list what **this run** changed (empty
+       lists when nothing), `key` is `"fixed"` if this run had to enable the
+       key or its rotation and `"ok"` otherwise, and `findings` is the total
+       number of fixes: one per instance, one per parameter, one for the key.
+    5. **Metric.** Publish exactly **one** datapoint per run: metric
+       **`Findings`** in namespace **`Governance`**, with the value of
+       `findings` (also when it is 0).
+    6. **Idempotent.** A run straight after another finds nothing: it
+       reports `[]`, `[]`, `"ok"`, `0` and changes nothing.
+
+    **The alarm** (set it up once; it is not part of the sweep):
+
+    7. **`governance-drift`** watches the **Maximum** of
+       `Governance`/`Findings` over **1** period of **300** seconds, goes to
+       ALARM when it is **greater than 0**, treats missing data as **not
+       breaching**, and notifies the SNS topic **`gov-alerts`**.
+
+    The check runs your sweep itself, as the lab user from `/`, against new
+    drift it creates in the account, so don't hard-code anything you see
+    there now.
+  hints:
+    - "Run Tom's script and look at what it reports and tags. Then look at the loop: `aws` is started with `docker run -i`, the loop is on the right of a pipe, and `out/` is relative to wherever you run it from."
+    - "Instances: `--filters Name=instance-state-name,Values=pending,running,stopping,stopped` drops terminated ones; `jq 'select([.Tags[]? | select(.Key == \"Owner\")] | length == 0)'` keeps those without the exact key. `mapfile -t ids < <(...)` collects the IDs in the main shell."
+    - "Parameters: `aws ssm describe-parameters --parameter-filters Key=Path,Option=Recursive,Values=/app/` gives `Name`, `Type` and `KeyId` for everything below `/app/`. Then filter on `.Type != \"SecureString\"` and `.Name | test(\"_(password|secret)$\")`."
+    - "Re-encrypt with `get-parameter --query Parameter.Value --output text`, then `put-parameter --type SecureString --key-id alias/platform --value \"$v\" --overwrite`. Do the key first."
+    - "The report: `jq -n --argjson u \"$U\" --argjson e \"$E\" --arg k \"$key\" --argjson n \"$n\" '{untagged: $u, encrypted: $e, key: $k, findings: $n}'`, where `U=$(printf '%s\\n' \"${ids[@]}\" | jq -Rsc 'split(\"\\n\") | map(select(length > 0))')`."
+    - "Test it the way the check will: run it twice from `/` (`cd / && /lab/gov/sweep.sh`). The second report must be empty, and `aws cloudwatch get-metric-statistics --namespace Governance --metric-name Findings ...` shows one sample per run."
+  solution: |
+    The draft had four bugs: `aws` (a container started with `-i`) swallowed
+    the loop's input after the first instance, `tagged+=` ran in a pipeline
+    subshell and was lost, terminated instances were included, and the report
+    path was relative. The finished sweep:
+
+    ```bash
+    cat > /lab/gov/sweep.sh <<'SH'
+    #!/bin/bash
+    # Nightly governance sweep (GOV-505): fix drift, report it, publish a metric.
+    set -uo pipefail
+    OUT=/lab/gov/out
+    mkdir -p "$OUT"
+    die() { echo "sweep: $*" >&2; exit 1; }
+
+    # 1. the platform key: enabled and rotating (fixed first, the parameters need it)
+    key=ok
+    KEY=$(aws kms describe-key --key-id alias/platform --query KeyMetadata.KeyId --output text </dev/null) || die "no alias/platform"
+    if [ "$(aws kms describe-key --key-id "$KEY" --query KeyMetadata.KeyState --output text </dev/null)" != Enabled ]; then
+      aws kms enable-key --key-id "$KEY" </dev/null || die "enable-key"
+      key=fixed
+    fi
+    if [ "$(aws kms get-key-rotation-status --key-id "$KEY" --query KeyRotationEnabled --output text </dev/null)" != True ]; then
+      aws kms enable-key-rotation --key-id "$KEY" </dev/null || die "enable-key-rotation"
+      key=fixed
+    fi
+
+    # 2. instances without an Owner tag (exact key), terminated ones excluded
+    mapfile -t ids < <(aws ec2 describe-instances --output json \
+      --filters Name=instance-state-name,Values=pending,running,stopping,stopped </dev/null \
+      | jq -r '.Reservations[].Instances[] | select([.Tags[]? | select(.Key == "Owner")] | length == 0) | .InstanceId' | sort)
+    if [ "${#ids[@]}" -gt 0 ]; then
+      aws ec2 create-tags --resources "${ids[@]}" --tags Key=Owner,Value=unassigned </dev/null || die "create-tags"
+    fi
+
+    # 3. plain-text secrets under /app/
+    mapfile -t params < <(aws ssm describe-parameters --output json \
+      --parameter-filters Key=Path,Option=Recursive,Values=/app/ </dev/null \
+      | jq -r '.Parameters[] | select(.Type != "SecureString") | select(.Name | test("_(password|secret)$")) | .Name' | sort)
+    for p in "${params[@]}"; do
+      v=$(aws ssm get-parameter --name "$p" --query Parameter.Value --output text </dev/null) || die "read $p"
+      aws ssm put-parameter --name "$p" --type SecureString --key-id alias/platform \
+        --value "$v" --overwrite </dev/null >/dev/null || die "encrypt $p"
+    done
+
+    # 4. the report and 5. the metric
+    list() { printf '%s\n' "$@" | jq -Rsc 'split("\n") | map(select(length > 0))'; }
+    n=$(( ${#ids[@]} + ${#params[@]} ))
+    [ "$key" = fixed ] && n=$((n + 1))
+    jq -n --argjson u "$(list "${ids[@]}")" --argjson e "$(list "${params[@]}")" --arg k "$key" --argjson n "$n" \
+      '{untagged: $u, encrypted: $e, key: $k, findings: $n}' > "$OUT/report.json"
+    aws cloudwatch put-metric-data --namespace Governance --metric-name Findings --value "$n" </dev/null || die "put-metric-data"
+    echo "findings: $n"
+    SH
+    chmod 755 /lab/gov/sweep.sh
+    ```
+
+    The alarm, once:
+
+    ```bash
+    TOPIC=$(aws sns list-topics --query "Topics[?ends_with(TopicArn, ':gov-alerts')].TopicArn" --output text)
+    aws cloudwatch put-metric-alarm --alarm-name governance-drift \
+      --namespace Governance --metric-name Findings --statistic Maximum \
+      --period 300 --evaluation-periods 1 --threshold 0 \
+      --comparison-operator GreaterThanThreshold --treat-missing-data notBreaching \
+      --alarm-actions "$TOPIC"
+    ```
+
+    Then run it twice from `/`: the first run fixes tonight's drift, the
+    second reports `findings: 0`.
+  setup: |
+    moto_start
+    mkdir -p /lab/gov
+
+    # --- the platform key, switched off while someone was debugging ---
+    key=$(aws kms create-key --description "platform secrets key" --query KeyMetadata.KeyId --output text)
+    aws kms create-alias --alias-name alias/platform --target-key-id "$key"
+    aws kms disable-key --key-id "$key"
+    echo "$key" > "$KL_STATE/key"
+    aws sns create-topic --name gov-alerts --query TopicArn --output text > "$KL_STATE/topic"
+
+    # --- Parameter Store ---
+    put() { aws ssm put-parameter --name "$1" --type "$2" --value "$3" >/dev/null; }
+    put /app/prod/db_host String db.prod.internal
+    put /app/prod/db_password String "pw-$RANDOM$RANDOM"
+    put /app/prod/password_policy String "min-length=16"
+    put /app/prod/api_secret SecureString "sk-$RANDOM$RANDOM"
+    put /app/staging/db_password String "pw-$RANDOM$RANDOM"
+    put /app/staging/mq/broker_secret String "mq-$RANDOM$RANDOM"
+    put /app/staging/hosts StringList "web1,web2"
+    put /legacy/db_password String "legacy-$RANDOM"
+
+    # --- the fleet ---
+    ami=$(aws ec2 describe-images --query 'Images[0].ImageId' --output text)
+    set -- $(aws ec2 run-instances --image-id "$ami" --instance-type t3.micro --count 7 --query 'Instances[].InstanceId' --output text)
+    aws ec2 create-tags --resources "$1" --tags Key=Owner,Value=alice
+    aws ec2 create-tags --resources "$2" --tags Key=Owner,Value=bob Key=Env,Value=prod
+    aws ec2 create-tags --resources "$3" --tags Key=owner,Value=carol
+    aws ec2 create-tags --resources "$4" --tags Key=Env,Value=prod
+    aws ec2 stop-instances --instance-ids "$5" >/dev/null
+    aws ec2 terminate-instances --instance-ids "$7" >/dev/null
+
+    # --- Tom's draft ---
+    lab_file /lab/gov/sweep.sh 0755 <<'EOF'
+    #!/bin/bash
+    # Nightly governance sweep (GOV-505). First draft by Tom: owners only.
+    # TODO: the platform key, Parameter Store, the Findings metric.
+    OUT=out/report.json
+    tagged=()
+
+    aws ec2 describe-instances --output text \
+      --query 'Reservations[].Instances[].[InstanceId, Tags[?Key==`Owner`] | [0].Value]' |
+    while read -r id owner; do
+      if [ "$owner" = None ]; then
+        aws ec2 create-tags --resources "$id" --tags Key=Owner,Value=unassigned
+        tagged+=("$id")
+      fi
+    done
+
+    mkdir -p out
+    printf '{"untagged": [%s]}\n' "${tagged[*]}" > "$OUT"
+    echo "tagged: ${#tagged[@]}"
+    EOF
+  check: |
+    d=/lab/gov
+    key=$(cat "$KL_STATE/key")
+    topic=$(cat "$KL_STATE/topic")
+
+    info "7. The alarm"
+    a=$(aws cloudwatch describe-alarms --alarm-names governance-drift --query 'MetricAlarms[0]' --output json 2>/dev/null)
+    check_eq "governance-drift watches the Maximum of Governance/Findings, 1 x 300 s" "$(jq -r '"\(.Namespace) \(.MetricName) \(.Statistic) \(.EvaluationPeriods) \(.Period)"' <<<"${a:-null}" 2>/dev/null)" "Governance Findings Maximum 1 300"
+    check_eq "...alarms above 0, missing data is not breaching" "$(jq -r '"\(.ComparisonOperator) \(.Threshold | floor) \(.TreatMissingData)"' <<<"${a:-null}" 2>/dev/null)" "GreaterThanThreshold 0 notBreaching"
+    check_eq "...and notifies gov-alerts" "$(jq -r --arg t "$topic" '[.AlarmActions[]? | select(. == $t)] | length' <<<"${a:-null}" 2>/dev/null)" 1
+
+    check "sweep.sh is executable" '[ -x $d/sweep.sh ]'
+    [ -x $d/sweep.sh ] || kl_finish
+    t0=$(date -u +%FT%TZ)
+    run() { rm -f $d/out/report.json; out=$(as_user "cd / && timeout 300 $d/sweep.sh" 2>&1); rc=$?; }
+    rep() { jq -c "$1" $d/out/report.json 2>/dev/null; }
+
+    # --- new drift, so the sweep has something to find ---
+    n=$RANDOM
+    ami=$(aws ec2 describe-images --query 'Images[0].ImageId' --output text)
+    set -- $(aws ec2 run-instances --image-id "$ami" --instance-type t3.micro --count 5 --query 'Instances[].InstanceId' --output text)
+    aws ec2 create-tags --resources "$2" --tags Key=owner,Value="dev-$n"
+    aws ec2 create-tags --resources "$3" --tags Key=Owner,Value="team-$n"
+    aws ec2 stop-instances --instance-ids "$4" >/dev/null
+    aws ec2 terminate-instances --instance-ids "$5" >/dev/null
+    keep=$3 gone=$5
+    p=/app/chk$n
+    put() { aws ssm put-parameter --name "$1" --type "$2" --value "$3" >/dev/null; }
+    put "$p/db_password" String "pw-$n-a"
+    put "$p/cache/token_secret" String "tk-$n-b"
+    put "$p/password_policy" String "min-length=$n"
+    put "$p/api_secret" SecureString "sk-$n-c"
+    put "/ops/chk$n/db_password" String "ops-$n-d"
+    aws kms disable-key-rotation --key-id "$key" >/dev/null 2>&1
+    aws kms disable-key --key-id "$key" >/dev/null 2>&1
+
+    # what a correct sweep must find, worked out from the account
+    want_u=$(aws ec2 describe-instances --output json | jq -c '[.Reservations[].Instances[]
+      | select(.State.Name != "terminated" and .State.Name != "shutting-down")
+      | select([.Tags[]? | select(.Key == "Owner")] | length == 0) | .InstanceId] | sort')
+    meta() { aws ssm describe-parameters --output json | jq -c '[.Parameters[] | {Name, Type, KeyId, Version}] | sort_by(.Name)'; }
+    vals() { aws ssm get-parameters-by-path --path / --recursive --with-decryption --output json | jq -c '[.Parameters[] | {(.Name): .Value}] | add'; }
+    m0=$(meta) v0=$(vals)
+    want_p=$(jq -c '[.[] | select((.Name | startswith("/app/")) and .Type != "SecureString" and (.Name | test("_(password|secret)$"))) | .Name] | sort' <<<"$m0")
+    others() { jq -c --argjson w "$want_p" '[.[] | select(.Name as $n | $w | index($n) | not)]' <<<"$1"; }
+
+    info "Night 1: new drift (instances, parameters, the key switched off)"
+    run
+    check_eq "the sweep exits 0" "$rc" 0
+    check_eq "report: untagged lists the instances it tagged" "$(rep '.untagged | sort')" "$want_u"
+    check_eq "report: encrypted lists the parameters it converted" "$(rep '.encrypted | sort')" "$want_p"
+    f1=$(( $(jq length <<<"$want_u") + $(jq length <<<"$want_p") + 1 ))
+    check_eq "report: the key was fixed, findings counted" "$(rep '[.key, .findings]')" "[\"fixed\",$f1]"
+    after=$(aws ec2 describe-instances --output json)
+    owner() { jq -r --arg i "$1" '[.Reservations[].Instances[] | select(.InstanceId == $i) | .Tags[]? | select(.Key == "Owner") | .Value][0] // ""' <<<"$after"; }
+    bad=0
+    for i in $(jq -r '.[]' <<<"$want_u"); do [ "$(owner "$i")" = unassigned ] || bad=$((bad + 1)); done
+    check_eq "2. instances without Owner are now Owner=unassigned" "$bad" 0
+    check_eq "2. existing owners are kept, terminated instances left alone" "$(owner "$keep")|$(owner "$gone")" "team-$n|"
+    m1=$(meta) v1=$(vals)
+    conv_ok() { jq -e --argjson w "$want_p" --arg k "$key" '[.[] | select(.Name as $n | $w | index($n)) | select(.Type == "SecureString" and ((.KeyId // "") | test("(alias/platform|" + $k + ")$")))] | length == ($w | length)' <<<"$m1"; }
+    check "3. converted parameters are SecureStrings under alias/platform" conv_ok
+    check "3. every parameter kept its value" '[ -n "$v0" ] && [ "$v1" = "$v0" ]'
+    check "3. no other parameter was touched" '[ "$(others "$m1")" = "$(others "$m0")" ]'
+    check_eq "1. alias/platform: same key, enabled, rotating" "$(aws kms describe-key --key-id alias/platform --query 'KeyMetadata.[KeyId,KeyState]' --output text 2>/dev/null | tr '\t' ' ') $(aws kms get-key-rotation-status --key-id "$key" --query KeyRotationEnabled --output text 2>/dev/null)" "$key Enabled True"
+
+    info "Night 2: nothing has changed since"
+    run
+    check_eq "the sweep exits 0 from / again" "$rc" 0
+    check_eq "6. it reports nothing to fix" "$(rep '[(.untagged | length), (.encrypted | length), .key, .findings]')" '[0,0,"ok",0]'
+    check "6. and changes nothing" '[ "$(meta)" = "$m1" ]'
+
+    info "5. The metric"
+    m=$(aws cloudwatch get-metric-statistics --namespace Governance --metric-name Findings \
+      --start-time "$t0" --end-time "$(date -u -d '+10 min' +%FT%TZ)" --period 3600 \
+      --statistics SampleCount Sum Maximum --output json 2>/dev/null)
+    check_eq "one Findings datapoint per run, with the run's count" "$(jq -c '[([.Datapoints[]?.SampleCount] | add), ([.Datapoints[]?.Maximum] | max), ([.Datapoints[]?.Sum] | add)] | map(. // 0 | floor)' <<<"${m:-null}" 2>/dev/null)" "[2,$f1,$f1]"
+  solve: |
+    cat > /lab/gov/sweep.sh <<'SH'
+    #!/bin/bash
+    # Nightly governance sweep (GOV-505): fix drift, report it, publish a metric.
+    set -uo pipefail
+    OUT=/lab/gov/out
+    mkdir -p "$OUT"
+    die() { echo "sweep: $*" >&2; exit 1; }
+
+    # 1. the platform key: enabled and rotating (fixed first, the parameters need it)
+    key=ok
+    KEY=$(aws kms describe-key --key-id alias/platform --query KeyMetadata.KeyId --output text </dev/null) || die "no alias/platform"
+    if [ "$(aws kms describe-key --key-id "$KEY" --query KeyMetadata.KeyState --output text </dev/null)" != Enabled ]; then
+      aws kms enable-key --key-id "$KEY" </dev/null || die "enable-key"
+      key=fixed
+    fi
+    if [ "$(aws kms get-key-rotation-status --key-id "$KEY" --query KeyRotationEnabled --output text </dev/null)" != True ]; then
+      aws kms enable-key-rotation --key-id "$KEY" </dev/null || die "enable-key-rotation"
+      key=fixed
+    fi
+
+    # 2. instances without an Owner tag (exact key), terminated ones excluded
+    mapfile -t ids < <(aws ec2 describe-instances --output json \
+      --filters Name=instance-state-name,Values=pending,running,stopping,stopped </dev/null \
+      | jq -r '.Reservations[].Instances[] | select([.Tags[]? | select(.Key == "Owner")] | length == 0) | .InstanceId' | sort)
+    if [ "${#ids[@]}" -gt 0 ]; then
+      aws ec2 create-tags --resources "${ids[@]}" --tags Key=Owner,Value=unassigned </dev/null || die "create-tags"
+    fi
+
+    # 3. plain-text secrets under /app/
+    mapfile -t params < <(aws ssm describe-parameters --output json \
+      --parameter-filters Key=Path,Option=Recursive,Values=/app/ </dev/null \
+      | jq -r '.Parameters[] | select(.Type != "SecureString") | select(.Name | test("_(password|secret)$")) | .Name' | sort)
+    for p in "${params[@]}"; do
+      v=$(aws ssm get-parameter --name "$p" --query Parameter.Value --output text </dev/null) || die "read $p"
+      aws ssm put-parameter --name "$p" --type SecureString --key-id alias/platform \
+        --value "$v" --overwrite </dev/null >/dev/null || die "encrypt $p"
+    done
+
+    # 4. the report and 5. the metric
+    list() { printf '%s\n' "$@" | jq -Rsc 'split("\n") | map(select(length > 0))'; }
+    n=$(( ${#ids[@]} + ${#params[@]} ))
+    [ "$key" = fixed ] && n=$((n + 1))
+    jq -n --argjson u "$(list "${ids[@]}")" --argjson e "$(list "${params[@]}")" --arg k "$key" --argjson n "$n" \
+      '{untagged: $u, encrypted: $e, key: $k, findings: $n}' > "$OUT/report.json"
+    aws cloudwatch put-metric-data --namespace Governance --metric-name Findings --value "$n" </dev/null || die "put-metric-data"
+    echo "findings: $n"
+    SH
+    chmod 755 /lab/gov/sweep.sh
+
+    TOPIC=$(aws sns list-topics --query "Topics[?ends_with(TopicArn, ':gov-alerts')].TopicArn" --output text)
+    aws cloudwatch put-metric-alarm --alarm-name governance-drift \
+      --namespace Governance --metric-name Findings --statistic Maximum \
+      --period 300 --evaluation-periods 1 --threshold 0 \
+      --comparison-operator GreaterThanThreshold --treat-missing-data notBreaching \
+      --alarm-actions "$TOPIC"
+
+    cd / && /lab/gov/sweep.sh && /lab/gov/sweep.sh

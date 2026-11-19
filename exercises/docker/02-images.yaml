@@ -1075,3 +1075,342 @@ exercises:
     EOF
     echo credentials.env > /lab/billing-sync/.dockerignore
     docker build --secret id=creds,src=/lab/billing-sync/credentials.env -t billing-sync:2.0 /lab/billing-sync
+
+# ===== Capstone: a real-world lab =====
+
+- id: docker-262
+  title: "Capstone: ship the ledger image"
+  difficulty: 5
+  kind: build
+  tags: [capstone, multi-stage, go, size, arg, labels, entrypoint, cmd, line-endings, user, healthcheck, dockerignore, buildkit, secrets, tag, save]
+  tutorial: |
+    **Concept.** A production image is judged on much more than "it builds". Before an image leaves the build host, a platform team usually asks the same questions, and each one is answered by a different part of the Dockerfile:
+
+    - **What is in it?** A multi-stage build compiles in a large toolchain image and copies only the finished artefacts into a small runtime base. The toolchain, the source and the build-time files stay behind in the first stage.
+    - **What never reached it?** Everything in the build context can be copied into a layer, and a file deleted in a later step is still in the earlier one. `.dockerignore` keeps files out of the context altogether, and a BuildKit **secret mount** hands a credential to one `RUN` step without writing it into any layer or into the image history.
+    - **Which version is it?** A build argument exists only while building. Promoting it to an `ENV` and a `LABEL` makes the version visible to the running process and to anyone inspecting the image. An `ARG` is scoped to the stage it is declared in.
+    - **How does it start?** `ENTRYPOINT` is the fixed part of the command and `CMD` its default arguments, so `docker run IMAGE something` swaps only the arguments. A script used as an entrypoint must be executable and start with a valid interpreter line, and invisible carriage returns break that line.
+    - **Who does it run as, and is it well?** `USER` drops root for the container's process, and any directory that process writes must belong to that user. A `HEALTHCHECK` baked into the image travels with it, but it can only call tools the runtime base actually ships.
+    - **How does it travel?** A tag is only a name for an image ID, so one image can carry its registry names without a rebuild, and `docker save` puts several names into one archive for a site without a registry.
+
+    **Read up on:**
+    - Dockerfile reference: `FROM ... AS`, `COPY --from`, `ARG` (and its scope), `ENV`, `LABEL`, `USER`, `HEALTHCHECK`, `ENTRYPOINT`, `CMD`
+    - Docker docs: 'Multi-stage builds' and 'Build secrets' (`RUN --mount=type=secret`, `docker build --secret`)
+    - Docker docs: '.dockerignore file'
+    - Go: static binaries with `CGO_ENABLED=0`; `go build -ldflags="-s -w"`
+    - `cat -A` and `sed` — find and remove carriage returns
+    - `adduser --help` in the alpine image; `chown`
+    - `docker image inspect` — `.Config.Entrypoint`, `.Config.Cmd`, `.Config.Env`, `.Config.Labels`, `.Config.Healthcheck`, `.Size`
+    - `docker tag`, `docker save -o`, and `manifest.json` inside the archive
+  scenario: |
+    **Ticket REL-318** — *from Dana (platform team), for the finance squad's `ledger` service*
+
+    > `ledger` 1.4.0 goes to the bank's air-gapped data centre on Friday. The current build
+    > in **`/lab/ledger`** is a single-stage `golang` image of several hundred MB that runs as
+    > root, and the security review stopped it: the treasury token and a developer's `.env` are
+    > baked into its layers. The entrypoint script came from a Windows laptop and the
+    > container does not even start. Please make the build production-ready.
+
+    The project: `main.go` and `go.mod` (the service, standard library only, so `go build`
+    needs no downloads), `fetch-rates.sh` (writes the FX rate table `/etc/ledger/rates.json`
+    and needs the treasury token file as its argument), `entrypoint.sh`, the `Dockerfile`,
+    `treasury.env` (the token), `.env` (local database settings), `fixtures/` (40 MB of test
+    data) and `.git/`. Read `main.go` and `entrypoint.sh` to see what the service needs at
+    run time. **Do not edit `main.go` or `fetch-rates.sh`.**
+
+    Build the image as **`ledger:1.4.0`** with
+    `docker build --build-arg VERSION=1.4.0 ... /lab/ledger` (add whatever other options your
+    Dockerfile needs). It must meet all of these:
+
+    1. **Small runtime image.** A multi-stage `/lab/ledger/Dockerfile`: compile in
+       `golang:1.24-alpine`, run on **`alpine:3.22`**. The image is **under 30 MB** and holds
+       no Go toolchain and no `.go` source.
+    2. **Versioned.** A build argument **`VERSION`** becomes the run-time environment variable
+       **`APP_VERSION`** and the label **`org.opencontainers.image.version`** (both `1.4.0`).
+    3. **Behaves like a command.** `entrypoint.sh` (as **`/entrypoint.sh`**) is the image's
+       `ENTRYPOINT` and the default `CMD` is **`serve`**, so `docker run ledger:1.4.0` starts
+       the service and `docker run --rm ledger:1.4.0 version` prints `ledger 1.4.0`. The script
+       expects the binary at `/usr/local/bin/ledger`.
+    4. **Not root.** The process runs as user **`ledger`** with UID **10001**, and
+       **`/var/lib/ledger`** (where the service keeps its journal) belongs to that user.
+    5. **Reports its own health.** A `HEALTHCHECK` in the image requests
+       `http://127.0.0.1:8080/healthz` **every 5 seconds**. Run the image as container
+       **`ledger`** on host port **8095** → 8080; it must become **healthy**.
+    6. **No secrets, no junk.** `.env`, `treasury.env`, `fixtures/` and `.git/` never reach
+       the build context. The rate table must still be built with the real treasury token,
+       but the token appears nowhere in the image, its layers or its history.
+    7. **Ready for the air gap.** Without rebuilding, the same image is also tagged
+       **`registry.acme.internal/fin/ledger:1.4.0`** and **`registry.acme.internal/fin/ledger:1.4`**,
+       and all three names are in one archive, **`/lab/dist/ledger-1.4.0.tar`**, that the
+       data centre can `docker load`.
+  hints:
+    - "Start by reading `main.go` (the files and directories it needs, its port) and `cat -A /lab/ledger/entrypoint.sh` (what ends each line?). `sed -i 's/\\r$//'` repairs the script."
+    - "Two stages: `FROM golang:1.24-alpine AS build` compiles with `CGO_ENABLED=0 go build -o /out/ledger .`; the `alpine:3.22` stage gets only the binary and `/etc/ledger/rates.json` through `COPY --from=build`. Alpine keeps the `sh` and `wget` that the entrypoint and the health check need."
+    - "A `.dockerignore` next to the Dockerfile keeps `.env`, `treasury.env`, `fixtures/` and `.git/` out of the context. The token then reaches the rates step only as a secret: `RUN --mount=type=secret,id=treasury sh fetch-rates.sh /run/secrets/treasury`, built with `--secret id=treasury,src=/lab/ledger/treasury.env`."
+    - "An `ARG` declared in one stage is not visible in the next: put `ARG VERSION` in the final stage, then `ENV APP_VERSION=$VERSION` and `LABEL org.opencontainers.image.version=$VERSION`. `ENTRYPOINT [\"/entrypoint.sh\"]` plus `CMD [\"serve\"]` gives the command behaviour."
+    - "`RUN adduser -D -H -u 10001 ledger && mkdir -p /var/lib/ledger && chown ledger /var/lib/ledger`, then `USER ledger`. `HEALTHCHECK --interval=5s --timeout=3s CMD wget -qO- http://127.0.0.1:8080/healthz || exit 1`."
+    - "Delivery: two `docker tag` commands, then `docker save -o /lab/dist/ledger-1.4.0.tar` with all three names. `tar -xOf FILE manifest.json` shows the names inside."
+  solution: |
+    Repair the entrypoint and keep the secrets and the junk out of the build context:
+
+    ```bash
+    cd /lab/ledger
+    sed -i 's/\r$//' entrypoint.sh
+    printf '.env\ntreasury.env\nfixtures/\n.git/\n' > .dockerignore
+    ```
+
+    Rewrite the Dockerfile as two stages. The token reaches the rates step as a secret
+    mount; only the binary and the rate table go into the runtime image:
+
+    ```dockerfile
+    FROM golang:1.24-alpine AS build
+    WORKDIR /src
+    COPY fetch-rates.sh ./
+    RUN --mount=type=secret,id=treasury sh fetch-rates.sh /run/secrets/treasury
+    COPY go.mod main.go ./
+    RUN CGO_ENABLED=0 go build -ldflags="-s -w" -o /out/ledger .
+
+    FROM alpine:3.22
+    RUN adduser -D -H -u 10001 ledger && mkdir -p /var/lib/ledger && chown ledger /var/lib/ledger
+    COPY --from=build /etc/ledger/rates.json /etc/ledger/rates.json
+    COPY --from=build /out/ledger /usr/local/bin/ledger
+    COPY entrypoint.sh /entrypoint.sh
+    ARG VERSION=dev
+    ENV APP_VERSION=$VERSION
+    LABEL org.opencontainers.image.version=$VERSION
+    USER ledger
+    EXPOSE 8080
+    HEALTHCHECK --interval=5s --timeout=3s --retries=3 CMD wget -qO- http://127.0.0.1:8080/healthz || exit 1
+    ENTRYPOINT ["/entrypoint.sh"]
+    CMD ["serve"]
+    ```
+
+    Build, run and check:
+
+    ```bash
+    docker build --build-arg VERSION=1.4.0 \
+      --secret id=treasury,src=/lab/ledger/treasury.env -t ledger:1.4.0 /lab/ledger
+    docker images ledger                       # well under 30 MB
+    docker run --rm ledger:1.4.0 version       # ledger 1.4.0
+    docker run -d --name ledger -p 8095:8080 ledger:1.4.0
+    docker ps                                  # (healthy) after a few seconds
+    curl localhost:8095/
+    ```
+
+    Tag for the registry and pack the delivery:
+
+    ```bash
+    docker tag ledger:1.4.0 registry.acme.internal/fin/ledger:1.4.0
+    docker tag ledger:1.4.0 registry.acme.internal/fin/ledger:1.4
+    mkdir -p /lab/dist
+    docker save -o /lab/dist/ledger-1.4.0.tar ledger:1.4.0 \
+      registry.acme.internal/fin/ledger:1.4.0 registry.acme.internal/fin/ledger:1.4
+    tar -xOf /lab/dist/ledger-1.4.0.tar manifest.json
+    ```
+
+    Why each piece matters: the old `COPY . .` put `treasury.env` and `.env` into a layer
+    (the later `rm` only hid them), the `ARG` had to be declared in the stage that uses it,
+    the shebang was `#!/bin/sh\r`, and the service's `/healthz` fails until its journal
+    directory is writable by the non-root user.
+  setup: |
+    D=/lab/ledger
+    tok="tt_$(tr -dc a-zA-Z0-9 </dev/urandom | head -c24)"
+    echo "$tok" > "$KL_STATE/token"
+    printf %s "$tok" | sha256sum | cut -c1-12 > "$KL_STATE/table"
+    tr -dc a-zA-Z0-9 </dev/urandom | head -c20 > "$KL_STATE/dbpw"
+    printf 'module ledger\n\ngo 1.24\n' | lab_file $D/go.mod
+    lab_file $D/main.go <<'EOF'
+    package main
+
+    import (
+        "encoding/json"
+        "fmt"
+        "log"
+        "net/http"
+        "os"
+    )
+
+    const journal = "/var/lib/ledger/journal.log"
+
+    type rateTable struct {
+        Table string             `json:"table"`
+        Rates map[string]float64 `json:"rates"`
+    }
+
+    func main() {
+        version := os.Getenv("APP_VERSION")
+        if version == "" {
+            version = "dev"
+        }
+        raw, err := os.ReadFile("/etc/ledger/rates.json")
+        if err != nil {
+            log.Fatalf("rate table missing: %v", err)
+        }
+        var t rateTable
+        if err := json.Unmarshal(raw, &t); err != nil {
+            log.Fatalf("rate table unreadable: %v", err)
+        }
+        // healthy only while the journal can be written
+        http.HandleFunc("/healthz", func(w http.ResponseWriter, r *http.Request) {
+            f, err := os.OpenFile(journal, os.O_APPEND|os.O_CREATE|os.O_WRONLY, 0o640)
+            if err != nil {
+                http.Error(w, "journal not writable: "+err.Error(), http.StatusInternalServerError)
+                return
+            }
+            f.Close()
+            fmt.Fprintln(w, "ok")
+        })
+        http.HandleFunc("/", func(w http.ResponseWriter, r *http.Request) {
+            fmt.Fprintf(w, "ledger %s: %d rates loaded (table %s)\n", version, len(t.Rates), t.Table)
+        })
+        port := os.Getenv("PORT")
+        if port == "" {
+            port = "8080"
+        }
+        log.Printf("ledger %s listening on :%s", version, port)
+        log.Fatal(http.ListenAndServe(":"+port, nil))
+    }
+    EOF
+    lab_file $D/fetch-rates.sh 0755 <<'EOF'
+    #!/bin/sh
+    # Fetches the FX rate table from the treasury mirror. Needs the treasury token file.
+    # (In this offline lab the table is generated here, but the token must be the real one.)
+    set -e
+    tok=$(sed -n 's/^TREASURY_TOKEN=//p' "${1:?usage: fetch-rates.sh TOKEN_FILE}")
+    [ -n "$tok" ] || { echo "fetch-rates: no TREASURY_TOKEN in $1" >&2; exit 1; }
+    id=$(printf %s "$tok" | sha256sum | cut -c1-12)
+    mkdir -p /etc/ledger
+    printf '{"table":"%s","rates":{"EUR":1.0,"USD":1.08,"GBP":0.85}}\n' "$id" > /etc/ledger/rates.json
+    echo "fetch-rates: table $id written"
+    EOF
+    printf '#!/bin/sh\r\nset -e\r\ncase "${1:-serve}" in\r\n  serve) exec /usr/local/bin/ledger ;;\r\n  version) echo "ledger ${APP_VERSION:-dev}" ;;\r\n  *) exec "$@" ;;\r\nesac\r\n' | lab_file $D/entrypoint.sh 0755
+    lab_file $D/Dockerfile <<'EOF'
+    FROM golang:1.24-alpine
+    WORKDIR /src
+    COPY . .
+    RUN sh fetch-rates.sh /src/treasury.env && rm /src/treasury.env
+    RUN go build -o /usr/local/bin/ledger .
+    EXPOSE 8080
+    CMD ["/src/entrypoint.sh", "serve"]
+    EOF
+    printf 'TREASURY_TOKEN=%s\n' "$tok" | lab_file $D/treasury.env 0600
+    printf 'DB_HOST=127.0.0.1\nDB_USER=ledger\nDB_PASSWORD=%s\n' "$(cat "$KL_STATE/dbpw")" | lab_file $D/.env 0600
+    mkdir -p $D/fixtures $D/.git
+    head -c 40M /dev/urandom > $D/fixtures/ledger-2024.dump
+    echo 'ref: refs/heads/main' > $D/.git/HEAD
+    mkdir -p /lab/dist
+    chown -R "$(lab_user):" /lab
+    (cd $D && md5sum main.go fetch-rates.sh) > "$KL_STATE/src.md5"
+  check: |
+    D=/lab/ledger; IMG=ledger:1.4.0
+    tok=$(cat "$KL_STATE/token"); tid=$(cat "$KL_STATE/table"); dbpw=$(cat "$KL_STATE/dbpw")
+    run() { timeout -s KILL 30 docker run --rm --pull never "$@"; }
+    have=0; img_exists $IMG && have=1
+
+    info "House rules"
+    check "main.go and fetch-rates.sh were not edited" '(cd $D && md5sum -c --status "$KL_STATE/src.md5")'
+    check "entrypoint.sh has Unix line endings" 'test -f $D/entrypoint.sh && ! grep -q $'"'"'\r'"'"' $D/entrypoint.sh'
+
+    info "1. Small runtime image"
+    check "image $IMG exists" '[ $have = 1 ]'
+    check "the Dockerfile is multi-stage" '[ "$(grep -ciE "^FROM " $D/Dockerfile)" -ge 2 ]'
+    size=$(docker image inspect -f '{{.Size}}' $IMG 2>/dev/null || echo 999999999)
+    mb="$((size/1024/1024)) MB"; [ $have = 1 ] || mb="no image"
+    check "$IMG is under 30 MB ($mb)" "[ $size -lt 31457280 ]"
+    check "no Go toolchain and no .go source in the image" '[ $have = 1 ] && run --entrypoint sh $IMG -c "! command -v go && ! find / -xdev -name \"*.go\" | grep -q ."'
+
+    info "2. Versioned"
+    check "the Dockerfile declares ARG VERSION" 'grep -qE "^ARG +VERSION" $D/Dockerfile'
+    check "APP_VERSION=1.4.0 in the image environment" 'docker image inspect -f "{{json .Config.Env}}" $IMG | grep -qF "\"APP_VERSION=1.4.0\""'
+    check_eq "label org.opencontainers.image.version" "$(docker image inspect -f '{{index .Config.Labels "org.opencontainers.image.version"}}' $IMG 2>/dev/null)" "1.4.0"
+
+    info "3. Behaves like a command"
+    check "ENTRYPOINT is /entrypoint.sh" 'docker image inspect -f "{{json .Config.Entrypoint}}" $IMG | grep -qF "/entrypoint.sh"'
+    check_eq "default CMD" "$(docker image inspect -f '{{json .Config.Cmd}}' $IMG 2>/dev/null)" '["serve"]'
+    v=""; [ $have = 1 ] && v=$(run $IMG version 2>&1)
+    check_eq "docker run --rm $IMG version" "$v" "ledger 1.4.0"
+
+    info "4. Not root"
+    u=""; un=""; own=""
+    if [ $have = 1 ]; then
+      u=$(run --entrypoint id $IMG -u 2>/dev/null); un=$(run --entrypoint id $IMG -un 2>/dev/null)
+      own=$(run --entrypoint stat $IMG -c %U /var/lib/ledger 2>/dev/null)
+    fi
+    check_eq "the process runs as UID" "$u" "10001"
+    check_eq "the user is called" "$un" "ledger"
+    check_eq "/var/lib/ledger belongs to" "$own" "ledger"
+
+    info "5. Reports its own health"
+    check "the image has a HEALTHCHECK on 127.0.0.1:8080/healthz" 'docker image inspect -f "{{json .Config.Healthcheck.Test}}" $IMG | grep -qF "127.0.0.1:8080/healthz"'
+    check_match "it probes every 5 seconds" "$(docker image inspect -f '{{.Config.Healthcheck.Interval}}' $IMG 2>/dev/null)" '^(5s|5000000000)$'
+    check "container ledger is running $IMG" '[ "$(c_get ledger "{{.Config.Image}}")" = $IMG ] && c_running ledger'
+    up=no; c_running ledger && eventually 10 'http_get localhost:8095/' && up=yes
+    check "localhost:8095 answers as ledger 1.4.0" '[ $up = yes ] && http_get localhost:8095/ | grep -qF "ledger 1.4.0: 3 rates loaded"'
+    h=no
+    if [ $up = yes ]; then eventually 30 '[ "$(c_get ledger "{{.State.Health.Status}}")" = healthy ]' && h=yes; fi
+    check "ledger reports healthy" '[ $h = yes ]'
+
+    info "6. No secrets, no junk"
+    T=$(mktemp -d); printf 'FROM busybox:1.37\nCOPY . /ctx\n' > $T/Dockerfile
+    ctx=""
+    if docker build -q -f $T/Dockerfile -t kl-ctx-probe $D >/dev/null 2>&1; then
+      ctx=$(run kl-ctx-probe ls -A /ctx 2>/dev/null)
+    fi
+    docker rmi -f kl-ctx-probe >/dev/null 2>&1; rm -rf $T
+    for f in .env treasury.env fixtures .git; do
+      check "$f never reaches the build context" 'grep -qx main.go <<<"$ctx" && ! grep -qxF -- "$f" <<<"$ctx"'
+    done
+    check "the rate table was built with the real treasury token" '[ $have = 1 ] && run --entrypoint cat $IMG /etc/ledger/rates.json | grep -qF "\"table\":\"$tid\""'
+    leaks=unknown
+    if [ $have = 1 ]; then
+      T=$(mktemp -d)
+      if docker save $IMG 2>/dev/null | tar -x -C $T 2>/dev/null; then
+        leaks=$(find $T -type f -exec sh -c 'zcat -f "$1" 2>/dev/null' _ {} \; | grep -acF -e "$tok" -e "$dbpw")
+      fi
+      rm -rf $T
+    fi
+    check "the token and the .env password appear nowhere in the image or its history ($leaks hits)" '[ "$leaks" = 0 ]'
+
+    info "7. Ready for the air gap"
+    id=$(docker image inspect -f '{{.Id}}' $IMG 2>/dev/null)
+    for t in 1.4.0 1.4; do
+      check_eq "registry.acme.internal/fin/ledger:$t is the same image as $IMG" "$(docker image inspect -f '{{.Id}}' registry.acme.internal/fin/ledger:$t 2>/dev/null)" "${id:-missing}"
+    done
+    m=$(tar -xOf /lab/dist/ledger-1.4.0.tar manifest.json 2>/dev/null)
+    check "the archive carries ledger:1.4.0" 'grep -qE "\"(docker\.io/library/)?ledger:1\.4\.0\"" <<<"$m"'
+    for t in 1.4.0 1.4; do
+      check "the archive carries registry.acme.internal/fin/ledger:$t" 'grep -qF "\"registry.acme.internal/fin/ledger:$t\"" <<<"$m"'
+    done
+  solve: |
+    cd /lab/ledger
+    sed -i 's/\r$//' entrypoint.sh
+    printf '.env\ntreasury.env\nfixtures/\n.git/\n' > .dockerignore
+    cat > Dockerfile <<'EOF'
+    FROM golang:1.24-alpine AS build
+    WORKDIR /src
+    COPY fetch-rates.sh ./
+    RUN --mount=type=secret,id=treasury sh fetch-rates.sh /run/secrets/treasury
+    COPY go.mod main.go ./
+    RUN CGO_ENABLED=0 go build -ldflags="-s -w" -o /out/ledger .
+
+    FROM alpine:3.22
+    RUN adduser -D -H -u 10001 ledger && mkdir -p /var/lib/ledger && chown ledger /var/lib/ledger
+    COPY --from=build /etc/ledger/rates.json /etc/ledger/rates.json
+    COPY --from=build /out/ledger /usr/local/bin/ledger
+    COPY entrypoint.sh /entrypoint.sh
+    ARG VERSION=dev
+    ENV APP_VERSION=$VERSION
+    LABEL org.opencontainers.image.version=$VERSION
+    USER ledger
+    EXPOSE 8080
+    HEALTHCHECK --interval=5s --timeout=3s --retries=3 CMD wget -qO- http://127.0.0.1:8080/healthz || exit 1
+    ENTRYPOINT ["/entrypoint.sh"]
+    CMD ["serve"]
+    EOF
+    docker build --build-arg VERSION=1.4.0 --secret id=treasury,src=/lab/ledger/treasury.env -t ledger:1.4.0 /lab/ledger
+    docker rm -f ledger >/dev/null 2>&1 || true
+    docker run -d --name ledger -p 8095:8080 ledger:1.4.0
+    docker tag ledger:1.4.0 registry.acme.internal/fin/ledger:1.4.0
+    docker tag ledger:1.4.0 registry.acme.internal/fin/ledger:1.4
+    mkdir -p /lab/dist
+    docker save -o /lab/dist/ledger-1.4.0.tar ledger:1.4.0 registry.acme.internal/fin/ledger:1.4.0 registry.acme.internal/fin/ledger:1.4

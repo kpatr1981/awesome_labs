@@ -539,3 +539,308 @@ exercises:
     check_eq "best trailing-week day" "$(tr -d '[:space:]' 2>/dev/null </lab/answer.txt)" "$(cat "$KL_STATE/answer")"
   solve: |
     docker exec kl-pg psql -h 127.0.0.1 -U lab -d lab -qAt -c "SELECT day FROM (SELECT day, row_number() OVER w AS rn, avg(amount) OVER w AS a FROM daily_sales WINDOW w AS (ORDER BY day ROWS BETWEEN 6 PRECEDING AND CURRENT ROW)) s WHERE rn >= 7 ORDER BY a DESC LIMIT 1" > /lab/answer.txt
+
+# ===== Capstone: a real-world lab =====
+
+- id: data-094
+  title: "Capstone: Black Friday readiness"
+  difficulty: 5
+  kind: fix
+  tags: [capstone, postgres, explain, index, partial, vacuum, reloptions, upsert, listen-notify, trigger, redis, hash, hyperloglog]
+  tutorial: |
+    **Concept.** A readiness review goes through every hot path of a system and fixes what
+    the load test found, without changing what the application sends. Each fix is small, but
+    each one rests on knowing how the store works underneath: what the planner can use, what
+    an index costs, what `VACUUM` leaves alone, and which Redis structure fits a job.
+
+    **An index shaped by the query and by its budget.** A multicolumn B-tree answers an
+    equality filter on its first column and returns rows already ordered by the second, so a
+    `LIMIT` query needs no `Sort`. When the query always targets a small subset (only active
+    rows), a **partial** index holds only that subset and is a fraction of the size. Every
+    index costs disk and slows writes, and `pg_stat_user_indexes.idx_scan` tells you which
+    ones were never used.
+
+    **Vacuum without a rewrite.** Plain `VACUUM` marks dead row versions reusable while the
+    table stays online. `VACUUM FULL` rewrites the whole table into a new file under an
+    exclusive lock: a fix that takes the shop down. Per-table storage parameters
+    (`reloptions`) can switch autovacuum off or make it wait so long that it never runs;
+    `ALTER TABLE ... RESET (...)` removes individual ones and leaves the rest alone.
+
+    **Counters that move between stores.** Redis hashes are a cheap place to count with
+    `HINCRBY`. A nightly job folds them into PostgreSQL with an upsert (`ON CONFLICT ... DO
+    UPDATE`), which adds to existing rows and creates new ones in one statement. Renaming the
+    hash before reading it means increments that arrive meanwhile land in a fresh key and are
+    not lost when you delete the old one.
+
+    **Exact or estimated.** A Redis set of visitor IDs gives an exact count but grows with
+    every visitor. A HyperLogLog gives the distinct count with a small standard error in at
+    most about 12 kB, whatever the number of visitors. Converting means feeding every member
+    into a new HyperLogLog and swapping it in with `RENAME`, which replaces the destination
+    whatever its type.
+
+    **Announcing changes, but only real ones.** A trigger can call `pg_notify()` for every
+    change. A `WHEN (OLD.col IS DISTINCT FROM NEW.col)` condition on the trigger keeps it
+    quiet for updates that don't change that column, including `SET col = col`.
+
+    **Read up on:**
+    - `EXPLAIN` — `Index Cond`, `Filter`, `Sort` and `Limit` nodes
+    - `CREATE INDEX ... (a, b) WHERE ...` — multicolumn partial indexes and predicate matching
+    - `pg_stat_user_indexes` (`idx_scan`), `pg_relation_size()`, `pg_size_pretty()`, `DROP INDEX`
+    - `VACUUM` versus `VACUUM FULL`; `pg_relation_filenode()`; `pg_stat_user_tables` (`n_dead_tup`, `last_vacuum`)
+    - `pg_class.reloptions`, `ALTER TABLE ... RESET (param, ...)`, `fillfactor`
+    - Redis `HGETALL`, `RENAME`, `DEL`; `INSERT ... ON CONFLICT (...) DO UPDATE` and `EXCLUDED`
+    - Redis `SMEMBERS`, `SCARD`, `PFADD`, `PFCOUNT`, `TYPE`, `MEMORY USAGE`
+    - `CREATE TRIGGER ... AFTER UPDATE ... FOR EACH ROW WHEN (...)`, `pg_notify()`, `LISTEN`
+  scenario: |
+    **Ticket PERF-1127**, from Marta (storefront lead):
+
+    > Black Friday is next Friday. Last night's load test fell over in five places, and the
+    > list is below. The application code is frozen, so everything has to be fixed in the
+    > databases. Please get it done before the go/no-go meeting.
+
+    PostgreSQL runs in **`kl-pg`** (`docker exec -it kl-pg psql -U lab -d lab`) and Redis in
+    **`kl-redis`** (`docker exec -it kl-redis redis-cli`). Don't change the application's
+    queries and don't lose any data.
+
+    ## Part 1: The category page
+
+    Every category page runs this query, and under load it is the slowest thing in the shop:
+
+    ```sql
+    SELECT id, name, price FROM products WHERE category_id = 7 AND active ORDER BY price LIMIT 24;
+    ```
+
+    (`category_id` changes, the rest doesn't). Only a small share of the 200,000
+    **`products`** are active.
+
+    1. Make its plan find the category **through an index condition** (`Index Cond` on
+       `category_id`), with **no `Sort` and no sequential scan**.
+    2. The DBA team's budget for `products`: apart from the primary key and the unique
+       constraint **`products_sku_key`** (both stay), its indexes may take **at most 1 MB in
+       total**. An index that nobody has used since it was created doesn't earn its space.
+
+    ## Part 2: The shopping carts
+
+    **`cart_items`** (60,000 rows) was bulk-updated by a migration and is full of dead rows.
+    Someone "tuned" its autovacuum settings during the migration and never put them back.
+
+    3. Clean the table up **while the shop stays online**: it must have been vacuumed, have
+       **fewer than 500 dead rows**, keep all its rows, and **not be rewritten** into a new
+       file.
+    4. Autovacuum must look after the table again: **remove every autovacuum override** on
+       it, but keep its **`fillfactor=80`**, which is there on purpose.
+
+    ## Part 3: The view counters
+
+    The website counts product views in the Redis hash **`kl:views:pending`** (field: the
+    product id, value: views since the last run). The nightly job that folds them into the
+    PostgreSQL table **`product_stats (product_id, views)`** has been failing all week.
+
+    5. Fold the counters in by hand: for a product already in `product_stats`, **add** its
+       pending views; for a new one, create the row. Afterwards **no `kl:views:*` key is
+       left** in Redis, so nothing can be counted twice.
+
+    ## Part 4: The visitor sets
+
+    The daily unique-visitor keys **`kl:visitors:2026-11-25`**, **`kl:visitors:2026-11-26`**
+    and **`kl:visitors:2026-11-27`** are Redis **sets** of visitor ids, and they have grown
+    to megabytes each. The dashboard only ever asks how many there are.
+
+    6. Turn each of them into a **HyperLogLog under the same name**, holding every visitor
+       of that day, so that `PFCOUNT` answers the dashboard and each key takes **under
+       16 kB** (`MEMORY USAGE`).
+
+    ## Part 5: The price feed
+
+    The search index has to hear about price changes as they happen.
+
+    7. Make PostgreSQL send a notification on the channel **`price_changed`** whenever a
+       product's `price` **really changes**, with the payload **`<id>:<new price>`** (for
+       example `1234:45.90`). An update that leaves the price as it was (also
+       `SET price = price`) must send **nothing**.
+  hints:
+    - "`EXPLAIN` the category query and read the plan. One index must serve both the `category_id` filter and the `ORDER BY price`, and the query only ever wants active rows, so the index can hold only those (`CREATE INDEX ... WHERE active`)."
+    - "`SELECT indexrelname, idx_scan, pg_size_pretty(pg_relation_size(indexrelid)) FROM pg_stat_user_indexes WHERE relname = 'products';` shows what each index costs and whether it was ever used."
+    - "`SELECT reloptions, pg_relation_filenode('cart_items') FROM pg_class WHERE relname = 'cart_items';` shows the overrides and the table's file. `VACUUM FULL` would give it a new file; a plain `VACUUM` doesn't. `ALTER TABLE ... RESET (a, b)` removes just the parameters you name."
+    - "Rename `kl:views:pending` to a key of your own first, then turn `HGETALL` output (`paste -d' ' - -`) into a `VALUES` list for `INSERT ... ON CONFLICT (product_id) DO UPDATE SET views = product_stats.views + EXCLUDED.views`, and finally `DEL` your key."
+    - "`PFADD` on a set fails with `WRONGTYPE`, so build the HyperLogLog under a new name: `docker exec kl-redis sh -c 'redis-cli SMEMBERS kl:visitors:2026-11-25 | xargs -n 1000 redis-cli PFADD kl:hll:tmp'`, then `RENAME kl:hll:tmp kl:visitors:2026-11-25`."
+    - "Part 5 needs a trigger function that calls `pg_notify('price_changed', NEW.id || ':' || NEW.price)` and a row trigger `AFTER UPDATE ON products ... WHEN (OLD.price IS DISTINCT FROM NEW.price)`. `UPDATE OF price` alone isn't enough: `SET price = price` still fires it."
+  solution: |
+    ```bash
+    docker exec -i kl-pg psql -U lab -d lab -v ON_ERROR_STOP=1 <<'SQL'
+    -- Part 1: a small index for the category query, and drop the one nobody uses
+    CREATE INDEX products_active_cat_price ON products (category_id, price) WHERE active;
+    DROP INDEX products_created_idx;
+
+    -- Part 2: vacuum in place, remove only the autovacuum overrides
+    VACUUM cart_items;
+    ALTER TABLE cart_items RESET (autovacuum_enabled, autovacuum_vacuum_scale_factor);
+
+    -- Part 5: notify on real price changes only
+    CREATE FUNCTION notify_price() RETURNS trigger LANGUAGE plpgsql AS $$
+    BEGIN
+      PERFORM pg_notify('price_changed', NEW.id || ':' || NEW.price);
+      RETURN NEW;
+    END $$;
+    CREATE TRIGGER products_price_changed AFTER UPDATE ON products
+      FOR EACH ROW WHEN (OLD.price IS DISTINCT FROM NEW.price) EXECUTE FUNCTION notify_price();
+    SQL
+
+    # Part 3: take the counters out of the website's way, merge them, delete them
+    docker exec kl-redis redis-cli RENAME kl:views:pending kl:views:processing
+    vals=$(docker exec kl-redis redis-cli HGETALL kl:views:processing | paste -d' ' - - \
+      | awk '{printf "%s(%s,%s)", (NR>1?",":""), $1, $2}')
+    docker exec kl-pg psql -U lab -d lab -c "INSERT INTO product_stats (product_id, views) VALUES $vals
+      ON CONFLICT (product_id) DO UPDATE SET views = product_stats.views + EXCLUDED.views"
+    docker exec kl-redis redis-cli DEL kl:views:processing
+
+    # Part 4: rebuild each set as a HyperLogLog and swap it in
+    for d in 2026-11-25 2026-11-26 2026-11-27; do
+      docker exec kl-redis sh -c "redis-cli SMEMBERS kl:visitors:$d | xargs -n 1000 redis-cli PFADD kl:hll:tmp >/dev/null"
+      docker exec kl-redis redis-cli RENAME kl:hll:tmp "kl:visitors:$d"
+    done
+    ```
+
+    `EXPLAIN` of the category query now shows `Limit` over `Index Scan using
+    products_active_cat_price` with `Index Cond: (category_id = 7)` and no `Sort`.
+  setup: |
+    pg_start
+    docker run -d --name kl-redis redis:7.4-alpine >/dev/null
+    eventually 20 '[ "$(docker exec kl-redis redis-cli ping)" = PONG ]'
+
+    # --- part 1: The category page ---
+    pg_sql <<'SQL'
+    CREATE TABLE products (id int PRIMARY KEY, sku text NOT NULL CONSTRAINT products_sku_key UNIQUE, name text NOT NULL,
+                           category_id int NOT NULL, price numeric(10,2) NOT NULL, active boolean NOT NULL, created_at timestamptz NOT NULL);
+    INSERT INTO products
+      SELECT g, 'SKU-' || g, 'Product ' || g, 1 + g % 50, round(5 + (g * 37 % 10000) / 10.0, 2), g % 19 = 0,
+             timestamptz '2024-01-01' + g * interval '3 minutes'
+      FROM generate_series(1, 200000) g;
+    CREATE INDEX products_created_idx ON products (created_at);
+    ANALYZE products;
+    SQL
+    for s in 17 4242 99999; do pg_sql "SELECT id FROM products WHERE sku = 'SKU-$s'" >/dev/null; done
+
+    # --- part 2: The shopping carts ---
+    pg_sql <<'SQL'
+    CREATE TABLE cart_items (id int PRIMARY KEY, cart_id int NOT NULL, sku text NOT NULL, qty int NOT NULL)
+      WITH (fillfactor = 80, autovacuum_enabled = false, autovacuum_vacuum_scale_factor = 0.9);
+    INSERT INTO cart_items SELECT g, g / 4, 'SKU-' || (g * 7 % 200000 + 1), 1 FROM generate_series(1, 60000) g;
+    UPDATE cart_items SET qty = qty + 1;
+    UPDATE cart_items SET qty = qty + 1;
+    UPDATE cart_items SET qty = qty + 1;
+    SQL
+    pg_sql "SELECT pg_relation_filenode('cart_items')" > "$KL_STATE/filenode"
+
+    # --- part 3: The view counters ---
+    pg_sql "CREATE TABLE product_stats (product_id int PRIMARY KEY REFERENCES products (id), views bigint NOT NULL)"
+    declare -A tot
+    vals=""
+    for id in $(seq 101 140); do
+      tot[$id]=$((RANDOM % 5000 + 100)); vals+="${vals:+,}($id,${tot[$id]})"
+    done
+    pg_sql "INSERT INTO product_stats VALUES $vals"
+    args=()
+    for id in $(seq 121 170); do
+      n=$((RANDOM % 300 + 1)); args+=("$id" "$n"); tot[$id]=$(( ${tot[$id]:-0} + n ))
+    done
+    docker exec kl-redis redis-cli HSET kl:views:pending "${args[@]}" >/dev/null
+    for id in "${!tot[@]}"; do echo "$id:${tot[$id]}"; done | sort -n | paste -sd, > "$KL_STATE/stats"
+
+    # --- part 4: The visitor sets ---
+    : > "$KL_STATE/visitors"
+    for d in 2026-11-25:18000 2026-11-26:24000 2026-11-27:31000; do
+      day=${d%%:*}
+      shuf -i 1-500000 -n "${d##*:}" | sed 's/^/v/' > "$KL_STATE/members"
+      docker exec -i kl-redis sh -c "xargs -n 1000 redis-cli SADD kl:visitors:$day >/dev/null" < "$KL_STATE/members"
+      docker exec -i kl-redis sh -c "xargs -n 1000 redis-cli PFADD kl:setup:hll >/dev/null" < "$KL_STATE/members"
+      echo "$day:$(docker exec kl-redis redis-cli PFCOUNT kl:setup:hll | tr -d '[:space:]')" >> "$KL_STATE/visitors"
+      docker exec kl-redis redis-cli DEL kl:setup:hll >/dev/null
+    done
+    rm -f "$KL_STATE/members"
+  check: |
+    info "Part 1: The category page"
+    plan=$(pg_sql "EXPLAIN SELECT id, name, price FROM products WHERE category_id = 7 AND active ORDER BY price LIMIT 24" 2>&1)
+    check "the category query finds the category through an index, with no Sort and no sequential scan" \
+      'grep -q "Index Cond: (category_id = 7)" <<<"$plan" && ! grep -Eq "Sort|Seq Scan" <<<"$plan"'
+    size=$(pg_sql "SELECT coalesce(sum(pg_relation_size(indexrelid)), 0) FROM pg_index WHERE indrelid = 'products'::regclass AND NOT indisprimary AND indexrelid <> 'products_sku_key'::regclass" 2>/dev/null)
+    keep=$(pg_sql "SELECT count(*) FROM pg_constraint WHERE conrelid = 'products'::regclass AND contype IN ('p', 'u') AND (contype = 'p' OR conname = 'products_sku_key')" 2>/dev/null)
+    check "the other indexes on products take at most 1 MB, and the primary key and products_sku_key stay" \
+      '[ "${keep:-0}" = 2 ] && [ "${size:-0}" -gt 0 ] && [ "${size:-0}" -le 1048576 ]'
+
+    info "Part 2: The shopping carts"
+    vac=$(pg_sql "SELECT (coalesce(last_vacuum, last_autovacuum) IS NOT NULL) || ':' || (n_dead_tup < 500) FROM pg_stat_user_tables WHERE relname = 'cart_items'" 2>/dev/null)
+    check_eq "cart_items was vacuumed and has fewer than 500 dead rows" "$vac" "true:true"
+    check_eq "cart_items kept its 60000 rows and was not rewritten into a new file" \
+      "$(pg_sql "SELECT pg_relation_filenode('cart_items') || ':' || (SELECT count(*) FROM cart_items)" 2>/dev/null)" "$(cat "$KL_STATE/filenode"):60000"
+    check_eq "cart_items has no autovacuum overrides left, only fillfactor=80" \
+      "$(pg_sql "SELECT coalesce(reloptions::text, '') FROM pg_class WHERE oid = 'cart_items'::regclass" 2>/dev/null)" "{fillfactor=80}"
+
+    info "Part 3: The view counters"
+    got=$(pg_sql "SELECT string_agg(product_id || ':' || views, ',' ORDER BY product_id) FROM product_stats" 2>/dev/null)
+    wrong=$(comm -3 <(tr , '\n' <<<"$got" | LC_ALL=C sort) <(tr , '\n' <"$KL_STATE/stats" | LC_ALL=C sort) | tr -d '\t' | cut -d: -f1 | sort -u | grep -c .)
+    left=$(docker exec kl-redis redis-cli --scan --pattern 'kl:views:*' | grep -c .)
+    check_eq "product_stats holds the merged totals and no kl:views:* key is left" "$wrong products wrong, $left keys left" "0 products wrong, 0 keys left"
+
+    info "Part 4: The visitor sets"
+    bad=""
+    while IFS=: read -r day want; do
+      k=kl:visitors:$day
+      t=$(docker exec kl-redis redis-cli TYPE "$k" | tr -d '[:space:]')
+      n=$(docker exec kl-redis redis-cli PFCOUNT "$k" 2>/dev/null | tr -d '[:space:]')
+      m=$(docker exec kl-redis redis-cli MEMORY USAGE "$k" | tr -d '[:space:]')
+      { [ "$t" = string ] && [ "$n" = "$want" ] && [ "${m:-99999}" -lt 16384 ]; } || bad="$bad $day"
+    done < "$KL_STATE/visitors"
+    check_eq "every visitor key is a HyperLogLog of all that day's visitors, under 16 kB" "${bad:- none wrong}" " none wrong"
+
+    info "Part 5: The price feed"
+    p=$(pg_sql "SELECT price || ' ' || (price + 1) FROM products WHERE id = 1234")
+    out=$(pg_sql 2>&1 <<'SQL'
+    LISTEN price_changed;
+    UPDATE products SET price = price + 1 WHERE id = 1234;
+    SELECT 1;
+    UPDATE products SET price = price, name = name WHERE id = 4321;
+    SELECT 2;
+    UPDATE products SET active = active WHERE id = 4321;
+    SELECT 3;
+    UPDATE products SET price = price - 1 WHERE id = 1234;
+    SELECT 4;
+    SQL
+    )
+    got=$(sed -n 's/.*"price_changed" with payload "\([^"]*\)".*/\1/p' <<<"$out" | paste -sd' ')
+    check_eq "a real price change is announced as <id>:<new price>, an unchanged price is not" "${got:-nothing}" "1234:${p#* } 1234:${p% *}"
+  solve: |
+    psql_lab() { docker exec -i kl-pg psql -h 127.0.0.1 -U lab -d lab -v ON_ERROR_STOP=1 -qAt "$@"; }
+
+    # --- part 1: The category page ---
+    psql_lab <<'SQL'
+    CREATE INDEX products_active_cat_price ON products (category_id, price) WHERE active;
+    DROP INDEX products_created_idx;
+    SQL
+
+    # --- part 2: The shopping carts ---
+    psql_lab -c "VACUUM cart_items"
+    psql_lab -c "ALTER TABLE cart_items RESET (autovacuum_enabled, autovacuum_vacuum_scale_factor)"
+
+    # --- part 3: The view counters ---
+    docker exec kl-redis redis-cli RENAME kl:views:pending kl:views:processing >/dev/null
+    vals=$(docker exec kl-redis redis-cli HGETALL kl:views:processing | paste -d' ' - - | awk '{printf "%s(%s,%s)", (NR>1?",":""), $1, $2}')
+    psql_lab -c "INSERT INTO product_stats (product_id, views) VALUES $vals ON CONFLICT (product_id) DO UPDATE SET views = product_stats.views + EXCLUDED.views"
+    docker exec kl-redis redis-cli DEL kl:views:processing >/dev/null
+
+    # --- part 4: The visitor sets ---
+    for d in 2026-11-25 2026-11-26 2026-11-27; do
+      docker exec kl-redis sh -c "redis-cli SMEMBERS kl:visitors:$d | xargs -n 1000 redis-cli PFADD kl:hll:tmp >/dev/null"
+      docker exec kl-redis redis-cli RENAME kl:hll:tmp "kl:visitors:$d" >/dev/null
+    done
+
+    # --- part 5: The price feed ---
+    psql_lab <<'SQL'
+    CREATE FUNCTION notify_price() RETURNS trigger LANGUAGE plpgsql AS $$
+    BEGIN
+      PERFORM pg_notify('price_changed', NEW.id || ':' || NEW.price);
+      RETURN NEW;
+    END $$;
+    CREATE TRIGGER products_price_changed AFTER UPDATE ON products
+      FOR EACH ROW WHEN (OLD.price IS DISTINCT FROM NEW.price) EXECUTE FUNCTION notify_price();
+    SQL

@@ -886,3 +886,385 @@ exercises:
       }
     }
     EOF
+
+# ===== Capstone: a real-world lab =====
+
+- id: net-097
+  title: "Capstone: get the package mirror ready for the build farm"
+  difficulty: 5
+  kind: fix
+  tags: [capstone, dns, dnsmasq, split-horizon, cache, haproxy, health-checks, tc, htb, shaping, netns]
+  tutorial: |
+    **Concept.** A service that hundreds of machines hit at once is only as good as the
+    weakest piece in front of it. Scaling it is rarely one big change; it is a handful of
+    small ones, each in a different layer:
+
+    - **Name resolution.** Clients find the service through DNS. A local resolver can
+      answer one name itself (the internal entry point) while forwarding everything else,
+      and its **cache** decides whether every lookup crosses a slow link or only the first.
+    - **Load balancing with health checks.** A load balancer without health checks sends
+      traffic to a server that is up but unable to serve. With them, it matters *what* you
+      check: a **liveness** endpoint says "the process runs", a **readiness** endpoint says
+      "I can serve requests now". Only the second one keeps a half-broken server out of
+      rotation, and lets it back in by itself once it recovers.
+    - **Health checks can hide mistakes.** A server that is configured wrongly (a wrong
+      port, say) is quietly marked down, and the remaining servers carry its share. Count
+      the servers that really answer, not just the errors.
+    - **Shaping.** Bulk traffic, such as a nightly sync, can starve everything else on a
+      link. A classful qdisc such as HTB caps one kind of traffic and leaves the rest alone.
+
+    Work layer by layer, from the client outwards, and test each layer from where the
+    clients really are.
+
+    **Read up on:**
+    - `dig @SERVER name`, `+short`, and the `Query time` line
+    - `man dnsmasq` — `host-record=`, `address=`, `server=` and `cache-size=`
+    - `/etc/netns/NAME/resolv.conf` — the resolver that `ip netns exec NAME` uses
+    - HAProxy `option httpchk`, `http-check send` / `http-check expect`, and the `server` options `check`, `inter`, `rise`, `fall`
+    - Liveness versus readiness probes
+    - `docker kill -s HUP NAME` — make HAProxy reload its config; `docker logs NAME` shows servers going UP and DOWN
+    - `man tc-htb` and `man tc-u32` — a capped class, a default class and a port filter
+    - `tc -s class show dev IF`
+  scenario: |
+    **Ticket BUILD-1187** (from Priya, Release Engineering): *"The build farm moves to the
+    internal package mirror on Monday. Last dry run, a third of the downloads failed and
+    every package lookup took ages. Also, the mirror's nightly sync saturated the uplink
+    and the security feed timed out. Please make it production-ready."*
+
+    Run commands inside a namespace with `sudo ip netns exec <namespace> <command>`.
+
+    ```
+    ci  (10.97.1.10) --- (10.97.1.1) lb (10.97.2.1) --- mirrors (10.97.2.11 m1, .12 m2, .13 m3)
+     |                   HAProxy, container kl-mr-lb      (10.97.3.1)
+     | (10.97.53.10)                                         |
+     |                                                    (10.97.3.2) upstream  :873 sync, :443 security feed
+    (10.97.53.1) dns (10.97.54.1) --- slow link --- (10.97.54.2) corp
+    ```
+
+    - **`ci`** is a build runner. Its resolver is **`dns`** (unit **`kl-mr-dns`**, config
+      **`/lab/mirror/resolver.conf`**), which forwards to the corporate DNS server `corp`.
+    - **`lb`** is the namespace of the HAProxy container **`kl-mr-lb`**. Its config,
+      **`/lab/mirror/lb/haproxy.cfg`**, is mounted read-only into the container.
+    - **`mirrors`** runs the three mirror nodes. How they work is described in
+      **`/lab/mirror/MIRRORS.md`**. One of them is currently broken.
+    - The sync policy is in **`/lab/mirror/sync-policy.txt`**.
+
+    Requirements:
+
+    1. **The mirror name.** Corporate DNS answers `mirror.ci.test` with the public CDN
+       address, which runners can't reach. The CI resolver must answer it with the load
+       balancer, **10.97.1.1**, and nothing else. Other names (such as `git.corp.test`)
+       still come from corporate DNS.
+    2. **Fast lookups.** Repeat lookups of corporate names such as `pypi.corp.test` from
+       `ci` must be answered without crossing the slow link. The resolver keeps forwarding
+       to `10.97.54.2`; don't touch `corp` or its link.
+    3. **No failed downloads.** Every download of
+       `http://10.97.1.1/pool/main/tool_1.0.deb` from `ci` succeeds.
+    4. **Full capacity.** Every mirror that can serve gets a share of the downloads.
+    5. **Self-healing.** All three `server` lines stay in the config, each with a health
+       check, and when the broken mirror is repaired it rejoins the pool **by itself**
+       within 10 seconds, with no config change or reload.
+    6. **A polite nightly sync.** Traffic from `mirrors` to `upstream` port **873** is held
+       to the rate in `sync-policy.txt` (megabits per second), while traffic to port
+       **443** stays unrestricted. Configure this on `mirrors`' interface **`eth1`**.
+
+    Don't change the mirror nodes, `upstream` or `corp`, and don't restart the
+    `kl-mr-lb` container (its network links would be lost); reloading it is fine.
+  hints:
+    - "Requirement 1: `sudo ip netns exec ci dig +short @10.97.53.1 mirror.ci.test` shows what runners get now. A `host-record=` (or `address=`) line in `resolver.conf` answers the name locally; restart `kl-mr-dns` afterwards."
+    - "Requirement 2: run `sudo ip netns exec ci dig @10.97.53.1 pypi.corp.test | grep 'Query time'` twice. Read `resolver.conf` for the setting that decides whether answers are remembered."
+    - "Requirements 3 and 4: `for i in $(seq 9); do sudo ip netns exec ci curl -s -w ' %{http_code}\\n' http://10.97.1.1/pool/main/tool_1.0.deb; done`. Which mirror names appear, and which status codes? Compare with `/lab/mirror/MIRRORS.md`, especially the ports and the two health endpoints."
+    - "Requirement 5: HAProxy only takes a server out, and puts it back, when it health-checks it: `option httpchk`, an `http-check send meth GET uri ...` and an `http-check expect status ...` in the backend, and `check` on every `server` line. Of the two endpoints, only one says whether the mirror can serve. Apply with `docker kill -s HUP kl-mr-lb` and watch `docker logs kl-mr-lb`."
+    - "Requirement 5: the default check interval is 2 seconds and a server needs `rise` good checks to come back. Keep `inter` and `rise` small enough to rejoin within 10 seconds."
+    - "Requirement 6: as in a shaping exercise: an `htb` root qdisc on `mirrors eth1` with `default` pointing at a fast class, a capped class for port 873 and a `u32` filter `match ip dport 873 0xffff`. `tc -s class show dev eth1` shows which class the bytes went through."
+  solution: |
+    **1 and 2. The resolver.** Answer the mirror name locally, and give the resolver a
+    cache (it was set to `cache-size=0`).
+
+    ```bash
+    sed -i 's/^cache-size=.*/cache-size=1000/' /lab/mirror/resolver.conf
+    echo 'host-record=mirror.ci.test,10.97.1.1' >> /lab/mirror/resolver.conf
+    sudo systemctl restart kl-mr-dns
+    sudo ip netns exec ci dig +short @10.97.53.1 mirror.ci.test
+    for i in 1 2; do sudo ip netns exec ci dig @10.97.53.1 pypi.corp.test | grep 'Query time'; done
+    ```
+
+    **3, 4 and 5. The load balancer.** Three problems: one `server` line points at port
+    8080 instead of 8000 (`MIRRORS.md`), there are no health checks at all, so the broken
+    mirror keeps getting a third of the traffic, and a health check has to use the
+    readiness endpoint `/-/ready`: `/-/live` answers 200 even on the broken mirror. Rewrite
+    the backend:
+
+    ```bash
+    sed -i '/^backend mirrors/,$d' /lab/mirror/lb/haproxy.cfg
+    cat >> /lab/mirror/lb/haproxy.cfg <<'EOF'
+    backend mirrors
+        balance roundrobin
+        option httpchk
+        http-check send meth GET uri /-/ready
+        http-check expect status 200
+        server m1 10.97.2.11:8000 check inter 1s rise 2 fall 2
+        server m2 10.97.2.12:8000 check inter 1s rise 2 fall 2
+        server m3 10.97.2.13:8000 check inter 1s rise 2 fall 2
+    EOF
+    docker kill -s HUP kl-mr-lb
+    for i in $(seq 9); do sudo ip netns exec ci curl -s http://10.97.1.1/pool/main/tool_1.0.deb; done
+    ```
+
+    When the broken mirror's `/-/ready` turns 200 again, two good checks (two seconds)
+    bring it back.
+
+    **6. The nightly sync.** An HTB tree on `mirrors eth1`: port 873 goes to a capped class,
+    everything else to a fast default class.
+
+    ```bash
+    . /lab/mirror/sync-policy.txt
+    sudo ip netns exec mirrors tc qdisc add dev eth1 root handle 1: htb default 20
+    sudo ip netns exec mirrors tc class add dev eth1 parent 1: classid 1:10 htb rate ${rate}mbit ceil ${rate}mbit
+    sudo ip netns exec mirrors tc class add dev eth1 parent 1: classid 1:20 htb rate 900mbit
+    sudo ip netns exec mirrors tc filter add dev eth1 parent 1: protocol ip u32 match ip dport 873 0xffff flowid 1:10
+    sudo ip netns exec mirrors tc -s class show dev eth1
+    ```
+  setup: |
+    on_reset 'for u in kl-mr-dns kl-mr-corp kl-mr-m1 kl-mr-m2 kl-mr-m3 kl-mr-sink; do systemctl stop $u 2>/dev/null; systemctl reset-failed $u 2>/dev/null; done; docker rm -f kl-mr-lb >/dev/null 2>&1; ip netns del lb 2>/dev/null; rm -rf /srv/kl-mr /etc/netns/ci'
+    mkdir -p /srv/kl-mr/state
+
+    # --- the mirror nodes: one broken, one listed with the wrong port ---
+    cat >/srv/kl-mr/mirror.py <<'PY'
+    import sys, http.server
+    addr, name = sys.argv[1], sys.argv[2]
+    def ready():
+        try:
+            return open("/srv/kl-mr/state/" + name).read().strip() == "ok"
+        except OSError:
+            return False
+    class H(http.server.BaseHTTPRequestHandler):
+        def do_GET(self):
+            if self.path == "/-/live":
+                code, body = 200, "live\n"
+            elif self.path == "/-/ready":
+                code, body = (200, "ready\n") if ready() else (503, "not ready: sync failed\n")
+            elif self.path == "/" or self.path.startswith("/pool/"):
+                code, body = (200, name + "\n") if ready() else (503, "storage unavailable\n")
+            else:
+                code, body = 404, "not found\n"
+            b = body.encode()
+            self.send_response(code)
+            self.send_header("Content-Length", str(len(b)))
+            self.end_headers()
+            self.wfile.write(b)
+        def log_message(self, *a):
+            pass
+    http.server.ThreadingHTTPServer((addr, 8000), H).serve_forever()
+    PY
+    bad=$((1 + RANDOM % 3)); wrong=$((bad % 3 + 1))
+    echo "m$bad" >"$KL_STATE/mr.bad"
+    good=""
+    for n in 1 2 3; do
+      if [ "$n" = "$bad" ]; then echo broken >/srv/kl-mr/state/m$n; else echo ok >/srv/kl-mr/state/m$n; good="$good m$n"; fi
+    done
+    echo "${good# }" >"$KL_STATE/mr.good"
+    lab_file /lab/mirror/MIRRORS.md <<'EOF'
+    # Mirror nodes (from the mirror team)
+
+    | node | address    | port |
+    |------|------------|------|
+    | m1   | 10.97.2.11 | 8000 |
+    | m2   | 10.97.2.12 | 8000 |
+    | m3   | 10.97.2.13 | 8000 |
+
+    Every node serves the same files under `/pool/` and answers with its name.
+
+    Probes:
+
+    - `GET /-/live`  : 200 while the process runs (for the process supervisor).
+    - `GET /-/ready` : 200 when the node can serve files, 503 while its storage or sync is
+      broken. It turns 200 again by itself once the node has recovered.
+    EOF
+
+    # --- topology ---
+    netns_new ci dns corp mirrors upstream
+    lab_file /lab/mirror/lb/haproxy.cfg <<EOF
+    global
+        maxconn 512
+
+    defaults
+        mode http
+        timeout connect 2s
+        timeout client 10s
+        timeout server 10s
+
+    frontend mirror
+        bind :80
+        default_backend mirrors
+
+    backend mirrors
+        balance roundrobin
+        server m1 10.97.2.11:$([ "$wrong" = 1 ] && echo 8080 || echo 8000)
+        server m2 10.97.2.12:$([ "$wrong" = 2 ] && echo 8080 || echo 8000)
+        server m3 10.97.2.13:$([ "$wrong" = 3 ] && echo 8080 || echo 8000)
+    EOF
+    chmod 755 /lab/mirror /lab/mirror/lb
+    docker rm -f kl-mr-lb >/dev/null 2>&1
+    docker run -d --name kl-mr-lb --network none -v /lab/mirror/lb:/usr/local/etc/haproxy:ro haproxy:3.0-alpine >/dev/null
+    eventually 20 '[ "$(docker inspect -f "{{.State.Pid}}" kl-mr-lb)" -gt 0 ]'
+    ip netns attach lb "$(docker inspect -f '{{.State.Pid}}' kl-mr-lb)"
+    ip -n lb link set lo up
+    netns_link ci eth0 lb eth0
+    netns_link lb eth1 mirrors eth0
+    netns_link mirrors eth1 upstream eth0
+    netns_link ci eth1 dns eth0
+    netns_link dns eth1 corp eth0
+    ip -n ci addr add 10.97.1.10/24 dev eth0
+    ip -n ci addr add 10.97.53.10/24 dev eth1
+    ip -n lb addr add 10.97.1.1/24 dev eth0
+    ip -n lb addr add 10.97.2.1/24 dev eth1
+    for n in 1 2 3; do ip -n mirrors addr add 10.97.2.1$n/24 dev eth0; done
+    ip -n mirrors addr add 10.97.3.1/24 dev eth1
+    ip -n upstream addr add 10.97.3.2/24 dev eth0
+    ip -n dns addr add 10.97.53.1/24 dev eth0
+    ip -n dns addr add 10.97.54.1/24 dev eth1
+    ip -n corp addr add 10.97.54.2/24 dev eth0
+    ip netns exec corp tc qdisc add dev eth0 root netem delay 150ms
+    mkdir -p /etc/netns/ci
+    echo 'nameserver 10.97.53.1' >/etc/netns/ci/resolv.conf
+    for n in 1 2 3; do
+      systemd-run --quiet --unit=kl-mr-m$n ip netns exec mirrors python3 /srv/kl-mr/mirror.py 10.97.2.1$n m$n
+    done
+
+    # --- DNS: corporate server behind a slow link, the CI resolver without a cache ---
+    cat >/srv/kl-mr/corp.conf <<'EOF'
+    host-record=mirror.ci.test,203.0.113.80
+    host-record=pypi.corp.test,10.97.200.5
+    host-record=git.corp.test,10.97.200.6
+    local-ttl=300
+    EOF
+    lab_file /lab/mirror/resolver.conf <<'EOF'
+    # CI resolver: forwards everything to corporate DNS
+    server=10.97.54.2
+    cache-size=0
+    EOF
+    chmod 755 /lab/mirror
+    systemd-run --quiet --unit=kl-mr-corp ip netns exec corp dnsmasq --no-daemon --no-resolv --no-hosts --bind-interfaces --listen-address=10.97.54.2 --port=53 --user=root -C /srv/kl-mr/corp.conf
+    systemd-run --quiet --unit=kl-mr-dns ip netns exec dns dnsmasq --no-daemon --no-resolv --no-hosts --bind-interfaces --listen-address=10.97.53.1 --port=53 --user=root -C /lab/mirror/resolver.conf
+
+    # --- upstream: the sync and security-feed sink, and a sender for the check ---
+    cat >/srv/kl-mr/sink.py <<'PY'
+    import socket, threading
+    def handle(c):
+        while c.recv(65536):
+            pass
+        c.sendall(b"ok")
+        c.close()
+    def serve(port):
+        s = socket.socket()
+        s.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+        s.bind(("10.97.3.2", port))
+        s.listen(16)
+        while True:
+            c, _ = s.accept()
+            threading.Thread(target=handle, args=(c,), daemon=True).start()
+    for p in (873, 443):
+        threading.Thread(target=serve, args=(p,), daemon=True).start()
+    threading.Event().wait()
+    PY
+    cat >/srv/kl-mr/send.py <<'PY'
+    import socket, sys, time
+    port, n = int(sys.argv[1]), int(sys.argv[2])
+    s = socket.create_connection(("10.97.3.2", port), timeout=20)
+    t = time.time()
+    s.sendall(b"x" * n)
+    s.shutdown(socket.SHUT_WR)
+    s.recv(2)
+    d = time.time() - t
+    print(int(n * 8 / d / 1000))
+    PY
+    systemd-run --quiet --unit=kl-mr-sink ip netns exec upstream python3 /srv/kl-mr/sink.py
+    ra=(2 4 6)
+    rate=${ra[RANDOM % 3]}
+    printf '# nightly sync to upstream (tcp/873), megabits per second\nrate=%s\n' "$rate" | lab_file /lab/mirror/sync-policy.txt
+    echo "$rate" >"$KL_STATE/mr.rate"
+
+    eventually 20 'ip netns exec ci dig +short +time=2 +tries=1 @10.97.53.1 git.corp.test | grep -q 10.97.200.6'
+    eventually 15 'ip netns exec upstream ss -ltn | grep -q ":873"'
+    eventually 20 'ip netns exec ci curl -s -m2 -o /dev/null http://10.97.1.1/pool/main/tool_1.0.deb'
+  check: |
+    info "1. The mirror name"
+    q() { ip netns exec ci dig +short +time=2 +tries=1 @10.97.53.1 "$1" A 2>/dev/null | grep -E '^[0-9.]+$' | sort | tr '\n' ' '; }
+    eventually 6 '[ -n "$(q git.corp.test)" ]' || true
+    check_eq "runners get the load balancer for mirror.ci.test" "$(q mirror.ci.test)" "10.97.1.1 "
+    check_eq "other names still come from corporate DNS" "$(q git.corp.test)" "10.97.200.6 "
+
+    info "2. Fast lookups"
+    qt() { ip netns exec ci dig +time=3 +tries=1 @10.97.53.1 pypi.corp.test 2>/dev/null | sed -n 's/.*Query time: \([0-9]*\) msec.*/\1/p'; }
+    check "the resolver still forwards to corporate DNS" 'grep -q "^server=10.97.54.2" /lab/mirror/resolver.conf'
+    check "the corporate link is still slow" 'ip netns exec corp tc qdisc show dev eth0 | grep -q netem'
+    qt >/dev/null
+    t=$(qt)
+    check "a repeat lookup of pypi.corp.test is served from the cache (${t:-?} ms)" '[ -n "$t" ] && [ "$t" -lt 60 ]'
+
+    info "3. No failed downloads"
+    url=http://10.97.1.1/pool/main/tool_1.0.deb
+    sample() { local i code; for i in $(seq 15); do code=$(ip netns exec ci curl -s -m2 -o "$KL_STATE/mr.body" -w '%{http_code}' "$url" 2>/dev/null); echo "$code $(head -1 "$KL_STATE/mr.body" 2>/dev/null)"; rm -f "$KL_STATE/mr.body"; done; }
+    codes() { awk '{print $1}' <<<"$1" | sort | uniq -c | tr -s ' ' | tr '\n' ' '; }
+    names() { awk '$1 == 200 {print $2}' <<<"$1" | sort -u | tr '\n' ' ' | sed 's/ $//'; }
+    check "the HAProxy container is running" 'c_running kl-mr-lb'
+    if grep -q 'httpchk' /lab/mirror/lb/haproxy.cfg; then eventually 12 '[ "$(codes "$(sample)")" = " 15 200 " ]' || true; fi
+    s=$(sample); c=$(codes "$s")
+    check_eq "15 downloads from ci, all succeed" "$c" " 15 200 "
+    mip=$(q mirror.ci.test | tr -d ' ')
+    check "ci downloads through the name mirror.ci.test" '[ -n "$mip" ] && ip netns exec ci curl -fs -m3 "http://mirror.ci.test/pool/main/tool_1.0.deb" | grep -q "^m[123]$"'
+
+    info "4. Full capacity"
+    good=$(cat "$KL_STATE/mr.good"); bad=$(cat "$KL_STATE/mr.bad")
+    if [ "$c" = " 15 200 " ] && [ "$(names "$s")" != "$good" ]; then
+      eventually 8 '[ "$(names "$(sample)")" = "$good" ]' || true
+      s=$(sample)
+    fi
+    check_eq "every healthy mirror serves downloads" "$(names "$s")" "$good"
+
+    info "5. Self-healing"
+    check_eq "all three mirrors are configured with a health check" "$(grep -cE '^\s*server\s+m[123]\s+10\.97\.2\.1[123]:8000\s.*\bcheck\b' /lab/mirror/lb/haproxy.cfg)" 3
+    healed=no
+    if [ "$c" = " 15 200 " ]; then
+      echo ok >/srv/kl-mr/state/$bad
+      eventually 10 '[ "$(names "$(sample)")" = "m1 m2 m3" ]' && healed=yes
+      echo broken >/srv/kl-mr/state/$bad
+    fi
+    check_eq "the repaired mirror ($bad) rejoins the pool by itself within 10 seconds" "$healed" yes
+
+    info "6. A polite nightly sync"
+    rate=$(cat "$KL_STATE/mr.rate")
+    kbps() { ip netns exec mirrors python3 /srv/kl-mr/send.py "$1" "$2" 2>/dev/null; }
+    check "an htb qdisc is installed on mirrors eth1" 'ip netns exec mirrors tc qdisc show dev eth1 | grep -q htb'
+    slow=$(kbps 873 $((rate * 125000)))
+    fast=$(kbps 443 500000)
+    lo=$((rate * 500)); hi=$((rate * 1500))
+    check "the sync (port 873) is held to about ${rate} Mbit/s (measured ${slow:-?} kbit/s)" '[ -n "$slow" ] && [ "$slow" -ge "$lo" ] && [ "$slow" -le "$hi" ]'
+    check "the security feed (port 443) is not limited (measured ${fast:-?} kbit/s)" '[ -n "$fast" ] && [ "$fast" -ge 30000 ]'
+  solve: |
+    # --- 1 and 2: the resolver ---
+    sed -i 's/^cache-size=.*/cache-size=1000/' /lab/mirror/resolver.conf
+    echo 'host-record=mirror.ci.test,10.97.1.1' >> /lab/mirror/resolver.conf
+    sudo systemctl restart kl-mr-dns
+
+    # --- 3, 4 and 5: the load balancer ---
+    sed -i '/^backend mirrors/,$d' /lab/mirror/lb/haproxy.cfg
+    cat >> /lab/mirror/lb/haproxy.cfg <<'EOF'
+    backend mirrors
+        balance roundrobin
+        option httpchk
+        http-check send meth GET uri /-/ready
+        http-check expect status 200
+        server m1 10.97.2.11:8000 check inter 1s rise 2 fall 2
+        server m2 10.97.2.12:8000 check inter 1s rise 2 fall 2
+        server m3 10.97.2.13:8000 check inter 1s rise 2 fall 2
+    EOF
+    docker kill -s HUP kl-mr-lb
+
+    # --- 6: the nightly sync ---
+    . /lab/mirror/sync-policy.txt
+    sudo ip netns exec mirrors tc qdisc add dev eth1 root handle 1: htb default 20
+    sudo ip netns exec mirrors tc class add dev eth1 parent 1: classid 1:10 htb rate ${rate}mbit ceil ${rate}mbit
+    sudo ip netns exec mirrors tc class add dev eth1 parent 1: classid 1:20 htb rate 900mbit
+    sudo ip netns exec mirrors tc filter add dev eth1 parent 1: protocol ip u32 match ip dport 873 0xffff flowid 1:10

@@ -893,3 +893,383 @@ exercises:
     search = GridSearchCV(pipe, grid, cv=5).fit(df[["x1", "x2"]], df["label"])
     joblib.dump(search.best_estimator_, "/lab/model.joblib")
     PY
+
+# ===== Capstone: a real-world lab =====
+
+- id: ds-083
+  title: "Capstone: an honest review of the delivery-time model"
+  difficulty: 5
+  kind: fix
+  deliverables: [holdout.txt, rmse_ci.txt]
+  tags: [capstone, feature-engineering, encoding, scaling, time-series, validation, rmse, bootstrap]
+  tutorial: |
+    **Concept.** A model review asks two questions: *does the model behave the same in
+    production as in the notebook*, and *how wrong will it be on the deliveries it hasn't
+    seen yet*. Each has classic traps.
+
+    - **Features must not depend on the batch.** One-hot columns built from the values that
+      happen to be in a batch differ between a batch of 500 deliveries and a batch of one,
+      and a model fed different columns is fed garbage. Build them from the *known* list of
+      categories. An ordered category (a bike is smaller than a van) needs an explicit
+      order: alphabetical codes put trucks between bikes and vans.
+    - **Fitted steps are part of the model.** A scaler learns means and spreads from the
+      training data; refitting it on each new batch moves the inputs under the model's
+      feet. Save the fitted scaler with the model, or better, put both in one pipeline.
+    - **Evaluate like you will use it.** A model that forecasts next month must be scored on
+      a later period than it was trained on. A shuffled split mixes the future into the
+      training data and hides drift, such as traffic that gets worse through the year.
+    - **A single number needs an error bar.** RMSE on one test period is an estimate. The
+      bootstrap resamples the test errors with replacement to show how much that estimate
+      could move.
+
+    **Read up on:**
+    - `Series.map` for ordinal codes, `pandas.get_dummies` and why its columns depend on the data
+    - `sklearn.preprocessing.StandardScaler`, `sklearn.pipeline.make_pipeline`, `joblib`
+    - `sklearn.linear_model.Ridge`
+    - Time-based train/test splits; why `train_test_split` shuffles by default
+    - `sklearn.metrics.mean_squared_error`, `r2_score`
+    - The percentile bootstrap: `numpy.random.Generator.integers`, `numpy.percentile`
+  scenario: |
+    **Ticket OPS-512**, from Nikos, the logistics lead:
+
+    > The data team says the delivery-time model is accurate to about four and a half
+    > minutes. Drivers say it has been badly off since the autumn, and the dispatch app,
+    > which asks for one depot's deliveries at a time, gets nonsense back. Before we sign
+    > it off for next year's contract I want a number I can trust, with an error bar.
+
+    **`/lab/deliveries.csv`** holds 2025's deliveries, **not in date order**: `delivery_id`,
+    `date` (`YYYY-MM-DD`), `depot`, `vehicle` (`bike`, `van` or `truck`), `distance_km`,
+    `parcels` and the actual `minutes`. Your notebook **`/lab/ds-083.ipynb`** starts with
+    the data team's code. Make it do what the review needs:
+
+    1. **`make_features(df)`** returns, for any batch of deliveries (even a single row,
+       keeping the batch's index), exactly these columns in this order:
+       - `distance_km`, `parcels`;
+       - **`vehicle_ord`**: `bike` = 0, `van` = 1, `truck` = 2;
+       - **`depot_<name>`** for every depot in **`DEPOTS`** (`depot_athens`, ...): 1 where
+         the delivery left from that depot, else 0, whichever depots the batch contains.
+    2. **`time_split(df, cutoff)`** returns `(train, test)`: the deliveries **before**
+       the date `cutoff` (`YYYY-MM-DD`) and those **on or after** it.
+    3. **`train(df)`** fits the model, a **`StandardScaler`** followed by
+       **`Ridge(alpha=1.0)`** on `make_features(df)`, predicting `minutes`, and saves what
+       `predict` needs to **`/lab/eta.joblib`**. **`predict(df)`** returns the predicted
+       minutes of each delivery in `df`, and a delivery gets the **same prediction
+       whatever batch it comes in**.
+
+    The check runs your notebook, then calls these functions on deliveries of its own, so
+    keep their names and arguments.
+
+    Then have the notebook evaluate the model as it will be used, **trained on the
+    deliveries before `2025-10-01`** and **tested on the rest**:
+
+    - **`/lab/holdout.txt`**: the test **RMSE** on the first line and the test **R²** on
+      the second, each to 3 decimals;
+    - **`/lab/rmse_ci.txt`**: a **95% percentile bootstrap confidence interval** for the
+      test RMSE: resample the test deliveries with replacement (at least 1000 times),
+      compute the RMSE of each resample, and write the 2.5th percentile on the first line
+      and the 97.5th on the second. It is compared with a reference interval, allowing for
+      the randomness of resampling.
+  hints:
+    - "Try `make_features(df.head(1))` and `make_features(df[df.depot == 'volos'])` next to `make_features(df)`: compare the columns. Then look at which numbers `astype('category').cat.codes` gives each vehicle."
+    - "A column per known depot: `(df['depot'] == d).astype(int)` for each `d` in `DEPOTS`, assigned to a frame that has `df`'s index. `df['vehicle'].map(VEHICLES)` gives the ordinal codes."
+    - "`time_split` must not shuffle: compare the `date` column with `cutoff` (text dates in `YYYY-MM-DD` compare correctly, or parse both)."
+    - "`predict` refits a `StandardScaler` on every batch. Fit the scaler once in `train` and save it, or save `make_pipeline(StandardScaler(), Ridge(alpha=1.0))` as one object, and have `predict` only load and call it."
+    - "For the evaluation, `train(train_df)`, then `err = test_df['minutes'] - predict(test_df)`. RMSE is `sqrt(mean(err ** 2))`; `r2_score` gives the R²."
+    - "Bootstrap: `idx = rng.integers(0, len(err), (5000, len(err)))`, then `np.sqrt((err.to_numpy()[idx] ** 2).mean(axis=1))` gives 5000 RMSEs; `np.percentile(..., [2.5, 97.5])`."
+  solution: |
+    Four bugs, one per rule:
+
+    ```python
+    import joblib
+    import numpy as np
+    import pandas as pd
+    from sklearn.linear_model import Ridge
+    from sklearn.metrics import r2_score
+    from sklearn.pipeline import make_pipeline
+    from sklearn.preprocessing import StandardScaler
+
+    DEPOTS = ["athens", "heraklion", "larissa", "patras", "volos"]
+    VEHICLES = {"bike": 0, "van": 1, "truck": 2}
+
+    def make_features(df):
+        X = df[["distance_km", "parcels"]].astype(float)
+        X["vehicle_ord"] = df["vehicle"].map(VEHICLES)       # not alphabetical codes
+        for d in DEPOTS:                                     # every known depot, not the batch's
+            X[f"depot_{d}"] = (df["depot"] == d).astype(int)
+        return X
+
+    def time_split(df, cutoff):
+        return df[df["date"] < cutoff], df[df["date"] >= cutoff]   # no shuffling
+
+    def train(df):
+        model = make_pipeline(StandardScaler(), Ridge(alpha=1.0))
+        model.fit(make_features(df), df["minutes"])
+        joblib.dump(model, "/lab/eta.joblib")                # the scaler travels with the model
+
+    def predict(df):
+        return joblib.load("/lab/eta.joblib").predict(make_features(df))
+    ```
+
+    Then the review:
+
+    ```python
+    deliveries = pd.read_csv("/lab/deliveries.csv")
+    train_df, test_df = time_split(deliveries, "2025-10-01")
+    train(train_df)
+    err = (test_df["minutes"] - predict(test_df)).to_numpy()
+    rmse = np.sqrt((err ** 2).mean())
+    open("/lab/holdout.txt", "w").write(f"{rmse:.3f}\n{r2_score(test_df['minutes'], predict(test_df)):.3f}\n")
+
+    rng = np.random.default_rng(0)
+    idx = rng.integers(0, len(err), (5000, len(err)))
+    lo, hi = np.percentile(np.sqrt((err[idx] ** 2).mean(axis=1)), [2.5, 97.5])
+    open("/lab/rmse_ci.txt", "w").write(f"{lo}\n{hi}\n")
+    ```
+
+    The honest RMSE is well above the 4.5 minutes of the shuffled split: delivery times
+    drift up through the year, and a model trained on January to September under-predicts
+    the autumn.
+  starter: |
+    # OPS-512: the data team's delivery-time model. The check calls make_features,
+    # time_split, train and predict on deliveries of its own: keep their names and arguments.
+    import joblib
+    from sklearn.linear_model import Ridge
+    from sklearn.model_selection import train_test_split
+    from sklearn.preprocessing import StandardScaler
+
+    DEPOTS = ["athens", "heraklion", "larissa", "patras", "volos"]
+    VEHICLES = {"bike": 0, "van": 1, "truck": 2}
+
+
+    def make_features(df):
+        X = df[["distance_km", "parcels"]].copy()
+        X["vehicle_ord"] = df["vehicle"].astype("category").cat.codes
+        return X.join(pd.get_dummies(df["depot"], prefix="depot", dtype=int))
+
+
+    def time_split(df, cutoff):
+        return train_test_split(df, test_size=0.25, random_state=0)
+
+
+    def train(df):
+        X = make_features(df)
+        scaler = StandardScaler().fit(X)
+        model = Ridge(alpha=1.0).fit(scaler.transform(X), df["minutes"])
+        joblib.dump(model, "/lab/eta.joblib")
+
+
+    def predict(df):
+        model = joblib.load("/lab/eta.joblib")
+        return model.predict(StandardScaler().fit_transform(make_features(df)))
+    # %%
+    deliveries = pd.read_csv("/lab/deliveries.csv")
+    train_df, test_df = time_split(deliveries, "2025-10-01")
+    train(train_df)
+    rmse = ((test_df["minutes"] - predict(test_df)) ** 2).mean() ** 0.5
+    print("RMSE:", round(rmse, 2), "minutes")
+  setup: |
+    ds_start
+    dspy - >"$KL_STATE/answer" <<'PY'
+    import numpy as np, pandas as pd
+    from sklearn.linear_model import Ridge
+    from sklearn.metrics import r2_score
+    from sklearn.pipeline import make_pipeline
+    from sklearn.preprocessing import StandardScaler
+    r = np.random.default_rng()
+    DEPOTS = ["athens", "heraklion", "larissa", "patras", "volos"]
+    VEHICLES = {"bike": 0, "van": 1, "truck": 2}
+    n = 4000
+    day = r.integers(0, 365, n)
+    depot = r.choice(DEPOTS, n, p=[0.35, 0.15, 0.15, 0.2, 0.15])
+    vehicle = r.choice(["bike", "van", "truck"], n, p=[0.25, 0.55, 0.2])
+    dist = np.where(vehicle == "bike", r.uniform(0.5, 6, n), r.uniform(2, 40, n))
+    parcels = np.where(vehicle == "truck", r.integers(10, 40, n), r.integers(1, 15, n))
+    effect = dict(zip(DEPOTS, r.normal(0, 4, len(DEPOTS))))
+    minutes = (8 + 2.1 * dist + 0.9 * parcels + pd.Series(vehicle).map({"bike": -2.0, "van": 0.0, "truck": 7.0}).to_numpy()
+               + pd.Series(depot).map(effect).to_numpy() + r.uniform(0.025, 0.04) * day + r.normal(0, 3, n))
+    df = pd.DataFrame({
+        "delivery_id": np.arange(900001, 900001 + n),
+        "date": (pd.Timestamp("2025-01-01") + pd.to_timedelta(day, unit="D")).strftime("%Y-%m-%d"),
+        "depot": depot, "vehicle": vehicle, "distance_km": dist.round(2), "parcels": parcels,
+        "minutes": minutes.round(1),
+    })
+    df.to_csv("/lab/deliveries.csv", index=False)
+
+    d = pd.read_csv("/lab/deliveries.csv")
+    def make_features(df):
+        X = df[["distance_km", "parcels"]].astype(float)
+        X["vehicle_ord"] = df["vehicle"].map(VEHICLES)
+        for p in DEPOTS:
+            X[f"depot_{p}"] = (df["depot"] == p).astype(int)
+        return X
+    tr, te = d[d["date"] < "2025-10-01"], d[d["date"] >= "2025-10-01"]
+    pred = make_pipeline(StandardScaler(), Ridge(alpha=1.0)).fit(make_features(tr), tr["minutes"]).predict(make_features(te))
+    err = (te["minutes"] - pred).to_numpy()
+    idx = r.integers(0, len(err), (20000, len(err)))
+    lo, hi = np.percentile(np.sqrt((err[idx] ** 2).mean(axis=1)), [2.5, 97.5])
+    print(np.sqrt((err ** 2).mean()))
+    print(r2_score(te["minutes"], pred))
+    print(lo)
+    print(hi)
+    PY
+    chown -R "$(lab_user):" /lab
+  check: |
+    NB_HIDDEN="$KL_STATE/answer" nb_check ds-083.ipynb holdout.txt rmse_ci.txt <<'PY'
+    import re
+    import numpy as np, pandas as pd
+    from sklearn.linear_model import Ridge
+    from sklearn.pipeline import make_pipeline
+    from sklearn.preprocessing import StandardScaler
+
+    def kl_try(f):
+        try:
+            return f()
+        except Exception as e:
+            return f"raised {type(e).__name__}: {str(e)[:80]}"
+
+    kl_depots = ["athens", "heraklion", "larissa", "patras", "volos"]
+    kl_cols = ["distance_km", "parcels", "vehicle_ord"] + [f"depot_{p}" for p in kl_depots]
+
+    def kl_feats(df):
+        X = df[["distance_km", "parcels"]].astype(float)
+        X["vehicle_ord"] = df["vehicle"].map({"bike": 0, "van": 1, "truck": 2})
+        for p in kl_depots:
+            X[f"depot_{p}"] = (df["depot"] == p).astype(int)
+        return X
+
+    g = np.random.default_rng(7)
+    def kl_make(n, first):
+        v = g.choice(["bike", "van", "truck"], n)
+        dist, parcels = g.uniform(1, 30, n).round(2), g.integers(1, 30, n)
+        dep = g.choice(kl_depots, n)
+        mins = 5 + 2 * dist + parcels + pd.Series(v).map({"bike": -2, "van": 0, "truck": 6}).to_numpy() + g.normal(0, 2, n)
+        return pd.DataFrame({"delivery_id": np.arange(first, first + n), "date": "2025-03-03", "depot": dep, "vehicle": v,
+                             "distance_km": dist, "parcels": parcels, "minutes": mins.round(1)}, index=np.arange(first, first + n))
+
+    def kl_features():
+        b = pd.DataFrame({"delivery_id": [7, 8, 9], "date": "2025-05-05", "depot": ["volos", "athens", "volos"],
+                          "vehicle": ["truck", "bike", "van"], "distance_km": [12.5, 3.0, 8.25], "parcels": [30, 2, 9],
+                          "minutes": [60.0, 12.0, 30.0]}, index=[40, 41, 42])
+        X = make_features(b)
+        if [str(c) for c in X.columns] != kl_cols:
+            return "columns " + ",".join(map(str, X.columns))
+        return "ok" if np.allclose(X.to_numpy(dtype=float), kl_feats(b).to_numpy(dtype=float)) else "wrong values"
+    print("features:", kl_try(kl_features))
+
+    def kl_one():
+        b = kl_make(1, 5000)
+        X = make_features(b)
+        if [str(c) for c in X.columns] != kl_cols:
+            return "columns " + ",".join(map(str, X.columns))
+        return "ok" if np.allclose(X.to_numpy(dtype=float), kl_feats(b).to_numpy(dtype=float)) else "wrong values"
+    print("one:", kl_try(kl_one))
+
+    def kl_split():
+        days = ["2025-06-02", "2025-05-31", "2025-06-01", "2025-01-15", "2025-12-30", "2025-06-01", "2025-05-01"]
+        t = pd.DataFrame({"delivery_id": range(len(days)), "date": days, "minutes": 1.0})
+        a, b = time_split(t, "2025-06-01")
+        return ",".join(map(str, sorted(a["delivery_id"]))) + "|" + ",".join(map(str, sorted(b["delivery_id"])))
+    print("split:", kl_try(kl_split))
+
+    kl_tr, kl_bt = kl_make(400, 1000), kl_make(60, 3000)
+    kl_ref = make_pipeline(StandardScaler(), Ridge(alpha=1.0)).fit(kl_feats(kl_tr), kl_tr["minutes"]).predict(kl_feats(kl_bt))
+    kl_full = None
+    def kl_batch():
+        global kl_full
+        train(kl_tr.copy())
+        kl_full = np.asarray(predict(kl_bt.copy()), dtype=float).ravel()
+        mask = (kl_bt["depot"] == "volos").to_numpy()
+        sub = np.asarray(predict(kl_bt[mask].copy()), dtype=float).ravel()
+        one = np.asarray(predict(kl_bt.iloc[[5]].copy()), dtype=float).ravel()
+        if len(kl_full) != len(kl_bt):
+            return f"{len(kl_full)} predictions for {len(kl_bt)} deliveries"
+        same = np.allclose(sub, kl_full[mask], atol=1e-6) and np.allclose(one, kl_full[[5]], atol=1e-6)
+        return "ok" if same else "a delivery's prediction changes with the batch it comes in"
+    print("batch:", kl_try(kl_batch))
+    print("model:", kl_try(lambda: "ok" if kl_full is not None and np.allclose(kl_full, kl_ref, atol=1e-3)
+                                    else "the predictions are not those of a scaler and Ridge(alpha=1.0) fitted on the training deliveries"))
+
+    def kl_numbers(name, n):
+        try:
+            return [float(v) for v in re.findall(r"-?\d+(?:\.\d+)?(?:[eE][-+]?\d+)?", open("/lab/" + name).read())][:n]
+        except OSError:
+            return None
+    kl_want = [float(v) for v in open("/tmp/kl-hidden/answer").read().split()]
+    h = kl_numbers("holdout.txt", 2)
+    if h is None or len(h) < 2:
+        print("rmse: /lab/holdout.txt needs the RMSE and the R2 on two lines")
+        print("r2: /lab/holdout.txt needs the RMSE and the R2 on two lines")
+    else:
+        print("rmse:", "ok" if abs(h[0] - kl_want[0]) < 0.002 else f"{h[0]} is not the RMSE of the time-based holdout")
+        print("r2:", "ok" if abs(h[1] - kl_want[1]) < 0.002 else f"{h[1]} is not the R2 of the time-based holdout")
+    ci = kl_numbers("rmse_ci.txt", 2)
+    if ci is None or len(ci) != 2:
+        print("ci: /lab/rmse_ci.txt needs two numbers")
+    elif not ci[0] < ci[1]:
+        print("ci: the lower bound must come first")
+    else:
+        tol = 0.2 * (kl_want[3] - kl_want[2])
+        ok = abs(ci[0] - kl_want[2]) <= tol and abs(ci[1] - kl_want[3]) <= tol
+        print("ci:", "ok" if ok else "that is not the bootstrap interval of the test RMSE")
+    PY
+    info "1. make_features"
+    check_eq "the columns and values are distance_km, parcels, vehicle_ord and one per depot" "$(sed -n 's/^features: //p' <<<"$NB_RESULT")" ok
+    check_eq "a one-row batch gets the same columns" "$(sed -n 's/^one: //p' <<<"$NB_RESULT")" ok
+    info "2. time_split"
+    check_eq "training is before the cutoff, testing on and after it" "$(sed -n 's/^split: //p' <<<"$NB_RESULT")" "1,3,6|0,2,4,5"
+    info "3. train and predict"
+    check_eq "a delivery gets the same prediction in any batch" "$(sed -n 's/^batch: //p' <<<"$NB_RESULT")" ok
+    check_eq "the predictions come from the scaler and model fitted in train" "$(sed -n 's/^model: //p' <<<"$NB_RESULT")" ok
+    info "The review"
+    check_eq "the first line of /lab/holdout.txt is the RMSE from October on" "$(sed -n 's/^rmse: //p' <<<"$NB_RESULT")" ok
+    check_eq "the second line of /lab/holdout.txt is the R2 from October on" "$(sed -n 's/^r2: //p' <<<"$NB_RESULT")" ok
+    check_eq "/lab/rmse_ci.txt holds the 95% bootstrap interval of that RMSE" "$(sed -n 's/^ci: //p' <<<"$NB_RESULT")" ok
+  solve: |
+    nb_write ds-083.ipynb <<'PY'
+    import joblib
+    import numpy as np
+    import pandas as pd
+    from sklearn.linear_model import Ridge
+    from sklearn.metrics import r2_score
+    from sklearn.pipeline import make_pipeline
+    from sklearn.preprocessing import StandardScaler
+
+    DEPOTS = ["athens", "heraklion", "larissa", "patras", "volos"]
+    VEHICLES = {"bike": 0, "van": 1, "truck": 2}
+
+
+    def make_features(df):
+        X = df[["distance_km", "parcels"]].astype(float)
+        X["vehicle_ord"] = df["vehicle"].map(VEHICLES)
+        for d in DEPOTS:
+            X[f"depot_{d}"] = (df["depot"] == d).astype(int)
+        return X
+
+
+    def time_split(df, cutoff):
+        return df[df["date"] < cutoff], df[df["date"] >= cutoff]
+
+
+    def train(df):
+        model = make_pipeline(StandardScaler(), Ridge(alpha=1.0))
+        model.fit(make_features(df), df["minutes"])
+        joblib.dump(model, "/lab/eta.joblib")
+
+
+    def predict(df):
+        return joblib.load("/lab/eta.joblib").predict(make_features(df))
+    # %%
+    deliveries = pd.read_csv("/lab/deliveries.csv")
+    train_df, test_df = time_split(deliveries, "2025-10-01")
+    train(train_df)
+    pred = predict(test_df)
+    err = (test_df["minutes"] - pred).to_numpy()
+    rmse = np.sqrt((err ** 2).mean())
+    open("/lab/holdout.txt", "w").write(f"{rmse:.3f}\n{r2_score(test_df['minutes'], pred):.3f}\n")
+    print("RMSE:", round(rmse, 2), "minutes")
+    # %%
+    rng = np.random.default_rng(0)
+    idx = rng.integers(0, len(err), (5000, len(err)))
+    lo, hi = np.percentile(np.sqrt((err[idx] ** 2).mean(axis=1)), [2.5, 97.5])
+    open("/lab/rmse_ci.txt", "w").write(f"{lo}\n{hi}\n")
+    PY

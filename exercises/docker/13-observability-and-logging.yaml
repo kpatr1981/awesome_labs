@@ -529,3 +529,293 @@ exercises:
     docker events --since "$(cat /lab/batch-started)" --until "$(date +%s)" --filter event=die \
       --format '{{.Actor.Attributes.name}} {{.Actor.Attributes.exitCode}}' \
       | awk '$1 ~ /^job-/ && $2 != 0 {print $1}' | sort -u > /lab/failed.txt
+
+# ===== Capstone: a real-world lab =====
+
+- id: docker-263
+  title: "Capstone: the payments outage post-mortem"
+  difficulty: 5
+  kind: fix
+  tags: [capstone, logs, stderr, structured-logging, oom, inspect, events, exit-code, stats, logging-driver, local, rotation, stdout, healthcheck]
+  tutorial: |
+    **Concept.** An incident on a Docker host has two phases, and their order matters: first **preserve the evidence**, then **fix**. Each kind of evidence lives in a different place and survives for a different time:
+
+    - **Logs** belong to the container. They survive a stop, but removing or re-creating the container throws them away, so they must be read before any fix that re-creates it. A service may split its output between standard output and standard error, and `docker logs` replays each stream on the matching stream of your terminal.
+    - **State** (`docker inspect`) records how a container ended: its exit code, and separately whether the kernel killed it for memory. Exit code 137 alone does not tell an out-of-memory kill from a plain SIGKILL.
+    - **Events** are the daemon's own short history. For containers started with `--rm` they are the only record left: each `die` event carries the container's name and exit code. Scope the search in time so older events do not mix in.
+    - **Live usage** (`docker stats`) only covers what is running now, so it answers "who is hurting us right now", not "who died".
+
+    The fixes then touch settings that are fixed when a container is created: its logging driver and options, and its healthcheck. They are changed in the start script and applied by creating the container again. Two classic traps: an application that writes its log to a file never reaches the logging driver, and a healthcheck can only call tools that exist inside the image.
+
+    **Read up on:**
+    - `docker logs --help`; shell redirection (`2>&1`, `2>/dev/null`)
+    - `grep` with a fixed string; `sed -n 's/.../\1/p'` or `jq` to pull one field out of a JSON line
+    - `docker inspect` — `.State.ExitCode`, `.State.OOMKilled`, `.HostConfig.LogConfig`, `.State.Health`
+    - `docker events --help` — `--since`, `--until`, `--filter`, `--format` and the attributes of a `die` event
+    - `docker stats --help` — a single snapshot and a custom format
+    - Docker docs 'Local file logging driver' — `max-size` and `max-file`
+    - `ln -s` and `/dev/stdout` in a container
+    - `docker run --help` — the `--health-*` options; which HTTP clients a `busybox` image ships
+  scenario: |
+    **Ticket OPS-733** — *from Priya (SRE lead): payments outage, post-mortem and hardening*
+
+    > Last night the payments host fell over: card charges failed, a settlement job died, the
+    > reconcile job reported errors and something has been burning a CPU ever since. I need
+    > the evidence for the post-mortem in **`/lab/postmortem/`**, then the three fixes the
+    > review asked for, made in the start scripts in **`/lab/payments/`** so they survive the
+    > next deploy.
+
+    **Collect the evidence first.** Re-creating a container throws its log away. Do not
+    restart or remove `settle-eu` or `settle-us`.
+
+    ## Part A: evidence
+
+    1. **Failed charges.** The **`pay-api`** container logs one JSON object per line, and
+       not all of it goes to the same output stream. Write the request **`id`** of every line
+       whose `level` is **`error`** to **`/lab/postmortem/errors.txt`**, one per line, in log
+       order. Other lines mention errors in their path or message; they are not error-level.
+    2. **The settlement crash.** `settle-eu` and `settle-us` both exited with code 137. One was
+       killed by the kernel for exceeding its memory limit, the other by an operator. Write
+       the name of the one killed **for memory** to **`/lab/postmortem/oom.txt`**.
+    3. **The reconcile job.** **`pay-reconcile`** ran **three times** during the incident and
+       was removed after each run (`--rm`). Write the **exit code of each run**, oldest first,
+       one per line, to **`/lab/postmortem/reconcile.txt`**. The incident started at the Unix
+       time in **`/lab/postmortem/incident-started`**; older events on this host are not part
+       of it.
+    4. **The CPU burner.** One of the sidecars **`pay-fx`**, **`pay-notify`** and **`pay-cache`**
+       is spinning on the CPU. Write its name to **`/lab/postmortem/hog.txt`**, then **stop**
+       it (do not remove it: the vendor wants to inspect it). Leave the other two running.
+
+    ## Part B: fixes
+
+    Change each script, then run it to re-create the container.
+
+    5. **Logging policy.** **`/lab/payments/logging-policy.txt`** gives the logging driver and
+       the retention limits for `pay-api` and `pay-worker`. Apply it in **`api.sh`** and
+       **`worker.sh`** (sizes in MiB, with the `m` suffix). Both containers must be running,
+       and the `pay-api` startup line must still be readable with `docker logs pay-api`.
+    6. **The silent worker.** **`pay-worker`** appends a `settled batch` line to
+       **`/var/log/worker/worker.log`** every second, and none of it reaches `docker logs`.
+       Make those lines appear in `docker logs pay-worker`. The worker must keep writing to
+       that same path, so it stays in the container's command.
+    7. **The gateway that is never healthy.** **`pay-gateway`** (started by **`gateway.sh`**)
+       serves `/health` on port 8080 and works, but docker marks it **unhealthy**. Fix the
+       healthcheck so the container becomes **healthy**. Do not change the server command.
+  hints:
+    - "Evidence 1: `docker logs pay-api` sends the container's stderr to your stderr, so a pipe only sees half of it. Redirect both into the pipe, then match the field and its value (`\"level\":\"error\"`), not the word."
+    - "Evidence 2: `docker inspect -f '{{.State.ExitCode}} {{.State.OOMKilled}}' settle-eu settle-us`."
+    - "Evidence 3: `docker events --since \"$(cat /lab/postmortem/incident-started)\" --until \"$(date +%s)\" --filter event=die --filter container=pay-reconcile --format '{{.Actor.Attributes.exitCode}}'`."
+    - "Evidence 4: `docker stats --no-stream --format '{{.CPUPerc}} {{.Name}}' | sort -rn`, then `docker stop` (not `rm`)."
+    - "Fix 5: `--log-driver` plus two `--log-opt` options, with the numbers from the policy file. Fix 6: make the log path a link to the container's standard output before the loop starts (`ln -sf /dev/stdout ...`)."
+    - "Fix 7: `docker inspect -f '{{json .State.Health}}' pay-gateway` shows the probe's output. Does the image have that HTTP client? BusyBox's `wget` against `127.0.0.1` (not `localhost`, which may mean IPv6) works."
+  solution: |
+    **Part A first**, while `pay-api` still has last night's log:
+
+    ```bash
+    cd /lab/postmortem
+
+    # 1. errors go to stderr: merge it into the pipe, then match the level field
+    docker logs pay-api 2>&1 | grep '"level":"error"' \
+      | sed 's/.*"id":"\([^"]*\)".*/\1/' > errors.txt
+
+    # 2. both exited 137; only one has OOMKilled=true
+    docker inspect -f '{{.Name}} exit={{.State.ExitCode}} oom={{.State.OOMKilled}}' settle-eu settle-us
+    echo settle-XX > oom.txt          # the one with oom=true
+
+    # 3. the --rm runs survive only as die events
+    docker events --since "$(cat incident-started)" --until "$(date +%s)" \
+      --filter event=die --filter container=pay-reconcile \
+      --format '{{.Actor.Attributes.exitCode}}' > reconcile.txt
+
+    # 4. one snapshot, busiest first; then stop it, don't remove it
+    docker stats --no-stream --format '{{.CPUPerc}} {{.Name}}' | sort -rn | head -1
+    echo pay-XX > hog.txt && docker stop "$(cat hog.txt)"
+    ```
+
+    **Part B.** With `S` MiB and `N` files from `logging-policy.txt`:
+
+    ```bash
+    cd /lab/payments
+    # 5. the policy, in both scripts
+    sed -i 's|--name pay-api|--name pay-api --log-driver local --log-opt max-size=Sm --log-opt max-file=N|' api.sh
+    sed -i 's|--name pay-worker|--name pay-worker --log-driver local --log-opt max-size=Sm --log-opt max-file=N|' worker.sh
+    # 6. the worker's log file becomes a link to its stdout
+    sed -i 's|mkdir -p /var/log/worker;|mkdir -p /var/log/worker; ln -sf /dev/stdout /var/log/worker/worker.log;|' worker.sh
+    # 7. busybox has no curl: probe with wget, on IPv4
+    sed -i "s|curl -fsS http://localhost:8080/health|wget -q -O /dev/null http://127.0.0.1:8080/health|" gateway.sh
+    sh api.sh && sh worker.sh && sh gateway.sh
+    docker logs pay-api; docker logs pay-worker; docker ps
+    ```
+
+    Doing Part B first would have destroyed the evidence for item 1: `api.sh` removes the old
+    `pay-api` and its log with it.
+  setup: |
+    P=/lab/payments; PM=/lab/postmortem
+    mkdir -p $P $PM
+    # the incident window starts now; older events on the host are not part of it
+    date +%s | lab_file $PM/incident-started
+
+    # --- 5: the logging policy ---
+    s=$((RANDOM % 4 + 2)); n=$((RANDOM % 3 + 2))
+    echo "$s $n" > "$KL_STATE/policy"
+    lab_file $P/logging-policy.txt <<EOF
+    # Logging policy for payment services (rev 4)
+    applies to:        pay-api, pay-worker
+    logging driver:    local
+    max size per file: ${s} MiB
+    max files kept:    ${n}
+    EOF
+
+    # --- 1: pay-api and last night's traffic ---
+    lab_file $P/api.sh 0755 <<'EOF'
+    #!/bin/sh
+    docker rm -f pay-api >/dev/null 2>&1
+    docker run -d --name pay-api busybox:1.37 \
+      sh -c 'echo "pay-api 2.7 starting"; mkdir -p /www; echo ok > /www/health; exec httpd -f -p 8080 -h /www'
+    EOF
+    sh $P/api.sh >/dev/null 2>&1 || true
+    set -- $(seq 6 40 | shuf -n4 | sort -n)
+    : > "$KL_STATE/traffic"; : > "$KL_STATE/answer-errors"
+    for i in $(seq 1 44); do
+      id="$((RANDOM % 9000 + 1000))-$i"; ts=$(printf '2025-03-14T02:%02d:%02dZ' $((i / 4)) $((i * 13 % 60)))
+      if [ "$i" = "$1" ] || [ "$i" = "$2" ] || [ "$i" = "$3" ] || [ "$i" = "$4" ]; then
+        echo "$id" >> "$KL_STATE/answer-errors"
+        echo "E {\"ts\":\"$ts\",\"level\":\"error\",\"id\":\"$id\",\"path\":\"/v1/charges\",\"msg\":\"card processor timed out\"}"
+      elif [ $((i % 7)) = 0 ]; then
+        echo "E {\"ts\":\"$ts\",\"level\":\"warn\",\"id\":\"$id\",\"path\":\"/v1/charges\",\"msg\":\"recovered from error, retried\"}"
+      elif [ $((i % 5)) = 0 ]; then
+        echo "O {\"ts\":\"$ts\",\"level\":\"info\",\"id\":\"$id\",\"path\":\"/v1/errors/summary\",\"msg\":\"served error summary\"}"
+      else
+        echo "O {\"ts\":\"$ts\",\"level\":\"info\",\"id\":\"$id\",\"path\":\"/v1/charges\",\"msg\":\"charge accepted\"}"
+      fi >> "$KL_STATE/traffic"
+    done
+    eventually 15 'c_running pay-api'
+    docker exec -i pay-api sh -c 'exec 3>/proc/1/fd/1 4>/proc/1/fd/2; while IFS= read -r l; do case "$l" in "E "*) echo "${l#E }" >&4 ;; *) echo "${l#O }" >&3 ;; esac; done' < "$KL_STATE/traffic"
+    eventually 15 '[ "$(docker logs pay-api 2>&1 | grep -c "\"level\":")" -ge 44 ]'
+
+    # --- 2: the settlement crash ---
+    set -- $(printf '%s\n' settle-eu settle-us | shuf)
+    echo "$1 $2" > "$KL_STATE/answer-oom"
+    for c in "$1" "$2"; do
+      docker run -d --name "$c" -m 48m --memory-swap 48m -e BATCH_MB=300 python:3.12-alpine \
+        python -c 'import os, time; time.sleep(3); x = b"x" * (int(os.environ["BATCH_MB"]) * 1024 * 1024); time.sleep(600)' >/dev/null
+    done
+    docker kill "$2" >/dev/null
+    oomc="$1"
+    eventually 40 '[ "$(c_get "$oomc" "{{.State.OOMKilled}}")" = true ]'
+
+    # --- 3: the reconcile runs (removed, only events remain) ---
+    : > "$KL_STATE/answer-rec"
+    for r in 1 2 3; do
+      case $r in 1) rc=$(shuf -n1 -e 0 2) ;; 2) rc=$(shuf -n1 -e 3 4 75) ;; 3) rc=$(shuf -n1 -e 0 1) ;; esac
+      echo "$rc" >> "$KL_STATE/answer-rec"
+      docker run --rm --name pay-reconcile busybox:1.37 sh -c "echo reconcile run $r; exit $rc" >/dev/null 2>&1 || true
+    done
+
+    # --- 4: the CPU burner ---
+    set -- $(printf '%s\n' pay-fx pay-notify pay-cache | shuf)
+    echo "$1 $2 $3" > "$KL_STATE/answer-cpu"
+    docker run -d --name "$1" busybox:1.37 sh -c 'while :; do :; done' >/dev/null
+    docker run -d --name "$2" busybox:1.37 sleep 86400 >/dev/null
+    docker run -d --name "$3" busybox:1.37 sleep 86400 >/dev/null
+
+    # --- 6: the silent worker ---
+    wt=$(head -c4 /dev/urandom | od -An -tx1 | tr -d ' \n')
+    echo "$wt" > "$KL_STATE/answer-worker"
+    lab_file $P/worker.sh 0755 <<EOF
+    #!/bin/sh
+    docker rm -f pay-worker >/dev/null 2>&1
+    docker run -d --name pay-worker busybox:1.37 \\
+      sh -c 'mkdir -p /var/log/worker; i=0; while :; do i=\$((i+1)); echo "settled batch $wt-\$i" >> /var/log/worker/worker.log; sleep 1; done'
+    EOF
+    sh $P/worker.sh >/dev/null 2>&1 || true
+
+    # --- 7: the gateway that is never healthy ---
+    lab_file $P/gateway.sh 0755 <<'EOF'
+    #!/bin/sh
+    docker rm -f pay-gateway >/dev/null 2>&1
+    docker run -d --name pay-gateway \
+      --health-cmd 'curl -fsS http://localhost:8080/health' \
+      --health-interval 2s --health-timeout 2s --health-retries 2 \
+      busybox:1.37 sh -c 'mkdir -p /www; echo ok > /www/health; exec httpd -f -p 8080 -h /www'
+    EOF
+    sh $P/gateway.sh >/dev/null 2>&1 || true
+    chown -R "$(lab_user):" /lab
+    # let the clock pass the last die event, so `--until "$(date +%s)"` includes it
+    sleep 2
+  check: |
+    PM=/lab/postmortem
+    read -r s n < "$KL_STATE/policy"
+    lines() { sed 's/[[:space:]]*$//; /^$/d' "$1" 2>/dev/null; }
+
+    info "1. Failed charges"
+    got=$(lines $PM/errors.txt | tr '\n' ' '); want=$(tr '\n' ' ' < "$KL_STATE/answer-errors")
+    check "errors.txt lists the error-level request ids, in order" '[ "$got" = "$want" ]'
+
+    info "2. The settlement crash"
+    read -r oom killed < "$KL_STATE/answer-oom"
+    check "oom.txt names the container killed for memory" '[ "$(lines $PM/oom.txt)" = "$oom" ]'
+    check "settle-eu and settle-us are still there, stopped" 'c_exists settle-eu && c_exists settle-us && ! c_running settle-eu && ! c_running settle-us'
+
+    info "3. The reconcile job"
+    got=$(tr -s '[:space:]' ' ' < $PM/reconcile.txt 2>/dev/null | sed 's/^ //; s/ $//'); want=$(tr '\n' ' ' < "$KL_STATE/answer-rec" | sed 's/ $//')
+    check "reconcile.txt holds the three exit codes, oldest first" '[ "$got" = "$want" ]'
+
+    info "4. The CPU burner"
+    read -r hog idle1 idle2 < "$KL_STATE/answer-cpu"
+    check "hog.txt names the spinning sidecar" '[ "$(lines $PM/hog.txt)" = "$hog" ]'
+    check "the spinning sidecar is stopped but not removed" 'c_exists "$hog" && ! c_running "$hog"'
+    check "the other two sidecars are still running" 'c_running "$idle1" && c_running "$idle2"'
+
+    info "5. Logging policy"
+    for c in pay-api pay-worker; do
+      check "$c is running" 'c_running $c'
+      check_eq "$c logging driver" "$(c_get $c '{{.HostConfig.LogConfig.Type}}')" "local"
+      ms=$(c_get $c '{{index .HostConfig.LogConfig.Config "max-size"}}')
+      check "$c max-size is ${s}m" '[ "$ms" = "${s}m" ] || [ "$ms" = "${s}M" ]'
+      check_eq "$c max-file" "$(c_get $c '{{index .HostConfig.LogConfig.Config "max-file"}}')" "$n"
+    done
+    check "the pay-api startup line is readable with docker logs" 'docker logs pay-api 2>&1 | grep -qF "pay-api 2.7 starting"'
+
+    info "6. The silent worker"
+    wt=$(cat "$KL_STATE/answer-worker")
+    check "the worker still writes to /var/log/worker/worker.log" 'c_get pay-worker "{{json .Config.Cmd}}" | grep -qF "/var/log/worker/worker.log"'
+    t=no
+    if c_running pay-worker; then
+      eventually 12 '[ "$(docker logs pay-worker 2>&1 | grep -c "settled batch $wt-")" -ge 2 ]' && t=yes
+    fi
+    check "settled batch lines show up in docker logs pay-worker" '[ $t = yes ]'
+
+    info "7. The gateway that is never healthy"
+    probe=$(c_get pay-gateway '{{json .Config.Healthcheck.Test}}')
+    check "pay-gateway is running" 'c_running pay-gateway'
+    check "the server command is unchanged" 'c_get pay-gateway "{{json .Config.Cmd}}" | grep -qF "exec httpd -f -p 8080 -h /www"'
+    h=no
+    if c_running pay-gateway && [ -n "$probe" ] && ! grep -q curl <<<"$probe"; then
+      eventually 30 '[ "$(c_get pay-gateway "{{.State.Health.Status}}")" = healthy ]' && h=yes
+    fi
+    check "pay-gateway reports healthy" '[ $h = yes ]'
+  solve: |
+    PM=/lab/postmortem; P=/lab/payments
+
+    # --- Part A: evidence, before anything is re-created ---
+    docker logs pay-api 2>&1 | grep '"level":"error"' | sed 's/.*"id":"\([^"]*\)".*/\1/' > $PM/errors.txt
+    for c in settle-eu settle-us; do
+      if [ "$(docker inspect -f '{{.State.OOMKilled}}' "$c")" = true ]; then echo "$c" > $PM/oom.txt; fi
+    done
+    docker events --since "$(cat $PM/incident-started)" --until "$(date +%s)" \
+      --filter event=die --filter container=pay-reconcile \
+      --format '{{.Actor.Attributes.exitCode}}' > $PM/reconcile.txt
+    docker stats --no-stream --format '{{.CPUPerc}} {{.Name}}' pay-fx pay-notify pay-cache \
+      | sort -rn | head -1 | awk '{print $2}' > $PM/hog.txt
+    docker stop "$(cat $PM/hog.txt)" >/dev/null
+
+    # --- Part B: fixes ---
+    s=$(sed -n 's/^max size per file: *\([0-9]*\).*/\1/p' $P/logging-policy.txt)
+    n=$(sed -n 's/^max files kept: *\([0-9]*\).*/\1/p' $P/logging-policy.txt)
+    opts="--log-driver local --log-opt max-size=${s}m --log-opt max-file=${n}"
+    sed -i "s|--name pay-api|--name pay-api $opts|" $P/api.sh
+    sed -i "s|--name pay-worker|--name pay-worker $opts|" $P/worker.sh
+    sed -i 's|mkdir -p /var/log/worker;|mkdir -p /var/log/worker; ln -sf /dev/stdout /var/log/worker/worker.log;|' $P/worker.sh
+    sed -i 's|curl -fsS http://localhost:8080/health|wget -q -O /dev/null http://127.0.0.1:8080/health|' $P/gateway.sh
+    sh $P/api.sh && sh $P/worker.sh && sh $P/gateway.sh

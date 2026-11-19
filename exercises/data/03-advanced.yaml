@@ -602,3 +602,224 @@ exercises:
     UPDATE seats SET holder = :'who'
     WHERE id = (SELECT id FROM seats WHERE holder IS NULL ORDER BY id LIMIT 1 FOR UPDATE SKIP LOCKED);
     SQL
+
+# ===== Capstone: a real-world lab =====
+
+- id: data-093
+  title: "Capstone: launch the analytics schema"
+  difficulty: 5
+  kind: build
+  tags: [capstone, postgres, partitioning, materialized-view, jsonb, roles, grants, redis, sorted-set]
+  tutorial: |
+    **Concept.** An analytics launch touches most of what this module covers at once: a big
+    table split so that queries read only the part they need, a pre-computed summary for the
+    dashboard, a read-only login for the BI tool, and a Redis structure the website reads.
+    Each piece is small; the work is in getting every one of them exactly right.
+
+    **Partitions, including the leftovers.** A range-partitioned table routes each row to the
+    child whose bounds contain its key (`FROM` inclusive, `TO` exclusive). A row that fits no
+    child is **refused**, unless the table has a **`DEFAULT`** partition, which takes every
+    row the others don't. When a query's range lies within one partition, the planner prunes
+    the others, the default one included.
+
+    **A summary readers never wait for.** A materialized view stores its result.
+    `REFRESH ... CONCURRENTLY` recomputes it without locking readers out, and needs a unique
+    index that covers every row of the view.
+
+    **Least privilege, now and later.** A role needs `USAGE` on a schema before any table
+    grant matters. Granting on named objects keeps the sensitive ones closed, and
+    `ALTER DEFAULT PRIVILEGES` covers the tables created from now on (by the role that runs
+    it). A partitioned table is queried through its parent, so that's where the grant goes.
+
+    **JSON into a leaderboard.** `jsonb_array_elements()` turns an array inside a document
+    into rows, which you can then filter and sum. A Redis sorted set keeps members ordered by
+    score; to replace a whole set without a moment where it is empty or half-built, build a
+    new key and `RENAME` it over the old one.
+
+    **Read up on:**
+    - `CREATE TABLE ... PARTITION BY RANGE`, `PARTITION OF ... FOR VALUES FROM ... TO ...`, `PARTITION OF ... DEFAULT`
+    - `tableoid::regclass` and `EXPLAIN`: where rows live, partition pruning
+    - `CREATE MATERIALIZED VIEW`, `REFRESH MATERIALIZED VIEW CONCURRENTLY`, `CREATE UNIQUE INDEX`
+    - `->>`, `jsonb_array_elements()`, `CROSS JOIN LATERAL`
+    - `GRANT USAGE ON SCHEMA`, `GRANT SELECT ON ...`, `ALTER DEFAULT PRIVILEGES IN SCHEMA`, `has_table_privilege()`
+    - Redis `ZADD`, `ZRANGE ... WITHSCORES`, `DEL`, `RENAME`
+  scenario: |
+    **Ticket ANL-342**, from Yusuf on the analytics team:
+
+    > The analytics schema goes live on Monday. The raw event dump is loaded, but nothing is
+    > built on top of it yet: no partitioned table, no dashboard summary, no access for the
+    > BI tool, and the shop's "top products" widget still shows August. Can you build it?
+
+    PostgreSQL runs in **`kl-pg`** (`docker exec -it kl-pg psql -U lab -d lab`) and Redis in
+    **`kl-redis`** (`docker exec -it kl-redis redis-cli`). Everything is in the schema
+    **`analytics`**. The raw events are in **`analytics.events_raw (id, ts, payload)`**, where
+    `payload` is a document such as:
+
+    ```json
+    {"kind": "purchase", "country": "GR", "items": [{"sku": "SKU-3", "qty": 2}, {"sku": "SKU-7", "qty": 1}]}
+    ```
+
+    `kind` is `view`, `signup`, `purchase` or `refund`; only purchases and refunds have
+    `items`.
+
+    ## Part 1: Partition the events
+
+    1. Create **`analytics.events`** with the same columns as `events_raw`, **range
+       partitioned on `ts`**, with one partition per month named
+       **`analytics.events_2026_08`**, **`analytics.events_2026_09`** and
+       **`analytics.events_2026_10`**, plus a **default partition
+       `analytics.events_default`** for the late and early stragglers. Copy **every row** of
+       `events_raw` into it, and leave `events_raw` as it is.
+    2. A query for September only (`ts >= '2026-09-01' AND ts < '2026-10-01'`) must scan
+       **only** `events_2026_09`.
+
+    ## Part 2: The dashboard summary
+
+    3. Create the materialized view **`analytics.daily_kinds`** over `analytics.events`, with
+       the columns **`day`** (the date of `ts`), **`kind`** (from the payload) and **`n`**
+       (the number of events), one row per day and kind.
+    4. It must be refreshable **without blocking dashboard readers**.
+
+    ## Part 3: Access for the BI tool
+
+    5. The BI tool logs in as **`bi`** (password **`bi-pw`**). It must be able to read
+       `analytics.events`, `analytics.daily_kinds`, **and any table created in `analytics`
+       from now on**. It must **not** be able to read **`analytics.customers_pii`**, must not
+       change any data, and stays a plain login role.
+
+    ## Part 4: The top products widget
+
+    6. The widget reads the Redis sorted set **`kl:top-skus`**: one member per sku, scored by
+       the **total quantity purchased in September 2026** (line items of `purchase` events
+       only, refunds don't count). It still holds stale numbers, including a retired product.
+       Make it hold exactly September's numbers, and **nothing else**.
+  hints:
+    - "`CREATE TABLE analytics.events (LIKE analytics.events_raw) PARTITION BY RANGE (ts)`, then one `CREATE TABLE ... PARTITION OF analytics.events FOR VALUES FROM ('2026-08-01') TO ('2026-09-01')` per month. Try the copy without a default partition first and read the error."
+    - "`CREATE TABLE analytics.events_default PARTITION OF analytics.events DEFAULT`. Then `INSERT INTO analytics.events SELECT * FROM analytics.events_raw`, and check where the rows went with `SELECT tableoid::regclass, count(*) FROM analytics.events GROUP BY 1`."
+    - "The view: `SELECT ts::date AS day, payload->>'kind' AS kind, count(*) AS n FROM analytics.events GROUP BY 1, 2`. Try `REFRESH MATERIALIZED VIEW CONCURRENTLY` on it and read what it asks for."
+    - "`bi` needs `USAGE` on the schema, `SELECT` on the two objects by name (not on all tables, or `customers_pii` opens too), and `ALTER DEFAULT PRIVILEGES IN SCHEMA analytics GRANT SELECT ON TABLES TO bi`. `has_table_privilege('bi', 'analytics.customers_pii', 'SELECT')` tests it."
+    - "The quantities: `CROSS JOIN LATERAL jsonb_array_elements(payload->'items') e`, then `sum((e->>'qty')::int)` per `e->>'sku'`, for `purchase` events in September. `psql -At -F' '` prints `score member` pairs, ready for `ZADD`."
+    - "Adding to the old set keeps the retired product. Build `kl:top-skus:new` with `ZADD` and `RENAME` it to `kl:top-skus`, or `DEL` the old set first."
+  solution: |
+    ```bash
+    docker exec -i kl-pg psql -U lab -d lab -v ON_ERROR_STOP=1 <<'SQL'
+    -- Part 1: monthly partitions, and a default one for the rest
+    CREATE TABLE analytics.events (LIKE analytics.events_raw) PARTITION BY RANGE (ts);
+    CREATE TABLE analytics.events_2026_08 PARTITION OF analytics.events FOR VALUES FROM ('2026-08-01') TO ('2026-09-01');
+    CREATE TABLE analytics.events_2026_09 PARTITION OF analytics.events FOR VALUES FROM ('2026-09-01') TO ('2026-10-01');
+    CREATE TABLE analytics.events_2026_10 PARTITION OF analytics.events FOR VALUES FROM ('2026-10-01') TO ('2026-11-01');
+    CREATE TABLE analytics.events_default PARTITION OF analytics.events DEFAULT;
+    INSERT INTO analytics.events SELECT * FROM analytics.events_raw;
+
+    -- Part 2: the summary, with the unique index a concurrent refresh needs
+    CREATE MATERIALIZED VIEW analytics.daily_kinds AS
+      SELECT ts::date AS day, payload->>'kind' AS kind, count(*) AS n FROM analytics.events GROUP BY 1, 2;
+    CREATE UNIQUE INDEX daily_kinds_day_kind_idx ON analytics.daily_kinds (day, kind);
+    REFRESH MATERIALIZED VIEW CONCURRENTLY analytics.daily_kinds;
+
+    -- Part 3: read-only access, by name, now and for future tables
+    GRANT USAGE ON SCHEMA analytics TO bi;
+    GRANT SELECT ON analytics.events, analytics.daily_kinds TO bi;
+    ALTER DEFAULT PRIVILEGES IN SCHEMA analytics GRANT SELECT ON TABLES TO bi;
+    SQL
+
+    docker exec kl-pg psql -U lab -d lab -c "EXPLAIN SELECT count(*) FROM analytics.events WHERE ts >= '2026-09-01' AND ts < '2026-10-01'"
+
+    # Part 4: build the new set under another name, then swap it in
+    pairs=$(docker exec kl-pg psql -U lab -d lab -At -F' ' -c "
+      SELECT sum((e->>'qty')::int), e->>'sku'
+      FROM analytics.events r CROSS JOIN LATERAL jsonb_array_elements(r.payload->'items') e
+      WHERE r.payload->>'kind' = 'purchase' AND r.ts >= '2026-09-01' AND r.ts < '2026-10-01'
+      GROUP BY 2")
+    docker exec kl-redis redis-cli DEL kl:top-skus:new
+    docker exec kl-redis redis-cli ZADD kl:top-skus:new $pairs
+    docker exec kl-redis redis-cli RENAME kl:top-skus:new kl:top-skus
+    docker exec kl-redis redis-cli ZREVRANGE kl:top-skus 0 -1 WITHSCORES
+    ```
+  setup: |
+    pg_start
+    pg_sql <<'SQL'
+    CREATE SCHEMA analytics;
+    CREATE ROLE bi LOGIN PASSWORD 'bi-pw';
+    CREATE TABLE analytics.customers_pii (id int PRIMARY KEY, email text, phone text);
+    INSERT INTO analytics.customers_pii SELECT g, 'c' || g || '@mail.test', '+30-69' || lpad(g::text, 8, '0') FROM generate_series(1, 500) g;
+    CREATE TABLE analytics.events_raw (id bigint NOT NULL, ts timestamp NOT NULL, payload jsonb NOT NULL);
+    INSERT INTO analytics.events_raw (id, ts, payload)
+    SELECT g, ts, CASE
+        WHEN k < 0.60 THEN jsonb_build_object('kind', 'view', 'country', c, 'page', '/p/' || (g % 50))
+        WHEN k < 0.70 THEN jsonb_build_object('kind', 'signup', 'country', c)
+        ELSE jsonb_build_object('kind', CASE WHEN k < 0.94 THEN 'purchase' ELSE 'refund' END, 'country', c,
+          'items', (SELECT jsonb_agg(jsonb_build_object('sku', 'SKU-' || (1 + (g * 7 + j * 13) % 12), 'qty', 1 + (g + j) % 5))
+                    FROM generate_series(1, 1 + g % 3) j))
+      END
+    FROM (SELECT g, random() k, (ARRAY['GR','DE','FR','IT'])[1 + g % 4] c,
+                 CASE WHEN g <= 15000 THEN timestamp '2026-08-01' + random() * interval '92 days'
+                      WHEN g <= 15040 THEN timestamp '2026-11-01' + random() * interval '18 days'
+                      WHEN g <= 15052 THEN timestamp '2026-07-20' + random() * interval '11 days'
+                      ELSE timestamp '2026-09-01' END ts
+          FROM generate_series(1, 15055) g) s;
+    SQL
+    pg_sql "SELECT count(*) FROM analytics.events_raw" > "$KL_STATE/raw-count"
+    pg_sql "SELECT e->>'sku' || ' ' || sum((e->>'qty')::int) FROM analytics.events_raw r CROSS JOIN LATERAL jsonb_array_elements(r.payload->'items') e WHERE r.payload->>'kind' = 'purchase' AND r.ts >= '2026-09-01' AND r.ts < '2026-10-01' GROUP BY e->>'sku'" | LC_ALL=C sort > "$KL_STATE/top-skus"
+
+    # --- the widget's sorted set, still holding August ---
+    docker run -d --name kl-redis redis:7.4-alpine >/dev/null
+    eventually 20 '[ "$(docker exec kl-redis redis-cli ping)" = PONG ]'
+    docker exec kl-redis redis-cli ZADD kl:top-skus 1210 SKU-1 1104 SKU-2 1388 SKU-3 990 SKU-4 1500 SKU-RETIRED 1020 SKU-6 >/dev/null
+  check: |
+    info "Part 1: Partition the events"
+    part=$(pg_sql "SELECT count(*) FROM pg_partitioned_table p JOIN pg_class c ON c.oid = p.partrelid JOIN pg_attribute a ON a.attrelid = c.oid AND a.attnum = p.partattrs[0] WHERE c.oid = to_regclass('analytics.events') AND p.partstrat = 'r' AND a.attname = 'ts'" 2>/dev/null)
+    check_eq "analytics.events is range partitioned on ts" "${part:-0}" 1
+    expected=$(pg_sql "SELECT p || '|' || count(*) FROM (SELECT CASE WHEN ts >= '2026-08-01' AND ts < '2026-11-01' THEN 'analytics.events_' || to_char(ts, 'YYYY_MM') ELSE 'analytics.events_default' END p FROM analytics.events_raw) t GROUP BY p ORDER BY 1 COLLATE \"C\"")
+    actual=$(pg_sql "SELECT tableoid::regclass::text || '|' || count(*) FROM analytics.events GROUP BY tableoid ORDER BY 1 COLLATE \"C\"" 2>/dev/null)
+    isdef=$(pg_sql "SELECT pg_get_expr(relpartbound, oid) FROM pg_class WHERE oid = to_regclass('analytics.events_default')" 2>/dev/null)
+    check_eq "every event is in its month's partition, the rest in the DEFAULT partition events_default" "$(printf '%s / %s' "$actual" "$isdef")" "$(printf '%s / DEFAULT' "$expected")"
+    check_eq "analytics.events_raw is untouched" "$(pg_sql 'SELECT count(*) FROM analytics.events_raw')" "$(cat "$KL_STATE/raw-count")"
+    plan=$(pg_sql "EXPLAIN SELECT count(*) FROM analytics.events WHERE ts >= '2026-09-01' AND ts < '2026-10-01'" 2>/dev/null)
+    check "a September query scans only events_2026_09" '[[ $plan =~ events_2026_09 ]] && ! grep -Eq "events_(2026_08|2026_10|default)" <<<"$plan"'
+
+    info "Part 2: The dashboard summary"
+    mv=$(pg_sql "SELECT count(*) FROM pg_matviews WHERE schemaname = 'analytics' AND matviewname = 'daily_kinds' AND definition !~ 'events_raw'")
+    sum_of() { echo "SELECT md5(string_agg(day || ':' || kind || ':' || n, ',' ORDER BY day, kind COLLATE \"C\")) FROM $1"; }
+    live="(SELECT ts::date AS day, payload->>'kind' AS kind, count(*) AS n FROM analytics.events_raw GROUP BY 1, 2) t"
+    check_eq "analytics.daily_kinds is a materialized view over analytics.events with n per day and kind" "$mv:$(pg_sql "$(sum_of analytics.daily_kinds)" 2>/dev/null)" "1:$(pg_sql "$(sum_of "$live")")"
+    nu=$(pg_sql "SELECT count(*) FROM pg_index WHERE indrelid = to_regclass('analytics.daily_kinds') AND indisunique AND indpred IS NULL" 2>/dev/null)
+    check "analytics.daily_kinds refreshes concurrently, without blocking readers" '[ "${nu:-0}" -ge 1 ] && pg_sql "REFRESH MATERIALIZED VIEW CONCURRENTLY analytics.daily_kinds"'
+
+    info "Part 3: Access for the BI tool"
+    as_bi() { docker exec -i -e PGPASSWORD=bi-pw kl-pg psql -h 127.0.0.1 -U bi -d lab -v ON_ERROR_STOP=1 -qAt -c "$1" 2>/dev/null; }
+    check_eq "bi can query analytics.events and analytics.daily_kinds" "$(as_bi 'SELECT count(*) FROM analytics.events'):$(as_bi 'SELECT count(*) > 0 FROM analytics.daily_kinds')" "$(cat "$KL_STATE/raw-count"):t"
+    check_eq "bi cannot read analytics.customers_pii" "$(pg_sql "SELECT has_table_privilege('bi', 'analytics.customers_pii', 'SELECT')")" f
+    w=$(pg_sql "SELECT bool_or(has_table_privilege('bi', t, p)) FROM unnest(ARRAY['analytics.events', 'analytics.daily_kinds', 'analytics.customers_pii', 'analytics.events_raw']) t, unnest(ARRAY['INSERT', 'UPDATE', 'DELETE', 'TRUNCATE']) p WHERE to_regclass(t) IS NOT NULL")
+    check_eq "bi cannot change data and is a plain login role" "$w:$(pg_sql "SELECT rolcanlogin AND NOT rolsuper FROM pg_roles WHERE rolname = 'bi'")" "f:t"
+    future=$(pg_sql <<'SQL'
+    CREATE TABLE analytics.zz_probe (i int);
+    SELECT has_table_privilege('bi', 'analytics.zz_probe', 'SELECT');
+    DROP TABLE analytics.zz_probe;
+    SQL
+    )
+    check_eq "bi can read tables created in analytics later" "$future" t
+
+    info "Part 4: The top products widget"
+    got=$(docker exec kl-redis redis-cli ZRANGE kl:top-skus 0 -1 WITHSCORES | paste -d' ' - - | LC_ALL=C sort)
+    check_eq "kl:top-skus holds September's purchased quantity per sku, and nothing else" "$got" "$(cat "$KL_STATE/top-skus")"
+  solve: |
+    docker exec -i kl-pg psql -U lab -d lab -v ON_ERROR_STOP=1 -q <<'SQL'
+    CREATE TABLE analytics.events (LIKE analytics.events_raw) PARTITION BY RANGE (ts);
+    CREATE TABLE analytics.events_2026_08 PARTITION OF analytics.events FOR VALUES FROM ('2026-08-01') TO ('2026-09-01');
+    CREATE TABLE analytics.events_2026_09 PARTITION OF analytics.events FOR VALUES FROM ('2026-09-01') TO ('2026-10-01');
+    CREATE TABLE analytics.events_2026_10 PARTITION OF analytics.events FOR VALUES FROM ('2026-10-01') TO ('2026-11-01');
+    CREATE TABLE analytics.events_default PARTITION OF analytics.events DEFAULT;
+    INSERT INTO analytics.events SELECT * FROM analytics.events_raw;
+    CREATE MATERIALIZED VIEW analytics.daily_kinds AS
+      SELECT ts::date AS day, payload->>'kind' AS kind, count(*) AS n FROM analytics.events GROUP BY 1, 2;
+    CREATE UNIQUE INDEX daily_kinds_day_kind_idx ON analytics.daily_kinds (day, kind);
+    GRANT USAGE ON SCHEMA analytics TO bi;
+    GRANT SELECT ON analytics.events, analytics.daily_kinds TO bi;
+    ALTER DEFAULT PRIVILEGES IN SCHEMA analytics GRANT SELECT ON TABLES TO bi;
+    SQL
+    pairs=$(docker exec kl-pg psql -U lab -d lab -At -F' ' -c "SELECT sum((e->>'qty')::int), e->>'sku' FROM analytics.events r CROSS JOIN LATERAL jsonb_array_elements(r.payload->'items') e WHERE r.payload->>'kind' = 'purchase' AND r.ts >= '2026-09-01' AND r.ts < '2026-10-01' GROUP BY 2")
+    docker exec kl-redis redis-cli DEL kl:top-skus:new >/dev/null
+    # shellcheck disable=SC2086
+    docker exec kl-redis redis-cli ZADD kl:top-skus:new $pairs >/dev/null
+    docker exec kl-redis redis-cli RENAME kl:top-skus:new kl:top-skus >/dev/null

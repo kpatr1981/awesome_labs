@@ -1504,3 +1504,707 @@ exercises:
 
     func main() {}
     GO
+
+# ===== Capstone: a real-world lab =====
+
+- id: prog-085
+  title: "Capstone: the nightly link checker"
+  difficulty: 5
+  kind: build
+  tags: [capstone, go, goroutines, worker-pool, context, timeout, cancellation, goroutine-leak, mutex, bufio, io]
+  tutorial: |
+    **Concept.** A tool that checks thousands of slow, flaky remote things
+    needs four habits at once:
+
+    - **A bounded worker pool.** A fixed number of goroutines pull work from
+      one channel, so 40,000 links never mean 40,000 connections. Each
+      worker writes its own slot of a results slice, which keeps the input
+      order without a lock.
+    - **A deadline per job.** `context.WithTimeout(parent, d)` gives one job
+      its own clock. The job code (here, the fetcher) watches `ctx.Done()`
+      and gives up; `ctx.Err()` then says why (`context.DeadlineExceeded`).
+      One shared deadline for the whole run is a different, wrong thing.
+    - **Cancellation that reaches everything.** When the caller cancels the
+      parent context, every child context is cancelled too. The code that
+      hands out work must stop handing it out (`select` on `ctx.Done()`
+      next to the send), work not started must not start, and every
+      goroutine must end: a worker blocked forever on a channel is a leak.
+    - **Streams and shared state.** An `io.Reader` may deliver any amount
+      per call, lines may be huge, and a read error must reach the caller.
+      State that several goroutines touch (a map of counters) needs one
+      lock around **every** access, reads included.
+
+    **Read up on:**
+    - `go doc context.WithTimeout`, `go doc context.Context` (`Done`, `Err`, `Deadline`)
+    - `go doc errors.Is` — matching `context.Canceled` and `context.DeadlineExceeded`
+    - `go doc sync.WaitGroup`, `go doc sync.Mutex`
+    - the `select` statement with a send case and a `<-ctx.Done()` case
+    - `go doc bufio.Reader.ReadString` versus `bufio.Scanner`'s token limit
+    - `go doc runtime.NumGoroutine` — how the tests spot a leak
+
+    Compile and vet your file with
+    `docker run --rm -v /lab:/src -w /src golang:1.24-alpine go vet linkcheck.go`.
+  scenario: |
+    **DOCS-340**, from Marek on the docs platform team: *"The nightly
+    broken-link check over our 40,000 doc links takes six hours because it
+    checks one link at a time. Someone tried `go fetch(link)` per link: it
+    opened 40,000 connections, got us rate-limited by GitHub, and crashed
+    with `concurrent map writes`. One server that never answers stalls the
+    whole run, and Ctrl-C in CI leaves it running. Please make the library
+    behave; the CLI around it calls these functions."*
+
+    **`/lab/linkcheck.go`** (package `main`, keep `func main() {}`) holds
+    the current code: `ReadLinks`, `CheckAll` and `Summary`. The `Fetcher`
+    the CLI passes in honours its context: it returns `ctx.Err()` as soon as
+    the context is done. Hidden Go tests check, one item each:
+
+    1. **Reading the list.** **`ReadLinks(r io.Reader) ([]string, error)`**
+       returns one link per line: surrounding spaces and `\r` trimmed, blank
+       lines and lines starting with `#` skipped, **duplicates dropped**
+       (first one kept). It handles lines of **any length** (generated links
+       reach a megabyte), a last line without a newline, and readers that
+       deliver one byte at a time. A read error other than end of input is
+       **returned**, together with the links read before it.
+    2. **Results.** **`CheckAll(ctx, links, workers, perLink, fetch)`**
+       returns one `Result{URL, Status, Err}` per link **in the same order
+       as `links`**, calling `fetch` exactly once per link. No links give an
+       empty result.
+    3. **Bounded concurrency.** Links are checked in parallel but **never
+       more than `workers` fetches at once**; `workers` below 1 means 1.
+    4. **A time limit per link.** Each call of `fetch` gets a context with
+       its **own** deadline, `perLink` from when that link starts. A link
+       that never answers ends with an `Err` matching
+       `context.DeadlineExceeded`, and doesn't hold up the others.
+    5. **Cancellation.** When `ctx` is cancelled, `CheckAll` returns
+       **promptly**: links not fetched yet are not fetched at all, and every
+       link that didn't complete has an `Err` matching `context.Canceled`.
+       When it returns, **no goroutine it started is still running**. An
+       already cancelled `ctx` means no fetch at all.
+    6. **The summary.** **`Summary`** is safe for any mix of concurrent
+       `Add` and `Counts` calls, and **`Counts()`** returns a copy (changing
+       it doesn't change the summary). Classes: `error` when `Err` is set,
+       `ok` for status 200–399, `broken` otherwise.
+  hints:
+    - "Item 1: `bufio.NewReader(r)` and `ReadString('\\n')` have no line limit and return the last partial line together with `io.EOF`; a `map[string]bool` drops the duplicates."
+    - "Items 2 and 3: start `workers` goroutines that `range` over a channel of indices and fill `results[i]`; close the channel after the last index and `wg.Wait()`."
+    - "Item 4: inside the worker, `c, cancel := context.WithTimeout(ctx, perLink)`, call `fetch(c, link)`, then `cancel()`. One context made before the loop would be a shared deadline."
+    - "Item 5: send each index with `select { case idx <- i: case <-ctx.Done(): }` and stop sending once the context is done; a worker should check `ctx.Err()` before it fetches."
+    - "Item 5: after `wg.Wait()`, every link that was never handed out gets `Result{URL: link, Err: ctx.Err()}`."
+    - "Item 6: a `sync.Mutex` field, locked in both `Add` and `Counts`; `Counts` builds a new map while holding the lock."
+  solution: |
+    `solve` writes the whole file. Item by item:
+
+    1. `ReadLinks` reads with `bufio.NewReader(r).ReadString('\n')` (no line
+       limit, the last partial line comes with `io.EOF`), trims, skips blank
+       and `#` lines, drops repeats with a `seen` map, and returns any error
+       other than `io.EOF` with the links so far.
+    2. and 3. `workers` (at least 1) goroutines `range` over an `idx` channel
+       and write `results[i]`; the feeder closes `idx`, then `wg.Wait()`.
+    4. and 5. The feeder stops handing out work once the context is done,
+       each job gets its own deadline, and links never handed out are
+       marked with `ctx.Err()`:
+       ```go
+       sent := 0
+       feed:
+       for i := range links {
+           select {
+           case idx <- i:
+               sent++
+           case <-ctx.Done():
+               break feed
+           }
+       }
+       close(idx)
+       wg.Wait()
+       for i := sent; i < len(links); i++ {
+           results[i] = Result{URL: links[i], Err: ctx.Err()}
+       }
+
+       // in the worker, for each index:
+       if err := ctx.Err(); err != nil {
+           return Result{URL: link, Err: err}
+       }
+       c, cancel := context.WithTimeout(ctx, perLink)
+       defer cancel()
+       status, err := fetch(c, link)
+       ```
+    6. `Summary` gets a `mu sync.Mutex` field; `Add` and `Counts` both
+       `Lock` / `defer Unlock`, and `Counts` copies the map into a new one.
+  setup: |
+    lab_file /lab/linkcheck.go <<'EOF'
+    package main
+
+    import (
+        "bufio"
+        "context"
+        "io"
+        "strings"
+        "time"
+    )
+
+    // Fetcher checks one link and returns its HTTP status. It returns
+    // ctx.Err() as soon as ctx is done.
+    type Fetcher func(ctx context.Context, url string) (int, error)
+
+    // Result is the outcome for one link.
+    type Result struct {
+        URL    string
+        Status int
+        Err    error
+    }
+
+    // ReadLinks reads one link per line from r.
+    func ReadLinks(r io.Reader) ([]string, error) {
+        var links []string
+        sc := bufio.NewScanner(r)
+        for sc.Scan() {
+            line := strings.TrimSpace(sc.Text())
+            if line == "" || strings.HasPrefix(line, "#") {
+                continue
+            }
+            links = append(links, line)
+        }
+        return links, nil
+    }
+
+    // CheckAll checks every link and returns one Result per link, in order.
+    func CheckAll(ctx context.Context, links []string, workers int, perLink time.Duration, fetch Fetcher) []Result {
+        results := make([]Result, len(links))
+        for i, link := range links {
+            status, err := fetch(ctx, link)
+            results[i] = Result{URL: link, Status: status, Err: err}
+        }
+        return results
+    }
+
+    // Summary counts results by class: "ok", "broken" and "error".
+    type Summary struct {
+        counts map[string]int
+    }
+
+    func NewSummary() *Summary { return &Summary{counts: map[string]int{}} }
+
+    func (s *Summary) Add(r Result) {
+        s.counts[classify(r)]++
+    }
+
+    func (s *Summary) Counts() map[string]int {
+        return s.counts
+    }
+
+    func classify(r Result) string {
+        switch {
+        case r.Err != nil:
+            return "error"
+        case r.Status >= 200 && r.Status < 400:
+            return "ok"
+        default:
+            return "broken"
+        }
+    }
+
+    func main() {}
+    EOF
+  check: |
+    d=$(mktemp -d)
+    cp /lab/*.go "$d"/ 2>/dev/null
+    cat >"$d/zz_hidden_test.go" <<'GO'
+    package main
+
+    import (
+        "context"
+        "errors"
+        "fmt"
+        "reflect"
+        "runtime"
+        "strings"
+        "sync"
+        "sync/atomic"
+        "testing"
+        "testing/iotest"
+        "time"
+    )
+
+    var klBoom = errors.New("boom")
+
+    type klFailAfter struct {
+        data string
+        done bool
+    }
+
+    func (f *klFailAfter) Read(p []byte) (int, error) {
+        if f.done {
+            return 0, klBoom
+        }
+        f.done = true
+        return copy(p, f.data), nil
+    }
+
+    func klLinks(n int) []string {
+        out := make([]string, n)
+        for i := range out {
+            out[i] = fmt.Sprintf("https://docs.example/p%d", i)
+        }
+        return out
+    }
+
+    func klRun(t *testing.T, ctx context.Context, links []string, workers int, per time.Duration, f Fetcher) []Result {
+        t.Helper()
+        done := make(chan []Result, 1)
+        go func() { done <- CheckAll(ctx, links, workers, per, f) }()
+        select {
+        case got := <-done:
+            if len(got) != len(links) {
+                t.Fatalf("got %d results for %d links", len(got), len(links))
+            }
+            return got
+        case <-time.After(10 * time.Second):
+            t.Fatal("CheckAll did not return within 10s")
+        }
+        return nil
+    }
+
+    func klNoLeak(base int) bool {
+        for end := time.Now().Add(3 * time.Second); time.Now().Before(end); time.Sleep(20 * time.Millisecond) {
+            if runtime.NumGoroutine() <= base {
+                return true
+            }
+        }
+        return false
+    }
+
+    func TestR1_Parse(t *testing.T) {
+        in := "# docs links\n  https://a.example/x \r\n\nhttps://b.example\r\n   # old\nhttps://a.example/x\nhttps://c.example"
+        got, err := ReadLinks(strings.NewReader(in))
+        want := []string{"https://a.example/x", "https://b.example", "https://c.example"}
+        if err != nil || !reflect.DeepEqual(got, want) {
+            t.Fatalf("got %q, %v; want %q", got, err, want)
+        }
+        if got, err := ReadLinks(strings.NewReader("")); err != nil || len(got) != 0 {
+            t.Fatalf("empty input: %q, %v", got, err)
+        }
+    }
+
+    func TestR1_LongLines(t *testing.T) {
+        long := "https://cdn.example/x?q=" + strings.Repeat("a", 1<<20)
+        in := "https://first.example\n" + long + "\nhttps://last.example\n"
+        got, err := ReadLinks(strings.NewReader(in))
+        if err != nil || len(got) != 3 || got[1] != long || got[2] != "https://last.example" {
+            t.Fatalf("with a 1 MiB link: got %d links, err %v", len(got), err)
+        }
+    }
+
+    func TestR1_OneByteReader(t *testing.T) {
+        got, err := ReadLinks(iotest.OneByteReader(strings.NewReader("https://x\n\nhttps://y")))
+        if err != nil || !reflect.DeepEqual(got, []string{"https://x", "https://y"}) {
+            t.Fatalf("got %q, %v", got, err)
+        }
+    }
+
+    func TestR1_ReaderError(t *testing.T) {
+        got, err := ReadLinks(&klFailAfter{data: "https://a\nhttps://b\n"})
+        if !errors.Is(err, klBoom) {
+            t.Fatalf("err = %v, want the reader's error", err)
+        }
+        if !reflect.DeepEqual(got, []string{"https://a", "https://b"}) {
+            t.Fatalf("links before the error: %q", got)
+        }
+    }
+
+    func TestR2_Order(t *testing.T) {
+        links := klLinks(40)
+        var mu sync.Mutex
+        calls := map[string]int{}
+        fetch := func(ctx context.Context, u string) (int, error) {
+            mu.Lock()
+            calls[u]++
+            mu.Unlock()
+            var n int
+            fmt.Sscanf(u, "https://docs.example/p%d", &n)
+            time.Sleep(time.Duration((7*n)%5) * time.Millisecond)
+            switch n % 10 {
+            case 3:
+                return 0, fmt.Errorf("dial %s: connection refused", u)
+            case 7:
+                return 404, nil
+            }
+            return 200, nil
+        }
+        got := klRun(t, context.Background(), links, 4, 5*time.Second, fetch)
+        for i, r := range got {
+            if r.URL != links[i] {
+                t.Fatalf("result %d is for %q, want %q", i, r.URL, links[i])
+            }
+            switch i % 10 {
+            case 3:
+                if r.Err == nil {
+                    t.Fatalf("%s: the fetch error was lost", r.URL)
+                }
+            case 7:
+                if r.Status != 404 || r.Err != nil {
+                    t.Fatalf("%s: got %d %v, want 404", r.URL, r.Status, r.Err)
+                }
+            default:
+                if r.Status != 200 || r.Err != nil {
+                    t.Fatalf("%s: got %d %v, want 200", r.URL, r.Status, r.Err)
+                }
+            }
+        }
+        for _, l := range links {
+            if calls[l] != 1 {
+                t.Fatalf("%s fetched %d times", l, calls[l])
+            }
+        }
+        if got := klRun(t, context.Background(), nil, 3, time.Second, fetch); len(got) != 0 {
+            t.Fatalf("no links gave %v", got)
+        }
+    }
+
+    func TestR3_Bounded(t *testing.T) {
+        for _, workers := range []int{0, 1, 3, 6} {
+            var cur, peak int32
+            fetch := func(ctx context.Context, u string) (int, error) {
+                c := atomic.AddInt32(&cur, 1)
+                for {
+                    p := atomic.LoadInt32(&peak)
+                    if c <= p || atomic.CompareAndSwapInt32(&peak, p, c) {
+                        break
+                    }
+                }
+                time.Sleep(25 * time.Millisecond)
+                atomic.AddInt32(&cur, -1)
+                return 200, nil
+            }
+            got := klRun(t, context.Background(), klLinks(30), workers, 5*time.Second, fetch)
+            limit := workers
+            if limit < 1 {
+                limit = 1
+            }
+            if int(peak) > limit {
+                t.Fatalf("workers=%d but %d fetches ran at once", workers, peak)
+            }
+            if limit > 1 && peak < 2 {
+                t.Fatalf("workers=%d but the fetches never overlapped", workers)
+            }
+            for _, r := range got {
+                if r.Status != 200 {
+                    t.Fatalf("workers=%d: %s got %d %v", workers, r.URL, r.Status, r.Err)
+                }
+            }
+        }
+    }
+
+    func TestR4_PerLinkDeadline(t *testing.T) {
+        hang := map[string]bool{"https://slow.example/1": true, "https://slow.example/2": true}
+        links := []string{"https://ok.example/1", "https://slow.example/1", "https://ok.example/2",
+            "https://slow.example/2", "https://ok.example/3"}
+        var noDeadline int32
+        fetch := func(ctx context.Context, u string) (int, error) {
+            if _, ok := ctx.Deadline(); !ok {
+                atomic.StoreInt32(&noDeadline, 1)
+            }
+            if hang[u] {
+                <-ctx.Done()
+                return 0, ctx.Err()
+            }
+            select {
+            case <-ctx.Done():
+                return 0, ctx.Err()
+            default:
+                return 200, nil
+            }
+        }
+        for _, workers := range []int{1, 3} {
+            got := klRun(t, context.Background(), links, workers, 400*time.Millisecond, fetch)
+            if atomic.LoadInt32(&noDeadline) == 1 {
+                t.Fatal("fetch was called with a context that has no deadline")
+            }
+            for i, r := range got {
+                if hang[links[i]] {
+                    if !errors.Is(r.Err, context.DeadlineExceeded) {
+                        t.Fatalf("workers=%d: %s ended with %d %v, want context.DeadlineExceeded", workers, r.URL, r.Status, r.Err)
+                    }
+                } else if r.Status != 200 || r.Err != nil {
+                    t.Fatalf("workers=%d: %s got %d %v; each link needs its own time limit", workers, r.URL, r.Status, r.Err)
+                }
+            }
+        }
+    }
+
+    func TestR5_CancelMidRun(t *testing.T) {
+        base := runtime.NumGoroutine()
+        links := klLinks(200)
+        var calls, late int32
+        var stopped atomic.Bool
+        ctx, cancel := context.WithCancel(context.Background())
+        defer cancel()
+        fetch := func(c context.Context, u string) (int, error) {
+            atomic.AddInt32(&calls, 1)
+            if stopped.Load() {
+                atomic.AddInt32(&late, 1)
+            }
+            select {
+            case <-time.After(30 * time.Millisecond):
+                return 200, nil
+            case <-c.Done():
+                return 0, c.Err()
+            }
+        }
+        go func() {
+            time.Sleep(250 * time.Millisecond)
+            stopped.Store(true)
+            cancel()
+        }()
+        start := time.Now()
+        got := klRun(t, ctx, links, 3, 5*time.Second, fetch)
+        if el := time.Since(start); el > 5*time.Second {
+            t.Fatalf("CheckAll took %v; it should stop soon after the cancel", el)
+        }
+        nCanceled := 0
+        for i, r := range got {
+            if r.URL != links[i] {
+                t.Fatalf("result %d is for %q, want %q", i, r.URL, links[i])
+            }
+            if r.Err == nil && r.Status == 200 {
+                continue
+            }
+            if !errors.Is(r.Err, context.Canceled) {
+                t.Fatalf("%s: got %d %v, want 200 or context.Canceled", r.URL, r.Status, r.Err)
+            }
+            nCanceled++
+        }
+        if nCanceled < 100 {
+            t.Fatalf("only %d of 200 links were cancelled", nCanceled)
+        }
+        if n := atomic.LoadInt32(&late); n > 3 {
+            t.Fatalf("fetch was still called for %d links after the cancel", n)
+        }
+        if !klNoLeak(base) {
+            t.Fatalf("goroutines leaked: %d running, %d before", runtime.NumGoroutine(), base)
+        }
+    }
+
+    func TestR5_AlreadyCancelled(t *testing.T) {
+        base := runtime.NumGoroutine()
+        ctx, cancel := context.WithCancel(context.Background())
+        cancel()
+        var calls int32
+        fetch := func(c context.Context, u string) (int, error) {
+            atomic.AddInt32(&calls, 1)
+            return 200, nil
+        }
+        got := klRun(t, ctx, klLinks(50), 4, time.Second, fetch)
+        if n := atomic.LoadInt32(&calls); n != 0 {
+            t.Fatalf("fetch called %d times for a cancelled context", n)
+        }
+        for _, r := range got {
+            if !errors.Is(r.Err, context.Canceled) || r.URL == "" {
+                t.Fatalf("got %+v, want the URL and context.Canceled", r)
+            }
+        }
+        if !klNoLeak(base) {
+            t.Fatalf("goroutines leaked: %d running, %d before", runtime.NumGoroutine(), base)
+        }
+    }
+
+    func TestR6_Concurrent(t *testing.T) {
+        s := NewSummary()
+        var wg sync.WaitGroup
+        for g := 0; g < 40; g++ {
+            wg.Add(2)
+            go func() {
+                defer wg.Done()
+                for i := 0; i < 250; i++ {
+                    switch i % 5 {
+                    case 0:
+                        s.Add(Result{Status: 404})
+                    case 1:
+                        s.Add(Result{Status: 200, Err: klBoom})
+                    default:
+                        s.Add(Result{Status: 200 + i%2*101})
+                    }
+                }
+            }()
+            go func() {
+                defer wg.Done()
+                for i := 0; i < 50; i++ {
+                    for k, v := range s.Counts() {
+                        _, _ = k, v
+                    }
+                }
+            }()
+        }
+        wg.Wait()
+        want := map[string]int{"ok": 40 * 150, "broken": 40 * 50, "error": 40 * 50}
+        if got := s.Counts(); !reflect.DeepEqual(got, want) {
+            t.Fatalf("got %v, want %v", got, want)
+        }
+    }
+
+    func TestR6_CountsIsACopy(t *testing.T) {
+        s := NewSummary()
+        s.Add(Result{Status: 301})
+        s.Add(Result{Status: 500})
+        c := s.Counts()
+        c["ok"] = 99
+        c["other"] = 1
+        if got := s.Counts(); !reflect.DeepEqual(got, map[string]int{"ok": 1, "broken": 1}) {
+            t.Fatalf("changing the returned map changed the summary: %v", got)
+        }
+    }
+    GO
+    out=$(timeout 420 docker run --rm -v "$d:/src" -v kl-gocache:/root/.cache -w /src golang:1.24-alpine sh -c '
+      go mod init lab >/dev/null 2>&1
+      if ! go test -c -o /tmp/hidden.test . >/tmp/build.log 2>&1; then
+        echo "KL build failed"; tail -n 12 /tmp/build.log; exit 0
+      fi
+      for r in R1 R2 R3 R4 R5 R6; do
+        if /tmp/hidden.test -test.run "^Test${r}_" -test.timeout 60s >/tmp/$r.log 2>&1; then
+          echo "KL $r ok"
+        else
+          echo "KL $r fail"
+          grep -E "^ +[a-z_]+\.go:[0-9]+: |^(panic|fatal error)" /tmp/$r.log | head -n 3
+        fi
+      done' 2>&1)
+    rm -rf "$d"
+    if grep -qx "KL build failed" <<<"$out"; then
+      echo "  linkcheck.go doesn't compile together with the tests:"
+      sed -n '/^KL build failed$/,$p' <<<"$out" | sed '1d; s/^/      /'
+    fi
+    # res ITEM "description" -> one check per item, with the test's message when it fails
+    res() {
+      check "$2" "grep -qx 'KL $1 ok' <<<\"\$out\""
+      grep -qx "KL $1 fail" <<<"$out" && awk -v r="KL $1 fail" '$0 == r {f = 1; next} /^KL / {f = 0} f' <<<"$out" | sed 's/^ */      /'
+      return 0
+    }
+    res R1 "1. ReadLinks handles long lines, duplicates and read errors"
+    res R2 "2. CheckAll returns one result per link, in order"
+    res R3 "3. never more than 'workers' fetches at once"
+    res R4 "4. every link gets its own time limit"
+    res R5 "5. cancelling stops the run promptly, without leaking goroutines"
+    res R6 "6. Summary is safe for concurrent use and Counts returns a copy"
+  solve: |
+    cat > /lab/linkcheck.go <<'GO'
+    package main
+
+    import (
+        "bufio"
+        "context"
+        "io"
+        "strings"
+        "sync"
+        "time"
+    )
+
+    // Fetcher checks one link and returns its HTTP status. It returns
+    // ctx.Err() as soon as ctx is done.
+    type Fetcher func(ctx context.Context, url string) (int, error)
+
+    // Result is the outcome for one link.
+    type Result struct {
+        URL    string
+        Status int
+        Err    error
+    }
+
+    // ReadLinks reads one link per line from r.
+    func ReadLinks(r io.Reader) ([]string, error) {
+        br := bufio.NewReader(r)
+        seen := map[string]bool{}
+        var links []string
+        for {
+            line, err := br.ReadString('\n')
+            if l := strings.TrimSpace(line); l != "" && !strings.HasPrefix(l, "#") && !seen[l] {
+                seen[l] = true
+                links = append(links, l)
+            }
+            if err == io.EOF {
+                return links, nil
+            } else if err != nil {
+                return links, err
+            }
+        }
+    }
+
+    // CheckAll checks every link and returns one Result per link, in order.
+    func CheckAll(ctx context.Context, links []string, workers int, perLink time.Duration, fetch Fetcher) []Result {
+        if workers < 1 {
+            workers = 1
+        }
+        results := make([]Result, len(links))
+        idx := make(chan int)
+        var wg sync.WaitGroup
+        for w := 0; w < workers; w++ {
+            wg.Add(1)
+            go func() {
+                defer wg.Done()
+                for i := range idx {
+                    results[i] = checkOne(ctx, links[i], perLink, fetch)
+                }
+            }()
+        }
+        sent := 0
+    feed:
+        for i := range links {
+            select {
+            case idx <- i:
+                sent++
+            case <-ctx.Done():
+                break feed
+            }
+        }
+        close(idx)
+        wg.Wait()
+        for i := sent; i < len(links); i++ {
+            results[i] = Result{URL: links[i], Err: ctx.Err()}
+        }
+        return results
+    }
+
+    func checkOne(ctx context.Context, link string, perLink time.Duration, fetch Fetcher) Result {
+        if err := ctx.Err(); err != nil {
+            return Result{URL: link, Err: err}
+        }
+        c, cancel := context.WithTimeout(ctx, perLink)
+        defer cancel()
+        status, err := fetch(c, link)
+        return Result{URL: link, Status: status, Err: err}
+    }
+
+    // Summary counts results by class: "ok", "broken" and "error".
+    type Summary struct {
+        mu     sync.Mutex
+        counts map[string]int
+    }
+
+    func NewSummary() *Summary { return &Summary{counts: map[string]int{}} }
+
+    func (s *Summary) Add(r Result) {
+        s.mu.Lock()
+        defer s.mu.Unlock()
+        s.counts[classify(r)]++
+    }
+
+    func (s *Summary) Counts() map[string]int {
+        s.mu.Lock()
+        defer s.mu.Unlock()
+        out := make(map[string]int, len(s.counts))
+        for k, v := range s.counts {
+            out[k] = v
+        }
+        return out
+    }
+
+    func classify(r Result) string {
+        switch {
+        case r.Err != nil:
+            return "error"
+        case r.Status >= 200 && r.Status < 400:
+            return "ok"
+        default:
+            return "broken"
+        }
+    }
+
+    func main() {}
+    GO

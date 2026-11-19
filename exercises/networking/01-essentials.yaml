@@ -304,3 +304,266 @@ exercises:
         echo "$link" > /lab/bad-link.txt
       fi
     done
+
+# ===== Capstone: a real-world lab =====
+
+- id: net-094
+  title: "Capstone: bring the branch office online"
+  difficulty: 5
+  kind: build
+  tags: [capstone, ip, addressing, netmask, cidr, routing, forwarding, nat, dnat, nftables, latency, netem, netns]
+  tutorial: |
+    **Concept.** Bringing a site online is the whole of this module at once, and the faults stack: a packet that leaves a host has to be addressed right, be judged local or remote correctly, be forwarded by every router on the way, and find a route **back**. A tidy way to work is to follow one packet outwards, a hop at a time, and fix the first thing that stops it.
+
+    - **The address plan first.** A subnet written as `NETWORK/LEN` fixes its first usable address (network + 1), its broadcast (the last address) and its last usable one (broadcast − 1). A host with the right address but the wrong prefix length disagrees with everyone else about who is local. A mask that is too **wide** is the sneaky case: the host believes far-away addresses are on its own wire, tries to reach them directly, and never asks its gateway.
+    - **Routers forward only when told to,** and each one needs a route towards every destination *and* every source it must answer. A route that points at last year's subnet is as good as none.
+    - **Publishing a private service.** A destination NAT rule on the router rewrites traffic arriving on its outside address to the private server, and connection tracking rewrites the replies. The far side never needs a route to the private network, which is the point.
+    - **Slow is a fault too.** A leftover `netem` qdisc from a test adds latency to one interface. Measure the round trip to each hop to see where it jumps, then look at the qdiscs.
+
+    **Read up on:**
+    - CIDR arithmetic — the network, broadcast, first and last usable address of a /26
+    - `man ip-address` — `add`, `del` and prefix lengths; `ip -br addr` for a quick view
+    - `ip route get ADDR` — which route, gateway and interface the kernel would use
+    - `man ip-route` — `add`, `del` and `replace`, default routes and routes via a gateway
+    - `sysctl net.ipv4.ip_forward` inside a namespace — whether a router forwards
+    - Return paths — why the far router needs a route to your subnet
+    - `man nft` — a `nat` table, the `prerouting` hook, `iifname`, `tcp dport` and `dnat to ADDR:PORT`
+    - `ping -c` to successive hops, `traceroute -n` — finding where time is lost
+    - `tc qdisc show` and `man tc-netem` — spotting and removing a delay
+  scenario: |
+    **Ticket NET-1187** from Maria in IT operations: *"The Larissa branch opens on Monday.
+    The cabling contractor wired everything and went home; nothing talks to HQ yet, the
+    security team can't see the camera recorder, and the one link that does answer is
+    painfully slow. Please get it to go-live state."*
+
+    Every device is a network namespace. Run commands inside one with
+    `sudo ip netns exec <namespace> <command>`. The IP plan is in **`/lab/ipplan.txt`**.
+
+    ```
+       pc1 ──┐
+             sw ── br1 ══ WAN 10.60.255.0/30 ══ hq1 ── srv (10.60.10.10)
+    printer ─┘      │  .1                   .2  .1
+                    └── nvr (192.168.77.10:8080, camera network)
+    ```
+
+    `sw` is a plain switch; you don't need to touch it. Go-live means all of this holds:
+
+    1. **pc1 is addressed.** Its `eth0` has the address the plan gives it, the **last
+       usable address** of the branch LAN, with the LAN's prefix length, and a default route
+       through the branch gateway (**br1**, the first usable address).
+    2. **The printer works.** `printer` can reach `srv`. Its address is printed on labels,
+       so keep the address itself as it is.
+    3. **The branch router routes.** `br1` forwards packets and sends traffic for HQ to
+       `hq1` (10.60.255.2).
+    4. **HQ answers back.** `srv` can reach `pc1` and `printer`.
+    5. **The camera recorder is published to HQ.** Using **nftables on br1**,
+       `curl http://10.60.255.1/` run on `srv` (port 80 on br1's WAN address) must reach the
+       recorder's web interface on `nvr` (192.168.77.10:8080). The camera network stays
+       private: **hq1 must have no route to 192.168.77.0/24**, not even a default route
+       through the branch.
+    6. **The WAN is fast again.** A test left a delay on one interface somewhere between the
+       branch and HQ. Remove it, so that pc1 reaches srv in well under **100 ms**, with no
+       `netem` qdisc left on any device.
+
+    Don't add or remove interfaces, and don't change the addresses of br1, hq1, srv or nvr.
+  hints:
+    - "Start with the plan: for the branch LAN in `/lab/ipplan.txt`, work out the network address, the broadcast address and the two usable ends. A /26 has 64 addresses."
+    - "Compare `sudo ip netns exec printer ip -br addr` with the plan. Then ask the printer how it would reach srv: `ip route get 10.60.10.10`. Does it go through the gateway?"
+    - "Changing the printer's prefix means deleting and re-adding the address. Routes that relied on the old address can go with it, so check `ip route` afterwards."
+    - "Follow a ping from pc1 to srv hop by hop: `ip route get` and `sysctl net.ipv4.ip_forward` on br1, then `ip route` on hq1. Is hq1's route for the branch really the branch's subnet?"
+    - "For the recorder: a `nat` table on br1 with a `type nat hook prerouting priority dstnat` chain and a rule like `iifname \"wan0\" tcp dport 80 dnat to 192.168.77.10:8080`. The replies leave br1 by its default route."
+    - "For the delay: ping br1, hq1 and srv from pc1 and see where the time jumps, then `tc -n NS qdisc show` on the devices around it and `tc qdisc del dev IF root`."
+  solution: |
+    Read the plan. If the branch LAN is, say, `10.60.4.64/26`, it runs from .64 (network)
+    to .127 (broadcast), so the gateway is **.65** and pc1 gets **.126**. Replace `B` below
+    with the network's last number.
+
+    **1. pc1.** Address and default route:
+
+    ```bash
+    B=64   # from /lab/ipplan.txt
+    sudo ip netns exec pc1 ip addr add 10.60.4.$((B+62))/26 dev eth0
+    sudo ip netns exec pc1 ip route add default via 10.60.4.$((B+1))
+    ```
+
+    **2. printer.** It has a **/16** mask, so it treats 10.60.10.10 as a neighbour on its own
+    wire and never uses its gateway. Re-add the same address as a /26 and make sure the
+    default route is there:
+
+    ```bash
+    sudo ip netns exec printer ip addr del 10.60.4.$((B+20))/16 dev eth0
+    sudo ip netns exec printer ip addr add 10.60.4.$((B+20))/26 dev eth0
+    sudo ip netns exec printer ip route replace default via 10.60.4.$((B+1))
+    ```
+
+    **3. br1.** Forwarding is off and it has no route towards HQ:
+
+    ```bash
+    sudo ip netns exec br1 sysctl -w net.ipv4.ip_forward=1
+    sudo ip netns exec br1 ip route add default via 10.60.255.2
+    ```
+
+    **4. hq1.** Its route to the branch points at another /26 (an old plan). Replace it with
+    the real one:
+
+    ```bash
+    sudo ip netns exec hq1 ip route          # the stale 10.60.4.x/26 via 10.60.255.1
+    sudo ip netns exec hq1 ip route del 10.60.4.OLD/26
+    sudo ip netns exec hq1 ip route add 10.60.4.$B/26 via 10.60.255.1
+    ```
+
+    **5. The recorder.** Destination NAT on br1; HQ never learns the camera network:
+
+    ```bash
+    sudo ip netns exec br1 nft -f - <<'EOF'
+    table ip nat {
+      chain prerouting {
+        type nat hook prerouting priority dstnat;
+        iifname "wan0" tcp dport 80 dnat to 192.168.77.10:8080
+      }
+    }
+    EOF
+    sudo ip netns exec srv curl -s http://10.60.255.1/
+    ```
+
+    **6. The delay.** Ping each hop from pc1; the round trip jumps after the bad interface.
+    Find the `netem` qdisc and delete it:
+
+    ```bash
+    for n in br1 hq1 srv; do echo "== $n"; sudo tc -n $n qdisc show | grep netem; done
+    sudo tc -n NS qdisc del dev IF root
+    sudo ip netns exec pc1 ping -c3 10.60.10.10
+    ```
+  setup: |
+    k=$((RANDOM % 4)); B=$((k * 64)); W=$(( ((k + 1) % 4) * 64 ))
+    echo "$B" > "$KL_STATE/answer.lan"
+
+    netns_new pc1 printer sw br1 hq1 srv nvr
+    # the branch switch
+    ip -n sw link add br0 type bridge
+    ip -n sw link set br0 up
+    netns_link pc1 eth0 sw p1
+    netns_link printer eth0 sw p2
+    netns_link br1 lan0 sw p0
+    for p in p0 p1 p2; do ip -n sw link set "$p" master br0; done
+    # links to HQ and to the camera network
+    netns_link br1 wan0 hq1 wan0
+    netns_link hq1 lan0 srv eth0
+    netns_link br1 cam0 nvr eth0
+
+    ip -n br1 addr add 10.60.4.$((B + 1))/26 dev lan0
+    ip -n br1 addr add 10.60.255.1/30 dev wan0
+    ip -n br1 addr add 192.168.77.1/24 dev cam0
+    ip -n hq1 addr add 10.60.255.2/30 dev wan0
+    ip -n hq1 addr add 10.60.10.1/24 dev lan0
+    ip -n srv addr add 10.60.10.10/24 dev eth0
+    ip -n nvr addr add 192.168.77.10/24 dev eth0
+    # the printer: right address, wrong mask
+    ip -n printer addr add 10.60.4.$((B + 20))/16 dev eth0
+    ip -n printer route add default via 10.60.4.$((B + 1))
+    ip -n srv route add default via 10.60.10.1
+    ip -n nvr route add default via 192.168.77.1
+    # hq1 still has the route from an old plan
+    ip -n hq1 route add 10.60.4.$W/26 via 10.60.255.1
+    ip netns exec br1 sysctl -qw net.ipv4.ip_forward=0
+    ip netns exec hq1 sysctl -qw net.ipv4.ip_forward=1
+
+    # the leftover delay
+    case $((RANDOM % 4)) in
+      0) ns=br1 dev=wan0 ;;
+      1) ns=hq1 dev=wan0 ;;
+      2) ns=hq1 dev=lan0 ;;
+      *) ns=srv dev=eth0 ;;
+    esac
+    tc -n "$ns" qdisc add dev "$dev" root netem delay 250ms
+
+    # the camera recorder's web interface
+    on_reset 'systemctl stop kl-nvr 2>/dev/null; systemctl reset-failed kl-nvr 2>/dev/null; rm -rf /srv/kl-nvr'
+    mkdir -p /srv/kl-nvr
+    echo "nvr-$(head -c6 /dev/urandom | od -An -tx1 | tr -d ' \n')" > /srv/kl-nvr/index.html
+    chmod -R a+rX /srv/kl-nvr
+    cp /srv/kl-nvr/index.html "$KL_STATE/answer.nvr"
+    systemd-run --quiet --unit=kl-nvr --working-directory=/srv/kl-nvr ip netns exec nvr python3 -m http.server 8080 --bind 192.168.77.10
+    eventually 15 'ip netns exec nvr curl -fsS -m2 http://192.168.77.10:8080/'
+
+    lab_file /lab/ipplan.txt <<EOF
+    # IP plan: Larissa branch (NET-1187)
+    branch LAN       10.60.4.$B/26
+      gateway        first usable address (br1, interface lan0, already set)
+      pc1            last usable address (interface eth0)
+      printer        10.60.4.$((B + 20)) (fixed: printed on the device labels)
+    WAN              10.60.255.0/30    br1 wan0 .1, hq1 wan0 .2
+    HQ servers       10.60.10.0/24     hq1 lan0 .1, srv eth0 .10
+    camera network   192.168.77.0/24   br1 cam0 .1, nvr eth0 .10 (web UI on port 8080)
+                                       private: nothing outside br1 routes to it
+    EOF
+  check: |
+    B=$(cat "$KL_STATE/answer.lan")
+    gw=10.60.4.$((B + 1)); pc=10.60.4.$((B + 62)); prn=10.60.4.$((B + 20))
+
+    info "1. pc1 is addressed"
+    check "pc1 has $pc/26 on eth0" 'ip -n pc1 -4 addr show eth0 | grep -q "inet $pc/26 "'
+    check "pc1's default route is via $gw" 'ip -n pc1 route show default | grep -q "via $gw "'
+
+    info "2. The printer works"
+    check "the printer is $prn/26" 'ip -n printer -4 addr show eth0 | grep -q "inet $prn/26 " && [ "$(ip -n printer -4 -o addr show eth0 | wc -l)" = 1 ]'
+    check "the printer can reach srv" 'ip netns exec printer ping -c2 -W2 10.60.10.10'
+
+    info "3. The branch router routes"
+    check_eq "br1 forwards packets" "$(ip netns exec br1 sysctl -n net.ipv4.ip_forward)" 1
+    check_match "br1 sends HQ traffic to hq1" "$(ip -n br1 route get 10.60.10.10 2>&1)" 'via 10\.60\.255\.2 '
+    check "pc1 can reach srv" 'ip netns exec pc1 ping -c2 -W2 10.60.10.10'
+
+    info "4. HQ answers back"
+    check_match "hq1 sends branch traffic to br1" "$(ip -n hq1 route get "$pc" 2>&1)" 'via 10\.60\.255\.1 '
+    check "srv can reach pc1" 'ip netns exec srv ping -c2 -W2 "$pc"'
+    check "srv can reach the printer" 'ip netns exec srv ping -c2 -W2 "$prn"'
+
+    info "5. The camera recorder is published to HQ"
+    check_eq "srv reaches the recorder at http://10.60.255.1/" "$(ip netns exec srv curl -fsS -m4 http://10.60.255.1/ 2>/dev/null)" "$(cat "$KL_STATE/answer.nvr")"
+    check "the forward is a dnat rule in nftables on br1" 'ip netns exec br1 nft list ruleset | grep -q "dnat"'
+    check_not "hq1 has no route to the camera network" 'ip -n hq1 route get 192.168.77.10'
+
+    info "6. The WAN is fast again"
+    check_not "no netem qdisc is left on any device" 'for n in pc1 printer sw br1 hq1 srv nvr; do tc -n $n qdisc show; done | grep -q netem'
+    rtt=$(ip netns exec pc1 ping -c3 -i0.2 -W2 10.60.10.10 2>/dev/null | awk -F/ '/^rtt/{print int($5)}')
+    check "pc1 reaches srv in under 100 ms" '[ -n "$rtt" ] && [ "$rtt" -lt 100 ]'
+  solve: |
+    B=$(awk '/^branch LAN/ {print $3}' /lab/ipplan.txt | cut -d/ -f1 | cut -d. -f4)
+    gw=10.60.4.$((B + 1))
+
+    # 1. pc1
+    sudo ip netns exec pc1 ip addr add 10.60.4.$((B + 62))/26 dev eth0
+    sudo ip netns exec pc1 ip route add default via "$gw"
+
+    # 2. the printer: same address, /26 instead of /16
+    sudo ip netns exec printer ip addr del 10.60.4.$((B + 20))/16 dev eth0
+    sudo ip netns exec printer ip addr add 10.60.4.$((B + 20))/26 dev eth0
+    sudo ip netns exec printer ip route replace default via "$gw"
+
+    # 3. br1 forwards and routes to HQ
+    sudo ip netns exec br1 sysctl -qw net.ipv4.ip_forward=1
+    sudo ip netns exec br1 ip route add default via 10.60.255.2
+
+    # 4. hq1: replace the stale branch route
+    for r in $(sudo ip netns exec hq1 ip route | awk '/^10\.60\.4\./ && /via 10\.60\.255\.1/ {print $1}'); do
+      sudo ip netns exec hq1 ip route del "$r"
+    done
+    sudo ip netns exec hq1 ip route add 10.60.4.$B/26 via 10.60.255.1
+
+    # 5. publish the recorder
+    sudo ip netns exec br1 nft -f - <<'EOF'
+    table ip nat {
+      chain prerouting {
+        type nat hook prerouting priority dstnat;
+        iifname "wan0" tcp dport 80 dnat to 192.168.77.10:8080
+      }
+    }
+    EOF
+
+    # 6. remove the leftover delay
+    for n in br1 hq1 srv; do
+      for dev in $(sudo tc -n "$n" qdisc show | awk '/netem/ {for (i = 1; i < NF; i++) if ($i == "dev") print $(i + 1)}'); do
+        sudo tc -n "$n" qdisc del dev "$dev" root
+      done
+    done

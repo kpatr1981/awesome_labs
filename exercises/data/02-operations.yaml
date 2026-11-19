@@ -501,3 +501,252 @@ exercises:
     docker exec kl-pg sh -c "echo 'host replication lab all scram-sha-256' >> /var/lib/postgresql/data/pg_hba.conf"
     docker exec kl-pg psql -U lab -d lab -c 'SELECT pg_reload_conf()' >/dev/null
     docker run -d --name kl-pg2 --network kl-db -e PGPASSWORD=lab postgres:16-alpine sh -c 'install -d -o postgres -m 700 /var/lib/postgresql/data && su-exec postgres pg_basebackup -h kl-pg -U lab -D /var/lib/postgresql/data -R -X stream && exec su-exec postgres postgres' >/dev/null
+
+# ===== Capstone: a real-world lab =====
+
+- id: data-092
+  title: "Capstone: the Saturday maintenance window"
+  difficulty: 5
+  kind: fix
+  tags: [capstone, postgres, locks, migration, constraints, index, window, redis, ttl, persistence]
+  tutorial: |
+    **Concept.** A maintenance window is a checklist that runs into the live system. The
+    migration script is reviewed and must run **as written**, so everything in its way has to
+    be cleared first: sessions holding locks, rows that break the new rules. Then you prove
+    the result with a report, and make sure the other data store is in shape too.
+
+    **Locks first.** A session that is **idle in transaction** still holds every lock it took.
+    Even a plain `SELECT` holds a lock that makes an `ALTER TABLE` wait, and every query
+    behind the `ALTER` waits too. A migration that sets `lock_timeout` gives up instead of
+    queueing forever, which is your cue to look at `pg_stat_activity` and
+    `pg_blocking_pids()`. Terminate the blocker, not everything that looks idle.
+
+    **Data before constraints.** A unique index on an *expression* such as `lower(email)`
+    refuses addresses that differ only in case, so duplicates have to go first, and they
+    have to be found the same way (compare `lower(email)`, not `email`). Rows that break a
+    new `CHECK` are moved aside, per policy, with `DELETE ... RETURNING` feeding an `INSERT`.
+
+    **Reports with running totals.** `GROUP BY` produces one row per month; a window function
+    over those rows (`sum(...) OVER (ORDER BY month)`) adds the cumulative total without
+    collapsing them.
+
+    **Redis that survives.** `TTL` returns `-1` for a key without an expiry. A runtime
+    `CONFIG SET appendonly yes` writes an AOF now, but a recreated container only keeps it
+    if its command enables AOF too.
+
+    **Read up on:**
+    - `pg_stat_activity` (`state`, `application_name`), `pg_blocking_pids()`, `pg_terminate_backend()`
+    - `lock_timeout` and the `ACCESS EXCLUSIVE` lock that `ALTER TABLE ... ADD CONSTRAINT` takes
+    - `DELETE ... USING` with `lower()`; `CREATE UNIQUE INDEX ... ON t (lower(col))`
+    - `WITH moved AS (DELETE ... RETURNING *) INSERT INTO ... SELECT * FROM moved`
+    - `date_trunc`, `to_char`, and `sum(...) OVER (ORDER BY ...)`
+    - `redis-cli --scan --pattern`, `TTL`, `EXPIRE`
+    - Redis persistence: `CONFIG SET appendonly`, `INFO persistence`, `redis-server --appendonly yes`
+  scenario: |
+    **Change OPS-2291**, owner: the platform DBA team. Tonight's window for the **accounts
+    service** has a reviewed migration and a Redis change, and both have to land before
+    Monday.
+
+    PostgreSQL runs in **`kl-pg`** (`docker exec -it kl-pg psql -U lab -d lab`), Redis in
+    **`kl-redis`** (`docker exec -it kl-redis redis-cli`).
+
+    ## Part 1: Clear the way for the migration
+
+    The migration is **`/lab/migrate.sql`**. It is reviewed: run it **unchanged**, for
+    example with `docker exec -i kl-pg psql -U lab -d lab < /lab/migrate.sql`. It fails at
+    the moment, for more than one reason.
+
+    1. Some session is holding a lock that the migration needs. **Terminate the session
+       that blocks it, and only that one**: the application's connection pool
+       (`application_name` **`api-pool`**) must stay connected.
+    2. `users (id, email, created_at)` has duplicate accounts whose addresses differ only in
+       letter case (`Ann@x.test` and `ann@x.test` are the same person). **Delete the
+       duplicates, keeping the row with the lowest `id`** for each address, compared
+       case-insensitively.
+    3. A few rows have an email that is not an address at all. Policy: **move them to
+       `users_rejected`** (same columns), don't just delete them.
+    4. **Run `/lab/migrate.sql` unchanged** so that it commits: afterwards a second account
+       for an existing address in any letter case is refused, and the login query
+       (`WHERE lower(email) = ...`) uses an index.
+
+    ## Part 2: The sign-up report
+
+    5. Product wants sign-ups per month **after the cleanup**, with a running total. Write
+       **`/lab/signups.csv`**, one `YYYY-MM,signups,running_total` line per month that has
+       sign-ups (by `created_at`), oldest month first, no header. For example:
+
+       ```
+       2026-01,412,412
+       2026-02,380,792
+       ```
+
+    ## Part 3: Redis sessions
+
+    `kl-redis` holds web sessions (`session:*`) and user profiles (`user:*`, permanent), on
+    the volume **`kl-rdata`**, with persistence switched off.
+
+    6. A bug created `session:*` keys with **no expiry**. Give each of them an expiry of
+       **1800 seconds**. Sessions that already have a TTL keep it, and `user:*` keys keep no
+       expiry.
+    7. Turn on **AOF persistence** so the data survives container restarts from now on,
+       including the setting itself: recreate `kl-redis` with the same name, image
+       (`redis:7.4-alpine`) and volume, and a command that enables AOF. **No key may be
+       lost** on the way.
+  hints:
+    - "Run the migration once and read the error. Then `SELECT pid, application_name, state, xact_start FROM pg_stat_activity WHERE datname = 'lab'`. While the migration waits, `pg_blocking_pids(<its pid>)` names the blocker; on its own, look for `idle in transaction`."
+    - "Find the duplicates the way the index will: `SELECT lower(email), count(*) FROM users GROUP BY 1 HAVING count(*) > 1`. Then `DELETE FROM users a USING users b WHERE lower(a.email) = lower(b.email) AND a.id > b.id`."
+    - "Read the `CHECK` in `migrate.sql`, find the rows that break it with `WHERE NOT (...)`, and move them in one statement: `WITH moved AS (DELETE FROM users WHERE ... RETURNING *) INSERT INTO users_rejected SELECT * FROM moved`."
+    - "The report: count per `date_trunc('month', created_at)` in a subquery, then `to_char(m, 'YYYY-MM'), n, sum(n) OVER (ORDER BY m)` outside it, written with `psql -AtF,`."
+    - "Sessions: `redis-cli --scan --pattern 'session:*'` in a loop, `EXPIRE` only when `TTL` says `-1`. Persistence: `CONFIG SET appendonly yes`, wait until `INFO persistence` shows `aof_rewrite_in_progress:0` and `aof_rewrites:1`, then `docker rm -f` and `docker run -d --name kl-redis -v kl-rdata:/data redis:7.4-alpine redis-server --appendonly yes`."
+  solution: |
+    ```bash
+    q() { docker exec -i kl-pg psql -U lab -d lab -v ON_ERROR_STOP=1 "$@"; }
+
+    # 1. the blocker: an export that opened a transaction and never finished it
+    q -c "SELECT pid, application_name, state FROM pg_stat_activity WHERE datname = 'lab'"
+    q -c "SELECT pg_terminate_backend(pid) FROM pg_stat_activity
+          WHERE state = 'idle in transaction' AND application_name = 'nightly-export'"
+
+    # 2. and 3. the data the migration trips over
+    q <<'SQL'
+    DELETE FROM users a USING users b WHERE lower(a.email) = lower(b.email) AND a.id > b.id;
+    WITH moved AS (DELETE FROM users WHERE NOT (email LIKE '%_@_%') RETURNING *)
+    INSERT INTO users_rejected SELECT * FROM moved;
+    SQL
+
+    # 4. the migration, as reviewed
+    q < /lab/migrate.sql
+    q -c 'ANALYZE users'
+
+    # 5. the report
+    docker exec kl-pg psql -U lab -d lab -AtF, -c "
+      SELECT to_char(m, 'YYYY-MM'), n, sum(n) OVER (ORDER BY m)
+      FROM (SELECT date_trunc('month', created_at) m, count(*) n FROM users GROUP BY 1) t
+      ORDER BY m" > /lab/signups.csv
+
+    # 6. sessions without an expiry
+    r() { docker exec kl-redis redis-cli "$@"; }
+    r --scan --pattern 'session:*' | while read -r k; do
+      [ "$(r TTL "$k")" = -1 ] && r EXPIRE "$k" 1800
+    done
+
+    # 7. AOF now, so the keys reach the disk, then in the container's command
+    r CONFIG SET appendonly yes
+    r INFO persistence | grep -E 'aof_rewrites:|aof_rewrite_in_progress:'   # wait for 1 and 0
+    docker rm -f kl-redis
+    docker run -d --name kl-redis -v kl-rdata:/data redis:7.4-alpine redis-server --appendonly yes
+    r DBSIZE
+    ```
+  setup: |
+    pg_start
+
+    # --- the users table: case-only duplicates and a few addresses that aren't ---
+    pg_sql <<'SQL'
+    CREATE TABLE users (id serial PRIMARY KEY, email text NOT NULL, created_at timestamp NOT NULL);
+    CREATE TABLE users_rejected (id int, email text, created_at timestamp);
+    INSERT INTO users (email, created_at)
+    SELECT (CASE WHEN random() < 0.3 THEN 'User' ELSE 'user' END) || k || '@' || (ARRAY['mail.test','Corp.test','shop.test'])[1 + k % 3],
+           timestamp '2026-01-01' + random() * interval '303 days'
+    FROM (SELECT floor(random() * 3000)::int k FROM generate_series(1, 4000)) s;
+    INSERT INTO users (email, created_at) VALUES
+      ('broken-import-17', '2026-03-04 10:00'), ('@mail.test', '2026-05-19 08:30'),
+      ('user99999@', '2026-07-02 17:45'), ('n/a', '2026-09-11 12:00');
+    SQL
+    survivors="SELECT min(id) FROM users WHERE email LIKE '%_@_%' GROUP BY lower(email)"
+    pg_sql "SELECT md5(string_agg(m::text, ',' ORDER BY m)) FROM ($survivors) t(m)" > "$KL_STATE/survivors"
+    pg_sql "SELECT string_agg(id || ':' || email, ',' ORDER BY id) FROM users WHERE email NOT LIKE '%_@_%'" > "$KL_STATE/rejected"
+    pg_sql "SELECT to_char(m, 'YYYY-MM') || ',' || n || ',' || sum(n) OVER (ORDER BY m) FROM (SELECT date_trunc('month', created_at) m, count(*) n FROM users WHERE id IN ($survivors) GROUP BY 1) t ORDER BY m" > "$KL_STATE/signups"
+
+    lab_file /lab/migrate.sql <<'EOF'
+    -- OPS-2291: one account per address, and only real addresses
+    BEGIN;
+    SET LOCAL lock_timeout = '5s';
+    CREATE UNIQUE INDEX users_email_lower_key ON users (lower(email));
+    ALTER TABLE users ADD CONSTRAINT users_email_valid CHECK (email LIKE '%_@_%');
+    COMMIT;
+    EOF
+    sha256sum /lab/migrate.sql > "$KL_STATE/migrate.sum"
+
+    # --- a forgotten export holding a lock, and the app's idle pool connection ---
+    docker exec -d kl-pg sh -c "(printf 'begin;\nselect count(*) from users;\n'; sleep 100000) | PGAPPNAME=nightly-export psql -h 127.0.0.1 -U lab -d lab >/dev/null 2>&1"
+    docker exec -d kl-pg sh -c "(printf 'select 1;\n'; sleep 100000) | PGAPPNAME=api-pool psql -h 127.0.0.1 -U lab -d lab >/dev/null 2>&1"
+    eventually 20 '[ "$(pg_sql "SELECT count(*) FROM pg_stat_activity WHERE application_name = '"'"'nightly-export'"'"' AND state = '"'"'idle in transaction'"'"'")" = 1 ]'
+    eventually 20 '[ "$(pg_sql "SELECT count(*) FROM pg_stat_activity WHERE application_name = '"'"'api-pool'"'"' AND state = '"'"'idle'"'"'")" = 1 ]'
+
+    # --- Redis: sessions (some without an expiry) and permanent profiles, no persistence ---
+    docker run -d --name kl-redis -v kl-rdata:/data redis:7.4-alpine redis-server --save '' --appendonly no >/dev/null
+    eventually 20 '[ "$(docker exec kl-redis redis-cli ping)" = PONG ]'
+    docker exec kl-redis redis-cli eval "
+      for i=1,60 do redis.call('set','session:'..string.format('%x', 4096 + i * 7919),'u'..i,'EX',86400) end
+      for i=1,30 do redis.call('set','session:'..string.format('%x', 9999 + i * 104729),'u'..i) end
+      for i=1,300 do redis.call('hset','user:'..i,'name','user-'..i,'plan','free') end
+      return 'ok'" 0 >/dev/null
+  check: |
+    info "Part 1: Clear the way for the migration"
+    app_n() { pg_sql "SELECT count(*) FROM pg_stat_activity WHERE application_name = '$1'"; }
+    eventually 4 '[ "$(app_n nightly-export)" = 0 ]' || true
+    check_eq "the blocking session is gone" "$(app_n nightly-export)" 0
+    check_eq "the api-pool connection is still there" "$(app_n api-pool)" 1
+    check_eq "the duplicates are gone, keeping the lowest id per address" "$(pg_sql "SELECT md5(string_agg(id::text, ',' ORDER BY id)) FROM users")" "$(cat "$KL_STATE/survivors")"
+    check_eq "the invalid addresses were moved to users_rejected" "$(pg_sql "SELECT coalesce(string_agg(id || ':' || email, ',' ORDER BY id), '') FROM users_rejected")" "$(cat "$KL_STATE/rejected")"
+    idx=$(pg_sql "SELECT count(*) FROM pg_index i WHERE i.indexrelid = to_regclass('users_email_lower_key') AND i.indisunique AND i.indisvalid")
+    con=$(pg_sql "SELECT count(*) FROM pg_constraint WHERE conname = 'users_email_valid' AND conrelid = 'users'::regclass AND convalidated")
+    e=$(pg_sql "SELECT upper(email) FROM users WHERE email LIKE '%_@_%' ORDER BY id LIMIT 1")
+    check "/lab/migrate.sql is unchanged and committed" 'sha256sum -c --quiet "$KL_STATE/migrate.sum" && [ "$idx" = 1 ] && [ "$con" = 1 ]'
+    check_not "an existing address in other letter case is refused" "pg_sql \"BEGIN; INSERT INTO users (email, created_at) VALUES ('$e', now()); ROLLBACK;\""
+    plan=$(pg_sql "EXPLAIN SELECT * FROM users WHERE lower(email) = 'user42@shop.test'")
+    check "the login query uses an index" '[[ $plan =~ Index ]] && ! grep -q "Seq Scan" <<<"$plan"'
+
+    info "Part 2: The sign-up report"
+    check_eq "/lab/signups.csv has the monthly sign-ups and the running total" "$(cat /lab/signups.csv 2>/dev/null)" "$(cat "$KL_STATE/signups")"
+
+    info "Part 3: Redis sessions"
+    r() { docker exec kl-redis redis-cli "$@"; }
+    c() { r eval "local n=0 for _,k in ipairs(redis.call('keys','$1')) do local t=redis.call('ttl',k) if $2 then n=n+1 end end return n" 0; }
+    sessions() {
+      check_eq "every session has an expiry: the 30 fixed ones about 1800s" "$(c 'session:*' 't==-1'):$(c 'session:*' 't>1700 and t<=1800')" 0:30
+      check_eq "the 60 existing session TTLs were kept, user:* has no expiry" "$(c 'session:*' 't>80000'):$(c 'user:*' 't==-1')" 60:300
+    }
+    check_eq "AOF is on" "$(r config get appendonly | tail -1)" yes
+    check "kl-redis runs redis:7.4-alpine with its data on kl-rdata" '[ "$(c_get kl-redis "{{.Config.Image}}")" = redis:7.4-alpine ] && c_get kl-redis "{{range .Mounts}}{{.Name}} {{end}}" | grep -qw kl-rdata'
+    eventually 8 '[ "$(docker exec kl-redis redis-cli dbsize)" = 390 ]' || true
+    check_eq "all 390 keys are there" "$(r dbsize)" 390
+    # a restart wipes an in-memory server, so only try it once AOF is on
+    if [ "$(r config get appendonly | tail -1)" = yes ] && [ "$(r dbsize)" = 390 ]; then
+      docker restart kl-redis >/dev/null 2>&1
+      eventually 20 '[ "$(docker exec kl-redis redis-cli ping)" = PONG ]' || true
+      eventually 10 '[ "$(docker exec kl-redis redis-cli dbsize)" = 390 ]' || true
+      check_eq "all keys and AOF survive a restart" "$(r dbsize) $(r config get appendonly | tail -1)" "390 yes"
+    else
+      fail "all keys and AOF survive a restart (AOF isn't protecting the data yet)"
+    fi
+    sessions
+  solve: |
+    q() { docker exec -i kl-pg psql -U lab -d lab -v ON_ERROR_STOP=1 -q "$@"; }
+
+    # --- part 1: the blocker, the data, then the migration as written ---
+    q -Atc "SELECT pg_terminate_backend(pid) FROM pg_stat_activity WHERE state = 'idle in transaction' AND application_name = 'nightly-export'" >/dev/null
+    q <<'SQL'
+    DELETE FROM users a USING users b WHERE lower(a.email) = lower(b.email) AND a.id > b.id;
+    WITH moved AS (DELETE FROM users WHERE NOT (email LIKE '%_@_%') RETURNING *)
+    INSERT INTO users_rejected SELECT * FROM moved;
+    SQL
+    q < /lab/migrate.sql
+    q -c 'ANALYZE users'
+
+    # --- part 2: monthly sign-ups with a running total ---
+    docker exec kl-pg psql -U lab -d lab -AtF, -c "SELECT to_char(m, 'YYYY-MM'), n, sum(n) OVER (ORDER BY m) FROM (SELECT date_trunc('month', created_at) m, count(*) n FROM users GROUP BY 1) t ORDER BY m" > /lab/signups.csv
+
+    # --- part 3: session TTLs, then AOF on the running server and in the new container ---
+    r() { docker exec kl-redis redis-cli "$@"; }
+    r --scan --pattern 'session:*' | while read -r k; do
+      if [ "$(r TTL "$k")" = -1 ]; then r EXPIRE "$k" 1800 >/dev/null; fi
+    done
+    r CONFIG SET appendonly yes >/dev/null
+    for i in $(seq 1 30); do
+      s=$(r INFO persistence | tr -d '\r')
+      grep -q '^aof_rewrites:[1-9]' <<<"$s" && grep -q '^aof_rewrite_in_progress:0' <<<"$s" && break
+      sleep 1
+    done
+    docker rm -f kl-redis >/dev/null
+    docker run -d --name kl-redis -v kl-rdata:/data redis:7.4-alpine redis-server --appendonly yes >/dev/null

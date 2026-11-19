@@ -804,3 +804,263 @@ exercises:
       done
     done
     true
+
+# ===== Capstone: a real-world lab =====
+
+- id: net-096
+  title: "Capstone: the store that went dark after the change"
+  difficulty: 5
+  kind: fix
+  tags: [capstone, incident, troubleshooting, nat, masquerade, nftables, routing, traceroute, mtu, pmtud, icmp, netem, packet-loss, netns]
+  tutorial: |
+    **Concept.** After a network change, several faults usually arrive together, and each one hides the next. The way through is to test one layer at a time from the user's side, write down what you measure, and fix the first thing that stops a packet before looking further.
+
+    - **Does the far end answer, and as whom?** When a branch hides behind source NAT, the server only ever sees the router's address. If the NAT rule matches the wrong interface or network, the real client address leaves the site, and a core that by design has no route to the branch can't reply. A rule that names an interface the router doesn't have is accepted without complaint and never matches.
+    - **Does every hop find the way back?** `traceroute` shows the last router whose answer made it home. A route whose next hop is a dead address is as broken as a missing one, and only the return path shows it.
+    - **Small works, big hangs.** That is the signature of a path MTU black hole. A router that can't forward a full-size packet over a smaller link sends ICMP "fragmentation needed" back to the sender. Connection tracking files that error as **related** to the connection, not established, so a host firewall that accepts only `established` silently drops it. The sender keeps retransmitting a packet that can never fit.
+    - **Flaky, not dead.** Loss on one interface shows up in every test that crosses it. Measure hop by hop, read the qdiscs, and remove only the one that causes the loss: other shaping on the path may be there on purpose.
+
+    **Read up on:**
+    - `man nft` — `nft list ruleset`, `postrouting`, `oifname`, `ip saddr` and `masquerade`
+    - `ip -br link` — the interfaces a router really has
+    - `traceroute -n` and `traceroute -I` — UDP versus ICMP probes, and where the answers stop
+    - `ip route get ADDR` and `ip neigh` — which next hop a router uses, and whether it answers ARP
+    - `ping -M do -s SIZE` and `curl -o /dev/null -w '%{size_download}'` — find where size starts to matter
+    - Connection tracking states — `new`, `established`, `related`, and which one ICMP errors get
+    - `man tc-netem` and `tc -n NS qdisc show` — loss and delay emulation, and deleting a single qdisc
+    - `ping -q -c 20 -i 0.2` — measure loss with enough samples
+  scenario: |
+    **INC-4471**, opened by the Patras store manager at 08:10: *"Since last night the tills
+    can't reach the file server, the morning price list won't download, and when anything
+    does answer it's flaky."* Last night's change **CHG-918** replaced the store's edge
+    router and moved the file server behind a new datacenter router, `dc`.
+
+    Every device is a network namespace. Run commands inside one with
+    `sudo ip netns exec <namespace> <command>`.
+
+    ```
+    pos  (10.8.1.10) ── lan0  ┐
+                             edge ── wan0 ═══ 1400 MTU ═══ wan0 ── core ── dc ── files (10.8.3.20)
+    jump (10.8.9.5)  ── mgmt0 ┘ 10.8.2.1              10.8.2.2     10.8.5.1/.2  10.8.3.1
+    ```
+
+    How the network is meant to work:
+
+    - The till network `10.8.1.0/24` is **hidden behind source NAT** on `edge`: the HQ side
+      sees it as **10.8.2.1**, and **neither `core` nor `dc` has a route to 10.8.1.0/24**.
+    - The management host **`jump`** (10.8.9.5) is **not** translated: HQ routes
+      `10.8.9.0/24` and identifies it by its real address.
+    - The file server `files` answers on port **8080**: `/whoami` prints the address it
+      sees you as, `/prices.csv` is the price list. Its host firewall allows only port 8080
+      and ping, and its admin port **2222** must stay closed to the stores.
+    - The `edge`–`core` link has an MTU of **1400** on purpose (it is a tunnel). It stays.
+    - The 40 ms of delay on one HQ-side interface is the WAN emulation the capacity team
+      uses. It stays.
+
+    Close the incident:
+
+    1. **NAT.** From `pos`, `curl http://10.8.3.20:8080/whoami` answers **10.8.2.1**, and
+       from `jump` it still answers **10.8.9.5**.
+    2. **The way back.** `traceroute -I -n 10.8.3.20` from `pos` reaches `files`, with every
+       hop answering.
+    3. **The price list.** From `pos`, `curl http://10.8.3.20:8080/prices.csv` downloads the
+       whole file, without changing the MTU, opening port 2222 or giving up the firewall's
+       default drop.
+    4. **The loss.** 20 pings from `pos` to `files` all arrive, and the 40 ms delay is left
+       as it is.
+    5. **The write-up.** Put the root cause of the loss in **`/lab/rca.txt`**, as one line
+       `loss: <namespace> <interface>` (for example `loss: core dc0`).
+
+    Fix things on the routers and on `files`; leave `pos` and `jump` as they are.
+  hints:
+    - "Start where the user is: `curl -m3 http://10.8.3.20:8080/whoami` from pos and from jump. One works, so compare what is different about the other's path. `sudo ip netns exec edge nft list ruleset` next to `ip -br link`."
+    - "Once the till traffic is translated, `sudo ip netns exec pos traceroute -I -n -w1 10.8.3.20` shows where the answers stop. On that router, `ip route get 10.8.2.1` and `ip neigh` tell you whether its next hop is real."
+    - "`/whoami` works but `/prices.csv` stalls: compare `ping -M do -s 1300` and `-s 1472` from pos. Who should be told that the packets are too big, and what does `files`' firewall do with that message?"
+    - "An ICMP error about a tracked connection is in conntrack state `related`. Accepting it is enough: `nft add rule inet kl_fw input ct state related accept`, or extend the `established` rule."
+    - "For the loss: `ping -q -c 20 -i 0.2` to each hop in turn, then `for n in edge core dc files; do sudo tc -n $n qdisc show; done`. Delete only the qdisc with `loss`, by its device."
+  solution: |
+    **1. NAT.** The masquerade rule was copied from the old router and matches
+    `oifname "eth1"`, an interface this edge router doesn't have. Match the real uplink
+    and only the till network:
+
+    ```bash
+    sudo ip netns exec edge nft list ruleset
+    sudo ip netns exec edge nft -f - <<'EOF'
+    delete table ip nat
+    table ip nat {
+      chain postrouting {
+        type nat hook postrouting priority srcnat;
+        oifname "wan0" ip saddr 10.8.1.0/24 masquerade
+      }
+    }
+    EOF
+    ```
+
+    **2. The way back.** `traceroute` stops after `core`: `dc`'s route back to
+    `10.8.2.0/24` points at `10.8.3.30`, an address nobody has (`ip neigh` shows it
+    FAILED). Send it to `core`:
+
+    ```bash
+    sudo ip netns exec dc ip route replace 10.8.2.0/24 via 10.8.5.1
+    sudo ip netns exec pos traceroute -I -n -w1 10.8.3.20
+    ```
+
+    **3. The price list.** `core` can't forward `files`' 1500-byte packets over the
+    1400-byte link and sends back "fragmentation needed", but the firewall on `files`
+    accepts only `established` traffic, and that ICMP error is `related`. Accept related
+    traffic too; the default drop and the closed port stay:
+
+    ```bash
+    sudo ip netns exec files nft add rule inet kl_fw input ct state related accept
+    sudo ip netns exec pos curl -s http://10.8.3.20:8080/prices.csv | wc -c
+    ```
+
+    **4 and 5. The loss.** Ping hop by hop to see where loss starts, then read the qdiscs.
+    One has `loss 30%`; another has only `delay 40ms`, which stays. Delete the lossy one
+    and record it:
+
+    ```bash
+    for n in edge core dc files; do echo "== $n"; sudo tc -n $n qdisc show | grep netem; done
+    sudo tc -n NS qdisc del dev IF root
+    echo "loss: NS IF" > /lab/rca.txt
+    ```
+  setup: |
+    netns_new pos jump edge core dc files
+    netns_link pos eth0 edge lan0
+    netns_link jump eth0 edge mgmt0
+    netns_link edge wan0 core wan0
+    netns_link core dc0 dc core0
+    netns_link dc srv0 files eth0
+    ip -n pos addr add 10.8.1.10/24 dev eth0
+    ip -n jump addr add 10.8.9.5/24 dev eth0
+    ip -n edge addr add 10.8.1.1/24 dev lan0
+    ip -n edge addr add 10.8.9.1/24 dev mgmt0
+    ip -n edge addr add 10.8.2.1/24 dev wan0
+    ip -n core addr add 10.8.2.2/24 dev wan0
+    ip -n core addr add 10.8.5.1/24 dev dc0
+    ip -n dc addr add 10.8.5.2/24 dev core0
+    ip -n dc addr add 10.8.3.1/24 dev srv0
+    ip -n files addr add 10.8.3.20/24 dev eth0
+    ip -n edge link set wan0 mtu 1400
+    ip -n core link set wan0 mtu 1400
+    ip -n pos route add default via 10.8.1.1
+    ip -n jump route add default via 10.8.9.1
+    ip -n edge route add default via 10.8.2.2
+    ip -n core route add 10.8.3.0/24 via 10.8.5.2
+    ip -n core route add 10.8.9.0/24 via 10.8.2.1
+    ip -n dc route add 10.8.9.0/24 via 10.8.5.1
+    # the way back to edge points at a host that doesn't exist
+    ip -n dc route add 10.8.2.0/24 via 10.8.3.30
+    ip -n files route add default via 10.8.3.1
+    for n in edge core dc; do ip netns exec "$n" sysctl -qw net.ipv4.ip_forward=1; done
+
+    # edge: NAT rule copied from the old router (it had eth1 as its uplink)
+    ip netns exec edge nft -f - <<'EOF'
+    table ip nat {
+      chain postrouting {
+        type nat hook postrouting priority srcnat;
+        oifname "eth1" ip saddr 10.8.1.0/24 masquerade
+      }
+    }
+    EOF
+    # files: the host firewall forgets ICMP errors about its own connections
+    ip netns exec files nft -f - <<'EOF'
+    table inet kl_fw {
+      chain input {
+        type filter hook input priority filter; policy drop;
+        iif lo accept
+        ct state established accept
+        icmp type echo-request accept
+        tcp dport 8080 accept
+      }
+    }
+    EOF
+
+    # the file server and its admin port
+    on_reset 'for u in kl-files kl-files-admin; do systemctl stop $u 2>/dev/null; systemctl reset-failed $u 2>/dev/null; done; rm -rf /srv/kl-inc'
+    mkdir -p /srv/kl-inc/www /srv/kl-inc/admin
+    head -c 300000 /dev/urandom | base64 > /srv/kl-inc/www/prices.csv
+    echo admin > /srv/kl-inc/admin/index.html
+    chmod -R a+rX /srv/kl-inc
+    sha256sum /srv/kl-inc/www/prices.csv | cut -d' ' -f1 > "$KL_STATE/answer.prices"
+    cat >/srv/kl-inc/app.py <<'PY'
+    from functools import partial
+    from http.server import SimpleHTTPRequestHandler, ThreadingHTTPServer
+    class H(SimpleHTTPRequestHandler):
+        def do_GET(self):
+            if self.path == '/whoami':
+                b = (self.client_address[0] + "\n").encode()
+                self.send_response(200)
+                self.send_header('Content-Length', str(len(b)))
+                self.end_headers()
+                self.wfile.write(b)
+                return
+            super().do_GET()
+        def log_message(self, *a):
+            pass
+    ThreadingHTTPServer(('10.8.3.20', 8080), partial(H, directory='/srv/kl-inc/www')).serve_forever()
+    PY
+    systemd-run --quiet --unit=kl-files ip netns exec files python3 /srv/kl-inc/app.py
+    systemd-run --quiet --unit=kl-files-admin --working-directory=/srv/kl-inc/admin ip netns exec files python3 -m http.server 2222 --bind 10.8.3.20
+    eventually 15 'ip netns exec jump curl -fsS -m2 http://10.8.3.20:8080/whoami | grep -qx 10.8.9.5'
+    eventually 15 'ip netns exec files ss -ltn | grep -q ":2222 "'
+
+    # last: the WAN emulation that stays, and the loss left over from a test
+    C=(edge:lan0 edge:wan0 core:wan0 core:dc0 dc:core0 dc:srv0 files:eth0)
+    L=$((RANDOM % 7)); D=$(( (L + 1 + RANDOM % 6) % 7 ))
+    IFS=: read -r lns ldev <<<"${C[L]}"
+    IFS=: read -r dns ddev <<<"${C[D]}"
+    tc -n "$lns" qdisc add dev "$ldev" root netem loss 30%
+    tc -n "$dns" qdisc add dev "$ddev" root netem delay 40ms
+    echo "$lns $ldev" > "$KL_STATE/answer.loss"
+    echo "$dns $ddev" > "$KL_STATE/answer.delay"
+  check: |
+    info "1. NAT"
+    check_eq "pos is seen as 10.8.2.1" "$(ip netns exec pos curl -fsS -m4 http://10.8.3.20:8080/whoami 2>/dev/null)" 10.8.2.1
+    check_eq "jump is still seen as 10.8.9.5" "$(ip netns exec jump curl -fsS -m4 http://10.8.3.20:8080/whoami 2>/dev/null)" 10.8.9.5
+    check_not "core and dc have no route to the till network" 'ip -n core route get 10.8.1.10 || ip -n dc route get 10.8.1.10'
+
+    info "2. The way back"
+    check "traceroute from pos reaches files with every hop answering" 'out=$(ip netns exec pos traceroute -I -n -w1 -q1 -m8 10.8.3.20) && ! grep -q "\*" <<<"$out" && tail -1 <<<"$out" | grep -q "10\.8\.3\.20"'
+
+    info "3. The price list"
+    check "the edge-core link is still 1400 bytes" '[ "$(ip -n edge -j link show wan0 | jq -r ".[0].mtu")" = 1400 ] && [ "$(ip -n core -j link show wan0 | jq -r ".[0].mtu")" = 1400 ]'
+    check "files' firewall still drops by default" 'ip netns exec files nft list ruleset | grep -q "hook input.*policy drop"'
+    check_not "the admin port 2222 stays closed to the store" 'ip netns exec pos curl -fsS -m3 http://10.8.3.20:2222/'
+    got=$(ip netns exec pos curl -fsS -m10 http://10.8.3.20:8080/prices.csv 2>/dev/null | sha256sum | cut -d' ' -f1)
+    check_eq "pos downloads prices.csv intact" "$got" "$(cat "$KL_STATE/answer.prices")"
+
+    info "4. The loss"
+    read -r dns ddev < "$KL_STATE/answer.delay"
+    check_not "no lossy qdisc is left on the path" 'for n in pos jump edge core dc files; do tc -n $n qdisc show; done | grep -Eq "loss [1-9]"'
+    check "the 40 ms delay on $dns $ddev is untouched" 'tc -n $dns qdisc show dev $ddev | grep -q "delay 40ms"'
+    out=$(ip netns exec pos ping -q -c 20 -i 0.2 -W 2 10.8.3.20 2>&1)
+    check_match "20 pings from pos to files all arrive" "$out" ' 0% packet loss'
+
+    info "5. The write-up"
+    check_eq "rca.txt names the lossy interface" "$(grep -E '^ *loss *:' /lab/rca.txt 2>/dev/null | head -1 | sed 's/^ *loss *://' | xargs)" "$(cat "$KL_STATE/answer.loss")"
+  solve: |
+    # 1. NAT on the interface this router really has
+    sudo ip netns exec edge nft -f - <<'EOF'
+    delete table ip nat
+    table ip nat {
+      chain postrouting {
+        type nat hook postrouting priority srcnat;
+        oifname "wan0" ip saddr 10.8.1.0/24 masquerade
+      }
+    }
+    EOF
+
+    # 2. dc's way back to the edge goes through core
+    sudo ip netns exec dc ip route replace 10.8.2.0/24 via 10.8.5.1
+
+    # 3. let "fragmentation needed" (conntrack: related) reach files
+    sudo ip netns exec files nft add rule inet kl_fw input ct state related accept
+
+    # 4 and 5. remove only the lossy qdisc, and write it down
+    for n in edge core dc files; do
+      for dev in $(sudo tc -n "$n" qdisc show | awk '/netem/ && /loss [1-9]/ {for (i = 1; i < NF; i++) if ($i == "dev") print $(i + 1)}'); do
+        sudo tc -n "$n" qdisc del dev "$dev" root
+        echo "loss: $n $dev" > /lab/rca.txt
+      done
+    done

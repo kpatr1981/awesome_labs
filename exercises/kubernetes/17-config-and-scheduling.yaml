@@ -714,3 +714,400 @@ exercises:
         scaleUp:
           policies: [{type: Percent, value: 100, periodSeconds: 30}]
     EOF
+
+# ===== Capstone: a real-world lab =====
+
+- id: k8s-370
+  title: "Capstone: a node of its own for search"
+  difficulty: 5
+  kind: build
+  tags: [capstone, taints, tolerations, noexecute, affinity, nodeaffinity, sidecar, initcontainers, configmap, immutable, debug, ephemeral-containers, scheduling]
+  tutorial: |
+    **Concept.** Giving a team a node of its own is several small changes that only work in
+    the right order:
+
+    - **Mark the node.** A label says what the node is for, a taint keeps everybody else
+      away. With the `NoExecute` effect the taint also **evicts** the pods already running
+      there that don't tolerate it: an evicted pod of a Deployment is replaced elsewhere if
+      it can be, a bare pod is simply gone. Anything that must survive needs its toleration
+      *before* the taint. A running pod's spec is mostly frozen, but tolerations may be
+      **added** to it (not changed or removed), for instance with a JSON patch that appends to
+      `/spec/tolerations/-`.
+    - **Attract the right pods.** A toleration only *allows* a pod onto the tainted node; it
+      doesn't send it there. A **required node affinity** on the label does (operators such as
+      `In`), and unlike `nodeSelector` it can express sets and negations. Pods that must leave
+      need somewhere else to go: on this cluster that is the control plane, behind its own
+      `NoSchedule` taint.
+    - **Order inside the pod.** Init containers run one by one, each to completion, and the
+      regular containers only start after the last of them. An init step that needs a helper
+      (a mesh proxy, say) waits forever if the helper is a regular container. A **native
+      sidecar** is an init container with `restartPolicy: Always`: it starts in its place in
+      the list, keeps running, and the next init container starts once it is up.
+    - **Configuration that can't change.** An immutable ConfigMap rejects every edit; the
+      update path is a new ConfigMap (a new name) that the workload points at, which also
+      rolls its pods.
+    - **Looking inside an image without a shell.** `kubectl debug --target=CONTAINER` adds an
+      ephemeral container to a running pod that shares that container's process namespace;
+      `/proc/<pid>/root` is then the target's filesystem. The pod isn't restarted.
+
+    **Read up on:**
+    - `kubectl taint --help`, `kubectl explain pod.spec.tolerations`
+    - `kubectl explain pod.spec.affinity.nodeAffinity.requiredDuringSchedulingIgnoredDuringExecution`
+    - `kubectl patch --help` (`--type=json`), Kubernetes docs: Taints and Tolerations
+    - `kubectl explain pod.spec.initContainers.restartPolicy`, Kubernetes docs: Sidecar Containers
+    - `kubectl explain configmap.immutable`
+    - `kubectl debug --help` (`--target`, `-c`), `man 5 proc` (`/proc/[pid]/root`)
+  scenario: |
+    **SRCH-212**, from Priya (search team lead): *"The sale starts on Friday. Capacity
+    planning gave us node01 for search alone, but nobody has made it so. And while you're in
+    there: our pods are stuck since the mesh rollout, we need a bigger page size, and the old
+    search box is being switched off, with the only copy of the partner API key still on it."*
+
+    Everything is in namespace **`search`**:
+
+    1. **Rescue the key.** Pod **`search-legacy`** (container **`legacy`**, an image without a
+       shell) holds the partner API key in **`/state/api-key`**. Read it with an **ephemeral
+       container** (`busybox:1.37`) that targets `legacy`, and write the key to
+       **`/lab/legacy-key.txt`**. The pod must not be restarted or re-created.
+    2. **Keep the warm cache.** Pod **`warm-cache`** on node01 took hours to fill. Whatever you
+       do, it must stay the **same pod**, Running on node01, with no restarts, and it must
+       tolerate the taint below.
+    3. **Dedicate node01.** Label it **`pool=search`** and taint it
+       **`dedicated=search:NoExecute`**, so that pods already running there that don't
+       tolerate the taint are evicted.
+    4. **Search on its node.** Deployment **`search-api`** keeps **2 replicas** that may only
+       be scheduled on nodes labelled `pool=search`, through a **required node affinity** (no
+       `nodeSelector`, no `nodeName`), and that tolerate the taint. Both run on node01.
+    5. **The mesh proxy first.** The `search-api` pods are stuck in `Init`: the init container
+       **`register`** waits for the mesh proxy on `127.0.0.1:8080`, but **`proxy`** is a regular
+       container. Make `proxy` a **native sidecar** that starts **before** `register` and keeps
+       running. Keep `register` and its command; **`web`** stays the only regular container.
+    6. **A bigger page.** `web` reads `RESULTS_PER_PAGE` from the immutable ConfigMap
+       **`search-tuning-v1`**. Change it to the value in **`/lab/tuning.txt`** through a **new
+       immutable ConfigMap**, leave `search-tuning-v1` as it is, and the running pods must see
+       the new value.
+    7. **Reports move out.** Deployment **`reports`** isn't search. It keeps **1 Ready
+       replica**, now **on the control plane**, and must **not** tolerate the `dedicated` taint.
+  hints:
+    - "Order matters: whatever must stay on node01 (warm-cache, search-api) has to tolerate the taint before you add it. An evicted bare pod is gone for good."
+    - "1: `kubectl -n search debug search-legacy --image=busybox:1.37 --target=legacy -c peek -- sh -c 'cat /proc/1/root/state/api-key'`, then `kubectl -n search logs search-legacy -c peek`."
+    - "2: Tolerations can be added to a running pod, but not removed: `kubectl -n search patch pod warm-cache --type=json -p '[{\"op\":\"add\",\"path\":\"/spec/tolerations/-\",\"value\":{...}}]'` keeps the ones it already has."
+    - "4: `nodeSelectorTerms` -> `matchExpressions` -> `{key: pool, operator: In, values: [search]}`, plus a toleration with key `dedicated`, value `search`, effect `NoExecute`."
+    - "5: A native sidecar lives in `initContainers` with `restartPolicy: Always`, and init containers start in list order: put `proxy` first. 6: `kubectl create configmap ... --dry-run=client -o yaml`, add `immutable: true`, then point `configMapKeyRef.name` at it."
+    - "7: Once node01 is tainted, `reports` has nowhere to go: `kubectl describe pod` says why. It needs to tolerate the control plane's `NoSchedule` taint, and nothing else."
+  solution: |
+    **1. Rescue the key** (the ephemeral container shares `legacy`'s processes; PID 1 is the
+    legacy program, and `/proc/1/root` is its filesystem)
+
+    ```bash
+    kubectl -n search debug search-legacy --image=busybox:1.37 --target=legacy -c peek -- \
+      sh -c 'cat /proc/1/root/state/api-key'
+    kubectl -n search logs search-legacy -c peek > /lab/legacy-key.txt
+    ```
+
+    **2. Keep the warm cache**: append a toleration before anything taints the node.
+
+    ```bash
+    kubectl -n search patch pod warm-cache --type=json -p \
+      '[{"op":"add","path":"/spec/tolerations/-","value":{"key":"dedicated","operator":"Equal","value":"search","effect":"NoExecute"}}]'
+    ```
+
+    **6. A bigger page**
+
+    ```bash
+    n=$(cat /lab/tuning.txt)
+    kubectl apply -f - <<EOF
+    apiVersion: v1
+    kind: ConfigMap
+    metadata: {name: search-tuning-v2, namespace: search}
+    immutable: true
+    data: {results: "$n"}
+    EOF
+    ```
+
+    **3a, 4 and 5.** Label the node, then give `search-api` its affinity, toleration, sidecar
+    and the new ConfigMap in one go:
+
+    ```bash
+    kubectl label node node01 pool=search
+    ```
+
+    ```yaml
+    spec:
+      template:
+        spec:
+          affinity:
+            nodeAffinity:
+              requiredDuringSchedulingIgnoredDuringExecution:
+                nodeSelectorTerms:
+                - matchExpressions:
+                  - {key: pool, operator: In, values: [search]}
+          tolerations:
+          - {key: dedicated, operator: Equal, value: search, effect: NoExecute}
+          initContainers:
+          - name: proxy                 # native sidecar, first in the list
+            image: busybox:1.37
+            restartPolicy: Always
+            command: ["sh", "-c", "mkdir -p /www && echo mesh-proxy > /www/index.html && exec httpd -f -p 8080 -h /www"]
+          - name: register              # unchanged
+            image: busybox:1.37
+            command: ["sh", "-c", "until wget -q -T 2 -O /dev/null http://127.0.0.1:8080/; do sleep 1; done; echo registered with the mesh"]
+          containers:
+          - name: web
+            image: nginx:1.27-alpine
+            env:
+            - name: RESULTS_PER_PAGE
+              valueFrom: {configMapKeyRef: {name: search-tuning-v2, key: results}}
+    ```
+
+    **3b. The taint**, now that everybody who stays tolerates it:
+
+    ```bash
+    kubectl taint node node01 dedicated=search:NoExecute
+    ```
+
+    **7. Reports move out**: evicted from node01, it needs to tolerate the control plane.
+
+    ```bash
+    kubectl -n search patch deploy reports --type=merge -p \
+      '{"spec":{"template":{"spec":{"tolerations":[{"key":"node-role.kubernetes.io/control-plane","operator":"Exists","effect":"NoSchedule"}]}}}}'
+    ```
+  setup: |
+    NS=search
+    k_ns $NS
+    n=$((RANDOM % 40 + 30))
+    echo "$n" >"$KL_STATE/tuning-370"
+    lab_file /lab/tuning.txt <<EOF
+    $n
+    EOF
+    kubectl apply -f - >/dev/null <<'EOF'
+    apiVersion: v1
+    kind: Pod
+    metadata: {name: search-legacy, namespace: search, labels: {app: search-legacy}}
+    spec:
+      nodeName: controlplane
+      tolerations: [{operator: Exists}]
+      terminationGracePeriodSeconds: 1
+      initContainers:
+      - name: keygen
+        image: busybox:1.37
+        command: ["sh", "-c"]
+        args:
+        - |
+          echo "sk-$(head -c 10 /dev/urandom | od -An -tx1 | tr -d ' \n')" > /state/api-key
+        volumeMounts: [{name: state, mountPath: /state}]
+      containers:
+      - name: legacy
+        image: traefik/whoami:v1.10
+        volumeMounts: [{name: state, mountPath: /state, readOnly: true}]
+      volumes:
+      - name: state
+        emptyDir: {}
+    ---
+    apiVersion: v1
+    kind: Pod
+    metadata: {name: warm-cache, namespace: search, labels: {app: warm-cache}}
+    spec:
+      nodeSelector: {kubernetes.io/hostname: node01}
+      terminationGracePeriodSeconds: 1
+      containers:
+      - name: cache
+        image: redis:7.4-alpine
+    ---
+    apiVersion: apps/v1
+    kind: Deployment
+    metadata: {name: reports, namespace: search}
+    spec:
+      replicas: 1
+      selector: {matchLabels: {app: reports}}
+      template:
+        metadata: {labels: {app: reports}}
+        spec:
+          terminationGracePeriodSeconds: 1
+          containers:
+          - name: reports
+            image: busybox:1.37
+            command: ["sleep", "infinity"]
+    ---
+    apiVersion: v1
+    kind: ConfigMap
+    metadata: {name: search-tuning-v1, namespace: search}
+    immutable: true
+    data: {results: "20"}
+    ---
+    apiVersion: apps/v1
+    kind: Deployment
+    metadata: {name: search-api, namespace: search}
+    spec:
+      replicas: 2
+      selector: {matchLabels: {app: search-api}}
+      template:
+        metadata: {labels: {app: search-api}}
+        spec:
+          terminationGracePeriodSeconds: 2
+          initContainers:
+          - name: register
+            image: busybox:1.37
+            command: ["sh", "-c", "until wget -q -T 2 -O /dev/null http://127.0.0.1:8080/; do sleep 1; done; echo registered with the mesh"]
+          containers:
+          - name: web
+            image: nginx:1.27-alpine
+            env:
+            - name: RESULTS_PER_PAGE
+              valueFrom: {configMapKeyRef: {name: search-tuning-v1, key: results}}
+          - name: proxy
+            image: busybox:1.37
+            command: ["sh", "-c", "mkdir -p /www && echo mesh-proxy > /www/index.html && exec httpd -f -p 8080 -h /www"]
+    EOF
+    wait_pod $NS search-legacy 120
+    uid=$(kj -n $NS pod search-legacy '{.metadata.uid}')
+    echo "$uid" >"$KL_STATE/legacy-uid-370"
+    eventually 30 "[ -s /var/lib/kubelet/pods/$uid/volumes/kubernetes.io~empty-dir/state/api-key ]" || true
+    tr -d '[:space:]' </var/lib/kubelet/pods/"$uid"/volumes/kubernetes.io~empty-dir/state/api-key >"$KL_STATE/key-370"
+    wait_pod $NS warm-cache 90
+    kj -n $NS pod warm-cache '{.metadata.uid}' >"$KL_STATE/cache-uid-370"
+    wait_deploy $NS reports 90
+  check: |
+    NS=search
+    key=$(cat "$KL_STATE/key-370" 2>/dev/null)
+    want=$(cat "$KL_STATE/tuning-370" 2>/dev/null)
+    dj() { kubectl -n $NS get deploy "$1" -o json 2>/dev/null; }
+    # cur_pods DEPLOY -> Running pods of the Deployment's current revision
+    cur_pods() {
+      local rev h
+      rev=$(dj "$1" | jq -r '.metadata.annotations["deployment.kubernetes.io/revision"] // empty')
+      [ -n "$rev" ] || return 0
+      h=$(kubectl -n $NS get rs -l "app=$1" -o json 2>/dev/null | jq -r --arg r "$rev" '.items[] | select(.metadata.annotations["deployment.kubernetes.io/revision"] == $r) | .metadata.labels["pod-template-hash"]' | head -1)
+      [ -n "$h" ] || return 0
+      kubectl -n $NS get pods -l "app=$1,pod-template-hash=$h" -o json 2>/dev/null |
+        jq -r '.items[] | select(.metadata.deletionTimestamp == null and .status.phase == "Running") | .metadata.name'
+    }
+    # tol: does a toleration match the taint dedicated=search:NoExecute?
+    TOL='def tol: ((.effect // "") as $e | $e == "" or $e == "NoExecute") and (if (.operator // "Equal") == "Exists" then ((.key // "") == "" or .key == "dedicated") else (.key == "dedicated" and (.value // "") == "search") end);'
+
+    info "1. Rescue the key"
+    check_eq "/lab/legacy-key.txt holds the partner API key" "$(tr -d '[:space:]' 2>/dev/null </lab/legacy-key.txt)" "${key:-no-key-recorded}"
+    check "an ephemeral busybox:1.37 container targets legacy" 'kubectl -n $NS get pod search-legacy -o json | jq -e "any(.spec.ephemeralContainers[]?; .image == \"busybox:1.37\" and .targetContainerName == \"legacy\")"'
+    check "search-legacy is the same pod and was never restarted" '[ "$(kj -n $NS pod search-legacy "{.metadata.uid}")" = "$(cat $KL_STATE/legacy-uid-370)" ] && [ "$(restarts $NS search-legacy)" = 0 ]'
+
+    info "2. Keep the warm cache"
+    check_eq "warm-cache is the same pod" "$(kj -n $NS pod warm-cache '{.metadata.uid}')" "$(cat "$KL_STATE/cache-uid-370" 2>/dev/null)"
+    check "warm-cache tolerates dedicated=search:NoExecute" 'kubectl -n $NS get pod warm-cache -o json | jq -e "$TOL"" any(.spec.tolerations[]?; tol)"'
+    check "warm-cache is Ready on node01, without restarts" 'pod_ready $NS warm-cache && [ "$(kj -n $NS pod warm-cache "{.spec.nodeName}")" = node01 ] && [ "$(restarts $NS warm-cache)" = 0 ]'
+
+    info "3. Dedicate node01"
+    tainted() { kubectl get node node01 -o json | jq -e 'any(.spec.taints[]?; .key == "dedicated" and .value == "search" and .effect == "NoExecute")' >/dev/null 2>&1; }
+    check_eq "node01 is labelled pool=search" "$(kj node node01 '{.metadata.labels.pool}')" search
+    check "node01 is tainted dedicated=search:NoExecute" tainted
+
+    info "4. Search on its node"
+    aff_ok() { dj search-api | jq -e '(.spec.template.spec.affinity.nodeAffinity.requiredDuringSchedulingIgnoredDuringExecution.nodeSelectorTerms // []) as $t | ($t | length) >= 1 and all($t[]; any(.matchExpressions[]?; .key == "pool" and .operator == "In" and (.values | index("search")))) and ((.spec.template.spec.nodeSelector // {}) | length) == 0 and (.spec.template.spec.nodeName // "") == ""' >/dev/null 2>&1; }
+    tol_ok() { dj search-api | jq -e "$TOL"' any(.spec.template.spec.tolerations[]?; tol)' >/dev/null 2>&1; }
+    check "search-api requires a node labelled pool=search (node affinity, no nodeSelector)" aff_ok
+    check "search-api tolerates the dedicated taint" tol_ok
+
+    info "5. The mesh proxy first"
+    side_ok() {
+      dj search-api | jq -e '.spec.template.spec as $s | [$s.initContainers[]?.name] as $n
+        | ($n | index("proxy")) != null and ($n | index("register")) != null and ($n | index("proxy")) < ($n | index("register"))
+        and ([$s.initContainers[] | select(.name == "proxy") | .restartPolicy] == ["Always"])
+        and ([$s.containers[].name] == ["web"])
+        and ([$s.initContainers[] | select(.name == "register") | (.command // []) + (.args // []) | join(" ")] | first | contains("until wget") and contains("127.0.0.1:8080"))' >/dev/null 2>&1
+    }
+    check "proxy is a native sidecar listed before register, web the only regular container" side_ok
+
+    info "6. A bigger page"
+    ref=$(dj search-api | jq -r '[.spec.template.spec.containers[]? | select(.name == "web") | .env[]? | select(.name == "RESULTS_PER_PAGE") | .valueFrom.configMapKeyRef | "\(.name) \(.key)"] | first // empty')
+    cm=${ref% *}; ck=${ref#* }
+    ref_ok() { [ -n "$ref" ] && [ "$cm" != search-tuning-v1 ] && [ "$(kubectl -n $NS get cm "$cm" -o json 2>/dev/null | jq -r --arg k "$ck" '.data[$k] // empty')" = "$want" ]; }
+    check "web reads RESULTS_PER_PAGE from a new ConfigMap with the new value" ref_ok
+    check "that ConfigMap is immutable" 'ref_ok && [ "$(kj -n $NS cm "$cm" "{.immutable}")" = true ]'
+    check "search-tuning-v1 is unchanged" '[ "$(kj -n $NS cm search-tuning-v1 "{.data.results} {.immutable}")" = "20 true" ]'
+
+    info "Search running on node01"
+    if aff_ok && tol_ok && side_ok && [ "$(kj node node01 '{.metadata.labels.pool}')" = search ]; then
+      wait_deploy $NS search-api 150
+    fi
+    P=$(cur_pods search-api)
+    check "search-api has 2 Ready replicas" '[ "$(kj -n $NS deploy search-api "{.spec.replicas}")" = 2 ] && deploy_ready $NS search-api'
+    check_eq "both run on node01" "$(for p in $P; do kj -n $NS pod "$p" '{.spec.nodeName}'; echo; done | grep -c '^node01$')" 2
+    st_ok() { [ -n "$P" ] || return 1; for p in $P; do kubectl -n $NS get pod "$p" -o json | jq -e '([.status.initContainerStatuses[]? | select(.name == "register") | .state.terminated.exitCode] == [0]) and ([.status.initContainerStatuses[]? | select(.name == "proxy") | .state.running != null] == [true])' >/dev/null || return 1; done; }
+    check "in every pod register has finished and proxy keeps running" st_ok
+    env_ok() { [ -n "$P" ] || return 1; for p in $P; do [ "$(kubectl -n $NS exec "$p" -c web -- printenv RESULTS_PER_PAGE 2>/dev/null)" = "$want" ] || return 1; done; }
+    check "the running pods see the new RESULTS_PER_PAGE" env_ok
+
+    info "7. Reports move out"
+    check "reports doesn't tolerate the dedicated taint" '! dj reports | jq -e "$TOL"" any(.spec.template.spec.tolerations[]?; tol)" >/dev/null'
+    wait_deploy $NS reports 90
+    on_cp() { [ "$(for p in $(cur_pods reports); do kj -n $NS pod "$p" '{.spec.nodeName}'; echo; done | grep -c '^controlplane$')" = 1 ]; }
+    tainted && deploy_ready $NS reports && eventually 30 on_cp
+    check "reports has 1 Ready replica" '[ "$(kj -n $NS deploy reports "{.spec.replicas}")" = 1 ] && deploy_ready $NS reports'
+    check "it runs on the control plane" on_cp
+  solve: |
+    NS=search
+    # 1. the key, through an ephemeral container that shares legacy's processes
+    kubectl -n $NS debug search-legacy --image=busybox:1.37 --target=legacy -c peek -- \
+      sh -c 'for f in /proc/[0-9]*/root/state/api-key; do cat "$f" 2>/dev/null; done | grep . | sort -u | head -1'
+    for i in $(seq 1 30); do
+      kubectl -n $NS logs search-legacy -c peek 2>/dev/null | grep -q . && break
+      sleep 2
+    done
+    kubectl -n $NS logs search-legacy -c peek > /lab/legacy-key.txt
+
+    # 2. the cache tolerates the taint before there is one
+    kubectl -n $NS patch pod warm-cache --type=json -p '[{"op":"add","path":"/spec/tolerations/-","value":{"key":"dedicated","operator":"Equal","value":"search","effect":"NoExecute"}}]'
+
+    # 6. a new immutable ConfigMap
+    n=$(tr -d '[:space:]' </lab/tuning.txt)
+    kubectl apply -f - <<EOF
+    apiVersion: v1
+    kind: ConfigMap
+    metadata: {name: search-tuning-v2, namespace: search}
+    immutable: true
+    data: {results: "$n"}
+    EOF
+
+    # 3a + 4 + 5. label the node, then search-api: affinity, toleration, sidecar, new ConfigMap
+    kubectl label node node01 pool=search --overwrite
+    kubectl replace -f - <<'EOF'
+    apiVersion: apps/v1
+    kind: Deployment
+    metadata: {name: search-api, namespace: search}
+    spec:
+      replicas: 2
+      selector: {matchLabels: {app: search-api}}
+      template:
+        metadata: {labels: {app: search-api}}
+        spec:
+          terminationGracePeriodSeconds: 2
+          affinity:
+            nodeAffinity:
+              requiredDuringSchedulingIgnoredDuringExecution:
+                nodeSelectorTerms:
+                - matchExpressions:
+                  - {key: pool, operator: In, values: [search]}
+          tolerations:
+          - {key: dedicated, operator: Equal, value: search, effect: NoExecute}
+          initContainers:
+          - name: proxy
+            image: busybox:1.37
+            restartPolicy: Always
+            command: ["sh", "-c", "mkdir -p /www && echo mesh-proxy > /www/index.html && exec httpd -f -p 8080 -h /www"]
+          - name: register
+            image: busybox:1.37
+            command: ["sh", "-c", "until wget -q -T 2 -O /dev/null http://127.0.0.1:8080/; do sleep 1; done; echo registered with the mesh"]
+          containers:
+          - name: web
+            image: nginx:1.27-alpine
+            env:
+            - name: RESULTS_PER_PAGE
+              valueFrom: {configMapKeyRef: {name: search-tuning-v2, key: results}}
+    EOF
+
+    # 3b. now the taint: evicts everything on node01 that doesn't tolerate it
+    kubectl taint node node01 dedicated=search:NoExecute --overwrite
+
+    # 7. reports was evicted; it may go to the control plane
+    kubectl -n $NS patch deploy reports --type=merge -p '{"spec":{"template":{"spec":{"tolerations":[{"key":"node-role.kubernetes.io/control-plane","operator":"Exists","effect":"NoSchedule"}]}}}}'
+    kubectl -n $NS rollout status deploy/search-api --timeout=180s
+    kubectl -n $NS rollout status deploy/reports --timeout=120s

@@ -542,3 +542,236 @@ exercises:
     git for-each-ref --format='%(refname)' refs/original/ | xargs -r -n1 git update-ref -d
     git reflog expire --expire=now --all
     git gc -q --prune=now
+
+# ===== Capstone: a real-world lab =====
+
+- id: git-252
+  title: "Capstone: put the monorepo's CI clone on a diet"
+  difficulty: 5
+  kind: build
+  tags: [git, capstone, partial-clone, sparse-checkout, single-branch, gc, commit-graph, objects]
+  tutorial: |
+    **Concept.** No single trick makes a big repository cheap. CI runners
+    usually combine several, and each one leaves a different part out:
+
+    - **`--single-branch --branch <name>`** fetches one branch and sets the
+      fetch refspec to it, so later fetches stay small too. Tags that point
+      into that branch's history still come along.
+    - **`--filter=blob:none`** (a *partial clone*) fetches every commit and
+      tree but no file contents. Git downloads a blob only when something
+      needs it, such as a checkout. The **server** has to allow it
+      (`uploadpack.allowFilter`); if it does not, the clone prints a warning,
+      ignores the filter and downloads everything. The filter needs a
+      `file://` URL for a repository on the same machine.
+    - **sparse checkout** (cone mode) writes only the directories you list,
+      plus the top-level files. Combined with a partial clone, the blobs
+      outside the cone are never downloaded at all, *but only if the clone
+      does not check out the whole tip first*: `git clone --sparse` (or
+      `--no-checkout`) starts with just the top level.
+    - a **shallow** clone (`--depth`) cuts history off. That breaks
+      `git describe` and `git log -- <path>` over older commits, so it is the
+      wrong tool when a job needs history.
+
+    On the server side, `git rev-list --objects --all | git cat-file
+    --batch-check` finds what makes a repository big, `git gc --prune=now`
+    packs loose objects and drops unreachable ones without rewriting any
+    commit, and `git commit-graph write --reachable --changed-paths` makes
+    `log` and `blame` on a path fast.
+
+    **Read up on:**
+    - `git clone --filter=blob:none --sparse --single-branch --branch <b> file://...`
+    - `uploadpack.allowFilter`, `remote.origin.promisor`, `remote.origin.partialclonefilter`
+    - `git sparse-checkout set` / `list`
+    - `git rev-list --objects --all --missing=print`
+    - `git cat-file --batch-check='%(objecttype) %(objectsize) %(rest)'`
+    - `git count-objects -v`, `git gc --prune=now`
+    - `git commit-graph write --reachable --changed-paths`
+  scenario: |
+    **Ticket BUILD-731** (from Tomasz, build infrastructure): *"The
+    `api-docs` CI job takes nine minutes, and eight of them are `git clone`.
+    It clones all of `mono.git`: forty-odd branches and every file anyone
+    ever committed, videos included. The job only builds `release/2.4`,
+    and only looks at `services/api` and `docs`. Please set up a runner
+    clone that fetches only what the job needs, and tidy the server while
+    you are at it. Do **not** rewrite history: two hundred people have
+    clones of it."*
+
+    The shared repository is the bare **`/lab/mono.git`**. The runner's
+    clone goes to **`/lab/runner`**.
+
+    1. **Find the culprit.** Write the **path** of the **largest blob ever
+       committed** to `mono.git`, on any branch (for example
+       `assets/video.mp4`), into **`/lab/biggest.txt`**. It is not in any
+       current branch tip.
+    2. **`mono.git` allows partial clones** (filtered fetches).
+    3. **Tidy `mono.git`:** no loose objects left, and the unreachable
+       junk blob a failed push left behind is gone right away. Every branch
+       and tag keeps the commit it points at.
+    4. **`/lab/runner`** is a **blobless partial clone** of `mono.git` (use a
+       `file://` URL), with **only `release/2.4`** fetched and checked out,
+       and its fetch refspec limited to that branch.
+    5. The job runs `git describe --tags` and `git log` on old commits, so
+       the runner clone has **all of `release/2.4`'s history** (not
+       shallow), and `git describe --tags` works.
+    6. **Sparse checkout** in `/lab/runner`: only **`services/api`** and
+       **`docs`** (plus the top-level files) are on disk. `git status` is
+       clean.
+    7. The point of all this: the runner **never downloaded** the old large
+       files or the contents of the other services' files.
+    8. `/lab/runner` has a **commit-graph with changed-path Bloom filters**
+       covering all its commits.
+  hints:
+    - "On `/lab/mono.git`: `git rev-list --objects --all | git cat-file --batch-check='%(objecttype) %(objectsize) %(rest)' | grep '^blob' | sort -k2 -n | tail -3`."
+    - "Try a `--filter=blob:none` clone and read its output: `warning: filtering not recognized by server, ignoring` means it quietly downloaded everything. `git -C /lab/mono.git config uploadpack.allowFilter true` fixes that. A plain path (no `file://`) ignores the filter too."
+    - "A clone that checks out the whole tip downloads every file in it, even if you make it sparse a second later. `git clone --sparse` (or `--no-checkout`) starts with only the top-level files; then `git sparse-checkout set services/api docs`."
+    - "Put it together: `git clone --filter=blob:none --sparse --single-branch --branch release/2.4 file:///lab/mono.git /lab/runner`. No `--depth`: describe needs history. If a try went wrong, `rm -rf /lab/runner` and clone again."
+    - "`git rev-list --objects --all --missing=print | grep -c '^?'` in the runner counts the objects it never downloaded."
+    - "Server: `git count-objects -v`, then `git gc --prune=now` (it packs, prunes and rewrites no commit). Runner: `git commit-graph write --reachable --changed-paths`."
+  solution: |
+    ```bash
+    # 1. what makes mono.git big
+    cd /lab/mono.git
+    git rev-list --objects --all \
+      | git cat-file --batch-check='%(objecttype) %(objectsize) %(rest)' \
+      | grep '^blob' | sort -k2 -n | tail -1 | cut -d' ' -f3- > /lab/biggest.txt
+
+    # 2. let the server filter (without it the clone ignores --filter)
+    git config uploadpack.allowFilter true
+
+    # 3. pack loose objects and drop the unreachable junk; no commit changes
+    git count-objects -v
+    git gc --prune=now
+    git count-objects -v
+
+    # 4-6. one branch, no blobs up front, then only the directories the job needs
+    git clone --filter=blob:none --sparse --single-branch --branch release/2.4 \
+      file:///lab/mono.git /lab/runner
+    cd /lab/runner
+    git sparse-checkout set services/api docs
+    git describe --tags
+    git rev-list --objects --all --missing=print | grep -c '^?'   # never downloaded
+
+    # 8. fast log/blame on paths
+    git commit-graph write --reachable --changed-paths
+    ```
+    `--no-checkout` followed by `git sparse-checkout set ...` and
+    `git checkout release/2.4` works as well as `--sparse`.
+  setup: |
+    rm -rf /lab/mono.git /lab/runner /lab/biggest.txt /lab/.seed
+    git init -q -b main /lab/.seed
+    cd /lab/.seed
+    git config gc.auto 0
+    at() { local who=$1 d=$2; shift 2; GIT_AUTHOR_DATE="$d" GIT_COMMITTER_DATE="$d" git -c user.name="$who" -c user.email="${who,,}@example.test" "$@"; }
+    c() { git add -A .; at "$1" "$2" commit -qm "$3"; }
+    cands=(assets/intro.mp4 backups/db-2025.sql data/fixtures.csv design/mockups.psd)
+    big=${cands[$(( RANDOM % 4 ))]}
+    echo "$big" > "$KL_STATE/biggest"
+    blob() { mkdir -p "$(dirname "$1")"; if [ "$1" = "$big" ]; then head -c 3000000 /dev/urandom > "$1"; else head -c $(( 300000 + RANDOM * 15 )) /dev/urandom > "$1"; fi; }
+    mkdir -p services/api services/web services/billing libs/common docs tools
+    printf 'from flask import Flask\n\napp = Flask(__name__)\n' > services/api/server.py
+    printf 'ROUTES = ["/health", "/orders"]\n' > services/api/routes.py
+    printf 'console.log("shop web");\n' > services/web/app.js
+    printf '<h1>Shop</h1>\n' > services/web/index.html
+    printf 'def invoice(order):\n    return order\n' > services/billing/invoice.py
+    printf 'def slug(s):\n    return s.lower()\n' > libs/common/util.py
+    printf '# Shop docs\n' > docs/index.md
+    printf '# API\n\nGET /health\nGET /orders\n' > docs/api.md
+    printf '#!/bin/sh\necho "cutting a release"\n' > tools/release.sh
+    printf '# shop monorepo\n' > README.md
+    printf 'all:\n\t@echo build\n' > Makefile
+    c Tomasz 2026-03-02T09:00:00+0000 "Initial monorepo layout"
+    blob assets/intro.mp4; c Priya 2026-03-04T10:00:00+0000 "Add product intro video"
+    git rev-parse HEAD:assets/intro.mp4 > "$KL_STATE/blob_video"
+    blob backups/db-2025.sql; c Kofi 2026-03-05T15:30:00+0000 "Add DB snapshot for local dev"
+    git rev-parse HEAD:backups/db-2025.sql > "$KL_STATE/blob_db"
+    printf 'ROUTES = ["/health", "/orders", "/orders/{id}"]\n' > services/api/routes.py
+    c Ines 2026-03-09T11:00:00+0000 "api: order detail route"
+    blob data/fixtures.csv; c Kofi 2026-03-10T09:15:00+0000 "Add test fixtures"
+    printf 'console.log("shop web, new landing page");\n' > services/web/app.js
+    c Priya 2026-03-12T14:00:00+0000 "web: new landing page"
+    git rm -rq assets backups data; at Tomasz 2026-03-16T08:30:00+0000 commit -qm "Remove large files from the repo"
+    at Tomasz 2026-03-16T08:31:00+0000 tag -a v2.3.0 -m "Release 2.3.0"
+    printf '# Shop docs\n\nSee api.md for the endpoints.\n' > docs/index.md
+    c Ines 2026-03-20T10:00:00+0000 "docs: link the API page"
+    printf 'def invoice(order):\n    return {"order": order, "currency": "EUR"}\n' > services/billing/invoice.py
+    c Kofi 2026-03-23T16:45:00+0000 "billing: return a dict"
+    # the release branch
+    git switch -qc release/2.4
+    printf '2.4.0\n' > VERSION; c Tomasz 2026-03-25T09:00:00+0000 "Release 2.4.0"
+    at Tomasz 2026-03-25T09:01:00+0000 tag -a v2.4.0 -m "Release 2.4.0"
+    printf 'ROUTES = ["/health", "/orders", "/orders/{id}"]\nEMPTY_OK = True\n' > services/api/routes.py
+    c Ines 2026-03-30T13:00:00+0000 "api: fix 500 on an empty order list"
+    printf '2.4.1\n' > VERSION; c Tomasz 2026-04-01T09:00:00+0000 "Release 2.4.1"
+    at Tomasz 2026-04-01T09:01:00+0000 tag -a v2.4.1 -m "Release 2.4.1"
+    printf '# API\n\nGET /health\nGET /orders\nGET /orders/{id}\n' > docs/api.md
+    c Ines 2026-04-03T10:30:00+0000 "docs: document the order detail route"
+    printf 'from flask import Flask\n\napp = Flask(__name__)\napp.config["LOG_REQUEST_IDS"] = True\n' > services/api/server.py
+    c Ines 2026-04-07T15:00:00+0000 "api: log request ids"
+    git rev-list --count HEAD > "$KL_STATE/count"
+    git rev-parse HEAD:services/web/app.js > "$KL_STATE/blob_web"
+    git rev-parse HEAD:services/billing/invoice.py > "$KL_STATE/blob_billing"
+    # main moves on
+    git switch -q main
+    printf 'console.log("shop web, dark mode");\n' > services/web/app.js
+    c Priya 2026-04-02T11:00:00+0000 "web: dark mode"
+    printf 'ROUTES = ["/health", "/orders", "/orders/{id}"]\nPAGE_SIZE = 50\n' > services/api/routes.py
+    c Ines 2026-04-06T09:30:00+0000 "api: paginate orders"
+    printf '2.5.0-rc1\n' > VERSION; c Tomasz 2026-04-08T09:00:00+0000 "Start 2.5"
+    at Tomasz 2026-04-08T09:01:00+0000 tag -a v2.5.0-rc1 -m "Release candidate 2.5.0-rc1"
+    n=10
+    for b in search cart wishlist reviews coupons gift-cards i18n checkout-v2 sso audit-log rate-limit exports \
+             recommendations shipping-quotes returns loyalty newsletter admin-ui; do
+      n=$((n + 1))
+      git switch -qc "feature/$b" main
+      printf '# %s\n' "$b" > "libs/common/${b//-/_}.py"
+      c Kofi "2026-04-${n}T10:00:00+0000" "$b: first cut"
+    done
+    git switch -qc feature/design-refresh main
+    blob design/mockups.psd; c Priya 2026-04-09T12:00:00+0000 "Design refresh mockups"
+    git switch -q main
+    # turn the work repository into the bare server repository, loose objects and all
+    cd /
+    mv /lab/.seed/.git /lab/mono.git
+    rm -rf /lab/.seed /lab/mono.git/index /lab/mono.git/logs /lab/mono.git/ORIG_HEAD
+    git --git-dir=/lab/mono.git config core.bare true
+    git --git-dir=/lab/mono.git hash-object -w --stdin <<<"partial upload from a failed push $RANDOM$RANDOM" > "$KL_STATE/junk"
+    git --git-dir=/lab/mono.git for-each-ref --format='%(refname) %(objectname)' > "$KL_STATE/refs"
+    chown -R "$(lab_user):" /lab/mono.git
+  check: |
+    M() { git -c safe.directory='*' --git-dir=/lab/mono.git "$@"; }
+    R() { git -c safe.directory='*' -C /lab/runner "$@"; }
+    st() { cat "$KL_STATE/$1"; }
+    # compare without printing the expected path: it is the answer
+    check "biggest.txt names the largest blob ever committed" '[ "$(tr -d " \t\r\n" < /lab/biggest.txt 2>/dev/null)" = "$(st biggest)" ]'
+    check_eq "mono.git allows filtered (partial) clones" "$(M config --bool uploadpack.allowFilter 2>/dev/null)" "true"
+    check_eq "mono.git has no loose objects" "$(M count-objects -v 2>/dev/null | awk '/^count:/{print $2}')" "0"
+    check_not "the junk blob from the failed push is gone" 'M cat-file -e "$(st junk)"'
+    check_eq "every branch and tag on mono.git still points where it did" "$(M for-each-ref --format='%(refname) %(objectname)' 2>/dev/null)" "$(st refs)"
+    check "/lab/runner is a clone of mono.git" '[ -d /lab/runner/.git ] && [[ "$(R config --get remote.origin.url)" =~ ^file:///lab/mono\.git/?$ ]]'
+    check_eq "it is a blobless partial clone" "$(R config --get remote.origin.promisor 2>/dev/null) $(R config --get remote.origin.partialclonefilter 2>/dev/null)" "true blob:none"
+    check_eq "release/2.4 is checked out" "$(R symbolic-ref -q --short HEAD 2>/dev/null)" "release/2.4"
+    check_eq "only origin/release/2.4 was fetched" "$(R for-each-ref --format='%(refname)' refs/remotes/origin/ 2>/dev/null | grep -v '/HEAD$' | tr '\n' ' ')" "refs/remotes/origin/release/2.4 "
+    check_eq "the fetch refspec is for release/2.4 only" "$(R config --get-all remote.origin.fetch 2>/dev/null)" "+refs/heads/release/2.4:refs/remotes/origin/release/2.4"
+    check_eq "the clone is not shallow" "$(R rev-parse --is-shallow-repository 2>/dev/null)" "false"
+    check_eq "all of release/2.4's history is there" "$(R rev-list --count HEAD 2>/dev/null)" "$(st count)"
+    check_match "git describe --tags works (v2.4.1 plus two commits)" "$(R describe --tags 2>/dev/null)" '^v2\.4\.1-2-g[0-9a-f]+$'
+    check_eq "sparse checkout lists services/api and docs" "$(R sparse-checkout list 2>/dev/null | sort | tr '\n' ' ')" "docs services/api "
+    check "services/api, docs and the top-level files are on disk" '[ -f /lab/runner/services/api/server.py ] && [ -f /lab/runner/docs/api.md ] && [ -f /lab/runner/README.md ] && [ -f /lab/runner/Makefile ]'
+    check_not "the other services, libs and tools are not on disk" '[ -e /lab/runner/services/web ] || [ -e /lab/runner/services/billing ] || [ -e /lab/runner/libs ] || [ -e /lab/runner/tools ]'
+    check_eq "git status is clean in the runner" "$(R status --porcelain 2>&1)" ""
+    missing() { R rev-list --objects --all --missing=print 2>/dev/null | grep -qx "?$1"; }
+    check "the old video and DB snapshot were never downloaded" 'missing "$(st blob_video)" && missing "$(st blob_db)"'
+    check "the web and billing services' files were never downloaded" 'missing "$(st blob_web)" && missing "$(st blob_billing)"'
+    graphs=$(ls /lab/runner/.git/objects/info/commit-graph /lab/runner/.git/objects/info/commit-graphs/*.graph 2>/dev/null)
+    check "the runner has a commit-graph with changed-path Bloom filters" '[ -n "$graphs" ] && cat $graphs | grep -qa BDAT'
+    check "the commit-graph covers every commit" '[ -n "$graphs" ] && R commit-graph verify'
+  solve: |
+    cd /lab/mono.git
+    git rev-list --objects --all | git cat-file --batch-check='%(objecttype) %(objectsize) %(rest)' \
+      | grep '^blob' | sort -k2 -n | tail -1 | cut -d' ' -f3- > /lab/biggest.txt
+    git config uploadpack.allowFilter true
+    git gc -q --prune=now
+    git clone -q --filter=blob:none --sparse --single-branch --branch release/2.4 file:///lab/mono.git /lab/runner
+    cd /lab/runner
+    git sparse-checkout set services/api docs
+    git commit-graph write --reachable --changed-paths

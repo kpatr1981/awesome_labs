@@ -653,3 +653,360 @@ exercises:
     # --- part 2: Read-only access for the auditor ---
     sudo setfacl -R -m u:kl-audit:rX /srv/kl-reports
     sudo find /srv/kl-reports -type d -exec setfacl -d -m u:kl-audit:r-x {} +
+
+# ===== Capstone: a real-world lab =====
+
+- id: linux-097
+  title: "Capstone: move the stock valuation job onto this host"
+  difficulty: 5
+  kind: build
+  tags: [capstone, users, acl, systemd, timers, journald, awk, sed, tar]
+  tutorial: |
+    **Concept.** Moving a job from an old server to a new one is everyday administration in miniature. The job needs an identity of its own, permission to read its input and write its output, a schedule, and a way for other people to see the results, and the old server's history has to be dug out of its logs and packed up before it goes.
+
+    Each piece is a skill from this module, and they depend on each other:
+
+    - **A service account** is only useful once it is in the right groups. Group membership is how it reaches data that people share.
+    - **A systemd service** says *who* runs a program (`User=`) and *how* (`Type=oneshot` for a job that runs and exits). A **timer** says *when*, and must be enabled to survive a reboot.
+    - **ACLs** let one extra user read a tree without loosening anything for everybody else. Reading a file also needs execute permission on every directory above it, and new files only get an entry if the directory has a default ACL.
+    - **Exports from other systems** are messy: line endings, separators, decimal commas, rows that don't count. Look at the bytes before you compute anything.
+    - **The journal** stores priority and identifier as fields, so ask for them directly instead of grepping text.
+
+    **Read up on:**
+    - `man useradd` — system accounts, home directory, shell, supplementary groups; `id`, `getent`
+    - `man systemd.service` and `man systemd.exec` — `Type=oneshot`, `ExecStart=`, `User=`
+    - `man systemd.timer`, `man systemd.time` — `OnCalendar=` with weekdays, `Persistent=`; `systemd-analyze calendar`
+    - `man setfacl` — `-m`, `-R`, `-d`, capital `X`; `getfacl`; and why directories above need `x`
+    - `cat -A`, `tr -d '\r'`, `awk -F';'`, `sub()`/`gsub()` and `printf "%.2f"`
+    - `man journalctl` — `-t` (an exact identifier), `-p`, `-o cat`
+    - `man tar` — `-C`, `--exclude`, `-tzf`
+  scenario: |
+    **Ticket FIN-88** — from Priya, finance engineering:
+
+    > The old reporting server is being switched off on Friday. Its nightly stock
+    > valuation job has to move to this host, our auditor needs to be able to read the
+    > reports, and before the old box goes I need the dates its job failed last month and
+    > an archive of the legacy reports.
+
+    Everything lives under **`/srv/kl-finance`** (group **`kl-finance`**, which already
+    exists). Don't loosen the owner, group or "other" permissions of anything there.
+
+    1. **The account.** Create **`kl-rpt`** as a **system account** with home
+       **`/var/lib/kl-rpt`** (created and owned by `kl-rpt`), a shell nobody can log in
+       with, and supplementary group **`kl-finance`**.
+    2. **The job.** **`/opt/kl-rpt/valuate.sh`** reads the export
+       **`/srv/kl-finance/export.csv`** and writes today's report
+       **`/srv/kl-finance/reports/valuation-YYYY-MM-DD.txt`** (today's date). The report
+       is one line: the stock value, the sum of **quantity × price over the `ACTIVE`
+       rows**, with two decimals (for example `1234.50`). The script was written for the
+       old server's export format and gets it wrong. Fix the calculation; keep the input
+       and output paths. It must work for any export in this format, not just today's.
+    3. **The service.** Create **`kl-valuation.service`**, a **oneshot** service that runs
+       `/opt/kl-rpt/valuate.sh` **as `kl-rpt`**. The check starts it with a fresh export
+       and reads the report it writes.
+    4. **The schedule.** Create **`kl-valuation.timer`** that starts it **Monday to Friday
+       at 06:15**, catches up a run missed while the host was off, and is **enabled and
+       active**.
+    5. **The auditor.** The user **`kl-audit`** must be able to **read** every report in
+       **`/srv/kl-finance/reports`**, in every subdirectory, including reports written
+       **in the future**, and must not be able to write anything. The user **`kl-guest`**
+       still has no access.
+    6. **The failed runs.** The old job logged one line per run to this host's journal
+       under the syslog identifier written in **`/lab/handover/ident.txt`**, like
+       `run 2026-10-07 ...`.
+       Write the dates of the runs logged at priority **error or more severe** to
+       **`/lab/handover/failed-dates.txt`**: one `YYYY-MM-DD` per line, oldest first,
+       nothing else.
+    7. **The legacy archive.** Pack **`/srv/kl-finance/legacy`** into
+       **`/lab/handover/legacy.tar.gz`** (gzip-compressed tar) with every member path
+       starting with **`legacy/`**, leaving out **`legacy/scratch`** and everything in it,
+       and everything else included unchanged.
+  hints:
+    - "Account: `useradd` has flags for a system account, the home path, creating it, the shell and extra groups. `id kl-rpt` shows the result."
+    - "The export: `sudo cat -A /srv/kl-finance/export.csv | head`. Note the separator, the line endings, how prices are written, the status column and the lines that aren't rows. `tr -d '\\r'` first, then `awk -F';'`; in awk, `gsub(/[^0-9,]/, \"\", p)` and `sub(/,/, \".\", p)` turn a price into a number."
+    - "Test the script the way the service runs it: `sudo -u kl-rpt /opt/kl-rpt/valuate.sh`. If it can't write the report, check `id kl-rpt` and the directory's group."
+    - "The units: `[Service]` with `Type=oneshot`, `User=kl-rpt` and `ExecStart=`; `[Timer]` with `OnCalendar=Mon..Fri *-*-* 06:15:00` and `Persistent=true`, `[Install] WantedBy=timers.target`. `daemon-reload`, then `enable --now` the timer."
+    - "The auditor needs `x` on `/srv/kl-finance` itself, `rX` on the existing reports tree (recursively), and a default entry on every directory under `reports`. Test with `sudo -u kl-audit cat ...`."
+    - "Failed runs: `sudo journalctl -t \"$(cat /lab/handover/ident.txt)\" -p err -o cat`. `-t` matches the identifier exactly, which matters here. Then `grep -oE '[0-9]{4}-[0-9]{2}-[0-9]{2}' | sort`. Archive: `sudo tar -czf ... -C /srv/kl-finance --exclude=legacy/scratch legacy`."
+  solution: |
+    ### 1. The account
+
+    ```bash
+    sudo useradd -r -m -d /var/lib/kl-rpt -s /usr/sbin/nologin -G kl-finance kl-rpt
+    id kl-rpt
+    ```
+
+    ### 2. The job
+
+    The export is semicolon-separated with Windows line endings, prices like `EUR 12,50`,
+    a `VOID`/`ACTIVE` status, a header and a trailer line:
+
+    ```bash
+    sudo cat -A /srv/kl-finance/export.csv | head -4
+    sudo tee /opt/kl-rpt/valuate.sh >/dev/null <<'EOF'
+    #!/bin/bash
+    # valuate.sh - write today's stock valuation report from the finance export
+    export_csv=/srv/kl-finance/export.csv
+    out=/srv/kl-finance/reports/valuation-$(date +%F).txt
+    tr -d '\r' < "$export_csv" | awk -F';' '
+      NR > 1 && NF == 4 && $4 == "ACTIVE" {
+        p = $3; gsub(/[^0-9,]/, "", p); sub(/,/, ".", p)
+        s += $2 * p
+      }
+      END { printf "%.2f\n", s }' > "$out"
+    EOF
+    ```
+
+    ### 3 and 4. The service and the timer
+
+    ```bash
+    sudo tee /etc/systemd/system/kl-valuation.service >/dev/null <<'EOF'
+    [Unit]
+    Description=Nightly stock valuation report
+
+    [Service]
+    Type=oneshot
+    User=kl-rpt
+    ExecStart=/opt/kl-rpt/valuate.sh
+    EOF
+    sudo tee /etc/systemd/system/kl-valuation.timer >/dev/null <<'EOF'
+    [Unit]
+    Description=Stock valuation, weekdays at 06:15
+
+    [Timer]
+    OnCalendar=Mon..Fri *-*-* 06:15:00
+    Persistent=true
+
+    [Install]
+    WantedBy=timers.target
+    EOF
+    sudo systemctl daemon-reload
+    sudo systemctl enable --now kl-valuation.timer
+    sudo systemctl start kl-valuation.service
+    cat /srv/kl-finance/reports/valuation-$(date +%F).txt
+    ```
+
+    ### 5. The auditor
+
+    ```bash
+    sudo setfacl -m u:kl-audit:x /srv/kl-finance
+    sudo setfacl -R -m u:kl-audit:rX /srv/kl-finance/reports
+    sudo find /srv/kl-finance/reports -type d -exec setfacl -d -m u:kl-audit:rx {} +
+    getfacl /srv/kl-finance/reports
+    ```
+
+    ### 6. The failed runs
+
+    A second identifier, the same name with `-dryrun` appended, logged errors too; `-t`
+    matches exactly and keeps it out:
+
+    ```bash
+    sudo journalctl -t "$(cat /lab/handover/ident.txt)" -p err -o cat \
+      | grep -oE '[0-9]{4}-[0-9]{2}-[0-9]{2}' | sort > /lab/handover/failed-dates.txt
+    ```
+
+    ### 7. The legacy archive
+
+    ```bash
+    sudo tar -czf /lab/handover/legacy.tar.gz -C /srv/kl-finance --exclude=legacy/scratch legacy
+    tar -tzf /lab/handover/legacy.tar.gz
+    ```
+  setup: |
+    on_reset 'systemctl disable --now kl-valuation.timer 2>/dev/null; systemctl stop kl-valuation.service 2>/dev/null; rm -f /etc/systemd/system/kl-valuation.service /etc/systemd/system/kl-valuation.timer /etc/systemd/system/timers.target.wants/kl-valuation.timer; rm -rf /etc/systemd/system/kl-valuation.service.d /opt/kl-rpt /srv/kl-finance; systemctl daemon-reload; systemctl reset-failed 2>/dev/null; userdel -r kl-rpt 2>/dev/null; groupdel kl-rpt 2>/dev/null; rm -rf /var/lib/kl-rpt; for u in kl-audit kl-guest; do userdel $u 2>/dev/null; groupdel $u 2>/dev/null; done; groupdel kl-finance 2>/dev/null; true'
+    groupadd kl-finance
+    useradd -M -s /usr/sbin/nologin kl-audit
+    useradd -M -s /usr/sbin/nologin kl-guest
+
+    # --- the tree ---
+    f=/srv/kl-finance
+    mkdir -p "$f/reports/2026-10" "$f/legacy/2024" "$f/legacy/2025" "$f/legacy/scratch/tmp"
+    echo "4211.07" > "$f/reports/2026-10/valuation-2026-10-30.txt"
+    echo "3987.40" > "$f/reports/valuation-2026-11-02.txt"
+    for y in 2024 2025; do
+      for m in 03 06 09 12; do echo "legacy $y-$m $RANDOM" > "$f/legacy/$y/valuation-$y-$m.txt"; done
+    done
+    echo "board pack $RANDOM" > "$f/legacy/2025/q4 board pack.txt"
+    echo "draft $RANDOM" > "$f/legacy/scratch/draft.txt"
+    echo "tmp $RANDOM" > "$f/legacy/scratch/tmp/x.tmp"
+    chown -R root:kl-finance "$f"
+    find "$f" -type d -exec chmod 750 {} +
+    find "$f" -type f -exec chmod 640 {} +
+    chmod 2770 "$f/reports" "$f/reports/2026-10"
+
+    # --- two exports: one in place, one the check swaps in ---
+    python3 - <<'PY'
+    import os, random
+    from decimal import Decimal
+    def export(path, totpath):
+        rows, tot = ["sku;qty;price;status"], Decimal(0)
+        for i in range(1, random.randint(10, 16) + 1):
+            q = random.randint(1, 60)
+            p = Decimal(random.randint(150, 99999)) / 100
+            st = "VOID" if random.random() < 0.25 else "ACTIVE"
+            if st == "ACTIVE":
+                tot += q * p
+            rows.append("SKU-%04d;%d;EUR %s;%s" % (random.randint(1, 9999), q, "{:.2f}".format(p).replace(".", ","), st))
+        rows.append("")
+        rows.append("# %d rows exported" % (len(rows) - 2))
+        with open(path, "w", newline="") as fh:
+            fh.write("\r\n".join(rows) + "\r\n")
+        with open(totpath, "w") as fh:
+            fh.write("{:.2f}\n".format(tot))
+    st = os.environ["KL_STATE"]
+    export("/srv/kl-finance/export.csv", st + "/total")
+    export(st + "/check-export.csv", st + "/check-total")
+    PY
+    chown root:kl-finance /srv/kl-finance/export.csv
+    chmod 640 /srv/kl-finance/export.csv
+
+    # --- the job, written for the old export format ---
+    mkdir -p /opt/kl-rpt
+    cat >/opt/kl-rpt/valuate.sh <<'EOF'
+    #!/bin/bash
+    # valuate.sh - write today's stock valuation report from the finance export
+    export_csv=/srv/kl-finance/export.csv
+    out=/srv/kl-finance/reports/valuation-$(date +%F).txt
+    awk -F, '{ s += $2 * $3 } END { print s }' "$export_csv" > "$out"
+    EOF
+    chmod 755 /opt/kl-rpt/valuate.sh
+
+    # --- the old job's journal ---
+    python3 - <<'PY' > "$KL_STATE/runs"
+    import random
+    days = sorted(random.sample(range(1, 32), 14))
+    prio = ["err", "crit", "err", "alert"] + ["info"] * 6 + ["warning"] * 3 + ["notice"]
+    random.shuffle(prio)
+    why = {"err": "failed: export missing", "crit": "failed: database unreachable", "alert": "failed: disk full",
+           "warning": "finished late: slow export", "info": "finished", "notice": "skipped: holiday"}
+    for d, p in zip(days, prio):
+        print(p, "run 2026-10-%02d %s" % (d, why[p]))
+    PY
+    ident="kl-valuation-$(head -c4 /dev/urandom | od -An -tx1 | tr -d ' \n')"
+    while read -r p msg; do logger -t "$ident" -p "user.$p" "$msg"; done <"$KL_STATE/runs"
+    logger -t "$ident-dryrun" -p user.err "run 2026-09-30 failed: dry run aborted"
+    logger -t "$ident-dryrun" -p user.err "run 2026-10-32 failed: invalid date"
+    awk '$1 ~ /^(err|crit|alert)$/ {print $3}' "$KL_STATE/runs" | sort > "$KL_STATE/failed"
+    eventually 30 '[ "$(journalctl -t "$ident" -o cat 2>/dev/null | wc -l)" -ge 14 ]'
+
+    mkdir -p /lab/handover
+    echo "$ident" > /lab/handover/ident.txt
+    chown -R "$(lab_user):" /lab/handover
+  check: |
+    f=/srv/kl-finance
+    info "1. The account"
+    if getent passwd kl-rpt >/dev/null; then
+      uid=$(id -u kl-rpt)
+      check "kl-rpt is a system account (UID below 1000)" '[ "$uid" -gt 0 ] && [ "$uid" -lt 1000 ]'
+      check_eq "home directory is /var/lib/kl-rpt" "$(getent passwd kl-rpt | cut -d: -f6)" /var/lib/kl-rpt
+      check "home exists and is owned by kl-rpt" '[ "$(stat -c %U /var/lib/kl-rpt 2>/dev/null)" = kl-rpt ]'
+      check_match "nobody can log in as kl-rpt" "$(getent passwd kl-rpt | cut -d: -f7)" '(nologin|/bin/false)$'
+      check "kl-rpt is in kl-finance" 'id -nG kl-rpt | tr " " "\n" | grep -qx kl-finance'
+    else
+      fail "account kl-rpt exists"
+    fi
+
+    info "2-3. The job and its service"
+    check_eq "kl-valuation.service is a oneshot" "$(systemctl show -p Type --value kl-valuation.service 2>/dev/null)" oneshot
+    check_eq "kl-valuation.service runs as kl-rpt" "$(systemctl show -p User --value kl-valuation.service 2>/dev/null)" kl-rpt
+    rep="$f/reports/valuation-$(date +%F).txt"
+    if [ -f /etc/systemd/system/kl-valuation.service ] || systemctl cat kl-valuation.service >/dev/null 2>&1; then
+      cp -p "$f/export.csv" "$KL_STATE/export.saved"
+      install -o root -g kl-finance -m 640 "$KL_STATE/check-export.csv" "$f/export.csv"
+      rm -f "$rep"
+      systemctl reset-failed kl-valuation.service 2>/dev/null
+      rc=0; timeout 60 systemctl start kl-valuation.service >/dev/null 2>&1 || rc=$?
+      check "kl-valuation.service runs successfully" '[ "$rc" = 0 ]'
+      [ "$rc" = 0 ] && { eventually 10 "[ -s '$rep' ]" || true; }
+      want=$(cat "$KL_STATE/check-total"); got=$(tr -d '[:space:]' 2>/dev/null <"$rep")
+      check "today's report holds the stock value of a fresh export" '[[ "$got" =~ ^[0-9]+\.[0-9][0-9]$ ]] && awk -v a="$got" -v b="$want" "BEGIN{exit !(a-b < 0.005 && b-a < 0.005)}"'
+      check_eq "the report was written by kl-rpt" "$(stat -c %U "$rep" 2>/dev/null)" kl-rpt
+      cp -p "$KL_STATE/export.saved" "$f/export.csv"
+    else
+      fail "kl-valuation.service exists"
+    fi
+
+    info "4. The schedule"
+    check "kl-valuation.timer is enabled" 'systemctl is-enabled -q kl-valuation.timer'
+    check "kl-valuation.timer is active" 'systemctl is-active -q kl-valuation.timer'
+    check "it fires Monday to Friday at 06:15" 'systemctl show kl-valuation.timer -p TimersCalendar --value | grep -q "Mon\.\.Fri \*-\*-\* 06:15:00"'
+    check_eq "missed runs are caught up" "$(systemctl show kl-valuation.timer -p Persistent --value 2>/dev/null)" yes
+    check_eq "it starts kl-valuation.service" "$(systemctl show kl-valuation.timer -p Unit --value 2>/dev/null)" kl-valuation.service
+
+    info "5. The auditor"
+    r=$f/reports
+    check "kl-audit reads existing reports, subdirectories included" 'runuser -u kl-audit -- cat "$r/valuation-2026-11-02.txt" "$r/2026-10/valuation-2026-10-30.txt"'
+    check "kl-audit reads the report the service just wrote" '[ -f "$rep" ] && runuser -u kl-audit -- cat "$rep"'
+    (umask 027; : > "$r/.probe"; : > "$r/2026-10/.probe")
+    check "kl-audit reads newly created files" 'runuser -u kl-audit -- cat "$r/.probe" "$r/2026-10/.probe"'
+    check_not "kl-audit cannot write" 'runuser -u kl-audit -- sh -c ": >> \"$r/valuation-2026-11-02.txt\"" || runuser -u kl-audit -- touch "$r/kl-audit-was-here"'
+    check_not "kl-guest has no access" 'runuser -u kl-guest -- cat "$r/valuation-2026-11-02.txt" || runuser -u kl-guest -- cat "$r/.probe" || runuser -u kl-guest -- ls "$r"'
+    rm -f "$r/.probe" "$r/2026-10/.probe" "$r/kl-audit-was-here"
+    check "nothing was loosened ('other' empty, groups unchanged)" '[ "$(stat -c %a:%G "$f")" = 750:kl-finance ] && [ "$(stat -c %a:%G "$r")" = 2770:kl-finance ]'
+
+    info "6. The failed runs"
+    check_eq "/lab/handover/failed-dates.txt lists exactly the failed runs, oldest first" "$(grep . /lab/handover/failed-dates.txt 2>/dev/null | tr -d ' \r' | tr '\n' ' ')" "$(tr '\n' ' ' <"$KL_STATE/failed")"
+
+    info "7. The legacy archive"
+    a=/lab/handover/legacy.tar.gz
+    if tar tzf "$a" >/dev/null 2>&1; then
+      check_not "every member starts with legacy/" 'tar tzf "$a" | grep -qv "^legacy/"'
+      check_not "legacy/scratch is left out" 'tar tzf "$a" | grep -q "^legacy/scratch"'
+      d=$(mktemp -d)
+      tar xzf "$a" -C "$d" 2>/dev/null
+      check "everything else is included unchanged" 'diff -r -x scratch "$f/legacy" "$d/legacy"'
+      rm -rf "$d"
+    else
+      fail "/lab/handover/legacy.tar.gz is a gzip-compressed tar"
+    fi
+  solve: |
+    # 1. the account
+    sudo useradd -r -m -d /var/lib/kl-rpt -s /usr/sbin/nologin -G kl-finance kl-rpt
+
+    # 2. the job
+    sudo tee /opt/kl-rpt/valuate.sh >/dev/null <<'EOF'
+    #!/bin/bash
+    # valuate.sh - write today's stock valuation report from the finance export
+    export_csv=/srv/kl-finance/export.csv
+    out=/srv/kl-finance/reports/valuation-$(date +%F).txt
+    tr -d '\r' < "$export_csv" | awk -F';' '
+      NR > 1 && NF == 4 && $4 == "ACTIVE" {
+        p = $3; gsub(/[^0-9,]/, "", p); sub(/,/, ".", p)
+        s += $2 * p
+      }
+      END { printf "%.2f\n", s }' > "$out"
+    EOF
+
+    # 3-4. the service and the timer
+    sudo tee /etc/systemd/system/kl-valuation.service >/dev/null <<'EOF'
+    [Unit]
+    Description=Nightly stock valuation report
+
+    [Service]
+    Type=oneshot
+    User=kl-rpt
+    ExecStart=/opt/kl-rpt/valuate.sh
+    EOF
+    sudo tee /etc/systemd/system/kl-valuation.timer >/dev/null <<'EOF'
+    [Unit]
+    Description=Stock valuation, weekdays at 06:15
+
+    [Timer]
+    OnCalendar=Mon..Fri *-*-* 06:15:00
+    Persistent=true
+
+    [Install]
+    WantedBy=timers.target
+    EOF
+    sudo systemctl daemon-reload
+    sudo systemctl enable --now kl-valuation.timer
+
+    # 5. the auditor
+    sudo setfacl -m u:kl-audit:x /srv/kl-finance
+    sudo setfacl -R -m u:kl-audit:rX /srv/kl-finance/reports
+    sudo find /srv/kl-finance/reports -type d -exec setfacl -d -m u:kl-audit:rx {} +
+
+    # 6. the failed runs
+    sudo journalctl -t "$(cat /lab/handover/ident.txt)" -p err -o cat | grep -oE '[0-9]{4}-[0-9]{2}-[0-9]{2}' | sort > /lab/handover/failed-dates.txt
+
+    # 7. the legacy archive
+    sudo tar -czf /lab/handover/legacy.tar.gz -C /srv/kl-finance --exclude=legacy/scratch legacy

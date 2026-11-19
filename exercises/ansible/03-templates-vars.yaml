@@ -760,3 +760,342 @@ exercises:
             key: "{{ lookup('file', '/lab/keys/team.pub') }}"
     EOF
     ansible-playbook site.yml
+
+# ===== Capstone: a real-world lab =====
+
+- id: ans-088
+  title: "Capstone: configure the payments API"
+  difficulty: 5
+  kind: build
+  tags: [ansible, capstone, template, jinja2, facts, hostvars, vault, no_log, precedence, blockinfile, lineinfile, filters]
+  tutorial: |
+    **Concept.** A service's configuration is assembled from many sources,
+    and each kind of value has its proper home:
+
+    - **shared settings** in `group_vars`, and an **exception** for one
+      host in its `host_vars` (a host beats its groups), without touching
+      the shared file
+    - **secrets** in a vault-encrypted vars file, decrypted at run time
+      through `vault_password_file`, and **kept out of the logs** with
+      `no_log` on every task that handles them (CI often runs with `-v`
+      and `--diff`, and a diff prints the new lines of a file)
+    - **facts** for what only the machine knows: its vCPU count, its
+      address, and through `hostvars`, the addresses of its **peers**
+      (facts exist for hosts gathered earlier in the same run)
+    - **filters** to turn data into exactly the text a file needs:
+      `selectattr`, `map`, `sort`, `join`, `min`
+    - **files you don't own** are edited in place: `lineinfile` for one
+      line, `blockinfile` for a block of lines you manage, everything else
+      left alone
+    - **files you ship** get an explicit owner and mode
+
+    A template is rendered on the controller, so test expressions with
+    `ansible HOST -m debug -a 'msg={{ ... }}'` before you put them in a file.
+
+    **Read up on:**
+    - `ansible.builtin.template`, Jinja2 `for` loops and `loop.last`
+    - variable precedence: `host_vars` vs `group_vars`, `group_vars/<group>/`
+      directories
+    - `ansible-vault encrypt`, `vault_password_file`
+    - `no_log`, `ansible-playbook --diff`
+    - `groups`, `hostvars`, `ansible_default_ipv4.address`,
+      `ansible_processor_vcpus`
+    - `selectattr`, `map(attribute=...)`, `join`, `min`
+    - `ansible.builtin.lineinfile` (`regexp`), `ansible.builtin.blockinfile`
+    - `ansible.builtin.copy` with `src`, `owner`, `mode`
+  scenario: |
+    **Ticket PAY-77**, from Sven (payments team lead): *"We go live with the
+    new payments API next week. Its config has to come out of Ansible, the
+    database must let the API servers in, and the auditors want the DB
+    password encrypted and never in a CI log."*
+
+    The project is **`/lab/payments`** (inventory: `web1`, `web2` in group
+    `web`, `db1` in group `db`). The data is already there:
+    `group_vars/all/main.yml` (database settings and the feature list),
+    `group_vars/all/secrets.yml` (the database password, **in plain
+    text**), `group_vars/web.yml` (`api_port`), the health check
+    **`files/payments-health`** and the vault password file
+    **`.vault_pass`**. Write **`site.yml`** and a template
+    **`templates/app.ini.j2`** so that, after `ansible-playbook site.yml`:
+
+    1. **The secret is vaulted.** `group_vars/all/secrets.yml` is encrypted
+       with the password in `.vault_pass`, and `ansible.cfg` is set up so
+       that a plain `ansible-playbook site.yml` works.
+    2. **`/etc/payments/app.ini`** on web1 and web2 (mode **`0640`**,
+       owned by **`root:root`**) has this layout (shown for web1):
+
+       ```ini
+       [server]
+       host = web1
+       port = 8443
+       workers = 4
+
+       [database]
+       host = db1
+       user = payments
+       password = <db_password>
+
+       [features]
+       enabled = apple_pay,fraud_check,refunds
+
+       [cluster]
+       peers = web1=<web1's IPv4 address>,web2=<web2's IPv4 address>
+       ```
+
+       Comment lines are allowed. Each value comes from a variable or a
+       fact, as follows.
+    3. **Ports:** `port` is `api_port`. **web2 is the exception:** it
+       listens on **`9443`**. Don't edit `group_vars/web.yml`.
+    4. **Sizing:** `workers` is **twice the host's vCPU count, but at most
+       8**, from facts.
+    5. **Features and peers:** `enabled` lists the names of the
+       **enabled** entries of `payments_features`, sorted, joined with
+       commas. `peers` lists every host of the `web` group, sorted by name,
+       as `name=address`, from facts. No feature names or addresses are
+       hard-coded in `site.yml` or the template.
+    6. **The database lets the API in.** On **db1**,
+       **`/etc/payments/db_access.conf`** (owned by the database package)
+       gets `max_connections = 200` in place of its current value (one
+       `max_connections` line), and an Ansible-managed block (default
+       markers) with one line per web host, sorted by name:
+       `host payments <address>/32`. Its other lines stay as they are.
+    7. **The health check is installed** on web1 and web2 as
+       **`/usr/local/bin/payments-health`**, `root:root`, mode `0755`, and
+       prints `healthy: <host> port=<port>` when run. db1 doesn't get it.
+    8. **No leaks, no drift.** `ansible-playbook -v --diff site.yml` never
+       prints the database password, even when it rewrites `app.ini`, and
+       a second plain run changes nothing.
+  hints:
+    - "Vault first: `ansible-vault encrypt --vault-password-file .vault_pass group_vars/all/secrets.yml`, then `vault_password_file = /lab/payments/.vault_pass` under `[defaults]` in `ansible.cfg`."
+    - "web2's port is a host exception: `host_vars/web2.yml` with `api_port: 9443`."
+    - "Try expressions before templating them: `ansible web1 -m debug -a \"msg={{ [ansible_processor_vcpus * 2, 8] | min }}\"` and `... | selectattr('enabled') | map(attribute='name') | sort | join(',')`. Ad-hoc `debug` doesn't gather facts, so try fact expressions in a small playbook, or with `-m setup` first."
+    - "Peers: `{% for h in groups['web'] | sort %}{{ h }}={{ hostvars[h].ansible_default_ipv4.address }}{% if not loop.last %},{% endif %}{% endfor %}`. Put the play for `web` first: its fact gathering is what fills `hostvars` for the `db` play."
+    - "db1: `lineinfile` with `regexp: '^max_connections'`, and `blockinfile` whose `block:` is a `{% for %}` loop over `groups['web'] | sort`."
+    - "The template task handles the password: give it `no_log: true`. Check with `ansible web1 -b -m lineinfile -a 'path=/etc/payments/app.ini regexp=^password state=absent'` followed by `ansible-playbook -v --diff site.yml | grep <password>`."
+  solution: |
+    ```bash
+    cd /lab/payments
+    ansible-vault encrypt --vault-password-file .vault_pass group_vars/all/secrets.yml
+    sed -i '/^\[defaults\]/a vault_password_file = /lab/payments/.vault_pass' ansible.cfg
+    mkdir -p host_vars templates
+    echo 'api_port: 9443' > host_vars/web2.yml
+
+    cat > templates/app.ini.j2 <<'EOF'
+    # Managed by Ansible - do not edit
+    [server]
+    host = {{ inventory_hostname }}
+    port = {{ api_port }}
+    workers = {{ [ansible_processor_vcpus * 2, 8] | min }}
+
+    [database]
+    host = {{ db_host }}
+    user = {{ db_user }}
+    password = {{ db_password }}
+
+    [features]
+    enabled = {{ payments_features | selectattr('enabled') | map(attribute='name') | sort | join(',') }}
+
+    [cluster]
+    peers = {% for h in groups['web'] | sort %}{{ h }}={{ hostvars[h].ansible_default_ipv4.address }}{% if not loop.last %},{% endif %}{% endfor %}
+
+    EOF
+
+    cat > site.yml <<'EOF'
+    - name: Payments API servers
+      hosts: web
+      become: true
+      tasks:
+        - name: Config directory
+          ansible.builtin.file:
+            path: /etc/payments
+            state: directory
+            mode: "0755"
+
+        - name: API config
+          ansible.builtin.template:
+            src: templates/app.ini.j2
+            dest: /etc/payments/app.ini
+            owner: root
+            group: root
+            mode: "0640"
+          no_log: true
+
+        - name: Health check
+          ansible.builtin.copy:
+            src: payments-health
+            dest: /usr/local/bin/payments-health
+            owner: root
+            group: root
+            mode: "0755"
+
+    - name: Payments database
+      hosts: db
+      become: true
+      tasks:
+        - name: Connection limit
+          ansible.builtin.lineinfile:
+            path: /etc/payments/db_access.conf
+            regexp: '^max_connections'
+            line: max_connections = 200
+
+        - name: Let the API servers in
+          ansible.builtin.blockinfile:
+            path: /etc/payments/db_access.conf
+            block: |
+              {% for h in groups['web'] | sort %}
+              host payments {{ hostvars[h].ansible_default_ipv4.address }}/32
+              {% endfor %}
+    EOF
+    ansible-playbook site.yml
+    ansible-playbook site.yml            # changed=0
+    # prove it: make app.ini change, then look at a verbose diff run
+    ansible web1 -b -m ansible.builtin.lineinfile -a 'path=/etc/payments/app.ini regexp=^password state=absent'
+    ansible-playbook -v --diff site.yml   # "API config": the output has been hidden (no_log)
+    ```
+  setup: |
+    ans_start web1 web2 db1
+    rm -rf /lab/payments
+    ans_project /lab/payments
+    pw="pw-$(head -c 9 /dev/urandom | od -An -tx1 | tr -d ' \n')"
+    echo "$pw" > "$KL_STATE/pw"
+    head -c 18 /dev/urandom | base64 | lab_file /lab/payments/.vault_pass 0600
+    printf '# the payments database password (TODO: encrypt before go-live)\ndb_password: "%s"\n' "$pw" | lab_file /lab/payments/group_vars/all/secrets.yml
+    lab_file /lab/payments/group_vars/all/main.yml <<'EOF'
+    db_host: db1
+    db_user: payments
+    payments_features:
+      - { name: refunds, enabled: true }
+      - { name: payouts_v2, enabled: false }
+      - { name: fraud_check, enabled: true }
+      - { name: legacy_xml, enabled: false }
+      - { name: apple_pay, enabled: true }
+    EOF
+    lab_file /lab/payments/group_vars/web.yml <<'EOF'
+    api_port: 8443
+    EOF
+    lab_file /lab/payments/files/payments-health 0755 <<'EOF'
+    #!/bin/sh
+    # payments API health check: reads the rendered config
+    conf=/etc/payments/app.ini
+    [ -r "$conf" ] || { echo "unhealthy: cannot read $conf" >&2; exit 1; }
+    port=$(sed -n 's/^port *= *//p' "$conf")
+    echo "healthy: $(hostname) port=$port"
+    EOF
+    sha256sum /lab/payments/group_vars/web.yml > "$KL_STATE/sums"
+    ans_on db1 "mkdir -p /etc/payments && printf '# payments database access - shipped by the db package\nlisten_addresses = *\nmax_connections = 100\nhost replication repl 10.9.0.0/24\n' > /etc/payments/db_access.conf"
+    ip() { docker inspect -f '{{(index .NetworkSettings.Networks "kl-ansible-net").IPAddress}}' "$1"; }
+    echo "web1=$(ip web1),web2=$(ip web2)" > "$KL_STATE/peers"
+    printf 'host payments %s/32\nhost payments %s/32\n' "$(ip web1)" "$(ip web2)" > "$KL_STATE/block"
+    ip web1 > "$KL_STATE/ip1"
+  check: |
+    d=/lab/payments
+    pw=$(cat "$KL_STATE/pw")
+    ini() { ans_on "$1" "python3 -c 'import configparser,sys; c=configparser.ConfigParser(interpolation=None); c.read(\"/etc/payments/app.ini\"); print(c.get(sys.argv[1], sys.argv[2], fallback=\"\"))' $2 $3" 2>/dev/null; }
+    check "1. secrets.yml is vault-encrypted" 'head -1 $d/group_vars/all/secrets.yml | grep -q "^\$ANSIBLE_VAULT"'
+    check_not "1. the password is not in clear text in the project" 'grep -rqsF "$pw" $d --exclude=.vault_pass'
+    check "1. ansible.cfg sets vault_password_file" 'grep -Eq "^[[:space:]]*vault_password_file[[:space:]]*=" $d/ansible.cfg'
+    workers=$(( $(ans_on web1 nproc) * 2 )); [ "$workers" -gt 8 ] && workers=8
+    for n in web1 web2; do
+      check_eq "2. $n app.ini is root:root 0640" "$(ans_on $n 'stat -c "%U:%G %a" /etc/payments/app.ini' 2>/dev/null)" "root:root 640"
+      check_eq "2. $n [server] host" "$(ini $n server host)" "$n"
+      check_eq "2. $n [database] host/user" "$(ini $n database host)/$(ini $n database user)" "db1/payments"
+      check "2. $n [database] password is the vaulted one" '[ "$(ini $n database password)" = "$pw" ]'
+      check_eq "4. $n [server] workers" "$(ini $n server workers)" "$workers"
+      check_eq "5. $n [features] enabled" "$(ini $n features enabled)" "apple_pay,fraud_check,refunds"
+      check_eq "5. $n [cluster] peers" "$(ini $n cluster peers)" "$(cat "$KL_STATE/peers")"
+    done
+    check_eq "3. web1 [server] port (from group_vars)" "$(ini web1 server port)" "8443"
+    check_eq "3. web2 [server] port (its own exception)" "$(ini web2 server port)" "9443"
+    check "3. group_vars/web.yml is unchanged" 'sha256sum -c --quiet "$KL_STATE/sums"'
+    check_not "5. no feature names or addresses hard-coded" 'grep -rqsE "apple_pay|fraud_check|$(sed "s/\./\\\\./g" "$KL_STATE/ip1")" $d/site.yml $d/templates'
+    acc=$(ans_on db1 'cat /etc/payments/db_access.conf' 2>/dev/null)
+    check_eq "6. db1 has one max_connections line, set to 200" "$(grep -c '^max_connections' <<<"$acc")/$(grep -Ec '^max_connections *= *200$' <<<"$acc")" "1/1"
+    check_eq "6. db1's managed block lets the web servers in" "$(sed -n '/^# BEGIN ANSIBLE MANAGED BLOCK$/,/^# END ANSIBLE MANAGED BLOCK$/p' <<<"$acc" | sed '1d;$d')" "$(cat "$KL_STATE/block")"
+    check "6. db1 kept its other settings" 'grep -qx "listen_addresses = \*" <<<"$acc" && grep -qx "host replication repl 10.9.0.0/24" <<<"$acc"'
+    for n in web1 web2; do
+      check_eq "7. $n payments-health is root:root 0755" "$(ans_on $n 'stat -c "%U:%G %a" /usr/local/bin/payments-health' 2>/dev/null)" "root:root 755"
+    done
+    check_eq "7. web1 payments-health runs" "$(ans_on web1 /usr/local/bin/payments-health 2>/dev/null)" "healthy: web1 port=8443"
+    check_eq "7. web2 payments-health runs" "$(ans_on web2 /usr/local/bin/payments-health 2>/dev/null)" "healthy: web2 port=9443"
+    check_not "7. db1 has no payments-health" 'ans_on db1 "test -e /usr/local/bin/payments-health"'
+    if [ "$(ini web1 database password)" = "$pw" ]; then
+      ans_on web1 "sed -i '/^password/d' /etc/payments/app.ini"
+      out=$(ans_as_user $d ansible-playbook -v --diff site.yml 2>&1)
+      check_not "8. a -v --diff run that rewrites app.ini never prints the password" 'grep -qF "$pw" <<<"$out"'
+      check "8. that run succeeded and restored web1's password" 'grep -q "ok=" <<<"$out" && ! grep -Eq "(failed|unreachable)=[1-9]" <<<"$out" && [ "$(ini web1 database password)" = "$pw" ]'
+      check "8. a second run changes nothing" 'ans_idempotent $d site.yml'
+    else
+      fail "8. no leaks, no drift (not tried: web1's app.ini doesn't have the password yet)"
+    fi
+  solve: |
+    cd /lab/payments
+    ansible-vault encrypt --vault-password-file .vault_pass group_vars/all/secrets.yml
+    sed -i '/^\[defaults\]/a vault_password_file = /lab/payments/.vault_pass' ansible.cfg
+    mkdir -p host_vars templates
+    echo 'api_port: 9443' > host_vars/web2.yml
+    cat > templates/app.ini.j2 <<'EOF'
+    # Managed by Ansible - do not edit
+    [server]
+    host = {{ inventory_hostname }}
+    port = {{ api_port }}
+    workers = {{ [ansible_processor_vcpus * 2, 8] | min }}
+
+    [database]
+    host = {{ db_host }}
+    user = {{ db_user }}
+    password = {{ db_password }}
+
+    [features]
+    enabled = {{ payments_features | selectattr('enabled') | map(attribute='name') | sort | join(',') }}
+
+    [cluster]
+    peers = {% for h in groups['web'] | sort %}{{ h }}={{ hostvars[h].ansible_default_ipv4.address }}{% if not loop.last %},{% endif %}{% endfor %}
+
+    EOF
+    cat > site.yml <<'EOF'
+    - name: Payments API servers
+      hosts: web
+      become: true
+      tasks:
+        - name: Config directory
+          ansible.builtin.file:
+            path: /etc/payments
+            state: directory
+            mode: "0755"
+
+        - name: API config
+          ansible.builtin.template:
+            src: templates/app.ini.j2
+            dest: /etc/payments/app.ini
+            owner: root
+            group: root
+            mode: "0640"
+          no_log: true
+
+        - name: Health check
+          ansible.builtin.copy:
+            src: payments-health
+            dest: /usr/local/bin/payments-health
+            owner: root
+            group: root
+            mode: "0755"
+
+    - name: Payments database
+      hosts: db
+      become: true
+      tasks:
+        - name: Connection limit
+          ansible.builtin.lineinfile:
+            path: /etc/payments/db_access.conf
+            regexp: '^max_connections'
+            line: max_connections = 200
+
+        - name: Let the API servers in
+          ansible.builtin.blockinfile:
+            path: /etc/payments/db_access.conf
+            block: |
+              {% for h in groups['web'] | sort %}
+              host payments {{ hostvars[h].ansible_default_ipv4.address }}/32
+              {% endfor %}
+    EOF
+    ansible-playbook site.yml

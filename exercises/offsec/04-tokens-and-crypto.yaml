@@ -895,3 +895,524 @@ exercises:
             raise ValueError("bad signature")
         return action
     PY
+
+# ===== Capstone: a real-world lab =====
+
+- id: offsec-tok-011
+  title: "Capstone: audit and harden the Acme auth stack"
+  difficulty: 5
+  kind: build
+  tags: [offsec, capstone, tokens, encoding, jwt, hmac, cracking, remediation, hardening, integrity]
+  tutorial: |
+    **Concept.** A token audit has two halves. First you **prove the bugs**:
+    encoded values are not secret (a base64 header, a JWT payload), and a
+    signature keyed with a guessable word can be forged against the service
+    itself. Then you **fix the code**: a verifier must never trust a token
+    whose header says `alg: none`, a session cookie must carry proof the
+    server issued it, and a session token must be unpredictable. This capstone
+    walks the module end to end.
+
+    **Read up on:**
+    - base64 / base64url and the three parts of a JWT (`header.payload.signature`)
+    - what a signature protects (integrity) versus what it does not (confidentiality)
+    - `openssl dgst -sha256 -hmac KEY` and brute-forcing a weak HMAC key with a wordlist
+    - the `alg: none` downgrade and why a verifier must ignore the header's `alg`
+    - signing a cookie with HMAC and comparing with `hmac.compare_digest`
+    - `secrets.token_hex` versus a hash of public values
+  scenario: |
+    **Ticket AUTH-511**, from Priya (appsec): *"Give the Acme auth stack a
+    once-over. Three services are up on this box — prove each weakness by
+    capturing its flag — then fix the three code smells the last review
+    flagged. All of it is local; nothing leaves the host."*
+
+    ## Part 1: Encoding is not encryption — `http://127.0.0.1:8721/`
+    A response *header* carries a base64 value that isn't actually secret.
+    Decode it and write the `KL{...}` flag to **`/lab/decoded.txt`**.
+
+    ## Part 2: Read the claim without the key — `http://127.0.0.1:8722/login`
+    `GET /login` returns a JWT. Its payload (the middle part) is base64url
+    JSON you can read with no key. Decode it and write the `KL{...}` flag from
+    its claim to **`/lab/claim.txt`**.
+
+    ## Part 3: Forge it with the wordlist — `http://127.0.0.1:8723/admin`
+    The endpoint expects `?user=<name>&sig=<hex>`, where `sig` is an
+    HMAC-SHA256 of `<name>` keyed with a server-side secret. The secret is one
+    of the fifteen words in **`/usr/share/kl/wordlists/top.txt`**, and the
+    service tells you (via the HTTP status) whether a guess was accepted. Work
+    out the secret, forge a valid signature for `user=admin`, and write the
+    flag you get back to **`/lab/forged.txt`**.
+
+    ## Part 4: Reject the unsigned token (remediation)
+    The toy JWT verifier at **`/lab/verify.py`** has a shortcut: if a token's
+    header claims `"alg": "none"`, it skips the signature check. Fix
+    `verify()` so it never trusts a token without a valid signature, no matter
+    what `alg` says — while a token from `issue()` still verifies.
+
+    ## Part 5: Sign the session cookie (remediation)
+    The portal at **`/lab/portal.py`** hands out a `session` cookie that is
+    just the username. Fix it so `/dashboard` only trusts a session the server
+    itself issued (sign the cookie and verify it), while a session obtained
+    normally from `/login` keeps working.
+
+    ## Part 6: Make the token unpredictable (remediation)
+    The generator at **`/lab/tokens.py`** builds a session token from the
+    username and the current time, hashed with MD5 — reproducible by anyone
+    who knows when a user logged in. Fix `generate_token()` so its output is a
+    fresh, unpredictable value every call.
+  hints:
+    - "Part 1: `curl -s -D - -o /dev/null http://127.0.0.1:8721/` shows an odd header; pipe its value to `base64 -d`."
+    - "Part 2: split the token on `.`; the second field is the payload. Restore padding and `base64 -d` (or python's `base64.urlsafe_b64decode`)."
+    - "Part 3: for each word, `sig=$(printf admin | openssl dgst -sha256 -hmac \"$word\" | awk '{print $2}')` then `curl \"http://127.0.0.1:8723/admin?user=admin&sig=$sig\"` and watch the status code."
+    - "Part 4: delete the `alg == \"none\"` branch and always compute the expected HMAC over `header.payload`, comparing with `hmac.compare_digest`."
+    - "Part 5: append an HMAC-SHA256 of the username (keyed with `SECRET`) to the cookie, e.g. `username + \".\" + hexdigest`, and recompute it on the way in before trusting the username."
+    - "Part 6: `secrets.token_hex(16)` returns 16 bytes of OS randomness as hex, with no dependency on the username or the clock."
+  solution: |
+    ```bash
+    # Part 1 — the base64 header is not encryption
+    curl -s -D - -o /dev/null http://127.0.0.1:8721/ | tr -d '\r' \
+      | grep -i '^X-Debug-Token:' | sed 's/^[^:]*: *//' | base64 -d > /lab/decoded.txt
+
+    # Part 2 — the JWT payload is readable without the key
+    tok=$(curl -s http://127.0.0.1:8722/login | python3 -c "import sys,json; print(json.load(sys.stdin)['token'])")
+    payload=$(echo "$tok" | cut -d. -f2)
+    python3 -c "
+    import base64, json
+    p = '$payload'; p += '=' * (-len(p) % 4)
+    print(json.loads(base64.urlsafe_b64decode(p))['debug_flag'])" > /lab/claim.txt
+
+    # Part 3 — the secret is a wordlist word; the service is the oracle
+    for w in $(cat /usr/share/kl/wordlists/top.txt); do
+      sig=$(printf admin | openssl dgst -sha256 -hmac "$w" | awk '{print $2}')
+      code=$(curl -s -o /tmp/tok11_out -w '%{http_code}' "http://127.0.0.1:8723/admin?user=admin&sig=$sig")
+      [ "$code" = "200" ] && { cp /tmp/tok11_out /lab/forged.txt; break; }
+    done
+
+    # Parts 4-6 — fix verify.py (drop the alg=none branch), portal.py (sign the
+    # cookie), and tokens.py (use secrets.token_hex).
+    ```
+  setup: |
+    # --- part 1: base64 header ---
+    FLAG=$(rand_flag); export FLAG
+    echo "$FLAG" > "$KL_STATE/p1"
+    web_target tok11hdr 8721 <<'PY'
+    import os, http.server, socketserver, base64
+
+    PORT = int(os.environ.get("PORT", "8721"))
+    FLAG = os.environ.get("FLAG", "KL{missing}")
+    TOKEN = base64.b64encode(FLAG.encode()).decode()
+
+    class H(http.server.BaseHTTPRequestHandler):
+        def log_message(self, *a): pass
+        def do_GET(self):
+            body = b"<h1>Acme Status</h1><p>All systems nominal.</p>"
+            self.send_response(200)
+            self.send_header("Content-Type", "text/html")
+            self.send_header("X-Debug-Token", TOKEN)
+            self.send_header("Content-Length", str(len(body)))
+            self.end_headers()
+            self.wfile.write(body)
+
+    socketserver.TCPServer.allow_reuse_address = True
+    with socketserver.TCPServer(("0.0.0.0", PORT), H) as s:
+        s.serve_forever()
+    PY
+    # --- part 2: JWT payload read ---
+    FLAG=$(rand_flag); export FLAG
+    SECRET="acme-$(head -c8 /dev/urandom | od -An -tx1 | tr -d ' \n')"; export SECRET
+    echo "$FLAG" > "$KL_STATE/p2"
+    web_target tok11jwt 8722 <<'PY'
+    import os, http.server, socketserver, json, base64, hmac, hashlib, time
+
+    PORT = int(os.environ.get("PORT", "8722"))
+    FLAG = os.environ.get("FLAG", "KL{missing}")
+    SECRET = os.environ.get("SECRET", "acme-signing-key")
+
+    def b64url(data):
+        return base64.urlsafe_b64encode(data).rstrip(b"=")
+
+    def make_jwt(claims):
+        header = b64url(json.dumps({"alg": "HS256", "typ": "JWT"}).encode())
+        payload = b64url(json.dumps(claims).encode())
+        signing_input = header + b"." + payload
+        sig = b64url(hmac.new(SECRET.encode(), signing_input, hashlib.sha256).digest())
+        return (signing_input + b"." + sig).decode()
+
+    TOKEN = make_jwt({"sub": "guest", "debug_flag": FLAG, "iat": int(time.time())})
+
+    class H(http.server.BaseHTTPRequestHandler):
+        def log_message(self, *a): pass
+        def _send(self, code, body, ctype="text/plain"):
+            b = body.encode() if isinstance(body, str) else body
+            self.send_response(code)
+            self.send_header("Content-Type", ctype)
+            self.send_header("Content-Length", str(len(b)))
+            self.end_headers()
+            self.wfile.write(b)
+        def do_GET(self):
+            if self.path == "/login":
+                self._send(200, json.dumps({"token": TOKEN}), "application/json")
+            else:
+                self._send(200, "Acme Auth Service. GET /login for a token.")
+
+    socketserver.TCPServer.allow_reuse_address = True
+    with socketserver.TCPServer(("0.0.0.0", PORT), H) as s:
+        s.serve_forever()
+    PY
+    # --- part 3: HMAC forge oracle (secret is a top.txt word) ---
+    FLAG=$(rand_flag); export FLAG
+    echo "$FLAG" > "$KL_STATE/p3"
+    N=$(wc -l < /usr/share/kl/wordlists/top.txt)
+    SECRET=$(sed -n "$(( (RANDOM % N) + 1 ))p" /usr/share/kl/wordlists/top.txt); export SECRET
+    web_target tok11sig 8723 <<'PY'
+    import os, http.server, socketserver, hmac, hashlib, urllib.parse
+
+    PORT = int(os.environ.get("PORT", "8723"))
+    FLAG = os.environ.get("FLAG", "KL{missing}")
+    SECRET = os.environ.get("SECRET", "changeme").encode()
+
+    class H(http.server.BaseHTTPRequestHandler):
+        def log_message(self, *a): pass
+        def _send(self, code, body):
+            b = body.encode() if isinstance(body, str) else body
+            self.send_response(code)
+            self.send_header("Content-Length", str(len(b)))
+            self.end_headers()
+            self.wfile.write(b)
+        def do_GET(self):
+            u = urllib.parse.urlparse(self.path)
+            if u.path != "/admin":
+                self._send(200, "GET /admin?user=X&sig=HEX\n")
+                return
+            q = urllib.parse.parse_qs(u.query)
+            user = q.get("user", [""])[0]
+            sig = q.get("sig", [""])[0]
+            expected = hmac.new(SECRET, user.encode(), hashlib.sha256).hexdigest()
+            if user == "admin" and hmac.compare_digest(sig, expected):
+                self._send(200, FLAG + "\n")
+            else:
+                self._send(403, "denied\n")
+
+    socketserver.TCPServer.allow_reuse_address = True
+    with socketserver.TCPServer(("0.0.0.0", PORT), H) as s:
+        s.serve_forever()
+    PY
+    unset SECRET
+    # --- part 4: reject the unsigned token (fix /lab/verify.py) ---
+    echo ok > "$KL_STATE/answer"
+    lab_file /lab/verify.py <<'PY'
+    import json, base64, hmac, hashlib
+
+    SECRET = "please-rotate-this-signing-key"
+
+    def _b64url_decode(s):
+        pad = "=" * (-len(s) % 4)
+        return base64.urlsafe_b64decode(s + pad)
+
+    def _b64url(data):
+        return base64.urlsafe_b64encode(data).rstrip(b"=").decode()
+
+    def issue(claims):
+        header = _b64url(json.dumps({"alg": "HS256", "typ": "JWT"}).encode())
+        payload = _b64url(json.dumps(claims).encode())
+        signing_input = (header + "." + payload).encode()
+        sig = _b64url(hmac.new(SECRET.encode(), signing_input, hashlib.sha256).digest())
+        return header + "." + payload + "." + sig
+
+    def verify(token):
+        """Return the claims dict if token is valid, else raise ValueError."""
+        try:
+            header_b64, payload_b64, sig_b64 = token.split(".")
+            header = json.loads(_b64url_decode(header_b64))
+            payload = json.loads(_b64url_decode(payload_b64))
+        except Exception:
+            raise ValueError("malformed token")
+        # VULNERABLE: a token claiming alg "none" is accepted without checking
+        # any signature at all.
+        if header.get("alg") == "none":
+            return payload
+        signing_input = (header_b64 + "." + payload_b64).encode()
+        expected = _b64url(hmac.new(SECRET.encode(), signing_input, hashlib.sha256).digest())
+        if not hmac.compare_digest(sig_b64, expected):
+            raise ValueError("bad signature")
+        return payload
+    PY
+    # --- part 5: sign the session cookie (fix /lab/portal.py) ---
+    PSECRET=$(head -c16 /dev/urandom | od -An -tx1 | tr -d ' \n')
+    echo "$PSECRET" > "$KL_STATE/portal_secret"
+    lab_file /lab/portal.py <<'PY'
+    import os, http.server, socketserver, base64
+    from http.cookies import SimpleCookie
+
+    PORT = int(os.environ.get("PORT", "8080"))
+    SECRET = os.environ.get("SECRET", "portal-secret")
+
+    def make_cookie(username):
+        # VULNERABLE: the cookie is just the username, base64-encoded — anyone
+        # can build one of these for any username they like.
+        return base64.b64encode(username.encode()).decode()
+
+    def user_from_cookie(value):
+        try:
+            return base64.b64decode(value).decode()
+        except Exception:
+            return None
+
+    class H(http.server.BaseHTTPRequestHandler):
+        def log_message(self, *a): pass
+        def _send(self, code, body, extra_headers=None):
+            b = body.encode() if isinstance(body, str) else body
+            self.send_response(code)
+            for k, v in (extra_headers or {}).items():
+                self.send_header(k, v)
+            self.send_header("Content-Length", str(len(b)))
+            self.end_headers()
+            self.wfile.write(b)
+        def do_GET(self):
+            if self.path == "/login":
+                self._send(200, "logged in as guest\n",
+                            {"Set-Cookie": "session=" + make_cookie("guest")})
+                return
+            if self.path == "/dashboard":
+                c = SimpleCookie()
+                c.load(self.headers.get("Cookie", ""))
+                user = user_from_cookie(c["session"].value) if "session" in c else None
+                if user == "admin":
+                    self._send(200, "ADMIN DASHBOARD\n")
+                elif user:
+                    self._send(200, "hello %s, nothing to see here\n" % user)
+                else:
+                    self._send(403, "no session\n")
+                return
+            self._send(200, "Acme Portal. Visit /login then /dashboard.\n")
+
+    socketserver.TCPServer.allow_reuse_address = True
+    with socketserver.TCPServer(("0.0.0.0", PORT), H) as s:
+        s.serve_forever()
+    PY
+    # --- part 6: make the token unpredictable (fix /lab/tokens.py) ---
+    lab_file /lab/tokens.py <<'PY'
+    import hashlib, time
+
+    def generate_token(username):
+        """Return a fresh session token for username.
+        VULNERABLE: this is only a hash of public information (the username
+        and the current time) — no secret, no randomness.
+        """
+        basis = str(int(time.time())) + "-" + username
+        return hashlib.md5(basis.encode()).hexdigest()
+    PY
+  check: |
+    info "Part 1: Encoding is not encryption"
+    got=$(grep -oE 'KL\{[0-9a-f]+\}' /lab/decoded.txt 2>/dev/null | head -1)
+    check_eq "flag decoded from the base64 header" "$got" "$(cat "$KL_STATE/p1")"
+    info "Part 2: Read the claim without the key"
+    got=$(grep -oE 'KL\{[0-9a-f]+\}' /lab/claim.txt 2>/dev/null | head -1)
+    check_eq "flag read from the JWT payload claim" "$got" "$(cat "$KL_STATE/p2")"
+    info "Part 3: Forge it with the wordlist"
+    got=$(grep -oE 'KL\{[0-9a-f]+\}' /lab/forged.txt 2>/dev/null | head -1)
+    check_eq "flag captured by forging the admin signature" "$got" "$(cat "$KL_STATE/p3")"
+    info "Part 4: Reject the unsigned token"
+    install -d -m755 /tmp/kl_tok011v
+    cp /lab/verify.py /tmp/kl_tok011v/verify.py 2>/dev/null
+    on_reset 'rm -rf /tmp/kl_tok011v'
+    if [ ! -s /tmp/kl_tok011v/verify.py ]; then
+      fail "verify.py present"; kl_finish
+    fi
+    result=$(python3 - <<'PYEOF' 2>/dev/null
+    import sys, json, base64
+    sys.path.insert(0, "/tmp/kl_tok011v")
+    import verify as v
+
+    tok = v.issue({"user": "guest"})
+    try:
+        legit_ok = v.verify(tok).get("user") == "guest"
+    except Exception:
+        legit_ok = False
+
+    def b64url(data):
+        return base64.urlsafe_b64encode(data).rstrip(b"=").decode()
+
+    header = b64url(json.dumps({"alg": "none", "typ": "JWT"}).encode())
+    payload = b64url(json.dumps({"user": "admin"}).encode())
+    forged = header + "." + payload + "."
+    try:
+        v.verify(forged)
+        forged_rejected = False
+    except Exception:
+        forged_rejected = True
+
+    print("legit" if legit_ok else "no-legit")
+    print("rejected" if forged_rejected else "accepted")
+    PYEOF
+    )
+    legit_line=$(printf '%s\n' "$result" | sed -n '1p')
+    forged_line=$(printf '%s\n' "$result" | sed -n '2p')
+    check "a token produced by issue() still verifies" '[ "$legit_line" = "legit" ]'
+    check "a forged alg=none token is rejected" '[ "$forged_line" = "rejected" ]'
+    info "Part 5: Sign the session cookie"
+    SECRET=$(cat "$KL_STATE/portal_secret" 2>/dev/null)
+    PORT=8824
+    rm -f /tmp/kl_tok011p.py /tmp/kl_tok011p.jar /tmp/kl_tok011p.log
+    cp /lab/portal.py /tmp/kl_tok011p.py 2>/dev/null
+    on_reset "pkill -f /tmp/kl_tok011p.py 2>/dev/null; rm -f /tmp/kl_tok011p.py /tmp/kl_tok011p.jar /tmp/kl_tok011p.log"
+    if [ ! -s /tmp/kl_tok011p.py ]; then
+      fail "portal.py present"; kl_finish
+    fi
+    pkill -f /tmp/kl_tok011p.py 2>/dev/null || true
+    (PORT=$PORT SECRET="$SECRET" python3 /tmp/kl_tok011p.py >/tmp/kl_tok011p.log 2>&1 &)
+    PPID_=$(pgrep -f /tmp/kl_tok011p.py | head -1)
+    on_reset "kill $PPID_ 2>/dev/null"
+    up=0
+    eventually 10 "timeout 2 bash -c '</dev/tcp/127.0.0.1/$PORT'" && up=1
+    if [ "$up" != 1 ]; then
+      fail "portal.py starts and listens on $PORT"
+      pkill -f /tmp/kl_tok011p.py 2>/dev/null || true
+      kl_finish
+    fi
+    curl -s -c /tmp/kl_tok011p.jar "http://127.0.0.1:$PORT/login" >/dev/null
+    legit=$(curl -s -b /tmp/kl_tok011p.jar "http://127.0.0.1:$PORT/dashboard")
+    forged=$(curl -s -H "Cookie: session=$(printf admin | base64)" "http://127.0.0.1:$PORT/dashboard")
+    pkill -f /tmp/kl_tok011p.py 2>/dev/null || true
+    check "a session issued by /login still reaches the dashboard" '[ -n "$(printf %s "$legit" | grep -i guest)" ]'
+    check_not "a hand-built, unsigned admin cookie is accepted" '[ -n "$(printf %s "$forged" | grep -i ADMIN)" ]'
+    info "Part 6: Make the token unpredictable"
+    install -d -m755 /tmp/kl_tok011t
+    cp /lab/tokens.py /tmp/kl_tok011t/tokens.py 2>/dev/null
+    on_reset 'rm -rf /tmp/kl_tok011t'
+    if [ ! -s /tmp/kl_tok011t/tokens.py ]; then
+      fail "tokens.py present"; kl_finish
+    fi
+    result=$(python3 - <<'PYEOF' 2>/dev/null
+    import sys, time, hashlib
+    sys.path.insert(0, "/tmp/kl_tok011t")
+    import tokens
+
+    t1 = tokens.generate_token("alice")
+    t2 = tokens.generate_token("alice")
+    distinct = (t1 != t2)
+
+    now = int(time.time())
+    predictable = any(
+        hashlib.md5((str(now - d) + "-alice").encode()).hexdigest() in (t1, t2)
+        for d in range(0, 3)
+    )
+
+    print("distinct" if distinct else "same")
+    print("unpredictable" if not predictable else "predictable")
+    PYEOF
+    )
+    distinct_line=$(printf '%s\n' "$result" | sed -n '1p')
+    pred_line=$(printf '%s\n' "$result" | sed -n '2p')
+    check "two tokens for the same user, moments apart, differ" '[ "$distinct_line" = "distinct" ]'
+    check "the token can't be reproduced from the username and current time alone" '[ "$pred_line" = "unpredictable" ]'
+  solve: |
+    # --- part 1 ---
+    curl -s -D - -o /dev/null http://127.0.0.1:8721/ | tr -d '\r' \
+      | grep -i '^X-Debug-Token:' | sed 's/^[^:]*: *//' | base64 -d > /lab/decoded.txt
+    # --- part 2 ---
+    tok=$(curl -s http://127.0.0.1:8722/login | python3 -c "import sys,json; print(json.load(sys.stdin)['token'])")
+    payload=$(echo "$tok" | cut -d. -f2)
+    python3 -c "
+    import base64, json
+    p = '$payload'
+    p += '=' * (-len(p) % 4)
+    print(json.loads(base64.urlsafe_b64decode(p))['debug_flag'])
+    " > /lab/claim.txt
+    # --- part 3 ---
+    for w in $(cat /usr/share/kl/wordlists/top.txt); do
+      sig=$(printf admin | openssl dgst -sha256 -hmac "$w" | awk '{print $2}')
+      code=$(curl -s -o /tmp/tok11_out -w '%{http_code}' "http://127.0.0.1:8723/admin?user=admin&sig=$sig")
+      if [ "$code" = "200" ]; then cp /tmp/tok11_out /lab/forged.txt; break; fi
+    done
+    # --- part 4 ---
+    cat > /lab/verify.py <<'PY'
+    import json, base64, hmac, hashlib
+
+    SECRET = "please-rotate-this-signing-key"
+
+    def _b64url_decode(s):
+        pad = "=" * (-len(s) % 4)
+        return base64.urlsafe_b64decode(s + pad)
+
+    def _b64url(data):
+        return base64.urlsafe_b64encode(data).rstrip(b"=").decode()
+
+    def issue(claims):
+        header = _b64url(json.dumps({"alg": "HS256", "typ": "JWT"}).encode())
+        payload = _b64url(json.dumps(claims).encode())
+        signing_input = (header + "." + payload).encode()
+        sig = _b64url(hmac.new(SECRET.encode(), signing_input, hashlib.sha256).digest())
+        return header + "." + payload + "." + sig
+
+    def verify(token):
+        header_b64, payload_b64, sig_b64 = token.split(".")
+        header = json.loads(_b64url_decode(header_b64))
+        payload = json.loads(_b64url_decode(payload_b64))
+        signing_input = (header_b64 + "." + payload_b64).encode()
+        expected = _b64url(hmac.new(SECRET.encode(), signing_input, hashlib.sha256).digest())
+        if not hmac.compare_digest(sig_b64, expected):
+            raise ValueError("bad signature")
+        return payload
+    PY
+    # --- part 5 ---
+    cat > /lab/portal.py <<'PY'
+    import os, http.server, socketserver, base64, hmac, hashlib
+    from http.cookies import SimpleCookie
+
+    PORT = int(os.environ.get("PORT", "8080"))
+    SECRET = os.environ.get("SECRET", "portal-secret")
+
+    def make_cookie(username):
+        sig = hmac.new(SECRET.encode(), username.encode(), hashlib.sha256).hexdigest()
+        return base64.b64encode((username + "." + sig).encode()).decode()
+
+    def user_from_cookie(value):
+        try:
+            raw = base64.b64decode(value).decode()
+            username, sig = raw.rsplit(".", 1)
+        except Exception:
+            return None
+        expected = hmac.new(SECRET.encode(), username.encode(), hashlib.sha256).hexdigest()
+        if not hmac.compare_digest(sig, expected):
+            return None
+        return username
+
+    class H(http.server.BaseHTTPRequestHandler):
+        def log_message(self, *a): pass
+        def _send(self, code, body, extra_headers=None):
+            b = body.encode() if isinstance(body, str) else body
+            self.send_response(code)
+            for k, v in (extra_headers or {}).items():
+                self.send_header(k, v)
+            self.send_header("Content-Length", str(len(b)))
+            self.end_headers()
+            self.wfile.write(b)
+        def do_GET(self):
+            if self.path == "/login":
+                self._send(200, "logged in as guest\n",
+                            {"Set-Cookie": "session=" + make_cookie("guest")})
+                return
+            if self.path == "/dashboard":
+                c = SimpleCookie()
+                c.load(self.headers.get("Cookie", ""))
+                user = user_from_cookie(c["session"].value) if "session" in c else None
+                if user == "admin":
+                    self._send(200, "ADMIN DASHBOARD\n")
+                elif user:
+                    self._send(200, "hello %s, nothing to see here\n" % user)
+                else:
+                    self._send(403, "no session\n")
+                return
+            self._send(200, "Acme Portal. Visit /login then /dashboard.\n")
+
+    socketserver.TCPServer.allow_reuse_address = True
+    with socketserver.TCPServer(("0.0.0.0", PORT), H) as s:
+        s.serve_forever()
+    PY
+    # --- part 6 ---
+    cat > /lab/tokens.py <<'PY'
+    import secrets
+
+    def generate_token(username):
+        return secrets.token_hex(16)
+    PY

@@ -542,3 +542,265 @@ exercises:
       neighbor 2001:db8:23::2 activate
       neighbor 2001:db8:23::2 prefix-list NO-LAB out
     EOF
+
+# ===== Capstone: a real-world lab =====
+
+- id: net-099
+  title: "Capstone: connect site A to the IPv6 datacenter"
+  difficulty: 5
+  kind: fix
+  tags: [capstone, ipv6, ospfv3, bgp, mp-bgp, redistribution, prefix-list, frr, dual-stack, troubleshooting]
+  tutorial: |
+    **Concept.** Most networks have two routing layers: an **IGP** (here OSPFv3) that
+    knows every prefix inside a site, and **BGP** at the border, which tells other
+    networks what the site owns. Connecting a site to the outside means joining the two,
+    in both directions, and deciding exactly what crosses the border.
+
+    - **IGP first.** BGP can only announce what the border router knows, so the site's
+      own OSPFv3 must be healthy: neighbours need the same area on both ends of a link,
+      and an interface marked **passive** sends no hellos, so it never gets a neighbour.
+      Passive belongs on LANs, never on a link to another router.
+    - **Into BGP.** A border router can list prefixes one by one (`network`) or
+      **redistribute** what OSPFv3 learned. Redistribution only takes routes the routing
+      table has *from OSPFv3*: the router's own connected LANs are "connected" routes,
+      not OSPFv3 ones, and are left out unless you add them.
+    - **Out of BGP.** The rest of the site needs routes to what BGP learned. The border
+      router can redistribute BGP into OSPFv3 (or originate a default route), so every
+      internal router learns them as external routes.
+    - **The border filter.** Redistribution announces *everything* that matches, so an
+      outbound IPv6 prefix-list on the border session decides what really leaves. Deny the
+      internal prefixes, permit the site's own range.
+    - **Per family.** As always with MP-BGP, an IPv6 neighbour must be **activated** in
+      `address-family ipv6 unicast` before it exchanges IPv6 routes, and filters are per
+      family too.
+
+    **Read up on:**
+    - `show ipv6 ospf6 neighbor`, `show ipv6 ospf6 interface IF`, `show running-config`
+    - FRR OSPFv3 — `ipv6 ospf6 area`, `ipv6 ospf6 passive`, `ipv6 ospf6 network point-to-point`, `redistribute bgp` (and `default-information originate`)
+    - FRR BGP — `address-family ipv6 unicast`, `neighbor ... activate`, `network`, `redistribute ospf6`, `redistribute connected`
+    - `ipv6 prefix-list NAME seq N permit|deny PREFIX [le LEN]`, `neighbor ... prefix-list NAME out`
+    - `show bgp summary`, `show bgp ipv6 unicast`, `show bgp ipv6 unicast neighbors ADDR advertised-routes`
+    - `show ipv6 route` — the protocol code of each route (`O`, `B`, `C`)
+  scenario: |
+    **Ticket NET-2290** (from Sam, network team): *"DC-B launches its IPv6-only services
+    on Tuesday, and site A has to reach them. Someone started the work last week and
+    left it half-done; since then even OSPFv3 inside site A is broken. Please finish it.
+    And remember: the management network must never be announced outside the site."*
+
+    ```
+                                  site A (AS 65010)                         |  DC-B (AS 65020)
+    h1 2001:db8:a1:1::10        h2 2001:db8:a1:2::10                       |  h3 2001:db8:b2:1::10
+       |                           |                                       |     |
+     eth0 r1 eth1 --- 2001:db8:a1:12::/64 --- eth1 r2 eth2 --- 2001:db8:ab::/64 --- eth1 r3 eth0
+          mgmt0 2001:db8:a1:ff::1/64    ::1   ::2    eth0  ::1  (+ 172.16.99.0/30)  ::2
+    ```
+
+    - `r1` and `r2` are site A's routers and run **OSPFv3** in **area 0** (router IDs
+      10.0.0.1 and 10.0.0.2). `r1` has the LAN `2001:db8:a1:1::/64` and the management
+      network **`2001:db8:a1:ff::/64`** on `mgmt0`; `r2` has the LAN `2001:db8:a1:2::/64`.
+    - `r2` is the border router (**AS 65010**). It already has a working **IPv4** BGP
+      session with `r3` (172.16.99.1 to 172.16.99.2), and a session to `r3` over IPv6
+      (`2001:db8:ab::1` to `2001:db8:ab::2`) that was started last week.
+    - **`r3`** belongs to the DC-B team (**AS 65020**). It is already configured for its
+      side, announces `2001:db8:b2:1::/64` and is **not yours to change**.
+
+    Open a router with `docker exec -it r1 vtysh`. Don't restart the containers (they would
+    lose their links). A new or reset BGP session can take a few seconds to come up.
+
+    Requirements:
+
+    1. **OSPFv3 in site A works.** `r1` and `r2` are fully adjacent over a
+       **point-to-point** core link, and each learns the other's LAN from OSPFv3.
+    2. **IPv6 routes from DC-B.** The IPv6 session to `r3` carries IPv6 routes: `r2` learns
+       `2001:db8:b2:1::/64` from BGP.
+    3. **Site A is announced.** `r3` learns both site-A LANs, `2001:db8:a1:1::/64` and
+       `2001:db8:a1:2::/64`, from `r2`. Take site A's routes from OSPFv3 by
+       **redistributing** it into BGP, so future site-A LANs are announced automatically.
+    4. **The management network stays inside.** `r2` still holds `2001:db8:a1:ff::/64` in
+       its BGP table (the NOC's looking glass reads it there), but `r3` never receives it.
+       Enforce this on `r2` with an **IPv6 prefix-list** outbound towards `r3`.
+    5. **Site A reaches DC-B.** `r1` learns how to reach DC-B from **OSPFv3**, not from a
+       static route.
+    6. **End to end.** `h1` and `h2` reach `h3` over IPv6, and `h3` reaches `h1`.
+
+    Throughout: the IPv4 session between `r2` and `r3` stays up, and there are no static
+    routes on any router.
+  hints:
+    - "Requirement 1: `show ipv6 ospf6 neighbor` on `r1` and `r2` is empty. Compare both ends with `show ipv6 ospf6 interface eth1` and `show running-config`: the area, and whether the interface sends hellos at all. There are two faults, one on each router."
+    - "Requirement 1: to move an interface to another area, remove the old one first: `no ipv6 ospf6 area ...`, then `ipv6 ospf6 area 0`. `no ipv6 ospf6 passive` makes an interface speak again."
+    - "Requirement 2: `show bgp summary` on `r2`: the IPv6 session is up, but in which table? Under `router bgp 65010`, `address-family ipv6 unicast`, the neighbour needs `activate`."
+    - "Requirement 3: `redistribute ospf6` under the IPv6 family brings in `r1`'s LAN, but not `r2`'s own: that one is a connected route on `r2`. Add it with a `network` statement (or `redistribute connected`, and let the filter decide)."
+    - "Requirement 4: `ipv6 prefix-list SITE-A seq 5 deny 2001:db8:a1:ff::/64`, then a permit for site A's range (`2001:db8:a1::/48 le 64`), applied with `neighbor 2001:db8:ab::2 prefix-list SITE-A out` in the IPv6 family. Check with `show bgp ipv6 unicast neighbors 2001:db8:ab::2 advertised-routes`."
+    - "Requirement 5: under `router ospf6` on `r2`, `redistribute bgp`. `show ipv6 route` on `r1` then shows DC-B's prefix as an OSPFv3 route."
+  solution: |
+    **1. OSPFv3.** `r1` put the core link in area 1, and `r2` made the core link passive,
+    so neither end ever sent the other a usable hello. On `r1`:
+
+    ```
+    interface eth1
+     no ipv6 ospf6 area 1
+     ipv6 ospf6 area 0
+    ```
+
+    On `r2`:
+
+    ```
+    interface eth1
+     no ipv6 ospf6 passive
+    ```
+
+    **2 to 5. The border, on `r2`.** Activate the IPv6 neighbour in the IPv6 family,
+    redistribute OSPFv3 into BGP plus a `network` for `r2`'s own LAN, filter outbound with
+    an IPv6 prefix-list, and redistribute BGP into OSPFv3 so `r1` learns DC-B's prefix:
+
+    ```
+    ipv6 prefix-list SITE-A-OUT seq 5 deny 2001:db8:a1:ff::/64
+    ipv6 prefix-list SITE-A-OUT seq 10 permit 2001:db8:a1::/48 le 64
+    router ospf6
+     redistribute bgp
+    router bgp 65010
+     address-family ipv6 unicast
+      neighbor 2001:db8:ab::2 activate
+      neighbor 2001:db8:ab::2 prefix-list SITE-A-OUT out
+      redistribute ospf6
+      network 2001:db8:a1:2::/64
+    ```
+
+    Check it from both sides:
+
+    ```bash
+    docker exec r2 vtysh -c 'show bgp ipv6 unicast'
+    docker exec r2 vtysh -c 'show bgp ipv6 unicast neighbors 2001:db8:ab::2 advertised-routes'
+    docker exec r1 vtysh -c 'show ipv6 route 2001:db8:b2:1::/64'
+    docker exec h1 ping -6 -c1 2001:db8:b2:1::10
+    ```
+  setup: |
+    frr_up r1 r2 r3 h1 h2 h3
+    frr_link r1 eth1 2001:db8:a1:12::1/64 r2 eth1 2001:db8:a1:12::2/64
+    frr_link r2 eth2 2001:db8:ab::1/64 r3 eth1 2001:db8:ab::2/64
+    frr_link r1 eth0 2001:db8:a1:1::1/64 h1 eth0 2001:db8:a1:1::10/64
+    frr_link r2 eth0 2001:db8:a1:2::1/64 h2 eth0 2001:db8:a1:2::10/64
+    frr_link r3 eth0 2001:db8:b2:1::1/64 h3 eth0 2001:db8:b2:1::10/64
+    docker exec r2 ip addr add 172.16.99.1/30 dev eth2
+    docker exec r3 ip addr add 172.16.99.2/30 dev eth1
+    docker exec r1 sh -c 'ip link add mgmt0 type dummy; ip link set mgmt0 up; ip addr add 2001:db8:a1:ff::1/64 dev mgmt0'
+    frr_gw6 h1 2001:db8:a1:1::1; frr_gw6 h2 2001:db8:a1:2::1; frr_gw6 h3 2001:db8:b2:1::1
+    frr_conf r1 <<'EOF'
+    interface eth0
+     ipv6 ospf6 area 0
+     ipv6 ospf6 passive
+    interface eth1
+     ipv6 ospf6 area 1
+     ipv6 ospf6 network point-to-point
+    interface mgmt0
+     ipv6 ospf6 area 0
+     ipv6 ospf6 passive
+    router ospf6
+     ospf6 router-id 10.0.0.1
+    EOF
+    frr_conf r2 <<'EOF'
+    interface eth0
+     ipv6 ospf6 area 0
+     ipv6 ospf6 passive
+    interface eth1
+     ipv6 ospf6 area 0
+     ipv6 ospf6 network point-to-point
+     ipv6 ospf6 passive
+    router ospf6
+     ospf6 router-id 10.0.0.2
+    router bgp 65010
+     bgp router-id 10.0.0.2
+     no bgp ebgp-requires-policy
+     neighbor 172.16.99.2 remote-as 65020
+     neighbor 172.16.99.2 timers connect 5
+     neighbor 2001:db8:ab::2 remote-as 65020
+     neighbor 2001:db8:ab::2 timers connect 5
+    EOF
+    frr_conf r3 <<'EOF'
+    router bgp 65020
+     bgp router-id 10.0.0.3
+     no bgp ebgp-requires-policy
+     neighbor 172.16.99.1 remote-as 65010
+     neighbor 172.16.99.1 timers connect 5
+     neighbor 2001:db8:ab::1 remote-as 65010
+     neighbor 2001:db8:ab::1 timers connect 5
+     address-family ipv6 unicast
+      neighbor 2001:db8:ab::1 activate
+      network 2001:db8:b2:1::/64
+    EOF
+    eventually 60 '[ "$(frr_json r2 "show bgp summary json" | jq -r ".ipv4Unicast.peers[\"172.16.99.2\"].state // empty")" = Established ]'
+    docker exec r3 vtysh -c 'show running-config' | sha256sum >"$KL_STATE/r3.sum"
+  check: |
+    state() { frr_json "$1" 'show ipv6 ospf6 neighbor json' | jq -r --arg n "$2" '.neighbors[]? | select(.neighborId==$n) | .state'; }
+    ifc() { frr_json "$1" "show ipv6 ospf6 interface $2 json" | jq -r --arg i "$2" ".[\$i]$3 // empty"; }
+    ifblock() { frr_json "$1" 'show running-config' | awk -v i="interface $2" '$0 == i {f = 1; next} f && /^(exit|!)/ {f = 0} f'; }
+    peer6() { frr_json r2 'show bgp summary json' | jq -r --arg p "$1" '.ipv6Unicast.peers[$p].state // empty'; }
+    peer4() { frr_json r2 'show bgp summary json' | jq -r --arg p "$1" '.ipv4Unicast.peers[$p].state // empty'; }
+    proto_to() { frr_json "$1" "show ipv6 route $2 json" | jq -r '[.[]?[]? | select(.selected == true) | .protocol][0] // empty'; }
+    r2cfg=$(frr_json r2 'show running-config')
+
+    info "1. OSPFv3 in site A works"
+    if ifblock r1 eth1 | grep -qE 'ospf6 area (0|0\.0\.0\.0)$' && ! ifblock r2 eth1 | grep -q passive; then
+      eventually 50 '[ "$(state r1 10.0.0.2)" = Full ] && frr_route6 r1 2001:db8:a1:2::/64 | grep -q "^ospf6"' || true
+    fi
+    check_eq "r1 is fully adjacent to r2" "$(state r1 10.0.0.2)" Full
+    check_eq "r1 eth1 is point-to-point" "$(ifc r1 eth1 .operatingAsType)" POINTOPOINT
+    check_eq "r2 eth1 is point-to-point" "$(ifc r2 eth1 .operatingAsType)" POINTOPOINT
+    check_match "r2 learned r1's LAN from OSPFv3" "$(frr_route6 r2 2001:db8:a1:1::/64)" '^ospf6'
+    check_match "r1 learned r2's LAN from OSPFv3" "$(frr_route6 r1 2001:db8:a1:2::/64)" '^ospf6'
+
+    info "2. IPv6 routes from DC-B"
+    if [ -n "$(peer6 2001:db8:ab::2)" ]; then
+      eventually 45 '[ "$(peer6 2001:db8:ab::2)" = Established ] && frr_route6 r2 2001:db8:b2:1::/64 | grep -q "^bgp"' || true
+    fi
+    check_eq "r2's IPv6 session to r3 exchanges IPv6 routes" "$(peer6 2001:db8:ab::2)" Established
+    check_match "r2 learned DC-B's prefix from BGP" "$(frr_route6 r2 2001:db8:b2:1::/64)" '^bgp'
+    check_eq "the IPv4 session to r3 is still up" "$(peer4 172.16.99.2)" Established
+
+    info "3. Site A is announced"
+    if [ "$(peer6 2001:db8:ab::2)" = Established ]; then
+      eventually 25 'frr_route6 r3 2001:db8:a1:1::/64 | grep -q "^bgp" && frr_route6 r3 2001:db8:a1:2::/64 | grep -q "^bgp"' || true
+    fi
+    check_match "r3 learned r1's LAN from r2" "$(frr_route6 r3 2001:db8:a1:1::/64)" '^bgp'
+    check_match "r3 learned r2's LAN from r2" "$(frr_route6 r3 2001:db8:a1:2::/64)" '^bgp'
+    check "r2 redistributes OSPFv3 into BGP" "grep -qE '^ +redistribute ospf6' <<<\"\$r2cfg\""
+
+    info "4. The management network stays inside"
+    check "r2 holds 2001:db8:a1:ff::/64 in its BGP table" "frr_json r2 'show bgp ipv6 unicast 2001:db8:a1:ff::/64 json' | jq -e '(.paths // []) | length > 0'"
+    check_eq "r3 never receives the management network" "$(frr_route6 r3 2001:db8:a1:ff::/64)" ""
+    check "r2 filters towards r3 with an outbound IPv6 prefix-list" "grep -q '^ipv6 prefix-list' <<<\"\$r2cfg\" && grep -qE '^ +neighbor 2001:db8:ab::2 prefix-list [^ ]+ out' <<<\"\$r2cfg\""
+
+    info "5. Site A reaches DC-B"
+    if grep -qE '^ +(redistribute bgp|default-information originate)' <<<"$r2cfg" && [ "$(state r1 10.0.0.2)" = Full ]; then
+      eventually 30 '[ "$(proto_to r1 2001:db8:b2:1::10)" = ospf6 ]' || true
+    fi
+    check_eq "r1 reaches DC-B through an OSPFv3 route" "$(proto_to r1 2001:db8:b2:1::10)" ospf6
+    check_not "no static routes on any router" "for r in r1 r2 r3; do docker exec \$r vtysh -c 'show running-config' | grep -qE '^ipv6 route|^ip route' && exit 0; done; exit 1"
+
+    info "6. End to end"
+    check "h1 reaches h3 over IPv6" 'eventually 6 "frr_ping6 h1 2001:db8:b2:1::10"'
+    check "h2 reaches h3 over IPv6" 'frr_ping6 h2 2001:db8:b2:1::10'
+    check "h3 reaches h1 over IPv6" 'frr_ping6 h3 2001:db8:a1:1::10'
+
+    info "DC-B's router"
+    check_eq "r3's configuration is unchanged" "$(docker exec r3 vtysh -c 'show running-config' | sha256sum)" "$(cat "$KL_STATE/r3.sum")"
+  solve: |
+    frr_conf r1 <<'EOF'
+    interface eth1
+     no ipv6 ospf6 area 1
+     ipv6 ospf6 area 0
+    EOF
+    frr_conf r2 <<'EOF'
+    interface eth1
+     no ipv6 ospf6 passive
+    ipv6 prefix-list SITE-A-OUT seq 5 deny 2001:db8:a1:ff::/64
+    ipv6 prefix-list SITE-A-OUT seq 10 permit 2001:db8:a1::/48 le 64
+    router ospf6
+     redistribute bgp
+    router bgp 65010
+     address-family ipv6 unicast
+      neighbor 2001:db8:ab::2 activate
+      neighbor 2001:db8:ab::2 prefix-list SITE-A-OUT out
+      redistribute ospf6
+      network 2001:db8:a1:2::/64
+    EOF

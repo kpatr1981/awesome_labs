@@ -575,3 +575,319 @@ exercises:
       wg set wg0 private-key /lab/h2.key listen-port 51820 peer $(cat h1.pub) allowed-ips 172.16.0.1/32 endpoint 10.0.0.1:51820
       ip addr add 172.16.0.2/24 dev wg0
       ip link set wg0 up"
+
+# ===== Capstone: a real-world lab =====
+
+- id: net-095
+  title: "Capstone: join the new site to the datacenter"
+  difficulty: 5
+  kind: build
+  tags: [capstone, vlan, bridge, layer2, vpn, wireguard, routing, dns, dnsmasq, tls, pki, openssl, netns]
+  tutorial: |
+    **Concept.** Connecting a new site touches every layer, and each one depends on the one below it:
+
+    - **Layer 2.** A switch keeps networks apart with VLANs. On a Linux "switch" each VLAN is one bridge, joined to the trunk by that VLAN's sub-interface (`trunk.10` in bridge 10, `trunk.20` in bridge 20) and to the access ports of that VLAN. An access port in the wrong bridge puts a host on the wrong network: its frames arrive at the router tagged for the other VLAN, and nothing answers.
+    - **The router's side of the trunk** is one VLAN sub-interface per network, each holding that network's gateway address.
+    - **The tunnel.** WireGuard carries the site's private traffic over the public link. Its **allowed IPs** do two jobs: on the way out they pick the peer for a destination, and on the way in they are the list of source addresses accepted from that peer. Each side still needs a route sending the far networks into `wg0`. Listing only the networks that should cross keeps everything else out, so a guest network that is never listed can't reach the datacenter even when its packets reach the tunnel.
+    - **Names.** A DNS server answers from the records it loaded at startup. After a server moves, a stale record keeps sending people to the old address, and a CNAME follows its target wherever it points.
+    - **Trust.** Clients check that a server's certificate chains to a CA they trust **and** that the name they asked for is one of its subject alternative names. One certificate can carry several names.
+
+    Debug from the bottom up: can a host reach its gateway, can the gateway reach the far side through the tunnel, does the name resolve, does TLS verify.
+
+    **Read up on:**
+    - `man ip-link` — `type vlan id N`, `type bridge`, `master` and `nomaster`; `ip -d link show` and `bridge link`
+    - 802.1Q trunks and access ports — which side tags the frames
+    - `man wg` — `genkey`, `pubkey`, and `set wg0 ... peer ... allowed-ips ... endpoint ...`; `wg show` for handshakes and transfer
+    - WireGuard cryptokey routing — allowed IPs as both a routing table and a source filter
+    - `ip route get ADDR` — confirm that traffic for the far side goes into `wg0`
+    - `dig @SERVER NAME` — ask one DNS server directly; `man dnsmasq`: `host-record`, `cname`, `mx-host`
+    - `systemctl restart` — dnsmasq reads its config only at startup
+    - `man openssl-req`, `man openssl-x509` — a key, a CSR, signing with `-CA`/`-CAkey`, and `-extfile` for `subjectAltName`
+    - `curl --cacert` and `curl --resolve NAME:PORT:ADDR` — trust a private CA and connect by name to an address you chose
+  scenario: |
+    **Ticket NET-2231** from Nikos, the network lead: *"Thessaloniki moved into the new
+    office. The switch is cabled and the WAN line is live, but the site isn't joined to the
+    datacenter yet. Staff need the internal app; guests get Wi-Fi only and must never
+    reach the datacenter."*
+
+    Every device is a network namespace. Run commands inside one with
+    `sudo ip netns exec <namespace> <command>`.
+
+    ```
+     staff (10.20.10.50) ─ p1 ┐                                   ┌ dcsrv 10.200.0.10 (app, HTTPS)
+                              sw ═ trunk ═ site ══ WAN ══ dc ── lan ┤       10.200.0.53 (DNS)
+     guest (10.20.20.50) ─ p2 ┘   up0   lan0   wan0   wan0   lan0 └ default via 10.200.0.1
+    ```
+
+    - Staff are **VLAN 10**, `10.20.10.0/24`; guests are **VLAN 20**, `10.20.20.0/24`. Both
+      hosts already have their addresses and a default route via `.1` of their network.
+    - The WAN link is `198.51.100.0/30`: `site` has `.1` on `wan0`, `dc` has `.2`.
+    - The datacenter LAN is `10.200.0.0/24`; `dc` is `10.200.0.1`.
+
+    Go-live means:
+
+    1. **Gateways on the trunk.** On `site`, create **`lan0.10`** (VLAN 10) with
+       **`10.20.10.1/24`** and **`lan0.20`** (VLAN 20) with **`10.20.20.1/24`**, so staff and
+       guests can each reach their gateway.
+    2. **Fix the switch.** On `sw` each VLAN is a bridge (**`br10`** and **`br20`**) holding
+       that VLAN's trunk sub-interface and its access ports. The guest port **`p2`** is
+       wired into the wrong one. Put it where it belongs, and leave the rest of the switch
+       as it is.
+    3. **The tunnel.** A WireGuard interface **`wg0`** on `site` and on `dc`, both listening
+       on UDP **51820** and peering over the WAN addresses. Tunnel addresses:
+       `site` **`172.31.255.1/30`**, `dc` **`172.31.255.2/30`**. The peers must have
+       completed a handshake. Keep the keys wherever you like (`/lab` is handy).
+    4. **Routing.** `staff` can reach `10.200.0.10`, and the traffic between the staff VLAN
+       and the datacenter LAN goes **through `wg0`** in both directions (not in the clear
+       over the WAN). `guest` must **not** be able to reach the datacenter.
+    5. **DNS.** The datacenter's DNS server (`dcsrv`, **10.200.0.53**, the systemd service
+       **`kl-dc-dns`**, config **`/srv/kl-dc/dnsmasq.conf`**) still sends people to the
+       app's old server: since the move, **`app.corp.test`** and its alias
+       **`portal.corp.test`** must both answer **`10.200.0.10`**. Keep the other records
+       (`wiki.corp.test` and the domain's mail server), and restart the service after the
+       change. Staff must get these answers when they ask 10.200.0.53 across the tunnel.
+    6. **The app's certificate.** The app on `10.200.0.10:443` loads its certificate from
+       **`/lab/pki/app.crt`** and its key from **`/lab/pki/app.key`** on every connection,
+       and they don't exist yet. Issue them from the company CA in **`/lab/pki`**
+       (`ca.crt`, `ca.key`), valid for **both** `app.corp.test` and `portal.corp.test`.
+       From `staff`, `curl --cacert /lab/pki/ca.crt` to `https://app.corp.test/` and
+       `https://portal.corp.test/`, at the address the DNS server gives, must succeed.
+  hints:
+    - "Work bottom up. Requirement 1 is `ip link add link lan0 name lan0.10 type vlan id 10` on `site`, an address, and `ip link set lan0.10 up`; the same for VLAN 20."
+    - "Requirement 2: `sudo ip netns exec sw bridge link` shows which bridge each port is in. `ip link set p2 master br20` moves a port."
+    - "Requirement 3: `wg genkey | tee site.key | wg pubkey > site.pub` (and the same for dc), `ip link add wg0 type wireguard`, `wg set wg0 private-key FILE listen-port 51820 peer DC_PUB allowed-ips ... endpoint 198.51.100.2:51820`, an address, and up. Each side needs the other's public key."
+    - "Requirement 4: allowed IPs must include the far side's LAN, but only the networks that should cross. `wg` adds no routes: `ip route add 10.200.0.0/24 dev wg0` on site and the staff network on dc. Check with `ip route get` on both routers."
+    - "Requirement 5: `sudo ip netns exec staff dig +short @10.200.0.53 app.corp.test` shows the stale answer once the tunnel works. Fix the one record the alias depends on, then `sudo systemctl restart kl-dc-dns`."
+    - "Requirement 6: sign a CSR with `openssl x509 -req -CA ca.crt -CAkey ca.key -CAcreateserial -extfile <(echo subjectAltName=DNS:app.corp.test,DNS:portal.corp.test)`. Test with `sudo ip netns exec staff curl --cacert /lab/pki/ca.crt --resolve app.corp.test:443:10.200.0.10 https://app.corp.test/`."
+  solution: |
+    **1. Gateways.** One VLAN sub-interface per network on the router's trunk port:
+
+    ```bash
+    sudo ip netns exec site bash -c '
+      for v in 10 20; do
+        ip link add link lan0 name lan0.$v type vlan id $v
+        ip addr add 10.20.$v.1/24 dev lan0.$v
+        ip link set lan0.$v up
+      done'
+    ```
+
+    **2. The switch.** `bridge link` shows `p2` in `br10`, so guest frames are tagged
+    VLAN 10. Move it:
+
+    ```bash
+    sudo ip netns exec sw bridge link
+    sudo ip netns exec sw ip link set p2 master br20
+    sudo ip netns exec guest ping -c1 10.20.20.1
+    ```
+
+    **3 and 4. The tunnel and its routes.** Allowed IPs list the far tunnel address and
+    only the networks that may cross: the datacenter LAN on `site`, the staff VLAN on `dc`.
+    The guest VLAN is listed nowhere, so `dc` drops anything from it.
+
+    ```bash
+    mkdir -p /lab/wg && cd /lab/wg
+    umask 077
+    for h in site dc; do wg genkey | tee $h.key | wg pubkey > $h.pub; done
+
+    sudo ip netns exec site bash -c "
+      ip link add wg0 type wireguard
+      wg set wg0 private-key /lab/wg/site.key listen-port 51820 \
+        peer $(cat dc.pub) allowed-ips 172.31.255.2/32,10.200.0.0/24 endpoint 198.51.100.2:51820
+      ip addr add 172.31.255.1/30 dev wg0
+      ip link set wg0 up
+      ip route add 10.200.0.0/24 dev wg0"
+
+    sudo ip netns exec dc bash -c "
+      ip link add wg0 type wireguard
+      wg set wg0 private-key /lab/wg/dc.key listen-port 51820 \
+        peer $(cat site.pub) allowed-ips 172.31.255.1/32,10.20.10.0/24 endpoint 198.51.100.1:51820
+      ip addr add 172.31.255.2/30 dev wg0
+      ip link set wg0 up
+      ip route add 10.20.10.0/24 dev wg0"
+
+    sudo ip netns exec staff ping -c2 10.200.0.10
+    sudo ip netns exec site wg show
+    ```
+
+    **5. DNS.** `app.corp.test` still has the old address `10.200.0.100`, and
+    `portal.corp.test` is a CNAME to it, so one line fixes both:
+
+    ```bash
+    sed -i 's/^host-record=app\.corp\.test,10\.200\.0\.100$/host-record=app.corp.test,10.200.0.10/' /srv/kl-dc/dnsmasq.conf
+    sudo systemctl restart kl-dc-dns
+    sudo ip netns exec staff dig +short @10.200.0.53 portal.corp.test
+    ```
+
+    **6. The certificate.** Both names go into the subject alternative name:
+
+    ```bash
+    cd /lab/pki
+    openssl req -newkey rsa:2048 -nodes -keyout app.key -out app.csr -subj "/CN=app.corp.test"
+    openssl x509 -req -in app.csr -CA ca.crt -CAkey ca.key -CAcreateserial -out app.crt -days 365 \
+      -extfile <(echo subjectAltName=DNS:app.corp.test,DNS:portal.corp.test)
+    ip=$(sudo ip netns exec staff dig +short @10.200.0.53 app.corp.test | tail -1)
+    sudo ip netns exec staff curl --cacert /lab/pki/ca.crt --resolve app.corp.test:443:$ip https://app.corp.test/
+    ```
+  setup: |
+    modprobe 8021q
+    modprobe wireguard
+    netns_new staff guest sw site dc dcsrv
+
+    # --- the site switch: one bridge per VLAN; p2 is in the wrong one ---
+    netns_link staff eth0 sw p1
+    netns_link guest eth0 sw p2
+    netns_link site lan0 sw up0
+    for v in 10 20; do
+      ip -n sw link add link up0 name up0.$v type vlan id $v
+      ip -n sw link add br$v type bridge
+      ip -n sw link set up0.$v master br$v
+      ip -n sw link set up0.$v up
+      ip -n sw link set br$v up
+    done
+    ip -n sw link set p1 master br10
+    ip -n sw link set p2 master br10
+    ip -n staff addr add 10.20.10.50/24 dev eth0
+    ip -n staff route add default via 10.20.10.1
+    ip -n guest addr add 10.20.20.50/24 dev eth0
+    ip -n guest route add default via 10.20.20.1
+
+    # --- the WAN and the datacenter ---
+    netns_link site wan0 dc wan0
+    netns_link dc lan0 dcsrv eth0
+    ip -n site addr add 198.51.100.1/30 dev wan0
+    ip -n dc addr add 198.51.100.2/30 dev wan0
+    ip -n dc addr add 10.200.0.1/24 dev lan0
+    ip -n dcsrv addr add 10.200.0.10/24 dev eth0
+    ip -n dcsrv addr add 10.200.0.53/24 dev eth0
+    ip -n dcsrv route add default via 10.200.0.1
+    ip netns exec site sysctl -qw net.ipv4.ip_forward=1
+    ip netns exec dc sysctl -qw net.ipv4.ip_forward=1
+
+    # --- DNS on dcsrv, with the app's old address ---
+    on_reset 'for u in kl-dc-dns kl-dc-app; do systemctl stop $u 2>/dev/null; systemctl reset-failed $u 2>/dev/null; done; rm -rf /srv/kl-dc'
+    mkdir -p /srv/kl-dc
+    cat >/srv/kl-dc/dnsmasq.conf <<'EOF'
+    # corp.test: internal names for every site
+    host-record=wiki.corp.test,10.200.0.11
+    host-record=app.corp.test,10.200.0.100
+    cname=portal.corp.test,app.corp.test
+    mx-host=corp.test,mail.corp.test,10
+    host-record=mail.corp.test,10.200.0.25
+    EOF
+    chown -R "$(lab_user):" /srv/kl-dc
+    systemd-run --quiet --unit=kl-dc-dns ip netns exec dcsrv dnsmasq --no-daemon --no-resolv --no-hosts --user=nobody --listen-address=10.200.0.53 --bind-interfaces --local=/test/ -C /srv/kl-dc/dnsmasq.conf
+    eventually 15 'ip netns exec dcsrv dig +short +time=1 +tries=1 @10.200.0.53 wiki.corp.test | grep -q 10.200.0.11'
+
+    # --- the company CA, and the app that loads its certificate per connection ---
+    d=/lab/pki
+    mkdir -p "$d"
+    openssl req -x509 -newkey rsa:2048 -nodes -keyout "$d/ca.key" -out "$d/ca.crt" -days 730 -subj "/CN=Corp Internal CA" 2>/dev/null
+    chown -R "$(lab_user):" "$d"
+    head -c6 /dev/urandom | od -An -tx1 | tr -d ' \n' > /srv/kl-dc/token
+    cp /srv/kl-dc/token "$KL_STATE/answer.app"
+    cat >/srv/kl-dc/app.py <<'PY'
+    import socket, ssl, threading
+    T = open('/srv/kl-dc/token').read().strip()
+    def handle(c):
+        try:
+            ctx = ssl.SSLContext(ssl.PROTOCOL_TLS_SERVER)
+            ctx.load_cert_chain('/lab/pki/app.crt', '/lab/pki/app.key')
+            t = ctx.wrap_socket(c, server_side=True)
+            t.recv(4096)
+            b = ("corp app %s\n" % T).encode()
+            t.sendall(b"HTTP/1.1 200 OK\r\nContent-Length: %d\r\nConnection: close\r\n\r\n" % len(b) + b)
+            t.close()
+        except Exception:
+            c.close()
+    s = socket.socket()
+    s.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+    s.bind(('10.200.0.10', 443))
+    s.listen(16)
+    while True:
+        c, _ = s.accept()
+        c.settimeout(5)
+        threading.Thread(target=handle, args=(c,), daemon=True).start()
+    PY
+    systemd-run --quiet --unit=kl-dc-app ip netns exec dcsrv python3 /srv/kl-dc/app.py
+    eventually 15 'ip netns exec dcsrv ss -ltn | grep -q "10.200.0.10:443"'
+  check: |
+    q() { ip netns exec staff dig +short +time=2 +tries=1 @10.200.0.53 "$1" "${2:-A}" 2>/dev/null | grep -v '^;' | tail -1; }
+
+    info "1. Gateways on the trunk"
+    check "site has lan0.10 on VLAN 10 with 10.20.10.1/24" 'ip -n site -d link show lan0.10 | grep -q "vlan protocol 802.1Q id 10 " && ip -n site -4 addr show lan0.10 | grep -q "inet 10.20.10.1/24"'
+    check "site has lan0.20 on VLAN 20 with 10.20.20.1/24" 'ip -n site -d link show lan0.20 | grep -q "vlan protocol 802.1Q id 20 " && ip -n site -4 addr show lan0.20 | grep -q "inet 10.20.20.1/24"'
+    check "staff can reach its gateway" 'ip netns exec staff ping -c2 -W2 10.20.10.1'
+
+    info "2. Fix the switch"
+    check_eq "br10 holds up0.10 and p1" "$(ip -n sw -o link show master br10 2>/dev/null | awk -F': ' '{print $2}' | cut -d@ -f1 | sort | xargs)" "p1 up0.10"
+    check_eq "br20 holds up0.20 and p2" "$(ip -n sw -o link show master br20 2>/dev/null | awk -F': ' '{print $2}' | cut -d@ -f1 | sort | xargs)" "p2 up0.20"
+    check "guest can reach its gateway" 'ip netns exec guest ping -c2 -W2 10.20.20.1'
+
+    info "3. The tunnel"
+    for n in site dc; do
+      check "$n has a WireGuard wg0 listening on 51820" 'ip -n $n -d link show wg0 | grep -q wireguard && [ "$(ip netns exec $n wg show wg0 listen-port)" = 51820 ]'
+    done
+    check "site's tunnel address is 172.31.255.1/30 and dc's is 172.31.255.2/30" 'ip -n site -4 addr show wg0 | grep -q "inet 172.31.255.1/30" && ip -n dc -4 addr show wg0 | grep -q "inet 172.31.255.2/30"'
+    check_match "site peers with dc over the WAN" "$(ip netns exec site wg show wg0 endpoints 2>/dev/null)" '198\.51\.100\.2:51820'
+
+    info "4. Routing"
+    check "staff can reach 10.200.0.10" 'ip netns exec staff ping -c2 -W2 10.200.0.10'
+    check_match "the peers completed a handshake" "$(ip netns exec site wg show wg0 latest-handshakes 2>/dev/null | awk '{print $2}')" '^[1-9]'
+    check_match "site sends datacenter traffic into wg0" "$(ip -n site route get 10.200.0.10 2>&1)" 'dev wg0 '
+    check_match "dc sends staff traffic into wg0" "$(ip -n dc route get 10.20.10.50 2>&1)" 'dev wg0 '
+    check_not "guest can't reach the datacenter" 'ip netns exec guest ping -c2 -W2 10.200.0.10'
+
+    info "5. DNS"
+    check_eq "staff resolve app.corp.test to 10.200.0.10" "$(q app.corp.test)" 10.200.0.10
+    check_eq "staff resolve portal.corp.test to 10.200.0.10" "$(q portal.corp.test)" 10.200.0.10
+    check "wiki.corp.test and the mail server are still served" '[ "$(q wiki.corp.test)" = 10.200.0.11 ] && q corp.test MX | grep -q "mail.corp.test"'
+
+    info "6. The app's certificate"
+    t=/lab/pki
+    if [ -f $t/app.crt ] && [ -f $t/app.key ]; then
+      check "app.crt is signed by the company CA" 'openssl verify -CAfile $t/ca.crt $t/app.crt'
+      want="corp app $(cat "$KL_STATE/answer.app")"
+      for name in app.corp.test portal.corp.test; do
+        ip=$(q $name); [ -n "$ip" ] || ip=0.0.0.0
+        check_eq "staff reach https://$name/ trusting only the company CA" "$(ip netns exec staff curl -fsS -m5 --cacert $t/ca.crt --resolve $name:443:$ip https://$name/ 2>/dev/null)" "$want"
+      done
+    else
+      fail "app.crt and app.key exist in /lab/pki"
+    fi
+  solve: |
+    # 1. gateways on the trunk
+    sudo ip netns exec site bash -c '
+      for v in 10 20; do
+        ip link add link lan0 name lan0.$v type vlan id $v
+        ip addr add 10.20.$v.1/24 dev lan0.$v
+        ip link set lan0.$v up
+      done'
+
+    # 2. the guest port belongs in br20
+    sudo ip netns exec sw ip link set p2 master br20
+
+    # 3 and 4. the tunnel and its routes
+    mkdir -p /lab/wg && cd /lab/wg
+    (umask 077; for h in site dc; do wg genkey | tee $h.key | wg pubkey > $h.pub; done)
+    sudo ip netns exec site bash -c "
+      ip link add wg0 type wireguard
+      wg set wg0 private-key /lab/wg/site.key listen-port 51820 peer $(cat dc.pub) allowed-ips 172.31.255.2/32,10.200.0.0/24 endpoint 198.51.100.2:51820
+      ip addr add 172.31.255.1/30 dev wg0
+      ip link set wg0 up
+      ip route add 10.200.0.0/24 dev wg0"
+    sudo ip netns exec dc bash -c "
+      ip link add wg0 type wireguard
+      wg set wg0 private-key /lab/wg/dc.key listen-port 51820 peer $(cat site.pub) allowed-ips 172.31.255.1/32,10.20.10.0/24 endpoint 198.51.100.1:51820
+      ip addr add 172.31.255.2/30 dev wg0
+      ip link set wg0 up
+      ip route add 10.20.10.0/24 dev wg0"
+
+    # 5. DNS: the app's record still has its old address
+    sed -i 's/^host-record=app\.corp\.test,10\.200\.0\.100$/host-record=app.corp.test,10.200.0.10/' /srv/kl-dc/dnsmasq.conf
+    sudo systemctl restart kl-dc-dns
+
+    # 6. the app's certificate, for both names
+    cd /lab/pki
+    openssl req -newkey rsa:2048 -nodes -keyout app.key -out app.csr -subj "/CN=app.corp.test" 2>/dev/null
+    openssl x509 -req -in app.csr -CA ca.crt -CAkey ca.key -CAcreateserial -out app.crt -days 365 \
+      -extfile <(echo subjectAltName=DNS:app.corp.test,DNS:portal.corp.test) 2>/dev/null
