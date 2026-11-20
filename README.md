@@ -7,8 +7,9 @@ real breakage, automatic grading.
 awesome_labs creates [Lima](https://lima-vm.io) virtual machines, puts each exercise's
 scenario in place (a broken deployment, a crashed daemon, a half-finished compose
 project…), drops you into a shell, and checks your work when you're done. Every
-exercise has a scenario, progressive hints and a full solution you can reveal, and most
-have a short tutorial on the concepts and commands to read first.
+exercise has a scenario, progressive hints and a full solution you can reveal, and a
+lesson-style tutorial on the concepts and commands to read first — teaching from zero,
+with worked examples on different values so they don't give the answer away.
 
 Run `awesome_labs` and the labs open **in your web browser**: the catalogue, each
 exercise's scenario, tutorial, hints and solution, live output from start and check, and
@@ -99,7 +100,7 @@ shows the plan.
 ## Download
 
 You can skip building: the [latest release](https://github.com/kpatr1981/awesome_labs/releases/latest)
-(v0.22.0) has static binaries for Linux and macOS on x86-64 and ARM. On Linux x86-64:
+(v0.23.0) has static binaries for Linux and macOS on x86-64 and ARM. On Linux x86-64:
 
 ```bash
 curl -fLo awesome_labs https://github.com/kpatr1981/awesome_labs/releases/latest/download/awesome_labs-linux-amd64
