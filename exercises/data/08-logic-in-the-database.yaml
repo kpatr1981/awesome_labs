@@ -12,19 +12,41 @@ exercises:
   kind: build
   tags: [postgres, functions, sql-function, volatility]
   tutorial: |
-    **Concept.** A **SQL function** gives an expression or a query a name, so every caller
-    gets the same result for the same input: `CREATE FUNCTION name(arg type, ...) RETURNS
-    type LANGUAGE sql AS $$ SELECT ... $$`. Inside the body you use the arguments by name.
+    **What you're learning.** SQL functions: `CREATE FUNCTION ... LANGUAGE sql`, and volatility (`IMMUTABLE`).
 
-    You also declare how the function behaves. **`IMMUTABLE`** promises that the same
-    arguments always give the same result and that no table is read, so PostgreSQL may
-    use the function in an index and work it out once while planning. `STABLE` and
-    `VOLATILE` promise less. **`STRICT`** returns NULL straight away when any argument is NULL.
+    ### The idea
 
-    **Read up on:**
-    - `CREATE [OR REPLACE] FUNCTION ... LANGUAGE sql`
-    - Function volatility categories: `IMMUTABLE`, `STABLE`, `VOLATILE`
-    - `lpad`, `length`, `greatest`, `extract`, string concatenation with `||`
+    ```sql
+    CREATE OR REPLACE FUNCTION ticket_code(n integer, opened date) RETURNS text
+    LANGUAGE sql IMMUTABLE
+    AS $$ SELECT 'T-' || to_char(opened, 'YYYYMM') || '-' || lpad(n::text, 5, '0') $$;
+    ```
+    **Volatility** tells the planner what it may assume:
+
+    | label | means | allows |
+    |---|---|---|
+    | `IMMUTABLE` | same inputs → same output, forever | use in indexes and generated columns |
+    | `STABLE` | same within one statement (reads tables) | |
+    | `VOLATILE` (default) | anything (`random()`, writes) | |
+
+    `lpad(s, n, '0')` pads on the left but **truncates** longer strings, so guard with `greatest(n, length(s))` if numbers can be longer.
+
+    ### Commands you'll use
+
+    ```bash
+    docker exec -i kl-pg psql -U lab -d lab -v ON_ERROR_STOP=1 < /lab/fn.sql
+    docker exec kl-pg psql -U lab -d lab -Atc "SELECT ticket_code(42, '2026-03-02'), ticket_code(1234567, '2026-03-02')"
+    docker exec kl-pg psql -U lab -d lab -Atc "SELECT provolatile FROM pg_proc WHERE proname = 'ticket_code'"     # i
+    ```
+
+    ### Common mistakes
+
+    - `extract(year ...)` returns numeric, so `2026.0` can appear in some casts: cast to `int`.
+    - Labelling something `IMMUTABLE` that reads a table.
+
+    ### Check your work
+
+    `invoice_code` returns the expected format for small and large numbers, and `pg_proc.provolatile` is `i`.
   scenario: |
     PostgreSQL runs in **`kl-pg`** (`docker exec -it kl-pg psql -U lab -d lab`). Every
     service formats invoice numbers its own way. Replace them all with one function:
@@ -75,18 +97,41 @@ exercises:
   kind: build
   tags: [postgres, trigger, plpgsql, before-update]
   tutorial: |
-    **Concept.** A **trigger** runs a function automatically when rows change. The
-    function is written in PL/pgSQL, `RETURNS trigger`, and sees the row being written
-    as **`NEW`** (and the previous version as `OLD` on UPDATE and DELETE).
+    **What you're learning.** `BEFORE UPDATE` triggers that set a column on every change.
 
-    *When* it fires matters. A **`BEFORE ... FOR EACH ROW`** trigger runs before the row
-    is stored: whatever it puts in `NEW` and returns is what gets written. An `AFTER`
-    trigger runs once the row is stored, so changing `NEW` there has no effect. A rule
-    in a BEFORE trigger therefore holds for every statement, whoever writes it.
+    ### The idea
 
-    **Read up on:**
-    - `CREATE FUNCTION ... RETURNS trigger LANGUAGE plpgsql`, `NEW`, `RETURN NEW`
-    - `CREATE [OR REPLACE] TRIGGER ... BEFORE UPDATE ON ... FOR EACH ROW EXECUTE FUNCTION ...`
+    A row-level `BEFORE` trigger can **change the row** before it's written, by modifying `NEW` and returning it:
+
+    ```sql
+    CREATE OR REPLACE FUNCTION stamp() RETURNS trigger LANGUAGE plpgsql AS $$
+    BEGIN
+      NEW.changed_at := now();
+      RETURN NEW;
+    END $$;
+    CREATE OR REPLACE TRIGGER items_stamp BEFORE UPDATE ON items
+      FOR EACH ROW EXECUTE FUNCTION stamp();
+    ```
+    It overrides whatever the client sent, so a service that writes an old value can't keep it. `WHEN (OLD.* IS DISTINCT FROM NEW.*)` skips updates that change nothing.
+
+    ### Commands you'll use
+
+    ```bash
+    q() { docker exec kl-pg psql -U lab -d lab -c "$1"; }
+    q "UPDATE items SET price = price WHERE id = 1 RETURNING changed_at"
+    q "UPDATE items SET price = 5, changed_at = '2000-01-01' WHERE id = 1 RETURNING changed_at"    # now(), not 2000
+    q '\d items'                                                                                      # Triggers:
+    ```
+
+    ### Common mistakes
+
+    - An `AFTER` trigger: modifying `NEW` has no effect.
+    - `RETURN NULL` in a `BEFORE` trigger: the update is silently skipped (data-080).
+    - `UPDATE items SET ...` inside the trigger: infinite recursion.
+
+    ### Check your work
+
+    Every update sets `updated_at` to the current time, even when the client sends another value.
   scenario: |
     The table **`products`** in **`kl-pg`** has `id`, `name`, `price` and
     **`updated_at`** (timestamptz). Some services forget to set `updated_at`, and one
@@ -138,19 +183,40 @@ exercises:
   kind: fix
   tags: [postgres, views, updatable-view, check-option, grants]
   tutorial: |
-    **Concept.** A simple view (one table, no aggregates) is **automatically
-    updatable**: INSERT and UPDATE through it are passed down to the table. By default
-    nothing stops a row from being written through the view even if it doesn't match
-    the view's `WHERE`, so it disappears from the view as soon as it's written.
-    **`WITH CHECK OPTION`** makes PostgreSQL reject such writes. `CASCADED` (the default)
-    also applies the conditions of the views underneath.
+    **What you're learning.** Updatable views with `WITH CHECK OPTION`.
 
-    `CREATE OR REPLACE VIEW` keeps the view's privileges, while `DROP VIEW` + `CREATE VIEW`
-    loses them.
+    ### The idea
 
-    **Read up on:**
-    - Updatable views, `WITH [CASCADED | LOCAL] CHECK OPTION`
-    - `ALTER VIEW ... SET (check_option = ...)`
+    A simple view (one table, no aggregates) is **updatable**: inserts and updates through it go to the table. Without a check, a user can insert a row the view **can't show** (`region = 'us'` through an EU view), or update a row out of it. `WITH CASCADED CHECK OPTION` rejects any write whose result wouldn't be visible through the view (and through views it's built on).
+
+    ```sql
+    CREATE OR REPLACE VIEW us_orders AS
+      SELECT id, customer, region FROM orders WHERE region = 'us'
+      WITH CASCADED CHECK OPTION;
+    ```
+
+    ### Commands you'll use
+
+    ```bash
+    d() { docker exec -e PGPASSWORD=usdesk kl-pg psql -h 127.0.0.1 -U us_desk -d lab -c "$1"; }
+    d "INSERT INTO us_orders (customer, region) VALUES ('x', 'eu')"
+    ```
+    ```text
+    ERROR:  new row violates check option for view "us_orders"
+    ```
+    ```bash
+    docker exec kl-pg psql -U lab -d lab -c "SELECT id, name, region FROM customers WHERE name LIKE 'desk-%'"
+    ```
+    The bad rows are invisible through the view, so delete them as the table owner.
+
+    ### Common mistakes
+
+    - `CREATE OR REPLACE VIEW` with different columns: it fails. Keep the column list the same.
+    - Granting the desk access to the table to "fix" it.
+
+    ### Check your work
+
+    Inserting or updating a non-EU row through `eu_customers` is refused, EU writes still work, and the three `desk-` rows are gone.
   scenario: |
     In **`kl-pg`**, the EU help desk logs in as **`eu_desk`** (password **`eu-d3sk`**)
     and manages customers through the view **`eu_customers`**, which shows the rows of
@@ -214,23 +280,51 @@ exercises:
   kind: build
   tags: [postgres, trigger, audit, jsonb, security-definer]
   tutorial: |
-    **Concept.** An **audit trigger** records every change in a log table: `AFTER INSERT
-    OR UPDATE OR DELETE ... FOR EACH ROW`. Inside the function, **`TG_OP`** says which
-    operation fired it and **`TG_TABLE_NAME`** which table, so one function serves many
-    tables. `to_jsonb(OLD)` and `to_jsonb(NEW)` store whole rows. `OLD` is NULL on
-    INSERT and `NEW` is NULL on DELETE.
+    **What you're learning.** An audit trigger: `TG_OP`, `to_jsonb(OLD/NEW)`, `session_user`, and `SECURITY DEFINER`.
 
-    The function normally runs with the **caller's** privileges, so the caller would need
-    INSERT on the log. A **`SECURITY DEFINER`** function runs with its **owner's**
-    privileges instead, so callers can write audit rows without having any access to the
-    log. Pin its `search_path` (`SET search_path = public, pg_temp`). Inside such a
-    function `current_user` is the owner. **`session_user`** is still the role that
-    logged in.
+    ### The idea
 
-    **Read up on:**
-    - Trigger variables: `TG_OP`, `TG_TABLE_NAME`, `OLD`, `NEW`
-    - `to_jsonb(record)`
-    - `SECURITY DEFINER`, `current_user` versus `session_user`
+    One trigger function can serve several tables:
+
+    | variable | value |
+    |---|---|
+    | `TG_OP` | `INSERT`, `UPDATE`, `DELETE` |
+    | `TG_TABLE_NAME` | the table |
+    | `OLD` / `NEW` | the row before / after (NULL where it doesn't apply) |
+
+    `to_jsonb(OLD)` stores a whole row as jsonb. **Who** made the change: `session_user` is the role that **logged in**. `current_user` changes inside a `SECURITY DEFINER` function to the function's owner.
+
+    The tellers can't write to `audit_log` themselves. A `SECURITY DEFINER` function runs with its **owner's** rights. Pin its `search_path` so nobody can hijack table names.
+
+    ### Commands you'll use
+
+    ```sql
+    CREATE OR REPLACE FUNCTION audit_row() RETURNS trigger
+    LANGUAGE plpgsql SECURITY DEFINER SET search_path = public, pg_temp AS $$
+    BEGIN
+      INSERT INTO history (tbl, op, row_id, before, after, who)
+      VALUES (TG_TABLE_NAME, TG_OP, coalesce(NEW.id, OLD.id),
+              CASE WHEN TG_OP <> 'INSERT' THEN to_jsonb(OLD) END,
+              CASE WHEN TG_OP <> 'DELETE' THEN to_jsonb(NEW) END,
+              session_user);
+      RETURN coalesce(NEW, OLD);
+    END $$;
+    CREATE TRIGGER tills_audit AFTER INSERT OR UPDATE OR DELETE ON tills FOR EACH ROW EXECUTE FUNCTION audit_row();
+    ```
+    ```bash
+    docker exec -e PGPASSWORD=t3ller kl-pg psql -h 127.0.0.1 -U teller -d lab -c "UPDATE accounts SET balance = balance + 1 WHERE id = 1"
+    docker exec kl-pg psql -U lab -d lab -c 'SELECT tbl, op, row_id, who FROM history ORDER BY id DESC LIMIT 3'
+    ```
+
+    ### Common mistakes
+
+    - `current_user` in a `SECURITY DEFINER` function: records the owner.
+    - `NEW.id` in a DELETE: NULL. Use `coalesce(NEW.id, OLD.id)`.
+    - Forgetting one of the two tables.
+
+    ### Check your work
+
+    Each insert, update and delete by `teller` on `accounts` and `cards` adds an `audit_log` row with the right table, op, id, old and new rows, and `changed_by = teller`.
   scenario: |
     In **`kl-pg`**, tellers log in as **`teller`** (password **`t3ller`**) and change
     the tables **`accounts`** (`id`, `owner`, `balance`) and **`cards`** (`id`,
@@ -330,19 +424,47 @@ exercises:
   kind: fix
   tags: [postgres, trigger, plpgsql, before-trigger, troubleshooting, on-conflict]
   tutorial: |
-    **Concept.** What a **BEFORE ROW** trigger returns decides what is written. Returning
-    `NEW` (possibly modified) writes that row. Returning **`NULL`** silently **skips** the
-    row: there is no error, and the command tag just says `INSERT 0 0`. AFTER triggers
-    can return NULL because the row is already stored by then. A trigger only fires for
-    the events it lists (`BEFORE INSERT OR UPDATE`).
+    **What you're learning.** `INSERT 0 0`: a `BEFORE` trigger that returns `NULL` and silently discards rows.
 
-    BEFORE triggers run before uniqueness is checked, so `INSERT ... ON CONFLICT` compares
-    the row as the trigger left it.
+    ### The idea
 
-    **Read up on:**
-    - Trigger return values: BEFORE versus AFTER, row versus statement
-    - `lower`, `btrim`
-    - `\copy ... FROM pstdin`, `INSERT ... ON CONFLICT DO NOTHING`
+    In a row-level **`BEFORE`** trigger, the return value decides:
+
+    | returns | effect |
+    |---|---|
+    | `NEW` (possibly modified) | that row is written |
+    | `NULL` | **the row is skipped**, with no error |
+
+    A function that falls off the end of an `IF` branch, or ends with `RETURN NULL`, makes every insert vanish. psql shows `INSERT 0 0` (0 rows).
+
+    ```sql
+    CREATE OR REPLACE FUNCTION clean_email() RETURNS trigger LANGUAGE plpgsql AS $$
+    BEGIN
+      NEW.email := lower(trim(NEW.email));
+      RETURN NEW;
+    END $$;
+    ```
+
+    ### Commands you'll use
+
+    ```bash
+    q() { docker exec -i kl-pg psql -U lab -d lab -v ON_ERROR_STOP=1 "$@"; }
+    q -c "INSERT INTO leads (email) VALUES (' Bob@X.test ')"                # INSERT 0 0
+    q -c '\sf clean_email'                                                  # show the function's source
+    q -c '\d leads'
+    q -c "CREATE TEMP TABLE back (email text)" -c "\copy back FROM STDIN" \
+      -c "INSERT INTO leads (email) SELECT email FROM back ON CONFLICT (email) DO NOTHING" < /lab/missed.csv
+    ```
+    The trigger normalises the recovered rows on the way in too, which may turn two lines into the same address: `ON CONFLICT DO NOTHING` (or `DISTINCT`) handles it.
+
+    ### Common mistakes
+
+    - Dropping the trigger: normalisation is still required.
+    - Normalising in the recovery `INSERT` but not in the trigger.
+
+    ### Check your work
+
+    New signups are stored lower-cased and trimmed, and every lost signup is back exactly once.
   scenario: |
     Since yesterday's release, the signup form in **`kl-pg`** says "thanks", but
     nothing new arrives in **`signups`** (`id`, `email` UNIQUE, `created_at`). In psql,
@@ -433,21 +555,41 @@ exercises:
   kind: build
   tags: [postgres, security-definer, functions, search-path, grants, security]
   tutorial: |
-    **Concept.** A **`SECURITY DEFINER`** function runs with the privileges of its
-    **owner**, so it can hand out one narrow capability ("this column of that row")
-    without granting the table. Two things make it safe:
+    **What you're learning.** Exposing one column through a `SECURITY DEFINER` function, with a pinned `search_path` and `EXECUTE` limited to one role.
 
-    - **`REVOKE EXECUTE ... FROM PUBLIC`**: by default everyone may call a new function.
-      Grant it only to the roles that need it.
-    - **A pinned `search_path`** (`SET search_path = public, pg_temp`). Otherwise
-      unqualified names resolve through the *caller's* path, which starts with their own
-      temporary schema, so a caller could create a temporary table with the same name
-      and make the function read their table, with the owner's rights.
+    ### The idea
 
-    **Read up on:**
-    - `CREATE FUNCTION ... SECURITY DEFINER SET search_path = ...`
-    - "Writing SECURITY DEFINER functions safely" in the PostgreSQL docs
-    - `REVOKE ... ON FUNCTION ... FROM PUBLIC`, `GRANT EXECUTE`
+    To let a role see **one** value from a table it can't read, give it a function that runs with the owner's rights:
+
+    ```sql
+    CREATE OR REPLACE FUNCTION staff_phone(staff_id integer) RETURNS text
+    LANGUAGE sql STABLE SECURITY DEFINER SET search_path = public, pg_temp
+    AS $$ SELECT phone FROM staff WHERE id = staff_id $$;
+    REVOKE EXECUTE ON FUNCTION staff_phone(integer) FROM PUBLIC;
+    GRANT EXECUTE ON FUNCTION staff_phone(integer) TO helpdesk;
+    ```
+    - New functions are executable by **PUBLIC** by default: revoke it.
+    - **`SET search_path`** stops a caller from creating their own `staff` table in a schema that comes earlier in the path and hijacking the query.
+
+    ### Commands you'll use
+
+    ```bash
+    p() { docker exec -e PGPASSWORD=$2 kl-pg psql -h 127.0.0.1 -U $1 -d lab -Atc "$3"; }
+    p helpdesk h3lp "SELECT staff_phone(3)"
+    p helpdesk h3lp "SELECT phone FROM staff LIMIT 1"          # permission denied
+    p intern int3rn "SELECT staff_phone(3)"                    # permission denied for function
+    docker exec kl-pg psql -U lab -d lab -c '\df+ staff_phone'
+    ```
+
+    ### Common mistakes
+
+    - `SECURITY INVOKER` (the default): the caller's lack of rights applies.
+    - Forgetting `REVOKE ... FROM PUBLIC`: every role can call it.
+    - Returning the whole row.
+
+    ### Check your work
+
+    `support` gets the email from the function but is denied on the table, `intern` can't call it, and `\df+` shows `security definer` with a fixed `search_path`.
   scenario: |
     In **`kl-pg`**, the table **`customers`** (`id`, `name`, `email`, `card_number`) holds
     card numbers, so the support team's role **`support`** (password **`supp0rt`**) has
@@ -507,21 +649,45 @@ exercises:
   kind: build
   tags: [postgres, plpgsql, functions, raise, sqlstate, concurrency]
   tutorial: |
-    **Concept.** A PL/pgSQL function can put a whole business operation behind one call,
-    and refuse it with a precise error. **`RAISE EXCEPTION 'message %', value USING
-    ERRCODE = '...'`** aborts the call with a SQLSTATE that applications can test (a
-    plain `RAISE EXCEPTION` uses `P0001`). The call is atomic: when it raises an error,
-    every change it made is undone.
+    **What you're learning.** PL/pgSQL functions that fail with precise **SQLSTATE** codes, and an atomic check-and-update.
 
-    For stock, decide and decrement in **one statement**: `UPDATE ... SET available =
-    available - qty WHERE sku = ... AND available >= qty`. If another session is
-    updating the same row, PostgreSQL waits for it and re-checks the condition on the
-    new value. Reading the stock first and writing it later loses updates under
-    concurrency. `FOUND` tells you whether the UPDATE matched a row.
+    ### The idea
 
-    **Read up on:**
-    - PL/pgSQL `RAISE ... USING ERRCODE`, the `FOUND` variable, `INSERT ... RETURNING ... INTO`
-    - PostgreSQL error codes: `invalid_parameter_value` (22023), `no_data_found` (P0002), `raise_exception` (P0001)
+    `RAISE EXCEPTION 'msg' USING ERRCODE = 'P0002'` aborts with a chosen SQLSTATE that callers can test for. Common codes: `22023` invalid_parameter_value, `P0002` no_data_found, `P0001` raise_exception (the default for `RAISE EXCEPTION`).
+
+    Check and update **in one statement**, so concurrent calls can't oversell:
+
+    ```sql
+    UPDATE stock SET available = available - p_qty
+    WHERE sku = p_sku AND available >= p_qty;
+    IF NOT FOUND THEN ... END IF;        -- FOUND: did the last statement affect a row?
+    ```
+    Then tell "no such SKU" apart from "not enough" with a second lookup.
+
+    ### Commands you'll use
+
+    ```bash
+    q() { docker exec -i kl-pg psql -U lab -d lab -v VERBOSITY=verbose -c "$1"; }
+    q "SELECT hold(7, 'NOPE', 1)"
+    ```
+    ```text
+    ERROR:  P0002: unknown sku NOPE
+    ```
+    ```bash
+    q "SELECT hold(7, 'A-1', 0)"; q "SELECT hold(7, 'A-1', 999)"; q "SELECT hold(7, 'A-1', 2)"
+    q "SELECT * FROM holds ORDER BY id DESC LIMIT 1"
+    ```
+    `VERBOSITY=verbose` makes psql print the SQLSTATE.
+
+    ### Common mistakes
+
+    - `SELECT available` then `UPDATE`: a race between them.
+    - Validating `p_qty` **after** touching the table.
+    - `RAISE NOTICE`: it doesn't abort.
+
+    ### Check your work
+
+    Each failure case raises its SQLSTATE and changes nothing, and a valid call lowers `available`, adds a reservation and returns its id.
   scenario: |
     In **`kl-pg`**, the table **`stock`** (`sku`, `available`) holds what can still be sold
     and **`reservations`** (`id`, `order_id`, `sku`, `qty`, `created_at`) what orders have
@@ -617,19 +783,39 @@ exercises:
   kind: fix
   tags: [redis, lua, eval, atomicity, rate-limiting, ttl]
   tutorial: |
-    **Concept.** Each Redis command is atomic, but a *sequence* of commands sent by a
-    client isn't: between your `GET` and your `INCR`, a hundred other clients can run
-    theirs. A **Lua script** sent with **`EVAL`** runs on the server **as one atomic
-    step**, so no other command runs in the middle of it. Keys are passed in `KEYS[]`,
-    other values in `ARGV[]`, and the script calls Redis with `redis.call(...)`.
+    **What you're learning.** Atomic rate limiting with a **Lua script** (`EVAL`): increment, set expiry, compare, in one step.
 
-    A fixed-window rate limiter is `INCR` plus an expiry on the counter. If the expiry is
-    set by a separate command, a crash or a lost race can leave a counter that **never
-    expires**, and that client stays blocked for good.
+    ### The idea
 
-    **Read up on:**
-    - `EVAL script numkeys key... arg...`, `KEYS`, `ARGV`, `redis.call`, `tonumber`
-    - `INCR`, `EXPIRE`, `TTL` (`-1` = no expiry, `-2` = no key)
+    `INCR` then `EXPIRE` from a shell script is two round trips. Under load, requests slip between them, and if the script dies after `INCR`, the key never expires. A Lua script runs **atomically** on the server:
+
+    ```lua
+    local n = redis.call('INCR', KEYS[1])
+    if n == 1 or redis.call('TTL', KEYS[1]) == -1 then
+      redis.call('EXPIRE', KEYS[1], ARGV[2])
+    end
+    if n > tonumber(ARGV[1]) then return 0 end
+    return 1
+    ```
+    `KEYS` and `ARGV` are the arguments after `EVAL script numkeys`. Checking for `TTL == -1` also repairs a counter that lost its expiry.
+
+    ### Commands you'll use
+
+    ```bash
+    docker exec kl-redis redis-cli EVAL "$(cat /lab/limit.lua)" 1 rl:test 3 30
+    for i in 1 2 3 4; do docker exec kl-redis redis-cli EVAL "$(cat /lab/limit.lua)" 1 rl:t2 3 30; done    # 1 1 1 0
+    docker exec kl-redis redis-cli TTL rl:t2
+    docker exec kl-redis redis-cli TTL rl:mobile-app        # -1: stuck
+    ```
+
+    ### Common mistakes
+
+    - `ARGV` values are strings: `tonumber` before comparing.
+    - Fixing the script but leaving `mobile-app`'s stuck counter: reset it (`DEL`).
+
+    ### Check your work
+
+    Bursts of parallel requests let through at most 10 per minute, every counter has a TTL, `mobile-app` is allowed again, and `ratelimit.sh` keeps its interface.
   scenario: |
     Redis runs in **`kl-redis`**. Every request runs **`/lab/ratelimit.sh CLIENT`**, which
     prints `allowed` or `denied`: at most **10 requests per client per 60 seconds**,
@@ -735,20 +921,42 @@ exercises:
   kind: fix
   tags: [redis, lua, distributed-lock, set-nx, atomicity]
   tutorial: |
-    **Concept.** A simple Redis lock is a key that only one client can create:
-    **`SET lock:name <token> NX PX <ms>`** sets the key only if it doesn't exist, and gives
-    it an expiry in the same command, so a crashed holder can't keep the lock forever. The
-    **token** is a random value only the holder knows.
+    **What you're learning.** Safe distributed locks: `SET NX PX` in one command, and release only by the owner (compare-and-delete in Lua).
 
-    Releasing has to check ownership. If the holder was slow, its lock may have expired
-    and been taken by someone else, and a plain `DEL` would delete *their* lock. The check
-    ("is the value still my token?") and the delete must happen **atomically**, which
-    means in a Lua script.
+    ### The idea
 
-    **Read up on:**
-    - `SET ... NX PX`, and why `SETNX` + `EXPIRE` is not the same
-    - The "correct implementation with a single instance" section of the Redis distributed locks page
-    - `EVAL`, `redis.call('GET', ...)`, `redis.call('DEL', ...)`
+    | step | right way | why |
+    |---|---|---|
+    | acquire | `SET lock:x TOKEN NX PX 30000` | atomic: set only if absent, **with** an expiry. `SETNX` + `EXPIRE` can leave a lock with no expiry |
+    | release | a Lua script: `if GET == token then DEL` | a job whose lock expired must not delete the **next** owner's lock |
+
+    ```lua
+    if redis.call('GET', KEYS[1]) == ARGV[1] then
+      return redis.call('DEL', KEYS[1])
+    end
+    return 0
+    ```
+    The token is a random value unique per holder (`uuidgen`, `$RANDOM$$`).
+
+    ### Commands you'll use
+
+    ```bash
+    r() { docker exec kl-redis redis-cli "$@"; }
+    r SET lock:demo tokA NX PX 10000          # OK
+    r SET lock:demo tokB NX PX 10000          # (nil): busy
+    r EVAL "$(cat /lab/release.lua)" 1 lock:demo tokB      # 0: not the owner
+    r EVAL "$(cat /lab/release.lua)" 1 lock:demo tokA      # 1
+    r PTTL lock:demo
+    ```
+
+    ### Common mistakes
+
+    - `DEL` without checking the token.
+    - `SET ... NX` followed by a separate `PEXPIRE`.
+
+    ### Check your work
+
+    `lock.sh acquire` sets the lock with its expiry in one command, `release` with a wrong token prints `not-owner` and leaves the lock, and the right token removes it.
   scenario: |
     The nightly report jobs serialise on Redis locks in **`kl-redis`** through
     **`/lab/lock.sh`**:
@@ -861,19 +1069,42 @@ exercises:
   kind: fix
   tags: [redis, lua, atomicity, validation, no-rollback, data-repair]
   tutorial: |
-    **Concept.** A Redis Lua script is **atomic** (nothing else runs while it runs), but it
-    has **no rollback**. When a script returns an error halfway, every write it already
-    made stays. The same is true of `MULTI`/`EXEC`: a command that fails at run time
-    doesn't undo the others. A script that may refuse must therefore **check everything
-    first, then write**.
+    **What you're learning.** All-or-nothing Lua scripts: **validate everything first, then write**.
 
-    Mind two Redis details: `HINCRBY` on a missing field **creates** it, and a missing
-    value comes back to Lua as `false`.
+    ### The idea
 
-    **Read up on:**
-    - Scripting with Lua: atomicity, errors, `redis.error_reply`
-    - Redis transactions: "Errors inside a transaction" and why there are no rollbacks
-    - `HGET`, `HINCRBY`, `HDEL`, `RPUSH`
+    A Redis script is atomic in that nothing runs **between** its commands. It does **not** roll back: commands before an error stay applied. So a script that decrements stock item by item and stops at the first shortage leaves a half-applied order. Structure it as two passes:
+
+    ```lua
+    for i = 1, #KEYS ... -- (cart passed as ARGV pairs: sku, qty, sku, qty...)
+      if tonumber(redis.call('HGET', 'stock', sku) or '0') < qty then
+        return redis.error_reply('out of stock: ' .. sku)
+      end
+    end
+    -- second pass: only now HINCRBY each sku by -qty, then RPUSH the order id
+    ```
+    `redis.error_reply(msg)` returns an error to the client.
+
+    To repair the damage, replay the log of failed checkouts: put back what the old script removed before it failed, using the catalogue to tell real SKUs from junk the old script created (`HINCRBY` on a missing field creates it).
+
+    ### Commands you'll use
+
+    ```bash
+    cat /lab/checkout.lua
+    docker exec kl-redis redis-cli EVAL "$(cat /lab/checkout.lua)" 0 order-99 SKU-1 2 SKU-404 1      # error, stock unchanged
+    docker exec kl-redis redis-cli HGETALL stock | paste - -
+    head -3 /lab/failed.log
+    ```
+    Check how the script receives its arguments (KEYS vs ARGV) and keep that interface.
+
+    ### Common mistakes
+
+    - Checking and decrementing in the same loop.
+    - Restoring stock for **successful** orders too.
+
+    ### Check your work
+
+    A cart with any shortage changes nothing and returns `out of stock: <sku>`, a full cart applies everything, and `stock` matches what the successful orders left, with no junk fields.
   scenario: |
     In **`kl-redis`**, the hash **`stock`** maps SKU → quantity, and the list **`orders`**
     holds the ids of the orders that went through. Checkout runs **`/lab/checkout.lua`**:
@@ -1039,21 +1270,42 @@ exercises:
   kind: build
   tags: [redis, functions, function-load, fcall, fcall-ro, replica, lua]
   tutorial: |
-    **Concept.** Scripts loaded with `SCRIPT LOAD` and run with `EVALSHA` live only in the
-    server's **script cache**. A restart or a failover empties it, and every call fails
-    with `NOSCRIPT`. **Redis Functions** (Redis 7+) are part of the data instead: a
-    **library** loaded with `FUNCTION LOAD` is saved in the RDB/AOF and replicated to
-    replicas, and you call its functions by name with **`FCALL name numkeys key... arg...`**.
+    **What you're learning.** Redis **Functions**: a named library loaded once (`FUNCTION LOAD`), surviving restarts and replicated, with `no-writes` for read-only calls.
 
-    A library is Lua code that starts with `#!lua name=<library>` and calls
-    `redis.register_function`. A function registered with the flag **`no-writes`** may
-    run through **`FCALL_RO`** and on read-only replicas. A function without that flag is
-    refused there.
+    ### The idea
 
-    **Read up on:**
-    - Redis Functions: `FUNCTION LOAD [REPLACE]`, `FUNCTION LIST`, `FCALL`, `FCALL_RO`
-    - `redis.register_function{function_name=..., callback=..., flags={'no-writes'}}`
-    - `redis-cli -x` (read the last argument from stdin)
+    `EVAL` scripts are sent with every call and cached only until a restart (`NOSCRIPT` errors after a restart). **Functions** (Redis 7) are stored with the data, persisted and replicated:
+
+    ```lua
+    #!lua name=quota
+    redis.register_function('quota_left', function(keys, args)
+      local h = redis.call('HMGET', keys[1], 'limit', 'used')
+      return tonumber(h[1]) - tonumber(h[2] or 0)
+    end)
+    redis.register_function{function_name = 'quota_peek', callback = function(keys) ... end, flags = {'no-writes'}}
+    ```
+    `FUNCTION LOAD REPLACE` loads or updates the library. `FCALL name numkeys key... arg...` calls it. Only `no-writes` functions can run on a **read-only replica** (`FCALL_RO`).
+
+    ### Commands you'll use
+
+    ```bash
+    docker exec -i kl-redis redis-cli -x FUNCTION LOAD REPLACE < /lab/quota.lua
+    docker exec kl-redis redis-cli FUNCTION LIST LIBRARYNAME quota
+    docker exec kl-redis redis-cli FCALL quota_left 1 quota:acme
+    docker exec kl-redis-ro redis-cli FCALL_RO quota_left 1 quota:acme
+    docker restart kl-redis && docker exec kl-redis redis-cli FUNCTION LIST | head -3
+    ```
+    `-x` makes redis-cli read the last argument from stdin.
+
+    ### Common mistakes
+
+    - The `#!lua name=...` first line missing: "Missing library metadata".
+    - A write inside a `no-writes` function: refused.
+    - Error replies: `return redis.error_reply('quota exceeded')`.
+
+    ### Check your work
+
+    Both functions work on the primary, `quota_left` works on the replica, the library survives a restart, and `app.sh` uses `FCALL`.
   scenario: |
     The quota service uses Redis in **`kl-redis`** (primary) with a read-only replica
     **`kl-redis-ro`**. Each tenant has a hash **`quota:<tenant>`** with `limit` and
@@ -1221,22 +1473,46 @@ exercises:
   kind: build
   tags: [postgres, procedure, plpgsql, transaction-control, batching]
   tutorial: |
-    **Concept.** A **function** always runs inside the caller's transaction. A
-    **procedure** (`CREATE PROCEDURE`, run with `CALL`) may **`COMMIT`** in the middle of
-    its work. That's what long maintenance jobs need: moving millions of rows in one
-    transaction holds locks for the whole time, bloats the table and keeps replicas
-    replaying one huge transaction. Moving them a batch at a time, with a commit after
-    each batch, keeps every transaction short.
+    **What you're learning.** **Procedures** that `COMMIT` between batches: archiving huge tables without one giant transaction.
 
-    A batch can be moved in one statement: `WITH moved AS (DELETE ... RETURNING *) INSERT
-    INTO archive SELECT * FROM moved`. `GET DIAGNOSTICS n = ROW_COUNT` tells you how many
-    rows the last statement moved. A procedure can only commit when `CALL` isn't inside
-    an explicit transaction block.
+    ### The idea
 
-    **Read up on:**
-    - `CREATE PROCEDURE`, `CALL`, transaction management in PL/pgSQL
-    - Data-modifying statements in `WITH`
-    - `GET DIAGNOSTICS ... = ROW_COUNT`, `LOOP ... EXIT WHEN`
+    A function runs inside the caller's transaction. A **procedure** (`CREATE PROCEDURE`, called with `CALL`) may **commit** inside itself, so a long job can work in batches, each committed on its own. That keeps locks short, lets vacuum keep up, and saves completed work if it's interrupted.
+
+    ```sql
+    CREATE OR REPLACE PROCEDURE purge_old(cutoff timestamptz, batch int) LANGUAGE plpgsql AS $$
+    DECLARE n int;
+    BEGIN
+      LOOP
+        WITH b AS (DELETE FROM logs WHERE id IN (SELECT id FROM logs WHERE at < cutoff ORDER BY id LIMIT batch)
+                   RETURNING *)
+        INSERT INTO logs_old SELECT * FROM b;
+        GET DIAGNOSTICS n = ROW_COUNT;
+        COMMIT;
+        EXIT WHEN n = 0;
+      END LOOP;
+    END $$;
+    ```
+    A data-modifying CTE (`DELETE ... RETURNING`) moves rows in one statement.
+
+    ### Commands you'll use
+
+    ```bash
+    docker exec kl-pg psql -U lab -d lab -c "CALL purge_old('2026-01-01', 5000)"
+    docker exec kl-pg psql -U lab -d lab -Atc "SELECT count(*) FROM logs WHERE at < '2026-01-01'"      # 0
+    docker exec kl-pg psql -U lab -d lab -Atc 'SELECT count(*) FROM logs_old'
+    ```
+    `CALL` must not run inside an explicit `BEGIN` block, or the internal `COMMIT` fails ("invalid transaction termination").
+
+    ### Common mistakes
+
+    - A function with `COMMIT`: not allowed.
+    - `LIMIT` without `ORDER BY`: works, but the order of batches is unpredictable.
+    - Column order differing between the two tables in `INSERT ... SELECT *`.
+
+    ### Check your work
+
+    After `CALL archive_events(...)`, no row older than the cutoff remains in `events`, `events_archive` has them with the same values, and the total count is unchanged.
   scenario: |
     In **`kl-pg`**, **`events`** (`id`, `at` timestamptz, `payload`) has grown huge, and
     **`events_archive`** has the same columns. Create the procedure
@@ -1322,19 +1598,45 @@ exercises:
   kind: fix
   tags: [postgres, trigger, plpgsql, denormalization, consistency]
   tutorial: |
-    **Concept.** Storing a **derived value** (an order's total, a line count) saves
-    recomputing it on every read, but every change to the source rows must update it.
-    An `INSERT` trigger alone is not enough. An `UPDATE` can change the amount *or move a
-    row to another parent* (`OLD.order_id` ≠ `NEW.order_id`), and a `DELETE` must take
-    the row's share away. Treat an UPDATE as "remove OLD, add NEW" and you cover every
-    case.
+    **What you're learning.** Keeping a summary column correct with a trigger that handles **INSERT, UPDATE and DELETE**, including moves between parents.
 
-    When the stored values are already wrong, fixing the trigger isn't enough: recompute
-    them once from the source with `UPDATE ... FROM (SELECT ... GROUP BY ...)`.
+    ### The idea
 
-    **Read up on:**
-    - Row triggers on `INSERT OR UPDATE OR DELETE`, `TG_OP`, `OLD`, `NEW`
-    - `UPDATE ... FROM`, `LEFT JOIN` with aggregates and `coalesce`
+    A totals trigger written only for INSERT drifts as soon as lines are updated or deleted. Treat every change as "remove the old contribution, add the new one":
+
+    | `TG_OP` | adjust |
+    |---|---|
+    | `INSERT` | `+ NEW` on `NEW.order_id` |
+    | `DELETE` | `- OLD` on `OLD.order_id` |
+    | `UPDATE` | `- OLD` on `OLD.order_id`, `+ NEW` on `NEW.order_id` (they may differ!) |
+
+    Return `NULL` from an `AFTER` trigger (the value is ignored). Then **recompute** the existing values once from the lines, with orders without lines set to 0:
+
+    ```sql
+    UPDATE orders o SET total = coalesce(s.t, 0), line_count = coalesce(s.c, 0)
+    FROM orders o2 LEFT JOIN (SELECT order_id, sum(qty * unit_price) t, count(*) c FROM order_lines GROUP BY 1) s
+      ON s.order_id = o2.id
+    WHERE o.id = o2.id;
+    ```
+
+    ### Commands you'll use
+
+    ```bash
+    q() { docker exec kl-pg psql -U lab -d lab -c "$1"; }
+    q "SELECT o.id, o.total, sum(l.qty * l.unit_price) FROM orders o LEFT JOIN order_lines l ON l.order_id = o.id
+       GROUP BY o.id HAVING o.total IS DISTINCT FROM coalesce(sum(l.qty * l.unit_price), 0) LIMIT 5"
+    q "UPDATE order_lines SET order_id = 2 WHERE id = 10"     # a move: both orders must change
+    ```
+    That first query is your drift detector. Run it after each test change.
+
+    ### Common mistakes
+
+    - Forgetting the `UPDATE` that changes `order_id`.
+    - A statement-level trigger using `NEW`: it has none.
+
+    ### Check your work
+
+    The drift query returns nothing, and stays empty after inserting, updating (including moving a line) and deleting lines.
   scenario: |
     In **`kl-pg`**, **`orders`** (`id`, `customer`, `total`, `line_count`) stores the sum of
     `qty * unit_price` and the number of lines of **`order_lines`** (`id`, `order_id`,
@@ -1443,21 +1745,46 @@ exercises:
   kind: build
   tags: [postgres, constraint-trigger, deferrable, plpgsql, integrity, accounting]
   tutorial: |
-    **Concept.** Some rules span **several rows**. In double-entry bookkeeping, the lines of
-    a journal entry must add up to zero. A `CHECK` constraint only sees one row. A normal
-    trigger fires after each statement's rows, when the entry is still half-written
-    (the debit is in, the credit isn't yet).
+    **What you're learning.** Rules checked **at commit time**: deferrable constraint triggers.
 
-    A **constraint trigger** created **`DEFERRABLE INITIALLY DEFERRED`** fires at
-    **COMMIT** instead, once the whole transaction is in place. If it raises an error,
-    the commit fails and the whole transaction is rolled back. It has to look at every
-    entry a change touches: on UPDATE a line can move from one entry (`OLD.entry_id`) to
-    another (`NEW.entry_id`), and on DELETE only `OLD` exists.
+    ### The idea
 
-    **Read up on:**
-    - `CREATE CONSTRAINT TRIGGER ... AFTER ... DEFERRABLE INITIALLY DEFERRED FOR EACH ROW`
-    - `SET CONSTRAINTS`, and what happens to a transaction whose deferred trigger fails
-    - `RAISE EXCEPTION ... USING ERRCODE`
+    "An entry's lines sum to zero" can't hold after **each** statement: you insert lines one at a time. Check it when the transaction **commits**:
+
+    ```sql
+    CREATE CONSTRAINT TRIGGER lines_balance
+    AFTER INSERT OR UPDATE OR DELETE ON journal_lines
+    DEFERRABLE INITIALLY DEFERRED
+    FOR EACH ROW EXECUTE FUNCTION check_balance();
+    ```
+    The function sums the affected entry's lines (`coalesce(NEW.entry_id, OLD.entry_id)`) and raises if they're non-zero. Deferred, it runs at `COMMIT`. A failure aborts the whole transaction. `SET CONSTRAINTS ALL IMMEDIATE` checks earlier, for debugging.
+
+    A line **moved** to another entry affects two entries: check both (`OLD.entry_id` and `NEW.entry_id`).
+
+    ### Commands you'll use
+
+    ```bash
+    docker exec -i kl-pg psql -U lab -d lab <<'SQL'
+    BEGIN;
+    INSERT INTO journal_entries (id, posted_on, memo) VALUES (900, current_date, 'test');
+    INSERT INTO journal_lines (entry_id, account, amount) VALUES (900, 'cash', 100);
+    INSERT INTO journal_lines (entry_id, account, amount) VALUES (900, 'sales', -90);
+    COMMIT;
+    SQL
+    ```
+    ```text
+    ERROR:  entry 900 is unbalanced
+    ```
+
+    ### Common mistakes
+
+    - A regular (non-deferred) trigger: the first line of every entry fails.
+    - A `CHECK` constraint: it can't look at other rows.
+    - Deleting the bad entries' lines but not the entries (or the reverse).
+
+    ### Check your work
+
+    `unbalanced.txt` lists the bad entries (now deleted), a balanced multi-line transaction commits, and an unbalanced one fails at `COMMIT` with a message containing `unbalanced`.
   scenario: |
     In **`kl-pg`**, **`journal_entries`** (`id`, `posted_on`, `memo`) each have lines in
     **`journal_lines`** (`id`, `entry_id`, `account`, `amount`): debits are positive,
@@ -1622,24 +1949,31 @@ exercises:
   kind: fix
   tags: [incident, postgres, triggers, security-definer, search-path, troubleshooting]
   tutorial: |
-    **Concept.** Logic in the database fails in ways the application can't explain, so
-    look at what the database runs on its own:
+    **What you're learning.** A release that broke triggers: missing or disabled triggers, wrong tables, and permissions inside trigger functions.
 
-    - **Triggers**: `\d table` lists them, including **disabled** ones, and `\sf function`
-      shows the code. A trigger that updates its own table can **recurse** until *stack
-      depth limit exceeded*. Change `NEW` in a BEFORE trigger instead, or guard with
-      `pg_trigger_depth()`.
-    - **Privileges inside triggers**: a trigger function runs as the caller unless it is
-      `SECURITY DEFINER`.
-    - **Per-role settings**: `ALTER ROLE ... SET search_path` silently changes which
-      table an unqualified name means. `\drds` (or `pg_db_role_setting`) lists them.
+    ### Method
 
-    Fix one layer at a time: each fix may uncover the next problem.
+    Reproduce each complaint **as `app`**, then read the trigger setup:
 
-    **Read up on:**
-    - `ALTER TABLE ... ENABLE TRIGGER`, `pg_trigger.tgenabled`
-    - `pg_trigger_depth()`, BEFORE versus AFTER triggers
-    - `ALTER FUNCTION ... SECURITY DEFINER SET search_path`, `ALTER ROLE ... RESET`
+    ```bash
+    a() { docker exec -e PGPASSWORD=app-pw kl-pg psql -h 127.0.0.1 -U app -d lab -v VERBOSITY=verbose -c "$1"; }
+    a "UPDATE accounts SET balance = balance WHERE id = 1"
+    docker exec kl-pg psql -U lab -d lab -c '\d accounts' -c '\d transfers' -c '\dn'
+    docker exec kl-pg psql -U lab -d lab -c "SELECT tgname, tgrelid::regclass, tgenabled FROM pg_trigger WHERE NOT tgisinternal"
+    docker exec -e PGPASSWORD=app-pw kl-pg psql -h 127.0.0.1 -U app -d lab -Atc 'SHOW search_path'
+    ```
+
+    | complaint | where to look (exercise) |
+    |---|---|
+    | updates fail | the `BEFORE UPDATE` function references a column that doesn't exist, or returns NULL (data-077, data-080) |
+    | transfers "disappear" | `app`'s `search_path` puts another schema first, so its inserts land in a table there |
+    | audit stopped | `tgenabled = 'D'` (disabled), or the function can't write `audit_log` as `app`: `SECURITY DEFINER` with a pinned `search_path` (data-079) |
+
+    `\sf function` shows each function's source.
+
+    ### Check your work
+
+    As `app`: the update works and sets the row's timestamp, every insert, update and delete on `accounts` adds an audit row with `accounts_audit` enabled, and a new transfer appears in `public.transfers`.
   scenario: |
     The payments app connects to **`kl-pg`** as **`app`** (password **`app-pw`**). Since
     this morning's release:

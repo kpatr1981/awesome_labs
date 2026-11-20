@@ -12,14 +12,38 @@ exercises:
   kind: build
   tags: [postgres, group-by, having, aggregates]
   tutorial: |
-    **Concept.** `WHERE` filters **rows** before grouping, and `HAVING`
-    filters **groups** after aggregation. So "customers with more than three
-    orders this year" is `WHERE` on the date, `GROUP BY customer`, then
-    `HAVING count(*) > 3`.
+    **What you're learning.** Counting groups that meet a condition: `GROUP BY ... HAVING` inside a subquery.
 
-    **Read up on:**
-    - `GROUP BY`, `HAVING`, `count(*)`
-    - Date ranges: `>= '2026-01-01' AND < '2027-01-01'`
+    ### The idea
+
+    `WHERE` filters **rows** before grouping, and `HAVING` filters **groups** after. "How many customers did X" means: group per customer, keep the groups that qualify, then count them in an outer query:
+
+    ```sql
+    SELECT count(*) FROM (
+      SELECT customer_id FROM orders
+      WHERE placed_at >= '2026-01-01'
+      GROUP BY customer_id
+      HAVING count(DISTINCT placed_at::date) >= 3
+    ) t;
+    ```
+    `count(DISTINCT expr)` counts different values only, so two orders on the same day count once.
+
+    ### Commands you'll use
+
+    ```bash
+    docker exec kl-pg psql -U lab -d lab -c '\d visits'
+    docker exec kl-pg psql -U lab -d lab -c "SELECT member_id, count(*) FROM visits GROUP BY member_id HAVING count(*) > 5 ORDER BY 2 DESC LIMIT 5"
+    docker exec kl-pg psql -U lab -d lab -Atc "SELECT count(*) FROM (SELECT member_id FROM visits GROUP BY member_id HAVING count(*) > 5) t"
+    ```
+
+    ### Common mistakes
+
+    - `count(*)` without the subquery: one row per customer, not the total.
+    - Counting orders when the task counts distinct months or days: read what "comes back" means.
+
+    ### Check your work
+
+    `answer.txt` holds one number, and the inner query's row count matches it.
   scenario: |
     PostgreSQL runs in **`kl-pg`** (`docker exec -it kl-pg psql -U lab -d lab`).
     The table **`orders`** has `id`, `customer_id`, `placed_at` (timestamp) and
@@ -56,14 +80,37 @@ exercises:
   kind: build
   tags: [postgres, jsonb, operators, gin-index]
   tutorial: |
-    **Concept.** `jsonb` columns store JSON in a binary form you can query.
-    `payload->'customer'` returns JSON, `payload->>'plan'` returns **text**, and
-    `payload @> '{"plan": "pro"}'` tests containment. A **GIN index** on the
-    column (`USING gin (payload)`) makes `@>` queries fast.
+    **What you're learning.** Querying `jsonb`: `->`, `->>`, containment `@>`, and a GIN index.
 
-    **Read up on:**
-    - PostgreSQL JSON functions and operators: `->`, `->>`, `@>`, `#>>`
-    - `CREATE INDEX ... USING gin`
+    ### The idea
+
+    | operator | returns |
+    |---|---|
+    | `payload -> 'user'` | jsonb |
+    | `payload ->> 'type'` | text |
+    | `payload #>> '{user,country}'` | text at a path |
+    | `payload @> '{"type": "signup"}'` | true if the document **contains** that structure |
+
+    A **GIN** index on the column (`USING gin (payload)`) speeds up `@>` and key-existence (`?`) queries. Plain `->>` comparisons don't use it, though an expression index on `(payload->>'type')` would serve them.
+
+    ### Commands you'll use
+
+    ```bash
+    q() { docker exec kl-pg psql -U lab -d lab -c "$1"; }
+    q "SELECT payload FROM logs LIMIT 2"
+    q "SELECT count(*) FROM logs WHERE payload @> '{\"action\": \"refund\", \"meta\": {\"channel\": \"web\"}}'"
+    q "CREATE INDEX logs_payload_gin ON logs USING gin (payload)"
+    q "EXPLAIN SELECT count(*) FROM logs WHERE payload @> '{\"action\": \"refund\"}'"      # Bitmap Index Scan on logs_payload_gin
+    ```
+
+    ### Common mistakes
+
+    - `payload->'plan' = 'pro'`: compares jsonb with text. Use `->>`, or `@>`.
+    - A B-tree index on the whole jsonb column: useless for containment.
+
+    ### Check your work
+
+    The count matches the containment query, and `EXPLAIN` of a containment query uses the GIN index.
   scenario: |
     The table **`events`** has an `id` and a `jsonb` column **`payload`**, for
     example `{"type": "upgrade", "plan": "pro", "customer": {"country": "GR"}}`.
@@ -104,15 +151,38 @@ exercises:
   kind: fix
   tags: [postgres, upsert, on-conflict, idempotence]
   tutorial: |
-    **Concept.** `INSERT ... ON CONFLICT (key) DO UPDATE SET col =
-    EXCLUDED.col` is an **upsert**: it inserts new rows and updates the
-    existing ones in one atomic statement. `EXCLUDED` is the row that was
-    proposed for insertion. An import written this way is **idempotent**:
-    running it again leaves the same result.
+    **What you're learning.** Idempotent imports: a staging table plus `INSERT ... ON CONFLICT DO UPDATE`.
 
-    **Read up on:**
-    - `INSERT ... ON CONFLICT ... DO UPDATE` / `DO NOTHING`
-    - The `EXCLUDED` pseudo-table
+    ### The idea
+
+    An import that blindly `INSERT`s fails on the second run (duplicate keys) or duplicates data. Load the file into a **temporary staging table**, then **upsert**:
+
+    ```sql
+    CREATE TEMP TABLE incoming (LIKE inventory);
+    \copy incoming FROM '/lab/inv.csv' WITH (FORMAT csv, HEADER true)
+    INSERT INTO inventory SELECT * FROM incoming
+    ON CONFLICT (code) DO UPDATE SET qty = EXCLUDED.qty, updated_at = EXCLUDED.updated_at;
+    ```
+    Running it twice gives the same final table. `\copy` reads the file on the **client** side, so the path is where psql runs.
+
+    ### Commands you'll use
+
+    ```bash
+    docker cp /lab/inv.csv kl-pg:/tmp/inv.csv
+    docker exec -i kl-pg psql -U lab -d lab -v ON_ERROR_STOP=1 -f /dev/stdin < /lab/import.sql
+    docker exec -i kl-pg psql -U lab -d lab -v ON_ERROR_STOP=1 -f /dev/stdin < /lab/import.sql     # again: no error
+    docker exec kl-pg psql -U lab -d lab -Atc 'SELECT count(*), sum(qty) FROM inventory'
+    ```
+    The file path inside `\copy` must exist where psql runs: here, inside the container.
+
+    ### Common mistakes
+
+    - `DO NOTHING`: changed quantities never update.
+    - A duplicated key **within** the CSV: "cannot affect row a second time". Deduplicate in the staging step.
+
+    ### Check your work
+
+    Running `import.sql` twice succeeds both times, and `stock` matches the CSV.
   scenario: |
     The nightly stock import **`/lab/import.sql`** loads
     **`/lab/stock.csv`** into the table **`stock(sku PRIMARY KEY, qty,
@@ -181,16 +251,38 @@ exercises:
   kind: build
   tags: [postgres, roles, grants, default-privileges, security]
   tutorial: |
-    **Concept.** Privileges in PostgreSQL work at several levels. A role
-    needs `CONNECT` on the database and `USAGE` on the schema before `SELECT`
-    on a table is any use. `GRANT SELECT ON ALL TABLES IN SCHEMA` covers the
-    tables that exist **now**. **`ALTER DEFAULT PRIVILEGES`** covers tables
-    created **later** (by the role that creates them).
+    **What you're learning.** A read-only login role: `SELECT` on existing tables plus default privileges for future ones.
 
-    **Read up on:**
-    - `CREATE ROLE ... LOGIN PASSWORD`
-    - `GRANT USAGE ON SCHEMA`, `GRANT SELECT ON ALL TABLES IN SCHEMA`
-    - `ALTER DEFAULT PRIVILEGES IN SCHEMA ... GRANT SELECT ON TABLES TO ...`
+    ### The idea
+
+    | grant | covers |
+    |---|---|
+    | `GRANT USAGE ON SCHEMA app` | entering the schema |
+    | `GRANT SELECT ON ALL TABLES IN SCHEMA app` | tables that exist **now** |
+    | `ALTER DEFAULT PRIVILEGES FOR ROLE owner IN SCHEMA app GRANT SELECT ON TABLES` | tables `owner` creates **later** |
+
+    Default privileges are tied to the **creating** role, so name it with `FOR ROLE` (data-021). Nothing else is granted, so writes fail.
+
+    ### Commands you'll use
+
+    ```bash
+    q() { docker exec -i kl-pg psql -U lab -d lab -v ON_ERROR_STOP=1 -c "$1"; }
+    q "CREATE ROLE auditor LOGIN PASSWORD 'aud1t'"
+    q "GRANT USAGE ON SCHEMA shop TO auditor"
+    q "GRANT SELECT ON ALL TABLES IN SCHEMA shop TO auditor"
+    q "ALTER DEFAULT PRIVILEGES FOR ROLE lab IN SCHEMA shop GRANT SELECT ON TABLES TO auditor"
+    q '\ddp'
+    docker exec -e PGPASSWORD=aud1t kl-pg psql -h 127.0.0.1 -U auditor -d lab -c 'DELETE FROM shop.items'   # permission denied
+    ```
+
+    ### Common mistakes
+
+    - Default privileges without `FOR ROLE lab` when another role runs the command.
+    - `GRANT ALL`: allows writes.
+
+    ### Check your work
+
+    `reporting` logs in, reads every `app` table and a newly created one, and every write or `CREATE` is refused.
   scenario: |
     The application's tables live in the schema **`app`** (owned by `lab`).
     Create a login role **`reporting`** with password **`r3ports`** that:
@@ -243,15 +335,36 @@ exercises:
   kind: build
   tags: [postgres, partial-index, unique, constraints]
   tutorial: |
-    **Concept.** A **partial unique index** enforces uniqueness only over the
-    rows matching its `WHERE` clause. `CREATE UNIQUE INDEX ... ON subs
-    (customer_id) WHERE status = 'active'` allows any number of cancelled
-    subscriptions per customer, but only **one active** one. A plain `UNIQUE`
-    constraint can't express that.
+    **What you're learning.** "At most one active row per X" with a **partial unique index**.
 
-    **Read up on:**
-    - Partial indexes
-    - `CREATE UNIQUE INDEX ... WHERE ...`
+    ### The idea
+
+    A plain `UNIQUE (customer_id)` would allow only one subscription per customer **ever**. A partial unique index applies only to matching rows:
+
+    ```sql
+    CREATE UNIQUE INDEX one_active_plan ON plans (account_id) WHERE state = 'active';
+    ```
+    Any number of cancelled rows, at most one active. Existing violations must be fixed first, according to the policy (for example, keep the newest active row and cancel the rest).
+
+    ### Commands you'll use
+
+    ```bash
+    q() { docker exec -i kl-pg psql -U lab -d lab -c "$1"; }
+    q "SELECT account_id, count(*) FROM plans WHERE state = 'active' GROUP BY 1 HAVING count(*) > 1"
+    q "UPDATE plans p SET state = 'cancelled' WHERE state = 'active'
+       AND id < (SELECT max(id) FROM plans q WHERE q.account_id = p.account_id AND q.state = 'active')"
+    q "CREATE UNIQUE INDEX one_active_plan ON plans (account_id) WHERE state = 'active'"
+    q "INSERT INTO plans (account_id, state) VALUES (1, 'active')"         # duplicate key value violates unique constraint
+    ```
+
+    ### Common mistakes
+
+    - Deleting the extra rows when the policy says cancel them.
+    - Keeping the oldest when the task says keep the newest (read it).
+
+    ### Check your work
+
+    No customer has two active subscriptions, a second active one is refused, and cancelled rows are unlimited.
   scenario: |
     The table **`subscriptions`** (`id`, `customer_id`, `status`) has a bug:
     some customers ended up with **two active subscriptions**. Clean that up
@@ -297,14 +410,33 @@ exercises:
   kind: build
   tags: [postgres, pg_dump, pg_restore, custom-format]
   tutorial: |
-    **Concept.** `pg_dump -Fc` writes a **custom-format** archive, which is
-    compressed and can be restored selectively with `pg_restore`. `-t TABLE`
-    dumps a single table with its indexes and constraints. `pg_restore -d DB`
-    loads it into another database, and `--no-owner` skips ownership commands
-    when the target has different roles.
+    **What you're learning.** Moving one table between databases with `pg_dump -t` and `pg_restore`.
 
-    **Read up on:**
-    - `pg_dump -Fc -t`, `pg_restore -d --no-owner`, `pg_restore -l`
+    ### The idea
+
+    `pg_dump -Fc -t TABLE DB` dumps one table (structure, data, its indexes and constraints) in custom format. `pg_restore -d OTHERDB FILE` loads it into another database. Foreign keys to tables that aren't in the target fail, so check the table's dependencies first.
+
+    To keep the file on the host, write the dump to stdout and redirect: `docker exec kl-pg pg_dump ... > /lab/x.dump`. Load it the same way: `docker exec -i kl-pg pg_restore ... < /lab/x.dump`.
+
+    ### Commands you'll use
+
+    ```bash
+    docker exec kl-pg psql -U lab -d lab -c '\d receipts'
+    docker exec kl-pg pg_dump -U lab -Fc -t public.receipts lab > /lab/receipts.dump
+    docker exec -i kl-pg pg_restore -U lab -l < /lab/receipts.dump | head
+    docker exec -i kl-pg pg_restore -U lab -d reporting < /lab/receipts.dump
+    docker exec kl-pg psql -U lab -d reporting -c '\d receipts' -c 'SELECT count(*) FROM receipts'
+    ```
+
+    ### Common mistakes
+
+    - `-t invoices` matching more than intended: use `schema.table`.
+    - Plain SQL format (`-Fp`) when custom format is asked.
+    - Restoring into `lab` again.
+
+    ### Check your work
+
+    `/lab/invoices.dump` is a custom-format archive (`pg_restore -l` reads it), and `analytics.public.invoices` has the same columns, indexes and row count as the source.
   scenario: |
     Copy the table **`public.invoices`** (structure, data and indexes) from
     the database **`lab`** to the existing, empty database **`analytics`** in
@@ -342,15 +474,41 @@ exercises:
   kind: fix
   tags: [postgres, sequences, setval, serial, migration]
   tutorial: |
-    **Concept.** A `serial` / identity column draws its values from a
-    **sequence**. When rows are loaded **with explicit IDs** (a migration, a
-    restore), the sequence doesn't move, so the next normal insert reuses an
-    ID that already exists. Fix it by moving the sequence past the current
-    maximum: `SELECT setval(pg_get_serial_sequence('orders', 'id'),
-    (SELECT max(id) FROM orders))`.
+    **What you're learning.** Sequences out of step with the data: `setval` and `pg_get_serial_sequence`.
 
-    **Read up on:**
-    - `pg_get_serial_sequence`, `setval`, `nextval`, `currval`
+    ### The idea
+
+    A `serial` or identity column takes its next value from a **sequence**. Rows inserted **with explicit ids** (a migration copying old data) don't advance it, so the next default id collides with an existing row:
+
+    ```text
+    ERROR:  duplicate key value violates unique constraint "orders_pkey"
+    DETAIL:  Key (id)=(17) already exists.
+    ```
+    Move the sequence past the highest id:
+
+    ```sql
+    SELECT setval(pg_get_serial_sequence('orders', 'id'), (SELECT max(id) FROM orders));
+    ```
+    The next `nextval` then returns max + 1.
+
+    ### Commands you'll use
+
+    ```bash
+    q() { docker exec kl-pg psql -U lab -d lab -c "$1"; }
+    q "SELECT pg_get_serial_sequence('tickets', 'id')"                          # public.tickets_id_seq
+    q "SELECT last_value, (SELECT max(id) FROM tickets) FROM tickets_id_seq"
+    q "SELECT setval(pg_get_serial_sequence('tickets', 'id'), (SELECT max(id) FROM tickets))"
+    q "INSERT INTO tickets (subject) VALUES ('probe') RETURNING id"
+    ```
+
+    ### Common mistakes
+
+    - Deleting the colliding rows.
+    - `setval(..., max(id) + 1)`: works but skips one id (fine), whereas `setval(..., n, false)` means "next value is n".
+
+    ### Check your work
+
+    A normal `INSERT` without an id succeeds and gets an id above every existing one.
   scenario: |
     After last night's migration copied old orders into **`orders`** with
     their original IDs, the application can't create new orders: *duplicate
@@ -385,16 +543,45 @@ exercises:
   kind: build
   tags: [postgres, copy, csv, null-handling]
   tutorial: |
-    **Concept.** `COPY ... FROM` loads CSV at full speed. Its options decide
-    how the file is read: `HEADER` skips the first line, `DELIMITER` sets the
-    separator, `NULL 'NA'` says which text means NULL, and `FORCE_NULL (col)`
-    turns empty quoted strings into NULL. The client-side **`\copy`** in psql
-    reads files on **your** machine, while `COPY` reads files on the
-    **server**.
+    **What you're learning.** `COPY` options for real-world CSV: delimiter, header, and a custom NULL marker.
 
-    **Read up on:**
-    - `COPY ... WITH (FORMAT csv, HEADER, DELIMITER, NULL, FORCE_NULL)`
-    - psql `\copy` vs SQL `COPY`
+    ### The idea
+
+    | option | for |
+    |---|---|
+    | `FORMAT csv` | quoted fields, embedded commas |
+    | `HEADER true` | skip the first line |
+    | `DELIMITER ';'` | semicolon-separated files |
+    | `NULL 'NA'` | the text that means "no value" |
+    | `FORCE_NULL (col)` | treat a quoted empty or NA value as NULL too |
+
+    Without `NULL 'NA'`, loading `NA` into a numeric column fails: `invalid input syntax for type numeric: "NA"`.
+
+    ### Commands you'll use
+
+    ```bash
+    head -3 /lab/items.csv
+    ```
+    ```text
+    code;title;cost;qty
+    A1;Bolt;0.20;500
+    A2;Nut;-;300
+    ```
+    ```bash
+    docker exec -i kl-pg psql -U lab -d lab -v ON_ERROR_STOP=1 \
+      -c "\copy items FROM STDIN WITH (FORMAT csv, HEADER true, DELIMITER ';', NULL '-')" < /lab/items.csv
+    docker exec kl-pg psql -U lab -d lab -c "SELECT count(*), count(cost) FROM items"
+    ```
+    `count(col)` skips NULLs, so the difference is how many prices were missing.
+
+    ### Common mistakes
+
+    - `sed 's/NA//'` on the file: also changes names containing "NA".
+    - Forgetting `HEADER`: the header row fails to parse as data.
+
+    ### Check your work
+
+    Every row is loaded, and the rows with `NA` have a NULL price.
   scenario: |
     The supplier sends **`/lab/products.csv`**: semicolon-separated, with a
     header line, and missing prices written as **`NA`**. Load it into the
@@ -436,13 +623,38 @@ exercises:
   kind: build
   tags: [redis, sorted-set, zadd, zrevrank, leaderboard]
   tutorial: |
-    **Concept.** A Redis **sorted set** keeps members ordered by a numeric
-    score. `ZINCRBY` adds points, `ZREVRANGE key 0 2 WITHSCORES` returns the
-    top three, and `ZREVRANK` gives a member's 0-based position from the top.
-    Every operation is O(log n), which is why leaderboards live in sorted sets.
+    **What you're learning.** Sorted-set updates and queries: `ZINCRBY`, `ZREVRANGE`, `ZREVRANK`.
 
-    **Read up on:**
-    - `ZADD`, `ZINCRBY`, `ZREVRANGE ... WITHSCORES`, `ZREVRANK`, `ZSCORE`
+    ### The idea
+
+    | command | does |
+    |---|---|
+    | `ZINCRBY key N member` | **adds** N to the member's score (creating it at N) |
+    | `ZREVRANGE key 0 2` | top three, highest first |
+    | `ZREVRANK key member` | 0-based rank from the top |
+    | `ZSCORE key member` | its score |
+
+    Ranks start at 0, so a "1-based rank" is `ZREVRANK + 1`. Note the argument order: `ZINCRBY key increment member`.
+
+    ### Commands you'll use
+
+    ```bash
+    r() { docker exec kl-redis redis-cli "$@"; }
+    r ZREVRANGE lb:week 0 4 WITHSCORES
+    while read -r name pts; do r ZINCRBY lb:week "$pts" "$name" >/dev/null; done < /lab/scores.txt
+    r ZREVRANGE lb:week 0 2
+    echo $(( $(r ZREVRANK lb:week orion) + 1 ))
+    ```
+    Check the file's column order before the loop: `points player` or `player points`.
+
+    ### Common mistakes
+
+    - `ZADD`: **replaces** the score instead of adding to it.
+    - The increment and the member swapped.
+
+    ### Check your work
+
+    Each player's score rose by their results, `top3.txt` has the top three names, and `nova.txt` holds the 1-based rank.
   scenario: |
     Redis runs in **`kl-redis`** (`docker exec -it kl-redis redis-cli`). Today's
     match results are in **`/lab/results.txt`**, one `player points` pair per
@@ -506,16 +718,40 @@ exercises:
   kind: build
   tags: [redis, memory, bigkeys, memory-usage, scan]
   tutorial: |
-    **Concept.** When Redis memory grows, find the **big keys**.
-    `redis-cli --bigkeys` samples the keyspace with `SCAN` and reports the
-    largest key of each type by element count. `redis-cli --memkeys` (or
-    `MEMORY USAGE key` per key) reports **bytes**, which is what really
-    matters. Never use `KEYS *` on a busy server: it blocks while it walks
-    everything. Use `SCAN`.
+    **What you're learning.** Finding big keys: `--memkeys`, `--bigkeys` and `MEMORY USAGE`, and deleting without blocking (`UNLINK`).
 
-    **Read up on:**
-    - `redis-cli --bigkeys`, `--memkeys`
-    - `MEMORY USAGE`, `SCAN ... MATCH ... COUNT`
+    ### The idea
+
+    | tool | finds |
+    |---|---|
+    | `redis-cli --memkeys` | the key using the most memory, per type |
+    | `redis-cli --bigkeys` | the largest key by element count, per type |
+    | `MEMORY USAGE key` | bytes for one key |
+
+    Both scans use `SCAN`, so they're safe on a live server. `DEL` of a huge key blocks Redis while it frees memory. **`UNLINK`** frees it in the background.
+
+    ### Commands you'll use
+
+    ```bash
+    docker exec kl-redis redis-cli --memkeys
+    ```
+    ```text
+    Biggest   hash found "cache:export:9" has 52428912 bytes
+    ```
+    ```bash
+    docker exec kl-redis redis-cli MEMORY USAGE cache:export:9
+    docker exec kl-redis redis-cli UNLINK cache:export:9
+    docker exec kl-redis redis-cli INFO memory | grep used_memory_human
+    ```
+
+    ### Common mistakes
+
+    - `--bigkeys`: the largest by element count isn't always the largest in bytes.
+    - `KEYS *` plus a loop: blocks the server.
+
+    ### Check your work
+
+    `answer.txt` holds the key that `--memkeys` reports as biggest overall, it's gone, and memory usage dropped.
   scenario: |
     The Redis in **`kl-redis`** has thousands of keys, and memory has doubled
     this week. Write the name of the **single key using the most memory**
@@ -570,14 +806,40 @@ exercises:
   kind: build
   tags: [redis, geo, geosearch, geospatial]
   tutorial: |
-    **Concept.** Redis **geo** commands store longitude/latitude pairs in a
-    sorted set (encoded as geohashes). `GEOADD key lon lat member` adds a
-    location, and `GEOSEARCH key FROMLONLAT lon lat BYRADIUS 5 km ASC COUNT
-    3` returns the nearest members within a radius. `WITHDIST` adds the
-    distance. Note that **longitude comes first**.
+    **What you're learning.** Redis **geo** commands: `GEOADD` (longitude first!) and `GEOSEARCH`.
 
-    **Read up on:**
-    - `GEOADD`, `GEOSEARCH`, `GEODIST`, `GEOPOS`
+    ### The idea
+
+    Geo keys are sorted sets with encoded positions:
+
+    | command | does |
+    |---|---|
+    | `GEOADD key LON LAT member` | add (**longitude, then latitude**) |
+    | `GEOSEARCH key FROMLONLAT LON LAT BYRADIUS 5 km ASC COUNT 3` | nearest members |
+    | `GEODIST key a b km` | distance between two members |
+
+    Data files usually list `lat,lon`, so swap them when loading. Valid latitudes are ±85.05, and Redis rejects swapped coordinates outside that range, but swapped values inside it load silently in the wrong place.
+
+    ### Commands you'll use
+
+    ```bash
+    head -2 /lab/depots.csv                       # name,lat,lon
+    tail -n +2 /lab/depots.csv | while IFS=, read -r name lat lon; do
+      docker exec kl-redis redis-cli GEOADD depots "$lon" "$lat" "$name" >/dev/null
+    done
+    docker exec kl-redis redis-cli GEOPOS depots "$(tail -n +2 /lab/depots.csv | head -1 | cut -d, -f1)"
+    docker exec kl-redis redis-cli GEOSEARCH depots FROMLONLAT 22.9444 40.6401 BYRADIUS 50 km ASC COUNT 3 WITHDIST
+    ```
+    `tail -n +2` skips a header line (check whether the file has one).
+
+    ### Common mistakes
+
+    - `GEOADD key lat lon`: the stores land somewhere else.
+    - `BYRADIUS` too small: fewer than three results.
+
+    ### Check your work
+
+    `GEOPOS` returns each store's coordinates as longitude/latitude, and `nearest.txt` lists the three closest names, nearest first.
   scenario: |
     **`/lab/stores.csv`** lists stores as `name,lat,lon` (note the order).
     Load them into the geo key **`stores`** in **`kl-redis`**, then write the
@@ -634,15 +896,43 @@ exercises:
   kind: build
   tags: [postgres, recursive-cte, hierarchy, tree]
   tutorial: |
-    **Concept.** Hierarchies stored as `manager_id` pointers need
-    **recursion** to answer "everyone below X". `WITH RECURSIVE` starts from
-    an *anchor* query (X's direct reports) and repeatedly joins the previous
-    result back to the table (their reports) until no new rows appear. Track
-    the **depth** in a column to answer "how many levels down".
+    **What you're learning.** Recursive CTEs that track **depth**.
 
-    **Read up on:**
-    - `WITH RECURSIVE ... UNION ALL ...`
-    - Guarding against cycles
+    ### The idea
+
+    A recursive CTE starts from the base rows and repeatedly adds the next level (data-018). Carrying a counter shows how deep each row is:
+
+    ```sql
+    WITH RECURSIVE tree AS (
+      SELECT id, 1 AS depth FROM staff WHERE manager_id = (SELECT id FROM staff WHERE title = 'COO')
+      UNION ALL
+      SELECT s.id, t.depth + 1 FROM staff s JOIN tree t ON s.manager_id = t.id
+    )
+    SELECT count(*), max(depth) FROM tree;
+    ```
+    Starting from the **direct reports** excludes the top person and makes them level 1.
+
+    ### Commands you'll use
+
+    ```bash
+    docker exec -i kl-pg psql -U lab -d lab -At <<'SQL'
+    WITH RECURSIVE tree AS (
+      SELECT id, 1 AS depth FROM staff WHERE manager_id = (SELECT id FROM staff WHERE title = 'COO')
+      UNION ALL
+      SELECT s.id, t.depth + 1 FROM staff s JOIN tree t ON s.manager_id = t.id
+    )
+    SELECT count(*) || E'\n' || max(depth) FROM tree;
+    SQL
+    ```
+
+    ### Common mistakes
+
+    - `UNION` vs `UNION ALL`: equivalent for a tree, but `UNION ALL` is cheaper.
+    - A cycle in bad data loops forever: add `WHERE depth < 100` while exploring.
+
+    ### Check your work
+
+    `answer.txt` has two lines, the count below the CTO and the maximum depth, matching the query output.
   scenario: |
     The table **`employees`** has `id`, `name`, `title` and `manager_id`. Write
     two lines to **`/lab/answer.txt`**:
@@ -701,16 +991,37 @@ exercises:
   kind: build
   tags: [postgres, full-text-search, tsvector, gin, ranking]
   tutorial: |
-    **Concept.** `LIKE '%term%'` can't use a normal index and doesn't know
-    that "restarting" matches "restart". PostgreSQL's **full-text search**
-    turns text into a `tsvector` of normalised lexemes (`to_tsvector('english',
-    body)`) and queries into a `tsquery` (`websearch_to_tsquery`). `@@`
-    matches them, `ts_rank` scores them, and a **GIN index** on a
-    **generated `tsvector` column** keeps it fast.
+    **What you're learning.** Full-text search done properly: a generated `tsvector` column, a GIN index, and ranking.
 
-    **Read up on:**
-    - `to_tsvector`, `websearch_to_tsquery`, `@@`, `ts_rank`
-    - `GENERATED ALWAYS AS (...) STORED` columns
+    ### The idea
+
+    ```sql
+    ALTER TABLE notes ADD COLUMN search tsvector
+      GENERATED ALWAYS AS (to_tsvector('english', title || ' ' || body)) STORED;
+    CREATE INDEX notes_search ON notes USING gin (search);
+    ```
+    The column updates itself on every write, and the index makes `@@` fast. `websearch_to_tsquery('english', 'restart database')` turns a search-box string into a query (words ANDed, quotes for phrases, `-` to exclude). `ts_rank(search, query)` scores matches, so order by it descending.
+
+    ### Commands you'll use
+
+    ```bash
+    q() { docker exec -i kl-pg psql -U lab -d lab -c "$1"; }
+    q "SELECT websearch_to_tsquery('english', 'rotate logs nightly')"            # 'rotat' & 'log' & 'night'
+    q "SELECT id, title, round(ts_rank(search, query)::numeric, 3) AS r
+       FROM notes, websearch_to_tsquery('english', 'rotate logs') query
+       WHERE search @@ query ORDER BY r DESC LIMIT 3"
+    q "EXPLAIN SELECT id FROM notes WHERE search @@ websearch_to_tsquery('english', 'rotate logs')"
+    ```
+
+    ### Common mistakes
+
+    - A different configuration in the column and the query (`simple` vs `english`): stems don't match.
+    - `title || body` without a space: the last word of the title fuses with the first of the body.
+    - A NULL title makes the whole concatenation NULL: wrap it with `coalesce`.
+
+    ### Check your work
+
+    `articles.search` is a generated column with a GIN index, and `answer.txt` holds the id at the top of the `ts_rank` ordering.
   scenario: |
     The table **`articles`** has `id`, `title` and `body`.
 
@@ -772,15 +1083,36 @@ exercises:
   kind: fix
   tags: [postgres, expression-index, explain, case-insensitive]
   tutorial: |
-    **Concept.** An index on `email` can't serve `WHERE lower(email) = ...`:
-    the planner sees a **function** of the column, not the column itself. An
-    **expression index** (`CREATE INDEX ON users (lower(email))`) stores the
-    function's result and lets that query use an index scan. Make it `UNIQUE`
-    and it also stops `Ana@x` and `ana@x` from both registering.
+    **What you're learning.** Making a case-insensitive lookup fast **and** unique with one expression index.
 
-    **Read up on:**
-    - Indexes on expressions
-    - `EXPLAIN` / `EXPLAIN ANALYZE`: `Seq Scan` vs `Index Scan`
+    ### The idea
+
+    A login query `WHERE lower(email) = lower($1)` can't use an index on `email` (data-015). A **unique** index on `lower(email)` both speeds it up and prevents case-variant duplicates (data-037):
+
+    ```sql
+    CREATE UNIQUE INDEX ON members (lower(email));
+    ```
+    Creating it fails if duplicates already exist: find and resolve them first.
+
+    ### Commands you'll use
+
+    ```bash
+    q() { docker exec kl-pg psql -U lab -d lab -c "$1"; }
+    q "EXPLAIN ANALYZE SELECT id FROM members WHERE lower(email) = 'a@b.test'"
+    q "SELECT lower(email), count(*) FROM members GROUP BY 1 HAVING count(*) > 1"
+    q "CREATE UNIQUE INDEX members_email_lower ON members (lower(email))"
+    q "EXPLAIN SELECT id FROM members WHERE lower(email) = 'a@b.test'"        # Index Scan using members_email_lower
+    ```
+    `CREATE INDEX CONCURRENTLY` builds it without blocking writes, but can't run inside a transaction.
+
+    ### Common mistakes
+
+    - Indexing `email` and changing the query: the task says don't.
+    - `citext` column type: also works, but changes the schema.
+
+    ### Check your work
+
+    The login query's plan uses an index on `lower(email)`, and that index is unique.
   scenario: |
     Logins run `SELECT id FROM users WHERE lower(email) = lower($1)`, and with
     half a million users each one does a sequential scan. Make that query
@@ -815,16 +1147,42 @@ exercises:
   kind: build
   tags: [postgres, lateral, top-n-per-group, window]
   tutorial: |
-    **Concept.** "The latest N rows per group" is a classic. One way uses a
-    window function: `row_number() OVER (PARTITION BY customer ORDER BY
-    placed_at DESC)` and keep `rn <= 2`. Another is **`LATERAL`**: for each
-    customer row, a subquery that may refer to it (`ORDER BY placed_at DESC
-    LIMIT 2`). With an index on `(customer_id, placed_at)` that subquery is a
-    tiny index scan per customer.
+    **What you're learning.** "Top N per group" in a view, with `LEFT JOIN LATERAL`.
 
-    **Read up on:**
-    - `JOIN LATERAL (...) ON true`
-    - `row_number() OVER (PARTITION BY ... ORDER BY ...)`
+    ### The idea
+
+    `LATERAL` lets a subquery in `FROM` refer to the current row of the table before it, a per-row subquery:
+
+    ```sql
+    SELECT a.id AS author_id, p.id AS post_id, p.published
+    FROM authors a
+    LEFT JOIN LATERAL (
+      SELECT id, published FROM posts WHERE posts.author_id = a.id
+      ORDER BY published DESC LIMIT 2
+    ) p ON true;
+    ```
+    `LEFT JOIN ... ON true` keeps authors with no posts (with NULLs). `row_number()` with `rn <= 2` is the alternative (data-006).
+
+    ### Commands you'll use
+
+    ```bash
+    docker exec -i kl-pg psql -U lab -d lab -v ON_ERROR_STOP=1 <<'SQL'
+    CREATE VIEW recent_posts AS
+    SELECT a.id AS author_id, p.id AS post_id, p.published
+    FROM authors a
+    LEFT JOIN LATERAL (SELECT id, published FROM posts WHERE author_id = a.id ORDER BY published DESC LIMIT 2) p ON true;
+    SQL
+    docker exec kl-pg psql -U lab -d lab -c 'SELECT * FROM recent_posts ORDER BY author_id, published DESC LIMIT 6'
+    ```
+
+    ### Common mistakes
+
+    - An inner `JOIN LATERAL`: customers without orders disappear.
+    - Ties on the timestamp: add a second sort key (`id DESC`) for a stable result.
+
+    ### Check your work
+
+    `latest_orders` has the required columns, every customer appears with at most two (their newest) orders, and customers with none appear too.
   scenario: |
     Create a view **`latest_orders`** with columns **`customer_id, order_id,
     placed_at`** listing the **two most recent orders** of every customer in
@@ -874,15 +1232,44 @@ exercises:
   kind: build
   tags: [redis, acl, security, permissions]
   tutorial: |
-    **Concept.** Redis **ACLs** give each user its own password, allowed
-    **commands** and allowed **key patterns**. `ACL SETUSER reports on >pw
-    ~report:* +@read` creates an enabled user who may run read commands, and
-    only on keys starting with `report:`. `-@all` removes everything first, so
-    you only grant what you list. Test it with `AUTH` or `redis-cli --user`.
+    **What you're learning.** Redis **ACLs**: a user limited to read commands on one key pattern.
 
-    **Read up on:**
-    - `ACL SETUSER` rules: `on`, `>password`, `~pattern`, `+@category`, `-@all`, `resetkeys`
-    - `ACL CAT`, `ACL WHOAMI`, `ACL DRYRUN`
+    ### The idea
+
+    `ACL SETUSER name rules...` creates or changes a user:
+
+    | rule | means |
+    |---|---|
+    | `on` / `off` | enabled |
+    | `>password` | add a password |
+    | `resetkeys ~report:*` | only keys matching the pattern |
+    | `-@all +@read` | no commands, then the read category |
+    | `+get -keys` | add or remove single commands |
+
+    `ACL CAT read` lists the commands in a category. `ACL GETUSER name` shows the result. `CONFIG`, `FLUSHALL` and friends are in `@admin`/`@dangerous`, which `-@all` already removed.
+
+    ### Commands you'll use
+
+    ```bash
+    r() { docker exec kl-redis redis-cli "$@"; }
+    r ACL SETUSER viewer on '>v1ew' resetkeys '~stats:*' -@all +@read
+    r ACL GETUSER viewer
+    docker exec kl-redis redis-cli --user viewer --pass v1ew GET stats:today
+    docker exec kl-redis redis-cli --user viewer --pass v1ew SET stats:x 1        # NOPERM
+    docker exec kl-redis redis-cli --user viewer --pass v1ew GET session:1        # NOPERM no permissions to access one of the keys
+    docker exec kl-redis redis-cli --user viewer --pass v1ew CONFIG GET maxmemory # NOPERM
+    ```
+    `ACL SAVE` (with an ACL file) or `CONFIG REWRITE` persists users.
+
+    ### Common mistakes
+
+    - `+@read` without `-@all` first: a new user starts with no commands, but an existing one keeps its old ones.
+    - Forgetting `resetkeys`: an earlier `~*` stays.
+    - `@read` includes `KEYS` and `SCAN`, which list key **names** across patterns. Remove them if the task requires.
+
+    ### Check your work
+
+    `reports` can read `report:*` keys, and every write, other key or admin command answers `NOPERM`.
   scenario: |
     In **`kl-redis`**, create a user **`reports`** with password
     **`r3ad-only`** that can:
@@ -930,16 +1317,38 @@ exercises:
   kind: build
   tags: [postgres, materialized-view, refresh-concurrently, unique-index]
   tutorial: |
-    **Concept.** A **materialized view** stores a query's result like a
-    table, so dashboards read it instantly. `REFRESH MATERIALIZED VIEW`
-    recomputes it but takes an exclusive lock that **blocks readers**.
-    `REFRESH ... CONCURRENTLY` builds the new result alongside the old one and
-    swaps in the differences, so readers carry on. It requires a **unique
-    index** on the view.
+    **What you're learning.** A dashboard summary that refreshes without blocking: a materialized view with a unique index.
 
-    **Read up on:**
-    - `CREATE MATERIALIZED VIEW`, `REFRESH MATERIALIZED VIEW CONCURRENTLY`
-    - Why `CONCURRENTLY` needs a unique index
+    ### The idea
+
+    Same pattern as data-020: `CREATE MATERIALIZED VIEW ... AS SELECT ... GROUP BY`, then a **unique index** on the grouping columns, so `REFRESH MATERIALIZED VIEW CONCURRENTLY` can run while readers query it.
+
+    ```sql
+    CREATE MATERIALIZED VIEW hourly_signups AS
+      SELECT date_trunc('hour', created_at) AS hour, source, count(*) AS n
+      FROM signups GROUP BY 1, 2;
+    CREATE UNIQUE INDEX ON hourly_signups (hour, source);
+    ```
+
+    ### Commands you'll use
+
+    ```bash
+    q() { docker exec kl-pg psql -U lab -d lab -c "$1"; }
+    q '\d+ hourly_signups'
+    q 'REFRESH MATERIALIZED VIEW CONCURRENTLY hourly_signups'
+    q "INSERT INTO signups (source, created_at) VALUES ('ads', now())"
+    q 'REFRESH MATERIALIZED VIEW CONCURRENTLY hourly_signups'
+    q "SELECT * FROM hourly_signups ORDER BY hour DESC LIMIT 3"
+    ```
+
+    ### Common mistakes
+
+    - A regular view: always current, but recomputed on every read.
+    - A unique index on `day` alone when there are several regions per day.
+
+    ### Check your work
+
+    `daily_revenue` has `day`, `region`, `revenue`, matches a fresh `GROUP BY`, and refreshes concurrently.
   scenario: |
     The dashboard reads daily revenue per region from **`orders`** (`id`,
     `region`, `placed_at`, `total`). Create a materialized view
@@ -985,18 +1394,41 @@ exercises:
   kind: build
   tags: [postgres, row-level-security, policies, multi-tenant]
   tutorial: |
-    **Concept.** **Row-level security** adds a `WHERE` clause that PostgreSQL
-    applies to every query on a table, so tenants can't see each other's data
-    even through a buggy query. `ALTER TABLE ... ENABLE ROW LEVEL SECURITY`
-    turns it on. A **policy** (`CREATE POLICY ... USING (...) WITH CHECK
-    (...)`) defines which rows are visible (`USING`) and which may be written
-    (`WITH CHECK`). A session setting such as `current_setting('app.tenant')`
-    tells the policy who is asking. Table owners and superusers bypass
-    policies unless you `FORCE` them.
+    **What you're learning.** **Row-level security**: per-tenant visibility with policies and a session setting.
 
-    **Read up on:**
-    - `ALTER TABLE ... ENABLE ROW LEVEL SECURITY`, `CREATE POLICY`
-    - `current_setting(name, missing_ok)`, `SET app.tenant = '...'`
+    ### The idea
+
+    ```sql
+    ALTER TABLE notes ENABLE ROW LEVEL SECURITY;
+    CREATE POLICY tenant_only ON notes
+      USING      (tenant = current_setting('app.tenant', true))    -- which rows are visible
+      WITH CHECK (tenant = current_setting('app.tenant', true));   -- which rows may be written
+    ```
+    The app sets `SET app.tenant = 'acme'` per session (or `SET LOCAL` per transaction). `current_setting(name, true)` returns NULL when it's unset, so the comparison is NULL and **no rows** match.
+
+    The table **owner** and superusers bypass RLS (unless `FORCE ROW LEVEL SECURITY`), so test as the application role.
+
+    ### Commands you'll use
+
+    ```bash
+    q() { docker exec -e PGPASSWORD=webpw kl-pg psql -h 127.0.0.1 -U web -d lab -c "$1"; }
+    q "SELECT count(*) FROM notes"                                         # 0: no tenant set
+    q "SET app.tenant = 'acme'; SELECT DISTINCT tenant FROM notes"         # acme
+    q "SET app.tenant = 'acme'; INSERT INTO notes (tenant, title) VALUES ('globex', 'x')"
+    ```
+    ```text
+    ERROR:  new row violates row-level security policy for table "notes"
+    ```
+
+    ### Common mistakes
+
+    - Testing as `lab` (the owner): RLS doesn't apply.
+    - `USING` without `WITH CHECK`: updates can move rows to another tenant (`WITH CHECK` defaults to `USING` only for the same policy, so be explicit).
+    - `current_setting('app.tenant')` without `true`: an error when unset, instead of no rows.
+
+    ### Check your work
+
+    As `webapp`, each tenant sees only its rows, writing another tenant's row is refused, and with no `app.tenant` the table looks empty.
   scenario: |
     The table **`documents`** (`id`, `tenant`, `title`) holds data for several
     customers, and the application connects as the role **`webapp`** (already
@@ -1048,15 +1480,41 @@ exercises:
   kind: build
   tags: [postgres, gaps-and-islands, window, dates]
   tutorial: |
-    **Concept.** "Gaps and islands" finds runs of consecutive values. For
-    consecutive dates the trick is: `day - row_number() OVER (PARTITION BY
-    user ORDER BY day)` is **constant within a streak**, because both rise by
-    one each day, and it changes after a gap. Group by that difference to get
-    each streak's length. Remove duplicate days first.
+    **What you're learning.** **Gaps and islands**: consecutive-day streaks with `row_number()`.
 
-    **Read up on:**
-    - The gaps-and-islands pattern
-    - `date - integer` arithmetic, `DISTINCT`
+    ### The idea
+
+    For one user's distinct login days in order, subtract the row number from the date:
+
+    ```
+    day        rn   day - rn
+    2026-03-01  1   2026-02-28
+    2026-03-02  2   2026-02-28   ← same group: consecutive
+    2026-03-04  3   2026-03-01   ← new group: a gap
+    ```
+    Consecutive days share the same `day - rn`, so group by it and count the rows in each group: that's the streak length.
+
+    ### Commands you'll use
+
+    ```bash
+    docker exec -i kl-pg psql -U lab -d lab -At <<'SQL'
+    WITH d AS (SELECT DISTINCT member_id, at::date AS day FROM checkins),
+         g AS (SELECT member_id, day - (row_number() OVER (PARTITION BY member_id ORDER BY day))::int AS grp FROM d),
+         s AS (SELECT member_id, count(*) AS streak FROM g GROUP BY member_id, grp)
+    SELECT streak, member_id FROM s ORDER BY streak DESC, member_id LIMIT 1;
+    SQL
+    ```
+    `date - integer` gives a date in PostgreSQL.
+
+    ### Common mistakes
+
+    - No `DISTINCT` per day: two logins on one day break the arithmetic.
+    - `at::date` in UTC vs local time: use what the task specifies.
+    - Ties: the smallest user_id wins, so add it to the `ORDER BY`.
+
+    ### Check your work
+
+    `answer.txt` has the longest streak on line 1 and the user on line 2, and listing that user's days by hand confirms it.
   scenario: |
     The table **`logins`** has `user_id` and `at` (timestamp), with several
     logins per day for some users. A **streak** is a run of **consecutive
@@ -1116,16 +1574,28 @@ exercises:
   kind: fix
   tags: [incident, postgres, locks, roles, sequences, troubleshooting]
   tutorial: |
-    **Concept.** When an application "can't write", check the layers in
-    order: can it **log in** (`pg_roles`: `rolcanlogin`, `rolvaliduntil`)?
-    Is something **blocking** it (`pg_stat_activity`, `pg_blocking_pids`, and
-    sessions `idle in transaction`)? Does the write itself **fail**
-    (constraints, sequences)? Fix the cause, and terminate a blocker only once
-    you know what it is.
+    **What you're learning.** A service that can't write: login attribute, a lock, a sequence and privileges, found one at a time.
 
-    **Read up on:**
-    - `pg_stat_activity`, `pg_blocking_pids(pid)`, `pg_terminate_backend`
-    - `ALTER ROLE ... LOGIN`, `idle_in_transaction_session_timeout`
+    ### Method
+
+    Connect **as the service** and fix the first error you see:
+
+    | error | cause (exercise) |
+    |---|---|
+    | `role "checkout" is not permitted to log in` | `ALTER ROLE checkout LOGIN` |
+    | the insert hangs | a session holds a lock on `payments`: `pg_blocking_pids`, terminate it (data-009) |
+    | `duplicate key ... payments_pkey` | the sequence is behind: `setval` (data-066) |
+    | `permission denied for table payments` / `for sequence payments_id_seq` | `GRANT INSERT ON payments`, `GRANT USAGE ON SEQUENCE ...` (and default privileges if new tables are expected) (data-059) |
+
+    ```bash
+    t() { docker exec -e PGPASSWORD=ch3ckout kl-pg psql -h 127.0.0.1 -U checkout -d lab -v ON_ERROR_STOP=1 -c "$1"; }
+    t "SET statement_timeout = '5s'; INSERT INTO payments(order_id, amount) VALUES (1, 9.99) RETURNING id"
+    ```
+    `statement_timeout` turns a hang into an error you can read.
+
+    ### Check your work
+
+    As `checkout`: login works, and the insert succeeds within the time limit and returns a new id.
   scenario: |
     The checkout service connects to **`kl-pg`** as **`checkout`** (password
     **`ch3ckout`**) and inserts into **`payments`**. Since this morning nothing
