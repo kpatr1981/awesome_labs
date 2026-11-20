@@ -12,31 +12,58 @@ exercises:
   kind: fix
   tags: [aws, iam, s3, least-privilege]
   tutorial: |
-    **Concept.** Every AWS request is evaluated the same way. It starts out refused, an `Allow`
-    statement can permit it, and an explicit `Deny` beats any `Allow`. A statement only applies
-    when both its `Action` and its `Resource` match the request, so a correct action on the
-    wrong resource grants nothing, and you get the same `AccessDenied` as having no policy at all.
+    **What you're learning.** How IAM evaluates a request, and why S3 buckets and objects are **different resources**.
 
-    *Reading a denial.* The error names the API **operation**, and you need the IAM **action**.
-    They are usually the same word, but not always: `ListObjectsV2` needs `s3:ListBucket`, and
-    `HeadObject` needs `s3:GetObject`, which is why a failed download often reports a bare
-    `(403) Forbidden` from `HeadObject`. On real AWS, S3 may also tell you the principal and why
-    it was refused. The emulator here says only `Access Denied`, so you work from the operation.
+    ### The idea
 
-    *S3 has two kinds of resource.* A bucket is `arn:aws:s3:::my-bucket` and the objects inside
-    it are `arn:aws:s3:::my-bucket/some/key`. Bucket-level actions match the first form and
-    object-level actions match the second. `*` matches any run of characters, including `/` and
-    `-`, so check what else your wildcard catches.
+    Every request starts **denied**. An `Allow` whose **Action and Resource both match** permits it; any matching explicit `Deny` wins over all allows. A correct action on the wrong resource grants nothing: same `AccessDenied` as no policy at all.
 
-    *Working as two identities.* The `aws` command here runs as the account administrator (the
-    `[default]` profile in `/lab/.aws/credentials`). `aws --profile NAME` runs as another user,
-    so you can reproduce the failure as that user and repair it as the administrator.
+    S3 has two kinds of resource:
 
-    **Read up on:**
-    - `aws iam list-user-policies help`, `aws iam get-user-policy help`, `aws iam put-user-policy help`
-    - The AWS service authorization reference for S3: which actions apply to a bucket and which to an object
-    - `aws s3 ls`, `aws s3 cp`, `aws s3 rm` with `--profile`
-    - IAM docs, "Policy evaluation logic"
+    | resource | ARN | actions |
+    |---|---|---|
+    | a bucket | `arn:aws:s3:::reports` | `s3:ListBucket`, bucket settings |
+    | objects in it | `arn:aws:s3:::reports/KEY` (`/*`, `/prefix/*`) | `s3:GetObject`, `s3:PutObject`, `s3:DeleteObject` |
+
+    `*` matches any characters, including `/` and `-`: `arn:aws:s3:::reports*` also matches `reports-archive`.
+
+    **Operation ≠ action**: the error names the API **operation**; policies use **actions**. `ListObjectsV2` → `s3:ListBucket`; `HeadObject` (called by `aws s3 cp` before downloading) → `s3:GetObject`.
+
+    ### Commands you'll use
+
+    The lab's `aws` runs as the administrator; `aws --profile USER` runs as another user, so you reproduce as them and fix as admin.
+
+    ```bash
+    aws --profile exporter s3 ls s3://exports/
+    ```
+    ```text
+    An error occurred (AccessDenied) when calling the ListObjectsV2 operation: Access Denied
+    ```
+
+    ```bash
+    aws iam get-user-policy --user-name exporter --policy-name exporter-access --query PolicyDocument | jq .
+    cat > /lab/p.json <<'EOF'
+    {"Version":"2012-10-17","Statement":[
+     {"Sid":"List","Effect":"Allow","Action":"s3:ListBucket","Resource":"arn:aws:s3:::exports"},
+     {"Sid":"Read","Effect":"Allow","Action":"s3:GetObject","Resource":"arn:aws:s3:::exports/*"},
+     {"Sid":"Write","Effect":"Allow","Action":"s3:PutObject","Resource":"arn:aws:s3:::exports/out/*"}
+    ]}
+    EOF
+    aws iam put-user-policy --user-name exporter --policy-name exporter-access --policy-document file:///lab/p.json
+    aws --profile exporter s3 cp /lab/x.txt s3://exports/out/x.txt        # allowed
+    aws --profile exporter s3 cp /lab/x.txt s3://exports/out-old/x.txt    # denied
+    ```
+    `out/*` doesn't match `out-old/...`; `out*` would.
+
+    ### Common mistakes
+
+    - `s3:ListBucket` on `bucket/*`, or `s3:GetObject` on the bucket ARN.
+    - A prefix without the slash (`outgoing*`): also matches `outgoing-old/`.
+    - Granting `s3:ListAllMyBuckets`: not asked (the bot must be refused `aws s3 ls`).
+
+    ### Check your work
+
+    As the bot: list and download in its bucket work, upload works only under `outgoing/`; every other listed case is refused.
   scenario: |
     The `aws` command talks to a local emulator with IAM enforced, and runs as the account
     administrator. `aws --profile report-bot ...` runs as the service user **`report-bot`**,
@@ -135,28 +162,51 @@ exercises:
   kind: fix
   tags: [aws, iam, s3, deny, groups]
   tutorial: |
-    **Concept.** A user's effective permissions are the union of everything attached to them:
-    inline policies on the user, managed policies on the user, and the inline and managed
-    policies of every group they belong to. Evaluation looks at all of it together, and one
-    matching `Deny` anywhere ends the discussion. That's why guardrails are written as `Deny`
-    statements, and why no amount of extra `Allow` will fix a request one of them catches.
+    **What you're learning.** Effective permissions come from **every** attached policy; an explicit `Deny` anywhere wins; and how to change a managed policy (a new version).
 
-    *Debugging a denial means walking all of those places.* Each of a user's policy sources has
-    its own listing command, and a managed policy's text belongs to its **default version**, so
-    you read it in two steps. Give statements a `Sid` and they are much easier to talk about.
+    ### The idea
 
-    *Changing a managed policy.* You don't edit a managed policy in place. You publish a new
-    version and make it the default, and everything attached to the policy changes at once.
+    A user's permissions = inline user policies + managed user policies + inline and managed policies of **every group** they're in. One matching `Deny` in any of them ends evaluation, so no extra `Allow` can fix it. Guardrails are therefore written as `Deny` statements, and a too-wide one must be **narrowed**, not removed.
 
-    *Keep it attached.* Removing someone from the group that carries a guardrail makes their
-    denial go away, and also removes the protection. A guardrail that's too wide should be
-    narrowed instead, so that it still catches what it was written for.
+    Where to look:
 
-    **Read up on:**
-    - `aws iam list-groups-for-user`, `aws iam list-attached-group-policies`, `aws iam list-group-policies`, `aws iam list-user-policies`, `aws iam list-attached-user-policies`
-    - `aws iam get-policy` and `aws iam get-policy-version` — finding and reading a managed policy's current text
-    - `aws iam create-policy-version help` — `--set-as-default`
-    - IAM docs, "Policy evaluation logic" — the role of an explicit deny
+    | source | list | read |
+    |---|---|---|
+    | user inline | `list-user-policies` | `get-user-policy` |
+    | user managed | `list-attached-user-policies` | policy → default version |
+    | groups | `list-groups-for-user`, then the same per group | |
+
+    A managed policy's text belongs to its **default version**: `get-policy` (DefaultVersionId) → `get-policy-version`. You don't edit it in place: `create-policy-version --set-as-default` publishes a new one.
+
+    ### Commands you'll use
+
+    ```bash
+    U=dana
+    aws iam list-user-policies --user-name $U
+    aws iam list-attached-user-policies --user-name $U
+    for g in $(aws iam list-groups-for-user --user-name $U --query 'Groups[].GroupName' --output text); do
+      echo "== $g"; aws iam list-attached-group-policies --group-name "$g"; aws iam list-group-policies --group-name "$g"
+    done
+    ARN=$(aws iam list-policies --scope Local --query "Policies[?PolicyName=='org-guard'].Arn" --output text)
+    V=$(aws iam get-policy --policy-arn "$ARN" --query Policy.DefaultVersionId --output text)
+    aws iam get-policy-version --policy-arn "$ARN" --version-id "$V" --query PolicyVersion.Document | jq .
+    ```
+    Find the `Deny` statement whose resource pattern catches the failing bucket.
+
+    ```bash
+    aws iam create-policy-version --policy-arn "$ARN" --policy-document file:///lab/guard-v2.json --set-as-default
+    aws iam delete-user-policy --user-name $U --policy-name desperate-allow
+    ```
+
+    ### Common mistakes
+
+    - Removing the user from the group: the denial disappears, and so does the protection.
+    - Rewriting the other statement while narrowing one.
+    - `Condition` tricks when the task asks for a plain `Resource`.
+
+    ### Check your work
+
+    The culprit file names the policy and Sid; as the developer, staging writes and prod reads work; as both users, prod writes/deletes and bucket deletes are refused; group membership and attachment are unchanged.
   scenario: |
     The `aws` command talks to a local emulator with IAM enforced, and runs as the account
     administrator. `aws --profile maria ...` and `aws --profile aiden ...` run as those users.
@@ -283,27 +333,43 @@ exercises:
   kind: fix
   tags: [aws, iam, managed-policy, versions]
   tutorial: |
-    **Concept.** A customer-managed policy keeps a history of versions, and exactly one of them
-    is the default, the only one that is ever evaluated. Rolling back is a single API call, which
-    makes the history useful in an outage and also a liability: a version that grants too much
-    stays one call away from being live again.
+    **What you're learning.** Managed policy **versions**: the five-version limit, rolling back, and cleaning dangerous history.
 
-    *There's a limit.* A managed policy can hold at most **five** versions. When it's full,
-    `create-policy-version` fails with `LimitExceeded` until you delete one. The default version
-    can't be deleted either, so sometimes the order of your steps matters.
+    ### The idea
 
-    *Reading the history.* `list-policy-versions` shows the version IDs and which is default,
-    but not their text. To compare them you read each one, and version IDs keep counting up, so
-    a new version will not reuse a number.
+    A customer-managed policy keeps up to **five** versions; exactly one is the **default** (the only one evaluated). Rolling back is one call (`set-default-policy-version`), which makes old versions useful and also a risk: a version granting `*` stays one call away from being live.
 
-    *Fixing forward.* After a bad emergency change, the goal is usually not to return to the
-    last good version unchanged. Requirements have moved on, so you start from what was reviewed
-    and add only what's newly needed.
+    - When full, `create-policy-version` fails with `LimitExceeded`: delete a non-default version first.
+    - The default can't be deleted: make another one the default first.
+    - Version IDs keep counting (`v6`, `v7`): numbers are never reused.
 
-    **Read up on:**
-    - `aws iam list-policy-versions help`, `aws iam get-policy-version help`
-    - `aws iam create-policy-version help`, `aws iam delete-policy-version help`, `aws iam set-default-policy-version help`
-    - IAM docs, "Versioning IAM policies" — the five-version limit
+    `list-policy-versions` shows IDs and which is default, **not** their text: read each with `get-policy-version`.
+
+    ### Commands you'll use
+
+    ```bash
+    ARN=$(aws iam list-policies --scope Local --query "Policies[?PolicyName=='svc-data'].Arn" --output text)
+    aws iam list-policy-versions --policy-arn "$ARN" --query 'Versions[].[VersionId,IsDefaultVersion]' --output text
+    for v in $(aws iam list-policy-versions --policy-arn "$ARN" --query 'Versions[].VersionId' --output text); do
+      echo "== $v"; aws iam get-policy-version --policy-arn "$ARN" --version-id "$v" --query PolicyVersion.Document | jq -c .
+    done
+    ```
+
+    Order matters when the list is full and the default is a bad one:
+    ```bash
+    aws iam delete-policy-version --policy-arn "$ARN" --version-id v2                 # a bad, non-default one: makes room
+    aws iam create-policy-version --policy-arn "$ARN" --policy-document file:///lab/new.json --set-as-default
+    aws iam delete-policy-version --policy-arn "$ARN" --version-id v5                 # the old default, now deletable
+    ```
+
+    ### Common mistakes
+
+    - Setting the reviewed version as default: it lacks the new requirement.
+    - Deleting the reviewed version: the audit trail needs it.
+
+    ### Check your work
+
+    The new default grants exactly what's required (test as the app's user), and no stored version contains `"*"` or `"s3:*"` as an action.
   scenario: |
     The `aws` command talks to a local emulator with IAM enforced, and runs as the account
     administrator. `aws --profile app-server ...` runs as the application's user, whose
@@ -435,33 +501,55 @@ exercises:
   kind: fix
   tags: [aws, iam, sts, assume-role, trust-policy]
   tutorial: |
-    **Concept.** A role has no long-term keys. Instead a principal calls `sts:AssumeRole` and
-    receives temporary credentials for it. Two different policies are involved, and they answer
-    different questions:
+    **What you're learning.** **Roles**: the trust policy (who may assume) vs permissions policies (what it may do), and using temporary credentials.
 
-    - The role's **trust policy** answers *who may become this role?* It's attached to the role,
-      and has a `Principal`.
-    - The role's **permissions policies** answer *what may the role do once assumed?*
+    ### The idea
 
-    The caller's own identity policy also has a say in whether they may call `sts:AssumeRole`.
-    Within a single account a trust policy that names a user directly is enough on its own, and
-    across accounts both sides have to agree, so when debugging always read both.
+    A role has no long-term keys. A principal calls `sts:AssumeRole` and gets **temporary credentials**.
 
-    *An `AccessDenied` from AssumeRole is about getting in.* An `AccessDenied` from S3 after a
-    successful AssumeRole is about the role's permissions. They're different failures with
-    different fixes, and only the error's operation name tells them apart.
+    | policy | answers | attached as |
+    |---|---|---|
+    | **trust policy** | who may become this role? (`Principal`) | `update-assume-role-policy` |
+    | **permissions policies** | what may the role do? | inline (`put-role-policy`) or managed (`attach-role-policy`) |
 
-    *Using the temporary credentials.* `assume-role` returns `AccessKeyId`, `SecretAccessKey`
-    and `SessionToken`. Exported as `AWS_ACCESS_KEY_ID`, `AWS_SECRET_ACCESS_KEY` and
-    `AWS_SESSION_TOKEN`, they take effect for the `aws` command in that shell (and `--profile`
-    must then not be given, as it would override them). `aws sts get-caller-identity` shows who
-    you currently are, and an assumed role has an `arn:aws:sts::...:assumed-role/...` identity.
+    An `AccessDenied` **from AssumeRole** is about getting in (trust policy, or the caller's own permission to call it). An `AccessDenied` **from S3** after a successful assume is about the role's permissions. The operation name tells them apart.
 
-    **Read up on:**
-    - `aws iam get-role help` — the trust policy is in `AssumeRolePolicyDocument`
-    - `aws iam update-assume-role-policy help`
-    - `aws iam list-role-policies`, `aws iam list-attached-role-policies`, `aws iam get-role-policy`, `aws iam put-role-policy`
-    - `aws sts assume-role help`, `aws sts get-caller-identity help`
+    ```json
+    {"Version":"2012-10-17","Statement":[{
+      "Effect":"Allow",
+      "Principal":{"AWS":"arn:aws:iam::123456789012:user/deploy-bot"},
+      "Action":"sts:AssumeRole"}]}
+    ```
+
+    ### Commands you'll use
+
+    ```bash
+    aws iam get-role --role-name deploy-role --query Role.AssumeRolePolicyDocument | jq .
+    aws iam list-role-policies --role-name deploy-role
+    aws iam list-attached-role-policies --role-name deploy-role
+    aws iam update-assume-role-policy --role-name deploy-role --policy-document file:///lab/trust.json
+
+    CREDS=$(aws --profile deploy-bot sts assume-role --role-arn arn:aws:iam::123456789012:role/deploy-role \
+      --role-session-name test --query Credentials --output json)
+    export AWS_ACCESS_KEY_ID=$(jq -r .AccessKeyId <<<"$CREDS")
+    export AWS_SECRET_ACCESS_KEY=$(jq -r .SecretAccessKey <<<"$CREDS")
+    export AWS_SESSION_TOKEN=$(jq -r .SessionToken <<<"$CREDS")
+    aws sts get-caller-identity --query Arn --output text
+    ```
+    ```text
+    arn:aws:sts::123456789012:assumed-role/deploy-role/test
+    ```
+    Don't pass `--profile` while these are exported (it would override them). `unset AWS_ACCESS_KEY_ID AWS_SECRET_ACCESS_KEY AWS_SESSION_TOKEN` returns to the admin.
+
+    ### Common mistakes
+
+    - Giving the CI user direct S3 permissions to "make it work".
+    - Several principals in the trust policy when only one is allowed.
+    - Typos in ARNs: read every resource in the role's policies against the bucket names.
+
+    ### Check your work
+
+    As the CI user, assume works and `get-caller-identity` shows the assumed-role ARN; the other two users are refused; with the role's credentials, list/download/upload under `releases/` work and the rest is refused.
   scenario: |
     The `aws` command talks to a local emulator with IAM enforced, and runs as the account
     administrator. `aws --profile ci-deployer ...` runs as the CI system's user. The users
@@ -612,28 +700,47 @@ exercises:
   kind: build
   tags: [aws, iam, s3, least-privilege]
   tutorial: |
-    **Concept.** The usual way a service ends up with `s3:*` is that nobody knew exactly what it
-    calls. The way out is the same on any cloud: record what the workload really does, translate
-    those calls into permissions, grant exactly that, then prove the excess is gone.
+    **What you're learning.** Least privilege from evidence: turning a call log into a tightly scoped policy, and testing what must be refused.
 
-    *From a call to a permission.* A call log records **operations** on **resources**. An IAM
-    statement names **actions** and **resources**, and the mapping isn't always word for word.
-    Listing with `ListObjectsV2` needs `s3:ListBucket`, a `HeadObject` needs `s3:GetObject`, and
-    writes to a key need a permission on that key, not on the bucket. Several operations collapse
-    into the same action, so a long log can become a short policy.
+    ### The idea
 
-    *Scope each action separately.* Grant each action to only the resources it was used on. It's
-    common for an application to read from one place and write to another, or to delete only what
-    it has consumed. A single statement with every action on every path gives back what you just
-    took away. A specific object can be named in full, with no wildcard.
+    1. **Read the log**: each line is an operation on a resource.
+    2. **Translate** operations to actions: `ListObjectsV2` → `s3:ListBucket` (on the bucket), `HeadObject` and `GetObject` → `s3:GetObject`, `PutObject` → `s3:PutObject`, `DeleteObject` → `s3:DeleteObject` (on keys).
+    3. **Scope each action separately** to exactly the resources it was used on: reading from one prefix and writing to another must not become "read and write both". A single object can be named in full (`arn:aws:s3:::cfg/app.json`).
+    4. **Test the negative space** as the service user.
 
-    *Test the negative space.* A policy is correct when the needed calls work **and** the calls
-    you meant to remove are refused. Try the second kind deliberately, as the service's user.
+    ### Commands you'll use
 
-    **Read up on:**
-    - `aws iam put-user-policy help`
-    - The AWS service authorization reference for S3
-    - IAM docs, "Security best practices in IAM" — apply least-privilege permissions
+    ```bash
+    head /lab/calls.log
+    awk '{print $2}' /lab/calls.log | sort | uniq -c          # which operations (adjust the column to the log format)
+    awk '{print $2, $3}' /lab/calls.log | sort -u             # operation + resource pairs
+    ```
+
+    ```json
+    {"Version":"2012-10-17","Statement":[
+     {"Sid":"List","Effect":"Allow","Action":"s3:ListBucket","Resource":"arn:aws:s3:::photos"},
+     {"Sid":"ReadIn","Effect":"Allow","Action":"s3:GetObject","Resource":["arn:aws:s3:::photos/raw/*","arn:aws:s3:::cfg/app.json"]},
+     {"Sid":"WriteOut","Effect":"Allow","Action":"s3:PutObject","Resource":"arn:aws:s3:::photos/thumbs/*"},
+     {"Sid":"Consume","Effect":"Allow","Action":"s3:DeleteObject","Resource":"arn:aws:s3:::photos/raw/*"}
+    ]}
+    ```
+
+    ```bash
+    aws iam put-user-policy --user-name worker --policy-name worker-access --policy-document file:///lab/p.json
+    aws --profile worker s3 ls                                   # must be refused
+    aws --profile worker s3 cp s3://photos/thumbs/a.jpg /lab/    # must be refused
+    ```
+
+    ### Common mistakes
+
+    - `s3:HeadObject` in the actions list: there's no such action.
+    - Wildcards wider than the log (`cfg/*` when one file was read).
+    - Duplicates in `actions.txt`.
+
+    ### Check your work
+
+    `actions.txt` lists each action once; every logged kind of call works as the worker; every case in the "refused" list fails.
   scenario: |
     The `aws` command talks to a local emulator with IAM enforced, and runs as the account
     administrator. `aws --profile media-worker ...` runs as a media-processing service user. Its
@@ -753,47 +860,32 @@ exercises:
   kind: fix
   tags: [aws, capstone, iam, s3, least-privilege, groups, managed-policy, versions, sts, assume-role, trust-policy, offboarding]
   tutorial: |
-    **Concept.** An access review asks one question of every identity:
-    *what can this do, and should it?* Closing its findings uses every
-    part of IAM at once:
+    **What you're learning.** Closing an access review: offboarding, groups over users, least privilege from a log, policy history, and roles for outsiders.
 
-    - **offboarding.** A user is only gone when the user is deleted. AWS
-      refuses to delete a user that still has access keys, group
-      memberships or policies (inline or attached), so you remove those
-      first. Removing the user doesn't edit the trust policies that name
-      them: read those too.
-    - **groups over users.** Permissions belong on a group through a
-      customer-managed policy; people get them by membership, and nothing
-      stays attached to the users themselves, least of all the "temporary"
-      grant from month-end.
-    - **resources.** A bucket (`arn:aws:s3:::name`) and its objects
-      (`arn:aws:s3:::name/key`) are different resources: `s3:ListBucket`
-      needs the first, `s3:GetObject`, `s3:PutObject` and
-      `s3:DeleteObject` the second, and a prefix narrows the second.
-    - **from a call log to a policy.** `ListObjectsV2` is `s3:ListBucket`,
-      `HeadObject` is `s3:GetObject`, and each action gets only the
-      resources it was used on.
-    - **policy versions.** A managed policy keeps at most **five**
-      versions and only the default is evaluated, but any stored version
-      is one `set-default-policy-version` away from being live again.
-      When it's full, make room by deleting a non-default version; the
-      default can only go once another one is the default.
-    - **roles.** The **trust policy** decides who may assume a role; the
-      role's **permissions policies** decide what it can do afterwards.
-      If everyone may *call* `sts:AssumeRole`, the trust policy is the only
-      thing keeping the wrong people out. An external party should get a
-      role, never permissions on their user.
+    ### Method
 
-    Test both sides as the identity concerned: what must work, and what
-    must be refused (`aws --profile NAME ...`, or the role's temporary
-    credentials exported in the shell).
+    | finding | how (exercise) |
+    |---|---|
+    | leaver | delete access keys, remove from groups, delete inline policies, detach managed ones, **then** `delete-user` (AWS refuses otherwise); check no trust policy still names them |
+    | analysts | a customer-managed policy on a new group; add both users; delete their inline `temp-ledger` (cloud-009, cloud-046) |
+    | ETL scope | translate the log (cloud-050), publish a new **default** version (cloud-047) |
+    | ETL history | delete only the dangerous versions; keep v1, v3, v4; mind the five-version limit and the default (cloud-048) |
+    | auditor in | trust policy with `kwame` only; remove `auditor-direct`, keep `may-assume-audit` (cloud-049) |
+    | auditor read-only | fix `audit-read`: list on both buckets, get on both `/*`, nothing else (cloud-046) |
 
-    **Read up on:**
-    - `aws iam list-access-keys`, `delete-access-key`, `list-groups-for-user`, `remove-user-from-group`, `delete-user-policy`, `delete-user`
-    - `aws iam create-policy`, `create-group`, `attach-group-policy`, `add-user-to-group`, `list-attached-user-policies`
-    - `aws iam list-policy-versions`, `get-policy-version`, `delete-policy-version`, `create-policy-version --set-as-default`
-    - `aws iam get-role`, `update-assume-role-policy`, `put-role-policy`, `aws sts assume-role`, `get-caller-identity`
-    - The AWS service authorization reference for S3; IAM docs, "Policy evaluation logic"
+    Test each identity both ways (`aws --profile NAME`, or the role's exported credentials).
+
+    ```bash
+    aws iam get-user --user-name olek                                  # NoSuchEntity
+    aws iam get-group --group-name finance-analysts --query 'Users[].UserName'
+    aws iam list-user-policies --user-name nora; aws iam list-attached-user-policies --user-name nora
+    aws iam list-policy-versions --policy-arn "$ETL" --query 'Versions[].[VersionId,IsDefaultVersion]' --output text
+    aws iam get-role --role-name ledger-audit --query Role.AssumeRolePolicyDocument
+    ```
+
+    ### Check your work
+
+    Olek's key fails; the analysts' allowed and refused cases behave; every logged ETL call works and the listed others fail; no ETL version grants `*`; only kwame can assume the audit role; the role can read both buckets and nothing more; the identity file holds the assumed-role ARN.
   scenario: |
     The `aws` command talks to a local emulator with IAM enforced, and runs
     as the account administrator. `aws --profile NAME ...` runs as the user
