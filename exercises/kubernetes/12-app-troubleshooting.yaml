@@ -12,12 +12,55 @@ exercises:
   kind: fix
   tags: [troubleshooting, crashloop, completed]
   tutorial: |
-    **Concept.** A container lives only as long as its main process. If the process exits, even successfully, a Deployment restarts it, and repeated exits show up as CrashLoopBackOff.
+    **What you're learning.** Why a container that exits successfully still ends in `CrashLoopBackOff` under a Deployment.
 
-    **Read up on:**
-    - `kubectl logs POD --previous` — output of the exited instance
-    - `kubectl describe pod` — Last State, Exit Code and Restart Count
-    - `sh -c` and `while` loops (`man sh`); Jobs and CronJobs for one-shot work
+    ### The idea
+
+    A container lives exactly as long as its **main process**. When the process exits, the container stops, whatever the exit code. A Deployment's pods have `restartPolicy: Always`, so the kubelet restarts it, and after a few quick exits it waits longer and longer between attempts: **CrashLoopBackOff**, even with exit code 0.
+
+    | kind of work | controller |
+    |---|---|
+    | runs forever (servers, loops) | Deployment / StatefulSet / DaemonSet |
+    | runs once and ends | Job |
+    | runs on a schedule | CronJob |
+
+    A "do X every N seconds" task under a Deployment needs a process that never ends: a loop.
+
+    ### Commands you'll use
+
+    ```bash
+    kubectl get pods -n demo
+    ```
+    ```text
+    NAME                      READY   STATUS             RESTARTS
+    pinger-5f7c9d-xk2lp       0/1     CrashLoopBackOff   6
+    ```
+
+    ```bash
+    kubectl describe pod -n demo -l app=pinger | grep -A3 'Last State'
+    ```
+    ```text
+        Last State:     Terminated
+          Reason:       Completed
+          Exit Code:    0
+    ```
+    `Completed`, exit 0: nothing crashed, the program simply finished.
+
+    ```bash
+    kubectl patch deploy pinger -n demo --type=json -p \
+      '[{"op":"replace","path":"/spec/template/spec/containers/0/command",
+         "value":["sh","-c","while true; do echo ping; sleep 30; done"]}]'
+    kubectl logs -n demo deploy/pinger -f
+    ```
+
+    ### Common mistakes
+
+    - Converting it to a Job: the task wants it forever.
+    - `sleep infinity` after one heartbeat: runs forever but sends only one.
+
+    ### Check your work
+
+    The pod stays Running with RESTARTS no longer growing, and the logs show a new line every 10 seconds.
   scenario: |
     The **`heartbeat`** deployment (namespace **`ops`**) is in `CrashLoopBackOff`, but its
     logs show no error — just `heartbeat sent` and then the container exits with code 0.
@@ -51,13 +94,40 @@ exercises:
   kind: fix
   tags: [troubleshooting, configmap, namespaces]
   tutorial: |
-    **Concept.** Namespaces isolate names, and pods can only mount ConfigMaps and Secrets from their own namespace. Sharing means copying the object into each namespace that needs it.
+    **What you're learning.** That ConfigMaps and Secrets can only be used by pods in **the same namespace**, and how to copy one.
 
-    **Read up on:**
-    - `kubectl get configmap NAME -n NS -o yaml` — view an object
-    - `kubectl get -o json` with `jq` (`man jq`) — strip metadata that is namespace- and cluster-specific
-    - `kubectl apply -f -` — create from stdin
-    - `kubectl describe pod` — verify the mount error disappears
+    ### The idea
+
+    A pod's `configMap` volume or `configMapKeyRef` names a ConfigMap **without** a namespace: it always means the pod's own. A ConfigMap in another namespace is invisible to it; the pod is stuck in `ContainerCreating` with `configmap "X" not found`.
+
+    To share configuration, copy the object into each namespace (or have a tool sync it). Copying means taking the data, and dropping the metadata the server added (uid, resourceVersion, creationTimestamp, the old namespace).
+
+    ### Commands you'll use
+
+    ```bash
+    kubectl describe pod app -n team-x | tail -3
+    ```
+    ```text
+    Warning  FailedMount  MountVolume.SetUp failed for volume "conf" : configmap "common-conf" not found
+    ```
+
+    ```bash
+    kubectl get cm common-conf -A
+    kubectl get cm common-conf -n shared -o json \
+      | jq '.metadata = {name: .metadata.name, namespace: "team-x"}' | kubectl apply -f -
+    kubectl get cm common-conf -n team-x
+    kubectl get pod app -n team-x -w        # the kubelet retries the mount by itself
+    ```
+    `jq '.metadata = {...}'` replaces the whole metadata with just the name and the new namespace.
+
+    ### Common mistakes
+
+    - `kubectl get -o yaml | sed 's/namespace: shared/namespace: team-x/'`: also changes any data containing that text, and keeps the uid (apply fails).
+    - Moving the original: other namespaces may use it.
+
+    ### Check your work
+
+    The copy has the same `data` (`diff <(kubectl get cm X -n A -o jsonpath='{.data}') <(kubectl get cm X -n B -o jsonpath='{.data}')`), and the pod is Running.
   scenario: |
     The **`api`** pod in namespace **`team-c`** can't start: its volume references the
     ConfigMap **`shared-tls-config`**, which exists — in namespace **`platform`**.
@@ -98,21 +168,51 @@ exercises:
   kind: fix
   tags: [troubleshooting, events, secret, named-ports, init-containers, dns]
   tutorial: |
-    **Concept.** A workload that "won't run" can be broken at very different layers, and each layer leaves its evidence in a different place. Work from the symptom to the layer:
+    **What you're learning.** A layer-by-layer method for "it won't run", and where each layer leaves its evidence.
 
-    - **Pod never starts (`ContainerCreating`).** The kubelet is preparing what the pod needs, such as volumes and Secrets. Pod *events* say what it is waiting for.
-    - **Pod runs but traffic fails.** A Service's `targetPort` may be a number or the *name* of a container port; a name only works if a container port with exactly that name exists. The Service's endpoints show whether backends are registered.
-    - **Pod stuck in `Init:0/1`.** Init containers must finish before app containers start. If one waits for a dependency at the wrong address or port, the cause is in the init container's own logs.
-    - **Pod runs but resolves nothing.** `dnsPolicy` decides which resolver configuration a pod gets. The default uses cluster DNS, but other policies replace it with settings you provide yourself.
+    ### Method: symptom → layer → evidence
 
-    **Read up on:**
-    - `kubectl describe pod NAME -n NS` — read the Events at the bottom
-    - `kubectl get events -n NS --sort-by=.lastTimestamp` — recent happenings
-    - `kubectl explain pod.spec.containers.env.valueFrom` and `kubectl create secret generic --help` — how Secrets are referenced and created
-    - `kubectl get endpoints NAME` / `kubectl describe svc NAME` — whether backends are registered, and the target port
-    - `kubectl explain pod.spec.containers.ports` — the `name` field
-    - `kubectl logs POD -c INIT_NAME` — what an init container is waiting for
-    - `kubectl explain pod.spec` — the DNS-related fields; `kubectl exec POD -- cat /etc/resolv.conf` shows what a pod really uses
+    | symptom | layer | evidence |
+    |---|---|---|
+    | `Pending` | scheduling | `kubectl describe pod` → FailedScheduling (k8s-091) |
+    | `ContainerCreating` for minutes | volumes / config | describe → `FailedMount` (a Secret/ConfigMap missing) |
+    | `CreateContainerConfigError` | env from missing keys | describe → "couldn't find key" (k8s-061) |
+    | `ImagePullBackOff` | image | describe → pull error |
+    | `Init:0/1` forever | init container | `kubectl logs POD -c INIT` (k8s-132) |
+    | `CrashLoopBackOff` | the program | `kubectl logs --previous` |
+    | Running, but requests fail | ports / names | Service `targetPort` vs container ports (k8s-046) |
+    | names don't resolve in one pod only | DNS settings | `kubectl exec POD -- cat /etc/resolv.conf` (k8s-055) |
+
+    ### Commands you'll use
+
+    ```bash
+    kubectl get pods -n demo
+    kubectl describe pod notifier -n demo | tail -5
+    ```
+    ```text
+    Warning  FailedMount  MountVolume.SetUp failed for volume "creds" : secret "mail-creds" not found
+    ```
+
+    ```bash
+    kubectl create secret generic mail-creds -n demo --from-literal=password=example-pw
+    kubectl get deploy shop -n demo -o jsonpath='{.spec.template.spec.containers[0].ports}'; echo
+    kubectl get svc shop -n demo -o jsonpath='{.spec.ports[0].targetPort}'; echo
+    kubectl logs deploy/site -n demo -c wait-for-db --tail=2
+    kubectl get svc site-db -n demo                  # which port does it really expose?
+    kubectl exec deploy/crawler -n demo -- cat /etc/resolv.conf
+    kubectl get deploy crawler -n demo -o jsonpath='{.spec.template.spec.dnsPolicy}'; echo
+    ```
+
+    For a JSON patch on an init container's command, the path is `/spec/template/spec/initContainers/0/command/N` (N = which list element; with `["sh","-c","..."]` the script is element 2).
+
+    ### Common mistakes
+
+    - Changing a Service when the task says the Service is right.
+    - Deleting the pod and hoping: the same template comes back broken.
+
+    ### Check your work
+
+    All four workloads are Running and Ready, and each one's original symptom is gone.
   scenario: |
     The team inherited four broken workloads in namespace **`triage`**. Fix every one.
     Never change the Services' own definitions or the data they serve; fix what is wrong
@@ -240,13 +340,54 @@ exercises:
   kind: fix
   tags: [troubleshooting, command, args]
   tutorial: |
-    **Concept.** In a pod spec, `command` overrides the image's ENTRYPOINT and `args` overrides its CMD. Putting flags in the wrong one replaces the program that should run.
+    **What you're learning.** `command` vs `args`, and how they map to the image's ENTRYPOINT and CMD.
 
-    **Read up on:**
-    - `kubectl explain pod.spec.containers.command` and `...args` — the exact override rules
-    - `kubectl describe pod` and `kubectl logs` — error text for exec failures
-    - `docker inspect IMAGE` or the image docs — the image's own entrypoint
-    - `kubectl edit deploy NAME` — editing the template
+    ### The idea
+
+    An image defines what runs with **ENTRYPOINT** (the program) and **CMD** (its default arguments). In a pod:
+
+    | pod field | replaces |
+    |---|---|
+    | `command` | the image's ENTRYPOINT |
+    | `args` | the image's CMD |
+
+    ```
+    image:  ENTRYPOINT ["/docker-entrypoint.sh"]  CMD ["nginx", "-g", "daemon off;"]
+    pod:    command: ["-g", "..."]        → runs a program called "-g" → "executable file not found"
+    pod:    args: ["nginx", "-g", "..."]  → /docker-entrypoint.sh nginx -g ...   (correct)
+    pod:    command: ["nginx"], args: ["-g", "..."]  → nginx -g ...             (also correct)
+    ```
+
+    ### Commands you'll use
+
+    ```bash
+    kubectl describe pod -n demo -l app=proxy | grep -A2 -i 'error\|reason'
+    ```
+    ```text
+    Error: failed to create containerd task: exec: "-c": executable file not found in $PATH
+    ```
+
+    Find what the image normally runs:
+    ```bash
+    docker image inspect nginx:1.28-alpine --format '{{json .Config.Entrypoint}} {{json .Config.Cmd}}'   # on a host with docker
+    ```
+    (On the cluster nodes: `crictl inspecti nginx:1.28-alpine | jq '.info.imageSpec.config | {Entrypoint, Cmd}'`.)
+
+    ```bash
+    kubectl patch deploy proxy -n demo --type=json -p '[
+      {"op":"remove","path":"/spec/template/spec/containers/0/command"},
+      {"op":"add","path":"/spec/template/spec/containers/0/args","value":["nginx","-c","/etc/nginx/alt.conf","-g","daemon off;"]}]'
+    kubectl rollout status deploy/proxy -n demo
+    ```
+
+    ### Common mistakes
+
+    - `command: ["nginx -g daemon off;"]` as one string: runs a program literally named that.
+    - Forgetting `daemon off;`: nginx forks into the background, the main process exits, and the container stops.
+
+    ### Check your work
+
+    The pods are Running, and `kubectl exec ... -- ps` (or the logs) show nginx started with the options.
   scenario: |
     Someone wanted to run nginx with an extra flag and wrote this into the **`edge`**
     deployment (namespace **`web`**):
@@ -295,13 +436,54 @@ exercises:
   kind: fix
   tags: [troubleshooting, readOnlyRootFilesystem, emptydir]
   tutorial: |
-    **Concept.** A read-only root filesystem blocks writes everywhere in the container. Programs that need scratch space can get it from separate writable volumes mounted at just the directories they use.
+    **What you're learning.** Running with a read-only root filesystem by giving the app writable `emptyDir` volumes exactly where it writes.
 
-    **Read up on:**
-    - `kubectl logs POD` — read-only filesystem errors name the path
-    - `kubectl explain pod.spec.volumes.emptyDir` — scratch volumes
-    - `kubectl explain pod.spec.containers.volumeMounts` — mounting at a path
-    - `kubectl explain pod.spec.containers.securityContext.readOnlyRootFilesystem`
+    ### The idea
+
+    `readOnlyRootFilesystem: true` makes the container's own filesystem read-only. Most apps write **somewhere**: temp files, caches, PID files. Each such directory gets its own `emptyDir` mounted on top: writable, but only there, and thrown away with the pod.
+
+    ```yaml
+    containers:
+    - name: app
+      securityContext:
+        readOnlyRootFilesystem: true
+      volumeMounts:
+      - {name: tmp,   mountPath: /tmp}
+      - {name: cache, mountPath: /var/cache/nginx}
+      - {name: run,   mountPath: /var/run}
+    volumes:
+    - {name: tmp,   emptyDir: {}}
+    - {name: cache, emptyDir: {}}
+    - {name: run,   emptyDir: {}}
+    ```
+
+    ### Commands you'll use
+
+    ```bash
+    kubectl logs -n demo deploy/thumbs --previous
+    ```
+    ```text
+    nginx: [emerg] mkdir() "/var/cache/nginx/client_temp" failed (30: Read-only file system)
+    ```
+    Error 30, "Read-only file system", names the path that needs a volume. Fix one, look at the next error.
+
+    ```bash
+    kubectl get deploy thumbs -n demo -o yaml > /lab/thumbs.yaml
+    vi /lab/thumbs.yaml           # add volumeMounts + volumes
+    kubectl apply -f /lab/thumbs.yaml
+    kubectl rollout status deploy/thumbs -n demo
+    kubectl exec -n demo deploy/thumbs -- sh -c 'touch /tmp/ok && touch /etc/nope'
+    ```
+
+    ### Common mistakes
+
+    - Turning `readOnlyRootFilesystem` off.
+    - Mounting one big volume at `/`: not possible, and defeats the purpose.
+    - A volume name used in a mount but not declared under `volumes`.
+
+    ### Check your work
+
+    Pods are Running, `readOnlyRootFilesystem` is still `true`, writing to `/tmp` works and writing to `/etc` fails.
   scenario: |
     Security made the root filesystem of the **`thumbs`** deployment (namespace
     **`media`**) read-only. Now the app crashes on start: it needs to write temporary files
@@ -355,19 +537,53 @@ exercises:
   kind: fix
   tags: [troubleshooting, hpa, resourcequota, rolling-update]
   tutorial: |
-    **Concept.** "It won't scale" and "the rollout is stuck" both mean the controllers cannot create or adjust pods, and both are explained by conditions and events on the controller object, not on the pods (there may be no pods to look at).
+    **What you're learning.** Diagnosing controllers that can't act: an HPA with a broken target, and a rollout blocked by a pod quota.
 
-    - A **HorizontalPodAutoscaler** points at a workload through `scaleTargetRef`, naming its kind and name. If the reference does not match a real object, metrics and scaling cannot work, and `describe hpa` says why.
-    - A **ResourceQuota** counts every pod, including the surge pods of a rolling update. If the quota is fully used, the new ReplicaSet cannot create pods. Events on the ReplicaSet show the quota error, and the update strategy decides how much extra capacity a rollout needs.
+    ### The idea
 
-    **Read up on:**
-    - `kubectl describe hpa NAME` — conditions and events explain the failure
-    - `kubectl explain hpa.spec.scaleTargetRef` (see also `horizontalpodautoscaler`)
-    - `kubectl get deploy -n NS` — compare real names
-    - `kubectl describe quota -n NS` — used versus hard
-    - `kubectl describe rs -n NS` — events show quota errors
-    - `kubectl explain deployment.spec.strategy.rollingUpdate` — `maxSurge` and `maxUnavailable`
-    - `kubectl patch --help` or `kubectl edit`
+    When **controllers** are stuck, there may be no pods to look at. Read the controller's own **conditions and events**:
+
+    ```bash
+    kubectl describe hpa NAME            # Conditions: AbleToScale, ScalingActive + Events
+    kubectl describe rs -n NS            # FailedCreate events (quota, admission)
+    kubectl rollout status deploy/NAME   # waits; the reason is in the RS events
+    ```
+
+    **HPA target.** `spec.scaleTargetRef` names the Deployment. A wrong name → `FailedGetScale: deployments/scale.apps "x" not found` and `<unknown>` targets.
+
+    **Rollouts and quotas.** A rolling update temporarily runs **more** pods than `replicas` (`maxSurge`, default 25% rounded up = 1 extra for 3 replicas). With a pod quota equal to `replicas`, that extra pod is rejected forever. `maxSurge: 0, maxUnavailable: 1` replaces pods one at a time **without** going over: one replica is briefly missing instead.
+
+    ### Commands you'll use
+
+    ```bash
+    kubectl get hpa web -n demo -o jsonpath='{.spec.scaleTargetRef}'; echo
+    ```
+    ```text
+    {"apiVersion":"apps/v1","kind":"Deployment","name":"web-deploy"}
+    ```
+
+    ```bash
+    kubectl patch hpa web -n demo --type=merge -p '{"spec":{"scaleTargetRef":{"name":"web"}}}'
+    kubectl describe rs -n demo | grep -i quota
+    ```
+    ```text
+    Error creating: pods "web-..." is forbidden: exceeded quota: pods, requested: pods=1, used: pods=3, limited: pods=3
+    ```
+
+    ```bash
+    kubectl patch deploy web -n demo -p '{"spec":{"strategy":{"rollingUpdate":{"maxSurge":0,"maxUnavailable":1}}}}'
+    kubectl rollout status deploy/web -n demo
+    ```
+
+    ### Common mistakes
+
+    - Recreating the HPA with different limits.
+    - Raising the quota: forbidden by the task.
+    - `maxUnavailable: 0` together with `maxSurge: 0`: the API rejects it (no way to make progress).
+
+    ### Check your work
+
+    The HPA shows a percentage target and the right min/max; the rollout finishes with all pods on the new image.
   scenario: |
     Two things are stuck in different namespaces. Fix both.
 
@@ -436,13 +652,48 @@ exercises:
   kind: fix
   tags: [readiness, rolling-update, zero-downtime]
   tutorial: |
-    **Concept.** A pod is added to Service endpoints as soon as it is Ready. Without a readiness probe that is immediately after the container starts, so slow-starting apps receive traffic too early. Rollout settings control overlap.
+    **What you're learning.** Zero-downtime rollouts: a readiness probe so pods get traffic only when ready, and a strategy that removes old pods only after new ones are ready.
 
-    **Read up on:**
-    - `kubectl explain pod.spec.containers.readinessProbe` — httpGet, periodSeconds and related timing fields
-    - `kubectl explain deployment.spec.strategy.rollingUpdate` — maxSurge and maxUnavailable
-    - `kubectl rollout status deploy/NAME` — watch rollouts
-    - `kubectl get endpoints` — see when pods get added
+    ### The idea
+
+    Without a readiness probe, a pod counts as **Ready as soon as its container starts**, joins the Service endpoints, and gets requests while the app is still warming up: errors. A readiness probe on a "ready" endpoint delays that.
+
+    Then the strategy: `maxUnavailable: 0` means an old pod is only removed when a new one is Ready; `maxSurge: 1` lets one extra pod exist during the update.
+
+    ```yaml
+    spec:
+      strategy:
+        type: RollingUpdate
+        rollingUpdate: {maxSurge: 1, maxUnavailable: 0}
+      template:
+        spec:
+          containers:
+          - name: app
+            readinessProbe:
+              httpGet: {path: /ready, port: 8080}
+              periodSeconds: 2
+    ```
+
+    ### Commands you'll use
+
+    ```bash
+    kubectl get deploy pay -n demo -o jsonpath='{.spec.template.spec.containers[0].readinessProbe}'; echo   # empty?
+    kubectl patch deploy pay -n demo --type=json -p '[{"op":"add",
+      "path":"/spec/template/spec/containers/0/readinessProbe",
+      "value":{"httpGet":{"path":"/ready","port":8080},"periodSeconds":2}}]'
+    kubectl patch deploy pay -n demo -p '{"spec":{"strategy":{"rollingUpdate":{"maxSurge":1,"maxUnavailable":0}}}}'
+    kubectl rollout status deploy/pay -n demo
+    kubectl get pods -n demo -w                 # new pods show 0/1 for ~8 s, then 1/1
+    ```
+
+    ### Common mistakes
+
+    - A **liveness** probe instead: it restarts slow starters, doesn't hold traffic back.
+    - Probing `/` when the app has a dedicated `/ready`.
+
+    ### Check your work
+
+    New pods show `0/1` during warm-up and only then `1/1`, and the Deployment's strategy reads `maxUnavailable: 0`.
   scenario: |
     Every rollout of **`checkout`** (namespace **`shop`**) causes a few seconds of errors:
     the app needs **~8 seconds** to warm up after its process starts, but Kubernetes
@@ -507,20 +758,49 @@ exercises:
   kind: build
   tags: [troubleshooting, restarts, events, logs, exec, jsonpath]
   tutorial: |
-    **Concept.** Before you change anything on a sick cluster, read what it is already telling you. Four sources answer most "what happened?" questions:
+    **What you're learning.** Reading what the cluster already tells you: restart counts, events, previous logs, and files inside containers.
 
-    - **Restart counts** are stored in each pod's status. Comparing across namespaces means pulling structured data out of every pod rather than reading columns by eye.
-    - **Events** record what happened to objects, with a type, reason and the object involved. They can be filtered server-side by field.
-    - **Previous logs.** When a container crashes, the kubelet starts a new one, and the old instance's logs are kept for a while. The fresh container may log nothing useful; the terminated one holds the evidence.
-    - **Exec.** You can run commands inside a running container and capture their output, or copy files out of it, through the API server.
+    ### The idea
 
-    **Read up on:**
-    - `kubectl get pods -A` — the RESTARTS column; `kubectl get pods -A -o json` and `jq` (`man jq`) — fields under `status.containerStatuses`
-    - `--sort-by` in `kubectl get --help` — sorting by a JSONPath
-    - `kubectl get events -n NS` and `--field-selector` — filter on fields such as type and reason; `-o jsonpath` for `involvedObject`
-    - `kubectl logs --help` — options for previous instances; `kubectl describe pod` — the Last State section
-    - `kubectl exec --help` and `kubectl cp --help` — running a command, selecting a container, copying files
-    - Shell redirection (`>`) and `grep` to write results to files
+    Before changing anything, collect evidence. Four sources answer most "what happened?" questions:
+
+    | source | command |
+    |---|---|
+    | restart counts | `kubectl get pods -A` (RESTARTS), or JSON `status.containerStatuses[].restartCount` |
+    | events | `kubectl get events -n NS --field-selector type=Warning,reason=X` |
+    | logs of the **previous** container | `kubectl logs POD --previous` |
+    | files inside a container | `kubectl exec POD -- cat FILE`, or `kubectl cp` |
+
+    ### Commands you'll use
+
+    Busiest restarter, across namespaces:
+    ```bash
+    kubectl get pods -A -o json | jq -r '.items[]
+      | "\([.status.containerStatuses[]?.restartCount] | add // 0) \(.metadata.namespace)/\(.metadata.name)"' \
+      | sort -n | tail -1
+    ```
+    ```text
+    14 shop/cart-7d9f-abcde
+    ```
+    Adds up all containers' restarts per pod (`add // 0` gives 0 when there are none).
+
+    ```bash
+    kubectl get events -n demo --field-selector type=Warning,reason=BackOff \
+      -o custom-columns=KIND:.involvedObject.kind,NAME:.involvedObject.name,MSG:.message
+    kubectl logs worker -n demo --previous | grep FATAL
+    kubectl exec app -n demo -- cat /run/app/settings.conf > /lab/settings.conf
+    kubectl cp demo/app:/run/app/settings.conf /lab/settings.conf     # needs tar in the image
+    ```
+
+    ### Common mistakes
+
+    - `kubectl logs` without `--previous` after a crash: shows the new, quiet container.
+    - `sort` without `-n`: `9` sorts after `14`.
+    - Writing more than asked (the restart count together with the name).
+
+    ### Check your work
+
+    Each file holds exactly the requested value; compare by eye with `kubectl get pods -A`, `kubectl get events` and the commands above.
   scenario: |
     Something is wrong in the cluster and you need four facts, written to files in
     **`/lab`** (the failing workloads live in namespace **`incident`**, plus whatever else
@@ -613,13 +893,42 @@ exercises:
   kind: fix
   tags: [troubleshooting, configmap, defaultMode]
   tutorial: |
-    **Concept.** ConfigMap volumes create files with a default mode that is not executable. The file mode of mounted ConfigMap files is controlled in the volume definition, in octal or decimal form.
+    **What you're learning.** File modes on ConfigMap volumes, and making a mounted script executable.
 
-    **Read up on:**
-    - `kubectl explain pod.spec.volumes.configMap` — options controlling how files are created, and YAML octal versus JSON decimal
-    - `kubectl create job --help` — creating a one-off job from a CronJob
-    - `man chmod` — mode bits for executable
-    - `kubectl logs job/NAME` — verify the run
+    ### The idea
+
+    Files from a ConfigMap (or Secret) volume get mode **0644** by default: readable, not executable. Running such a script directly (`/scripts/run.sh`) fails with **Permission denied**. `defaultMode` on the volume sets the mode for all its files (`items[].mode` for one file).
+
+    In YAML, write the mode in octal with a leading zero (`0755`). In **JSON** (a JSON patch), octal isn't allowed, so use the **decimal** value: `0755` octal = `493` decimal, `0644` = `420`, `0400` = `256`.
+
+    ### Commands you'll use
+
+    ```bash
+    kubectl logs -n demo -l job-name=... --tail=2
+    ```
+    ```text
+    /bin/sh: /scripts/job.sh: Permission denied
+    ```
+
+    ```bash
+    kubectl get cronjob cleanup -n demo -o jsonpath='{.spec.jobTemplate.spec.template.spec.volumes}'; echo
+    kubectl patch cronjob cleanup -n demo --type=json -p \
+      '[{"op":"add","path":"/spec/jobTemplate/spec/template/spec/volumes/0/configMap/defaultMode","value":493}]'
+    kubectl create job cleanup-test --from=cronjob/cleanup -n demo
+    kubectl wait --for=condition=complete job/cleanup-test -n demo --timeout=60s
+    ```
+
+    `printf '%d\n' 0755` prints the decimal value of an octal number.
+
+    ### Common mistakes
+
+    - `"value": 0755` in JSON: invalid JSON.
+    - Changing the CronJob's command to `sh /scripts/job.sh`: the task says it's executed directly.
+    - Creating the test Job before patching: it uses the old template.
+
+    ### Check your work
+
+    The test Job completes, and `kubectl exec` into a pod (or `ls -lL` in a debug run) shows `-rwxr-xr-x` on the script.
   scenario: |
     The **`backup`** CronJob's pods (namespace **`ops`**) fail with
     `/scripts/backup.sh: Permission denied`. The script comes from the ConfigMap
@@ -669,13 +978,48 @@ exercises:
   kind: fix
   tags: [troubleshooting, multi-container, ports]
   tutorial: |
-    **Concept.** All containers in a pod share one network namespace, so two processes cannot bind the same port. Containers are immutable in many fields once running, so some changes need the pod recreated.
+    **What you're learning.** That all containers in a pod share **one network namespace**, so two can't use the same port.
 
-    **Read up on:**
-    - `kubectl logs POD -c CONTAINER` — the bind error
-    - `kubectl get pod NAME -o yaml` — container args
-    - `kubectl replace --help` — the `--force` option for immutable pod fields
-    - The sidecar's own `--help` (via `kubectl exec` or image docs)
+    ### The idea
+
+    Containers in a pod share an IP address and port space (that's why they reach each other at `localhost`). If two processes bind the same port, the second fails with **address already in use**. One of them must move to another port.
+
+    Most fields of a running pod's containers can't be changed (only the image, mostly). To change `args`, save the pod, edit, and `kubectl replace --force`.
+
+    ### Commands you'll use
+
+    ```bash
+    kubectl get pod api -n demo
+    ```
+    ```text
+    NAME   READY   STATUS             RESTARTS
+    api    1/2     CrashLoopBackOff   5
+    ```
+
+    ```bash
+    kubectl logs api -n demo -c metrics --previous | tail -2
+    ```
+    ```text
+    listen tcp :8080: bind: address already in use
+    ```
+
+    ```bash
+    kubectl get pod api -n demo -o json | jq '.spec.containers[] | {name, args, ports}'
+    kubectl get pod api -n demo -o json \
+      | jq '.spec.containers[1].args = ["netexec","--http-port=9100","--udp-port=-1"]' > /lab/api.json
+    kubectl replace --force -f /lab/api.json
+    kubectl get pod api -n demo
+    ```
+    `--udp-port=-1` disables netexec's UDP listener, which would otherwise also take 8081.
+
+    ### Common mistakes
+
+    - Moving the app instead of the sidecar: the task says keep the app on 8080.
+    - `kubectl edit` on a running pod's args: "spec: Forbidden: pod updates may not change fields other than ...".
+
+    ### Check your work
+
+    The pod shows `2/2 Running` and both ports answer from inside (`kubectl exec api -c app -- wget -qO- localhost:9100`).
   scenario: |
     The **`api`** pod (namespace **`obs`**) runs the application plus a metrics sidecar.
     One of the two containers keeps crashing with *address already in use*.
@@ -715,13 +1059,39 @@ exercises:
   kind: fix
   tags: [troubleshooting, imagePullPolicy, tags]
   tutorial: |
-    **Concept.** imagePullPolicy decides whether the kubelet reuses a locally cached image or contacts the registry on each start. Mutable tags like `latest` make this matter, since the same name can refer to different content over time.
+    **What you're learning.** `imagePullPolicy`, mutable tags, and why pinning by digest is better.
 
-    **Read up on:**
-    - `kubectl explain pod.spec.containers.imagePullPolicy` — IfNotPresent, Always, Never and defaults
-    - `kubectl rollout restart --help`
-    - `kubectl describe pod` — Events show pulls
-    - Kubernetes docs: Images, pinning by digest
+    ### The idea
+
+    A tag like `app:1.4` can be **re-pushed** with different content. Whether a node gets the new content depends on `imagePullPolicy`:
+
+    | policy | the kubelet |
+    |---|---|
+    | `IfNotPresent` (default for normal tags) | uses the cached image if the node has one with that name |
+    | `Always` | asks the registry each time a container starts (downloads only if the digest changed) |
+    | `Never` | only uses a local image |
+
+    With `IfNotPresent` and a re-pushed tag, different nodes run different code. `Always` fixes that; referencing the image by **digest** (`app@sha256:...`) is better still: the name means exactly one image, forever.
+
+    ### Commands you'll use
+
+    ```bash
+    kubectl get deploy portal -n demo -o jsonpath='{.spec.template.spec.containers[0].imagePullPolicy}'; echo
+    kubectl patch deploy portal -n demo --type=json \
+      -p '[{"op":"replace","path":"/spec/template/spec/containers/0/imagePullPolicy","value":"Always"}]'
+    kubectl rollout status deploy/portal -n demo
+    kubectl get pods -n demo -l app=portal -o jsonpath='{range .items[*]}{.status.containerStatuses[0].imageID}{"\n"}{end}'
+    ```
+    `imageID` shows the digest each pod actually runs.
+
+    ### Common mistakes
+
+    - `op: add` vs `replace`: if the field isn't set in the template, use `add`.
+    - Changing the policy without a rollout: existing pods keep their image.
+
+    ### Check your work
+
+    The template's `imagePullPolicy` is `Always`, the rollout finished, and all pods report the same `imageID`.
   scenario: |
     The team pushes **`nginx:1.29-alpine`** fixes under the *same tag*... in this story,
     the deployment **`portal`** (namespace **`web`**) uses a **mutable tag**, and some
@@ -757,13 +1127,42 @@ exercises:
   kind: fix
   tags: [troubleshooting, namespace, finalizers, crd]
   tutorial: |
-    **Concept.** A namespace stays Terminating until every object inside it is gone. Objects with finalizers wait for a controller to clean up; if that controller is gone they block forever.
+    **What you're learning.** **Finalizers**, and why a namespace can hang in `Terminating`.
 
-    **Read up on:**
-    - `kubectl get ns NAME -o yaml` — conditions in status say what remains
-    - `kubectl api-resources --verbs=list --namespaced -o name` — enumerate kinds to search
-    - `kubectl explain pod.metadata.finalizers` — what finalizers mean
-    - `kubectl patch --help` — merge patches to edit metadata
+    ### The idea
+
+    A **finalizer** is a name in `metadata.finalizers`: "don't delete me yet, controller X must clean up first". Deleting the object sets `deletionTimestamp`; the object disappears only when its finalizers list is empty. A namespace is deleted only when **everything inside** is gone.
+
+    If the controller that owns a finalizer was uninstalled, nobody will ever remove it: the object, and its namespace, hang forever. The clean fix: remove the finalizers of the **blocking objects** (accepting that their external clean-up won't happen), not force the namespace itself.
+
+    ### Commands you'll use
+
+    ```bash
+    kubectl get ns legacy -o jsonpath='{range .status.conditions[*]}{.type}: {.message}{"\n"}{end}'
+    ```
+    ```text
+    NamespaceContentRemaining: Some resources are remaining: gadgets.demo.example.com has 3 resource instances
+    NamespaceFinalizersRemaining: Some content in the namespace has finalizers remaining: demo.example.com/cleanup in 3 resource instances
+    ```
+
+    ```bash
+    kubectl get gadgets.demo.example.com -n legacy -o custom-columns=NAME:.metadata.name,FIN:.metadata.finalizers
+    for g in $(kubectl get gadgets.demo.example.com -n legacy -o name); do
+      kubectl patch "$g" -n legacy --type=merge -p '{"metadata":{"finalizers":null}}'
+    done
+    kubectl get ns legacy           # NotFound shortly after
+    ```
+
+    To list everything left in a namespace: `kubectl api-resources --verbs=list --namespaced -o name | xargs -n1 kubectl get -n legacy --ignore-not-found --show-kind`.
+
+    ### Common mistakes
+
+    - Editing the namespace's own `spec.finalizers` through the `finalize` subresource: forbidden by the task, and leaves orphaned objects in etcd.
+    - Patching with the wrong resource name (use the full `plural.group` shown in the condition).
+
+    ### Check your work
+
+    `kubectl get ns NAME` returns NotFound.
   scenario: |
     `kubectl delete namespace old-operator` was run yesterday; the namespace is still
     **`Terminating`**. The operator that managed its custom resources was uninstalled
@@ -818,12 +1217,40 @@ exercises:
   kind: fix
   tags: [incident, troubleshooting]
   tutorial: |
-    **Concept.** A request to an app crosses several layers, and a break at any layer looks like an outage. Walk the chain hop by hop, checking each hop's selector, port mapping and configuration before changing anything.
+    **What you're learning.** Walking a full request chain (Ingress → web → api → db) and fixing every broken hop.
 
-    **Read up on:**
-    - `kubectl get ingress,svc,endpoints,pods -n NS` — overview of every hop
-    - `kubectl describe ingress NAME` — class, backends and events
-    - `kubectl exec` with `wget` or `curl` — test each hop from inside the cluster
+    ### Method
+
+    Check each hop's **selector, ports and configuration** before changing anything, and test after every fix.
+
+    | hop | check | exercise |
+    |---|---|---|
+    | Ingress | class, host, backend port | k8s-163 |
+    | web Service | selector matches pods; `targetPort` | k8s-044 |
+    | web pods | ConfigMap mounted where nginx expects it (mounting at `/etc/nginx` hides `nginx.conf`) | k8s-065 |
+    | api Service | `targetPort` = the port agnhost listens on | k8s-044 |
+    | api pods | readiness probe on a path/port that exists | k8s-028 |
+    | db pods | env from a Secret key that exists | k8s-061, k8s-080 |
+
+    ```bash
+    kubectl get ingress,svc,endpointslices,deploy,pods -n booking
+    kubectl describe ingress -n booking
+    for s in web api db; do echo "$s: $(kubectl get svc $s -n booking -o jsonpath='{.spec.selector} {.spec.ports[0].targetPort}')"; done
+    kubectl get pods -n booking --show-labels
+    kubectl describe pod -n booking -l app=db | tail -5
+    kubectl get secret -n booking -o json | jq '.items[] | {n: .metadata.name, k: (.data|keys)}'
+    ```
+
+    Test from outside and inside:
+    ```bash
+    curl -H 'Host: booking.example.com' http://node01:30080/
+    curl -H 'Host: booking.example.com' http://node01:30080/api/hostname
+    kubectl exec -n booking deploy/api -- nc -z -w 3 db 5432 && echo db ok
+    ```
+
+    ### Check your work
+
+    Both URLs answer correctly, the api pod reaches the db, and `kubectl get deploy -n booking` shows every Deployment fully Ready.
   scenario: |
     The booking platform in namespace **`booking`** is down. Users hit
     **`http://booking.example.com/`** (Traefik on port 30080). The chain is:
