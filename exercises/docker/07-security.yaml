@@ -12,13 +12,40 @@ exercises:
   kind: build
   tags: [restart-policy]
   tutorial: |
-    **Concept.** Restart policies decide what the daemon does when a container's main process exits. Some restart regardless of the exit code; some depend on it and can be capped.
+    **What you're learning.** `on-failure:N`: retrying only failed runs, a limited number of times.
 
-    **Read up on:**
-    - `docker run --help` — the `--restart` option and its policies
-    - Docker docs 'Start containers automatically' — comparison of policies
-    - `docker inspect` — `.RestartCount`, `.State.ExitCode`
-    - `docker ps -a` — watching the container state change
+    ### The idea
+
+    | policy | restarts on exit 0? | on exit ≠ 0? | limit |
+    |---|---|---|---|
+    | `always` / `unless-stopped` | yes | yes | none |
+    | `on-failure` | **no** | yes | none |
+    | `on-failure:N` | no | yes | at most **N** restarts |
+
+    Docker waits longer between each restart (100 ms, doubling), so a crash loop doesn't hammer the host. `RestartCount` in `docker inspect` counts the restarts.
+
+    ### Commands you'll use
+
+    ```bash
+    docker run -d --name fetch --restart on-failure:2 busybox:1.37 sh -c 'echo trying; exit 3'
+    sleep 10
+    docker inspect fetch --format '{{.HostConfig.RestartPolicy.Name}}:{{.HostConfig.RestartPolicy.MaximumRetryCount}} restarts={{.RestartCount}} exit={{.State.ExitCode}}'
+    ```
+    ```text
+    on-failure:2 restarts=2 exit=3
+    ```
+    ```bash
+    docker logs fetch          # "trying" once per attempt
+    ```
+
+    ### Common mistakes
+
+    - `--restart always`: it also restarts after success, forever.
+    - `on-failure=3`: the separator is `:`.
+
+    ### Check your work
+
+    `docker inspect sync-job` shows `on-failure` with a maximum of 3 retries, and it stops after 3 restarts.
   scenario: |
     The **`sync-job`** container sometimes fails because the remote API is flaky. It
     should be retried automatically when it **fails**, but **at most 3 times**, and never
@@ -46,13 +73,39 @@ exercises:
   kind: build
   tags: [oom, troubleshooting]
   tutorial: |
-    **Concept.** Exit code 137 means the process received SIGKILL (128 + 9). That may come from the kernel OOM killer or from someone running kill or a timed-out stop, so you need to read the state the daemon recorded.
+    **What you're learning.** Reading exit codes: **137** = SIGKILL, and telling the OOM killer apart from other kills.
 
-    **Read up on:**
-    - `docker inspect --format` — fields under `.State`
-    - `docker ps -a` — stopped containers still hold their state
-    - `dmesg` or `journalctl -k` — kernel OOM messages
-    - Docker docs 'Runtime options with memory' — memory limits and OOM behaviour
+    ### The idea
+
+    An exit code above 128 means "killed by signal (code − 128)": **137** = 128 + 9 = **SIGKILL**, and 143 = SIGTERM. SIGKILL can come from:
+
+    - the kernel's **OOM killer**, when the container exceeds its memory limit: `State.OOMKilled` is `true`;
+    - `docker kill`, or `docker stop` after its timeout: `OOMKilled` is `false`.
+
+    `HostConfig.Memory` is the limit in **bytes** (0 = no limit).
+
+    ### Commands you'll use
+
+    ```bash
+    docker ps -a --filter name=loader --format '{{.Status}}'          # Exited (137) 3 hours ago
+    docker inspect loader --format 'oom={{.State.OOMKilled}} exit={{.State.ExitCode}} mem={{.HostConfig.Memory}}'
+    ```
+    ```text
+    oom=true exit=137 mem=67108864
+    ```
+    ```bash
+    echo $(( 67108864 / 1024 / 1024 ))      # 64
+    docker events --since 24h --filter container=loader --filter event=oom   # if events still cover it
+    ```
+
+    ### Common mistakes
+
+    - Concluding "OOM" from 137 alone.
+    - Dividing by 1000: MiB uses 1024.
+
+    ### Check your work
+
+    The cause file says `OOMKilled` or `SIGKILL` as `docker inspect` shows, and the limit is the MiB number.
   scenario: |
     The **`importer`** container died overnight with exit code 137.
 
@@ -95,13 +148,32 @@ exercises:
   kind: fix
   tags: [security, docker-group]
   tutorial: |
-    **Concept.** Access to the docker socket is effectively root on the host, because containers can mount any host path and run privileged. Controlling who is in the docker group is a security task.
+    **What you're learning.** Why membership of the `docker` group equals root, and removing a user from it.
 
-    **Read up on:**
-    - `id <user>` and `getent group docker` — see group membership
-    - `man gpasswd` and `man usermod` — removing a user from a group
-    - `ls -l /var/run/docker.sock` — who can talk to the daemon
-    - Docker docs 'Docker daemon attack surface'
+    ### The idea
+
+    The Docker daemon runs as root, and anyone who can talk to its socket (`/var/run/docker.sock`) can ask it to start a container that mounts the host's `/` read-write, or runs `--privileged`. Membership of the **`docker` group**, which owns the socket, is therefore **root on the host**. Read-only needs like "look at logs" call for something else (`sudo` for specific commands, or a log collector).
+
+    ### Commands you'll use
+
+    ```bash
+    ls -l /var/run/docker.sock            # srw-rw---- root docker
+    getent group docker
+    id contractor
+    sudo gpasswd -d contractor docker
+    id contractor                         # docker gone, other groups kept
+    ```
+    `gpasswd -d USER GROUP` removes one membership. The change takes effect at the user's next login: existing sessions keep the group until then.
+
+    ### Common mistakes
+
+    - `usermod -G GROUP1,GROUP2 USER` without `-a`: it **replaces** the whole supplementary group list.
+    - Deleting the account.
+    - `chmod 666 docker.sock`: gives everyone root.
+
+    ### Check your work
+
+    `id intern` no longer lists `docker` but still lists their other groups.
   scenario: |
     An intern account **`intern`** was added to the **`docker`** group "so they can look
     at logs". Membership of that group is equivalent to root on the host (anyone in it
@@ -136,19 +208,50 @@ exercises:
   kind: fix
   tags: [security, resources, no-new-privileges, pids-limit, ulimits, cpuset, update, oom]
   tutorial: |
-    **Concept.** A container is a process under a set of kernel controls, and hardening it means setting those controls deliberately. Some are **cgroup limits** (memory, process count, CPU placement and weight); they can usually be changed on a running container with `docker update`. Others are **process attributes** fixed at creation (`no_new_privs`, per-process `ulimit`s such as the open-file limit); to change those you must recreate the container. Knowing which kind you are dealing with decides whether you update in place or recreate.
+    **What you're learning.** cgroup limits you can change live with `docker update`, and run-time hardening options (`no-new-privileges`, ulimits).
 
-    - `no_new_privs` stops a process and its children from gaining privileges through setuid/setgid binaries.
-    - The cgroup **pids** limit caps how many processes a container may create, which stops fork bombs from exhausting the host.
-    - The **nofile** ulimit caps open file descriptors per process; busy gateways run out with the default.
-    - **cpuset** restricts which cores a container may use, **cpu-shares** sets its relative weight when cores are contended.
-    - Memory and swap are separate settings that interact: with `--memory-swap` equal to `--memory` there is no swap.
+    ### The idea
 
-    **Read up on:**
-    - `docker run --help` and `docker update --help` — compare which flags exist in both and which only in `run`
-    - Docker docs 'Runtime options with Memory, CPUs, and GPUs' and 'Security'
-    - `docker inspect` — `.HostConfig.Memory`, `.PidsLimit`, `.CpusetCpus`, `.CPUShares`, `.Ulimits`, `.SecurityOpt`
-    - Inside a container: `cat /sys/fs/cgroup/pids.max`, `cat /sys/fs/cgroup/cpuset.cpus.effective`, `ulimit -n`, `grep NoNewPrivs /proc/1/status`
+    **cgroup limits**: the kernel enforces them per container, and most can be changed **on a running container** with `docker update`:
+
+    | option | limits |
+    |---|---|
+    | `--memory 256m --memory-swap 256m` | RAM, and RAM+swap (equal = no swap) |
+    | `--pids-limit 100` | processes and threads |
+    | `--cpuset-cpus 0` | which CPUs it may run on |
+    | `--cpu-shares 256` | relative weight when CPUs are busy (default 1024) |
+
+    **Options fixed at creation**:
+
+    | option | effect |
+    |---|---|
+    | `--security-opt no-new-privileges` | setuid binaries and file capabilities can't raise privileges |
+    | `--ulimit nofile=65536:65536` | open-files limit (soft:hard) |
+
+    ### Commands you'll use
+
+    ```bash
+    docker inspect cache --format 'oom={{.State.OOMKilled}} restarts={{.RestartCount}} mem={{.HostConfig.Memory}}'
+    docker update --memory 512m --memory-swap 512m --pids-limit 200 --cpuset-cpus 1 --cpu-shares 512 cache
+    docker inspect cache --format '{{.HostConfig.Memory}} {{.HostConfig.PidsLimit}} {{.HostConfig.CpusetCpus}} {{.HostConfig.CpuShares}}'
+    docker exec cache cat /sys/fs/cgroup/memory.max /sys/fs/cgroup/pids.max
+
+    docker run -d --name proxy -p 8140:80 --security-opt no-new-privileges \
+      --ulimit nofile=65536:65536 nginx:1.28-alpine
+    docker exec proxy sh -c 'ulimit -n; ulimit -Hn'
+    docker exec proxy grep NoNewPrivs /proc/1/status          # NoNewPrivs: 1
+    ```
+    Raising `--memory` above the current `--memory-swap` fails: change both together.
+
+    ### Common mistakes
+
+    - Recreating `search-index`: the task says keep its identity (same ID).
+    - `--memory` alone when swap must equal it.
+    - `--ulimit nofile=65536`: sets soft and hard to the same value, which is fine. Check it with `ulimit -Hn`.
+
+    ### Check your work
+
+    `search-index` has the same ID, the new limits in `inspect` and its index loaded. `ws-gateway` shows `NoNewPrivs: 1` and 65536 for both limits.
   scenario: |
     Two containers need hardening.
 
@@ -216,13 +319,40 @@ exercises:
   kind: build
   tags: [stats, monitoring, resources, blkio]
   tutorial: |
-    **Concept.** Troubleshooting a loaded docker host has two halves: *finding* the container that consumes a resource, then *constraining* the next one before it hurts. Docker reports live usage per container from cgroup counters (`docker stats`), and cgroups can throttle block I/O throughput - but only per block device, so you must name the right disk.
+    **What you're learning.** Finding the container that uses the most of a resource, and throttling disk bandwidth.
 
-    **Read up on:**
-    - `docker stats --help` — `--no-stream` and `--format`, placeholders such as `.Name`, `.MemUsage`, `.MemPerc`
-    - `sort -h` and `sort -n` — ordering human-readable sizes or plain numbers (`MemUsage` contains a unit and a limit column, `MemPerc` is easier)
-    - `lsblk` and `findmnt -no SOURCE /` — identify the root disk (the whole disk, not the partition)
-    - `docker run --help` — the `--device-write-bps` option and its units; `docker inspect` — `.HostConfig.BlkioDeviceWriteBps`
+    ### The idea
+
+    `docker stats --no-stream` prints one snapshot of live usage per container (CPU %, memory, network and block I/O). `--format` makes it sortable.
+
+    **Block I/O throttling** applies to a **whole disk device** (not a partition):
+
+    | option | limits |
+    |---|---|
+    | `--device-write-bps /dev/vda:10mb` | write bytes/s |
+    | `--device-read-bps`, `--device-write-iops` | read rate, operations/s |
+
+    Find the disk under `/`: `findmnt -no SOURCE /` gives the partition (`/dev/vda1`), and `lsblk -no PKNAME` gives its parent disk (`vda`).
+
+    ### Commands you'll use
+
+    ```bash
+    docker stats --no-stream --format '{{.MemUsage}}\t{{.Name}}'
+    docker stats --no-stream --format '{{.MemPerc}} {{.Name}}' | tr -d '%' | sort -n | tail -1
+    findmnt -no SOURCE /                         # /dev/vda1
+    lsblk -no PKNAME /dev/vda1                   # vda
+    docker run -d --name archiver --device-write-bps /dev/vda:5mb busybox:1.37 sleep infinity
+    docker inspect archiver --format '{{json .HostConfig.BlkioDeviceWriteBps}}'
+    ```
+
+    ### Common mistakes
+
+    - Sorting `MemUsage` as text: `900MiB` sorts after `1.2GiB`. Sort `MemPerc` numerically, or convert the units.
+    - Throttling the partition (`/dev/vda1`): Docker needs the disk.
+
+    ### Check your work
+
+    The hog file names the container at the top of `docker stats`, the disk file holds a whole-disk path, and `backup` has a 10485760 bytes/s write limit on it.
   scenario: |
     The docker host is swapping and slow.
 
@@ -270,13 +400,42 @@ exercises:
   kind: fix
   tags: [security, seccomp, apparmor]
   tutorial: |
-    **Concept.** Docker confines every container with two default kernel security layers. **seccomp** filters which system calls a process may make; the default profile blocks dozens of dangerous ones. **AppArmor** confines file access and capabilities with the `docker-default` profile. Both can be switched off per container with `--security-opt ...=unconfined`, which is handy while debugging and dangerous when forgotten. These settings are part of the container's creation config and cannot be changed afterwards - you recreate the container, keeping everything else (image, command, ports) identical.
+    **What you're learning.** Docker's default **seccomp** and **AppArmor** profiles, and how to tell they're active.
 
-    **Read up on:**
-    - `docker inspect` — `.HostConfig.SecurityOpt`, `.AppArmorProfile`, `.Config.Image`, `.Config.Cmd`
-    - `docker run --help` — `--security-opt` and its seccomp / apparmor values
-    - Docker docs 'Seccomp security profiles for Docker' and 'AppArmor security profiles for Docker'
-    - `grep Seccomp /proc/1/status` inside a container (0 = off, 2 = filter), `aa-status` on the host
+    ### The idea
+
+    Two kernel security layers confine every container by default:
+
+    | layer | restricts | turned off by | check inside |
+    |---|---|---|---|
+    | **seccomp** | which **system calls** are allowed (blocks dozens of dangerous ones, like `mount`, `kexec_load` and `bpf`) | `--security-opt seccomp=unconfined` | `grep Seccomp /proc/1/status` → `2` = filtering |
+    | **AppArmor** | which files and capabilities a program may use (profile `docker-default`) | `--security-opt apparmor=unconfined` | `cat /proc/1/attr/current` → `docker-default (enforce)` |
+
+    Security options are fixed at creation: to restore the defaults, recreate **without** those options.
+
+    ### Commands you'll use
+
+    ```bash
+    docker inspect worker --format '{{json .HostConfig.SecurityOpt}} {{.AppArmorProfile}}'
+    ```
+    ```text
+    ["seccomp=unconfined"] docker-default
+    ```
+    ```bash
+    docker inspect worker --format '{{.Config.Image}} {{json .Config.Cmd}}'
+    docker rm -f worker && docker run -d --name worker IMAGE CMD...
+    docker exec worker grep Seccomp /proc/1/status          # Seccomp: 2
+    docker exec web cat /proc/1/attr/current                # docker-default (enforce)
+    ```
+
+    ### Common mistakes
+
+    - Adding `--security-opt seccomp=default`: not needed (the default applies when nothing is set).
+    - Changing the image, command or port while recreating.
+
+    ### Check your work
+
+    `SecurityOpt` is empty for both, `payments-worker` shows `Seccomp: 2`, and `reverse-proxy` runs under `docker-default` and answers on 8131.
   scenario: |
     A post-debugging audit found two containers left with their protections off:
 
@@ -326,13 +485,36 @@ exercises:
   kind: fix
   tags: [security, docker-socket]
   tutorial: |
-    **Concept.** Mounting the docker socket into a container hands that container control over the whole daemon and thus the host. A static web page needs none of that.
+    **What you're learning.** Why mounting the **Docker socket** into a container hands over the host.
 
-    **Read up on:**
-    - `docker inspect` — `.Mounts` to see what is mounted
-    - `docker rm -f` and `docker run -v` — recreating with a different mount
-    - Docker docs 'Docker daemon attack surface'
-    - nginx image docs — where static content is served from
+    ### The idea
+
+    `-v /var/run/docker.sock:/var/run/docker.sock` gives the container full control of the daemon. Anyone who compromises it can start a privileged container that mounts `/`: **root on the host**. Only tools that genuinely manage Docker need it, and even they should get a filtered proxy. A static web server needs nothing but its content.
+
+    ### Commands you'll use
+
+    ```bash
+    docker inspect board --format '{{range .Mounts}}{{.Source}} -> {{.Destination}}{{"\n"}}{{end}}'
+    ```
+    ```text
+    /lab/board -> /usr/share/nginx/html
+    /var/run/docker.sock -> /var/run/docker.sock
+    ```
+    ```bash
+    docker inspect board --format '{{.Config.Image}} {{json .HostConfig.PortBindings}}'
+    docker rm -f board
+    docker run -d --name board -p 8141:80 -v /lab/board:/usr/share/nginx/html:ro nginx:1.28-alpine
+    docker exec board ls -l /var/run/docker.sock       # No such file
+    ```
+
+    ### Common mistakes
+
+    - Mounting the socket read-only (`:ro`): the API still works through a read-only socket file.
+    - Dropping the content mount by accident.
+
+    ### Check your work
+
+    No mount of `docker.sock` in `docker inspect status-board`, and the page answers on 8132.
   scenario: |
     The **`status-board`** container only needs to serve a static page from
     `/lab/status-board` on port **8132**, but whoever started it also mounted the
@@ -365,13 +547,45 @@ exercises:
   kind: build
   tags: [security, capabilities, non-root]
   tutorial: |
-    **Concept.** Least privilege for a container combines several levers: which user it runs as, which Linux capabilities it keeps, and whether its filesystem is writable. Binding a low port normally requires a specific capability.
+    **What you're learning.** **Capabilities**: dropping them all and adding back only what's needed.
 
-    **Read up on:**
-    - `docker run --help` — user, capability and read-only options
-    - `man capabilities` — what each capability grants, especially for ports below 1024
-    - Mount mode suffixes on `-v` (read-only)
-    - `docker exec <c> id` and `/proc/1/status` — verify the result
+    ### The idea
+
+    Linux splits root's powers into ~40 **capabilities**. Docker gives containers a reduced default set (about 14). `--cap-drop ALL` removes them all, and `--cap-add NAME` adds back exactly what's needed:
+
+    | need | capability |
+    |---|---|
+    | bind a port below 1024 as non-root | `NET_BIND_SERVICE` |
+    | change the clock | `SYS_TIME` |
+    | change file ownership | `CHOWN` |
+
+    A **non-root** user (`-u 1000`) normally has no capabilities even when they're in the bounding set. Docker grants added capabilities to non-root users too (as ambient capabilities), which is what makes binding port 80 as UID 1000 work.
+
+    ### Commands you'll use
+
+    ```bash
+    docker run -d --name mini -u 1000 --cap-drop ALL --cap-add NET_BIND_SERVICE \
+      -v /lab/mini:/www:ro -p 8142:80 busybox:1.37 httpd -f -p 80 -h /www
+    curl -s localhost:8142/
+    docker exec mini grep Cap /proc/1/status
+    ```
+    ```text
+    CapInh:	0000000000000000
+    CapPrm:	0000000000000400
+    CapEff:	0000000000000400
+    CapBnd:	0000000000000400
+    CapAmb:	0000000000000400
+    ```
+    `0x400` = bit 10 = `CAP_NET_BIND_SERVICE` (`capsh --decode=400` shows the name).
+
+    ### Common mistakes
+
+    - Running as root to get port 80.
+    - `--cap-add NET_ADMIN`: wrong capability, and far too broad.
+
+    ### Check your work
+
+    `CapEff` is `0000000000000400`, `id` shows uid 1000, the mount is read-only, and `curl localhost:8133` works.
   scenario: |
     Run a tiny web server **`tiny-web`** that is as locked down as possible:
 
@@ -406,13 +620,42 @@ exercises:
   kind: fix
   tags: [security, privileged, capabilities]
   tutorial: |
-    **Concept.** `--privileged` gives all capabilities and all devices. Usually a task needs only a single capability, which can be granted on its own.
+    **What you're learning.** Replacing `--privileged` with the single capability a task needs.
 
-    **Read up on:**
-    - `man capabilities` — find the capability that allows changing the system clock
-    - `docker run --help` — options to add and drop capabilities
-    - `docker inspect` — `.HostConfig.Privileged`, `.Config.Cmd`
-    - `capsh --decode` — read capability masks in `/proc/1/status`
+    ### The idea
+
+    `--privileged` grants **all** capabilities, access to **all host devices**, and turns off seccomp and AppArmor. A container that needs one power should get only that one with `--cap-add`. Setting the clock needs `CAP_SYS_TIME`.
+
+    | operation | capability |
+    |---|---|
+    | set the clock | `SYS_TIME` |
+    | change network configuration | `NET_ADMIN` |
+    | raw sockets (ping) | `NET_RAW` |
+    | trace processes | `SYS_PTRACE` |
+
+    `man 7 capabilities` lists them all.
+
+    ### Commands you'll use
+
+    ```bash
+    docker inspect ntp --format '{{.HostConfig.Privileged}} {{.Config.Image}} {{json .Config.Cmd}}'
+    docker rm -f ntp
+    docker run -d --name ntp --cap-add SYS_TIME IMAGE CMD...
+    docker inspect ntp --format '{{.HostConfig.Privileged}} {{json .HostConfig.CapAdd}}'
+    ```
+    ```text
+    false ["CAP_SYS_TIME"]
+    ```
+    Setting the clock inside a container changes the **host's** clock: there's no time namespace for the wall clock.
+
+    ### Common mistakes
+
+    - `--cap-add ALL`: the same as privileged for capabilities.
+    - Forgetting the original command.
+
+    ### Check your work
+
+    `Privileged` is `false`, `CapAdd` is just `SYS_TIME`, and the container runs.
   scenario: |
     **`clock-sync`** runs with `--privileged` because it needs to set the system time.
     `--privileged` grants *every* capability and all devices.
@@ -444,13 +687,37 @@ exercises:
   kind: fix
   tags: [security, secrets, files]
   tutorial: |
-    **Concept.** Environment variables are visible to anyone who can run `docker inspect`. Secrets are better delivered as files, which apps read at runtime.
+    **What you're learning.** Delivering secrets as **files**, not environment variables.
 
-    **Read up on:**
-    - `docker inspect` — see `.Config.Env`
-    - Docker docs 'Manage sensitive data' and the `_FILE` convention many images use
-    - `docker run -v` — mounting a file read-only
-    - `ls -l` — host file permissions
+    ### The idea
+
+    Environment variables are visible to anyone who can run `docker inspect` (or read `/proc/PID/environ`), and they often end up in logs and crash reports. Mount the secret as a **read-only file** and tell the app **where** it is: the `*_FILE` convention. Many official images support `POSTGRES_PASSWORD_FILE`, `MYSQL_PASSWORD_FILE` and similar.
+
+    ```bash
+    -v /host/secret:/run/secrets/NAME:ro -e APP_PASSWORD_FILE=/run/secrets/NAME
+    ```
+
+    ### Commands you'll use
+
+    ```bash
+    docker inspect api --format '{{json .Config.Env}}'          # ["DB_PASS=hunter2", ...]
+    docker inspect api --format '{{json .Config.Cmd}}'
+    docker rm -f api
+    docker run -d --name api -v /lab/secrets/api_db:/run/secrets/api_db:ro \
+      -e DB_PASS_FILE=/run/secrets/api_db busybox:1.37 sh -c '...same command...'
+    docker inspect api | grep -c "$(cat /lab/secrets/api_db)"    # 0
+    docker exec api cat /run/secrets/api_db
+    ```
+
+    ### Common mistakes
+
+    - Keeping the old variable alongside the new one.
+    - The password in the command line: also visible in `inspect`.
+    - A writable mount.
+
+    ### Check your work
+
+    `docker inspect orders-api` doesn't contain the password, the environment has only `DB_PASSWORD_FILE`, and the file mount is read-only.
   scenario: |
     Anyone in the docker group can read the database password of **`orders-api`** with
     `docker inspect` — it's passed as an environment variable.
@@ -493,13 +760,43 @@ exercises:
   kind: build
   tags: [compose, secrets, postgres]
   tutorial: |
-    **Concept.** Compose has a first-class `secrets` section: secrets come from files and appear inside services as files under `/run/secrets`. Images like postgres can read a password from a file.
+    **What you're learning.** **Compose secrets**: file-based secrets declared once and given to services.
 
-    **Read up on:**
-    - Compose file reference — top-level `secrets` and the service-level `secrets` key
-    - postgres image docs — the `_FILE` variants of environment variables
-    - `docker compose config` — validate the resulting configuration
-    - `docker compose up -d` and `docker exec` — verify
+    ### The idea
+
+    ```yaml
+    secrets:
+      api_key:
+        file: ./api_key.txt         # top-level: where the secret comes from
+
+    services:
+      app:
+        secrets: [api_key]          # appears as /run/secrets/api_key in the container
+        environment:
+          API_KEY_FILE: /run/secrets/api_key
+    ```
+    The secret is mounted read-only. Without Swarm, Compose bind-mounts the file, so it's still kept out of `inspect`'s environment and out of the compose file.
+
+    ### Commands you'll use
+
+    ```bash
+    cd /lab/reports-db
+    docker compose config | grep -A3 secrets
+    docker compose up -d
+    docker compose exec db ls -l /run/secrets/
+    docker compose exec db printenv | grep -i password       # only the _FILE variable
+    grep -rn 'POSTGRES_PASSWORD:' compose.yaml || echo none
+    ```
+    Postgres reads `POSTGRES_PASSWORD_FILE` on first initialisation. With an old data volume, the old password stays (docker-099).
+
+    ### Common mistakes
+
+    - `secrets:` only on the service, with no top-level definition.
+    - Leaving `POSTGRES_PASSWORD` in the file.
+
+    ### Check your work
+
+    `/run/secrets/pg_password` exists in `db`, the environment has only the `_FILE` variable, and the database is up.
   scenario: |
     In **`/lab/billing-db`**, run PostgreSQL with compose **using compose secrets**:
 
@@ -554,13 +851,31 @@ exercises:
   kind: build
   tags: [logging, journald]
   tutorial: |
-    **Concept.** Docker logging drivers decide where container output goes. Non-default drivers integrate with host logging systems, and per-driver options such as tags help filter entries.
+    **What you're learning.** **Logging drivers**: sending container output to journald with a tag.
 
-    **Read up on:**
-    - `docker run --help` — `--log-driver` and `--log-opt`
-    - Docker docs 'Configure logging drivers' — journald driver
-    - `journalctl --help` — filtering by field, e.g. `CONTAINER_NAME`
-    - `docker inspect` — `.HostConfig.LogConfig`
+    ### The idea
+
+    The **log driver** decides where a container's stdout and stderr go. `json-file` is the default (docker-060), and others include `journald`, `syslog`, `fluentd` and `local`. Options are set per driver with `--log-opt`. For journald, `tag=NAME` sets the `SYSLOG_IDENTIFIER`, which `journalctl -t NAME` filters on.
+
+    ### Commands you'll use
+
+    ```bash
+    docker run -d --name events --log-driver journald --log-opt tag=events \
+      busybox:1.37 sh -c 'while true; do echo "event $(date +%s)"; sleep 3; done'
+    docker inspect events --format '{{json .HostConfig.LogConfig}}'
+    sudo journalctl -t events -n 3 --no-pager
+    sudo journalctl CONTAINER_NAME=events -n 3 --no-pager
+    docker logs events | tail -2       # still works (dual logging)
+    ```
+
+    ### Common mistakes
+
+    - `--log-opt tag=audit` without `--log-driver journald`: json-file accepts `tag` too, but nothing reaches the journal.
+    - Looking in `journalctl -u docker`: that's the daemon's own log.
+
+    ### Check your work
+
+    `sudo journalctl -t audit -n 3` shows the container's lines.
   scenario: |
     The security team collects everything from **journald**. Run **`audit-trail`**
     (`busybox:1.37`, command `sh -c 'while true; do echo "audit event $(date +%s)"; sleep 2; done'`)
@@ -588,13 +903,35 @@ exercises:
   kind: build
   tags: [daemon, live-restore]
   tutorial: |
-    **Concept.** Normally stopping the daemon stops its containers. Docker can be configured to keep containers running during daemon downtime, but the setting lives in the daemon configuration.
+    **What you're learning.** `live-restore`: keeping containers running while the daemon restarts.
 
-    **Read up on:**
-    - Docker docs, daemon section on keeping containers alive across daemon downtime — what is and isn't supported
-    - `/etc/docker/daemon.json` — daemon configuration file
-    - `systemctl reload docker` vs `restart` — which applies which changes
-    - `docker info` — look for a live restore line
+    ### The idea
+
+    Normally, stopping the daemon stops every container. With `"live-restore": true` in `/etc/docker/daemon.json`, containers **keep running** while dockerd is down, and the daemon reattaches to them when it comes back. It's useful for daemon upgrades.
+
+    Applying the setting needs one restart (or `systemctl reload docker`, which sends SIGHUP: `live-restore` is one of the options that reload can change). If you restart, that last restart still stops containers, so start the ones that must be up again.
+
+    ### Commands you'll use
+
+    ```bash
+    sudo cat /etc/docker/daemon.json 2>/dev/null
+    sudo sh -c 'jq ". + {\"live-restore\": true}" /etc/docker/daemon.json > /tmp/d.json && mv /tmp/d.json /etc/docker/daemon.json'
+    sudo systemctl reload docker
+    docker info --format '{{.LiveRestoreEnabled}}'          # true
+    docker inspect keeper --format '{{.State.StartedAt}}'
+    sudo systemctl restart docker
+    docker inspect keeper --format '{{.State.StartedAt}}'   # unchanged
+    ```
+    With no existing file: `echo '{"live-restore": true}' | sudo tee /etc/docker/daemon.json`.
+
+    ### Common mistakes
+
+    - Invalid JSON: the daemon refuses to start. Validate with `jq . /etc/docker/daemon.json`.
+    - Overwriting other settings in the file.
+
+    ### Check your work
+
+    `docker info` reports live restore enabled, and `always-on`'s `StartedAt` doesn't change across a daemon restart.
   scenario: |
     Upgrading or restarting the docker daemon currently stops every container on the
     host. Configure the daemon so **running containers keep running while the daemon is
@@ -635,13 +972,28 @@ exercises:
   kind: fix
   tags: [security, audit, incident]
   tutorial: |
-    **Concept.** A hardening audit usually combines several controls: non-root user, dropped capabilities, read-only root filesystem, no privilege escalation, and no unneeded mounts. nginx needs some writable paths even when read-only.
+    **What you're learning.** A container hardening audit: every rule mapped to a run option.
 
-    **Read up on:**
-    - `docker run --help` — user, cap, read-only, security-opt and tmpfs options
-    - `docker inspect` — compare settings against the audit list
-    - nginx image docs — which directories nginx writes to
-    - `man capabilities` — what an unprivileged nginx still needs
+    ### Method
+
+    | audit rule | option (exercise) |
+    |---|---|
+    | not privileged, no host PID/network | drop `--privileged`, `--pid host`, `--network host` (docker-134, docker-068) |
+    | no docker socket, no host `/` | no such `-v` (docker-132) |
+    | content read-only | `-v SRC:DST:ro` (docker-017) |
+    | no-new-privileges | `--security-opt no-new-privileges` (docker-121) |
+    | memory and process limits | `--memory 128m --pids-limit 200` (docker-121) |
+    | restart policy | `--restart unless-stopped` (docker-002) |
+
+    Start from what the container really needs: `docker inspect legacy-admin` lists every option it has now. Keep the image, content and port, and leave out everything else.
+
+    ### Check your work
+
+    ```bash
+    docker inspect legacy-admin --format 'priv={{.HostConfig.Privileged}} pid={{.HostConfig.PidMode}} net={{.HostConfig.NetworkMode}} sec={{json .HostConfig.SecurityOpt}} mem={{.HostConfig.Memory}} pids={{.HostConfig.PidsLimit}} restart={{.HostConfig.RestartPolicy.Name}}'
+    docker inspect legacy-admin --format '{{range .Mounts}}{{.Source}}:{{.Destination}}:{{.RW}} {{end}}'
+    curl -s localhost:8134 | head -3
+    ```
   scenario: |
     A security audit flagged the **`legacy-admin`** container. Its job is simple: serve
     the admin UI from **`/lab/admin-ui`** with nginx on port **8134**.
