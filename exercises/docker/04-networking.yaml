@@ -12,15 +12,58 @@ exercises:
   kind: build
   tags: [network, dns, ports, inspect]
   tutorial: |
-    **Concept.** On a user-defined bridge network docker runs an embedded DNS server (127.0.0.11) that resolves container names, so containers find each other by name and never need IP addresses. The default `bridge` network has no such DNS. Every network also keeps a list of its members, which you can read back with `inspect` and a Go template. Separately, a published port can be bound to one host IP, so a service is reachable from the host only (`127.0.0.1`) instead of from every machine on the network (`0.0.0.0`).
+    **What you're learning.** Container networking from scratch: user-defined networks, name-based discovery, finding a network's members, and publishing a port on localhost only.
 
-    **Read up on:**
-    - `docker network create --help` and `docker network ls`
-    - `docker run --help` — the network option and the publish format with an IP address
-    - `docker exec CONTAINER nslookup NAME` — test name resolution from inside
-    - `docker network inspect` with `--format` and `range` — list the members of a network
-    - `docker port CONTAINER` and `ss -ltn` — verify what is published and where
-    - Docker docs: 'User-defined bridge networks'
+    ### Container networking from zero
+
+    Each container gets its own network stack: interfaces, an IP address and ports. Docker connects containers through **networks**:
+
+    | network | names resolve? | notes |
+    |---|---|---|
+    | default `bridge` | **no** | where containers go if you don't say otherwise |
+    | **user-defined bridge** (`docker network create X`) | **yes**, by container name | Docker's embedded DNS server at `127.0.0.11` |
+
+    Containers on the same user-defined network reach each other **by name**, so no IP addresses are needed. A container can be on several networks.
+
+    A published port binds on **all** host addresses by default (`0.0.0.0`). `-p 127.0.0.1:8100:80` binds only on loopback, so only the host itself can connect.
+
+    ### Commands you'll use
+
+    ```bash
+    docker network create appnet
+    docker run -d --name backend --network appnet traefik/whoami:v1.10
+    docker run -d --name tool --network appnet busybox:1.37 sleep infinity
+    docker exec tool wget -qO- http://backend | head -3
+    docker exec tool nslookup backend
+    ```
+    ```text
+    Server:    127.0.0.11
+    Name:      backend
+    Address:   172.19.0.2
+    ```
+
+    Who is on a network:
+    ```bash
+    docker network inspect billing-net --format '{{range .Containers}}{{.Name}}{{"\n"}}{{end}}'
+    docker ps --filter network=billing-net --format '{{.Names}}'
+    ```
+    `docker ps` without `-a` lists only running containers. Add `-a` when stopped members count.
+
+    Loopback-only publishing:
+    ```bash
+    docker run -d --name panel -p 127.0.0.1:8110:80 nginx:1.28-alpine
+    docker port panel                    # 80/tcp -> 127.0.0.1:8110
+    ```
+
+    ### Common mistakes
+
+    - Expecting names to resolve on the default `bridge`.
+    - `--filter network=` matching by prefix or name: compare it with `network inspect`.
+    - `-p 8100:80` for "host only": that's reachable from other machines.
+
+    ### Check your work
+
+    `docker exec client wget -qO- http://api` works, the members file matches `docker network inspect payments-net`, and `docker port admin` shows `127.0.0.1:8100`.
   scenario: |
     Three small jobs on the docker host.
 
@@ -87,13 +130,43 @@ exercises:
   kind: fix
   tags: [ports, troubleshooting]
   tutorial: |
-    **Concept.** A published port maps a host port to the port where the app actually listens, so both sides of the mapping must be right (`-p HOST:CONTAINER`). If the container side is wrong, the connection is accepted by docker's proxy and then goes nowhere. When you don't care about the host port, docker can choose a free one for every `EXPOSE`d port of the image and report the choice afterwards.
+    **What you're learning.** Getting both sides of `-p HOST:CONTAINER` right, and letting Docker pick the host port.
 
-    **Read up on:**
-    - `docker run --help` — the publish option, and the option that publishes all exposed ports
-    - `docker port CONTAINER` — the current mappings
-    - `docker image inspect` — `Config.ExposedPorts` shows where the image says the app listens
-    - `docker logs` — many apps print the port they listen on
+    ### The idea
+
+    `-p 8102:80` forwards host port 8102 to **container** port 80. If nothing listens on the container side, Docker still accepts the connection on the host and then has nowhere to send it, so you get "connection reset" or "empty reply" rather than "refused". Find the port the app listens on:
+
+    - `docker image inspect IMAGE -f '{{.Config.ExposedPorts}}'` (documentation, usually right);
+    - `docker exec NAME netstat -tln` (the truth).
+
+    **Random host port**: `-p 80` (container port only) or `-P` (all exposed ports) lets Docker choose a free host port. `docker port NAME 80` reveals it.
+
+    ### Commands you'll use
+
+    ```bash
+    docker port catalog
+    docker image inspect traefik/whoami:v1.10 -f '{{json .Config.ExposedPorts}}'   # {"80/tcp":{}}
+    docker rm -f catalog && docker run -d --name catalog -p 8111:80 traefik/whoami:v1.10
+    docker run -d --name temp -P traefik/whoami:v1.10
+    docker port temp 80
+    ```
+    ```text
+    0.0.0.0:32771
+    [::]:32771
+    ```
+    ```bash
+    docker port temp 80 | head -1 | cut -d: -f2
+    docker inspect temp --format '{{(index (index .NetworkSettings.Ports "80/tcp") 0).HostPort}}'
+    ```
+
+    ### Common mistakes
+
+    - Keeping the wrong container port: the host side is fine, the inside isn't.
+    - Writing `0.0.0.0:32771` instead of just the number.
+
+    ### Check your work
+
+    `curl localhost:8102` answers, and `curl localhost:$(cat /lab/port.txt)` reaches `scratchpad`.
   scenario: |
     Two things to sort out.
 
@@ -141,13 +214,33 @@ exercises:
   kind: fix
   tags: [network, dns, troubleshooting]
   tutorial: |
-    **Concept.** Name resolution between containers works only when they share a user-defined network, because docker's DNS serves names per network.
+    **What you're learning.** "bad address": containers on the default bridge can't resolve each other, and connecting running containers to a network fixes it.
 
-    **Read up on:**
-    - `docker network ls`, `connect` and `inspect` — see and change network membership
-    - `docker inspect` — which networks each container is attached to
-    - `docker exec CONTAINER nslookup NAME` — test whether a name resolves
-    - Docker docs: 'Networking overview'
+    ### The idea
+
+    The default `bridge` network has no DNS for container names. (The old `--link` was a workaround and is deprecated.) `docker network connect NET NAME` attaches a **running** container to another network without restarting it, so name resolution works on that network straight away.
+
+    ### Commands you'll use
+
+    ```bash
+    docker inspect web --format '{{json .NetworkSettings.Networks}}' | jq 'keys'    # ["bridge"]
+    docker exec web nslookup queue                       # can't resolve
+    docker network create mid
+    docker network connect mid queue
+    docker network connect mid web
+    docker exec web nslookup queue
+    docker exec web ping -c1 queue
+    docker inspect web --format '{{.State.StartedAt}}'   # unchanged: not restarted
+    ```
+
+    ### Common mistakes
+
+    - Recreating with `--network`: the task says don't.
+    - Connecting only one of the two.
+
+    ### Check your work
+
+    Both containers are on `backend`, `docker exec app nslookup cache` resolves, and the app's errors stop.
   scenario: |
     The **`app`** container is configured to talk to Redis at host **`cache`**, but
     keeps logging `bad address 'cache'`. Both containers are running.
@@ -186,12 +279,32 @@ exercises:
   kind: build
   tags: [network, alias]
   tutorial: |
-    **Concept.** A container can answer to several DNS names on a network through aliases, in addition to its own name.
+    **What you're learning.** Network **aliases**: extra DNS names for a container.
 
-    **Read up on:**
-    - `docker run --help` — the network alias option
-    - `docker network inspect` — Aliases per container
-    - `docker exec CONTAINER nslookup NAME`
+    ### The idea
+
+    `--network-alias NAME` (repeatable) adds DNS names for a container **on that network**, in addition to its container name. `docker network connect --alias NAME` does the same when attaching. Aliases belong to a specific network, so other networks don't see them.
+
+    ### Commands you'll use
+
+    ```bash
+    docker network create store
+    docker run -d --name redis1 --network store \
+      --network-alias cache.internal --network-alias sessions redis:7.4-alpine
+    docker run -d --name probe --network store busybox:1.37 sleep infinity
+    docker exec probe nslookup cache.internal
+    docker exec probe nslookup sessions
+    docker inspect redis1 --format '{{json .NetworkSettings.Networks.store.Aliases}}'
+    ```
+
+    ### Common mistakes
+
+    - `--hostname`: sets the container's own hostname, not DNS for others.
+    - `--add-host` on the client: that only helps that one container, with a fixed IP.
+
+    ### Check your work
+
+    From `tester`, `nslookup db.internal` and `nslookup primary` both return `pg`'s IP.
   scenario: |
     Different legacy services expect the database under different host names.
 
@@ -225,15 +338,37 @@ exercises:
   kind: build
   tags: [network, none, host, dns, security]
   tutorial: |
-    **Concept.** Besides user-defined bridges, a container can use special network modes. `none` leaves it with only a loopback interface (no network at all). `host` shares the docker host's network namespace, so the container binds the host's ports directly, with no NAT and no published ports (`-p` is ignored). On bridge networks, a container's DNS servers and search domains come from its `/etc/resolv.conf`, which docker generates and which you can override per container.
+    **What you're learning.** The special network modes: `none`, `host` and `container:NAME`.
 
-    **Read up on:**
-    - `docker run --help` — the network option and its special values, plus the DNS options
-    - `docker exec CONTAINER ip addr` — list interfaces
-    - `ss -ltnp` — which process listens on which port on the host
-    - `man resolv.conf` — `nameserver` and `search` lines
-    - `docker exec CONTAINER cat /etc/resolv.conf`
-    - Docker docs: 'Host network driver', 'None network driver'
+    ### The idea
+
+    | `--network` | the container gets |
+    |---|---|
+    | `none` | only a loopback interface: no network at all |
+    | `host` | the **host's** network stack: it binds host ports directly, and `-p` is ignored |
+    | `container:OTHER` | **another container's** network stack: same IP, and `localhost` is shared |
+
+    `host` is fast and simple but gives no isolation and risks port clashes. `container:` is how sidecars and debugging tools join an existing container's network.
+
+    ### Commands you'll use
+
+    ```bash
+    docker run -d --name offline --network none busybox:1.37 sleep infinity
+    docker exec offline ip addr                                # lo only
+    docker run -d --name hostnginx --network host nginx:1.28-alpine
+    curl -s localhost:80 | grep -i title                       # served directly on the host
+    docker run -d --name app1 traefik/whoami:v1.10
+    docker run --rm --network container:app1 busybox:1.37 wget -qO- localhost:80 | head -2
+    ```
+
+    ### Common mistakes
+
+    - `-p` together with `--network host`: ignored, with a warning.
+    - Port 80 already used on the host: nginx in `host` mode fails to bind (read its logs).
+
+    ### Check your work
+
+    `docker inspect NAME --format '{{.HostConfig.NetworkMode}}'` shows each required mode, and each container behaves as described.
   scenario: |
     Three containers, each needing a different network mode.
 
@@ -278,13 +413,37 @@ exercises:
   kind: build
   tags: [network, extra-hosts]
   tutorial: |
-    **Concept.** Docker can add extra hostname-to-IP entries to a container's /etc/hosts at startup.
+    **What you're learning.** `--add-host`: static name-to-IP entries in a container's `/etc/hosts`.
 
-    **Read up on:**
-    - `docker run --help` — the host mapping option
-    - `man hosts` — file format
-    - `docker exec CONTAINER cat /etc/hosts`
-    - `getent hosts NAME`
+    ### The idea
+
+    Docker writes `/etc/hosts` inside each container. `--add-host NAME:IP` adds a line to it, for a name that no DNS you control knows about. `host-gateway` is a special value meaning the host's address as seen from the container (`--add-host host.docker.internal:host-gateway`).
+
+    ### Commands you'll use
+
+    ```bash
+    docker run -d --name crm --add-host ledger.vendor.test:192.0.2.55 busybox:1.37 sleep infinity
+    docker exec crm cat /etc/hosts | tail -2
+    ```
+    ```text
+    192.0.2.55	ledger.vendor.test
+    172.17.0.4	3c1d2e...
+    ```
+    ```bash
+    docker exec crm nslookup ledger.vendor.test      # nslookup asks DNS: may say not found
+    docker exec crm ping -c1 -W1 ledger.vendor.test  # PING ... (192.0.2.55) — uses /etc/hosts
+    docker inspect crm --format '{{json .HostConfig.ExtraHosts}}'
+    ```
+    `nslookup` queries DNS directly and skips `/etc/hosts`. `ping`, `getent hosts` and normal programs use it.
+
+    ### Common mistakes
+
+    - Editing `/etc/hosts` inside a running container: lost on recreate.
+    - `--add-host IP:NAME` (wrong order).
+
+    ### Check your work
+
+    `/etc/hosts` in `billing` maps `payments.partner.local` to `10.20.30.40`, and `ping` resolves to that address.
   scenario: |
     The payment partner's API is reachable at **10.20.30.40** through a VPN, but their
     hostname **`payments.partner.local`** isn't in any DNS you control.
@@ -312,15 +471,37 @@ exercises:
   kind: build
   tags: [network, connect, disconnect, ipam, static-ip]
   tutorial: |
-    **Concept.** A running container can be attached to and detached from networks without restarting, and a container can sit on several networks at once. When you create a network yourself you can choose its subnet and gateway (IPAM), and containers on it can then be given fixed addresses, which matters for services that whitelist by IP. Static addresses are only allowed on user-defined networks that have an explicit subnet.
+    **What you're learning.** Moving a container between networks live, and networks with your own subnet and fixed IPs.
 
-    **Read up on:**
-    - `docker network connect --help` and `docker network disconnect --help`
-    - `docker inspect` — `NetworkSettings.Networks` and `IPAddress`
-    - `docker network create --help` — subnet and gateway options
-    - `docker run --help` — the static IP option
-    - CIDR notation
-    - `docker exec` — test name resolution afterwards
+    ### The idea
+
+    - `docker network connect NET NAME` and `docker network disconnect NET NAME` work on running containers.
+    - `docker network create --subnet 10.60.0.0/24 --gateway 10.60.0.1 NAME` picks the address range.
+    - `docker run --network NAME --ip 10.60.0.50` gives a fixed IP. This is only allowed on networks with a user-specified subnet.
+
+    ### Commands you'll use
+
+    ```bash
+    docker network connect metrics exporter
+    docker network disconnect bridge exporter
+    docker inspect exporter --format '{{json .NetworkSettings.Networks}}' | jq 'keys'
+    docker exec exporter ping -c1 prometheus
+
+    docker network create --subnet 10.60.0.0/24 --gateway 10.60.0.1 plant-lan
+    docker run -d --name plc --network plant-lan --ip 10.60.0.50 busybox:1.37 sleep infinity
+    docker network inspect plant-lan --format '{{json .IPAM.Config}}'
+    docker inspect plc --format '{{.NetworkSettings.Networks.plant-lan.IPAddress}}'
+    ```
+    A Go template can't use a key that contains `-` with dot syntax. Use `{{(index .NetworkSettings.Networks "plant-lan").IPAddress}}`.
+
+    ### Common mistakes
+
+    - Disconnecting first: the container briefly has no network (fine here, but connect first in production).
+    - `--ip` on a network created without `--subnet`: "user specified IP address is supported only when connecting to networks with user configured subnets".
+
+    ### Check your work
+
+    `reporting` is only on `analytics` and reaches `warehouse`, and `mainframe` has the required IP on `legacy-lan` (`10.50.0.0/24`, gateway `.1`).
   scenario: |
     Two jobs.
 
@@ -368,13 +549,31 @@ exercises:
   kind: build
   tags: [network, internal, security]
   tutorial: |
-    **Concept.** An internal network blocks traffic leaving it, while containers on it can still talk to each other.
+    **What you're learning.** `--internal` networks: containers talk to each other but nothing leaves.
 
-    **Read up on:**
-    - `docker network create --help` — options
-    - Docker docs: 'Bridge network driver'
-    - `docker exec CONTAINER ping` — test reachability
-    - `docker network inspect` — Internal flag
+    ### The idea
+
+    `docker network create --internal NAME` makes a bridge network with **no route out**: no NAT to the outside world, and published ports don't work either. Containers on it still reach each other by name. It's the way to say "this service may be reached but may not phone home".
+
+    ### Commands you'll use
+
+    ```bash
+    docker network create --internal sealed
+    docker run -d --name keystore --network sealed traefik/whoami:v1.10
+    docker run -d --name keyuser --network sealed busybox:1.37 sleep infinity
+    docker exec keyuser wget -qO- http://keystore | head -2          # works
+    docker exec keyuser wget -T 3 -qO- http://1.1.1.1                # fails
+    docker network inspect sealed --format '{{.Internal}}'           # true
+    ```
+
+    ### Common mistakes
+
+    - Also attaching a container to a normal network: that container can get out through it.
+    - Expecting `-p` to publish from an internal network.
+
+    ### Check your work
+
+    `vault-client` reaches `http://vault`, `wget http://1.1.1.1` times out from both containers, and `vault-net` is `Internal: true`.
   scenario: |
     The secrets service must be reachable by its clients but must **never reach the
     internet** (no data exfiltration).
@@ -413,13 +612,37 @@ exercises:
   kind: fix
   tags: [ports, bind-address, troubleshooting]
   tutorial: |
-    **Concept.** A published port forwards to the container's network address, so an app listening only on localhost inside is unreachable from outside.
+    **What you're learning.** "Works inside, not from outside": an app listening on `127.0.0.1` in the container.
 
-    **Read up on:**
-    - `docker exec CONTAINER netstat -tln` — which addresses sockets listen on
-    - `docker logs`
-    - Listen address 0.0.0.0 versus 127.0.0.1
-    - `docker inspect` — Cmd and Entrypoint
+    ### The idea
+
+    A published port forwards traffic to the container's **network interface** (say `172.17.0.5:9000`). An app bound to `127.0.0.1:9000` only accepts connections from **inside** the container, so traffic arriving from outside finds nothing listening. The app must bind `0.0.0.0` (all interfaces).
+
+    ```text
+    netstat -tln inside:
+    tcp  0  0 127.0.0.1:9000  0.0.0.0:*  LISTEN    ← loopback only: unreachable via -p
+    tcp  0  0 0.0.0.0:9000    0.0.0.0:*  LISTEN    ← reachable
+    ```
+
+    ### Commands you'll use
+
+    ```bash
+    docker exec dash netstat -tln
+    docker inspect dash --format '{{.Config.Image}} {{json .Config.Cmd}} {{json .Mounts}} {{.Config.WorkingDir}}'
+    docker rm -f dash
+    docker run -d --name dash -p 8112:7000 ... python -m http.server 7000 --bind 0.0.0.0
+    curl -s localhost:8112 | head -3
+    ```
+    Recreate with **everything** the old container had (mounts, working directory, command). Change only the bind address.
+
+    ### Common mistakes
+
+    - Changing the port mapping: the mapping wasn't the problem.
+    - Losing the mount when recreating.
+
+    ### Check your work
+
+    `netstat -tln` in `stats` shows `0.0.0.0:9000`, and `curl localhost:8101` returns the dashboard.
   scenario: |
     **`stats`** serves a small dashboard on port 9000 inside the container, published as
     **8101** on the host. Inside the container `wget -qO- localhost:9000` works, but from
@@ -457,12 +680,35 @@ exercises:
   kind: fix
   tags: [network, segmentation]
   tutorial: |
-    **Concept.** Containers can talk only if they share a network, and one container can be on several networks.
+    **What you're learning.** Network **segmentation**: putting the middle tier on two networks.
 
-    **Read up on:**
-    - `docker network connect --help`
-    - `docker network inspect` — members
-    - `docker exec CONTAINER wget -qO- URL` — test each hop
+    ### The idea
+
+    Containers can only talk if they share a network. For three tiers, keep the database on a private network and attach the **middle** tier to both:
+
+    ```
+    web-net:  frontend ── orders-api
+    api-net:              orders-api ── orders-db
+    ```
+    frontend reaches the API. The API reaches the database. frontend can't reach the database.
+
+    ### Commands you'll use
+
+    ```bash
+    docker network inspect front-net back-net --format '{{.Name}}: {{range .Containers}}{{.Name}} {{end}}'
+    docker network connect front-net service
+    docker exec ui wget -qO- http://service | head -2
+    docker exec ui nc -z -w 2 database 5432 && echo REACHABLE || echo blocked
+    ```
+
+    ### Common mistakes
+
+    - Connecting the frontend to `api-net`: it can then reach the database.
+    - Merging the networks.
+
+    ### Check your work
+
+    `frontend` reaches `http://orders-api`, `nc -z orders-db 5432` from `frontend` fails, and no container was recreated.
   scenario: |
     Three tiers run on two networks:
 
@@ -504,13 +750,42 @@ exercises:
   kind: build
   tags: [network, alias, dns-round-robin]
   tutorial: |
-    **Concept.** Several containers can share a network alias. Docker's DNS then returns all their addresses, spreading clients across them.
+    **What you're learning.** Shared aliases: DNS round-robin across several containers.
 
-    **Read up on:**
-    - `docker run --help` — network alias option
-    - `nslookup NAME` in busybox — see all addresses
-    - Round-robin DNS
-    - `docker network inspect` — Aliases
+    ### The idea
+
+    If several containers on a network have the **same alias**, Docker's DNS returns **all** their IPs for that name. Clients usually take the first answer, and the order rotates, so requests spread across the replicas. There are no health checks and no weighting: it's poor man's load balancing.
+
+    ### Commands you'll use
+
+    ```bash
+    docker network create pool
+    for n in a b c; do
+      docker run -d --name svc-$n --network pool --network-alias api traefik/whoami:v1.10
+    done
+    docker run -d --name caller --network pool busybox:1.37 sleep infinity
+    docker exec caller nslookup api
+    ```
+    ```text
+    Name:	api
+    Address: 172.20.0.2
+    Name:	api
+    Address: 172.20.0.3
+    Name:	api
+    Address: 172.20.0.4
+    ```
+    ```bash
+    for i in 1 2 3 4 5 6; do docker exec caller wget -qO- http://api | grep Hostname; done
+    ```
+
+    ### Common mistakes
+
+    - Using the container names: each resolves to just one container.
+    - Expecting even spreading: clients may cache the answer.
+
+    ### Check your work
+
+    `nslookup backend` from `client` returns three addresses, and repeated requests show different hostnames.
   scenario: |
     Run **three** replicas of `traefik/whoami:v1.10` named **`web1`**, **`web2`** and
     **`web3`** on a network **`lb`**, all answering to the shared DNS name **`backend`**.
@@ -545,13 +820,45 @@ exercises:
   kind: build
   tags: [reverse-proxy, nginx, network]
   tutorial: |
-    **Concept.** A reverse proxy forwards requests to other containers by name over a shared network, so those containers need no published port.
+    **What you're learning.** A reverse proxy container that forwards to other containers by name.
 
-    **Read up on:**
-    - nginx docs: `location` and `proxy_pass`
-    - `docker run --help` — mounting a config file
-    - `nginx -t` inside the container — validate the config
-    - `docker logs`
+    ### The idea
+
+    The proxy is the only container with a published port. It forwards to backends **by container name** over a shared network, so the backends publish nothing. In nginx:
+
+    ```nginx
+    location /api/ {
+        proxy_pass http://BACKEND:PORT/;     # trailing / strips the /api/ prefix
+        proxy_set_header Host $host;
+    }
+    ```
+    With `/` after the port, `/api/users` reaches the backend as `/users`. Without it, the backend gets `/api/users`.
+
+    ### Commands you'll use
+
+    ```bash
+    docker network create edge
+    docker run -d --name svc --network edge traefik/whoami:v1.10
+    cat /lab/proxy/default.conf
+    docker run -d --name proxy --network edge -p 8113:80 \
+      -v /lab/proxy/default.conf:/etc/nginx/conf.d/default.conf:ro nginx:1.28-alpine
+    docker exec proxy nginx -t
+    curl -s localhost:8113/svc/ | grep -E 'Hostname|GET'
+    ```
+    ```text
+    Hostname: 4b4b4b...
+    GET / HTTP/1.1
+    ```
+
+    ### Common mistakes
+
+    - Publishing the API's port too.
+    - Different networks for the proxy and the backend: nginx fails at startup with "host not found in upstream".
+    - Forgetting the trailing `/`: the backend sees the prefix.
+
+    ### Check your work
+
+    The proxy serves its own page at `/` and forwards `/api/` to the API, and the API publishes no port.
   scenario: |
     Put nginx in front of the API:
 
@@ -622,13 +929,41 @@ exercises:
   kind: fix
   tags: [reverse-proxy, nginx, dns, troubleshooting]
   tutorial: |
-    **Concept.** nginx resolves upstream hostnames once at startup. If a backend gets a new IP, nginx keeps the old one unless names are resolved at request time.
+    **What you're learning.** Why nginx returns **502** after a backend is recreated, and resolving names per request.
 
-    **Read up on:**
-    - nginx docs: the `resolver` directive
-    - nginx docs: variables in `proxy_pass`
-    - Docker's embedded DNS server address 127.0.0.11
-    - `nginx -s reload` and `docker logs`
+    ### The idea
+
+    nginx resolves the hostname in `proxy_pass http://app:80` **once, at startup**, and keeps that IP. A redeployed backend gets a **new IP**, so nginx keeps sending to the old address and returns 502 until it restarts.
+
+    To resolve at request time, nginx needs a **resolver** (Docker's DNS is `127.0.0.11`) and a **variable** in `proxy_pass`, because a variable makes nginx look the name up on each request:
+
+    ```nginx
+    resolver 127.0.0.11 valid=10s ipv6=off;
+    location / {
+        set $backend http://svc:80;
+        proxy_pass $backend;
+    }
+    ```
+
+    ### Commands you'll use
+
+    ```bash
+    docker logs gw 2>&1 | grep -m2 'connect() failed'
+    docker exec gw nginx -t && docker exec gw nginx -s reload
+    curl -s -o /dev/null -w '%{http_code}\n' localhost:8114/
+    docker rm -f svc && docker run -d --name svc --network mesh traefik/whoami:v1.10   # redeploy
+    sleep 11; curl -s -o /dev/null -w '%{http_code}\n' localhost:8114/              # still 200
+    ```
+
+    ### Common mistakes
+
+    - `resolver` without the variable: nginx still resolves the name only once.
+    - Restarting nginx: that fixes it once, not for the next redeploy.
+    - Using the host's resolver instead of `127.0.0.11`: it doesn't know container names.
+
+    ### Check your work
+
+    After recreating `app`, the gateway still returns 200 without a restart.
   scenario: |
     The **`gateway`** (nginx, port **8104**) proxies to the **`app`** container on network
     **`mesh`**. Every time `app` is redeployed, the gateway returns **502 Bad Gateway**
@@ -702,13 +1037,29 @@ exercises:
   kind: fix
   tags: [network, incident, troubleshooting]
   tutorial: |
-    **Concept.** Multi-service failures need a hop-by-hop check of networks, membership, names, and published ports.
+    **What you're learning.** A hop-by-hop method for broken multi-container networking.
 
-    **Read up on:**
-    - `docker network inspect` — who is attached to what
-    - `docker exec CONTAINER wget -qO- URL` — test each hop
-    - `docker logs` — errors per service
-    - `docker port` — actual published ports
+    ### Method
+
+    Draw the intended design, then check every hop:
+
+    | hop | check | typical break |
+    |---|---|---|
+    | host → proxy | `docker port storefront`, `curl localhost:8105` | port not published, or published wrong |
+    | proxy → service | both on the same network: `docker network inspect shop` | a container disconnected |
+    | service → next service | `docker run --rm --network container:checkout busybox wget -qO- http://payments` | a container on the wrong network |
+    | names | `nslookup NAME` from the client's namespace | the name exists only on another network |
+
+    ```bash
+    for n in shop pay; do docker network inspect $n --format '{{.Name}}: {{range .Containers}}{{.Name}} {{end}}'; done
+    docker ps --format '{{.Names}} {{.Ports}}'
+    ```
+
+    Fix membership with `docker network connect` and `disconnect` (docker-072). Recreate only to change ports. Keep each container on **only** the networks the design shows.
+
+    ### Check your work
+
+    `curl localhost:8105` goes all the way through (storefront → checkout), checkout reaches payments, and every container is on exactly the networks the design lists.
   scenario: |
     After a "network cleanup" the order flow is broken. The intended design:
 
