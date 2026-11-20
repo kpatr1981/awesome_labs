@@ -12,13 +12,37 @@ exercises:
   kind: build
   tags: [aws, ec2, elastic-ip]
   tutorial: |
-    **Concept.** An instance's public address normally changes whenever it is stopped and started. An Elastic IP is an address you allocate to your account and then attach to an instance, so the address stays yours.
+    **What you're learning.** **Elastic IPs**: a public address that belongs to your account, not to an instance.
 
-    **Read up on:**
-    - `aws ec2 allocate-address help` — what an allocation returns
-    - `aws ec2 associate-address help` — which IDs it needs
-    - `aws ec2 describe-addresses` — the link between address and instance
-    - `aws ec2 describe-instances` — finding an instance by its Name tag
+    ### The idea
+
+    An EC2 instance's automatic public IP changes whenever it's stopped and started. An **Elastic IP** is allocated to your **account**; you **associate** it with an instance (or move it to another), and it stays yours until you release it. Partners can whitelist it.
+
+    ```
+    allocate-address ─► eipalloc-... 203.0.113.25 ─► associate-address with i-...
+    ```
+
+    ### Commands you'll use
+
+    ```bash
+    IID=$(aws ec2 describe-instances --filters Name=tag:Name,Values=bastion \
+      --query 'Reservations[0].Instances[0].InstanceId' --output text)
+    read AID IP < <(aws ec2 allocate-address --domain vpc --query '[AllocationId,PublicIp]' --output text)
+    echo "$AID $IP"
+    aws ec2 associate-address --instance-id "$IID" --allocation-id "$AID"
+    aws ec2 describe-addresses --allocation-ids "$AID" --query 'Addresses[0].[PublicIp,InstanceId]'
+    echo "$IP" > /lab/bastion-ip.txt
+    ```
+    `read A B < <(cmd)` puts the two tab-separated fields of the output into two variables.
+
+    ### Common mistakes
+
+    - `--domain vpc` missing: some setups default to the obsolete EC2-Classic domain.
+    - Writing the allocation ID instead of the address.
+
+    ### Check your work
+
+    `describe-addresses` shows the address associated with the instance, and the file holds just that address.
   scenario: |
     The `aws` command talks to a local emulator. A running instance tagged **`Name=gateway`**
     is the company VPN endpoint, and partners keep its address in their firewalls.
@@ -62,13 +86,34 @@ exercises:
   kind: fix
   tags: [aws, route53, dns]
   tutorial: |
-    **Concept.** Changing a DNS record's value does not reach everyone at once: resolvers keep the old answer until its TTL runs out. A migration therefore changes the value and shortens the TTL, so later changes spread quickly.
+    **What you're learning.** DNS **TTL** during a migration, and changing a record safely with `UPSERT`.
 
-    **Read up on:**
-    - `aws route53 change-resource-record-sets help` — the `UPSERT` action
-    - `aws route53 list-resource-record-sets` — reading the current record
-    - What TTL means for a resolver cache
-    - Why `UPSERT` is safer than a `DELETE` followed by a `CREATE`
+    ### The idea
+
+    Resolvers cache an answer for its **TTL** (seconds). With a TTL of 86400 (a day), changing the address reaches clients only as their caches expire, up to a day later. Migrations lower the TTL (e.g. 60), so later changes spread in a minute.
+
+    `UPSERT` replaces the record in one step; a `DELETE` followed by a `CREATE` in separate calls briefly leaves no record at all.
+
+    ### Commands you'll use
+
+    ```bash
+    ZID=$(aws route53 list-hosted-zones-by-name --dns-name corp.example --query 'HostedZones[0].Id' --output text)
+    aws route53 list-resource-record-sets --hosted-zone-id "$ZID" \
+      --query "ResourceRecordSets[?Name=='mail.corp.example.']"
+    jq -n --arg ip "$(cat /lab/mail-ip.txt)" \
+      '{Changes:[{Action:"UPSERT",ResourceRecordSet:{Name:"mail.corp.example",Type:"A",TTL:60,ResourceRecords:[{Value:$ip}]}}]}' > /lab/b.json
+    aws route53 change-resource-record-sets --hosted-zone-id "$ZID" --change-batch file:///lab/b.json
+    ```
+    Route 53 shows names with a trailing dot (`mail.corp.example.`); you can write them with or without.
+
+    ### Common mistakes
+
+    - Changing the value but leaving the TTL at a day.
+    - An address with a trailing newline (use `jq --arg` with `$(cat ...)`, which strips it).
+
+    ### Check your work
+
+    The record shows the new address and `TTL: 60`.
   scenario: |
     The `aws` command talks to a local emulator. In the hosted zone **`corp.example`**, the
     record **`www.corp.example`** (type A) still points at the retired server and has a TTL of a
@@ -118,13 +163,41 @@ exercises:
   kind: build
   tags: [aws, route53, weighted-routing]
   tutorial: |
-    **Concept.** Route 53 can hold several records with the same name and type, each marked with a set identifier and a weight. Resolvers are answered in proportion to the weights, which makes a gradual rollout possible with nothing but DNS.
+    **What you're learning.** **Weighted routing** in Route 53: a canary with nothing but DNS.
 
-    **Read up on:**
-    - `aws route53 change-resource-record-sets help` — the change batch JSON
-    - Weighted routing policy — the `SetIdentifier` and `Weight` fields
-    - `aws route53 list-hosted-zones-by-name` — finding the zone ID
-    - Why two records of the same name need different identifiers
+    ### The idea
+
+    Several records can share a **name and type** if each has a unique **`SetIdentifier`** and a **`Weight`**. Route 53 answers each query with one of them, in proportion to the weights: 90/10 sends about a tenth of new lookups to the canary.
+
+    ```json
+    {"Action":"UPSERT","ResourceRecordSet":{
+      "Name":"api.demo.example","Type":"A","SetIdentifier":"blue","Weight":70,"TTL":60,
+      "ResourceRecords":[{"Value":"198.51.100.10"}]}}
+    ```
+
+    ### Commands you'll use
+
+    ```bash
+    ZID=$(aws route53 list-hosted-zones-by-name --dns-name demo.example --query 'HostedZones[0].Id' --output text)
+    cat > /lab/w.json <<'EOF'
+    {"Changes":[
+     {"Action":"UPSERT","ResourceRecordSet":{"Name":"api.demo.example","Type":"A","SetIdentifier":"blue","Weight":70,"TTL":60,"ResourceRecords":[{"Value":"198.51.100.10"}]}},
+     {"Action":"UPSERT","ResourceRecordSet":{"Name":"api.demo.example","Type":"A","SetIdentifier":"green","Weight":30,"TTL":60,"ResourceRecords":[{"Value":"198.51.100.20"}]}}
+    ]}
+    EOF
+    aws route53 change-resource-record-sets --hosted-zone-id "$ZID" --change-batch file:///lab/w.json
+    aws route53 list-resource-record-sets --hosted-zone-id "$ZID" \
+      --query "ResourceRecordSets[?Name=='api.demo.example.'].[SetIdentifier,Weight,ResourceRecords[0].Value]" --output table
+    ```
+
+    ### Common mistakes
+
+    - The same `SetIdentifier` twice: the second replaces the first.
+    - A plain (non-weighted) record of the same name and type alongside: not allowed (cloud-090).
+
+    ### Check your work
+
+    Two records for the name, `stable`/90 and `canary`/10, both TTL 60, with the right addresses.
   scenario: |
     The `aws` command talks to a local emulator. The hosted zone **`canary.example`** exists.
 
@@ -175,13 +248,38 @@ exercises:
   kind: build
   tags: [aws, ec2, security-group]
   tutorial: |
-    **Concept.** A security group rule can name another security group as its source instead of an address range. Anything wearing that group is allowed, wherever it lives, and nothing else is, so the rule survives instances being replaced.
+    **What you're learning.** Security group rules that name **another security group** as the source.
 
-    **Read up on:**
-    - `aws ec2 authorize-security-group-ingress help` — the `--source-group` option
-    - `aws ec2 describe-security-groups` — `UserIdGroupPairs` versus `IpRanges`
-    - Why group-to-group rules beat CIDR rules for tiered applications
-    - The default port for PostgreSQL
+    ### The idea
+
+    Instead of an address range, an ingress rule can allow traffic from **any instance wearing a given security group**. In tiered applications that's the right model: "the web tier may reach the database", whatever the web servers' IPs are, and the rule survives instances being replaced.
+
+    ```
+    db-sg ingress: tcp 3306 from source group app-sg
+    ```
+
+    ### Commands you'll use
+
+    ```bash
+    APP=$(aws ec2 describe-security-groups --filters Name=group-name,Values=app-sg --query 'SecurityGroups[0].GroupId' --output text)
+    DB=$(aws ec2 describe-security-groups --filters Name=group-name,Values=mysql-sg --query 'SecurityGroups[0].GroupId' --output text)
+    aws ec2 authorize-security-group-ingress --group-id "$DB" --protocol tcp --port 3306 --source-group "$APP"
+    aws ec2 describe-security-groups --group-ids "$DB" \
+      --query 'SecurityGroups[0].IpPermissions[].[FromPort,UserIdGroupPairs[0].GroupId,IpRanges]'
+    ```
+    ```text
+    [[3306, "sg-0app...", []]]
+    ```
+    Group-sourced rules appear under `UserIdGroupPairs`, CIDR rules under `IpRanges`.
+
+    ### Common mistakes
+
+    - `--cidr` with the web servers' current IPs: breaks when they change.
+    - The wrong port (PostgreSQL is 5432, MySQL 3306).
+
+    ### Check your work
+
+    The database group has exactly one rule: TCP 5432 from `web-sg`, with no CIDR ranges.
   scenario: |
     The `aws` command talks to a local emulator. In one VPC there are two security groups,
     **`web-sg`** for the web servers and **`db-sg`** for the database. `db-sg` has no inbound
@@ -222,13 +320,38 @@ exercises:
   kind: fix
   tags: [aws, elbv2, target-group, health-check]
   tutorial: |
-    **Concept.** A load balancer only sends traffic to targets that pass the target group's health check. If the check probes the wrong port or path, every healthy server is marked unhealthy and taken out of rotation.
+    **What you're learning.** Load balancer **target group health checks**: why all targets can be "unhealthy" when they're fine.
 
-    **Read up on:**
-    - `aws elbv2 describe-target-groups` — the `HealthCheck*` fields
-    - `aws elbv2 modify-target-group help` — which settings can be changed in place
-    - The difference between the traffic port and the health check port
-    - Health check interval and its effect on how fast failures are noticed
+    ### The idea
+
+    A load balancer only sends traffic to targets that pass the **target group's health check**: it requests a **path** on a **port** every **interval** seconds and expects a success status. A check copied from another service (wrong path, wrong port) marks healthy servers unhealthy and takes them out of rotation.
+
+    | setting | flag |
+    |---|---|
+    | path | `--health-check-path /status` |
+    | port | `--health-check-port 9000`, or `traffic-port` (the port each target is registered on) |
+    | interval | `--health-check-interval-seconds 15` |
+
+    ### Commands you'll use
+
+    ```bash
+    cat /lab/svc-notes.txt
+    ARN=$(aws elbv2 describe-target-groups --names orders-tg --query 'TargetGroups[0].TargetGroupArn' --output text)
+    aws elbv2 describe-target-groups --target-group-arns "$ARN" \
+      --query 'TargetGroups[0].[HealthCheckPath,HealthCheckPort,HealthCheckIntervalSeconds]'
+    aws elbv2 modify-target-group --target-group-arn "$ARN" \
+      --health-check-path /status --health-check-port 9000 --health-check-interval-seconds 15
+    aws elbv2 describe-target-health --target-group-arn "$ARN"
+    ```
+
+    ### Common mistakes
+
+    - Changing the traffic port (the targets' registration) instead of the health check port.
+    - Copying values from this tutorial: your notes file has the real ones.
+
+    ### Check your work
+
+    `describe-target-groups` shows the path, port and interval from the notes.
   scenario: |
     The `aws` command talks to a local emulator. The target group **`api-tg`** fronts an API
     whose operations notes are in **`/lab/api-notes.txt`**. The group's health check was
@@ -279,13 +402,33 @@ exercises:
   kind: build
   tags: [aws, ec2, ebs, snapshot]
   tutorial: |
-    **Concept.** A snapshot is a point-in-time copy of an EBS volume. A new, larger volume can be created from it, which is the usual way to enlarge a disk safely: take the backup, then build from the backup.
+    **What you're learning.** EBS **snapshots**, and growing a disk by creating a bigger volume from one.
 
-    **Read up on:**
-    - `aws ec2 create-snapshot help` — description and tag options
-    - `aws ec2 create-volume help` — `--snapshot-id`, `--size` and availability zone
-    - `aws ec2 describe-snapshots` and `describe-volumes` — reading results back
-    - Why a restored volume must be at least as large as its snapshot
+    ### The idea
+
+    A **snapshot** is a point-in-time copy of an EBS volume (stored regionally). A new volume can be created **from** it, in any zone of the region, at least as large as the snapshot. That's the safe way to enlarge (or move, cloud-090) a disk: backup first, build from the backup, keep the original for rollback.
+
+    ### Commands you'll use
+
+    ```bash
+    VOL=$(aws ec2 describe-volumes --filters Name=tag:Name,Values=reports-data --query 'Volumes[0].VolumeId' --output text)
+    SNAP=$(aws ec2 create-snapshot --volume-id "$VOL" --description before-resize --query SnapshotId --output text)
+    aws ec2 describe-snapshots --snapshot-ids "$SNAP" --query 'Snapshots[0].[State,VolumeSize,Description]'
+    aws ec2 create-volume --snapshot-id "$SNAP" --size "$(cat /lab/new-size.txt)" --availability-zone us-east-1a \
+      --tag-specifications 'ResourceType=volume,Tags=[{Key=Name,Value=reports-data-big}]'
+    aws ec2 describe-volumes --filters Name=tag:Name,Values=reports-data-big \
+      --query 'Volumes[0].[Size,SnapshotId,AvailabilityZone]'
+    ```
+    On real AWS, wait for the snapshot (`aws ec2 wait snapshot-completed --snapshot-ids "$SNAP"`) before using it.
+
+    ### Common mistakes
+
+    - A size smaller than the snapshot: rejected.
+    - Another zone than asked.
+
+    ### Check your work
+
+    The new volume has the size from the file, the snapshot as its source, the zone and the tag; the snapshot has the description.
   scenario: |
     The `aws` command talks to a local emulator. The volume tagged **`Name=ledger-data`** holds
     the accounting database in zone **us-east-1a**. The new size, in GiB, is in **`/lab/size.txt`**.
@@ -338,13 +481,36 @@ exercises:
   kind: build
   tags: [aws, ec2, launch-template, user-data]
   tutorial: |
-    **Concept.** A launch template stores everything needed to start an instance: image, size and a boot script called user data. User data travels base64-encoded, and every change to a template creates a new numbered version rather than editing the old one.
+    **What you're learning.** **Launch templates**: everything needed to start an instance, including base64-encoded user data.
 
-    **Read up on:**
-    - `aws ec2 create-launch-template help` — the `--launch-template-data` JSON
-    - `base64 -w0` — encoding a file onto one line
-    - `aws ec2 describe-launch-template-versions` — reading versions back
-    - `aws ec2 describe-images` — choosing an image ID
+    ### The idea
+
+    A launch template stores an instance's settings: image (`ImageId`), size (`InstanceType`), security groups, and **user data**, a boot script the instance runs at first start. User data is sent **base64-encoded**. Templates are **versioned**: every change creates a new version (cloud-090).
+
+    ```json
+    {"ImageId": "ami-0abc...", "InstanceType": "t3.micro", "UserData": "IyEvYmluL2Jhc2gK..."}
+    ```
+
+    ### Commands you'll use
+
+    ```bash
+    AMI=$(aws ec2 describe-images --query 'Images[0].ImageId' --output text)
+    DATA=$(jq -nc --arg a "$AMI" --arg u "$(base64 -w0 /lab/boot.sh)" \
+      '{ImageId:$a,InstanceType:"t3.micro",UserData:$u}')
+    aws ec2 create-launch-template --launch-template-name api-lt --launch-template-data "$DATA"
+    aws ec2 describe-launch-template-versions --launch-template-name api-lt \
+      --query 'LaunchTemplateVersions[0].LaunchTemplateData.UserData' --output text | base64 -d | head -3
+    ```
+    `base64 -w0` keeps it on one line.
+
+    ### Common mistakes
+
+    - Raw script text in `UserData`: must be base64.
+    - `base64` without `-w0`: line breaks inside the JSON string.
+
+    ### Check your work
+
+    The template exists with the instance type, and its decoded user data equals the script file.
   scenario: |
     The `aws` command talks to a local emulator. The boot script **`/lab/userdata.sh`** installs
     and starts the web server.
@@ -388,13 +554,33 @@ exercises:
   kind: build
   tags: [aws, vpc, vpc-endpoint, s3]
   tutorial: |
-    **Concept.** A gateway VPC endpoint adds a route in chosen route tables so that traffic to a supported AWS service, such as S3, stays on the provider's private network instead of leaving through a NAT gateway or internet gateway.
+    **What you're learning.** **Gateway VPC endpoints**: keeping S3 traffic off the NAT and the internet.
 
-    **Read up on:**
-    - `aws ec2 create-vpc-endpoint help` — type, service name and route tables
-    - Gateway endpoints versus interface endpoints
-    - The service name format `com.amazonaws.REGION.s3`
-    - `aws ec2 describe-vpc-endpoints` — checking the result
+    ### The idea
+
+    Without an endpoint, a private subnet reaches S3 through a NAT gateway (paid per GB) and the internet. A **gateway endpoint** for S3 (or DynamoDB) adds a route, in the **route tables you choose**, sending S3 traffic over AWS's private network. (Interface endpoints are a different kind: network interfaces with private IPs, for most other services.)
+
+    Service name format: `com.amazonaws.REGION.s3`.
+
+    ### Commands you'll use
+
+    ```bash
+    VPC=$(aws ec2 describe-vpcs --filters Name=tag:Name,Values=analytics-vpc --query 'Vpcs[0].VpcId' --output text)
+    RT=$(aws ec2 describe-route-tables --filters Name=tag:Name,Values=batch-rt --query 'RouteTables[0].RouteTableId' --output text)
+    aws ec2 create-vpc-endpoint --vpc-id "$VPC" --vpc-endpoint-type Gateway \
+      --service-name com.amazonaws.us-east-1.s3 --route-table-ids "$RT"
+    aws ec2 describe-vpc-endpoints --filters Name=vpc-id,Values="$VPC" \
+      --query 'VpcEndpoints[].[ServiceName,VpcEndpointType,RouteTableIds]'
+    ```
+
+    ### Common mistakes
+
+    - `--vpc-endpoint-type Interface` for S3 when a gateway is asked.
+    - Attaching it to every route table (the task says one).
+
+    ### Check your work
+
+    One Gateway endpoint for `com.amazonaws.us-east-1.s3` in the VPC, attached to exactly that route table.
   scenario: |
     The `aws` command talks to a local emulator. The VPC tagged **`Name=data-vpc`** has a route
     table tagged **`Name=private-rt`** used by the batch servers, which pull large files from S3
@@ -442,13 +628,42 @@ exercises:
   kind: fix
   tags: [aws, vpc, nat-gateway, routing]
   tutorial: |
-    **Concept.** Instances in a private subnet have no public addresses, so outbound traffic needs a NAT gateway. The gateway itself must sit in a public subnet, with an Elastic IP, and the private subnet's route table must send its default route to it.
+    **What you're learning.** **NAT gateways**: how private subnets reach the internet, and where the NAT must live.
 
-    **Read up on:**
-    - `aws ec2 create-nat-gateway help` — what it needs
-    - `aws ec2 allocate-address` — the address a NAT gateway uses
-    - `aws ec2 create-route help` — the `--nat-gateway-id` target
-    - Why a NAT gateway in a private subnet is a classic mistake
+    ### The idea
+
+    Instances in a **private** subnet have no public IPs, so they can't use the internet gateway directly. A **NAT gateway**:
+
+    - lives in a **public** subnet (one routed to the internet gateway);
+    - has an **Elastic IP**;
+    - is the target of the private route table's default route (`0.0.0.0/0`).
+
+    ```
+    private instance ─► private-rt: 0.0.0.0/0 → nat-... (in the public subnet) ─► igw ─► internet
+    ```
+
+    A NAT gateway placed in the **private** subnet has no way out itself: a classic mistake.
+
+    ### Commands you'll use
+
+    ```bash
+    PUB=$(aws ec2 describe-subnets --filters Name=tag:Name,Values=dmz-a --query 'Subnets[0].SubnetId' --output text)
+    RT=$(aws ec2 describe-route-tables --filters Name=tag:Name,Values=apps-rt --query 'RouteTables[0].RouteTableId' --output text)
+    AID=$(aws ec2 allocate-address --domain vpc --query AllocationId --output text)
+    NAT=$(aws ec2 create-nat-gateway --subnet-id "$PUB" --allocation-id "$AID" --query NatGateway.NatGatewayId --output text)
+    aws ec2 create-route --route-table-id "$RT" --destination-cidr-block 0.0.0.0/0 --nat-gateway-id "$NAT"
+    aws ec2 describe-route-tables --route-table-ids "$RT" --query 'RouteTables[0].Routes'
+    ```
+    If a `0.0.0.0/0` route already exists (to something wrong), use `replace-route` instead of `create-route`.
+
+    ### Common mistakes
+
+    - Creating the NAT in the private subnet.
+    - Pointing the public route table at the NAT (it must keep the internet gateway).
+
+    ### Check your work
+
+    The NAT gateway is in the public subnet with an Elastic IP, and the private route table's `0.0.0.0/0` goes to it.
   scenario: |
     The `aws` command talks to a local emulator. A VPC has a public subnet tagged
     **`Name=public-a`** (routed to an internet gateway) and a private subnet tagged
@@ -505,13 +720,39 @@ exercises:
   kind: build
   tags: [aws, elbv2, alb, listener-rule]
   tutorial: |
-    **Concept.** An application load balancer listener has a default action, and extra rules that are checked in priority order before it. A rule pairs conditions, such as a path pattern, with an action, such as forwarding to a particular target group.
+    **What you're learning.** **Listener rules** on an application load balancer: routing by path, by priority.
 
-    **Read up on:**
-    - `aws elbv2 describe-listeners` and `describe-rules` — finding the listener and reading its rules
-    - `aws elbv2 create-rule help` — priority, conditions and actions
-    - Path pattern wildcards — how `*` matches
-    - The default rule — why it always comes last
+    ### The idea
+
+    An ALB listener has a **default action** (e.g. forward to `web-tg`) and **rules** checked first, in **priority** order (lower number first). Each rule pairs **conditions** (path pattern, host header...) with an **action**.
+
+    ```
+    priority 10: path /api/* → forward api-tg
+    default:     → forward web-tg
+    ```
+    `*` in a path pattern matches any characters.
+
+    ### Commands you'll use
+
+    ```bash
+    LB=$(aws elbv2 describe-load-balancers --names store-alb --query 'LoadBalancers[0].LoadBalancerArn' --output text)
+    L=$(aws elbv2 describe-listeners --load-balancer-arn "$LB" --query 'Listeners[?Port==`80`].ListenerArn | [0]' --output text)
+    TG=$(aws elbv2 describe-target-groups --names images-tg --query 'TargetGroups[0].TargetGroupArn' --output text)
+    aws elbv2 create-rule --listener-arn "$L" --priority 20 \
+      --conditions Field=path-pattern,Values='/img/*' --actions Type=forward,TargetGroupArn="$TG"
+    aws elbv2 describe-rules --listener-arn "$L" \
+      --query 'Rules[].[Priority,Conditions[0].Values[0],Actions[0].TargetGroupArn]' --output table
+    ```
+    Quote `'/api/*'` so the shell doesn't expand it.
+
+    ### Common mistakes
+
+    - Changing the listener's default action: everything goes to the API.
+    - `Values=/api` without `/*`: matches only that exact path.
+
+    ### Check your work
+
+    `describe-rules` shows the priority-10 rule to `api-tg` and the default still forwarding to `web-tg`.
   scenario: |
     The `aws` command talks to a local emulator. The application load balancer **`shop-alb`**
     has an HTTP listener on port 80 that forwards everything to the target group **`web-tg`**.
@@ -564,45 +805,31 @@ exercises:
   kind: build
   tags: [aws, capstone, ec2, ebs, snapshot, vpc, nat-gateway, vpc-endpoint, security-group, launch-template, elbv2, alb, elastic-ip, route53, weighted-routing]
   tutorial: |
-    **Concept.** Moving a service between availability zones touches
-    every layer of the compute stack, and each layer has its own rule
-    about what can move and what has to be rebuilt:
+    **What you're learning.** A zone cutover touching every compute layer: disks, egress, firewalls, launch templates, load balancing, addresses and DNS.
 
-    - **disks.** An EBS volume lives in one zone and can only be attached
-      to an instance in that zone. To move data across zones you take a
-      **snapshot** (it is regional) and create a new volume from it in the
-      target zone, at least as large as the snapshot. The old volume stays
-      as the rollback.
-    - **egress.** A private subnet reaches the internet through a **NAT
-      gateway in a public subnet**, ideally in the same zone so that zone's
-      traffic doesn't depend on another zone. A **gateway endpoint** for
-      S3 adds a route to chosen route tables, so S3 traffic skips the NAT.
-    - **firewalls.** A security group is referenced by ID from instances
-      and other groups, so you fix its rules in place: revoke what is
-      wrong, authorize what is right. A rule can name another group as its
-      source instead of an address range.
-    - **launch templates.** Templates are versioned: a change is a **new
-      version**, and the **default version** is what launches use unless
-      told otherwise. Old versions stay, which makes a rollback one call.
-    - **load balancers.** A target group only routes to targets that are
-      registered and pass its health check, which can probe the
-      **traffic port** (the port each target was registered on) or a
-      fixed one. Listener rules are checked by priority before the default
-      action.
-    - **addresses and DNS.** An Elastic IP stays with the account. Route 53
-      can hold several **weighted** records of one name and type, each
-      with a `SetIdentifier`, but a plain record of that name and type
-      cannot live beside them: the switch is a `DELETE` of the plain record
-      (with its exact values) and the `CREATE`s, in **one** change batch,
-      which is applied atomically.
+    ### Method
 
-    **Read up on:**
-    - `aws ec2 create-snapshot`, `create-volume --snapshot-id --availability-zone`, `attach-volume`, `aws ec2 wait`
-    - `aws ec2 create-nat-gateway`, `create-route --nat-gateway-id`, `create-vpc-endpoint --vpc-endpoint-type Gateway`
-    - `aws ec2 revoke-security-group-ingress`, `authorize-security-group-ingress --source-group`
-    - `aws ec2 create-launch-template-version`, `modify-launch-template --default-version`, `describe-launch-template-versions`
-    - `aws elbv2 modify-target-group`, `register-targets`, `describe-target-health`, `create-rule`
-    - `aws ec2 allocate-address`, `associate-address`, `aws route53 change-resource-record-sets` (`DELETE`, `CREATE`, weighted records)
+    | layer | rule | exercise |
+    |---|---|---|
+    | disk | a volume can't change zone: snapshot → new volume in the target zone → attach (`/dev/sdf`); keep the old one | cloud-042 |
+    | egress | NAT gateway in the **public subnet of the same zone**; S3 gateway endpoint on the private route table only | cloud-041, cloud-045 |
+    | firewall | fix the **existing** group: revoke every wrong rule, authorize 5432 from the app group | cloud-008, cloud-038 |
+    | template | `create-launch-template-version` with **complete** data (same image as v1, new type, base64 user data), then `modify-launch-template --default-version` | cloud-040 |
+    | load balancer | health check path + `--health-check-port traffic-port`; register only **running** `Role=billing-api` instances on 8080 (deregister anything else); listener rule priority 10 | cloud-039, cloud-043 |
+    | DNS | Elastic IP; replace the plain A record by two weighted ones: **one** change batch with the `DELETE` (exact old values) and two `CREATE`s | cloud-036, cloud-037, cloud-044 |
+
+    Read the handover notes for the size and path; look everything up by tag, never by hard-coded IDs.
+
+    ```bash
+    aws ec2 describe-security-groups --group-ids "$DBSG" --query 'SecurityGroups[0].IpPermissions'
+    aws ec2 describe-launch-template-versions --launch-template-name billing-api-lt --versions 1 --query 'LaunchTemplateVersions[0].LaunchTemplateData'
+    aws elbv2 describe-target-health --target-group-arn "$TG"
+    aws route53 list-resource-record-sets --hosted-zone-id "$ZID" --query "ResourceRecordSets[?Name=='pay.shop.example.']"
+    ```
+
+    ### Check your work
+
+    The new volume (right zone, size, tag, from the snapshot) is attached to billing-db-2 and the old one still to billing-db-1; the private route table goes to the zone-b NAT and has the S3 endpoint; the DB group has exactly one rule; the template's default version is the new one; only running API instances are registered; two weighted records and no plain one exist.
   scenario: |
     The `aws` command talks to a local emulator. It runs in `/lab` and can
     only see files under `/lab`, so give it absolute paths such as
