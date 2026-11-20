@@ -12,13 +12,61 @@ exercises:
   kind: build
   tags: [liveness, probes]
   tutorial: |
-    **Concept.** A liveness probe periodically checks a container, and the kubelet restarts it after enough consecutive failures. Probes can use HTTP, TCP or a command, with tunable timing.
+    **What you're learning.** **Probes** from zero, starting with the **liveness** probe that restarts a hung container.
 
-    **Read up on:**
-    - `kubectl explain pod.spec.containers.livenessProbe` — handler plus timing fields
-    - `kubectl create deployment --help` — generate YAML with `--dry-run=client -o yaml`
-    - `kubectl describe pod` — probe settings and failure events
-    - Kubernetes docs: Configure Liveness, Readiness and Startup Probes
+    ### Probes from zero
+
+    A container can be running but useless: deadlocked, stuck in a loop, not yet ready. The kubelet can check it periodically with a **probe**:
+
+    | probe | when it fails |
+    |---|---|
+    | **liveness** | the kubelet **restarts** the container |
+    | **readiness** | the pod is taken **out of Service endpoints** (no traffic), not restarted |
+    | **startup** | the other two wait until it has succeeded once (k8s-143) |
+
+    Each probe uses one **handler** (`httpGet`, `tcpSocket`, `exec`, `grpc`) and timing fields:
+
+    | field | default | meaning |
+    |---|---|---|
+    | `initialDelaySeconds` | 0 | wait before the first check |
+    | `periodSeconds` | 10 | time between checks |
+    | `timeoutSeconds` | 1 | how long one check may take |
+    | `failureThreshold` | 3 | consecutive failures before acting |
+
+    An HTTP probe passes on any status from 200 to 399.
+
+    ```yaml
+    containers:
+    - name: web
+      image: nginx:1.28-alpine
+      livenessProbe:
+        httpGet: {path: /, port: 80}
+        initialDelaySeconds: 3
+        periodSeconds: 15
+        failureThreshold: 4
+    ```
+
+    ### Commands you'll use
+
+    ```bash
+    kubectl create deployment web -n demo --image=nginx:1.28-alpine --dry-run=client -o yaml > /lab/web.yaml
+    vi /lab/web.yaml           # add livenessProbe under the container
+    kubectl apply -f /lab/web.yaml
+    kubectl describe pod -n demo -l app=web | grep -A1 Liveness
+    ```
+    ```text
+    Liveness:  http-get http://:80/ delay=3s timeout=1s period=15s #success=1 #failure=4
+    ```
+    A failing liveness probe shows up as `Warning Unhealthy ... Liveness probe failed` events and a growing `RESTARTS` count.
+
+    ### Common mistakes
+
+    - `livenessProbe` at the pod level: it's per container.
+    - A liveness probe on something slow or external (a database): when that's down, every pod restarts for nothing.
+
+    ### Check your work
+
+    `kubectl describe pod` shows the probe line with your delay, period and failure count.
   scenario: |
     Create a deployment **`api`** in namespace **`health`** (`nginx:1.28-alpine`) with a
     **liveness probe** that does an HTTP GET on `/` port 80 every **10 seconds**, starting
@@ -67,13 +115,50 @@ exercises:
   kind: build
   tags: [probes, tcp]
   tutorial: |
-    **Concept.** Probe handlers come in several kinds: HTTP GET, TCP socket and exec. Readiness decides whether a pod receives traffic; liveness decides whether it gets restarted. Choose a handler that fits the service's protocol.
+    **What you're learning.** Choosing a probe **handler** to fit the service, and the difference between readiness and liveness.
 
-    **Read up on:**
-    - `kubectl explain pod.spec.containers.readinessProbe` — the handler types
-    - `kubectl explain pod.spec.containers.livenessProbe.exec` — running a command in the container
-    - `redis-cli --help` — what ping does and its exit status
-    - `kubectl get pod` — READY column reflects readiness
+    ### The idea
+
+    | handler | passes when | good for |
+    |---|---|---|
+    | `httpGet` | HTTP status 200-399 | web apps |
+    | `tcpSocket` | a TCP connection opens | databases, caches, anything non-HTTP |
+    | `exec` | the command exits 0 | a check tool in the image (`pg_isready`, `redis-cli ping`) |
+
+    **Readiness** = "should this pod get traffic now?"; **liveness** = "is it broken beyond repair?". A pod can have both, with different handlers.
+
+    ```yaml
+    readinessProbe:
+      tcpSocket: {port: 5432}
+      periodSeconds: 5
+    livenessProbe:
+      exec:
+        command: ["pg_isready", "-U", "postgres"]
+      periodSeconds: 20
+    ```
+
+    ### Commands you'll use
+
+    ```bash
+    kubectl apply -f /lab/db.yaml
+    kubectl get pod db -n demo -w            # READY 0/1 until the readiness probe passes
+    kubectl describe pod db -n demo | grep -E 'Liveness|Readiness'
+    ```
+    ```text
+    Liveness:   exec [pg_isready -U postgres] delay=0s timeout=1s period=20s #success=1 #failure=3
+    Readiness:  tcp-socket :5432 delay=0s timeout=1s period=5s #success=1 #failure=3
+    ```
+
+    Try the exec command yourself first: `kubectl exec db -n demo -- pg_isready -U postgres; echo $?`.
+
+    ### Common mistakes
+
+    - `exec.command` as one string (`"redis-cli ping"`): it must be a list, one element per argument.
+    - HTTP probes against a non-HTTP port: always fail.
+
+    ### Check your work
+
+    `describe` shows both probes with the right handlers, and the pod becomes `1/1` Ready.
   scenario: |
     Redis doesn't speak HTTP. Create pod **`cache`** in namespace **`health`**
     (`redis:7.4-alpine`) with a **readiness probe** that checks that **TCP port 6379**
@@ -120,13 +205,54 @@ exercises:
   kind: build
   tags: [limitrange]
   tutorial: |
-    **Concept.** A LimitRange sets per-container defaults, minimums and maximums for a namespace. It is applied when a pod is admitted, so it affects new pods only.
+    **What you're learning.** **LimitRange**: default, minimum and maximum resources per container in a namespace.
 
-    **Read up on:**
-    - `kubectl explain limitrange.spec.limits` — default, defaultRequest, max, min
-    - `kubectl describe limitrange -n NS` — verify the values
-    - `kubectl run` a test pod and `kubectl get pod -o yaml` — see injected resources
-    - Kubernetes docs: Limit Ranges
+    ### The idea
+
+    A LimitRange is applied **when a pod is admitted** (created). For each container that doesn't set something, it fills in defaults; for each that sets too much, it rejects the pod.
+
+    | field | effect |
+    |---|---|
+    | `defaultRequest` | request given to containers that set none |
+    | `default` | **limit** given to containers that set none |
+    | `max` / `min` | allowed range; outside → pod rejected |
+    | `maxLimitRequestRatio` | limit may be at most N × request |
+
+    Existing pods aren't changed.
+
+    ```yaml
+    apiVersion: v1
+    kind: LimitRange
+    metadata: {name: container-defaults, namespace: demo}
+    spec:
+      limits:
+      - type: Container
+        defaultRequest: {cpu: 50m, memory: 64Mi}
+        default:        {cpu: 250m, memory: 128Mi}
+        max:            {cpu: "2", memory: 2Gi}
+    ```
+    Note the confusing naming: `default` is the default **limit**.
+
+    ### Commands you'll use
+
+    ```bash
+    kubectl apply -f /lab/lr.yaml
+    kubectl describe limitrange container-defaults -n demo
+    kubectl run probe -n demo --image=busybox:1.37 -- sleep 3600
+    kubectl get pod probe -n demo -o jsonpath='{.spec.containers[0].resources}'; echo
+    ```
+    ```text
+    {"limits":{"cpu":"250m","memory":"128Mi"},"requests":{"cpu":"50m","memory":"64Mi"}}
+    ```
+
+    ### Common mistakes
+
+    - `1Gi` (gibibytes) and `1G` (gigabytes) are different values.
+    - Expecting running pods to pick up the defaults.
+
+    ### Check your work
+
+    A new pod without resources gets exactly the defaults, and one asking for a limit above the max is rejected.
   scenario: |
     Developers in namespace **`dev`** never set resources. Create a **LimitRange**
     **`defaults`** so that every container that doesn't specify anything gets:
@@ -178,13 +304,47 @@ exercises:
   kind: build
   tags: [resourcequota]
   tutorial: |
-    **Concept.** A ResourceQuota caps the total requests, limits and object counts in a namespace. Usage is tracked against the hard limits and new objects beyond them are rejected.
+    **What you're learning.** **ResourceQuota**: a total budget for a namespace.
 
-    **Read up on:**
-    - `kubectl create quota --help` — examples of `--hard`
-    - `kubectl explain resourcequota.spec.hard` — supported keys
-    - `kubectl describe quota -n NS` — Used versus Hard
-    - Kubernetes docs: Resource Quotas, compute resource quota
+    ### The idea
+
+    A ResourceQuota caps the **sum** of what all objects in a namespace request:
+
+    | key | caps |
+    |---|---|
+    | `requests.cpu`, `requests.memory` | sum of container requests |
+    | `limits.cpu`, `limits.memory` | sum of container limits |
+    | `pods`, `services`, `persistentvolumeclaims`, `configmaps`... | object counts |
+    | `requests.storage` | sum of PVC sizes |
+
+    Creating something that would exceed a limit is **rejected** with "exceeded quota". If a quota covers `requests.cpu` (etc.), every new pod **must** declare that resource (k8s-147).
+
+    ### Commands you'll use
+
+    ```bash
+    kubectl create quota budget -n demo \
+      --hard=requests.cpu=2,requests.memory=2Gi,limits.cpu=4,limits.memory=4Gi,pods=20,services=10
+    kubectl describe quota budget -n demo
+    ```
+    ```text
+    Resource         Used  Hard
+    --------         ----  ----
+    limits.cpu       0     4
+    limits.memory    0     4Gi
+    pods             0     20
+    requests.cpu     0     2
+    requests.memory  0     2Gi
+    services         0     10
+    ```
+
+    ### Common mistakes
+
+    - `cpu=2` instead of `requests.cpu=2`: `cpu` alone means `requests.cpu`, which may be fine, but be explicit.
+    - A typo in a key: the quota is created but doesn't limit what you meant.
+
+    ### Check your work
+
+    `kubectl describe quota NAME -n NS` lists every limit with the right value.
   scenario: |
     Team **`marketing`** gets a fixed slice of the cluster. Create a ResourceQuota
     **`team-budget`** in their namespace limiting the totals to:
@@ -216,13 +376,46 @@ exercises:
   kind: build
   tags: [qos, resources]
   tutorial: |
-    **Concept.** Every pod gets a QoS class derived from its requests and limits: Guaranteed, Burstable or BestEffort. The class influences eviction order under node pressure.
+    **What you're learning.** **QoS classes**: how requests and limits decide which pods are evicted first under memory pressure.
 
-    **Read up on:**
-    - Kubernetes docs: Pod Quality of Service Classes — the exact rules
-    - `kubectl explain pod.spec.containers.resources` — requests and limits
-    - `kubectl get pod NAME -o jsonpath='{.status.qosClass}'` — see the class assigned
-    - `kubectl describe pod` — QoS Class line
+    ### The idea
+
+    Kubernetes puts each pod in a QoS class from its containers' resources:
+
+    | class | rule | evicted |
+    |---|---|---|
+    | **Guaranteed** | every container has CPU **and** memory limits, with requests **equal** to limits | last |
+    | **Burstable** | at least one request or limit, but not Guaranteed | in between |
+    | **BestEffort** | no requests or limits at all | first |
+
+    Setting only limits also gives Guaranteed (requests default to the limits).
+
+    ```yaml
+    resources:
+      requests: {cpu: 500m, memory: 256Mi}
+      limits:   {cpu: 500m, memory: 256Mi}
+    ```
+
+    ### Commands you'll use
+
+    ```bash
+    kubectl apply -f /lab/critical.yaml
+    kubectl get pod critical -n demo -o jsonpath='{.status.qosClass}'; echo
+    ```
+    ```text
+    Guaranteed
+    ```
+
+    `kubectl run x --image=busybox:1.37 --dry-run=client -o yaml -- sleep infinity` gives a starting YAML; add the `resources` block.
+
+    ### Common mistakes
+
+    - Requests and limits that differ by a little (`250m` vs `0.25`): those are equal. `128Mi` vs `128M` are **not**.
+    - Only CPU set: Burstable.
+
+    ### Check your work
+
+    `.status.qosClass` is `Guaranteed`.
   scenario: |
     Under memory pressure the kubelet evicts **BestEffort** pods first and **Guaranteed**
     pods last. The **`ledger`** pod (namespace **`fin`**) must be as safe as possible.
@@ -264,14 +457,47 @@ exercises:
   kind: build
   tags: [metrics, top, nodes]
   tutorial: |
-    **Concept.** metrics-server provides live CPU and memory figures per pod and per node. `kubectl top` reads those, can sort the output, and prints several columns, so choose by header and put the values into the requested format. Metrics lag a minute or so behind new pods.
+    **What you're learning.** Reading live CPU and memory usage with `kubectl top`.
 
-    **Read up on:**
-    - `kubectl top pods --help` — sorting (`--sort-by`) and namespace flags
-    - `kubectl top pods -n NS` — read the CPU column and its millicore units
-    - `kubectl top nodes --no-headers` — script-friendly output; columns are NAME CPU(cores) CPU% MEMORY(bytes) MEMORY%
-    - `awk` and `head` — extracting columns and a single name from text output
-    - `kubectl get apiservices` — is metrics-server available
+    ### The idea
+
+    **metrics-server** collects current CPU and memory usage from each kubelet. `kubectl top pods` and `kubectl top nodes` show it. These are **live usage** numbers, not requests. They lag about a minute behind new pods.
+
+    ### Commands you'll use
+
+    ```bash
+    kubectl top pods -n demo --sort-by=cpu
+    ```
+    ```text
+    NAME          CPU(cores)   MEMORY(bytes)
+    spinner-1     412m         3Mi
+    spinner-2     98m          3Mi
+    idle          0m           1Mi
+    ```
+
+    ```bash
+    kubectl top pods -n demo --sort-by=cpu --no-headers | head -1 | awk '{print $1}'
+    kubectl top nodes
+    ```
+    ```text
+    NAME           CPU(cores)   CPU(%)   MEMORY(bytes)   MEMORY(%)
+    controlplane   301m         15%      1530Mi          41%
+    node01         520m         26%      980Mi           26%
+    ```
+
+    ```bash
+    kubectl top nodes --no-headers | awk '{print $1, $5}'
+    ```
+    Count the columns by the header: `$5` is MEMORY(%) here. Check your version's header before picking a column.
+
+    ### Common mistakes
+
+    - `error: Metrics API not available`: metrics-server isn't ready yet; wait a minute.
+    - Picking the bytes column instead of the percentage.
+
+    ### Check your work
+
+    The files contain exactly what `kubectl top` shows (the busiest pod's name; `NODE PERCENT` lines).
   scenario: |
     Two questions about resource pressure on the cluster:
 
@@ -319,13 +545,41 @@ exercises:
   kind: fix
   tags: [limitrange, admission, troubleshooting]
   tutorial: |
-    **Concept.** A LimitRange also enforces maximums at admission. A pod whose container values exceed the namespace limits is refused, and the reason shows up in the ReplicaSet's events.
+    **What you're learning.** Why a Deployment has zero pods when a LimitRange rejects them, and where that error shows up.
 
-    **Read up on:**
-    - `kubectl describe rs -n NS` — events with the forbidden message
-    - `kubectl describe limitrange -n NS` — min, max and defaults
-    - `kubectl set resources --help` — adjust requests and limits
-    - `kubectl get deploy -o yaml` — check current resources
+    ### The idea
+
+    Pods are created by the **ReplicaSet**, not by you. If admission rejects them (a LimitRange maximum, a quota), there's no pod to describe: the error is in the **ReplicaSet's events**. The Deployment just shows `0/N`.
+
+    ```
+    Deployment ─► ReplicaSet ─► create pod ✗ forbidden: maximum memory usage per Container is 512Mi, but limit is 1Gi
+    ```
+
+    ### Commands you'll use
+
+    ```bash
+    kubectl get deploy,rs -n demo
+    kubectl describe rs -n demo | grep -i -A1 forbidden
+    ```
+    ```text
+    Warning  FailedCreate  ... Error creating: pods "transcode-6f9..." is forbidden:
+    maximum memory usage per Container is 512Mi, but limit is 1Gi
+    ```
+
+    ```bash
+    kubectl describe limitrange -n demo
+    kubectl set resources deploy/transcode -n demo --limits=memory=450Mi --requests=memory=350Mi
+    kubectl rollout status deploy/transcode -n demo
+    ```
+
+    ### Common mistakes
+
+    - Looking for pod events: there are no pods.
+    - Changing the LimitRange: the task says fix the Deployment.
+
+    ### Check your work
+
+    The Deployment shows all replicas Ready, and its container's resources have the measured values.
   scenario: |
     The **`video-encoder`** deployment (namespace **`media`**) has 0 pods. Its ReplicaSet
     events say *forbidden: maximum memory usage per Container is 512Mi, but limit is 2Gi*.
@@ -383,13 +637,44 @@ exercises:
   kind: fix
   tags: [startupProbe, liveness, crashloop]
   tutorial: |
-    **Concept.** A startup probe holds off liveness and readiness checks until the app has started, giving slow-starting software a long allowance. Total allowance is period multiplied by failure threshold.
+    **What you're learning.** **Startup probes**: giving a slow-starting app time, without weakening its liveness probe.
 
-    **Read up on:**
-    - `kubectl explain pod.spec.containers.startupProbe` — same shape as other probes
-    - `kubectl get deploy NAME -o yaml` — see the existing probe definition
-    - `kubectl describe pod` — events like Unhealthy and Killing
-    - `kubectl get pod -w` — watch restart counts
+    ### The idea
+
+    A liveness probe that's strict enough to catch hangs (say 3 failures × 10 s) kills an app that needs 40 s to start, so it restarts forever. A **startup probe** runs first; while it hasn't passed yet, liveness and readiness are **not** checked. Once it passes, it stops and the normal probes take over.
+
+    Allowance = `periodSeconds` × `failureThreshold`. For 2 minutes: `5 × 24 = 120 s`.
+
+    ```yaml
+    startupProbe:
+      httpGet: {path: /health, port: 9000}
+      periodSeconds: 5
+      failureThreshold: 24
+    livenessProbe:                     # unchanged
+      httpGet: {path: /health, port: 9000}
+      periodSeconds: 10
+      failureThreshold: 3
+    ```
+
+    ### Commands you'll use
+
+    ```bash
+    kubectl get pods -n demo -w                          # RESTARTS keeps climbing: the symptom
+    kubectl get deploy slowapp -n demo -o jsonpath='{.spec.template.spec.containers[0].livenessProbe}'; echo
+    kubectl patch deploy slowapp -n demo --type=json -p '[{"op":"add",
+      "path":"/spec/template/spec/containers/0/startupProbe",
+      "value":{"httpGet":{"path":"/health","port":9000},"periodSeconds":5,"failureThreshold":24}}]'
+    kubectl rollout status deploy/slowapp -n demo
+    ```
+
+    ### Common mistakes
+
+    - Raising the liveness probe's `initialDelaySeconds` instead: that's weakening it (and slow startups vary).
+    - A startup probe with a different check than liveness: it should prove the same thing.
+
+    ### Check your work
+
+    The new pod reaches Ready with `RESTARTS 0`, and the liveness probe is unchanged.
   scenario: |
     The legacy **`erp`** deployment (namespace **`legacy`**) needs about **40 seconds** to
     start. Its liveness probe kills it long before that, so it restarts forever.
@@ -444,19 +729,53 @@ exercises:
   kind: fix
   tags: [liveness, timeouts, pdb, in-place-resize, troubleshooting]
   tutorial: |
-    **Concept.** Three independent reliability levers protect one service.
+    **What you're learning.** Three reliability tools: probe **timeouts**, **PodDisruptionBudgets**, and resizing a running pod **in place**.
 
-    1. A probe has a timeout: if the endpoint does not answer in time, that counts as a failure even when the app is healthy, and a failing *liveness* probe makes the kubelet restart the container. Compare the endpoint's real latency with the probe's `timeoutSeconds` (default 1), `periodSeconds` and `failureThreshold`.
-    2. A PodDisruptionBudget limits how many pods of a workload *voluntary* disruptions (drains, upgrades) may take down at once. It selects pods by label and is expressed as `minAvailable` or `maxUnavailable`; `ALLOWED DISRUPTIONS` is what the eviction API will currently permit.
-    3. Recent Kubernetes versions can change a running pod's CPU and memory through the `resize` subresource, and the container may keep running without a restart, depending on its `resizePolicy`.
+    ### The idea
 
-    **Read up on:**
-    - `kubectl explain pod.spec.containers.livenessProbe` — timeoutSeconds, periodSeconds, failureThreshold
-    - `kubectl describe pod` — Liveness probe failed messages, and the RESTARTS column of `kubectl get pod`
-    - `kubectl create pdb --help` and `kubectl explain pdb.spec` — selector, minAvailable, maxUnavailable
-    - `kubectl patch --help` — JSON patch of a nested field, and the `--subresource` flag
-    - `kubectl explain pod.spec.containers.resizePolicy` — restart behaviour per resource
-    - Kubernetes docs: Disruptions; Resize CPU and Memory Resources assigned to Containers
+    **Probe timeout.** Each check may take `timeoutSeconds` (default **1**). An endpoint that takes 2 s counts as a **failure** even though the app is healthy; with a liveness probe, the kubelet restarts healthy containers.
+
+    **PodDisruptionBudget (PDB).** Limits how many pods of a workload **voluntary** disruptions (drains, upgrades) may take down at once: `minAvailable: N` or `maxUnavailable: N`, selecting pods by label. `ALLOWED DISRUPTIONS` is what the eviction API permits right now. (Crashes and node failures aren't stopped by a PDB.)
+
+    **In-place resize.** A pod's CPU and memory can be changed through the `resize` subresource; depending on the container's `resizePolicy` (default for CPU: `NotRequired`), the container keeps running.
+
+    ### Commands you'll use
+
+    ```bash
+    kubectl describe pod -n demo -l app=api | grep -E 'Liveness|Unhealthy' | head -3
+    ```
+    ```text
+    Liveness:  http-get http://:8080/healthz delay=0s timeout=1s period=10s #success=1 #failure=3
+    Warning  Unhealthy  ... Liveness probe failed: Get "http://10.244.1.7:8080/healthz": context deadline exceeded
+    ```
+    "context deadline exceeded" = the timeout.
+
+    ```bash
+    kubectl patch deploy api -n demo --type=json -p \
+      '[{"op":"replace","path":"/spec/template/spec/containers/0/livenessProbe/timeoutSeconds","value":4}]'
+    kubectl create pdb api-pdb -n demo --selector=app=api --min-available=2
+    kubectl get pdb -n demo
+    ```
+    ```text
+    NAME      MIN AVAILABLE   MAX UNAVAILABLE   ALLOWED DISRUPTIONS
+    api-pdb   2               N/A               1
+    ```
+
+    ```bash
+    kubectl patch pod worker -n demo --subresource resize --patch \
+      '{"spec":{"containers":[{"name":"worker","resources":{"requests":{"cpu":"200m"},"limits":{"cpu":"400m"}}}]}}'
+    kubectl get pod worker -n demo -o jsonpath='{.status.containerStatuses[0].restartCount} {.status.containerStatuses[0].resources}'; echo
+    ```
+
+    ### Common mistakes
+
+    - Changing the endpoint, or removing the probe: the task says keep it.
+    - `kubectl edit pod` for the resize: resources in the main spec are immutable; use `--subresource resize`.
+    - A PDB selector that doesn't match the pods: `ALLOWED DISRUPTIONS` stays 0 or the PDB protects nothing.
+
+    ### Check your work
+
+    `RESTARTS` stops climbing; the PDB shows `MIN AVAILABLE 2`; the pod's UID and `restartCount` are unchanged and its resources show the new values.
   scenario: |
     Namespace **`catalog`** hosts the team's search stack. Three things need attention:
 
@@ -571,13 +890,38 @@ exercises:
   kind: fix
   tags: [resourcequota, limitrange, troubleshooting]
   tutorial: |
-    **Concept.** When a quota covers compute resources, every new pod must declare those resources, or admission rejects it. A LimitRange can supply defaults on the developers' behalf. Existing ReplicaSets retry creation.
+    **What you're learning.** How a quota and a LimitRange work together: the quota demands resources, the LimitRange supplies defaults.
 
-    **Read up on:**
-    - `kubectl describe rs -n NS` — events show the admission error
-    - `kubectl describe quota -n NS` — which resources are tracked
-    - `kubectl explain limitrange.spec.limits` — default and defaultRequest
-    - `kubectl rollout restart --help` — nudging a workload
+    ### The idea
+
+    Once a ResourceQuota covers `limits.cpu`, `requests.memory` etc., **every** new pod must declare them, or admission rejects it ("must specify limits.cpu"). Teams that don't set resources suddenly can't deploy. A **LimitRange** with defaults (k8s-145) fills them in at admission, before the quota check, so the same manifests work again.
+
+    The ReplicaSet keeps retrying pod creation with back-off; `kubectl rollout restart` (or just waiting) gets new pods created right away.
+
+    ### Commands you'll use
+
+    ```bash
+    kubectl describe rs -n demo | grep -i 'failed quota'
+    ```
+    ```text
+    Error creating: pods "app-..." is forbidden: failed quota: q1: must specify limits.cpu,limits.memory,requests.cpu,requests.memory
+    ```
+
+    ```bash
+    kubectl apply -f /lab/defaults.yaml        # a LimitRange with defaultRequest + default
+    kubectl rollout restart deploy/app -n demo
+    kubectl get pods -n demo
+    kubectl describe quota -n demo             # Used goes up
+    ```
+
+    ### Common mistakes
+
+    - Editing the deployment's resources: the team doesn't want that, and the task says fix the namespace.
+    - Defaults bigger than the quota allows for the replica count: pods are rejected for "exceeded quota" instead.
+
+    ### Check your work
+
+    The deployment shows all replicas Ready, and each pod has the default resources.
   scenario: |
     After a quota was added to namespace **`sales`**, the **`crm`** deployment can't
     create pods anymore (`kubectl get rs -n sales` shows 0/2, events say *failed quota:
@@ -634,16 +978,56 @@ exercises:
   kind: build
   tags: [hpa, autoscaling, metrics-server, requests, troubleshooting]
   tutorial: |
-    **Concept.** The Horizontal Pod Autoscaler adjusts replicas based on observed metrics. CPU *utilisation* is measured relative to each container's CPU **request**, using data from metrics-server. Two things must therefore exist before an HPA can work: metrics-server, and a CPU request on the target's containers. If either is missing, `kubectl get hpa` shows `<unknown>` in TARGETS and nothing scales. Even when everything is right, metrics take 30-60 seconds to appear and scaling happens with some delay, so watching it needs patience.
+    **What you're learning.** The **Horizontal Pod Autoscaler**, and the two prerequisites it can't work without.
 
-    **Read up on:**
-    - `kubectl autoscale --help` — imperative creation and its flags
-    - `kubectl explain hpa.spec` — scale target, min/max and metrics
-    - `kubectl get hpa -n NS -w` — follow TARGETS and REPLICAS
-    - `kubectl describe hpa NAME` — Conditions and events explain each decision (for example *missing request for cpu*)
-    - `kubectl set resources --help` — set requests and limits imperatively
-    - `kubectl top pods` — verify metrics are available
-    - Kubernetes docs: Horizontal Pod Autoscaling
+    ### The idea
+
+    An HPA adjusts a Deployment's replica count to keep a metric near a target. For CPU, the target is **utilisation**: usage as a percentage of the container's CPU **request**.
+
+    ```
+    utilisation = current CPU usage / CPU request
+    desired replicas ≈ current replicas × (current utilisation / target)
+    ```
+
+    Two prerequisites:
+
+    1. **metrics-server** running (it is in this cluster).
+    2. A **CPU request** on the target's containers. Without one, utilisation can't be computed: TARGETS shows `<unknown>`.
+
+    Metrics take 30-60 s to appear; scale-up happens within a minute or two of sustained load.
+
+    ### Commands you'll use
+
+    ```bash
+    kubectl autoscale deployment api -n demo --cpu-percent=60 --min=2 --max=6
+    kubectl get hpa -n demo
+    ```
+    ```text
+    NAME   REFERENCE        TARGETS        MINPODS   MAXPODS   REPLICAS
+    api    Deployment/api   cpu: 12%/60%   2         6         2
+    ```
+
+    ```bash
+    kubectl describe hpa api -n demo | tail -5
+    ```
+    ```text
+    Warning  FailedGetResourceMetric  ... missing request for cpu in container ...
+    ```
+    That message means prerequisite 2 is missing:
+    ```bash
+    kubectl set resources deploy/api -n demo --requests=cpu=100m
+    kubectl get hpa -n demo -w                 # watch REPLICAS change
+    ```
+
+    ### Common mistakes
+
+    - Expecting instant scaling: give it a couple of minutes.
+    - Setting a CPU **limit** but no request: the request then defaults to the limit, which works, but be explicit.
+    - Scaling the deployment by hand while an HPA controls it: the HPA overrides you.
+
+    ### Check your work
+
+    Every HPA shows a percentage (not `<unknown>`), and the busy deployment's `REPLICAS` reaches the expected count.
   scenario: |
     Namespace **`autoscale`** has three workloads and your job is to autoscale all of them:
 
@@ -717,13 +1101,44 @@ exercises:
   kind: fix
   tags: [pdb, drain, troubleshooting]
   tutorial: |
-    **Concept.** Drain evicts pods through the eviction API, which respects PodDisruptionBudgets. If a budget leaves no room for any disruption, the drain waits indefinitely.
+    **What you're learning.** Why a drain hangs on a PodDisruptionBudget, and how to set a budget that allows maintenance.
 
-    **Read up on:**
-    - `kubectl get pdb -n NS` — compare budget with replica count
-    - `kubectl describe pdb NAME` — current and desired healthy pods
-    - `kubectl drain --help` — flags and eviction behaviour
-    - `kubectl uncordon --help` — restoring a node afterwards
+    ### The idea
+
+    `kubectl drain` evicts pods through the **eviction API**, which refuses an eviction that would break a PDB. A PDB with `minAvailable` equal to the replica count (or `maxUnavailable: 0`) allows **zero** disruptions, so the drain retries forever:
+
+    ```text
+    error when evicting pods/"pay-7d9-abcde" -n "pay" (will retry after 5s):
+    Cannot evict pod as it would violate the pod's disruption budget.
+    ```
+
+    The fix is a budget that permits what the owners accept (here: one of two may be down).
+
+    ### Commands you'll use
+
+    ```bash
+    kubectl get pdb -A
+    ```
+    ```text
+    NAMESPACE   NAME        MIN AVAILABLE   MAX UNAVAILABLE   ALLOWED DISRUPTIONS
+    demo        cache-pdb   2               N/A               0
+    ```
+
+    ```bash
+    kubectl patch pdb cache-pdb -n demo --type=merge -p '{"spec":{"minAvailable":null,"maxUnavailable":1}}'
+    kubectl get pdb cache-pdb -n demo        # ALLOWED DISRUPTIONS 1
+    kubectl drain node01 --ignore-daemonsets --delete-emptydir-data
+    ```
+    A PDB may have `minAvailable` **or** `maxUnavailable`, not both: set the old one to `null` in the same patch.
+
+    ### Common mistakes
+
+    - Deleting the PDB: the owners want protection, just not total.
+    - Draining with `--disable-eviction`: bypasses PDBs entirely.
+
+    ### Check your work
+
+    `ALLOWED DISRUPTIONS` is 1, and the drain finishes with node01 cordoned.
   scenario: |
     `kubectl drain node01 --ignore-daemonsets --delete-emptydir-data` hangs forever with
     *Cannot evict pod as it would violate the pod's disruption budget*. The culprit is the
@@ -762,13 +1177,50 @@ exercises:
   kind: fix
   tags: [ephemeral-storage, eviction]
   tutorial: |
-    **Concept.** Ephemeral storage covers the container's writable layer, logs and emptyDir volumes. You can cap an emptyDir and set container ephemeral-storage requests and limits so a runaway pod is evicted instead of its neighbours.
+    **What you're learning.** **Ephemeral storage** limits: making a disk-hungry pod the one that gets evicted.
 
-    **Read up on:**
-    - `kubectl explain pod.spec.volumes.emptyDir` — sizeLimit
-    - `kubectl explain pod.spec.containers.resources` — ephemeral-storage as a resource name
-    - `kubectl get pod -o yaml` — export the existing pod as a starting point
-    - Kubernetes docs: Node-pressure Eviction
+    ### The idea
+
+    Containers use node disk for their writable layer, logs and `emptyDir` volumes: **ephemeral storage**. When a node runs low, the kubelet evicts pods, possibly innocent ones. Two caps put the blame where it belongs:
+
+    | setting | effect when exceeded |
+    |---|---|
+    | `emptyDir.sizeLimit` | the pod is evicted |
+    | container `resources.limits.ephemeral-storage` | the pod is evicted |
+
+    A matching `requests.ephemeral-storage` also lets the scheduler account for it.
+
+    ```yaml
+    containers:
+    - name: worker
+      image: busybox:1.37
+      command: ["sh", "-c", "sleep 3600"]
+      resources:
+        requests: {ephemeral-storage: 50Mi}
+        limits:   {ephemeral-storage: 150Mi}
+      volumeMounts: [{name: tmp, mountPath: /tmp/work}]
+    volumes:
+    - name: tmp
+      emptyDir: {sizeLimit: 100Mi}
+    ```
+
+    ### Commands you'll use
+
+    ```bash
+    kubectl get pod warmer -n demo -o yaml > /lab/warmer.yaml
+    vi /lab/warmer.yaml                         # add sizeLimit and the resources
+    kubectl replace --force -f /lab/warmer.yaml
+    kubectl get pod warmer -n demo -o jsonpath='{.spec.volumes[0].emptyDir} {.spec.containers[0].resources}'; echo
+    ```
+
+    ### Common mistakes
+
+    - `ephemeral-storage` under `requests` only: no limit, no eviction of this pod.
+    - Mixing up which cap goes where (volume vs container).
+
+    ### Check your work
+
+    The pod runs with `sizeLimit` on the volume and the ephemeral-storage limit on the container.
   scenario: |
     The **`cache-warmer`** pod (namespace **`edge`**) writes temporary files to an
     `emptyDir` without bounds; on a busy day it filled node01's disk and the kubelet had to
@@ -819,13 +1271,49 @@ exercises:
   kind: build
   tags: [hpa, behavior]
   tutorial: |
-    **Concept.** HPA behavior tunes how quickly it scales in each direction, using stabilization windows and rate policies, to avoid flapping.
+    **What you're learning.** HPA **behaviour**: stabilization windows and rate policies to stop flapping.
 
-    **Read up on:**
-    - `kubectl explain hpa.spec.behavior` — scaleUp and scaleDown
-    - `kubectl explain hpa.spec.behavior.scaleDown.policies` — type, value, periodSeconds
-    - `kubectl get hpa NAME -o yaml` — edit or patch an existing HPA
-    - Kubernetes docs: Horizontal Pod Autoscaling, Configurable scaling behavior
+    ### The idea
+
+    Without tuning, an HPA follows the metric closely: after a spike it scales down soon, then up again on the next spike ("flapping"). The `behavior` section controls each direction:
+
+    | field | meaning |
+    |---|---|
+    | `stabilizationWindowSeconds` | use the **highest** (for scale-down) recommendation seen in this window, so a brief dip doesn't remove pods |
+    | `policies` | at most `value` pods (`type: Pods`) or percent (`type: Percent`) per `periodSeconds` |
+    | `selectPolicy` | `Max` (default), `Min` or `Disabled` when several policies apply |
+
+    ```yaml
+    spec:
+      behavior:
+        scaleDown:
+          stabilizationWindowSeconds: 600
+          policies:
+          - {type: Pods, value: 2, periodSeconds: 120}
+        scaleUp:
+          stabilizationWindowSeconds: 0
+          policies:
+          - {type: Percent, value: 100, periodSeconds: 30}
+    ```
+
+    ### Commands you'll use
+
+    ```bash
+    kubectl get hpa web -n demo -o yaml > /lab/hpa.yaml
+    vi /lab/hpa.yaml              # add spec.behavior
+    kubectl apply -f /lab/hpa.yaml
+    kubectl describe hpa web -n demo | sed -n '/Behavior/,/Events/p'
+    ```
+    Or patch it directly: `kubectl patch hpa web -n demo --type=merge -p '{"spec":{"behavior":{...}}}'`.
+
+    ### Common mistakes
+
+    - `behavior` under `metrics` or at the top level: it's under `spec`.
+    - Minutes vs seconds: 5 minutes = 300.
+
+    ### Check your work
+
+    `kubectl get hpa NAME -o jsonpath='{.spec.behavior}'` shows both directions as asked.
   scenario: |
     The HPA **`checkout`** (namespace **`shop`**) scales down too eagerly after traffic
     spikes and then has to scale up again.
@@ -869,13 +1357,30 @@ exercises:
   kind: fix
   tags: [quota, limitrange, probes, incident]
   tutorial: |
-    **Concept.** Quotas and limit ranges interact: a quota can reject pods that omit resources or whose requests exceed what's left, while a LimitRange can reject or default them. Check each workload separately.
+    **What you're learning.** Untangling quotas, LimitRanges and probes in one namespace, workload by workload.
 
-    **Read up on:**
-    - `kubectl describe quota -n NS` — total used versus hard
-    - `kubectl describe rs -n NS` — admission errors per deployment
-    - `kubectl get deploy -o yaml` — each one's resources
-    - `kubectl set resources --help` and `kubectl describe limitrange`
+    ### Method
+
+    For each Deployment that isn't fully Ready, find which stage fails:
+
+    | where to look | message | cause (exercise) |
+    |---|---|---|
+    | `kubectl describe rs` (no pods at all) | `exceeded quota: ... requested: requests.cpu=1, used: ..., limited: ...` | a request too big for what's left (k8s-146) |
+    | same | `must specify limits.cpu ...` | no resources while a quota covers them (k8s-147) |
+    | same | `maximum ... per Container is ...` | above a LimitRange max (k8s-159) |
+    | `kubectl describe pod` (pods exist, `0/1`) | `Readiness probe failed` | probe port/path wrong (k8s-028, k8s-142) |
+
+    ```bash
+    kubectl describe quota webshop-quota -n webshop        # Used vs Hard
+    kubectl get deploy -n webshop -o custom-columns=NAME:.metadata.name,READY:.status.readyReplicas,WANT:.spec.replicas
+    kubectl get deploy -n webshop -o json | jq '.items[] | {name: .metadata.name, res: .spec.template.spec.containers[0].resources}'
+    ```
+
+    Fix the workloads (`kubectl set resources`, a probe patch) or add a LimitRange with defaults; keep the quota and the replica counts. The total of all replicas' requests must fit under the quota: add them up before choosing values.
+
+    ### Check your work
+
+    All three Deployments show every replica Ready and `kubectl describe quota` shows usage below every hard limit.
   scenario: |
     Namespace **`webshop`** is a mess after a "resource governance" initiative. Three
     deployments should be running with all replicas ready:
