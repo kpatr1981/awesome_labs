@@ -12,21 +12,34 @@ exercises:
   kind: fix
   tags: [permissions, secrets, sudo, least-privilege, ssh, hardening]
   tutorial: |
-    **Concept.** Hardening is least privilege applied layer by layer: who can read a file, what an account may run as root, and how anyone gets in at all. Each layer has a rule you must apply precisely, because a sloppy fix either misses the problem or breaks something that was fine.
+    **What you're learning.** Three hardening fixes: secret files readable by others, an over-broad sudo rule, and SSH settings.
 
-    **Files.** Permissions have three classes: owner, group and others. Secret material should not be readable by others, and a bulk fix should touch only the files that match, leaving public assets and already-correct files alone.
+    ### The idea
 
-    **Sudo.** Rules in `/etc/sudoers.d` define who may run which commands as whom. The narrowest rule names exact commands with absolute paths. A syntax error can break sudo for everyone, so validate before you trust a change.
+    - **Readable secrets**: `find -perm /o+r` matches files with the "other read" bit. Combine it with name patterns and change **only** those (`chmod 600`).
+    - **Least-privilege sudo**: a rule naming exactly one command with its arguments (linux-082). Validate with `visudo -cf FILE`.
+    - **SSH**: settings like `PermitRootLogin no` and `PasswordAuthentication no`. The first value found wins, and `sshd -t` checks the file (linux-086).
 
-    **SSH.** sshd reads its configuration top to bottom, and for most keywords the first value found wins. The effective configuration is what the daemon computes, not what you see on a single line, so ask the daemon rather than reading the file.
+    ### Commands you'll use
 
-    **Read up on:**
-    - `man find` — `-name` with `-o`, `-perm` modes, `-exec`; `-perm /mode` versus `-perm -mode`
-    - Grouping with `\( ... \)` — quoting parentheses in the shell; `chmod` numeric modes
-    - `man sudoers` — the user, host, runas and command specification, and the `NOPASSWD:` tag
-    - `visudo -c -f FILE` — validate syntax; `sudo -l -U user` — list what a user may run
-    - `man sshd_config` — the options and their defaults; `Match` blocks apply conditionally
-    - `sshd -T -f FILE` — print effective settings; `sshd -t` — syntax check; `grep -n` — find every place a keyword appears
+    ```bash
+    sudo find /srv/web -type f \( -name '*.env' -o -name '*.key' -o -name '*.pem' \) -perm /o+r -ls
+    sudo find /srv/web -type f \( -name '*.env' -o -name '*.key' -o -name '*.pem' \) -perm /o+r -exec chmod 600 {} +
+    sudo cat /etc/sudoers.d/ops
+    sudo visudo -f /etc/sudoers.d/ops            # e.g. ops ALL=(root) NOPASSWD: /usr/bin/systemctl reload apache2
+    sudo -l -U ops
+    sudo sshd -t && sudo sshd -T | grep -E 'permitrootlogin|passwordauthentication'
+    ```
+    `-perm /o+r` = "any of these bits set". `-perm -o+r` = "all of these bits set". For one bit they match the same files.
+
+    ### Common mistakes
+
+    - `chmod -R 600 /srv/kl/app`: breaks directories and public assets.
+    - Allowing `systemctl *`: covers every unit and subcommand.
+
+    ### Check your work
+
+    No secret file is readable by others, public files keep their modes, `sudo -l -U kl-ops` lists only the nginx command, and `sshd -T` shows the required settings.
   scenario: |
     A new server is about to go live. Before it does, apply the hardening review's three findings.
 
@@ -168,14 +181,37 @@ exercises:
   kind: fix
   tags: [ports, forensics]
   tutorial: |
-    **Concept.** Listening ports expose services. To find what changed, take the current list, compare it with a known baseline, then map the new port to its owning process.
+    **What you're learning.** Comparing listening ports against a baseline, and stopping the process behind a new one.
 
-    **Read up on:**
-    - `ss -ltnp` — listening TCP sockets with owning processes
-    - `man ss` — the flags
-    - `comm` — differences between sorted lists
-    - `lsof -i :PORT` — another way to find the owner
-    - `kill` and `systemctl` — stopping a process, and why it might return
+    ### The idea
+
+    `ss -ltn` lists listening TCP sockets. Normalise the port numbers, sort them, and `comm` against the audit's baseline: the new line is the suspect. Then `ss -ltnp 'sport = :PORT'` names the process (as root). Stop it **at its source**: its systemd unit, cron job or parent, so it doesn't return (linux-010).
+
+    ### Commands you'll use
+
+    ```bash
+    ss -ltnH | awk '{print $4}' | sed 's/.*://' | sort -u > /tmp/now.txt
+    comm -13 <(sort -u /lab/ports-known.txt) /tmp/now.txt
+    sudo ss -ltnp 'sport = :4444'
+    ```
+    ```text
+    LISTEN 0 1 0.0.0.0:4444 0.0.0.0:* users:(("nc",pid=1903,fd=3))
+    ```
+    ```bash
+    ps -o pid,ppid,user,cmd -p 1903
+    systemctl status 1903 --no-pager | head -3
+    ```
+    `ss -ltnH` drops the header. `sed 's/.*://'` keeps what follows the last colon (works for `[::]:22` too).
+
+    ### Common mistakes
+
+    - Comparing unsorted files with `comm`.
+    - Killing the process while a supervisor restarts it.
+    - Counting the same port twice (IPv4 and IPv6): `sort -u`.
+
+    ### Check your work
+
+    `answer.txt` holds the new port, and `ss -ltn` no longer shows it, even a minute later.
   scenario: |
     **`/lab/ports-baseline.txt`** lists the TCP ports this host was listening on when it
     was last audited. Something new has opened a port since.
@@ -217,19 +253,33 @@ exercises:
   kind: build
   tags: [containers, hardening, docker, supply-chain]
   tutorial: |
-    **Concept.** Container security has two moments: when the image is built and when it runs. Build-time controls decide *what* you are running; run-time controls limit what that thing can do if it is compromised.
+    **What you're learning.** Supply-chain and runtime hardening for a container: pinning the base image by digest, and run-time restrictions.
 
-    **Build time.** A tag is a movable label, while a digest identifies exact image content. Pinning a base image to a digest makes builds reproducible and resistant to someone moving the tag.
+    ### The idea
 
-    **Run time.** Containers can be restricted at start-up: filesystem access, Linux capabilities, user, privilege escalation and resources. Each restriction reduces what a compromised process can do, and together they leave very little for an attacker to work with.
+    - **Pin by digest**: a tag can be moved. `FROM image:tag@sha256:...` always resolves to the same content (docker-108). The local copy's digest is in `RepoDigests`.
+    - **Run hardened** (docker-133, docker-019, docker-121): a non-root user, `--cap-drop ALL`, `--read-only` with a tmpfs where needed, `--security-opt no-new-privileges`, memory and pids limits.
 
-    **Read up on:**
-    - `docker image inspect` — fields such as `RepoDigests`; `docker images --digests`
-    - Dockerfile `FROM` syntax — name, tag, and `@sha256:` digest
-    - Go templates with `-f` — extract one field; `sed` — edit a line in place
-    - `docker run --help` — flags for read-only, capabilities, user, security options and memory
-    - `man capabilities` — what capabilities are; `--security-opt no-new-privileges` — what it stops
-    - `docker inspect` — verify HostConfig settings; `docker exec NAME id` — confirm the running user
+    ### Commands you'll use
+
+    ```bash
+    docker image inspect -f '{{index .RepoDigests 0}}' nginx:1.28-alpine
+    sed -i "s|^FROM nginx:1.28-alpine.*|FROM nginx:1.28-alpine@sha256:<digest>|" /lab/web/Dockerfile
+    docker build -t web:pinned /lab/web
+    docker run -d --name w -u 101 --cap-drop ALL --read-only --tmpfs /tmp \
+      --security-opt no-new-privileges --memory 128m --pids-limit 64 -p 8099:8080 web:pinned
+    docker inspect w --format '{{.HostConfig.ReadonlyRootfs}} {{json .HostConfig.CapDrop}} {{json .HostConfig.SecurityOpt}}'
+    ```
+
+    ### Common mistakes
+
+    - The digest of a different image or tag.
+    - Dropping the tag from the `FROM` line: the task keeps it for readability.
+    - A read-only root with no writable path the app needs: check `docker logs`.
+
+    ### Check your work
+
+    The `FROM` line has the tag plus the exact local digest and builds, and the running container meets every run-time requirement in the task.
   scenario: |
     A small service is moving to production. Fix how it's built, then how it runs.
 
@@ -313,20 +363,32 @@ exercises:
   kind: build
   tags: [git, secrets, passwords, john, audit]
   tutorial: |
-    **Concept.** A credential audit asks two questions before a release: has a secret already escaped, and which of the secrets still in use could be guessed? Both have the same uncomfortable answer pattern: what looks clean on the surface often isn't.
+    **What you're learning.** Finding secrets in **Git history**, and auditing password hashes against a wordlist.
 
-    **Git remembers.** Git stores history, so deleting a file in a new commit does not remove it from earlier ones. Anyone with the repository can recover old content, which is why a leaked secret must be **rotated**, not just deleted.
+    ### The idea
 
-    **Hashes can be guessed.** Password hashes can't be reversed, but they can be attacked by hashing guesses from a wordlist and comparing. Defenders do the same thing to find weak passwords before attackers do, then force a reset on those accounts. Only audit hashes you have permission to test.
+    - **History**: deleting a file in a new commit leaves the secret in every earlier commit. `git log -p --all` shows every diff on every branch, so grep it for the pattern. A leaked secret must be **rotated**: rewriting history doesn't un-leak it (linux-049).
+    - **Weak passwords**: crypt-style hashes look like `$6$salt$hash` (`$6$` = SHA-512, `$y$` = yescrypt). To test a candidate, hash it with the **same salt and method** and compare. Tools like `john` or `hashcat` automate this. In a lab, Python's `crypt` (or `openssl passwd -6 -salt SALT PASS`) works for SHA-512.
 
-    **Read up on:**
-    - `git log -p` — show the diff of every commit; `git log -S` — search history for added or removed strings
-    - `git log --all` — include other branches; `git show COMMIT` — view one commit
-    - `grep -o` with a regular expression — extract the matching text
-    - `man john` — wordlist mode, `--wordlist` and `--show`
-    - Hash formats — how to recognise crypt-style hashes such as `$6$`
-    - The pot file — where John stores cracked results
-    - `cut` and `sort` — reshape output into a list of names
+    ### Commands you'll use
+
+    ```bash
+    git -C /lab/repo log -p --all | grep -oE 'ghp_[A-Za-z0-9]{36}' | sort -u
+    git -C /lab/repo log --all -S 'ghp_' --oneline            # commits that added or removed it
+    head -2 /lab/shadow-export.txt
+    openssl passwd -6 -salt 'Xy7Qp' 'summer2026'               # compare with the stored hash
+    john --wordlist=/lab/words.txt --format=sha512crypt /lab/shadow-export.txt 2>/dev/null; john --show /lab/shadow-export.txt
+    ```
+    `git log -S STRING` (the "pickaxe") finds commits that change how often STRING appears.
+
+    ### Common mistakes
+
+    - `git grep` on the current tree only: the key is gone there.
+    - Comparing hashes made with a different salt.
+
+    ### Check your work
+
+    `key.txt` holds the full `sk_live_...` key, and the weak-password answer lists exactly the accounts whose hashes match a wordlist entry.
   scenario: |
     Before the next release, the security team wants an authorized credential audit of the
     project and its accounts.
@@ -418,14 +480,33 @@ exercises:
   kind: fix
   tags: [process, forensics, proc]
   tutorial: |
-    **Concept.** Real kernel threads have no executable on disk, but userspace programs can rename themselves to look like them. The /proc filesystem exposes the truth for each process.
+    **What you're learning.** Spotting a process disguised as a kernel thread, via `/proc/PID/exe`.
 
-    **Read up on:**
-    - `man proc` — `/proc/PID/exe`, `cmdline` and `comm`
-    - `ps -eo pid,ppid,comm,args` — compare names with arguments
-    - `readlink -f` — resolve a symlink
-    - Kernel threads — they are children of PID 2 (`kthreadd`)
-    - `kill` — sending a signal, and `-9` as a last resort
+    ### The idea
+
+    Kernel threads show in `ps` as `[kworker/0:1]` and have **no program on disk**: `/proc/PID/exe` is empty, and their parent is `kthreadd` (PID 2). A user-space process can set its displayed name to anything (`exec -a '[kworker]'`), but its `exe` link still points to a real file. The `exe` link is the real path even if the file was deleted (it then ends in `(deleted)`).
+
+    ### Commands you'll use
+
+    ```bash
+    ps -eo pid,ppid,user,cmd | grep '\[' | head
+    for p in /proc/[0-9]*; do
+      n=$(tr '\0' ' ' < $p/cmdline 2>/dev/null)
+      [[ $n == \[* ]] && echo "${p#/proc/} $(sudo readlink $p/exe) :: $n"
+    done
+    sudo ls -l /proc/2817/exe
+    sudo kill 2817
+    ```
+    Real kernel threads have an **empty** `cmdline`. `ps` adds the brackets itself, so a non-empty cmdline that starts with `[` is suspicious.
+
+    ### Common mistakes
+
+    - Killing real kernel threads (they can't be killed anyway, but don't try).
+    - Writing the fake name instead of the real path.
+
+    ### Check your work
+
+    `pid.txt` and `exe.txt` hold the impostor's PID and real program path, and it no longer runs.
   scenario: |
     A process on this host is disguised with a name that looks like a kernel thread, in
     square brackets.
@@ -479,14 +560,43 @@ exercises:
   kind: build
   tags: [containment, nftables, netns, incident]
   tutorial: |
-    **Concept.** Containment means restricting a host's network access while preserving yours. A default-deny input policy plus narrow allows does this, but remember the replies and any outbound traffic you want to cut.
+    **What you're learning.** Containing a host with nftables: default drop in both directions, one exception, and connection tracking for replies.
 
-    **Read up on:**
-    - `man nft` — base chains, `policy drop`, and matching `ip saddr` and `tcp dport`
-    - Connection tracking — `ct state established,related`
-    - Input versus output hooks — ingress and egress traffic
-    - `nft list ruleset` — verify
-    - `ip netns exec` — run commands inside the host namespace
+    ### The idea
+
+    To isolate a compromised machine but keep investigating it:
+
+    ```nft
+    table inet contain {
+      chain input  { type filter hook input  priority filter; policy drop;
+                     iif lo accept
+                     ip saddr 10.9.0.10 tcp dport 22 accept }
+      chain output { type filter hook output priority filter; policy drop;
+                     oif lo accept
+                     ct state established,related accept }
+    }
+    ```
+    `policy drop` on **output** stops the host phoning home. `ct state established,related accept` lets **replies** to the allowed SSH sessions out, but no new connections. `nft -f FILE` loads it atomically.
+
+    ### Commands you'll use
+
+    ```bash
+    sudo ip netns exec h nft list ruleset
+    sudo ip netns exec h nft -f /tmp/contain.nft
+    sudo ip netns exec mgmt nc -z -w2 10.60.0.5 22 && echo mgmt ok
+    sudo ip netns exec other nc -z -w2 10.60.0.5 22 || echo other blocked
+    sudo ip netns exec h ping -c1 -W1 10.60.0.20 || echo outbound blocked
+    ```
+
+    ### Common mistakes
+
+    - Only an input policy: the host can still reach out.
+    - Allowing all `established` traffic on input **before** restricting new connections: fine, since only allowed connections become established.
+    - Locking out loopback: local services break in confusing ways.
+
+    ### Check your work
+
+    SSH from mgmt works, SSH from other doesn't, and `h` can't start any outbound connection.
   scenario: |
     Host **`h`** (10.60.0.5) is compromised, and you need to cut it off without losing
     access for the investigation. It shares a segment with **`mgmt`** (10.60.0.10) and
