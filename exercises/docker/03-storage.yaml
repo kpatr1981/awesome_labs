@@ -12,20 +12,51 @@ exercises:
   kind: build
   tags: [volume, bind-mount, tmpfs, postgres]
   tutorial: |
-    **Concept.** A container's own filesystem is disposable: remove the container and it is gone. Docker offers three ways to attach storage with very different lifetimes.
+    **What you're learning.** The three kinds of container storage (named volumes, bind mounts and tmpfs) and what each one survives.
 
-    - A **named volume** is managed by docker and outlives any container that uses it. Use it for data you must keep (a database).
-    - A **bind mount** shows a host path inside the container. Use it for files you edit on the host (configuration, SQL, content). It can be mounted read-only so the container cannot change it.
-    - A **tmpfs mount** lives in memory, can be size-capped, and vanishes when the container stops. Use it for scratch data that must never touch the disk.
+    ### Storage from zero
 
-    One container can use all three at once. The official postgres image also runs every `*.sql` file in `/docker-entrypoint-initdb.d` the first time it starts on an *empty* data directory, and skips them afterwards.
+    A container's own filesystem is a thin writable layer on top of the image. It is **deleted with the container**. Anything that must outlive the container goes on a mount:
 
-    **Read up on:**
-    - `docker volume --help` — create, ls, inspect
-    - `docker run --help` — the `-v`, `--mount` and `--tmpfs` options, and the read-only mode
-    - Postgres image page — the data directory and the initialisation directory
-    - `docker inspect` — the Mounts section; `docker exec CONTAINER df -h` to see a tmpfs and its size
-    - `docker rm` then `docker run` — the way to prove persistence
+    | kind | syntax | lives in | survives `docker rm`? |
+    |---|---|---|---|
+    | **named volume** | `-v NAME:/path` | Docker-managed storage (`/var/lib/docker/volumes/NAME`) | yes |
+    | **bind mount** | `-v /host/path:/path[:ro]` | a host file or directory you choose | yes (it's your file) |
+    | **tmpfs** | `--tmpfs /path:size=64m` | RAM | no, and not even a restart |
+
+    One container can use all three. Official database images also run every `*.sql` file in `/docker-entrypoint-initdb.d` **once**, on the first start with an empty data directory.
+
+    ### Commands you'll use
+
+    ```bash
+    docker volume create appdata
+    docker run -d --name mydb -e POSTGRES_PASSWORD=pw \
+      -v appdata:/var/lib/postgresql/data \
+      -v /lab/init/01-tables.sql:/docker-entrypoint-initdb.d/01-tables.sql:ro \
+      --tmpfs /work:size=32m postgres:16-alpine
+    docker inspect mydb --format '{{json .Mounts}}' | jq '.[] | {Type, Source, Destination, RW}'
+    docker inspect mydb --format '{{json .HostConfig.Tmpfs}}'
+    ```
+
+    Wait until the database answers, then prove the data outlives the container:
+    ```bash
+    until docker exec mydb pg_isready -h 127.0.0.1 -q; do sleep 1; done
+    docker exec mydb psql -U postgres -c "insert into items(name) values ('survivor')"
+    docker rm -f mydb
+    docker run -d --name mydb ... (same options)
+    docker exec mydb psql -U postgres -tc "select name from items"
+    ```
+    `pg_isready -h 127.0.0.1` checks over TCP. The init phase runs a temporary server on the socket only, so checking the socket can say "ready" too early.
+
+    ### Common mistakes
+
+    - Mounting the volume at the wrong path: the data still lives in the container layer.
+    - Changing the init script after the first start: it never runs again on a non-empty volume.
+    - Relying on tmpfs for anything you need later.
+
+    ### Check your work
+
+    `docker inspect db` shows a `volume` mount `pgdata`, a read-only `bind` mount of the schema and a 64m tmpfs. The `kept` row is still there after you recreate the container.
   scenario: |
     The notes service needs a PostgreSQL database with three kinds of storage. The
     schema file **`/lab/db/10-schema.sql`** is maintained by ops on the host.
@@ -97,12 +128,35 @@ exercises:
   kind: fix
   tags: [volume, redis, persistence]
   tutorial: |
-    **Concept.** Data written inside a container is lost when the container is removed. A named volume at the application's data directory keeps it.
+    **What you're learning.** Keeping an application's data across deploys with a named volume on its data directory.
 
-    **Read up on:**
-    - Redis image page — where it writes data
-    - `docker volume ls` and `docker volume inspect`
-    - `redis-cli` — write a key, recreate, read it back
+    ### The idea
+
+    A deploy usually means `docker rm` plus `docker run` of a new container. Whatever the old one wrote inside itself is gone. Find the directory where the application keeps its state (the image documentation says; for Redis it's `/data`) and put a **named volume** there. Some applications also need to be told to persist at all. Redis keeps data in memory and writes it to disk only as configured: `--appendonly yes` logs every write to an append-only file.
+
+    ### Commands you'll use
+
+    ```bash
+    docker inspect cache --format '{{json .Mounts}}'                       # [] → nothing persists
+    docker rm -f cache
+    docker run -d --name cache -p 6390:6379 -v cache-data:/data \
+      redis:7.4-alpine redis-server --appendonly yes
+    docker exec cache redis-cli set user:1 ana
+    docker rm -f cache && docker run -d --name cache -p 6390:6379 -v cache-data:/data \
+      redis:7.4-alpine redis-server --appendonly yes
+    docker exec cache redis-cli get user:1                                  # "ana"
+    docker exec cache ls /data/appendonlydir
+    docker exec cache redis-cli config get appendonly
+    ```
+
+    ### Common mistakes
+
+    - Putting `--appendonly yes` before the image name: Docker treats it as a `docker run` option.
+    - Forgetting the command after the image when adding the flag: you have to write `redis-server` yourself.
+
+    ### Check your work
+
+    `docker inspect sessions` shows `sessions-data` at `/data`, `config get appendonly` returns `yes`, and a key survives recreating the container.
   scenario: |
     Every deployment of the **`sessions`** Redis container logs all users out: data is
     stored inside the container, and deployments recreate it.
@@ -137,12 +191,38 @@ exercises:
   kind: build
   tags: [volume, read-only]
   tutorial: |
-    **Concept.** A volume can be mounted by several containers with different access modes, so one writes while another only reads.
+    **What you're learning.** Sharing one volume between containers, with a read-only mount for the reader.
 
-    **Read up on:**
-    - `docker run --help` — volume mount modes
-    - `docker volume create`
-    - `docker exec` — try writing from the reader and read what the writer made
+    ### The idea
+
+    Several containers can mount the same volume at the same time. Each mount has its own mode: `-v VOL:/path` for read-write, `-v VOL:/path:ro` for read-only. A producer writes and a consumer can only read. The producer and consumer may mount the volume at different paths.
+
+    ### Commands you'll use
+
+    ```bash
+    docker volume create reports
+    docker run -d --name maker -v reports:/data busybox:1.37 \
+      sh -c 'while true; do echo "$(date) ok" > /data/status.txt; sleep 3; done'
+    docker run -d --name viewer -v reports:/view:ro busybox:1.37 sleep infinity
+    docker exec viewer cat /view/status.txt
+    docker exec viewer sh -c 'echo x > /view/hack'
+    ```
+    ```text
+    sh: can't create /view/hack: Read-only file system
+    ```
+
+    ```bash
+    docker inspect viewer --format '{{range .Mounts}}{{.Name}} {{.Destination}} RW={{.RW}}{{end}}'
+    ```
+
+    ### Common mistakes
+
+    - Using the same mount path when the task names two different ones.
+    - Forgetting `:ro` on the reader.
+
+    ### Check your work
+
+    `writer` keeps updating the file, `reader` sees it change, and `reader`'s mount shows `RW=false`.
   scenario: |
     A feed generator produces a file that a publisher only needs to read.
 
@@ -177,12 +257,44 @@ exercises:
   kind: fix
   tags: [permissions, bind-mount, troubleshooting]
   tutorial: |
-    **Concept.** Bind-mounted files keep their host ownership and permission bits, so the container's process must be allowed to read them.
+    **What you're learning.** File permissions through a bind mount: why the web server gets **403 Forbidden**.
 
-    **Read up on:**
-    - `docker logs` — the nginx error line
-    - `ls -la` — owner and mode of files and directories
-    - `man chmod` — read and execute bits; a directory needs execute to be entered
+    ### The idea
+
+    A bind mount shows the host's files **as they are**, including their owner and mode bits. The process inside runs as some user (nginx workers run as user `nginx`). It needs:
+
+    - **read** (`r`) on every file it serves;
+    - **execute** (`x`, meaning traverse) on every directory on the way there.
+
+    The error log says which one fails: `open() "..." failed (13: Permission denied)`.
+
+    ### Commands you'll use
+
+    ```bash
+    docker logs wiki 2>&1 | tail -3
+    ls -la /lab/wiki /lab/wiki/guides
+    ```
+    ```text
+    drwx------ 2 lab lab 4096 ... guides
+    -rw------- 1 lab lab  812 ... index.html
+    ```
+
+    ```bash
+    chmod -R a+rX /lab/wiki
+    ls -la /lab/wiki
+    curl -s -o /dev/null -w '%{http_code}\n' localhost:8099/guides/start.html     # 200
+    ```
+    `a+rX`: everyone can read; capital `X` adds execute to directories only (and to files that are already executable).
+
+    ### Common mistakes
+
+    - `chmod -R 777`: everything becomes writable and executable for everyone.
+    - `chmod a+r` without `X`: the files are readable, but nobody can enter the directories.
+    - Recreating the container: the task says leave it as it is.
+
+    ### Check your work
+
+    Both URLs return 200 and `ls -l` shows no world-writable files.
   scenario: |
     The **`handbook`** container serves the employee handbook from **`/lab/handbook`**
     (bind-mounted into nginx). Since the last content update, every page returns
@@ -225,12 +337,37 @@ exercises:
   kind: fix
   tags: [bind-mount, uid, dev-workflow]
   tutorial: |
-    **Concept.** Processes in a container run as root by default, so files they create on a bind mount are owned by root on the host.
+    **What you're learning.** Why files a container writes to a bind mount are owned by root, and how `--user` fixes it.
 
-    **Read up on:**
-    - `docker run --help` — the user option (UID:GID)
-    - `id -u` and `id -g` — your own numeric IDs
-    - `ls -ln` — numeric ownership of created files
+    ### The idea
+
+    On a bind mount, files are created by the **process inside the container**, with its UID and GID. Containers run as root (UID 0) by default, so the host sees root-owned files. Run the process as **your** IDs and the files belong to you:
+
+    ```bash
+    --user "$(id -u):$(id -g)"
+    ```
+    Only the numbers matter. The user doesn't need to exist inside the image, although a program that looks up its home directory might complain.
+
+    ### Commands you'll use
+
+    ```bash
+    id -u; id -g                                   # e.g. 501 and 20
+    docker run --rm -v /lab/out:/out alpine:3.22 touch /out/a.txt
+    ls -ln /lab/out/a.txt                          # 0 0: root
+    docker run --rm --user "$(id -u):$(id -g)" -v /lab/out:/out alpine:3.22 touch /out/b.txt
+    ls -ln /lab/out/b.txt                          # your numbers
+    ```
+    `ls -n` shows numeric IDs, which is what the kernel compares.
+
+    ### Common mistakes
+
+    - `sudo chown` afterwards: it fixes the result once but not the command.
+    - `--user $(whoami)`: a **name**, which usually doesn't exist inside the image.
+    - Forgetting the group: the file gets group 0.
+
+    ### Check your work
+
+    `ls -ln /lab/reports/summary.txt` shows your UID and GID, and the file contains `ok`.
   scenario: |
     Developers generate reports with:
 
@@ -267,12 +404,41 @@ exercises:
   kind: build
   tags: [backup, volume]
   tutorial: |
-    **Concept.** A volume can be backed up by mounting it in a throwaway container alongside a host directory and archiving it there.
+    **What you're learning.** Backing up a volume with a throwaway container.
 
-    **Read up on:**
-    - `docker run --help` — mounting more than one volume, and auto-removal
-    - `man tar` — create, gzip, file and directory options
-    - `tar -tzf` — list the archive to verify
+    ### The idea
+
+    A volume's files belong to Docker, so the clean way to read them is from a container. Start a temporary one that mounts **the volume** and **a host directory**, and archive one into the other:
+
+    ```bash
+    docker run --rm -v VOLUME:/data:ro -v /host/backups:/backup IMAGE tar -czf /backup/X.tar.gz -C /data .
+    ```
+    `-C /data .` makes the archive's paths **relative** to the volume root (`./pages/...`) rather than `data/pages/...`. `--rm` removes the helper when it's done. Mounting the volume `:ro` makes sure the backup can't change it.
+
+    ### Commands you'll use
+
+    ```bash
+    docker volume inspect blog-data --format '{{.Mountpoint}}'
+    mkdir -p /lab/bk
+    docker run --rm -v blog-data:/data:ro -v /lab/bk:/backup busybox:1.37 \
+      tar -czf /backup/blog-data.tar.gz -C /data .
+    tar -tzf /lab/bk/blog-data.tar.gz | head
+    ```
+    ```text
+    ./
+    ./posts/
+    ./posts/hello.md
+    ```
+    For a database, stop the container first, or use the database's own dump tool, so the copy is consistent.
+
+    ### Common mistakes
+
+    - `tar -czf ... /data`: the paths start with `data/`.
+    - Writing the archive inside the volume itself.
+
+    ### Check your work
+
+    `tar -tzf /lab/backups/wiki-data.tar.gz` lists `./pages/home.md`-style paths, and the volume's file count matches.
   scenario: |
     The **`wiki`** container keeps its pages in the volume **`wiki-data`** (mounted at
     `/var/www/data`). Before an upgrade you need a backup.
@@ -308,12 +474,33 @@ exercises:
   kind: build
   tags: [restore, volume]
   tutorial: |
-    **Concept.** A backup archive can be restored by extracting it into a new volume from a temporary container.
+    **What you're learning.** Restoring a backup archive into a new volume.
 
-    **Read up on:**
-    - `docker volume create`
-    - `man tar` — extract mode and directory option
-    - `tar -tzf` — see how paths are stored before extracting
+    ### The idea
+
+    This is the reverse of docker-050. Create the volume, then extract into it from a throwaway container that mounts both the volume and the backup directory (read-only). Then start the service on the volume.
+
+    ### Commands you'll use
+
+    ```bash
+    tar -tzf /lab/bk/avatars.tar.gz | head -3        # check its layout first
+    docker volume create avatars
+    docker run --rm -v avatars:/data -v /lab/bk:/backup:ro busybox:1.37 \
+      tar -xzf /backup/avatars.tar.gz -C /data
+    docker run --rm -v avatars:/data busybox:1.37 ls -la /data
+    docker run -d --name cdn -p 8098:80 -v avatars:/usr/share/nginx/html:ro nginx:1.28-alpine
+    curl -s localhost:8098/index.txt
+    ```
+    If the archive's paths have a leading directory (`backup/x`), add `--strip-components=1` to the extraction.
+
+    ### Common mistakes
+
+    - Extracting into `/data/backup/...` because of the archive layout: always look first.
+    - `docker cp` into a container that isn't running: works, but the volume is easier.
+
+    ### Check your work
+
+    `curl localhost:8092/catalog.txt` returns the file, and the volume is mounted read-only in `images`.
   scenario: |
     The shop's product images were lost. Luckily there's a backup:
     **`/lab/backups/product-images.tar.gz`**.
@@ -354,17 +541,47 @@ exercises:
   kind: build
   tags: [system-df, volume, filter, prune, disk]
   tutorial: |
-    **Concept.** Cleaning up a docker host safely is three questions in a row: *which volume is eating the disk*, *who is using it*, and *what can go*. Docker answers each one, but only if you ask the right command.
+    **What you're learning.** Volume housekeeping: which volume is largest, who uses it, and what can safely go.
 
-    - `docker system df -v` reports disk usage per object type, including the size of every volume. The volume directories can also be measured on the host with `du`.
-    - Docker tracks which containers reference a volume, **running or stopped**, and refuses to delete a volume that is in use. The `volume` filter of `docker ps` shows the holders.
-    - A volume is *unused* only when no container at all references it. Anonymous volumes (created by an image's `VOLUME` line or `-v /path`) pile up quietly, and since Docker 23 `volume prune` removes only anonymous ones unless told otherwise.
+    ### The idea
 
-    **Read up on:**
-    - `docker system df --help` — the verbose option
-    - `docker ps --help` — filter options, `-a` to include stopped containers, `--format` for names only
-    - `docker volume prune --help` — what is covered by default and what the all option adds
-    - `du -sh` — measuring a directory on the host (volumes live under the volume's Mountpoint)
+    | question | command |
+    |---|---|
+    | how big is each volume? | `docker system df -v` (the Volumes section) |
+    | who holds a volume? | `docker ps -a --filter volume=NAME` (running **and** stopped) |
+    | delete unused volumes | `docker volume prune --all` |
+
+    A volume is "in use" while **any** container, even a stopped one, references it. `docker volume prune` without `--all` removes only **anonymous** unused volumes (Docker 23+). `--all` removes named ones too.
+
+    ### Commands you'll use
+
+    ```bash
+    docker system df -v | sed -n '/VOLUME NAME/,/^$/p'
+    ```
+    ```text
+    VOLUME NAME   LINKS   SIZE
+    logs-old      0       12MB
+    pg-main       2       210MB
+    ```
+    `LINKS` counts the containers using it.
+
+    ```bash
+    docker ps -a --filter volume=pg-main --format '{{.Names}} {{.Status}}'
+    docker volume ls -q --filter dangling=true      # unused ones (named and anonymous)
+    docker volume prune --all -f
+    docker volume ls
+    docker ps -a | wc -l                            # same count as before
+    ```
+
+    ### Common mistakes
+
+    - `docker volume prune` without `--all`: the named leftovers stay.
+    - `docker system prune --volumes`: also removes stopped containers, networks and images.
+    - `docker ps` without `-a`: misses stopped users.
+
+    ### Check your work
+
+    The two answer files are correct, only used volumes remain, and no container was removed.
   scenario: |
     Disk usage on the docker host is climbing. Four named volumes
     (`audit-logs`, `media-cache`, `build-cache`, `tmp-exports`) are in use by
@@ -425,13 +642,39 @@ exercises:
   kind: build
   tags: [volume, migration]
   tutorial: |
-    **Concept.** Docker cannot rename a volume, so data is copied into a new one, and the copy must keep ownership and permissions.
+    **What you're learning.** "Renaming" a volume by copying it, keeping ownership, modes and hidden files.
 
-    **Read up on:**
-    - `docker volume create`
-    - `man cp` — the archive mode that preserves attributes
-    - `docker run --help` — two volume mounts in one container
-    - `docker volume rm` — only after verifying
+    ### The idea
+
+    Docker has no `volume rename`. Create the new volume, copy everything across with a helper container, point the service at the new volume, then delete the old one.
+
+    The copy must keep permissions and owners and include dotfiles:
+
+    ```bash
+    cp -a /from/. /to/
+    ```
+    `-a` (archive) preserves mode, owner and timestamps and recurses. `/from/.` means "the contents, including hidden files". `/from/*` would skip dotfiles.
+
+    ### Commands you'll use
+
+    ```bash
+    docker volume create media
+    docker run --rm -v old-media:/from:ro -v media:/to busybox:1.37 cp -a /from/. /to/
+    docker run --rm -v old-media:/a:ro -v media:/b:ro busybox:1.37 sh -c 'ls -lan /a; ls -lan /b'
+    docker rm -f gallery
+    docker run -d --name gallery -v media:/srv/media busybox:1.37 sleep infinity
+    docker volume rm old-media
+    ```
+    `docker volume rm` refuses while any container (even a stopped one) still uses the volume, so recreate the container first.
+
+    ### Common mistakes
+
+    - `cp -r /from/* /to/`: loses ownership and skips hidden files.
+    - Deleting the old volume before you've checked the copy.
+
+    ### Check your work
+
+    `uploads` has the same `ls -lan` listing as the old volume had, `cms` mounts it at `/srv/uploads`, and `old-uploads` is gone.
   scenario: |
     The volume **`old-uploads`** has to be called **`uploads`** to match the new naming
     convention. Docker has no `volume rename`.
@@ -476,12 +719,40 @@ exercises:
   kind: build
   tags: [volume, driver-opts, tmpfs]
   tutorial: |
-    **Concept.** The local volume driver accepts mount options and can mount a tmpfs, giving a shared in-memory volume.
+    **What you're learning.** A named volume backed by **tmpfs**: shared memory storage between containers.
 
-    **Read up on:**
-    - `docker volume create --help` — driver and option flags
-    - `man mount` — tmpfs type and its size option
-    - `docker exec CONTAINER df -h` — check type and size
+    ### The idea
+
+    `--tmpfs` gives one container a private RAM disk. To **share** one, create a named volume with the `local` driver and mount options, the same ones as `mount -t tmpfs`:
+
+    ```bash
+    docker volume create --driver local --opt type=tmpfs --opt device=tmpfs --opt o=size=16m NAME
+    ```
+    The data lives in RAM and is lost when the last container stops using it (and on reboot).
+
+    ### Commands you'll use
+
+    ```bash
+    docker volume create --driver local --opt type=tmpfs --opt device=tmpfs --opt o=size=16m fastbuf
+    docker volume inspect fastbuf --format '{{.Driver}} {{json .Options}}'
+    docker run -d --name a -v fastbuf:/buf busybox:1.37 sleep infinity
+    docker run -d --name b -v fastbuf:/buf busybox:1.37 sleep infinity
+    docker exec a sh -c 'echo ping > /buf/msg'; docker exec b cat /buf/msg
+    docker exec a df -h /buf
+    ```
+    ```text
+    Filesystem   Size  Used Available Use% Mounted on
+    tmpfs        16.0M    4K     16.0M   0% /buf
+    ```
+
+    ### Common mistakes
+
+    - `--tmpfs` on each container: two separate RAM disks.
+    - `o=size=32M` vs `32m`: both work. Forgetting `size` means a default of half the RAM.
+
+    ### Check your work
+
+    `df` in both containers shows a 32 MiB tmpfs at `/shm`, and a file written by one is visible to the other.
   scenario: |
     Two cooperating containers need a fast shared scratch area that lives in memory and
     is shared between them — a plain `--tmpfs` can't be shared.
@@ -515,13 +786,43 @@ exercises:
   kind: fix
   tags: [permissions, uid, troubleshooting]
   tutorial: |
-    **Concept.** A bind mount keeps the host directory's ownership, so a container running as a non-root UID needs write access through the host's modes.
+    **What you're learning.** Fixing bind-mount write permissions on the **host** for a container that runs as a fixed non-root UID.
 
-    **Read up on:**
-    - `docker logs` — the permission error
-    - `ls -ld` — owner and mode of the directory
-    - `man chown` and `man chmod`
-    - `id` — the UID the container is configured to use
+    ### The idea
+
+    Across the container boundary only **numbers** count. A process running as UID 1500 can write to a host directory if UID 1500 owns it (or a group 1500 is in, or the mode allows everyone). The host needs no user called 1500. To give exactly that UID write access, without opening it up for everyone, change the **owner**:
+
+    ```bash
+    sudo chown 1500 /host/dir           # or: sudo chown 1500:1500
+    ```
+    `chmod 777` would work too, but every user on the host could then write.
+
+    ### Commands you'll use
+
+    ```bash
+    docker inspect collector --format '{{.Config.User}} {{json .Mounts}}'
+    docker logs collector 2>&1 | tail -2
+    ls -ldn /lab/data
+    ```
+    ```text
+    drwxr-xr-x 2 0 0 4096 ... /lab/data
+    ```
+
+    ```bash
+    sudo chown 2000 /lab/data
+    ls -ldn /lab/data
+    sleep 5; docker logs collector 2>&1 | tail -2; ls -l /lab/data
+    ```
+    If the container is in a restart loop, it picks up the fix on its next restart. Don't recreate it.
+
+    ### Common mistakes
+
+    - `chmod 777` or `o+w`: the task forbids write access for others.
+    - Changing the container's user.
+
+    ### Check your work
+
+    The container stays up as UID 1500, the export file appears and updates, and `ls -ld` shows no write bit for others.
   scenario: |
     The **`exporter`** container (it runs as uid **1500**, as required by policy) keeps
     restarting. It should write a CSV export to **`/lab/exports`** on the host every few
@@ -560,12 +861,43 @@ exercises:
   kind: fix
   tags: [volume, mounts, troubleshooting]
   tutorial: |
-    **Concept.** A volume mounted over a directory hides whatever the image had at that path.
+    **What you're learning.** A mount **hides** whatever the image had at that path.
 
-    **Read up on:**
-    - `docker inspect --format '{{json .Mounts}}'` — list every mount and destination
-    - `docker run --rm IMAGE ls PATH` — see what the image holds
-    - `docker volume ls`
+    ### The idea
+
+    Mounting anything over a directory makes the image's own files at that path invisible. A volume mounted at the web root hides the baked-in site. Worse, an **empty named volume** mounted there is first filled with the image's files at that path (docker-058). So if the volume was ever mounted on top of the stock image, it now holds the wrong content and keeps serving it.
+
+    Find where each mount really lands:
+
+    ```bash
+    docker inspect NAME --format '{{range .Mounts}}{{.Name}} -> {{.Destination}}{{"\n"}}{{end}}'
+    ```
+
+    ### Commands you'll use
+
+    ```bash
+    docker inspect manual --format '{{range .Mounts}}{{.Name}} -> {{.Destination}}{{"\n"}}{{end}}'
+    ```
+    ```text
+    manual-logs -> /usr/share/nginx/html
+    ```
+
+    ```bash
+    docker run --rm manual:1.0 ls /usr/share/nginx/html      # what the image itself has
+    docker rm -f manual
+    docker volume rm manual-logs                             # its content is the stale copy
+    docker run -d --name manual -p 8097:80 -v manual-logs:/var/log/nginx manual:1.0
+    curl -s localhost:8097 | grep -i title
+    ```
+
+    ### Common mistakes
+
+    - Recreating with the volume at the right path but keeping its old content: the logs directory then holds HTML. It's harmless, but the task says discard it.
+    - Not checking the mount's destination at all.
+
+    ### Check your work
+
+    `curl localhost:8093` shows the documentation, and the mount goes to `/var/log/nginx`.
   scenario: |
     Yesterday someone "added a volume for the logs" to the **`docs`** container. Since
     then the site shows nginx's default page instead of the documentation that was
@@ -616,13 +948,38 @@ exercises:
   kind: fix
   tags: [bind-mount, inode, gotcha]
   tutorial: |
-    **Concept.** A single-file bind mount tracks the file's inode. Tools that replace a file rather than edit it in place leave the container with the old inode.
+    **What you're learning.** Why a **single-file** bind mount stops seeing edits, and the safer way to mount config.
 
-    **Read up on:**
-    - `ls -i` — inode numbers
-    - `man sed` — what in-place editing does
-    - `docker exec CONTAINER cat FILE` — compare with the host copy
-    - `docker restart --help`
+    ### The idea
+
+    A single-file bind mount is attached to the file's **inode** (the file itself), not to its name. Many editors and `sed -i` **replace** a file: they write a new file and rename it over the old one. The name now points at a new inode, but the container still has the old one, so it sees the old content.
+
+    | fix | when |
+    |---|---|
+    | `docker restart NAME` | now: the mount is attached again to the current file |
+    | mount the **directory** instead | for good: new files in the directory are visible |
+    | edit in place (`cat > file`, `truncate` + write) | keeps the inode |
+
+    ### Commands you'll use
+
+    ```bash
+    ls -i /lab/gw/default.conf                         # inode before
+    sed -i 's/old/new/' /lab/gw/default.conf
+    ls -i /lab/gw/default.conf                         # a different inode
+    docker exec gw cat /etc/nginx/conf.d/default.conf  # still the old text
+    docker restart gw
+    docker exec gw cat /etc/nginx/conf.d/default.conf  # the new text
+    curl -s localhost:8096/version
+    ```
+
+    ### Common mistakes
+
+    - `nginx -s reload` alone: it reloads the old file the container still sees.
+    - Editing the file inside the container: that changes the host file too, which may not be what you want.
+
+    ### Check your work
+
+    `curl localhost:8094/version` returns `v2`, and the container shows the new file.
   scenario: |
     The **`proxy`** container bind-mounts the single file **`/lab/proxy/nginx.conf`**.
     A teammate updated the file (with `sed -i`) so that `/version` returns `v2`, and ran
@@ -666,12 +1023,37 @@ exercises:
   kind: build
   tags: [volume, initialisation]
   tutorial: |
-    **Concept.** An empty named volume mounted over a path gets that path's content from the image on first use. Files can then be added to it.
+    **What you're learning.** How an **empty named volume** is filled from the image the first time it is mounted.
 
-    **Read up on:**
-    - Docker docs: 'Populate a volume using a container'
-    - `docker cp --help` — copy files into a container
-    - `docker exec CONTAINER ls` — list the web root
+    ### The idea
+
+    When an **empty named (or anonymous) volume** is mounted over a path that has files in the image, Docker first **copies the image's files** into the volume. The container starts with the image's content and can then add to it. **Bind mounts never do this**: an empty host directory just hides the image's files.
+
+    ```
+    image /usr/share/nginx/html: index.html 50x.html
+    -v newvol:/usr/share/nginx/html   → newvol now holds index.html 50x.html
+    -v /empty/dir:/usr/share/nginx/html → empty: 403
+    ```
+
+    ### Commands you'll use
+
+    ```bash
+    docker run -d --name files -p 8097:80 -v files-vol:/usr/share/nginx/html nginx:1.28-alpine
+    docker run --rm -v files-vol:/v busybox:1.37 ls /v            # index.html 50x.html
+    docker cp /lab/banner.png files:/usr/share/nginx/html/banner.png
+    curl -s -o /dev/null -w '%{http_code}\n' localhost:8097/banner.png
+    curl -s localhost:8097/ | grep -i welcome
+    ```
+    `docker cp` into a running container writes into the mounted volume.
+
+    ### Common mistakes
+
+    - A bind mount: the default files are missing.
+    - Creating the volume and filling it **before** first use: it's no longer empty, so the image's files aren't copied.
+
+    ### Check your work
+
+    Both `/` (nginx's default page) and `/logo.svg` are served, and both files are in the `assets` volume.
   scenario: |
     The marketing team wants to drop extra files into the web root of the **`assets`**
     web server without rebuilding the image — but the image's own default files must stay.
@@ -710,13 +1092,44 @@ exercises:
   kind: fix
   tags: [postgres, migration, volume]
   tutorial: |
-    **Concept.** A database's files live in its data directory. Moving them needs a stopped, consistent database and a copy that keeps everything intact.
+    **What you're learning.** Moving a database's data out of the container layer onto a volume without losing anything.
 
-    **Read up on:**
-    - `docker stop --help` — clean shutdown
-    - `docker cp --help` and `docker run --volumes-from`
-    - Postgres image page — the data directory
-    - `docker inspect` — Mounts
+    ### The idea
+
+    A database started without a volume keeps its files in the container's writable layer. They survive `docker stop` but not `docker rm`. To move them:
+
+    1. **stop** the database, so its files on disk are consistent;
+    2. create the volume;
+    3. copy the data directory into it **with ownership** (`cp -a`), from a helper container that sees the stopped container's mounts (`--volumes-from`) or its files;
+    4. remove the old container and start a new one on the volume.
+
+    `docker cp` from a stopped container also works: `docker cp crm:/var/lib/postgresql/data - | ...`.
+
+    ### Commands you'll use
+
+    ```bash
+    docker inspect hr-db --format '{{json .Mounts}}'         # an anonymous volume? or nothing?
+    docker exec hr-db psql -U postgres -tc 'select count(*) from staff'   # count before
+    docker stop hr-db
+    docker volume create hr-pgdata
+    docker run --rm --volumes-from hr-db -v hr-pgdata:/new busybox:1.37 \
+      sh -c 'cp -a /var/lib/postgresql/data/. /new/'
+    docker rm hr-db
+    docker run -d --name hr-db -e POSTGRES_PASSWORD=hr -p 5436:5432 \
+      -v hr-pgdata:/var/lib/postgresql/data postgres:16-alpine
+    docker exec hr-db psql -U postgres -tc 'select count(*) from staff'   # same count
+    ```
+    The postgres image declares its data directory as a `VOLUME`, so a container started without `-v` has an **anonymous volume** there. `--volumes-from` mounts it in the helper.
+
+    ### Common mistakes
+
+    - Copying while the database runs: the copy may be corrupt.
+    - `docker rm` before copying: the data is gone (or left in an anonymous volume you'd have to find).
+    - `cp -r`: files end up owned by root and postgres refuses to start.
+
+    ### Check your work
+
+    `crm-db` runs with `crm-pgdata` at the data directory, and `customers` has the same rows as before.
   scenario: |
     **`crm-db`** was started months ago **without a volume** (its data lives in the
     container's writable layer). It contains the precious `customers` table.
@@ -769,13 +1182,41 @@ exercises:
   kind: fix
   tags: [logs, disk, log-rotation, incident]
   tutorial: |
-    **Concept.** The default json-file log driver writes container output to disk without limit unless rotation is configured.
+    **What you're learning.** Container logs filling the disk, and **log rotation** with the `json-file` driver.
 
-    **Read up on:**
-    - `docker inspect` — LogPath and HostConfig.LogConfig
-    - `du -h` and `man truncate` — measure and shrink a file
-    - `docker run --help` — log options
-    - Docker docs: 'JSON File logging driver'
+    ### The idea
+
+    By default Docker stores each container's stdout and stderr in `/var/lib/docker/containers/ID/ID-json.log`, **with no size limit**. A chatty container can fill the disk. Rotation options (they can be set per container, or as daemon defaults in `daemon.json`):
+
+    | option | effect |
+    |---|---|
+    | `--log-opt max-size=10m` | start a new file at 10 MB |
+    | `--log-opt max-file=3` | keep at most 3 files |
+
+    Log options are fixed when the container is created. To change them, recreate it. Removing the container also removes its log file. Truncating it in place (`sudo truncate -s 0 FILE`) frees the space without removing the container.
+
+    ### Commands you'll use
+
+    ```bash
+    docker inspect noisy --format '{{.LogPath}}'
+    sudo du -h "$(docker inspect noisy --format '{{.LogPath}}')"
+    docker inspect noisy --format '{{.Config.Image}} {{json .Config.Cmd}}'
+    docker rm -f noisy
+    docker run -d --name noisy --log-opt max-size=5m --log-opt max-file=2 IMAGE CMD...
+    docker inspect noisy --format '{{json .HostConfig.LogConfig}}'
+    ```
+    ```text
+    {"Type":"json-file","Config":{"max-file":"2","max-size":"5m"}}
+    ```
+
+    ### Common mistakes
+
+    - `rm` on the log file of a running container: the daemon keeps writing to the deleted file and the space isn't freed.
+    - `max-file` without `max-size`: it does nothing.
+
+    ### Check your work
+
+    `chatty` runs with the same image and command, `LogConfig` shows `10m` and `3`, and the old huge log is gone.
   scenario: |
     Alert: **/var/lib/docker is filling up fast**. The culprit is the **`chatty`**
     container — it logs like crazy and its JSON log file is already huge.
