@@ -12,13 +12,49 @@ exercises:
   kind: build
   tags: [certificates, kubeadm]
   tutorial: |
-    **Concept.** kubeadm issues certificates with limited lifetimes and can report their expiry. Output is a table, and you need to pick out specific cells for specific certificates.
+    **What you're learning.** The cluster's certificates and their expiry: what kubeadm creates and how to check it.
 
-    **Read up on:**
-    - `kubeadm certs check-expiration` — lists certificates, expiry and residual time (`kubeadm certs --help`)
-    - `awk` (`man awk`) — select fields from a row
-    - `openssl x509 -in FILE -noout -enddate` — alternative view of a cert
-    - Shell redirection to save values
+    ### The idea
+
+    Every component authenticates with TLS certificates signed by the cluster **CA** (in `/etc/kubernetes/pki/`): the API server's serving certificate, its client certificates for etcd and kubelets, the admin kubeconfig, the scheduler's and controller-manager's kubeconfigs. kubeadm issues leaf certificates for **1 year** and the CA for **10 years**. Expired certificates break the cluster in confusing ways, so audits check them.
+
+    `kubeadm certs check-expiration` prints a table:
+
+    ```text
+    CERTIFICATE                EXPIRES                  RESIDUAL TIME   CERTIFICATE AUTHORITY   EXTERNALLY MANAGED
+    admin.conf                 Nov 07, 2027 18:10 UTC   351d            ca                      no
+    apiserver                  Nov 07, 2027 18:10 UTC   351d            ca                      no
+    ...
+    CERTIFICATE AUTHORITY   EXPIRES                  RESIDUAL TIME   EXTERNALLY MANAGED
+    ca                      Nov 05, 2036 18:10 UTC   9y              no
+    ```
+
+    ### Commands you'll use
+
+    ```bash
+    sudo kubeadm certs check-expiration
+    sudo kubeadm certs check-expiration | awk '$1=="admin.conf"{print $7}'
+    ```
+    ```text
+    351d
+    ```
+    `awk` splits on spaces: for a certificate line, `$1` is the name, `$2..$6` the date ("Nov 07, 2027 18:10 UTC"), `$7` the residual time.
+
+    ```bash
+    sudo kubeadm certs check-expiration | awk '$1=="front-proxy-ca"{print $2, $3, $4, $5, $6}'
+    sudo openssl x509 -in /etc/kubernetes/pki/apiserver.crt -noout -enddate      # the same, from the file
+    ```
+
+    `sudo kubeadm certs renew all` renews leaf certificates (then restart the control-plane pods).
+
+    ### Common mistakes
+
+    - Taking the column number from the CA section for a certificate line (the CA table has fewer columns).
+    - Forgetting `sudo`: the command needs to read `/etc/kubernetes/pki`.
+
+    ### Check your work
+
+    `cat` both files: the residual time (e.g. `351d`) and the CA's full date, exactly as kubeadm prints them.
   scenario: |
     Your audit checklist asks for the **expiry of the cluster's certificates**.
 
@@ -47,13 +83,51 @@ exercises:
   kind: build
   tags: [crictl, node, containers]
   tutorial: |
-    **Concept.** Below Kubernetes, containers are managed by the runtime, which `crictl` can inspect directly on the node. It maps pods to container IDs and exposes low-level details such as the process ID.
+    **What you're learning.** Looking at containers **below** Kubernetes, with the runtime's own tool `crictl`.
 
-    **Read up on:**
-    - `crictl --help` — pods, ps, inspect subcommands
-    - `crictl pods --help` and `crictl ps --help` — filtering by name and namespace
-    - `crictl inspect` — JSON output; pair with `jq` (`man jq`)
-    - `sudo` — crictl needs root
+    ### The idea
+
+    The kubelet asks the container runtime (**containerd**) to run containers through the **CRI** interface. `crictl` speaks CRI directly on a node, so it works even when the API server is down, and shows low-level details: container IDs, the process ID on the host, mounts.
+
+    | crictl | shows |
+    |---|---|
+    | `crictl pods --name N --namespace NS` | pod sandboxes |
+    | `crictl ps [--pod POD_ID]` | containers (add `-a` for stopped ones) |
+    | `crictl inspect CONTAINER_ID` | JSON: state, mounts, `.info.pid`... |
+    | `crictl logs CONTAINER_ID` | logs |
+    | `crictl images` | images on the node |
+
+    `-q` prints only IDs, handy in `$(...)`.
+
+    ### Commands you'll use
+
+    ```bash
+    kubectl get pod cache -n demo -o wide     # which node?
+    ssh node01
+    POD=$(sudo crictl pods --name cache --namespace demo -q)
+    CID=$(sudo crictl ps --pod "$POD" -q)
+    sudo crictl ps --pod "$POD"
+    ```
+    ```text
+    CONTAINER      IMAGE          CREATED        STATE     NAME    ATTEMPT   POD ID
+    3a9f1c2b7d4e   6b2f...        2 hours ago    Running   redis   0         8e7d...
+    ```
+
+    ```bash
+    sudo crictl inspect "$CID" | jq .info.pid
+    sudo crictl inspect "$CID" | jq -r '.status.image.image'
+    ps -o pid,cmd -p "$(sudo crictl inspect "$CID" | jq .info.pid)"
+    exit
+    ```
+
+    ### Common mistakes
+
+    - Running `crictl` on the control plane for a pod on node01: it only sees its own node.
+    - Pods with several containers: `crictl ps --pod` lists all; pick by NAME (`--name`).
+
+    ### Check your work
+
+    The PID you found shows the container's process in `ps` on the node.
   scenario: |
     Debug at the node level. On **node01**, use **`crictl`** to find the container of the
     pod **`ledger`** (namespace **`fin`**) and write:
@@ -92,15 +166,67 @@ exercises:
   kind: fix
   tags: [node, kubelet, containerd, systemd, labels]
   tutorial: |
-    **Concept.** A worker node is only `Ready` when a whole chain works: the container runtime (containerd) must be running, the kubelet must be running and enabled, and the kubelet must be able to load its configuration, including the certificate paths it references. Any broken link makes the node `NotReady` after a grace period, and each link has its own symptom in the logs. Debug from the bottom up: runtime first, then kubelet service, then the kubelet's config. Services must also be *enabled* to survive a reboot. Finally, the ROLES column of `kubectl get nodes` is not a field: it is derived from labels with the prefix `node-role.kubernetes.io/`.
+    **What you're learning.** What makes a node `Ready`, and debugging a NotReady node from the bottom up.
 
-    **Read up on:**
-    - `ssh node01` — log in to the node
-    - `systemctl status kubelet` and `systemctl status containerd` — active state and whether each is enabled
-    - `man systemctl` — start, enable and the combined `enable --now`
-    - `journalctl -u kubelet -n 50 --no-pager` — what the kubelet complains about (runtime socket, missing files)
-    - `/var/lib/kubelet/config.yaml` — the KubeletConfiguration file; `ls -l /etc/kubernetes/pki` shows which certificate files really exist
-    - `kubectl label node --help` and `kubectl get nodes --show-labels` — labels and the ROLES column
+    ### The idea
+
+    A node is `Ready` only while a chain works:
+
+    ```
+    containerd (runtime) running ─► kubelet running ─► kubelet config valid (certs, paths) ─► kubelet reports to the API server
+    ```
+
+    Break any link and the node turns `NotReady` after about 40 s. Each link has its own evidence:
+
+    | link | check | fix |
+    |---|---|---|
+    | runtime | `systemctl status containerd` | `systemctl enable --now containerd` |
+    | kubelet service | `systemctl status kubelet` | `systemctl enable --now kubelet` |
+    | kubelet config | `journalctl -u kubelet -n 30` (e.g. "unable to load client CA file") | fix `/var/lib/kubelet/config.yaml` |
+
+    `enable` makes a service start at boot; `--now` also starts it immediately. "Stays Ready after a reboot" needs both enabled.
+
+    The **ROLES** column in `kubectl get nodes` is derived from labels named `node-role.kubernetes.io/ROLE` (any value, usually empty).
+
+    ### Commands you'll use
+
+    ```bash
+    kubectl get nodes
+    ssh node01
+    sudo systemctl status containerd kubelet --no-pager | grep -E 'Loaded|Active'
+    ```
+    ```text
+         Loaded: loaded (/lib/systemd/system/containerd.service; disabled; ...)
+         Active: inactive (dead)
+    ```
+
+    ```bash
+    sudo systemctl enable --now containerd
+    sudo journalctl -u kubelet -n 20 --no-pager
+    ```
+    ```text
+    ... failed to construct kubelet dependencies: unable to load client CA file /etc/kubernetes/pki/ca.pem: no such file or directory
+    ```
+
+    ```bash
+    ls /etc/kubernetes/pki/
+    sudo grep -n pki /var/lib/kubelet/config.yaml
+    sudo vi /var/lib/kubelet/config.yaml
+    sudo systemctl enable --now kubelet
+    exit
+    kubectl label node node01 node-role.kubernetes.io/worker=
+    kubectl get nodes -w
+    ```
+
+    ### Common mistakes
+
+    - Starting the kubelet before fixing its config: it exits again ("activating (auto-restart)").
+    - `systemctl start` without `enable`: lost at the next reboot.
+    - Moving the certificate files to match the broken path instead of fixing the config.
+
+    ### Check your work
+
+    `kubectl get nodes` shows node01 `Ready` with role `worker`, and `systemctl is-enabled containerd kubelet` says `enabled` twice.
   scenario: |
     `kubectl get nodes` shows **node01** as **`NotReady`**, and its ROLES column is `<none>`.
     Over the last day several people have touched node01: someone stopped services "to
@@ -157,14 +283,44 @@ exercises:
   kind: fix
   tags: [node, kubelet, swap]
   tutorial: |
-    **Concept.** By default the kubelet refuses to run on a node with swap enabled. Disabling swap now is not enough: anything that activates it at boot (such as fstab) must be changed too.
+    **What you're learning.** Why the kubelet refuses swap, and disabling swap **permanently**.
 
-    **Read up on:**
-    - `swapon --show` and `free -h` — see active swap
-    - `man swapoff` — turn swap off right now
-    - `man fstab` — where boot-time swap is configured
-    - `journalctl -u kubelet` — the error message
-    - `systemctl restart kubelet`
+    ### The idea
+
+    By default the kubelet won't run on a node with swap on (it makes memory limits and eviction unpredictable); it logs "running with swap on is not supported" and exits. Turning swap off now (`swapoff`) isn't enough: swap is activated at boot from **`/etc/fstab`** entries, so remove the entry as well.
+
+    ### Commands you'll use
+
+    ```bash
+    ssh node01
+    sudo journalctl -u kubelet -n 5 --no-pager | grep -i swap
+    swapon --show
+    ```
+    ```text
+    NAME       TYPE  SIZE USED PRIO
+    /swapfile  file  512M   0B   -2
+    ```
+
+    ```bash
+    sudo swapoff -a                    # turn off all swap now
+    grep -n swap /etc/fstab
+    sudo sed -i '/\/swapfile/d' /etc/fstab     # delete the line that mentions /swapfile
+    sudo rm -f /swapfile
+    sudo systemctl restart kubelet
+    free -h                            # Swap: 0B
+    exit
+    kubectl get nodes -w
+    ```
+    `sed -i '/PATTERN/d'` deletes matching lines in place. Escape the `/` in the path (`\/`).
+
+    ### Common mistakes
+
+    - Only `swapoff`: swap is back after a reboot.
+    - Commenting out the wrong fstab line (the root filesystem!). Read the file first.
+
+    ### Check your work
+
+    `swapon --show` prints nothing, `/etc/fstab` has no swap entry, and node01 is `Ready`.
   scenario: |
     Someone "added some memory" to node01 by enabling a swap file. Since the last kubelet
     restart, node01 is **NotReady**.
@@ -205,13 +361,51 @@ exercises:
   kind: build
   tags: [etcd, etcdctl]
   tutorial: |
-    **Concept.** etcd holds all cluster state and is queried with `etcdctl`, which needs the endpoint and TLS client certificates. Kubernetes keys are stored under well-known prefixes.
+    **What you're learning.** Talking to **etcd** directly with `etcdctl`, and how Kubernetes stores objects there.
 
-    **Read up on:**
-    - `etcdctl --help` — global flags for endpoints and certificates
-    - `etcdctl endpoint status` and `etcdctl version` — server information
-    - `etcdctl get --prefix --keys-only` — list keys
-    - `kubectl exec --help` — run commands inside the etcd pod; certs live under `/etc/kubernetes/pki/etcd`
+    ### The idea
+
+    **etcd** is the key-value database holding all cluster state. Only the API server should write to it, but for health checks and backups you query it with `etcdctl`. It requires **TLS client certificates** and the endpoint:
+
+    ```bash
+    etcdctl --endpoints=https://127.0.0.1:2379 \
+      --cacert=/etc/kubernetes/pki/etcd/ca.crt \
+      --cert=/etc/kubernetes/pki/etcd/server.crt \
+      --key=/etc/kubernetes/pki/etcd/server.key  COMMAND
+    ```
+
+    The etcd **pod** (`etcd-controlplane` in `kube-system`) has `etcdctl` and the certificates mounted, so you can run it there with `kubectl exec`.
+
+    Kubernetes keys live under `/registry/RESOURCE/NAMESPACE/NAME`, e.g. `/registry/configmaps/demo/settings`, `/registry/namespaces/demo`. Values are binary (protobuf).
+
+    ### Commands you'll use
+
+    ```bash
+    E="kubectl -n kube-system exec etcd-controlplane -- etcdctl --endpoints=https://127.0.0.1:2379 \
+      --cacert=/etc/kubernetes/pki/etcd/ca.crt --cert=/etc/kubernetes/pki/etcd/server.crt \
+      --key=/etc/kubernetes/pki/etcd/server.key"
+    $E endpoint health
+    ```
+    ```text
+    https://127.0.0.1:2379 is healthy: successfully committed proposal: took = 4.2ms
+    ```
+
+    ```bash
+    $E endpoint status -w table
+    $E endpoint status -w json | jq -r '.[0].Status.version'
+    $E get /registry/configmaps/ --prefix --keys-only | grep -c .
+    ```
+    `--keys-only` prints keys separated by blank lines; `grep -c .` counts non-empty lines.
+
+    ### Common mistakes
+
+    - Port 2380 (peer traffic) instead of 2379 (clients).
+    - `wc -l` on `--keys-only` output: counts the blank lines too.
+    - In zsh, `$E` without word splitting fails; the lab shell is bash.
+
+    ### Check your work
+
+    The version matches `$E version`, and the key count matches `kubectl get ns --no-headers | wc -l` for namespaces.
   scenario: |
     Check the cluster's datastore. Using **`etcdctl`** inside the etcd pod (it uses TLS
     client certificates), write:
@@ -246,13 +440,46 @@ exercises:
   kind: fix
   tags: [node, terminating, force-delete]
   tutorial: |
-    **Concept.** When a node dies, Terminating pods remain because only the kubelet can confirm deletion. An administrator can remove the API object directly, but only when sure the workload is no longer running.
+    **What you're learning.** Why pods hang in `Terminating` on a dead node, and when force-deleting is safe.
 
-    **Read up on:**
-    - `kubectl delete --help` — options for grace period and forced deletion
-    - `kubectl get pods -A -o wide` — see which node holds it
-    - Kubernetes docs: Force Delete StatefulSet Pods (concepts apply to bare pods)
-    - `kubectl get nodes -w` — watch recovery
+    ### The idea
+
+    Deleting a pod is a two-step handshake: the API marks it for deletion, the **kubelet** on its node stops the containers and then confirms, and only then the object is removed. If the node is dead, nobody confirms, so the pod stays **Terminating** forever (a Deployment would already have created a replacement; a bare pod or a StatefulSet pod waits).
+
+    `kubectl delete pod --grace-period=0 --force` removes the **API object** immediately without the confirmation. That's safe only if the containers are really gone: otherwise you may get two copies running (dangerous for singletons and StatefulSets).
+
+    ### Commands you'll use
+
+    ```bash
+    kubectl get nodes
+    kubectl get pod reporter -n demo -o wide
+    ```
+    ```text
+    NAME       READY   STATUS        NODE
+    reporter   1/1     Terminating   node01
+    ```
+
+    ```bash
+    kubectl delete pod reporter -n demo --grace-period=0 --force
+    ```
+    ```text
+    Warning: Immediate deletion does not wait for confirmation that the running resource has been terminated...
+    pod "reporter" force deleted
+    ```
+
+    ```bash
+    ssh node01 sudo systemctl start kubelet
+    kubectl get nodes -w
+    ```
+
+    ### Common mistakes
+
+    - Force-deleting while the node might still be running.
+    - Forgetting to bring the node back: the task needs it Ready.
+
+    ### Check your work
+
+    The pod object is gone and node01 is `Ready` again.
   scenario: |
     node01 lost power (its kubelet is stopped). The pod **`legacy-singleton`** (namespace
     **`ops`**, a bare pod) on it has been **`Terminating`** for a long time, because no
@@ -292,13 +519,54 @@ exercises:
   kind: fix
   tags: [node, disk-pressure, eviction]
   tutorial: |
-    **Concept.** The kubelet evicts pods and taints the node when disk space falls below thresholds. The condition clears only after space is freed and a settling period has passed.
+    **What you're learning.** Node **pressure conditions**, eviction, and why recovery takes a few minutes.
 
-    **Read up on:**
-    - `df -h` (`man df`) — filesystem usage
-    - `du -xh --max-depth=2` (`man du`) — locate the large directory
-    - `kubectl describe node node01` — Conditions and Taints
-    - Kubernetes docs: Node-pressure Eviction
+    ### The idea
+
+    The kubelet watches the node's resources. When free disk (or memory, or PIDs) drops below an **eviction threshold**, it:
+
+    1. sets a condition (`DiskPressure=True`) and taints the node `node.kubernetes.io/disk-pressure:NoSchedule`;
+    2. **evicts** pods to reclaim space.
+
+    After space is freed, the condition clears only once it's been fine for `evictionPressureTransitionPeriod` (default **5 minutes**), to avoid flapping.
+
+    ### Commands you'll use
+
+    ```bash
+    kubectl describe node node01 | grep -A8 Conditions
+    ```
+    ```text
+      DiskPressure     True    ...  KubeletHasDiskPressure   kubelet has disk pressure
+    ```
+
+    ```bash
+    kubectl get pods -A --field-selector status.phase=Failed | head     # "Evicted" pods
+    ssh node01
+    df -h /
+    sudo du -xh / --max-depth=3 2>/dev/null | sort -h | tail -5
+    ```
+    ```text
+    2.1G  /var/log/old
+    2.3G  /var/log
+    ```
+    `du -x` stays on one filesystem; `sort -h` sorts human sizes (K < M < G).
+
+    ```bash
+    sudo ls -lh /var/log/old
+    sudo rm /var/log/old/huge-trace.bin
+    df -h /
+    exit
+    kubectl get node node01 -w -o custom-columns=NAME:.metadata.name,DISK:.status.conditions[?(@.type==\"DiskPressure\")].status
+    ```
+
+    ### Common mistakes
+
+    - Deleting files you don't recognise (container images, `/var/lib/containerd`). Delete only the obvious culprit.
+    - Removing the taint by hand: the kubelet manages it; wait for the condition to clear.
+
+    ### Check your work
+
+    `df -h` shows free space, and after a few minutes `DiskPressure` is `False` and the node has no disk-pressure taint.
   scenario: |
     node01 reports **`DiskPressure`** and has started **evicting** pods. New pods can't be
     scheduled there. A forgotten debug dump is filling its disk.
@@ -342,15 +610,52 @@ exercises:
   kind: fix
   tags: [control-plane, kube-apiserver, etcd, static-pods, kubeconfig]
   tutorial: |
-    **Concept.** On a kubeadm control plane the API server runs as a static pod defined by a manifest file, which the kubelet watches. When kubectl is down you debug at the container-runtime and manifest level. The API server may have several independent mistakes in its flags: an unknown flag makes the process exit at once, while a wrong etcd address lets it start but fail as soon as it tries to use its datastore. etcd listens for clients on 2379 and for peers on 2380. Separately, kubectl reads its own connection settings (server URL, credentials) from a kubeconfig; a wrong server address there gives *connection refused* even if the cluster is healthy, so you need to fix the cluster **and** your client.
+    **What you're learning.** Reviving the API server: **static pods**, debugging with `crictl` when `kubectl` is dead, and your own kubeconfig.
 
-    **Read up on:**
-    - `crictl ps -a` and `crictl logs ID` (`man crictl`) — container state and output when kubectl is down
-    - `/etc/kubernetes/manifests/` — static pod manifests (`kube-apiserver.yaml`, `etcd.yaml`)
-    - Kubernetes docs: kube-apiserver reference, flag names; compare `--etcd-servers` with etcd's `--listen-client-urls`
-    - `ss -ltnp` (`man ss`) — which ports are listening
-    - `journalctl -u kubelet` — if no container is even created
-    - `kubectl config view --minify` and `kubectl config set-cluster --help` — the active cluster entry in `~/.kube/config`
+    ### The idea
+
+    On a kubeadm control plane, the API server, etcd, scheduler and controller-manager are **static pods**: the kubelet runs whatever manifests are in `/etc/kubernetes/manifests/` and restarts them when the files change. When the API server is down, `kubectl` can't help, so you work on the node:
+
+    | step | command |
+    |---|---|
+    | is it running, crashing? | `sudo crictl ps -a --name kube-apiserver` |
+    | why? | `sudo crictl logs CONTAINER_ID` |
+    | fix | edit `/etc/kubernetes/manifests/kube-apiserver.yaml` (the kubelet picks it up in ~30-60 s) |
+
+    Typical faults: a typo in a flag (`unknown flag: --x`, the process exits at once), or a wrong etcd URL (**2379** is for clients, 2380 for peers; the server starts, then fails talking to etcd).
+
+    Separately, **your** `kubectl` reads the server address from `~/.kube/config`. A wrong address gives "connection refused" even with a healthy cluster. `/etc/kubernetes/admin.conf` (root-only) is a known-good reference.
+
+    ### Commands you'll use
+
+    ```bash
+    sudo crictl ps -a --name kube-apiserver
+    ```
+    ```text
+    CONTAINER      STATE    NAME             ATTEMPT
+    7c1e9...       Exited   kube-apiserver   6
+    ```
+
+    ```bash
+    sudo crictl logs $(sudo crictl ps -a --name kube-apiserver -q | head -1) 2>&1 | tail -3
+    sudo cp /etc/kubernetes/manifests/kube-apiserver.yaml /root/apiserver.bak     # backup OUTSIDE the manifests dir
+    sudo vi /etc/kubernetes/manifests/kube-apiserver.yaml
+    sudo grep -nE 'etcd-servers|authorization' /etc/kubernetes/manifests/kube-apiserver.yaml
+    watch -n2 'sudo crictl ps --name kube-apiserver'
+    sudo kubectl --kubeconfig /etc/kubernetes/admin.conf get nodes
+    kubectl config view --minify -o jsonpath='{.clusters[0].cluster.server}'; echo
+    kubectl config set-cluster "$(kubectl config view --minify -o jsonpath='{.clusters[0].name}')" --server=https://controlplane:6443
+    ```
+
+    ### Common mistakes
+
+    - Saving a backup copy **inside** `/etc/kubernetes/manifests/`: the kubelet runs it too.
+    - Fixing one fault and assuming done: re-read the logs after each restart.
+    - Comparing against admin.conf without `sudo`.
+
+    ### Check your work
+
+    `sudo crictl ps --name kube-apiserver` shows it Running with a stable ATTEMPT count, and your own `kubectl get nodes` works.
   scenario: |
     `kubectl get pods` → *The connection to the server controlplane:6443 was refused*.
     Someone edited the API server's configuration on the control plane an hour ago, and
@@ -408,16 +713,52 @@ exercises:
   kind: fix
   tags: [control-plane, kube-scheduler, kube-controller-manager, coredns, kube-proxy, kubelet]
   tutorial: |
-    **Concept.** A working cluster needs more than an API server. The *scheduler* assigns Pending pods to nodes (when it is down, pods wait with no events at all). The *controller-manager* runs the loops that turn Deployments into ReplicaSets and ReplicaSets into pods (when it fails, objects are accepted but nothing acts on them). Both are static pods defined by manifests in `/etc/kubernetes/manifests/`, so a bad image tag or a wrong file path breaks them. On top of that sit add-ons: CoreDNS (a Deployment; an unpullable image leaves cluster DNS down) and kube-proxy (a DaemonSet that reads its settings from a ConfigMap; an invalid value makes it exit at start-up). Finally, each kubelet records the API server URL in `/etc/kubernetes/kubelet.conf`; if that address is wrong the node is healthy but cannot report in. Several of these break different things at once, so find them one at a time and verify each.
+    **What you're learning.** The rest of the control plane and the core add-ons, what breaks when each one fails, and how to find it.
 
-    **Read up on:**
-    - `kubectl get pods -n kube-system` — status of control-plane static pods and add-ons
-    - `kubectl describe pod` — pull errors with the exact image
-    - `crictl ps -a` and `crictl logs ID` — control-plane container output
-    - `/etc/kubernetes/manifests/` and `ls /etc/kubernetes` — manifests, and which files really exist
-    - `kubectl set image --help`, `kubectl rollout restart --help` — changing images; restarting pods so they re-read a ConfigMap
-    - `kubectl logs -n kube-system ds/kube-proxy` and `kubectl get cm kube-proxy -n kube-system -o yaml` — kube-proxy errors and config
-    - `journalctl -u kubelet` and `/etc/kubernetes/kubelet.conf` (on node01) — the kubelet's view of the API server
+    ### The idea
+
+    | component | runs as | when broken |
+    |---|---|---|
+    | **scheduler** | static pod | new pods `Pending` with **no events** |
+    | **controller-manager** | static pod | Deployments get no ReplicaSets, ReplicaSets no pods |
+    | **CoreDNS** | Deployment in kube-system | cluster DNS fails |
+    | **kube-proxy** | DaemonSet, settings in ConfigMap `kube-proxy` | Service IPs stop working on that node |
+    | kubelet → API server | `/etc/kubernetes/kubelet.conf` on each node | node `NotReady`, kubelet logs "connection refused" |
+
+    For static pods: `crictl ps -a` + `crictl logs`, then the manifest (image tag, paths). For add-ons: `kubectl -n kube-system get pods`, `describe`, `logs`.
+
+    ### Commands you'll use
+
+    ```bash
+    kubectl -n kube-system get pods -o wide
+    sudo crictl ps -a --name 'kube-scheduler|kube-controller-manager'
+    sudo grep -n image: /etc/kubernetes/manifests/kube-scheduler.yaml
+    sudo crictl images | grep kube-scheduler                 # which tags exist locally
+    sudo crictl logs $(sudo crictl ps -a --name kube-controller-manager -q | head -1) 2>&1 | tail -3
+    ```
+    ```text
+    ... stat /etc/kubernetes/controller-mgr.conf: no such file or directory
+    ```
+
+    ```bash
+    ls /etc/kubernetes/*.conf
+    kubectl -n kube-system describe pod -l k8s-app=kube-dns | grep -A2 Failed
+    kubectl -n kube-system set image deploy/coredns coredns=registry.k8s.io/coredns/coredns:v1.14.2
+    kubectl -n kube-system logs ds/kube-proxy --tail=3
+    kubectl -n kube-system get cm kube-proxy -o jsonpath='{.data.config\.conf}' | grep -n mode
+    kubectl -n kube-system edit cm kube-proxy && kubectl -n kube-system rollout restart ds/kube-proxy
+    ssh node01 'sudo grep server: /etc/kubernetes/kubelet.conf; sudo journalctl -u kubelet -n 3 --no-pager'
+    ```
+
+    ### Common mistakes
+
+    - Fixing the test workloads instead of the components: they start by themselves once the cluster works.
+    - An image tag guessed from memory: list what's available (`crictl images`, the other components' tags).
+    - Forgetting to restart kube-proxy after editing its ConfigMap.
+
+    ### Check your work
+
+    Every pod in `kube-system` is Running, both nodes are `Ready`, and the two test workloads are running.
   scenario: |
     The API server works, but the cluster is sick:
 
@@ -530,14 +871,40 @@ exercises:
   kind: fix
   tags: [control-plane, kubelet, static-pods]
   tutorial: |
-    **Concept.** Static pods start only from the directory the kubelet is configured to watch. If that path is wrong, the kubelet silently runs none of the control-plane pods even though their manifests are fine.
+    **What you're learning.** The kubelet's `staticPodPath`, and what happens when it's wrong.
 
-    **Read up on:**
-    - `/var/lib/kubelet/config.yaml` — the kubelet configuration, including its static pod path setting
-    - `ls /etc/kubernetes/manifests` — where manifests actually are
-    - `journalctl -u kubelet` — startup messages
-    - `crictl ps` — running containers
-    - `systemctl restart kubelet`
+    ### The idea
+
+    The kubelet runs the manifests in the directory set by `staticPodPath` in `/var/lib/kubelet/config.yaml` (kubeadm: `/etc/kubernetes/manifests`). If that path is wrong (a typo, a missing `s`), the kubelet watches an empty or missing directory and **silently runs no control-plane pods**, even though the manifests are perfect.
+
+    ```
+    kubelet config: staticPodPath: /etc/kubernetes/manifest    ← no such directory
+    manifests in:                   /etc/kubernetes/manifests/  ← ignored
+    ```
+
+    ### Commands you'll use
+
+    ```bash
+    sudo crictl ps                  # no apiserver, etcd, scheduler, controller-manager
+    ls /etc/kubernetes/manifests/
+    sudo grep -n staticPodPath /var/lib/kubelet/config.yaml
+    sudo journalctl -u kubelet -n 20 --no-pager | grep -i 'static\|path'
+    sudo vi /var/lib/kubelet/config.yaml
+    sudo systemctl restart kubelet
+    watch -n2 sudo crictl ps
+    kubectl get pods -n kube-system
+    ```
+
+    Unlike manifests, the kubelet's own config needs a **kubelet restart** to take effect.
+
+    ### Common mistakes
+
+    - Moving the manifests to the wrong path: the next admin expects them in the standard place.
+    - Editing `/etc/kubernetes/kubelet.conf` (that's the kubelet's kubeconfig, not its configuration).
+
+    ### Check your work
+
+    `sudo crictl ps` shows all four control-plane containers, and `kubectl get nodes` works.
   scenario: |
     All control-plane components disappeared at once: `kubectl` fails, and `sudo crictl
     ps` on the control plane shows **no** apiserver, etcd, scheduler or controller-manager
@@ -576,13 +943,33 @@ exercises:
   kind: fix
   tags: [incident, control-plane, nodes]
   tutorial: |
-    **Concept.** Multiple failures can overlap. Fix them in dependency order: first get API access, then node health, then scheduling. Re-check after each step because fixing one reveals the next.
+    **What you're learning.** Recovering a cluster with overlapping faults, in dependency order.
 
-    **Read up on:**
-    - `crictl ps -a` and `crictl logs` — control-plane containers when kubectl is down
-    - `/etc/kubernetes/manifests/` and `/etc/kubernetes/*.conf` — configs to compare
-    - `journalctl -u kubelet` on each node
-    - `kubectl get nodes` and `kubectl get pods -n kube-system` — verify
+    ### Method: API → nodes → scheduling
+
+    Fix in the order things depend on each other, and re-check after every step: each fix reveals the next fault.
+
+    1. **API access** (k8s-245): `sudo crictl ps -a --name kube-apiserver`, logs, manifest. If a port was changed, check **every** place it appears (flags and the liveness/readiness/startup probes) with `grep -n PORT`. Then your own kubeconfig.
+    2. **Nodes** (k8s-241, k8s-244): `kubectl get nodes`; on each NotReady node, `systemctl status containerd kubelet`, `journalctl -u kubelet`.
+    3. **Control loops** (k8s-247, k8s-255): scheduler and controller-manager static pods (image, kubeconfig paths).
+    4. **Workloads**: create the test deployment and watch it become Ready.
+
+    ```bash
+    sudo grep -n 6553 /etc/kubernetes/manifests/*.yaml     # every leftover of a changed port
+    for n in controlplane node01; do echo "== $n"; ssh $n 'systemctl is-active containerd kubelet; systemctl is-enabled containerd kubelet'; done
+    kubectl -n kube-system get pods
+    ```
+    (From the control plane, `ssh controlplane` works too; or run the commands locally for it.)
+
+    Keep notes of each fault as you find it; the hardening script probably touched the same kind of thing on both nodes.
+
+    ### Check your work
+
+    ```bash
+    kubectl get nodes                          # both Ready
+    kubectl -n kube-system get pods            # all Running
+    kubectl -n monday rollout status deploy/canary
+    ```
   scenario: |
     Over the weekend, an unsupervised "hardening" script ran on both nodes. On Monday:
 
