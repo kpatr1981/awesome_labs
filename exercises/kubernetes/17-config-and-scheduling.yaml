@@ -12,13 +12,51 @@ exercises:
   kind: fix
   tags: [initcontainers, ordering]
   tutorial: |
-    **Concept.** Init containers run one at a time, strictly in the order they are listed, and each must finish successfully before the next one starts. The application containers only start after the last one completes, so a wrong order can block a pod forever.
+    **What you're learning.** That init containers run **strictly in list order**, and how a wrong order blocks a pod forever.
 
-    **Read up on:**
-    - `kubectl get pod NAME` — what `Init:0/2` means
-    - `kubectl describe pod NAME` — the state of each init container
-    - `kubectl logs NAME -c INIT_CONTAINER` — logs of an init container
-    - Kubernetes docs: Init Containers
+    ### The idea
+
+    Init containers run one at a time, top to bottom; each must exit successfully before the next starts, and the app containers start only after the last one (k8s-132). If an init container **waits** for something that a **later** init container produces, it waits forever: the later one never starts.
+
+    ```
+    initContainers:
+    - wait-for-file   ← waits for /shared/ready ... forever
+    - make-file       ← would create it, but never runs
+    ```
+
+    The pod shows `Init:0/2` (zero of two finished).
+
+    ### Commands you'll use
+
+    ```bash
+    kubectl get pods -n demo
+    ```
+    ```text
+    NAME                   READY   STATUS     RESTARTS
+    app-7c9d8f6b5-x2k9p    0/1     Init:0/2   0
+    ```
+
+    ```bash
+    kubectl describe pod -n demo -l app=app | sed -n '/Init Containers/,/Containers:/p' | grep -E '^  [a-z]|State'
+    kubectl logs -n demo -l app=app -c wait-for-file --tail=3
+    kubectl get deploy app -n demo -o jsonpath='{range .spec.template.spec.initContainers[*]}{.name}{"\n"}{end}'
+    ```
+
+    A JSON patch `move` reorders list items without rewriting them:
+    ```bash
+    kubectl -n demo patch deploy app --type=json \
+      -p '[{"op":"move","from":"/spec/template/spec/initContainers/1","path":"/spec/template/spec/initContainers/0"}]'
+    kubectl -n demo rollout status deploy/app
+    ```
+
+    ### Common mistakes
+
+    - Editing the init containers' commands: the task forbids it.
+    - Deleting the waiting container.
+
+    ### Check your work
+
+    The new pod passes `Init:1/2`, `PodInitializing` and becomes `1/1 Running`.
   scenario: |
     Deployment **`shop`** in namespace **`boot`** never leaves `Init`. It has two init
     containers, **`seed`** (writes a file into a shared volume) and **`wait-seed`** (waits
@@ -87,13 +125,52 @@ exercises:
   kind: build
   tags: [sidecar, initcontainers, logs]
   tutorial: |
-    **Concept.** A native sidecar is an init container with its own restart policy: it starts before the main containers, keeps running next to them, and is stopped after them. This ordering guarantee is the difference from just adding a second regular container.
+    **What you're learning.** A native sidecar for a regular, long-running pod: a log shipper that starts first.
 
-    **Read up on:**
-    - `kubectl explain pod.spec.initContainers.restartPolicy` — the field that turns an init container into a sidecar
-    - `kubectl get pod NAME -o yaml` — where sidecar status is reported
-    - `kubectl logs NAME -c CONTAINER` — reading one container's logs
-    - Kubernetes docs: Sidecar Containers
+    ### The idea
+
+    A **native sidecar** is an init container with `restartPolicy: Always` (k8s-134). It starts in its place in the init list, and the next init container (or the main containers) start as soon as it's **running**, not finished. It runs for the pod's whole life and is stopped **after** the main containers.
+
+    A log shipper as a sidecar: the app writes log files into a shared `emptyDir`; the sidecar follows them and prints them, so `kubectl logs POD -c SIDECAR` shows the app's logs.
+
+    `tail -F` (capital F) keeps following a file even if it doesn't exist yet or is rotated.
+
+    ### Commands you'll use
+
+    ```yaml
+    spec:
+      initContainers:
+      - name: tailer
+        image: busybox:1.37
+        restartPolicy: Always
+        command: ["sh", "-c", "tail -F /logs/app.log"]
+        volumeMounts: [{name: logs, mountPath: /logs}]
+      containers:
+      - name: app
+        image: busybox:1.37
+        command: ["sh", "-c", "while true; do date >> /var/log/app/app.log; sleep 5; done"]
+        volumeMounts: [{name: logs, mountPath: /var/log/app}]
+      volumes:
+      - {name: logs, emptyDir: {}}
+    ```
+
+    ```bash
+    kubectl apply -f /lab/app.yaml
+    kubectl get pod app -n demo                          # READY 2/2
+    kubectl get pod app -n demo -o jsonpath='{.status.initContainerStatuses[0].started}'; echo
+    kubectl logs app -n demo -c tailer --tail=3
+    ```
+
+    The official nginx image symlinks `access.log` to stdout; with an `emptyDir` mounted over `/var/log/nginx` it writes real files instead.
+
+    ### Common mistakes
+
+    - `tail -f` on a file that doesn't exist yet: exits with an error.
+    - The sidecar under `containers:`: no start-order guarantee.
+
+    ### Check your work
+
+    After a request to the web server (`kubectl exec edge -c web -- wget -qO- http://127.0.0.1/`), the line shows up in `kubectl logs edge -c shipper`.
   scenario: |
     In namespace **`side`**, create pod **`edge`**:
 
@@ -161,13 +238,46 @@ exercises:
   kind: fix
   tags: [configmap, immutable, rollout]
   tutorial: |
-    **Concept.** A ConfigMap marked immutable rejects every change to its data. The way to change the value is to create a new ConfigMap and point the workload at it, which also rolls the pods. Editing or deleting-and-recreating the same name is unreliable, because the kubelet caches a referenced ConfigMap by name.
+    **What you're learning.** Updating configuration that lives in an **immutable** ConfigMap: a new, versioned ConfigMap.
 
-    **Read up on:**
-    - `kubectl explain configmap.immutable` — what the field guarantees
-    - `kubectl set env deploy/NAME --from=configmap/NAME` or patching `configMapKeyRef.name`
-    - `kubectl rollout status` — waiting for the new pods
-    - Versioned ConfigMaps — why a new name is the usual update path
+    ### The idea
+
+    An immutable ConfigMap (k8s-074) can't be edited. Deleting it and recreating the **same** name is unreliable: kubelets cache an immutable ConfigMap by name and may keep serving the old content. The intended path:
+
+    ```
+    create ratelimit-v2 (immutable, new value) ─► point the Deployment at it ─► rollout
+    ```
+
+    Pointing the Deployment at the new name changes its template, so new pods start with the new value. Rolling back = pointing back at v1.
+
+    ### Commands you'll use
+
+    ```bash
+    kubectl get cm -n demo
+    kubectl get deploy api -n demo -o jsonpath='{.spec.template.spec.containers[0].env}'; echo
+    ```
+    ```text
+    [{"name":"TIMEOUT","valueFrom":{"configMapKeyRef":{"key":"timeout","name":"api-settings-v1"}}}]
+    ```
+
+    ```bash
+    kubectl -n demo create configmap api-settings-v2 --from-literal=timeout="$(cat /lab/timeout.txt)" \
+      --dry-run=client -o json | jq '.immutable = true' | kubectl apply -f -
+    kubectl -n demo patch deploy api --type=json -p '[{"op":"replace",
+      "path":"/spec/template/spec/containers/0/env/0/valueFrom/configMapKeyRef/name","value":"api-settings-v2"}]'
+    kubectl -n demo rollout status deploy/api
+    kubectl -n demo exec deploy/api -- printenv TIMEOUT
+    ```
+
+    ### Common mistakes
+
+    - The new ConfigMap not immutable (the task requires it).
+    - Using the wrong key name in the new ConfigMap: the pod fails with `CreateContainerConfigError`.
+    - `$(cat file)` keeps the content without the trailing newline: good.
+
+    ### Check your work
+
+    The new ConfigMap has `immutable: true`, the Deployment refers to it, and the running pod shows the new value.
   scenario: |
     Deployment **`gate`** in namespace **`immut`** reads its `MAX` from the immutable
     ConfigMap **`ratelimit-v1`**. The rate limit must change to the value in
@@ -244,13 +354,57 @@ exercises:
   kind: build
   tags: [debug, ephemeral-containers]
   tutorial: |
-    **Concept.** An ephemeral container is added to an already running pod, which cannot be changed otherwise. When it targets a container it shares that container's process namespace, so you can inspect its processes and files from a toolbox image.
+    **What you're learning.** **Ephemeral containers** with `kubectl debug`: inspecting a running pod whose image has no shell.
 
-    **Read up on:**
-    - `kubectl debug --help` — the `--target` and `--image` options
-    - `kubectl get pod NAME -o yaml` — where ephemeral containers are recorded
-    - `man 5 proc` — the per-process `root` link
-    - Kubernetes docs: Ephemeral Containers
+    ### The idea
+
+    Minimal images (distroless, scratch) contain only the program: no shell, no `cat`, so `kubectl exec` can't help. `kubectl debug POD --image=busybox:1.37 --target=CONTAINER` **adds** an ephemeral container to the running pod (the pod isn't restarted). With `--target`, it shares that container's **process namespace**: it sees its processes, and through `/proc/PID/root` its filesystem.
+
+    ```
+    ephemeral "probe" (busybox) ──shares processes──► container "web"
+    /proc/1/root/run/secret ── is ──► web's /run/secret
+    ```
+
+    Ephemeral containers can't be removed afterwards (they stay in the pod spec, stopped); that's fine.
+
+    ### Commands you'll use
+
+    ```bash
+    kubectl -n demo exec app -c web -- cat /etc/app/key
+    ```
+    ```text
+    error: ... exec: "cat": executable file not found in $PATH
+    ```
+
+    ```bash
+    kubectl -n demo debug app --image=busybox:1.37 --target=web -c peek -- sh -c 'ps; ls /proc/1/root/etc/app'
+    kubectl -n demo logs app -c peek
+    ```
+    ```text
+    PID   USER     TIME  COMMAND
+        1 65532     0:00 /app/server
+       12 root      0:00 sh -c ps; ...
+    key
+    ```
+
+    ```bash
+    kubectl -n demo debug app --image=busybox:1.37 --target=web -c peek2 -- cat /proc/1/root/etc/app/key
+    kubectl -n demo logs app -c peek2 > /lab/key.txt
+    kubectl get pod app -n demo -o jsonpath='{.spec.ephemeralContainers[*].name}'; echo
+    ```
+    Each `kubectl debug` needs a **new** container name (`-c`).
+
+    If the target's main process isn't PID 1 (e.g. a pause process or a shell wrapper), loop over `/proc/[0-9]*/root/PATH` and take the one that exists.
+
+    ### Common mistakes
+
+    - `kubectl debug --copy-to=...`: creates a **copy** of the pod, which isn't the running one.
+    - Forgetting `--target`: you get your own process namespace and can't see the app's files.
+    - Reading a permission-protected file: the ephemeral container runs as root by default, which usually works.
+
+    ### Check your work
+
+    The pod's UID and restart count are unchanged, and the file holds the token.
   scenario: |
     Pod **`vault`** in namespace **`dbg`** (container **`web`**) serves a page and has a
     token mounted from a Secret at **`/run/vault/token`**. Nobody remembers the value.
@@ -308,13 +462,58 @@ exercises:
   kind: build
   tags: [affinity, nodeaffinity, labels, antiaffinity, resilience, scheduling]
   tutorial: |
-    **Concept.** Affinity comes in two strengths. `requiredDuringScheduling…` is a filter: a pod that no node can satisfy stays Pending forever. `preferredDuringScheduling…` is a weighted score: the scheduler honours it when it can and places the pod anyway when it cannot. Node affinity looks at node labels, using operators such as `In` and `DoesNotExist`. Pod anti-affinity looks at where other pods run, within a `topologyKey`.
+    **What you're learning.** Hard vs soft placement rules, with node affinity (`In`, `DoesNotExist`) and preferred pod anti-affinity.
 
-    **Read up on:**
-    - Kubernetes docs: Assigning Pods to Nodes, "Affinity and anti-affinity"
-    - `kubectl explain pod.spec.affinity.nodeAffinity.requiredDuringSchedulingIgnoredDuringExecution`
-    - `kubectl explain pod.spec.affinity.podAntiAffinity.preferredDuringSchedulingIgnoredDuringExecution`
-    - `kubectl describe pod` — the scheduler's explanation under Events
+    ### The idea
+
+    | strength | field | when nothing satisfies it |
+    |---|---|---|
+    | hard | `requiredDuringSchedulingIgnoredDuringExecution` | the pod stays **Pending** |
+    | soft | `preferredDuringSchedulingIgnoredDuringExecution` (with a `weight`) | the pod is scheduled anyway |
+
+    Expressions in one `matchExpressions` list are AND'ed: `pool In [blue, green]` **and** `dedicated DoesNotExist` (k8s-086).
+
+    A **required** pod anti-affinity on hostname with more replicas than usable nodes leaves replicas Pending (k8s-088). The **preferred** form keeps the spreading intent without blocking:
+
+    ```yaml
+    affinity:
+      podAntiAffinity:
+        preferredDuringSchedulingIgnoredDuringExecution:
+        - weight: 100
+          podAffinityTerm:
+            topologyKey: kubernetes.io/hostname
+            labelSelector: {matchLabels: {app: cache}}
+    ```
+    Note the extra level `podAffinityTerm:` in the preferred form.
+
+    ### Commands you'll use
+
+    ```bash
+    kubectl get nodes -L pool,dedicated
+    kubectl apply -f /lab/pinned.yaml
+    kubectl get pod pinned -n demo -o wide
+    kubectl describe pod -n demo -l app=cache | grep -A2 FailedScheduling
+    ```
+    ```text
+    0/2 nodes are available: 1 node(s) didn't match pod anti-affinity rules, 1 node(s) had untolerated taint ...
+    ```
+
+    Replace the required rule with the preferred one in one patch (the merge patch sets `podAntiAffinity` to exactly what you send):
+    ```bash
+    kubectl -n demo patch deploy cache --type=merge -p '{"spec":{"template":{"spec":{"affinity":{"podAntiAffinity":{
+      "requiredDuringSchedulingIgnoredDuringExecution":null,
+      "preferredDuringSchedulingIgnoredDuringExecution":[{"weight":100,"podAffinityTerm":{
+        "topologyKey":"kubernetes.io/hostname","labelSelector":{"matchLabels":{"app":"cache"}}}}]}}}}}}'
+    ```
+
+    ### Common mistakes
+
+    - Two `nodeSelectorTerms` instead of two expressions in one term: that's OR.
+    - Keeping the required rule next to the preferred one: still blocked.
+
+    ### Check your work
+
+    The first pod runs on a node matching both conditions; all three replicas of the second Deployment are Ready and the template has only the preferred rule.
   scenario: |
     Two placement problems: one needs a rule the scheduler must obey, and the other has a rule so strict that it cannot be satisfied:
 
@@ -443,13 +642,46 @@ exercises:
   kind: fix
   tags: [scheduling, requests, capacity]
   tutorial: |
-    **Concept.** The scheduler places a pod on a node only if the sum of the CPU and memory requests of the pods already there, plus the new pod's requests, fits in the node's allocatable amount. Real usage does not matter, only requests.
+    **What you're learning.** That scheduling is about **requests**, not usage: when a node is "full" on paper.
 
-    **Read up on:**
-    - `kubectl describe node node01` — the Allocated resources section
-    - `kubectl describe pod NAME` — the scheduler's events (Insufficient cpu)
-    - `kubectl set resources --help` — changing requests of a workload
-    - Kubernetes docs: Resource Management for Pods and Containers
+    ### The idea
+
+    The scheduler places a pod only if, on the node, **sum of existing requests + new request ≤ allocatable** (k8s-095). Actual CPU usage is irrelevant: a pod that requests 1.5 cores but idles still "uses" them for scheduling. A tiny workload with an inflated request can't fit next to such a pod.
+
+    ### Commands you'll use
+
+    ```bash
+    kubectl describe pod -n demo -l app=worker | grep -A2 FailedScheduling
+    ```
+    ```text
+    0/2 nodes are available: 1 Insufficient cpu, 1 node(s) didn't match Pod's node affinity/selector.
+    ```
+
+    ```bash
+    kubectl describe node node01 | sed -n '/Allocatable:/,/System Info/p' | grep cpu
+    kubectl describe node node01 | sed -n '/Allocated resources/,/Events/p'
+    ```
+    ```text
+      Resource           Requests      Limits
+      cpu                1650m (82%)   ...
+    ```
+    Allocatable 2000m − 1650m = 350m free: one worker at 250m fits, the second doesn't.
+
+    ```bash
+    kubectl -n demo set resources deploy worker --requests=cpu=150m
+    kubectl -n demo rollout status deploy/worker
+    kubectl describe node node01 | sed -n '/Allocated resources/,/Events/p' | grep cpu
+    ```
+
+    ### Common mistakes
+
+    - Deleting or shrinking the other pod: it must stay.
+    - A request of `0` or removing it: the task requires 100m-200m.
+    - Forgetting that during the rollout old and new pods briefly coexist; with little room, the rollout may need `maxSurge: 0` (k8s-227).
+
+    ### Check your work
+
+    Both replicas run on node01, each requesting a value in the allowed range.
   scenario: |
     Namespace **`fit`** runs a pod **`filler`** that has reserved most of the CPU left on
     **node01** (it must stay). Deployment **`worker`** wants **2 replicas**, both pinned to
@@ -531,13 +763,44 @@ exercises:
   kind: build
   tags: [taints, tolerations, noexecute, eviction]
   tutorial: |
-    **Concept.** A taint with the NoExecute effect not only blocks new pods, it also evicts running pods that do not tolerate it. A toleration lets a pod stay, and matches a taint by key, value and effect.
+    **What you're learning.** Dedicating a node with a `NoExecute` taint: evicting everyone who doesn't tolerate it.
 
-    **Read up on:**
-    - `kubectl taint --help` — adding and removing taints, effects
-    - `kubectl explain pod.spec.tolerations` — operator, key, value, effect
-    - `kubectl describe node node01` — the Taints line
-    - Kubernetes docs: Taints and Tolerations
+    ### The idea
+
+    `NoExecute` (k8s-098) evicts pods already running on the node unless they tolerate the taint. To keep one team's pods and push everyone else off:
+
+    1. add the toleration to the team's workload **first** (otherwise its pods are evicted too);
+    2. then taint the node.
+
+    Evicted pods of a Deployment are recreated, but if they're pinned to that node and don't tolerate the taint, they stay **Pending**: they don't run, which is what "must not run" means here.
+
+    ### Commands you'll use
+
+    ```bash
+    T=$(cat /lab/team.txt); echo "$T"
+    kubectl -n demo patch deploy dataops --type=json -p '[{"op":"add","path":"/spec/template/spec/tolerations",
+      "value":[{"key":"team","operator":"Equal","value":"'"$T"'","effect":"NoExecute"}]}]'
+    kubectl -n demo rollout status deploy/dataops
+    kubectl taint node node01 team="$T":NoExecute
+    kubectl get pods -n demo -o wide
+    ```
+    `'...'"$T"'...'` closes the single quotes, inserts the variable, and reopens them.
+
+    ```text
+    NAME                       READY   STATUS    NODE
+    dataops-6c8d9f7b4-abcde    1/1     Running   node01
+    other-5d7c8b9f6-fghij      0/1     Pending   <none>
+    ```
+
+    ### Common mistakes
+
+    - `NoSchedule`: the other team's pods keep running.
+    - Tainting before the toleration has rolled out: your own pods get evicted (they come back, but it's an outage).
+    - Deleting the other Deployment: forbidden.
+
+    ### Check your work
+
+    `kubectl describe node node01 | grep Taints` shows `team=VALUE:NoExecute`, the tolerating pods run there, and no pod of the other Deployment is Running.
   scenario: |
     Namespace **`team`** has deployments **`analytics`** and **`intruder`**, all pods pinned to
     **node01**. From now on node01 belongs to one team, whose name is in **`/lab/team.txt`**.
@@ -617,13 +880,59 @@ exercises:
   kind: build
   tags: [hpa, autoscaling, behavior]
   tutorial: |
-    **Concept.** The autoscaling/v2 HorizontalPodAutoscaler can combine several metrics (the largest desired size wins) and has a behavior section that limits how quickly it scales up and down. The object is valid and stored even when no metrics are available yet.
+    **What you're learning.** An `autoscaling/v2` HPA with **several metrics** and **behaviour** limits, written as YAML.
 
-    **Read up on:**
-    - `kubectl explain hpa.spec.metrics.resource.target` — Utilization versus AverageValue
-    - `kubectl explain hpa.spec.behavior.scaleDown` — stabilization window and policies
-    - `kubectl api-resources | grep autoscal` — the API group and versions
-    - Kubernetes docs: Horizontal Pod Autoscaling
+    ### The idea
+
+    `kubectl autoscale` only makes a CPU target. The v2 API supports a list of `metrics`; the HPA computes a desired size for each and uses the **largest**. Resource metrics can target:
+
+    | `target.type` | meaning |
+    |---|---|
+    | `Utilization` (+ `averageUtilization: %`) | percent of the containers' **requests** |
+    | `AverageValue` (+ `averageValue: 100Mi`) | an absolute amount per pod |
+
+    `behavior` limits the pace in each direction (k8s-157): stabilization windows and policies (`Pods` or `Percent` per `periodSeconds`).
+
+    ```yaml
+    apiVersion: autoscaling/v2
+    kind: HorizontalPodAutoscaler
+    metadata: {name: api, namespace: demo}
+    spec:
+      scaleTargetRef: {apiVersion: apps/v1, kind: Deployment, name: api}
+      minReplicas: 1
+      maxReplicas: 10
+      metrics:
+      - type: Resource
+        resource: {name: cpu, target: {type: Utilization, averageUtilization: 60}}
+      - type: Resource
+        resource: {name: memory, target: {type: AverageValue, averageValue: 200Mi}}
+      behavior:
+        scaleDown:
+          stabilizationWindowSeconds: 300
+          policies: [{type: Pods, value: 2, periodSeconds: 60}]
+        scaleUp:
+          policies: [{type: Percent, value: 50, periodSeconds: 15}]
+    ```
+
+    ### Commands you'll use
+
+    ```bash
+    kubectl api-resources | grep -i horizontal
+    cat /lab/target-cpu.txt
+    kubectl apply -f /lab/hpa.yaml
+    kubectl get hpa api -n demo -o yaml | sed -n '/spec:/,/status:/p'
+    ```
+    The object is stored even without metrics (TARGETS shows `<unknown>`).
+
+    ### Common mistakes
+
+    - `averageUtilization: "65"` as a string, or `averageValue: 100` without a unit.
+    - `behavior` with `scaleDown`/`scaleUp` at the wrong level (they go under `behavior`).
+    - `apiVersion: autoscaling/v1`: no multiple metrics or behaviour.
+
+    ### Check your work
+
+    `kubectl get hpa NAME -o yaml` shows both metrics with the right types and values, min/max, and both behaviour sections.
   scenario: |
     Namespace **`scale`** has deployment **`catalog`**. Create an **autoscaling/v2**
     HorizontalPodAutoscaler named **`catalog`** that targets it with:
@@ -723,40 +1032,39 @@ exercises:
   kind: build
   tags: [capstone, taints, tolerations, noexecute, affinity, nodeaffinity, sidecar, initcontainers, configmap, immutable, debug, ephemeral-containers, scheduling]
   tutorial: |
-    **Concept.** Giving a team a node of its own is several small changes that only work in
-    the right order:
+    **What you're learning.** Dedicating a node to one team end to end, with a careful order: rescue data, protect a pod, mark the node, attract the right pods, fix init order, roll config, move others away.
 
-    - **Mark the node.** A label says what the node is for, a taint keeps everybody else
-      away. With the `NoExecute` effect the taint also **evicts** the pods already running
-      there that don't tolerate it: an evicted pod of a Deployment is replaced elsewhere if
-      it can be, a bare pod is simply gone. Anything that must survive needs its toleration
-      *before* the taint. A running pod's spec is mostly frozen, but tolerations may be
-      **added** to it (not changed or removed), for instance with a JSON patch that appends to
-      `/spec/tolerations/-`.
-    - **Attract the right pods.** A toleration only *allows* a pod onto the tainted node; it
-      doesn't send it there. A **required node affinity** on the label does (operators such as
-      `In`), and unlike `nodeSelector` it can express sets and negations. Pods that must leave
-      need somewhere else to go: on this cluster that is the control plane, behind its own
-      `NoSchedule` taint.
-    - **Order inside the pod.** Init containers run one by one, each to completion, and the
-      regular containers only start after the last of them. An init step that needs a helper
-      (a mesh proxy, say) waits forever if the helper is a regular container. A **native
-      sidecar** is an init container with `restartPolicy: Always`: it starts in its place in
-      the list, keeps running, and the next init container starts once it is up.
-    - **Configuration that can't change.** An immutable ConfigMap rejects every edit; the
-      update path is a new ConfigMap (a new name) that the workload points at, which also
-      rolls its pods.
-    - **Looking inside an image without a shell.** `kubectl debug --target=CONTAINER` adds an
-      ephemeral container to a running pod that shares that container's process namespace;
-      `/proc/<pid>/root` is then the target's filesystem. The pod isn't restarted.
+    ### Method
 
-    **Read up on:**
-    - `kubectl taint --help`, `kubectl explain pod.spec.tolerations`
-    - `kubectl explain pod.spec.affinity.nodeAffinity.requiredDuringSchedulingIgnoredDuringExecution`
-    - `kubectl patch --help` (`--type=json`), Kubernetes docs: Taints and Tolerations
-    - `kubectl explain pod.spec.initContainers.restartPolicy`, Kubernetes docs: Sidecar Containers
-    - `kubectl explain configmap.immutable`
-    - `kubectl debug --help` (`--target`, `-c`), `man 5 proc` (`/proc/[pid]/root`)
+    Order matters, because the `NoExecute` taint evicts anything not yet prepared:
+
+    | step | exercise |
+    |---|---|
+    | 1. read the key with an ephemeral container (`--target`, `/proc/1/root/...`) | k8s-316 |
+    | 2. add a toleration to the **running** bare pod: tolerations may be **appended** to a pod (`op: add`, path `/spec/tolerations/-`) | k8s-318 |
+    | 3. label, then taint `NoExecute` | k8s-081, k8s-318 |
+    | 4. Deployment: required node affinity on the label + toleration | k8s-313 |
+    | 5. make the proxy a native sidecar, **first** in `initContainers` | k8s-311, k8s-314 |
+    | 6. new immutable ConfigMap, point the Deployment at it | k8s-315 |
+    | 7. the other Deployment: tolerate only the **control-plane** taint and prefer/require the control plane | k8s-085 |
+
+    Steps 4-6 touch the same pod template: put them in **one** apply so there's one rollout.
+
+    ```bash
+    kubectl -n search get pod warm-cache -o jsonpath='{.metadata.uid} {.status.containerStatuses[0].restartCount}'; echo   # before and after
+    kubectl get node node01 -o jsonpath='{.spec.taints}'; echo
+    kubectl -n search get pods -o wide
+    ```
+
+    ### Check your work
+
+    ```bash
+    cat /lab/legacy-key.txt
+    kubectl -n search get pods -o wide                     # warm-cache same UID on node01; 2 search-api on node01; reports on controlplane
+    kubectl -n search get pod -l app=search-api -o jsonpath='{.items[0].spec.initContainers[*].name}'; echo   # proxy register
+    kubectl -n search exec deploy/search-api -c web -- printenv RESULTS_PER_PAGE
+    kubectl -n search get deploy reports -o jsonpath='{.spec.template.spec.tolerations}'; echo   # no dedicated toleration
+    ```
   scenario: |
     **SRCH-212**, from Priya (search team lead): *"The sale starts on Friday. Capacity
     planning gave us node01 for search alone, but nobody has made it so. And while you're in
