@@ -12,21 +12,42 @@ exercises:
   kind: build
   tags: [postgres, initdb, restore]
   tutorial: |
-    **Concept.** A database container starts empty, and there are two different moments at which data can get in. Which one you use depends on whether the database has been initialised yet.
+    **What you're learning.** The two ways data gets into a database container: init scripts on first start, and restoring a dump into a running one.
 
-    - **Before first start.** The official postgres image looks in a special directory the first time it runs and executes every `.sql` and `.sh` file there, in alphabetical order. This only happens when the data directory is empty; on any later start the directory is ignored. That makes it perfect for a schema and seed data, and useless for loading something into a database that already exists.
-    - **After it is running.** To load a dump into a live database you run the client *inside* the container and feed it the file from the host. A shell redirection on the host hands the file to the `docker exec` process, and that process must pass its stdin through to the command in the container. Holding stdin open is a separate option from allocating a TTY, and asking for a TTY here fails, because redirected stdin is not a terminal.
+    ### The idea
 
-    One gotcha applies to both. During initialisation the image runs a temporary server that listens only on the unix socket, then shuts it down and starts the real one. A check that merely asks "is it ready?" over the socket can answer yes during that temporary phase. A real connection over TCP is what proves the database is finished.
+    | moment | mechanism | runs when |
+    |---|---|---|
+    | **first start** | files in `/docker-entrypoint-initdb.d` (`*.sql`, `*.sql.gz`, `*.sh`), in **alphabetical** order | only if the data directory is **empty** |
+    | **any time later** | feed a dump to the client: `docker exec -i DB psql -U USER -d DBNAME < dump.sql` | whenever you run it |
 
-    **Read up on:**
-    - Docker Hub `postgres` page — section 'Initialization scripts'
-    - `docker run -v` — bind mounts, including read-only
-    - `docker exec --help` — the interactive option, and how it differs from a TTY
-    - `psql --help` — `-U`, `-d`, `-h`, `-f`, `-c`
-    - Shell redirection with `<`
-    - `docker logs` — see the init scripts running
-    - `psql -c '\dt'` — verify tables loaded
+    Mounting the whole init directory read-only runs every script in it. Number the files (`01-`, `02-`) to fix their order.
+
+    `docker exec -i` (without `-t`) passes your **stdin** into the container, which is what makes `< file` work.
+
+    ### Commands you'll use
+
+    ```bash
+    ls /lab/shop-db/init
+    docker run -d --name shop-db -e POSTGRES_PASSWORD=dev \
+      -v /lab/shop-db/init:/docker-entrypoint-initdb.d:ro postgres:16-alpine
+    docker logs shop-db 2>&1 | grep -E 'running /docker-entrypoint-initdb.d|ready to accept'
+    docker exec shop-db psql -h 127.0.0.1 -U postgres -c 'select count(*) from orders'
+
+    docker exec -i reports-db psql -U postgres -d reports -v ON_ERROR_STOP=1 < /lab/reports.sql
+    docker exec reports-db psql -U postgres -d reports -c '\dt'
+    ```
+    `-v ON_ERROR_STOP=1` makes psql stop at the first error instead of carrying on.
+
+    ### Common mistakes
+
+    - Running the init SQL by hand when the task says the image should.
+    - `docker exec -it ... < file`: "the input device is not a TTY".
+    - Restoring into the wrong database (the default is the user's own database, `postgres`).
+
+    ### Check your work
+
+    `products` exists and has the seed rows in `catalog-db`, and the dump's tables have data in `analytics`.
   scenario: |
     You are setting up the databases for a new environment. One starts life seeded from
     scripts; the other already exists and has to be filled from a dump.
@@ -101,24 +122,56 @@ exercises:
   kind: build
   tags: [compose, signals, stop-signal, resources, logging]
   tutorial: |
-    **Concept.** A compose file that "works" on a laptop usually says nothing about how its services should stop, how much of the machine they may take, or where their output goes. Production needs answers to all three, and each is a per-service setting.
+    **What you're learning.** Production settings in Compose: graceful stop signals, CPU and memory limits, and logging per service.
 
-    - **Stopping.** `docker stop` sends a signal (SIGTERM by default), waits, and then sends SIGKILL. Both the signal and the wait can be configured. nginx treats SIGTERM as a fast shutdown that drops in-flight requests and SIGQUIT as a graceful one, so the signal you choose decides whether a deploy cuts off downloads. With `docker run` these are `--stop-signal` and `--stop-timeout`; compose has its own keys for the same two settings. A long grace period only costs time when the process really needs it.
-    - **Resources.** Without limits, one busy container can starve its neighbours. *Limits* are hard ceilings; *reservations* are minimums the host tries to guarantee. Compose sets both under `deploy.resources`, and plain `docker compose up` honours them.
-    - **Logging.** Options can differ per service. The default json-file driver grows without bound unless you give it rotation by size and count, and a very chatty service can fill a disk. The `none` driver stores nothing at all, so `docker logs` has nothing to show; that's a deliberate trade.
+    ### The idea
 
-    Changing any of these means recreating the container, which `docker compose up -d` does for you. The running container, not the file, is the proof, so confirm with `docker inspect`.
+    | key | effect |
+    |---|---|
+    | `stop_signal: SIGQUIT` | the signal `docker compose stop` / `down` sends first |
+    | `stop_grace_period: 60s` | how long to wait before SIGKILL (default 10 s) |
+    | `deploy.resources.limits.cpus / memory` | hard caps |
+    | `deploy.resources.reservations.memory` | a soft guarantee (memory reservation) |
+    | `logging.driver` + `logging.options` | per-service log driver and rotation; driver `none` stores nothing |
 
-    **Read up on:**
-    - Compose reference — `stop_signal`, `stop_grace_period`
-    - `docker run --help` — the stop signal and stop timeout options they map to
-    - `docker inspect` — `.Config.StopSignal`, `.Config.StopTimeout`
-    - nginx docs 'Controlling nginx' — signals and their meaning
-    - Compose Deploy Specification — `resources.limits` and `resources.reservations`
-    - `docker inspect` — `.HostConfig.NanoCpus`, `.Memory`, `.MemoryReservation`, `.HostConfig.LogConfig`
-    - `docker stats --no-stream`
-    - Compose reference — `logging` with `driver` and `options`
-    - Docker docs 'Configure logging drivers' — json-file options and the `none` driver
+    Many servers shut down gracefully on a specific signal: nginx on **SIGQUIT** (it finishes in-flight requests), and SIGTERM is a fast shutdown.
+
+    ### Commands you'll use
+
+    ```yaml
+    services:
+      web:
+        stop_signal: SIGQUIT
+        stop_grace_period: 30s
+      worker:
+        deploy:
+          resources:
+            limits: { cpus: "1.0", memory: 512M }
+            reservations: { memory: 128M }
+      noisy:
+        logging:
+          driver: json-file
+          options: { max-size: "2m", max-file: "5" }
+      silent:
+        logging:
+          driver: none
+    ```
+    ```bash
+    docker compose up -d
+    docker inspect PROJECT-web-1 --format '{{.Config.StopSignal}} {{.Config.StopTimeout}}'
+    docker inspect PROJECT-worker-1 --format '{{.HostConfig.NanoCpus}} {{.HostConfig.Memory}} {{.HostConfig.MemoryReservation}}'
+    docker inspect PROJECT-silent-1 --format '{{.HostConfig.LogConfig.Type}}'
+    ```
+
+    ### Common mistakes
+
+    - `cpus: 0.5` unquoted: works, but keep it quoted for consistency.
+    - `max-file: 2` as a number: a string is safer, as in daemon.json (docker-146).
+    - Relying on the image's `STOPSIGNAL`: the task says write it in the compose file.
+
+    ### Check your work
+
+    `downloads` shows `SIGQUIT` and 60, `transcoder` shows 500000000 / 268435456 / 67108864, `chatter` has `1m`/`2`, and `quiet` has driver `none`.
   scenario: |
     The media platform in **`/lab/media/compose.yaml`** works, but the production review
     came back with three findings. Fix all of them in that one file and apply it with
@@ -259,21 +312,47 @@ exercises:
   kind: build
   tags: [network, sidecar, container-mode, pid-namespace, debugging]
   tutorial: |
-    **Concept.** A container is mostly a set of Linux namespaces, and nothing says two containers need separate ones. Joining another container's namespace is how you add capabilities to a container without touching its image.
+    **What you're learning.** Joining another container's network or PID namespace: sidecars and debug containers.
 
-    - **Network namespace.** Containers that share one see the same interfaces and the same loopback, so `localhost` in one is `localhost` in the other. A service that listens only on `127.0.0.1` is unreachable from the network, yet a sidecar in its namespace can talk to it directly. The joining container has no network of its own, so ports can only be published on the original container.
-    - **PID namespace.** Containers that share one see each other's processes. This is how you troubleshoot a minimal image that has no `ps` or shell tools: bring your own tools in a second container. PIDs are per-namespace, so a process has one number inside and another on the host.
+    ### The idea
 
-    Kubernetes pods are built from exactly these parts: the containers of a pod share a network namespace, which is why they reach each other on `localhost`, and can optionally share a PID namespace too.
+    A container is mostly a set of namespaces, and another container can **join** them:
 
-    **Read up on:**
-    - `docker run --help` — the `--network` option and the `container:` mode
-    - `docker run --help` — the `--pid` option and its `container:` form
-    - Docker docs 'Container networks' — joining another container's network
-    - `man pid_namespaces`
-    - `docker exec <c> wget -qO- http://127.0.0.1/...`
-    - `docker exec <c> ps` — view the shared process list
-    - Docker docs 'Namespaces' and `docker top`
+    | option | shares | then |
+    |---|---|---|
+    | `--network container:NAME` | network namespace | its `127.0.0.1` is NAME's loopback, and the ports are shared |
+    | `--pid container:NAME` | PID namespace | `ps` shows NAME's processes, with **its** PIDs |
+
+    That's how you add tools to a container without rebuilding it.
+
+    ### Commands you'll use
+
+    ```bash
+    docker run -d --name scraper --network container:api busybox:1.37 sleep infinity
+    docker exec scraper wget -qO- http://127.0.0.1:9090/metrics | head -3
+
+    docker run -d --name dbg --pid container:job busybox:1.37 sleep infinity
+    docker exec dbg ps
+    ```
+    ```text
+    PID   USER     TIME  COMMAND
+        1 root      0:00 sh -c ...
+        7 root      0:00 sleep 900
+       12 root      0:00 sleep infinity
+    ```
+    ```bash
+    docker exec dbg ps -o pid,args | awk '$2=="sleep" && $3=="900" {print $1}'
+    ```
+    The PIDs are as seen **inside** the shared namespace (not host PIDs).
+
+    ### Common mistakes
+
+    - `-p` together with `--network container:`: not allowed. Ports belong to the namespace owner.
+    - Writing the host PID (from `docker top`) when the namespace PID is asked for.
+
+    ### Check your work
+
+    `docker exec exporter wget -qO- http://127.0.0.1/status` works, and the PID file matches `ps` inside `inspector`.
   scenario: |
     Two running containers need help from tools their images don't include. You won't
     rebuild either one: attach a second container to the namespace it needs.
@@ -346,22 +425,44 @@ exercises:
   kind: build
   tags: [redis, nginx, config-file, templates, envsubst]
   tutorial: |
-    **Concept.** Good images are generic; the configuration that makes them yours comes from outside. There are two common shapes for that, and they solve different problems.
+    **What you're learning.** Configuration from outside the image: mounting a config file, and nginx's `envsubst` templates.
 
-    - **A config file you mount.** When a real config file exists (from ops, from version control), bind-mount it read-only. But mounting is only half of the job: many images load a config file only when you pass its path as the command, so a mounted file that nobody asked the server to read does nothing at all, silently. Always confirm from the running service that the setting took effect, rather than trusting that the file is there.
-    - **A template rendered at start-up.** When the same image must behave differently per environment, keep one template and supply the differences as environment variables. The official nginx image renders template files with `envsubst` when the container starts and writes the result into its config directory. Only variables that are actually set are substituted, which is why nginx's own `$host`-style variables survive the process.
+    ### The idea
 
-    A related point about nginx: a hostname written directly in `proxy_pass` is resolved once, at start-up, and nginx refuses to start if it can't be resolved. Order matters: the backend has to exist first.
+    **A config file**: mount it read-only, then **tell the program to read it**. Many images don't look for one by default. Redis, for example, only reads a config file passed as the first argument:
 
-    **Read up on:**
-    - Docker Hub `redis` page — section on custom configuration
-    - `docker run --help` — `-v` with `:ro`, and trailing command arguments
-    - `redis-cli CONFIG GET` — verify settings took effect
-    - `docker volume create` — persistent data volume
-    - Docker Hub `nginx` page — section 'Using environment variables in nginx configuration'
-    - `docker run -e` — pass variables
-    - `docker network create` — name-based reachability between containers
-    - `docker exec <c> nginx -T` — print the rendered config
+    ```bash
+    redis-server /usr/local/etc/redis/redis.conf
+    ```
+
+    **Templates**: the official nginx image renders every `/etc/nginx/templates/*.template` with `envsubst` at start-up, writing the result to `/etc/nginx/conf.d/` without `.template`. `${VAR}` in the template becomes the container's environment variable. One image, different config per environment.
+
+    nginx's own variables (`$host`, `$uri`) are left alone only if no environment variable has the same name. Avoid naming your variables like nginx's.
+
+    ### Commands you'll use
+
+    ```bash
+    docker run -d --name queue -p 6391:6379 -v /lab/q/redis.conf:/usr/local/etc/redis/redis.conf:ro \
+      -v queue-data:/data redis:7.4-alpine redis-server /usr/local/etc/redis/redis.conf
+    docker exec queue redis-cli config get maxmemory         # the value from your file
+
+    cat /lab/tpl/default.conf.template
+    #   location / { proxy_pass ${UPSTREAM}; }
+    docker run -d --name gw --network appnet -p 8190:80 -e UPSTREAM=http://svc-a:80 \
+      -v /lab/tpl:/etc/nginx/templates:ro nginx:1.28-alpine
+    docker exec gw cat /etc/nginx/conf.d/default.conf          # rendered
+    curl -s localhost:8190 | grep Hostname
+    ```
+
+    ### Common mistakes
+
+    - Mounting `redis.conf` without passing its path: Redis ignores it.
+    - Mounting the template into `conf.d` directly: nginx reads `${...}` literally and fails.
+    - A template with a `.conf` name: only `*.template` files are rendered.
+
+    ### Check your work
+
+    `sessions` reports your config's settings and uses the volume, and `env-proxy`'s rendered config has the backend URL and proxies to `backend-a`.
   scenario: |
     Two services are moving out of hand-edited containers and onto configuration that
     lives outside the image.
@@ -453,23 +554,50 @@ exercises:
   kind: build
   tags: [nginx, basic-auth, tls, certificates]
   tutorial: |
-    **Concept.** A web server facing people has two separate questions to answer: *who is allowed in*, and *is the conversation private*. nginx handles both in configuration, and each is scoped by where you write it.
+    **What you're learning.** nginx front-door security: basic auth for one location, and HTTPS with an HTTP→HTTPS redirect.
 
-    - **Authentication** is per location. `auth_basic` and a password file protect exactly the URLs matched by the `location` block they sit in, so one path can be locked while the rest of the site stays public. The password file holds hashes, not passwords. The file has to be readable by the nginx *worker* processes, which do not run as root.
-    - **Encryption** is per server. HTTPS needs a certificate and a key, and a certificate is only valid for the names it lists. Modern clients ignore the Common Name and look at the subjectAltName extension, so a certificate without one fails verification even if the CN is right.
-    - **Redirecting plain HTTP** to HTTPS is a separate `server` block whose only job is to answer with a 301. Keep the original path and query string in the target, or every deep link lands on the home page.
+    ### The idea
 
-    A self-signed certificate is created locally with openssl, which is enough to test all of this. To test a name that has no DNS entry, tell curl which address to use for it instead of editing any files.
+    **Basic auth**, scoped to a location:
+    ```nginx
+    location /admin/ {
+        auth_basic "Restricted";
+        auth_basic_user_file /etc/nginx/htpasswd;
+    }
+    ```
+    nginx accepts bcrypt, apr1 (MD5) and SHA hashes (`htpasswd -B` works).
 
-    **Read up on:**
-    - nginx docs `ngx_http_auth_basic_module` — `auth_basic`, `auth_basic_user_file`
-    - `man htpasswd` — creating a password file
-    - nginx `location` blocks
-    - `curl -u user:pass -i` — test with and without credentials
-    - `man openssl-req` — `-x509`, `-nodes`, `-subj`, `-addext` for subjectAltName
-    - nginx docs `ngx_http_ssl_module` — `ssl_certificate`, `ssl_certificate_key`
-    - nginx `return 301` redirects
-    - `curl -k -i` and `--resolve` — testing a name without DNS
+    **HTTPS**: a certificate and key (self-signed is fine for a lab), a `listen 443 ssl` server, and a plain-HTTP server that **redirects**:
+    ```nginx
+    server { listen 80;  return 301 https://NAME:PORT$request_uri; }
+    server { listen 443 ssl; server_name NAME; ssl_certificate ...; ssl_certificate_key ...; }
+    ```
+    `$request_uri` keeps the path and query string.
+
+    ### Commands you'll use
+
+    ```bash
+    htpasswd -Bbn admin 'p4ss' > /lab/site/htpasswd
+    openssl req -x509 -newkey rsa:2048 -nodes -days 30 -subj '/CN=app.test' \
+      -addext 'subjectAltName=DNS:app.test' -keyout /lab/certs/server.key -out /lab/certs/server.crt
+    docker run --rm -v /lab/certs/default.conf:/etc/nginx/conf.d/default.conf:ro \
+      -v /lab/certs:/certs:ro nginx:1.28-alpine nginx -t          # test the config first
+    curl -s -o /dev/null -w '%{http_code}\n' localhost:8190/admin/             # 401
+    curl -s -u admin:p4ss -o /dev/null -w '%{http_code}\n' localhost:8190/admin/   # 200
+    curl -sI localhost:8191/x?y=1 | grep -iE '^HTTP|location'
+    curl -sk --resolve app.test:8444:127.0.0.1 https://app.test:8444/ | head -2
+    ```
+    `--resolve NAME:PORT:IP` makes curl use that name (for SNI and the Host header) without editing `/etc/hosts`.
+
+    ### Common mistakes
+
+    - `auth_basic` on the whole server: the public part asks for a password too.
+    - `return 301 https://$host...`: `$host` has no port, so the redirect lands on 443.
+    - The container's port 443 not published as 8443.
+
+    ### Check your work
+
+    `/admin/` gives 401 without credentials and 200 with them, `/` is public, 8181 answers `301` to `https://shop.lab.internal:8443/...`, and 8443 serves the self-signed certificate for that name.
   scenario: |
     Before launch, security has two findings about the sites that face users: an admin
     area anyone can open, and a shop that still speaks plain HTTP.
@@ -599,13 +727,50 @@ exercises:
   kind: build
   tags: [haproxy, load-balancing, compose]
   tutorial: |
-    **Concept.** A load balancer distributes requests across replicas. In compose, a service can be scaled, and the service name resolves to all replicas through the network's DNS.
+    **What you're learning.** Load balancing scaled Compose replicas with HAProxy and Docker's DNS.
 
-    **Read up on:**
-    - Compose reference — `deploy.replicas` or `docker compose up --scale`
-    - HAProxy docs — `backend`, `balance roundrobin`, `server-template` or DNS `resolvers`
-    - `docker compose config` and `docker compose ps`
-    - `curl` repeatedly — watch the hostname in responses change
+    ### The idea
+
+    A scaled service's **name** resolves to **all** its replicas' IPs on the project network (docker-077). HAProxy can use that in two ways:
+
+    - `server-template app 3 app:80 check resolvers docker init-addr none`: creates 3 server slots filled from DNS, kept current at run time;
+    - a fixed list of `server` lines: breaks when the replicas change.
+
+    `balance roundrobin` sends requests to each server in turn.
+
+    ### Commands you'll use
+
+    ```text
+    resolvers docker
+      nameserver dns 127.0.0.11:53
+    defaults
+      mode http
+      timeout connect 5s
+      timeout client 30s
+      timeout server 30s
+    frontend web
+      bind :80
+      default_backend pool
+    backend pool
+      balance roundrobin
+      server-template svc 4 web:80 check resolvers docker init-addr none
+    ```
+    ```bash
+    docker compose up -d
+    docker compose exec lb haproxy -c -f /usr/local/etc/haproxy/haproxy.cfg
+    for i in $(seq 6); do curl -s localhost:8189 | grep Hostname; done | sort | uniq -c
+    ```
+    The image reads `/usr/local/etc/haproxy/haproxy.cfg`. Mount your file there.
+
+    ### Common mistakes
+
+    - `server app app:80`: HAProxy resolves it **once**, to one IP.
+    - No `timeout` settings: HAProxy warns, and connections can hang.
+    - `container_name:` on the scaled service (docker-089).
+
+    ### Check your work
+
+    Repeated `curl localhost:8183` requests show three different hostnames.
   scenario: |
     In **`/lab/lb`**, write a compose project:
 
@@ -694,13 +859,51 @@ exercises:
   kind: build
   tags: [compose, depends_on, init]
   tutorial: |
-    **Concept.** Compose can order service startup based on conditions, not just on start. A one-shot job can be required to finish successfully, and a service can be required to be healthy.
+    **What you're learning.** One-shot jobs in a Compose startup chain: `service_completed_successfully`.
 
-    **Read up on:**
-    - Compose reference — `depends_on` long syntax and its `condition` values
-    - Compose `healthcheck` — defines healthy for a service
-    - `docker compose up -d` then `docker compose ps -a`
-    - `docker compose logs migrate`
+    ### The idea
+
+    `depends_on` conditions (docker-094):
+
+    | condition | waits until the dependency |
+    |---|---|
+    | `service_started` | has started (the default) |
+    | `service_healthy` | reports healthy |
+    | `service_completed_successfully` | has **exited with code 0** |
+
+    A migration job sits in the middle: it waits for a **healthy** database, and the app waits for the migration to **complete**. If the job fails, the app doesn't start.
+
+    ### Commands you'll use
+
+    ```yaml
+      seed:
+        depends_on:
+          db: { condition: service_healthy }
+      web:
+        depends_on:
+          seed: { condition: service_completed_successfully }
+    ```
+    ```bash
+    docker compose up -d
+    docker compose ps -a
+    ```
+    ```text
+    release-db-1     Up 20 seconds (healthy)
+    release-seed-1   Exited (0) 12 seconds ago
+    release-web-1    Up 11 seconds
+    ```
+    ```bash
+    docker compose logs seed | tail -3
+    ```
+
+    ### Common mistakes
+
+    - `restart: always` on the one-shot job: it reruns forever.
+    - `service_started` for the job: the app starts while the migration is still running.
+
+    ### Check your work
+
+    `migrate` exited 0 before `app` started (compare their `State.StartedAt` and `FinishedAt`), and `db` is healthy.
   scenario: |
     In **`/lab/release`**, the **`app`** service must only start after the one-shot
     **`migrate`** service has **finished successfully** (and `migrate` itself must wait
@@ -783,21 +986,47 @@ exercises:
   kind: build
   tags: [compose, backup, pg_dump, cron, busybox]
   tutorial: |
-    **Concept.** Operational jobs are containers too, but they don't belong in the normal `up` of a stack. A backup is run on demand and exits; a scheduler runs forever and starts other work. Both patterns are small, and both have a sharp edge.
+    **What you're learning.** Operational jobs as containers: an on-demand backup with `compose run`, and a cron scheduler container.
 
-    - **On-demand jobs.** Compose profiles keep a helper service out of a plain `up`; `docker compose run` starts it when you ask. The job reaches the database by its service name on the project network, and its output must land on a mounted directory, because a file written inside a throw-away container disappears with it. A redirection such as `>` is shell syntax, so a command that uses one needs a shell.
-    - **Schedules.** Busybox ships a small cron daemon that reads a crontab from a known directory. In a container it must stay in the foreground, or the main process exits and the container with it. It also expects the crontab file to be owned by the matching user and silently ignores it otherwise, which is the classic "the job never runs and nothing says why" trap with bind mounts.
+    ### The idea
 
-    A cron job also has no terminal to complain to: a job that fails looks exactly like a job that hasn't run yet. That is why these jobs write to a log you can see from the host, and why you verify by reading that log after the schedule has fired.
+    **On-demand jobs** (backups, migrations) don't belong in the normal `up`. Put them in a **profile** (docker-096) and run them with `docker compose run --rm SERVICE`, which starts a one-off container on the project's network. `run` ignores profiles: naming the service is enough.
 
-    **Read up on:**
-    - Compose reference — `profiles` and `docker compose run --rm`
-    - `pg_dump --help` — connecting and writing to a file
-    - Compose `volumes` — bind-mounting a host directory
-    - Networking: reach the db service by its service name
-    - `busybox crond --help` — foreground and log level flags, and the crontab directory
-    - `man 5 crontab` — the five time fields
-    - `docker logs` and `docker exec` — verify the job runs
+    **Schedules**: a container whose main process is a cron daemon. busybox `crond -f` runs in the foreground, with `-c DIR` for the crontab directory. The crontab file in that directory is named after the user (`root`). A line is `MIN HOUR DOM MON DOW COMMAND`, so `* * * * *` means every minute.
+
+    ### Commands you'll use
+
+    ```yaml
+      dump:
+        image: postgres:16-alpine
+        profiles: [ops]
+        environment: { PGPASSWORD: secret }
+        volumes: ["./dumps:/dumps"]
+        command: sh -c 'pg_dump -h db -U postgres shop > /dumps/shop.sql'
+    ```
+    ```bash
+    docker compose run --rm dump
+    head -3 dumps/shop.sql
+    ```
+
+    ```bash
+    printf '* * * * * /jobs/rotate.sh\n' > /lab/sched/root
+    docker run -d --name cron -v /lab/sched/root:/var/spool/cron/crontabs/root:ro \
+      -v /lab/sched/rotate.sh:/jobs/rotate.sh:ro -v /lab/sched/logs:/var/log/jobs \
+      busybox:1.37 crond -f -l 8
+    sleep 65; cat /lab/sched/logs/*.log
+    ```
+    The crontab must end with a newline, or the last line is ignored.
+
+    ### Common mistakes
+
+    - The backup service without a profile: it runs on every `up`.
+    - `pg_dump` connecting to `localhost`: in the job's container that's the job itself. Use the service name.
+    - A non-executable script: run it with `sh /path` in the crontab, or `chmod +x`.
+
+    ### Check your work
+
+    `/lab/crm-stack/backups/crm.sql` is a real dump, a plain `up` doesn't start `backup`, and the cleanup log gets a new line every minute.
   scenario: |
     The CRM database has no backups and old files pile up on the host. Add both jobs, kept
     apart from the normal stack.
@@ -903,22 +1132,54 @@ exercises:
   kind: fix
   tags: [compose, anchors, extension-fields, build-target, multi-stage]
   tutorial: |
-    **Concept.** A compose file is code, and it decays the same way code does. Two common kinds of decay: settings copied between services until the copies disagree, and a file that quietly does something other than what its name suggests.
+    **What you're learning.** Keeping Compose files DRY with `x-` extension fields and YAML anchors, and building a chosen stage with `build.target`.
 
-    - **Repetition.** YAML anchors and aliases let you define a block once and reuse it, and a merge key folds that block into a mapping alongside the keys unique to each service. Compose ignores top-level keys beginning with `x-` (extension fields), which gives the shared block a legitimate home. When you collapse copies into one, the copies that have drifted must be brought to the agreed value, not preserved. The merged result, not the source, is what compose runs, so read it back after refactoring.
-    - **Build targets.** A multi-stage Dockerfile can define several named stages, and a build normally produces the *last* one. So the order of stages in a Dockerfile silently decides what gets built. The build can be told to stop at a named stage instead, and compose has a key for it. A dev and a prod image can then come from one Dockerfile without anyone having to remember a flag.
+    ### The idea
 
-    In both cases the check is the same habit: don't trust the file by eye, look at what compose resolved and at what actually runs.
+    **Anchors and merges** (YAML): `&name` labels a block, and `<<: *name` merges it into another mapping. Compose ignores top-level keys starting with **`x-`**, so that's where shared blocks live:
 
-    **Read up on:**
-    - Compose reference — 'Extensions' (`x-` fields) and 'Fragments' / YAML anchors
-    - YAML spec: anchors `&`, aliases `*`, merge `<<:`
-    - `docker compose config` — view the fully merged result
-    - Compare service definitions to find drift
-    - Compose reference — `build.target`
-    - Dockerfile docs — multi-stage builds, `FROM ... AS`
-    - `docker compose up -d --build`
-    - `docker compose exec api ls /` — check for the stage's contents
+    ```yaml
+    x-base: &base
+      image: alpine:3.22
+      restart: unless-stopped
+    services:
+      a:
+        <<: *base
+        command: echo a
+    ```
+    A key set in the service **overrides** the merged one. Merging is shallow: a nested map like `environment` is replaced as a whole, not combined.
+
+    **Stage selection**: `build.target: STAGE` builds that stage of a multi-stage Dockerfile (docker-036). `image:` next to `build:` names the result.
+
+    ### Commands you'll use
+
+    ```bash
+    docker compose config | sed -n '1,30p'          # the expanded result: check every service
+    grep -c 'image:' compose.yaml                    # 1
+    ```
+    ```yaml
+    services:
+      web:
+        build:
+          context: .
+          target: debug
+        image: web:debug
+    ```
+    ```bash
+    docker compose up -d --build
+    docker compose exec web ls /debug-marker
+    docker image inspect web:debug --format '{{.Id}}'
+    ```
+
+    ### Common mistakes
+
+    - Defining the anchor after it's used: YAML anchors must come first in the file.
+    - Overriding `environment` in one worker and losing `QUEUE_HOST`.
+    - `--target` on the command line instead of in the file.
+
+    ### Check your work
+
+    `docker compose config` shows all three workers with the same image, restart policy, `QUEUE_HOST` and `5m` logs, `image:` appears once, and `api:dev` contains `/debug-tools`.
   scenario: |
     The developer tooling needs a clean-up: one project has copies that have drifted
     apart, and another builds the wrong image.
@@ -1078,24 +1339,46 @@ exercises:
   kind: build
   tags: [multi-stage, node, nginx, blue-green, zero-downtime]
   tutorial: |
-    **Concept.** A release has two halves: producing an artifact you trust, and moving users onto it without them noticing.
+    **What you're learning.** Building static assets in a throwaway stage, and a **blue/green** switch with an nginx reload.
 
-    - **Build small.** A multi-stage build uses a tool-heavy first stage to produce files, then copies only the result into a small final image, leaving the compiler or runtime behind. What ships is only what the last stage contains, so a Node.js build can end in an image that has no Node.js at all, with less to patch and less to attack.
-    - **Switch without dropping anyone.** A reverse proxy picks its backend from its config file, and nginx can re-read that config without dropping connections: new workers start with the new config, and old workers finish their in-flight requests and exit. Restarting the container instead would cut everyone off. Always validate the config before you reload; a reload of a broken config is refused, but finding out first is cleaner.
+    ### The idea
 
-    Blue-green is the order of operations built on that: run both versions, switch traffic, confirm, and only then stop the old one.
+    **Build stage for assets**: run the generator in the toolchain image, then `COPY --from=build /src/dist/ /usr/share/nginx/html/` into nginx. Node.js never reaches the final image (docker-037).
 
-    One detail about bind mounts: mounting a *directory* lets an edit on the host appear in the container, even when an editor or `sed -i` replaces the file with a new one. A single-file bind mount is pinned to the original inode and would keep showing the old content.
+    **Blue/green**: both versions run side by side, and the proxy points at one. Switch by changing the proxy's config and **reloading** (`nginx -s reload`). nginx starts new workers on the new config while the old ones finish their requests, so no connection drops. Stop the old version once traffic has moved.
 
-    **Read up on:**
-    - Dockerfile docs — `FROM ... AS`, `COPY --from=`
-    - `docker build -t`
-    - Docker Hub `nginx` page — document root location
-    - `docker run -p` and `curl`; `docker history` to check what shipped
-    - `nginx -t` — test configuration syntax
-    - `nginx -s reload` — graceful reload
-    - `docker exec` — run these inside the container
-    - `proxy_pass` and upstream names resolved over docker networks
+    If the config is a **single-file** bind mount, editing it with `sed -i` breaks the mount (docker-057). Write it in place, or mount the directory.
+
+    ### Commands you'll use
+
+    ```dockerfile
+    FROM node:22-alpine AS build
+    WORKDIR /src
+    COPY . .
+    RUN node build.js
+    FROM nginx:1.28-alpine
+    COPY --from=build /src/dist/ /usr/share/nginx/html/
+    ```
+    ```bash
+    docker run --rm site:1.0 sh -c 'command -v node || echo no node'
+    cat /lab/edge/upstream.conf                      # proxy_pass http://v1:80;
+    cat > /tmp/u.conf < /lab/edge/upstream.conf; sed 's/v1:80/v2:80/' /tmp/u.conf > /lab/edge/upstream.conf
+    docker exec edge nginx -t && docker exec edge nginx -s reload
+    docker inspect edge --format '{{.State.StartedAt}}'   # unchanged
+    curl -s localhost:8192 | grep Hostname                  # v2
+    docker stop v1
+    ```
+    `cat > file` writes into the existing file, so its inode stays the same.
+
+    ### Common mistakes
+
+    - `docker restart front`: drops connections, and the task forbids it.
+    - `sed -i` on a single-file mount: the container keeps the old file.
+    - Stopping blue before you've checked green gets the traffic.
+
+    ### Check your work
+
+    `docs-site` serves the generated HTML on 8187 without node, `front` answers from green with an unchanged start time, and `app-blue` is stopped.
   scenario: |
     Release day. The documentation has to ship as a small image, and the application has
     to move from the old version to the new one with no downtime.
@@ -1210,13 +1493,30 @@ exercises:
   kind: fix
   tags: [compose, incident, troubleshooting]
   tutorial: |
-    **Concept.** A multi-service stack failing in several ways needs systematic debugging: validate the merged config, check each service's state and logs, then test each connection individually.
+    **What you're learning.** A method for a broken Compose stack with several overlapping faults.
 
-    **Read up on:**
-    - `docker compose config` — see what compose actually sees
-    - `docker compose ps -a` and `docker compose logs <svc>`
-    - nginx `proxy_pass` and docker network name resolution
-    - Compose `depends_on`, `healthcheck`, and `networks` references
+    ### Method
+
+    1. **Parse**: `docker compose config` (YAML, anchors, unknown keys, docker-083/175).
+    2. **Compare each requirement with the merged config**:
+
+    | requirement | what to check (exercise) |
+    |---|---|
+    | proxy on 8188, `/api/` → api | ports, config mount path, same network (docker-078) |
+    | api after a healthy db | db `healthcheck` + `condition: service_healthy` (docker-094) |
+    | db password from a secret | top-level `secrets`, service `secrets`, `POSTGRES_PASSWORD_FILE` (docker-136) |
+    | volumes `pgdata` / `redisdata` | declared at top level and mounted at the right paths (docker-086) |
+    | cache AOF | `command: redis-server --appendonly yes` (docker-044) |
+    | all `unless-stopped` | the anchor merged into **every** service (docker-175) |
+
+    3. **Run**: `docker compose up -d`, `docker compose ps -a`, `docker compose logs SERVICE` for anything not up.
+    4. **Test** the path end to end: `curl localhost:8188/` and `curl localhost:8188/api/`.
+
+    A changed password doesn't apply to an already initialised volume (docker-099). Check `docker compose logs db`.
+
+    ### Check your work
+
+    Every service is up with `unless-stopped`, db is healthy and reads the secret file, the cache has AOF on `redisdata`, and both proxy paths answer.
   scenario: |
     The shop stack in **`/lab/eshop`** has been "improved" by three different people and
     nothing works. Requirements:
