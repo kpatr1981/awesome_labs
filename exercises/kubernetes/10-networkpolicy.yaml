@@ -12,13 +12,76 @@ exercises:
   kind: build
   tags: [networkpolicy, default-deny, namespace-isolation, automation]
   tutorial: |
-    **Concept.** Pods accept all traffic until a NetworkPolicy selects them; from then on only what some policy allows gets through, for the directions listed in `policyTypes`. Policies are additive and namespaced, so an empty `podSelector` means "every pod here", an empty rule list means "nothing", and there is no cluster-wide object in vanilla Kubernetes: covering many namespaces means applying one policy to each, usually with a small loop.
+    **What you're learning.** **NetworkPolicies** from zero: how pods go from "accept everything" to "only what's allowed", and default-deny policies.
 
-    **Read up on:**
-    - Kubernetes docs: Network Policies, especially "Default policies"
-    - `kubectl explain networkpolicy.spec.podSelector` and `networkpolicy.spec.policyTypes`
-    - `kubectl explain networkpolicy.spec.ingress.from` — how an empty selector differs from a missing one
-    - `kubectl get ns -l key=value -o name` — select namespaces for a shell loop
+    ### NetworkPolicies from zero
+
+    By default every pod can talk to every other pod in the cluster. A **NetworkPolicy** selects some pods and lists what traffic they may receive (**ingress**) and/or send (**egress**). The CNI plugin enforces it (here **Calico**).
+
+    The rules that confuse everyone:
+
+    1. A pod not selected by any policy is **wide open**.
+    2. Once **any** policy selects a pod for a direction (listed in `policyTypes`), only traffic that **some** policy allows gets through in that direction.
+    3. Policies are **additive**: there's no "deny" rule, only allows that add up.
+    4. Policies are **namespaced**: they select pods in their own namespace.
+
+    | `spec` part | meaning |
+    |---|---|
+    | `podSelector: {}` | every pod in the namespace |
+    | `policyTypes: [Ingress]` | this policy governs incoming traffic |
+    | no `ingress:` list (or empty) | allow nothing in → **default deny** |
+    | `ingress: [{from: [...]}]` | allow from those sources |
+
+    ```yaml
+    apiVersion: networking.k8s.io/v1
+    kind: NetworkPolicy
+    metadata: {name: deny-in, namespace: demo}
+    spec:
+      podSelector: {}
+      policyTypes: [Ingress]
+    ```
+
+    Same-namespace only: `ingress: [{from: [{podSelector: {}}]}]` (a `podSelector` in `from` means pods in the **policy's** namespace).
+
+    ### Commands you'll use
+
+    ```bash
+    kubectl apply -f /lab/deny-in.yaml
+    kubectl get netpol -n demo
+    kubectl describe netpol deny-in -n demo
+    ```
+    ```text
+    Spec:
+      PodSelector:     <none> (Allowing the specific traffic to all pods in this namespace)
+      Allowing ingress traffic:
+        <none> (Selected pods are isolated for ingress connectivity)
+      Not affecting egress traffic
+    ```
+
+    Test from a throw-away pod (`wget -T 3` gives up after 3 seconds instead of hanging):
+    ```bash
+    kubectl run t --rm -i --restart=Never --image=busybox:1.37 -n other -- \
+      wget -qO- -T 3 http://web.demo
+    ```
+    `wget: download timed out` = blocked.
+
+    Many namespaces at once:
+    ```bash
+    for ns in $(kubectl get ns -l tier=critical -o jsonpath='{.items[*].metadata.name}'); do
+      kubectl apply -n "$ns" -f /lab/default-deny.yaml
+    done
+    ```
+    (The policy file has no `namespace:`, so `-n` decides.)
+
+    ### Common mistakes
+
+    - `podSelector` missing entirely: required; `{}` is "all".
+    - Expecting a policy in one namespace to protect another.
+    - Forgetting `Egress` in `policyTypes` when both directions must be denied.
+
+    ### Check your work
+
+    `kubectl describe netpol` says ingress (and egress where asked) is isolated, and a test connection from outside the allowed set times out.
   scenario: |
     The security team wants namespaces that start closed and open up deliberately. Calico enforces NetworkPolicies on this cluster. Three rollouts:
 
@@ -148,14 +211,59 @@ exercises:
   kind: build
   tags: [networkpolicy, podSelector, namespaceSelector, ingress-controller, monitoring]
   tutorial: |
-    **Concept.** An ingress rule names its callers with a `podSelector` (pods in the policy's own namespace), a `namespaceSelector` (all pods in matching namespaces), or both together in one list item (matching pods in matching namespaces only). Namespaces are selected by label, and every namespace automatically carries `kubernetes.io/metadata.name`, which is the reliable way to name one. Traffic that arrives through an ingress controller comes from the controller's pods, so that is the source a policy has to allow.
+    **What you're learning.** The ways to name a caller: by pod label, by namespace label, and both together.
 
-    **Read up on:**
-    - Kubernetes docs: Network Policies, "Behavior of to and from selectors"
-    - `kubectl explain networkpolicy.spec.ingress.from.namespaceSelector`
-    - Kubernetes docs: Well-Known Labels — `kubernetes.io/metadata.name`
-    - `kubectl label namespace --help`
-    - `kubectl get pods -n <ns> --show-labels` — read the real labels before you select on them
+    ### The idea
+
+    Inside `ingress.from`, each list item is one allowed source:
+
+    | item | allows |
+    |---|---|
+    | `podSelector: {...}` | matching pods **in the policy's namespace** |
+    | `namespaceSelector: {...}` | **all** pods in matching namespaces |
+    | both **in the same item** | matching pods **in** matching namespaces (AND) |
+    | `ipBlock: {cidr: ...}` | addresses (mostly for outside the cluster) |
+
+    Every namespace carries the label `kubernetes.io/metadata.name: NAME` automatically: the reliable way to select one namespace by name.
+
+    `ports:` in the same rule narrows it to those destination ports.
+
+    ```yaml
+    ingress:
+    - from:
+      - namespaceSelector: {matchLabels: {kubernetes.io/metadata.name: ops}}
+        podSelector: {matchLabels: {app: grafana}}        # same item → AND
+      ports:
+      - {protocol: TCP, port: 3000}
+    ```
+
+    **Through an ingress controller**: the connection reaching your pod comes from **Traefik's pods** (namespace `traefik`), not from the browser. Allow that namespace.
+
+    ### Commands you'll use
+
+    ```bash
+    kubectl get ns --show-labels | grep -E 'NAME|traefik|ops'
+    kubectl label namespace data-team purpose=analytics
+    kubectl apply -f /lab/policies.yaml
+    kubectl describe netpol -n demo
+    ```
+
+    Test both an allowed and a denied caller:
+    ```bash
+    kubectl run ok --rm -i --restart=Never --image=busybox:1.37 -n demo --labels=tier=frontend -- wget -qO- -T 3 http://backend
+    kubectl run no --rm -i --restart=Never --image=busybox:1.37 -n demo -- wget -qO- -T 3 http://backend
+    ```
+    `--labels` gives the test pod the label the policy expects.
+
+    ### Common mistakes
+
+    - `podSelector` meant for another namespace: it only looks at the policy's own namespace.
+    - Two items (`- namespaceSelector` and `- podSelector`) when AND was meant (k8s-188).
+    - Allowing the client namespace when traffic really comes from the ingress controller.
+
+    ### Check your work
+
+    For each policy, one allowed caller connects and one other caller times out; the public URL through Traefik still works.
   scenario: |
     Four teams need access rules, each one a different way of naming the caller. Each policy must allow exactly what is asked and nothing more:
 
@@ -379,13 +487,51 @@ exercises:
   kind: build
   tags: [networkpolicy, egress, dns, ipBlock, cross-namespace]
   tutorial: |
-    **Concept.** Once egress is restricted, every destination must be allowed explicitly, and that includes CoreDNS: without it a pod cannot even turn a Service name into an IP, and the failure looks like a broken application. Destinations can be pods and namespaces, chosen with selectors, or addresses outside the cluster, chosen with `ipBlock`. Policies match the pod IPs behind a Service, so select the backing pods and their container port.
+    **What you're learning.** Egress policies: allowing outbound traffic per destination, and never forgetting DNS.
 
-    **Read up on:**
-    - `kubectl explain networkpolicy.spec.egress.to`
-    - `kubectl explain networkpolicy.spec.egress.to.ipBlock`
-    - Kubernetes docs: Network Policies, "Default deny all egress traffic"
-    - `kubectl -n kube-system get pods --show-labels` — how CoreDNS is labelled, and remember DNS uses UDP and TCP
+    ### The idea
+
+    With `policyTypes: [Egress]`, a selected pod may only open connections that some `egress.to` rule allows. That includes **DNS**: a pod that can't reach CoreDNS can't turn `api` into an IP, and the failure looks like "bad address" or a broken app.
+
+    DNS rule (CoreDNS pods carry `k8s-app: kube-dns` in `kube-system`):
+    ```yaml
+    - to:
+      - namespaceSelector: {matchLabels: {kubernetes.io/metadata.name: kube-system}}
+        podSelector: {matchLabels: {k8s-app: kube-dns}}
+      ports:
+      - {protocol: UDP, port: 53}
+      - {protocol: TCP, port: 53}
+    ```
+
+    Destinations:
+
+    | kind | `to` item |
+    |---|---|
+    | pods in the same namespace | `podSelector` |
+    | pods in another namespace | `namespaceSelector` + `podSelector` (same item) |
+    | an outside address | `ipBlock: {cidr: 203.0.113.9/32}` |
+
+    Policies see **pod IPs and container ports**, not Service IPs and ports: select the pods behind the Service and their **target** port.
+
+    ### Commands you'll use
+
+    ```bash
+    kubectl get pods -n kube-system -l k8s-app=kube-dns --show-labels
+    kubectl apply -f /lab/egress.yaml
+    kubectl exec -n demo deploy/app -- nslookup api                 # DNS works
+    kubectl exec -n demo deploy/app -- wget -qO- -T 3 http://api     # allowed
+    kubectl exec -n demo deploy/app -- wget -qO- -T 3 http://example.com   # blocked
+    ```
+
+    ### Common mistakes
+
+    - Only UDP 53: larger answers use TCP.
+    - Allowing the Service's port when the pods listen on another one.
+    - `ipBlock` without `/32` for a single address.
+
+    ### Check your work
+
+    From the selected pods: DNS resolves, each allowed destination answers, and everything else times out.
   scenario: |
     Three namespaces get outbound allow-lists, each with a different kind of destination. In all of them, name resolution has to keep working:
 
@@ -587,13 +733,49 @@ exercises:
   kind: fix
   tags: [networkpolicy, egress, dns, troubleshooting, labels, policyTypes]
   tutorial: |
-    **Concept.** The API server accepts any well-formed NetworkPolicy, so a mistake only shows up as traffic that behaves wrongly. The usual suspects are a selector that matches no pods because of a label typo, a `policyTypes` entry that switches on a direction nobody meant to restrict, and a default-deny egress that forgot DNS. Debug by comparing what the policy selects with the labels pods really have, and by asking which direction is failing.
+    **What you're learning.** Debugging NetworkPolicies that were accepted by the API but behave wrongly.
 
-    **Read up on:**
-    - `kubectl describe networkpolicy` — how the API reads your selectors
-    - `kubectl get pods --show-labels` and `kubectl get pods -l key=value`
-    - `kubectl explain networkpolicy.spec.policyTypes` — including its default when omitted
-    - `nslookup` and `wget -T 2` from inside a pod, to tell DNS failures from connection failures
+    ### Method
+
+    The API accepts any well-formed policy, so mistakes only show as traffic problems. Three usual suspects:
+
+    | symptom | cause | check |
+    |---|---|---|
+    | "bad address" / names don't resolve | default-deny egress without a DNS rule | `kubectl get netpol -o yaml` → any egress to kube-dns? |
+    | an allow policy that doesn't allow | selector matches **no** pods (label typo) | compare `kubectl describe netpol` selectors with `kubectl get pods --show-labels` |
+    | everything outbound broke after an "ingress" policy | `policyTypes` lists `Egress` too, with no egress rules | `kubectl get netpol X -o jsonpath='{.spec.policyTypes}'` |
+
+    ### Commands you'll use
+
+    ```bash
+    kubectl get netpol -n demo
+    kubectl describe netpol allow-ui-to-api -n demo
+    ```
+    ```text
+      PodSelector:     app=api
+      Allowing ingress traffic:
+        To Port: <any> (traffic allowed to all ports)
+        From:
+          PodSelector: app=frontend
+    ```
+
+    ```bash
+    kubectl get pods -n demo --show-labels       # the callers are app=ui, not app=frontend
+    kubectl patch netpol allow-ui-to-api -n demo --type=json \
+      -p '[{"op":"replace","path":"/spec/ingress/0/from/0/podSelector/matchLabels/app","value":"ui"}]'
+    kubectl patch netpol worker-in -n demo --type=merge -p '{"spec":{"policyTypes":["Ingress"]}}'
+    ```
+
+    Since policies add up, a missing permission is usually fixed by **adding** a policy (like `allow-dns`), not by editing others.
+
+    ### Common mistakes
+
+    - Deleting the default-deny to make things work.
+    - Editing the wrong selector (the target's instead of the caller's).
+
+    ### Check your work
+
+    Each ticket's failing connection now works, and the default-deny policies are still there.
   scenario: |
     Three tickets landed after last week's security rollout. Each policy applied without an error and each does the wrong thing. Find out why before you change anything:
 
@@ -766,13 +948,52 @@ exercises:
   kind: build
   tags: [networkpolicy, endPort, database, egress, named-ports]
   tutorial: |
-    **Concept.** A policy's `ports` list narrows a rule to specific destinations. Beyond a single number, an entry can span a range with `endPort`, or refer to a container's port by name so the policy survives a change of number between releases. One policy can also govern both directions: list `Ingress` and `Egress` in `policyTypes`, and an empty egress section then means no outbound traffic at all.
+    **What you're learning.** The `ports` section in detail: ranges, named ports, and denying all egress for one workload.
 
-    **Read up on:**
-    - `kubectl explain networkpolicy.spec.ingress.ports` — `port`, `endPort`, `protocol`
-    - Kubernetes docs: Network Policies, "Targeting a range of ports"
-    - `kubectl explain pod.spec.containers.ports.name`
-    - `kubectl explain networkpolicy.spec.policyTypes` — what listing a type with no rules does
+    ### The idea
+
+    | port entry | matches |
+    |---|---|
+    | `{protocol: TCP, port: 443}` | one port |
+    | `{protocol: TCP, port: 9000, endPort: 9100}` | a range (inclusive) |
+    | `{protocol: TCP, port: metrics}` | the container port **named** `metrics`, whatever its number |
+
+    A rule with `ports` but no `from` allows those ports **from anywhere**.
+
+    One policy can govern both directions: `policyTypes: [Ingress, Egress]` with an `ingress` section and **no** `egress` section = some traffic in, **nothing** out.
+
+    ```yaml
+    spec:
+      podSelector: {matchLabels: {app: vault}}
+      policyTypes: [Ingress, Egress]
+      ingress:
+      - from: [{podSelector: {matchLabels: {app: web}}}]
+        ports: [{protocol: TCP, port: 8200}]
+    ```
+
+    ### Commands you'll use
+
+    ```bash
+    kubectl get pods -n demo -l app=billing -o jsonpath='{.items[0].spec.containers[0].ports}'; echo
+    ```
+    ```text
+    [{"containerPort":50051,"name":"grpc","protocol":"TCP"}]
+    ```
+
+    ```bash
+    kubectl apply -f /lab/ports.yaml
+    kubectl describe netpol -n demo
+    ```
+
+    ### Common mistakes
+
+    - `endPort` lower than `port`, or without `port`.
+    - A named port that isn't declared in the container spec: nothing matches.
+    - Forgetting that DNS is blocked too when egress is denied (fine here: the database needs none).
+
+    ### Check your work
+
+    Allowed ports connect, others time out; from the locked-down pods any outbound connection fails.
   scenario: |
     Three workloads need their ports locked down, and each calls for a different feature of the `ports` section:
 
@@ -962,13 +1183,47 @@ exercises:
   kind: build
   tags: [networkpolicy, investigation]
   tutorial: |
-    **Concept.** A policy only matters to a pod if its podSelector matches the pod's labels. An empty selector matches all. Compare each policy's selector with the target pod's labels.
+    **What you're learning.** Working out which policies apply to a pod.
 
-    **Read up on:**
-    - `kubectl get pod -l LABEL --show-labels`
-    - `kubectl get --help` — custom-columns output
-    - `kubectl get netpol -o json` with `jq` — filtering
-    - `kubectl describe netpol`
+    ### The idea
+
+    Only policies whose `podSelector` **matches the pod's labels** affect it. An empty selector (`{}`) matches every pod in the namespace; `matchLabels` must all match; `matchExpressions` can use `In`, `NotIn`, `Exists`, `DoesNotExist`.
+
+    ### Commands you'll use
+
+    ```bash
+    kubectl get pods -n demo -l app=target --show-labels
+    ```
+    ```text
+    NAME     LABELS
+    target   app=target,tier=db,env=prod
+    ```
+
+    ```bash
+    kubectl get netpol -n demo -o custom-columns=NAME:.metadata.name,SELECTOR:.spec.podSelector
+    ```
+    ```text
+    NAME          SELECTOR
+    deny-all      map[]
+    db-only       map[matchLabels:map[tier:db]]
+    web-only      map[matchLabels:map[app:web]]
+    not-staging   map[matchExpressions:[map[key:env operator:NotIn values:[staging]]]]
+    ```
+
+    Let the API do the matching: turn each selector into a label query.
+    ```bash
+    kubectl get pods -n demo -l 'env notin (staging)' -o name        # matches target?
+    kubectl get pods -n demo -l tier=db -o name
+    ```
+
+    ### Common mistakes
+
+    - Forgetting the empty selector: it selects everyone.
+    - `NotIn` also matches pods that **don't have** the key.
+
+    ### Check your work
+
+    Your list contains exactly the policies whose selector, as a label query, returns the target pod.
   scenario: |
     Namespace **`maze`** has six NetworkPolicies. Traffic from the **`client`** pod to the
     **`target`** service on port 80 is blocked, and you need to tell the owning team
@@ -1045,13 +1300,39 @@ exercises:
   kind: build
   tags: [networkpolicy, multi-tenancy]
   tutorial: |
-    **Concept.** Tenant isolation combines policies per namespace: allow same-namespace pods and the ingress controller's namespace, and nothing else. A policy applies only in the namespace where it exists.
+    **What you're learning.** Tenant isolation: the same policy in each tenant's namespace.
 
-    **Read up on:**
-    - `kubectl explain networkpolicy.spec.ingress.from` — how multiple entries combine
-    - `kubectl get ns --show-labels`
-    - `kubectl apply -n NS` — one object per namespace
-    - `curl -H 'Host: ...' http://node01:30080/` — verify public URLs
+    ### The idea
+
+    To isolate tenants, each namespace needs its own policy (policies don't cross namespaces): allow from its own pods and from the ingress controller, nothing else. Two items in one `from` list are OR'ed.
+
+    ```yaml
+    spec:
+      podSelector: {}
+      policyTypes: [Ingress]
+      ingress:
+      - from:
+        - podSelector: {}                                            # own namespace
+        - namespaceSelector: {matchLabels: {kubernetes.io/metadata.name: traefik}}   # the ingress controller
+    ```
+
+    ### Commands you'll use
+
+    ```bash
+    for ns in red blue; do kubectl apply -n "$ns" -f /lab/isolation.yaml; done
+    kubectl exec -n red deploy/app -- wget -qO- -T 3 http://app.blue      # blocked
+    curl -H 'Host: red.example.com' http://node01:30080/                   # still works
+    curl -H 'Host: blue.example.com' http://node01:30080/
+    ```
+
+    ### Common mistakes
+
+    - One policy in one namespace only.
+    - Forgetting the ingress controller: the public URLs stop working.
+
+    ### Check your work
+
+    Cross-tenant calls time out, same-namespace calls and both public URLs work.
   scenario: |
     Two tenants share the cluster: namespaces **`acme`** and **`globex`**, each with an
     `app` service exposed through the ingress controller (`acme.example.com`,
@@ -1101,13 +1382,57 @@ exercises:
   kind: fix
   tags: [networkpolicy, semantics, security]
   tutorial: |
-    **Concept.** Inside one from entry, a namespaceSelector and a podSelector combine with AND. Written as separate list items they combine with OR. The YAML indentation and dashes decide which one you get.
+    **What you're learning.** How YAML structure turns AND into OR in a NetworkPolicy.
 
-    **Read up on:**
-    - Kubernetes docs: Network Policies, Behavior of to and from selectors
-    - `kubectl explain networkpolicy.spec.ingress.from`
-    - `kubectl get netpol NAME -o yaml` — read list structure carefully
-    - `kubectl exec` tests from several pods and namespaces
+    ### The idea
+
+    The dash decides:
+
+    ```yaml
+    from:                                   # ONE item: pods labelled app=x IN namespace ops (AND)
+    - namespaceSelector: {matchLabels: {kubernetes.io/metadata.name: ops}}
+      podSelector: {matchLabels: {app: x}}
+    ```
+    ```yaml
+    from:                                   # TWO items: any pod in ops, OR app=x pods in THIS namespace (OR)
+    - namespaceSelector: {matchLabels: {kubernetes.io/metadata.name: ops}}
+    - podSelector: {matchLabels: {app: x}}
+    ```
+
+    A one-character difference (`-` before `podSelector`) widens the policy a lot. `kubectl describe` makes it visible.
+
+    ### Commands you'll use
+
+    ```bash
+    kubectl describe netpol scrape -n demo
+    ```
+    ```text
+        From:
+          NamespaceSelector: kubernetes.io/metadata.name=ops
+        From:
+          PodSelector: app=prometheus
+    ```
+    Two `From:` blocks = OR. After the fix:
+    ```text
+        From:
+          NamespaceSelector: kubernetes.io/metadata.name=ops
+          PodSelector: app=prometheus
+    ```
+
+    ```bash
+    kubectl get netpol scrape -n demo -o yaml > /lab/scrape.yaml
+    vi /lab/scrape.yaml          # remove the dash before podSelector and align it under namespaceSelector
+    kubectl apply -f /lab/scrape.yaml
+    ```
+
+    ### Common mistakes
+
+    - Indentation: `podSelector` must line up with `namespaceSelector` inside the same item.
+    - Dropping the `ports` restriction while editing.
+
+    ### Check your work
+
+    `describe` shows one `From:` with both selectors; a non-Prometheus pod in `monitoring` and a Prometheus-labelled pod elsewhere are both blocked.
   scenario: |
     The policy **`metrics-scrape`** (namespace **`prod`**) was meant to allow scraping of
     port 9090 on the `api` pods **only by Prometheus**, i.e. pods labelled
@@ -1192,14 +1517,37 @@ exercises:
   kind: fix
   tags: [networkpolicy, incident]
   tutorial: |
-    **Concept.** A zero-trust rollout needs an explicit rule for each flow in both directions: the caller's egress and the receiver's ingress, plus DNS. Walk each intended flow and check both sides.
+    **What you're learning.** Rolling out zero trust properly: every flow needs egress on the caller and ingress on the receiver, plus DNS.
 
-    **Read up on:**
-    - `kubectl get netpol -n NS` and `kubectl describe netpol` — the whole policy set
-    - `kubectl get pods --show-labels -A`
-    - `kubectl explain networkpolicy.spec` — selectors, ports, directions
-    - `kubectl exec POD -- nc -z -w 2 HOST PORT` — test each hop
-    - Kubernetes docs: Network Policies
+    ### Method
+
+    With default-deny in **both** directions, each intended flow needs **two** allows:
+
+    ```
+    caller ──(egress rule on caller)──► network ──(ingress rule on receiver)──► receiver
+    ```
+
+    Write the flows down, then one row per flow:
+
+    | flow | egress (caller) | ingress (receiver) |
+    |---|---|---|
+    | everyone → DNS | `allow-dns`: all pods → kube-dns UDP/TCP 53 | (kube-system has no policy) |
+    | Traefik → web:80 | (Traefik's namespace isn't restricted) | web: from namespace `traefik`, port 80 |
+    | web → api | web: to `app=api`, port 80 | api: from `app=web`, port 80 |
+    | api → db | api: to `app=db`, port 5432 | db: from `app=api`, port 5432 |
+
+    Existing policies may have the classic bugs: a `podSelector` where a `namespaceSelector` was needed (another namespace), a port that's the Service's instead of the container's, a missing direction. Use `kubectl describe netpol` and the pods' labels and `containerPort`s (k8s-185).
+
+    Test each flow from the real caller:
+    ```bash
+    kubectl exec -n shop deploy/web -- wget -qO- -T 3 http://api
+    kubectl exec -n shop deploy/api -- nc -z -w 3 db 5432 && echo db ok
+    curl -H 'Host: shop.example.com' http://node01:30080/
+    ```
+
+    ### Check your work
+
+    All intended flows work, an unintended one (web → db) times out, and the default-deny policies are unchanged.
   scenario: |
     The security team rolled out NetworkPolicies to namespace **`shop`** on Friday
     evening. Now:
