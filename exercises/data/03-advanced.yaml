@@ -12,20 +12,45 @@ exercises:
   kind: fix
   tags: [redis, sorted-set, list, queue]
   tutorial: |
-    **Concept.** Redis is more than a key-value store: each key holds a data structure, and the operations on that structure do the work your application would otherwise have to do. A game backend leans on two of them.
+    **What you're learning.** Redis data types from scratch: sorted sets for rankings, lists for queues.
 
-    A **sorted set** keeps unique members ordered by a numeric score, so a leaderboard is always in order and you can read it by rank or by score range. Ranks count from 0, and the "reverse" commands count from the top.
+    ### Redis from zero
 
-    A **list** can act as a queue. The reliable-queue pattern has a worker move a job into a second "processing" list while it runs, so a job is never only in the worker's memory. If the worker crashes, the job is still in that list and can be moved back atomically. Which end you take from and which end you push to decides the final order.
+    Redis is an in-memory server where each **key** holds a **data structure**, and its commands work on that structure atomically:
 
-    **Read up on:**
-    - `ZADD` and `ZSCORE` — how members and scores are stored
-    - `ZRANGE` and `ZREVRANGE` — read members by rank, in either direction
-    - Rank numbering — whether ranks start at 0 or 1
-    - `LMOVE source dest LEFT|RIGHT LEFT|RIGHT` — atomic move between lists
-    - `LRANGE key 0 -1` and `LLEN` — inspect a list
-    - `LPUSH` versus `RPUSH` — which end each command adds to
-    - `docker exec ... redis-cli` — run one command inside the container
+    | type | for | key commands |
+    |---|---|---|
+    | string | values, counters | `SET`, `GET`, `INCR` |
+    | hash | records | `HSET`, `HGETALL` |
+    | list | queues | `LPUSH`/`RPUSH` (add left/right), `LPOP`/`RPOP`, `LRANGE` |
+    | set | unique members | `SADD`, `SMEMBERS` |
+    | **sorted set** | rankings | `ZADD`, `ZRANGE`/`ZREVRANGE` (by rank), `ZSCORE` |
+
+    Ranks count from **0**. `ZREVRANGE key 0 0` is the top member, and `WITHSCORES` adds the scores. `LMOVE src dst LEFT|RIGHT LEFT|RIGHT` moves one element between lists atomically.
+
+    ### Commands you'll use
+
+    ```bash
+    r() { docker exec kl-redis redis-cli "$@"; }
+    r TYPE kl:ranking
+    r ZREVRANGE kl:ranking 0 4 WITHSCORES
+    r ZREVRANGE kl:ranking 1 1            # second place
+
+    r LRANGE kl:todo 0 -1
+    r LRANGE kl:doing 0 -1
+    r LMOVE kl:doing kl:todo RIGHT LEFT   # last of doing → front of todo
+    ```
+    To put a whole list back in front **in the same order**, move items from its **end** to the **front** of the queue, one at a time, until it's empty: the last one moved ends up first.
+
+    ### Common mistakes
+
+    - `ZRANGE` (ascending) when the highest scores are wanted.
+    - `RPUSH` the stuck jobs: they go to the back.
+    - Moving in the wrong order: the jobs come out reversed.
+
+    ### Check your work
+
+    `third-place.txt` holds `ZREVRANGE kl:scores 2 2`, `LRANGE kl:jobs 0 4` shows the five stuck jobs in their original order, and `kl:processing` is empty.
   scenario: |
     Redis is running in the container **`kl-redis`**. Open a prompt with:
 
@@ -112,13 +137,44 @@ exercises:
   kind: fix
   tags: [sql, postgres, materialized-view]
   tutorial: |
-    **Concept.** A materialized view stores its query result on disk, so it goes stale until refreshed. A plain refresh blocks readers, and the non-blocking variant has a requirement on the view.
+    **What you're learning.** **Materialized views**: refreshing them, and refreshing without blocking readers.
 
-    **Read up on:**
-    - `REFRESH MATERIALIZED VIEW` — recompute the stored result
-    - The `CONCURRENTLY` option — what it avoids, and the error you get without its prerequisite
-    - `CREATE INDEX` on a materialized view — works like on tables
-    - `\dm` and `pg_matviews` — list views and definitions
+    ### The idea
+
+    A **materialized view** stores its query's result like a table. It's fast to read, but **stale** until refreshed:
+
+    | command | effect |
+    |---|---|
+    | `REFRESH MATERIALIZED VIEW v` | rebuilds it, **locking out readers** meanwhile |
+    | `REFRESH MATERIALIZED VIEW CONCURRENTLY v` | builds a new copy and swaps in the differences: readers keep working |
+
+    `CONCURRENTLY` requires a **unique index** on the view covering every row (so rows can be matched).
+
+    ### Commands you'll use
+
+    ```bash
+    q() { docker exec kl-pg psql -U lab -d lab -c "$1"; }
+    q '\d+ visits_by_week'
+    q "SELECT max(week) FROM visits_by_week"; q "SELECT max(date_trunc('week', ts)) FROM visits"
+    q 'REFRESH MATERIALIZED VIEW CONCURRENTLY visits_by_week'
+    ```
+    ```text
+    ERROR:  cannot refresh materialized view "public.visits_by_week" concurrently
+    HINT:  Create a unique index with no WHERE clause on one or more columns of the materialized view.
+    ```
+    ```bash
+    q 'CREATE UNIQUE INDEX ON visits_by_week (week)'
+    q 'REFRESH MATERIALIZED VIEW CONCURRENTLY visits_by_week'
+    ```
+
+    ### Common mistakes
+
+    - Dropping it and creating a table: the task says keep it a materialized view.
+    - A unique index on a column that isn't unique in the view (one row per day is unique; check).
+
+    ### Check your work
+
+    The view's totals match a fresh `GROUP BY` on `sales`, it has a unique index, and `REFRESH ... CONCURRENTLY` succeeds.
   scenario: |
     PostgreSQL is running in **`kl-pg`** (`docker exec -it kl-pg psql -U lab -d lab`).
 
@@ -167,13 +223,45 @@ exercises:
   kind: fix
   tags: [sql, postgres, roles, grants]
   tutorial: |
-    **Concept.** PostgreSQL checks access at several levels: the schema first, then the table. Privileges granted on existing tables do not cover tables created later unless default privileges say so.
+    **What you're learning.** PostgreSQL privileges: schema `USAGE`, table `SELECT`, and **default privileges** for future tables.
 
-    **Read up on:**
-    - `GRANT USAGE ON SCHEMA` and `GRANT SELECT ON TABLE` — the two levels
-    - `ALTER DEFAULT PRIVILEGES` — rules for future objects
-    - `\dp` and `\ddp` in psql — show current and default privileges
-    - `has_table_privilege()` — test a privilege without logging in
+    ### The idea
+
+    Reading `schema.table` needs **two** grants:
+
+    1. `USAGE` on the **schema** (to look inside it);
+    2. `SELECT` on the **table**.
+
+    Grants apply to **existing** objects only. For tables created **later**:
+
+    ```sql
+    ALTER DEFAULT PRIVILEGES [FOR ROLE creator] IN SCHEMA reports GRANT SELECT ON TABLES TO analyst;
+    ```
+    Default privileges apply to objects created **by** that role (the one running the command, unless `FOR ROLE` says otherwise). `GRANT SELECT ON ALL TABLES IN SCHEMA` would include tables you must keep private.
+
+    ### Commands you'll use
+
+    ```bash
+    q() { docker exec -i kl-pg psql -U lab -d lab -c "$1"; }
+    q '\dn+ reports'
+    q '\dp reports.*'
+    q 'GRANT USAGE ON SCHEMA reports TO viewer'
+    q 'GRANT SELECT ON reports.daily, reports.weekly TO viewer'
+    q 'ALTER DEFAULT PRIVILEGES IN SCHEMA reports GRANT SELECT ON TABLES TO viewer'
+    q '\ddp'
+    docker exec kl-pg psql -U viewer -d lab -c 'SELECT count(*) FROM reports.daily'
+    docker exec kl-pg psql -U viewer -d lab -c 'SELECT count(*) FROM reports.payroll'    # permission denied
+    ```
+
+    ### Common mistakes
+
+    - Only the table grant: "permission denied for schema reports".
+    - `ALL TABLES IN SCHEMA`: includes `salaries`.
+    - `GRANT ALL`: allows changes.
+
+    ### Check your work
+
+    `analyst` reads `sales` and `visits` and a newly created table in `reports`, gets "permission denied" on `salaries` and on writes, and isn't a superuser.
   scenario: |
     PostgreSQL is running in **`kl-pg`** (`docker exec -it kl-pg psql -U lab -d lab`).
 
@@ -242,13 +330,44 @@ exercises:
   kind: build
   tags: [redis, streams, consumer-groups]
   tutorial: |
-    **Concept.** A Redis stream is an append-only log. A consumer group remembers what it delivered to each consumer and keeps every entry pending until it is acknowledged, so failures can be found and retried.
+    **What you're learning.** Redis **streams** and **consumer groups**: reading, acknowledging, and the pending list.
 
-    **Read up on:**
-    - `XGROUP CREATE key group id` — where the group starts reading
-    - `XREADGROUP GROUP g consumer STREAMS key >` — deliver new entries
-    - `XACK` — remove entries from the pending list
-    - `XPENDING` and `XRANGE` — inspect pending entries and fields
+    ### The idea
+
+    A stream is an append-only log of entries (`ID field value ...`). A **consumer group** tracks delivery:
+
+    | command | does |
+    |---|---|
+    | `XGROUP CREATE stream group 0` | a group starting from the **beginning** (`$` = only new entries) |
+    | `XREADGROUP GROUP g consumer COUNT n STREAMS stream >` | deliver entries never delivered to the group |
+    | `XACK stream group ID...` | mark entries processed |
+    | `XPENDING stream group` | delivered but not acknowledged |
+
+    Unacknowledged entries stay **pending**, so they can be retried or claimed by another consumer (`XCLAIM`/`XAUTOCLAIM`).
+
+    ### Commands you'll use
+
+    ```bash
+    r() { docker exec kl-redis redis-cli "$@"; }
+    r XLEN kl:events
+    r XGROUP CREATE kl:events audit 0
+    r XREADGROUP GROUP audit w1 COUNT 100 STREAMS kl:events '>'
+    r XRANGE kl:events - +                                     # every entry with its fields
+    r XACK kl:events audit 1700000000000-0 1700000000001-0
+    r XPENDING kl:events audit
+    r XINFO GROUPS kl:events
+    ```
+    Pick the IDs to acknowledge from `XRANGE` output by their `status` field.
+
+    ### Common mistakes
+
+    - `XGROUP CREATE ... $`: the group skips the existing entries.
+    - `XDEL`: deletes from the stream, which the task forbids.
+    - Reading with `XREAD` (no group): nothing is tracked.
+
+    ### Check your work
+
+    `XPENDING kl:orders billing` lists exactly the `failed` entries for consumer `c1`, the stream still has 10 entries, and the group's last delivered ID is the last entry.
   scenario: |
     Redis is running in **`kl-redis`** (`docker exec -it kl-redis redis-cli`).
 
@@ -316,23 +435,46 @@ exercises:
   kind: build
   tags: [sql, postgres, full-text-search, recursive-cte, jsonb]
   tutorial: |
-    **Concept.** Some questions don't fit `WHERE column = value`, because the data has a shape that a flat comparison can't see into. PostgreSQL has a dedicated tool for each of the common shapes.
+    **What you're learning.** Three PostgreSQL features for shaped data: full-text search, recursive CTEs, and `jsonb` queries.
 
-    **Language.** Full-text search turns text into a `tsvector` of normalised word stems and matches it against a `tsquery`. A search for one word also finds its other forms, which `LIKE` cannot do. The text search configuration (`english`) decides how words are reduced.
+    ### The idea
 
-    **Hierarchy.** A recursive common table expression walks a tree of unknown depth. It starts from an anchor query, then keeps joining the previous step's rows back to the table until no new rows appear.
+    | question | tool |
+    |---|---|
+    | "mentions *backup* in any form" | `to_tsvector('english', text) @@ to_tsquery('english', 'backup & replicate')`: words are reduced to stems, so *backups* and *replicated* match |
+    | "everyone under X, at any depth" | `WITH RECURSIVE`: a base row, then repeatedly join children onto it |
+    | "a line item with sku A **and** qty ≥ 4" | `jsonb_array_elements(doc->'items')`: one row per element, so both conditions apply to the **same** item |
 
-    **Documents.** JSONB columns can be queried inside the document. Nested objects are reached with path operators (`->` returns JSON, `->>` returns text). Arrays need more care: a condition on *one element* must be tested after unpacking the array into rows, or two conditions can each be satisfied by different elements.
+    ```sql
+    WITH RECURSIVE sub AS (
+      SELECT id FROM staff WHERE name = 'Lee Park'
+      UNION ALL
+      SELECT s.id FROM staff s JOIN sub ON s.manager_id = sub.id
+    )
+    SELECT count(*) - 1 FROM sub;       -- minus Lee
+    ```
 
-    **Read up on:**
-    - `to_tsvector('english', text)`, `to_tsquery` and the `@@` operator
-    - `ts_debug()` — see how words are reduced
-    - `WITH RECURSIVE` — the anchor, `UNION ALL` and the recursive part
-    - Self joins, and when a recursion terminates
-    - `->` versus `->>`, and the `@>` containment operator
-    - `jsonb_array_elements()` — one row per array element
-    - `EXISTS` with a correlated subquery — "has an element such that"
-    - Casting text to numbers — for numeric comparisons
+    ### Commands you'll use
+
+    ```bash
+    q() { docker exec kl-pg psql -U lab -d lab -Atc "$1"; }
+    q "SELECT to_tsvector('english', 'Replicating backups nightly')"     # 'backup':2 'night':3 'replic':1
+    q "SELECT count(*) FROM docs WHERE to_tsvector('english', title || ' ' || body) @@ to_tsquery('english', 'restore & snapshot')"
+    q "SELECT count(*) FROM carts c WHERE c.doc->'customer'->>'country' = 'DE'
+         AND EXISTS (SELECT 1 FROM jsonb_array_elements(c.doc->'items') i
+                     WHERE i->>'sku' = 'SKU-9' AND (i->>'qty')::int >= 2)"
+    ```
+    `->` returns jsonb and `->>` returns text, so cast text before comparing numbers.
+
+    ### Common mistakes
+
+    - `ILIKE '%backup%'`: misses *backing up* stems and matches inside other words.
+    - `doc @> '{"items":[{"sku":"SKU-3"}]}'` plus a separate qty check: the two conditions may match **different** items.
+    - Counting the manager herself.
+
+    ### Check your work
+
+    Each file holds one number. Cross-check by listing the matching rows (`SELECT id ...` instead of `count(*)`).
   scenario: |
     PostgreSQL is running in **`kl-pg`** (`docker exec -it kl-pg psql -U lab -d lab`).
 
@@ -472,14 +614,44 @@ exercises:
   kind: build
   tags: [sql, postgres, partitioning]
   tutorial: |
-    **Concept.** Declarative partitioning splits one logical table into child tables by a key, so queries filtering on the key touch only the relevant children. The parent holds no rows itself.
+    **What you're learning.** Declarative **range partitioning**, and partition pruning.
 
-    **Read up on:**
-    - `PARTITION BY RANGE (col)` — declare the parent and its key
-    - `PARTITION OF ... FOR VALUES FROM (a) TO (b)` — bounds are inclusive, then exclusive
-    - `INSERT INTO ... SELECT` — copy existing rows in
-    - `tableoid::regclass` — which partition a row lives in
-    - `EXPLAIN` — partition pruning
+    ### The idea
+
+    ```sql
+    CREATE TABLE readings (LIKE readings_raw) PARTITION BY RANGE (ts);
+    CREATE TABLE readings_2026_01 PARTITION OF readings FOR VALUES FROM ('2026-01-01') TO ('2026-02-01');
+    ```
+    The parent holds no data. Each row goes to the partition whose range contains its key. Ranges are **[FROM, TO)**: inclusive start, exclusive end, so months don't overlap. A row with no matching partition is rejected, unless there's a `DEFAULT` partition.
+
+    **Pruning**: a query whose `WHERE` restricts the key scans only the matching partitions. `EXPLAIN` shows which.
+
+    ### Commands you'll use
+
+    ```bash
+    docker exec -i kl-pg psql -U lab -d lab -v ON_ERROR_STOP=1 <<'SQL'
+    CREATE TABLE readings (LIKE readings_raw) PARTITION BY RANGE (ts);
+    CREATE TABLE readings_2026_01 PARTITION OF readings FOR VALUES FROM ('2026-01-01') TO ('2026-02-01');
+    CREATE TABLE readings_2026_02 PARTITION OF readings FOR VALUES FROM ('2026-02-01') TO ('2026-03-01');
+    INSERT INTO readings SELECT * FROM readings_raw;
+    SQL
+    docker exec kl-pg psql -U lab -d lab -c '\d+ readings'
+    docker exec kl-pg psql -U lab -d lab -c "EXPLAIN SELECT count(*) FROM readings WHERE ts >= '2026-02-01' AND ts < '2026-03-01'"
+    ```
+    ```text
+    Aggregate
+      ->  Seq Scan on readings_2026_02 readings
+    ```
+
+    ### Common mistakes
+
+    - `TO ('2025-01-31')`: the last day falls out of range.
+    - `WHERE date_trunc('month', ts) = ...`: a function on the key can prevent pruning.
+    - Forgetting a month: the insert fails with "no partition of relation found".
+
+    ### Check your work
+
+    `metrics` has the three named partitions, the same row count as `metrics_raw`, and `EXPLAIN` for February scans only `metrics_2025_02`.
   scenario: |
     PostgreSQL is running in **`kl-pg`** (`docker exec -it kl-pg psql -U lab -d lab`).
 
@@ -538,13 +710,42 @@ exercises:
   kind: build
   tags: [sql, postgres, transactions, concurrency, locking]
   tutorial: |
-    **Concept.** Under READ COMMITTED, two sessions can read the same free row and both try to claim it. Row locks make one wait, but waiting serialises everyone unless the query says how to treat already-locked rows.
+    **What you're learning.** Claiming one row under concurrency: `FOR UPDATE SKIP LOCKED`.
 
-    **Read up on:**
-    - `SELECT ... FOR UPDATE` — lock the selected rows
-    - `SKIP LOCKED` and `NOWAIT` — behaviour on locked rows
-    - Isolation levels — what READ COMMITTED prevents
-    - `psql -v name=value` and `:'name'` — pass values into a SQL file
+    ### The idea
+
+    "Pick a free row, then update it" races: two sessions read the same free seat, and one overwrites the other or both wait. Combine the pick and the lock into one statement:
+
+    ```sql
+    UPDATE slots SET owner = :'who'
+    WHERE id = (SELECT id FROM slots WHERE owner IS NULL ORDER BY id
+                LIMIT 1 FOR UPDATE SKIP LOCKED);
+    ```
+    `FOR UPDATE` locks the chosen row. **`SKIP LOCKED`** makes other sessions **skip** rows already locked and take the next free one, instead of waiting. Every session gets a different row, at once. It's the standard pattern for job queues too.
+
+    `:'who'` is a psql variable inserted as a quoted literal (`psql -v who=alice`).
+
+    ### Commands you'll use
+
+    ```bash
+    cat > /lab/claim.sql <<'SQL'
+    UPDATE slots SET owner = :'who'
+    WHERE id = (SELECT id FROM slots WHERE owner IS NULL ORDER BY id LIMIT 1 FOR UPDATE SKIP LOCKED);
+    SQL
+    for u in u1 u2 u3 u4 u5 u6; do docker exec -i kl-pg psql -U lab -d lab -v who=$u < /lab/claim.sql & done; wait
+    docker exec kl-pg psql -U lab -d lab -c 'SELECT owner, count(*) FROM slots WHERE owner IS NOT NULL GROUP BY owner'
+    ```
+    Every customer should appear exactly once.
+
+    ### Common mistakes
+
+    - `SELECT ... ; UPDATE ...` in two statements: the race is between them.
+    - `FOR UPDATE` without `SKIP LOCKED`: correct, but everyone queues behind one row, and after it's taken the waiter re-checks and may update **zero** rows.
+    - Removing the slow trigger.
+
+    ### Check your work
+
+    After a dozen parallel runs, a dozen different seats are held, one per customer, and every run updated exactly one row (`UPDATE 1`).
   scenario: |
     PostgreSQL is running in **`kl-pg`** (`docker exec -it kl-pg psql -U lab -d lab`).
 
@@ -611,38 +812,35 @@ exercises:
   kind: build
   tags: [capstone, postgres, partitioning, materialized-view, jsonb, roles, grants, redis, sorted-set]
   tutorial: |
-    **Concept.** An analytics launch touches most of what this module covers at once: a big
-    table split so that queries read only the part they need, a pre-computed summary for the
-    dashboard, a read-only login for the BI tool, and a Redis structure the website reads.
-    Each piece is small; the work is in getting every one of them exactly right.
+    **What you're learning.** Launching an analytics schema: partitioning with a default, a concurrently refreshable view, scoped access, and a Redis ranking built from SQL.
 
-    **Partitions, including the leftovers.** A range-partitioned table routes each row to the
-    child whose bounds contain its key (`FROM` inclusive, `TO` exclusive). A row that fits no
-    child is **refused**, unless the table has a **`DEFAULT`** partition, which takes every
-    row the others don't. When a query's range lies within one partition, the planner prunes
-    the others, the default one included.
+    ### Method
 
-    **A summary readers never wait for.** A materialized view stores its result.
-    `REFRESH ... CONCURRENTLY` recomputes it without locking readers out, and needs a unique
-    index that covers every row of the view.
+    | part | approach (exercise) |
+    |---|---|
+    | 1. partitions | three monthly ranges + `CREATE TABLE ... PARTITION OF ... DEFAULT`, `INSERT ... SELECT` (data-024). `EXPLAIN` the September query |
+    | 2. dashboard view | `CREATE MATERIALIZED VIEW ... AS SELECT ts::date AS day, payload->>'kind' AS kind, count(*) AS n ... GROUP BY 1, 2`, plus a unique index on `(day, kind)` (data-020) |
+    | 3. BI access | `CREATE ROLE bi LOGIN PASSWORD 'bi-pw'`, `USAGE` on the schema, `SELECT` on the two objects, default privileges for future tables, nothing on `customers_pii` (data-021) |
+    | 4. top SKUs | sum `qty` per sku over `jsonb_array_elements(payload->'items')` for `kind = 'purchase'` in September (data-018). `DEL kl:top-skus`, then `ZADD` each pair |
 
-    **Least privilege, now and later.** A role needs `USAGE` on a schema before any table
-    grant matters. Granting on named objects keeps the sensitive ones closed, and
-    `ALTER DEFAULT PRIVILEGES` covers the tables created from now on (by the role that runs
-    it). A partitioned table is queried through its parent, so that's where the grant goes.
+    Materialized views are not tables for `GRANT ... ON ALL TABLES` purposes in all versions, so grant on it explicitly. Build the Redis commands from SQL output:
 
-    **JSON into a leaderboard.** `jsonb_array_elements()` turns an array inside a document
-    into rows, which you can then filter and sum. A Redis sorted set keeps members ordered by
-    score; to replace a whole set without a moment where it is empty or half-built, build a
-    new key and `RENAME` it over the old one.
+    ```bash
+    docker exec kl-pg psql -U lab -d lab -AtF' ' -c "SELECT total, sku FROM ..." \
+      | awk '{print "ZADD kl:top-skus", $1, $2}' | docker exec -i kl-redis redis-cli
+    ```
+    Replace the set in one go (`DEL` plus `ZADD` inside `MULTI`/`EXEC`, or build a temporary key and `RENAME` it) so the widget never sees a half-filled set.
 
-    **Read up on:**
-    - `CREATE TABLE ... PARTITION BY RANGE`, `PARTITION OF ... FOR VALUES FROM ... TO ...`, `PARTITION OF ... DEFAULT`
-    - `tableoid::regclass` and `EXPLAIN`: where rows live, partition pruning
-    - `CREATE MATERIALIZED VIEW`, `REFRESH MATERIALIZED VIEW CONCURRENTLY`, `CREATE UNIQUE INDEX`
-    - `->>`, `jsonb_array_elements()`, `CROSS JOIN LATERAL`
-    - `GRANT USAGE ON SCHEMA`, `GRANT SELECT ON ...`, `ALTER DEFAULT PRIVILEGES IN SCHEMA`, `has_table_privilege()`
-    - Redis `ZADD`, `ZRANGE ... WITHSCORES`, `DEL`, `RENAME`
+    ### Check your work
+
+    ```bash
+    q() { docker exec kl-pg psql -U lab -d lab -Atc "$1"; }
+    q "SELECT (SELECT count(*) FROM analytics.events) = (SELECT count(*) FROM analytics.events_raw)"
+    docker exec kl-pg psql -U lab -d lab -c "EXPLAIN SELECT count(*) FROM analytics.events WHERE ts >= '2026-09-01' AND ts < '2026-10-01'"
+    docker exec kl-pg psql -U lab -d lab -c 'REFRESH MATERIALIZED VIEW CONCURRENTLY analytics.daily_kinds'
+    PGPASSWORD=bi-pw docker exec -e PGPASSWORD=bi-pw kl-pg psql -h 127.0.0.1 -U bi -d lab -c 'SELECT count(*) FROM analytics.customers_pii'   # denied
+    docker exec kl-redis redis-cli ZREVRANGE kl:top-skus 0 -1 WITHSCORES
+    ```
   scenario: |
     **Ticket ANL-342**, from Yusuf on the analytics team:
 

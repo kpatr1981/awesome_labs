@@ -12,20 +12,40 @@ exercises:
   kind: build
   tags: [sql, window, aggregate, postgres]
   tutorial: |
-    **Concept.** Reports usually ask for a number *per something*: per department, per month. Two tools cover most of them, and each answers a different shape of question.
+    **What you're learning.** **Window functions** for "top per group", and `date_trunc` for grouping by month.
 
-    `GROUP BY` collapses each group to one row, which is exactly right when you want a total per bucket. For time series, the bucket usually has to be made first: truncate or format the timestamp into a month, then aggregate. The bucket and its output format are separate concerns: `date_trunc` rounds a timestamp, `to_char` turns it into text.
+    ### The idea
 
-    `GROUP BY` falls short when you want the **rest of the row** for the top entry: the *name* of the highest-paid person, not just the salary. Window functions rank rows within partitions without collapsing them. Compute the rank in a subquery, then keep rank 1. PostgreSQL also has `DISTINCT ON` as a shortcut for the same job.
+    `GROUP BY` collapses rows. A **window function** computes over a group (a **partition**) but keeps every row:
 
-    **Read up on:**
-    - PostgreSQL docs: window functions — `OVER (PARTITION BY ... ORDER BY ...)`
-    - `row_number()` and `rank()` — how ties are treated
-    - Subqueries — filtering on a window result
-    - `DISTINCT ON` — a Postgres-specific alternative
-    - `date_trunc` and `to_char` — bucket a timestamp, format a date as text
-    - `GROUP BY`, `sum()` and `ORDER BY ... DESC LIMIT` — find the maximum
-    - `psql -A -F,` — unaligned CSV-like output
+    ```sql
+    row_number() OVER (PARTITION BY team ORDER BY score DESC)
+    ```
+    numbers each team's rows 1, 2, 3… by score. Wrap it in a subquery and keep `= 1` for "the top one per team". `rank()` gives ties the same number.
+
+    `date_trunc('month', ts)` cuts a timestamp down to the first of its month, a handy group key. `to_char(ts, 'YYYY-MM')` formats it.
+
+    ### Commands you'll use
+
+    ```bash
+    docker exec kl-pg psql -U lab -d lab -AtF, -c "
+      SELECT team, player FROM (
+        SELECT team, player, row_number() OVER (PARTITION BY team ORDER BY score DESC) AS r FROM results
+      ) t WHERE r = 1 ORDER BY team"
+    docker exec kl-pg psql -U lab -d lab -Atc "
+      SELECT to_char(date_trunc('month', paid_at), 'YYYY-MM') AS m, sum(total)
+      FROM invoices GROUP BY 1 ORDER BY 2 DESC LIMIT 1"
+    ```
+    `-F,` sets the field separator for `-A` output. `GROUP BY 1` refers to the first output column.
+
+    ### Common mistakes
+
+    - `SELECT department, name, max(salary) ... GROUP BY department`: `name` isn't grouped, which is an error.
+    - Grouping by month **number** only: January 2025 and January 2026 merge.
+
+    ### Check your work
+
+    `top.csv` has one `department,name` line per department, sorted, and `best-month.txt` holds one `YYYY-MM`.
   scenario: |
     PostgreSQL is running in **`kl-pg`** (`docker exec -it kl-pg psql -U lab -d lab`).
 
@@ -96,14 +116,39 @@ exercises:
   kind: fix
   tags: [redis, ttl]
   tutorial: |
-    **Concept.** Redis keys have an optional time-to-live. A key with no TTL never expires, and TTL reports that case with a special value. Scanning is safer than listing every key.
+    **What you're learning.** Redis key expiry: `TTL`, `EXPIRE`, and walking keys with `SCAN`.
 
-    **Read up on:**
-    - `SCAN` and `--scan --pattern` — iterate keys without blocking
-    - `TTL` — the return values, including -1 and -2
-    - `EXPIRE` — setting a TTL in seconds
-    - `man redis-cli` — non-interactive use
-    - Shell loops — combine the commands to process each key
+    ### The idea
+
+    | command | does |
+    |---|---|
+    | `TTL key` | seconds left. **-1** = no expiry, **-2** = no such key |
+    | `EXPIRE key N` | expire in N seconds |
+    | `PERSIST key` | remove the expiry |
+    | `SCAN cursor MATCH pat COUNT n` | iterate keys in small batches |
+
+    `KEYS pattern` blocks the server while it walks **every** key. `SCAN` (and `redis-cli --scan`) does it incrementally, which is safe in production.
+
+    ### Commands you'll use
+
+    ```bash
+    docker exec kl-redis redis-cli --scan --pattern 'token:*' | head -3
+    docker exec kl-redis redis-cli TTL token:ab12              # -1
+    docker exec kl-redis redis-cli --scan --pattern 'token:*' | while read -r k; do
+      [ "$(docker exec kl-redis redis-cli TTL "$k")" = -1 ] && docker exec kl-redis redis-cli EXPIRE "$k" 900 >/dev/null
+    done
+    docker exec kl-redis redis-cli --scan --pattern 'token:*' | while read -r k; do docker exec kl-redis redis-cli TTL "$k"; done | sort -n | uniq -c | head
+    ```
+    One `docker exec` per key is slow but fine for hundreds. For more, pipe commands into a single `redis-cli`.
+
+    ### Common mistakes
+
+    - `EXPIRE` on every key: overwrites the TTLs that existed.
+    - `KEYS session:*` on a big production instance.
+
+    ### Check your work
+
+    No `session:*` key reports TTL -1, the keys that had a TTL kept theirs, and other prefixes are untouched.
   scenario: |
     Redis is running in **`kl-redis`**. A bug created some `session:*` keys with **no
     expiry**, so they'll stay forever.
@@ -150,22 +195,43 @@ exercises:
   kind: fix
   tags: [sql, constraints, migration, postgres]
   tutorial: |
-    **Concept.** Schema changes on a table that already holds data have one recurring problem: the database enforces the new rule against the rows that are already there. So a migration is rarely one statement. The pattern is: clean or move the rows that would break the rule, make the change, and then let the constraint keep things clean from now on.
+    **What you're learning.** Schema changes on tables that already hold data: duplicates, a `NOT NULL` column, and rows that break a new constraint.
 
-    Three common shapes of that pattern:
+    ### The idea
 
-    - **Duplicates before a UNIQUE constraint.** Compare the table with itself and keep one row per key, then add the constraint so duplicates are refused at the door. Preview with a `SELECT` before you `DELETE`.
-    - **A NOT NULL column on a populated table.** Adding it in one step fails, because existing rows have no value. Add it loosely, fill it in, then tighten it, ideally inside one transaction so nobody sees the half-done state.
-    - **Rows that violate a new CHECK.** The migration fails until they are dealt with. Policy decides whether to fix or delete them; moving them to a holding table keeps them for later. A `DELETE ... RETURNING` inside a CTE moves rows in a single statement.
+    The database checks a new rule against **existing** rows, so clean the data first:
 
-    **Read up on:**
-    - `DELETE ... USING` — deleting rows by joining a table to itself
-    - `GROUP BY ... HAVING count(*) > 1` — find duplicate keys
-    - `ALTER TABLE ... ADD CONSTRAINT ... UNIQUE`, `ADD COLUMN`, `SET NOT NULL`
-    - `UPDATE` with expressions, and string functions such as `split_part`
-    - `BEGIN` / `COMMIT` — keep migration steps atomic
-    - `WITH ... AS (DELETE ... RETURNING *) INSERT ... SELECT` — moving rows
-    - `psql -f`, or a file fed to `docker exec -i` — run a script file
+    | change | prepare with |
+    |---|---|
+    | `UNIQUE (email)` | delete duplicates: `DELETE FROM t a USING t b WHERE a.email = b.email AND a.id > b.id` keeps the lowest id |
+    | a `NOT NULL` column | add it nullable, fill it (`UPDATE ... SET col = split_part(email, '@', 2)`), then `SET NOT NULL`. Or add it with a default expression in one step |
+    | a `CHECK` constraint | find the violating rows, move them: `INSERT INTO rejected SELECT * FROM t WHERE NOT (cond); DELETE FROM t WHERE NOT (cond);` |
+
+    Do it in a **transaction** so a half-finished change can't remain.
+
+    ### Commands you'll use
+
+    ```bash
+    q() { docker exec -i kl-pg psql -U lab -d lab -v ON_ERROR_STOP=1 "$@"; }
+    q -c "SELECT email, count(*) FROM members GROUP BY email HAVING count(*) > 1 LIMIT 5"
+    q -c "ALTER TABLE members ADD COLUMN host text" \
+      -c "UPDATE members SET host = split_part(email, '@', 2)" \
+      -c "ALTER TABLE members ALTER COLUMN host SET NOT NULL"
+    q < /lab/change.sql                      # read the error: which constraint, which row
+    q -c "BEGIN" -c "INSERT INTO refunds_bad SELECT * FROM refunds WHERE amount <= 0" \
+      -c "DELETE FROM refunds WHERE amount <= 0" -c "COMMIT"
+    ```
+    Several `-c` options in one `psql` run in the same session, in order.
+
+    ### Common mistakes
+
+    - `DELETE ... WHERE a.id < b.id`: keeps the highest id.
+    - Editing `/lab/migrate.sql`: run it unchanged.
+    - A different "bad" condition from the one the migration's constraint enforces: read it from the file.
+
+    ### Check your work
+
+    No duplicate emails and a unique constraint exists, `domain` is `NOT NULL` and correct, the bad rows are in `payments_rejected`, and the migration ran unchanged.
   scenario: |
     PostgreSQL is running in **`kl-pg`** (`docker exec -it kl-pg psql -U lab -d lab`).
 
@@ -287,14 +353,43 @@ exercises:
   kind: fix
   tags: [locks, postgres, troubleshooting]
   tutorial: |
-    **Concept.** Postgres uses locks to serialise conflicting changes, and a transaction that holds a lock can block others indefinitely. The system views show who is waiting and who is holding.
+    **What you're learning.** Finding which session blocks another, and terminating just that one.
 
-    **Read up on:**
-    - `pg_stat_activity` — sessions, their state and application name
-    - `pg_blocking_pids(pid)` — which sessions block a given one
-    - `pg_locks` — the underlying lock table
-    - `pg_cancel_backend` versus `pg_terminate_backend` — the difference
-    - Idle in transaction — why a quiet session can still hold locks
+    ### The idea
+
+    A transaction holding a row or table lock blocks every other transaction that needs a conflicting lock, for as long as it stays open, often an idle client that forgot to `COMMIT`. The system views show it:
+
+    | view/function | shows |
+    |---|---|
+    | `pg_stat_activity` | every session: `pid`, `application_name`, `state` (`idle in transaction`!), `query` |
+    | `pg_blocking_pids(pid)` | the PIDs blocking that session |
+    | `pg_terminate_backend(pid)` | ends a session (its transaction is rolled back) |
+
+    ### Commands you'll use
+
+    ```bash
+    docker exec kl-pg psql -U lab -d lab -c "
+      SELECT pid, application_name, state, wait_event_type, pg_blocking_pids(pid) AS blocked_by, left(query, 40)
+      FROM pg_stat_activity WHERE datname = 'lab'"
+    ```
+    ```text
+     pid | application_name |        state        | wait_event_type | blocked_by |  left
+     812 | report-export    | idle in transaction |                 | {}         | UPDATE stock SET ...
+     840 | web-order        | active              | Lock            | {812}      | UPDATE stock SET ...
+    ```
+    ```bash
+    docker exec kl-pg psql -U lab -d lab -c 'SELECT pg_terminate_backend(812)'
+    ```
+    Blockers can be chained: A blocks B, B blocks C. Terminate the **root** blocker.
+
+    ### Common mistakes
+
+    - Terminating the waiting session: the blocker keeps its lock.
+    - `pg_cancel_backend`: cancels a running query, but an `idle in transaction` session has none.
+
+    ### Check your work
+
+    `web-checkout` finishes, and only the blocking session was terminated.
   scenario: |
     PostgreSQL is running in **`kl-pg`** (`docker exec -it kl-pg psql -U lab -d lab`).
 
@@ -332,14 +427,42 @@ exercises:
   kind: fix
   tags: [redis, persistence]
   tutorial: |
-    **Concept.** Redis can persist data with RDB snapshots or an append-only file. A runtime change is lost when the container is recreated unless the setting is also in the start command or config file.
+    **What you're learning.** Redis persistence: RDB versus AOF, turning AOF on live, and making it permanent.
 
-    **Read up on:**
-    - Redis docs: persistence — RDB versus AOF and `appendonly`
-    - `CONFIG SET appendonly yes` — and `INFO persistence` to check
-    - `redis-server` command-line flags — setting options at startup
-    - `docker inspect` — see a container's mounts, command and image
-    - Docker volumes — reusing a named volume in a new container
+    ### The idea
+
+    | mode | writes | on restart |
+    |---|---|---|
+    | none | nothing | empty |
+    | **RDB** (`save`) | periodic snapshots (`dump.rdb`) | data as of the last snapshot |
+    | **AOF** (`appendonly yes`) | every write appended to a log | replays it: loses at most about a second |
+
+    `CONFIG SET appendonly yes` on a running server starts a **rewrite** that writes the current data to the AOF. Wait for it to finish (`aof_rewrite_in_progress:0`, `aof_rewrites` ≥ 1) before stopping. A setting made with `CONFIG SET` is lost when the container is **recreated**, so also pass it on the command line: `redis-server --appendonly yes`.
+
+    ### Commands you'll use
+
+    ```bash
+    r() { docker exec kl-cache redis-cli "$@"; }
+    r DBSIZE
+    r CONFIG SET appendonly yes
+    r INFO persistence | grep -E 'aof_enabled|aof_rewrite_in_progress|aof_rewrites'
+    docker exec kl-cache ls /data /data/appendonlydir
+    docker inspect kl-cache --format '{{.Config.Image}} {{json .Mounts}}'
+    docker rm -f kl-cache
+    docker run -d --name kl-cache -v kl-cdata:/data redis:7.4-alpine redis-server --appendonly yes
+    r DBSIZE                          # same count
+    r CONFIG GET appendonly
+    ```
+
+    ### Common mistakes
+
+    - Recreating first: the keys exist only in memory and are lost.
+    - A different volume or image when recreating.
+    - Starting with `--appendonly yes` over a volume with an old, empty AOF: check the key count.
+
+    ### Check your work
+
+    After recreating, `DBSIZE` is still 500, `CONFIG GET appendonly` is `yes`, and the container's command contains `--appendonly yes`.
   scenario: |
     Redis is running in **`kl-redis`** with persistence switched off, and its data volume
     is **`kl-rdata`**. It holds 500 keys that must not be lost.
@@ -399,14 +522,40 @@ exercises:
   kind: fix
   tags: [sql, index, performance, postgres]
   tutorial: |
-    **Concept.** An index matches only the expression it was built on. A query wrapping a column in a function cannot use a plain index on that column, but an index can be built on the expression.
+    **What you're learning.** **Expression indexes**: why `WHERE lower(col) = ...` can't use a plain index on `col`.
 
-    **Read up on:**
-    - PostgreSQL docs: indexes on expressions
-    - `EXPLAIN` — compare the plan before and after
-    - `CREATE INDEX` — the syntax with an expression in parentheses
-    - `lower()` — case-insensitive matching
-    - `ANALYZE` — updating statistics
+    ### The idea
+
+    An index stores values of exactly the expression it was built on. An index on `email` holds `email`, not `lower(email)`, so a query filtering on `lower(email)` can't use it and scans the table. Index the **expression**:
+
+    ```sql
+    CREATE INDEX ON users (lower(email));
+    ```
+    The query must use the **same** expression for the planner to match it.
+
+    ### Commands you'll use
+
+    ```bash
+    docker exec kl-pg psql -U lab -d lab -c '\d customers'
+    docker exec kl-pg psql -U lab -d lab -c "EXPLAIN SELECT * FROM customers WHERE upper(code) = 'GR-42'"
+    ```
+    ```text
+    Seq Scan on customers  (cost=0.00..1834.00 rows=500 width=52)
+      Filter: (upper(code) = 'GR-42'::text)
+    ```
+    ```bash
+    docker exec kl-pg psql -U lab -d lab -c 'CREATE INDEX customers_upper_code_idx ON customers (upper(code))' -c 'ANALYZE customers'
+    docker exec kl-pg psql -U lab -d lab -c "EXPLAIN SELECT * FROM customers WHERE upper(code) = 'GR-42'"
+    ```
+
+    ### Common mistakes
+
+    - Rewriting the query to drop `lower()`: the task forbids it, and it changes matching.
+    - An index on `lower(email::text)` when the column is `citext` or the expression differs.
+
+    ### Check your work
+
+    `EXPLAIN` of the login query shows an index scan on the new index.
   scenario: |
     PostgreSQL is running in **`kl-pg`** (`docker exec -it kl-pg psql -U lab -d lab`).
 
@@ -449,14 +598,40 @@ exercises:
   kind: build
   tags: [postgres, replication]
   tutorial: |
-    **Concept.** A streaming replica copies the primary's write-ahead log. The primary must permit replication connections, and the standby begins from a physical base backup rather than a logical dump.
+    **What you're learning.** PostgreSQL **streaming replication**: allowing replication connections, a base backup, and a hot standby.
 
-    **Read up on:**
-    - `pg_basebackup` — options for streaming and writing the standby signal
-    - `pg_hba.conf` — the `replication` pseudo-database entry and reload
-    - `pg_stat_replication` — check the primary sees the standby
-    - `pg_is_in_recovery()` — check the standby is in recovery
-    - `docker run` — networks, volumes and overriding the entrypoint
+    ### The idea
+
+    1. The **primary** must allow replication connections: a `pg_hba.conf` line `host replication USER ADDRESS METHOD`, then reload. (`wal_level=replica` and `max_wal_senders` are the defaults in modern versions.)
+    2. The **standby** starts from a **physical copy** of the primary: `pg_basebackup -h PRIMARY -U USER -D DATADIR -R`. `-R` writes `standby.signal` and the connection settings (`primary_conninfo`).
+    3. Start postgres on that data directory: it connects to the primary and **streams** WAL, read-only (a **hot standby**).
+
+    `pg_stat_replication` on the primary lists connected standbys. `pg_is_in_recovery()` is true on a standby.
+
+    ### Commands you'll use
+
+    ```bash
+    docker exec kl-pg sh -c "tail -3 /var/lib/postgresql/data/pg_hba.conf"
+    docker exec kl-pg sh -c "echo 'host replication lab all scram-sha-256' >> /var/lib/postgresql/data/pg_hba.conf"
+    docker exec kl-pg psql -U lab -d lab -c 'SELECT pg_reload_conf()'
+    docker run -d --name stand1 --network kl-db -e PGPASSWORD=lab postgres:16-alpine sh -c '
+      pg_basebackup -h kl-pg -U lab -D /var/lib/postgresql/data -R -X stream &&
+      chown -R postgres:postgres /var/lib/postgresql/data && chmod 700 /var/lib/postgresql/data &&
+      exec su-exec postgres postgres -D /var/lib/postgresql/data'
+    docker exec kl-pg psql -U lab -d lab -c 'SELECT client_addr, state FROM pg_stat_replication'
+    docker exec stand1 psql -U lab -d lab -Atc 'SELECT pg_is_in_recovery()'          # t
+    ```
+    The official image's entrypoint would run `initdb` on an empty directory. Running the base backup **first** and then `postgres` yourself avoids that.
+
+    ### Common mistakes
+
+    - `host all ...` in `pg_hba.conf`: `all` doesn't include the `replication` pseudo-database.
+    - Forgetting the reload.
+    - A data directory not owned by `postgres` or not mode 700: postgres refuses to start.
+
+    ### Check your work
+
+    `pg_stat_replication` shows the standby `streaming`, `pg_is_in_recovery()` is true on `kl-pg2`, and a row inserted on the primary appears on the standby.
   scenario: |
     The primary PostgreSQL server is **`kl-pg`** (user and password `lab`), on the Docker
     network **`kl-db`**.
@@ -510,38 +685,32 @@ exercises:
   kind: fix
   tags: [capstone, postgres, locks, migration, constraints, index, window, redis, ttl, persistence]
   tutorial: |
-    **Concept.** A maintenance window is a checklist that runs into the live system. The
-    migration script is reviewed and must run **as written**, so everything in its way has to
-    be cleared first: sessions holding locks, rows that break the new rules. Then you prove
-    the result with a report, and make sure the other data store is in shape too.
+    **What you're learning.** A maintenance window: clearing the way for a reviewed migration, a report, and Redis changes that lose nothing.
 
-    **Locks first.** A session that is **idle in transaction** still holds every lock it took.
-    Even a plain `SELECT` holds a lock that makes an `ALTER TABLE` wait, and every query
-    behind the `ALTER` waits too. A migration that sets `lock_timeout` gives up instead of
-    queueing forever, which is your cue to look at `pg_stat_activity` and
-    `pg_blocking_pids()`. Terminate the blocker, not everything that looks idle.
+    ### Method
 
-    **Data before constraints.** A unique index on an *expression* such as `lower(email)`
-    refuses addresses that differ only in case, so duplicates have to go first, and they
-    have to be found the same way (compare `lower(email)`, not `email`). Rows that break a
-    new `CHECK` are moved aside, per policy, with `DELETE ... RETURNING` feeding an `INSERT`.
+    | item | approach (exercise) |
+    |---|---|
+    | 1. blocker | `pg_stat_activity` + `pg_blocking_pids`. Terminate the root blocker, not `api-pool` (data-009) |
+    | 2. case-insensitive duplicates | `DELETE FROM users a USING users b WHERE lower(a.email) = lower(b.email) AND a.id > b.id` (data-008) |
+    | 3. invalid emails | read the migration's check: move the violating rows to `users_rejected` (data-008) |
+    | 4. migration | `docker exec -i kl-pg psql -v ON_ERROR_STOP=1 < /lab/migrate.sql`, then check its unique expression index (data-015) |
+    | 5. sign-ups | `count(*)` per `date_trunc('month', created_at)` plus `sum(count(*)) OVER (ORDER BY month)` for the running total (data-006) |
+    | 6. sessions | `SCAN` + `TTL` = -1 → `EXPIRE 1800` (data-013) |
+    | 7. AOF | `CONFIG SET appendonly yes`, wait for the rewrite, recreate with `--appendonly yes` (data-012) |
 
-    **Reports with running totals.** `GROUP BY` produces one row per month; a window function
-    over those rows (`sum(...) OVER (ORDER BY month)`) adds the cumulative total without
-    collapsing them.
+    Order matters: clean the data **before** the migration, and run the report **after** the cleanup.
 
-    **Redis that survives.** `TTL` returns `-1` for a key without an expiry. A runtime
-    `CONFIG SET appendonly yes` writes an AOF now, but a recreated container only keeps it
-    if its command enables AOF too.
+    ### Check your work
 
-    **Read up on:**
-    - `pg_stat_activity` (`state`, `application_name`), `pg_blocking_pids()`, `pg_terminate_backend()`
-    - `lock_timeout` and the `ACCESS EXCLUSIVE` lock that `ALTER TABLE ... ADD CONSTRAINT` takes
-    - `DELETE ... USING` with `lower()`; `CREATE UNIQUE INDEX ... ON t (lower(col))`
-    - `WITH moved AS (DELETE ... RETURNING *) INSERT INTO ... SELECT * FROM moved`
-    - `date_trunc`, `to_char`, and `sum(...) OVER (ORDER BY ...)`
-    - `redis-cli --scan --pattern`, `TTL`, `EXPIRE`
-    - Redis persistence: `CONFIG SET appendonly`, `INFO persistence`, `redis-server --appendonly yes`
+    ```bash
+    q() { docker exec kl-pg psql -U lab -d lab -Atc "$1"; }
+    q "SELECT count(*) FROM pg_stat_activity WHERE application_name = 'api-pool'"
+    q "SELECT lower(email), count(*) FROM users GROUP BY 1 HAVING count(*) > 1"            # nothing
+    docker exec kl-pg psql -U lab -d lab -c "EXPLAIN SELECT * FROM users WHERE lower(email) = 'a@x.test'"
+    cat /lab/signups.csv
+    docker exec kl-redis redis-cli CONFIG GET appendonly
+    ```
   scenario: |
     **Change OPS-2291**, owner: the platform DBA team. Tonight's window for the **accounts
     service** has a reviewed migration and a Redis change, and both have to land before
