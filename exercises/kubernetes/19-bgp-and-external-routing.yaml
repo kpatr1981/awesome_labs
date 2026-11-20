@@ -12,42 +12,65 @@ exercises:
   kind: build
   tags: [calico, bgp, frr, routing, ippool]
   tutorial: |
-    **Concept.** Calico routes pod traffic between nodes with **BIRD**, a BGP daemon inside
-    every `calico-node`. Out of the box the nodes peer only with each other (the **node-to-node
-    mesh**); nothing outside the cluster learns where pods live. Adding a **BGPPeer** tells every
-    selected node to open a session to a device outside the cluster, and from then on that device
-    receives the routes the node knows about.
+    **What you're learning.** How Calico uses **BGP** to route pod traffic, and how to peer the cluster with a router outside it so the outside world can reach pods and Services.
 
-    *What gets announced.* Calico hands each node one or more **IP blocks** (a `/26` by default)
-    out of the IP pool, and those blocks are what BGP carries: a route like
-    `10.244.49.64/26 next-hop <node>`. The Service ranges are announced too, but only when
-    `BGPConfiguration` lists them.
+    ### The idea
 
-    *Next hops.* A node that passes a route along normally puts itself as the next hop. Each
-    node knows every block, so an external router learns every block from both nodes and, with
-    ECMP, splits traffic between them. A flow can then enter a node that does not host the pod
-    while the reply leaves the node that does: the first node's conntrack sees only half of the
-    TCP handshake and drops the rest. A BGPPeer can instead be told to keep the original next hop, so each
-    block points at the node that really owns it.
+    Calico runs **BIRD**, a BGP daemon, inside every `calico-node`. By default nodes peer only with each other (the **node-to-node mesh**). A **BGPPeer** object makes the selected nodes (all, if no selector) open a session to an outside router. From then on the router learns:
 
-    *Going the other way.* BGP is bidirectional: routes the router announces are programmed
-    into the node's kernel by BIRD (`proto bird`). When a pod talks to an address outside the
-    pool, the pool's **`natOutgoing`** decides what happens: on, the node SNATs the pod to its own
-    address; off, the packet leaves with the pod's real address and the outside world must
-    route replies back to it. An extra **IPPool** lets you make that choice per workload rather
-    than cluster-wide.
+    | route | when |
+    |---|---|
+    | each node's **pod blocks** (a `/26` per block, from the IP pool) | always, once peered |
+    | Service ranges | only those listed in `BGPConfiguration.spec.serviceClusterIPs` |
 
-    There's no `calicoctl` in this cluster. These are ordinary CRDs: always spell the type in
-    full, `bgppeers.crd.projectcalico.org`.
+    The cluster's own AS is `BGPConfiguration.spec.asNumber` (64512 if unset); the BGPPeer states the **router's** AS.
 
-    **Read up on:**
-    - `kubectl explain bgppeers.spec`, `kubectl explain bgpconfigurations.spec` (add
-      `--api-version=crd.projectcalico.org/v1` if the short name is ambiguous)
-    - `kubectl get ippool default-ipv4-ippool -o yaml`, and the pod annotation
-      `cni.projectcalico.org/ipv4pools`
-    - On the router: `show bgp summary`, `show ip bgp`, `show ip route`
-    - `ip route | grep bird` on a node
-    - `traceroute`
+    **Next hops.** Every node knows every block, so by default the router learns each block from **both** nodes. ECMP then splits traffic, and a flow can enter the node that doesn't host the pod while the reply leaves the one that does: half a TCP handshake per node, and conntrack drops it. `nextHopMode: Keep` on the BGPPeer keeps each block's real owner as its next hop.
+
+    **Leaving the cluster.** A pool's `natOutgoing: true` SNATs pods to their node's address when they talk to the outside; `false` keeps the pod's own address (the outside must route it back: it can, via BGP). A second IPPool lets some pods have that, chosen with the pod annotation `cni.projectcalico.org/ipv4pools: '["POOL"]'`.
+
+    There's no `calicoctl` here: use the CRDs by full name (`bgppeers.crd.projectcalico.org`, `ippools.crd.projectcalico.org`...).
+
+    ### Commands you'll use
+
+    ```bash
+    cat /lab/topology.txt
+    kubectl get bgpconfigurations.crd.projectcalico.org default -o yaml
+    kubectl patch bgpconfigurations.crd.projectcalico.org default --type=merge -p '{"spec":{"asNumber":64600}}'
+    kubectl apply -f - <<EOF
+    apiVersion: crd.projectcalico.org/v1
+    kind: BGPPeer
+    metadata: {name: upstream}
+    spec:
+      peerIP: 192.168.50.1
+      asNumber: 65100
+      nextHopMode: Keep
+    EOF
+    kubectl -n edge exec router -c frr -- vtysh -c 'show bgp summary'
+    kubectl -n edge exec router -c frr -- vtysh -c 'show ip route bgp'
+    ```
+    ```text
+    B>* 10.244.49.64/26 [20/0] via 192.168.50.11, eth0
+    B>* 10.244.120.0/26 [20/0] via 192.168.50.12, eth0
+    ```
+    One next hop per block = `Keep` works.
+
+    A merge patch on `serviceClusterIPs` replaces that list but keeps other fields.
+
+    ```bash
+    kubectl get ippools.crd.projectcalico.org default-ipv4-ippool -o yaml    # copy its fields for a new pool
+    kubectl -n demo exec tracer -- traceroute -n -m 5 -w 2 203.0.113.9
+    ```
+
+    ### Common mistakes
+
+    - Setting the cluster's AS in the BGPPeer (it's the **router's** AS there).
+    - A new IPPool without `nodeSelector: all()`, `vxlanMode`, `ipipMode`: CRDs get no defaults.
+    - Expecting existing pods to move pools: only new pods get addresses from a new pool.
+
+    ### Check your work
+
+    On the router: both sessions `Established`, every pod block with one next hop, the Service range with two (ECMP), and HTTP answers from a pod IP and from the ClusterIP; `tracer` is seen with its pod IP, `client` with its node's.
   scenario: |
     The network team has racked an edge router and given you a BGP session to it. It runs
     **FRR** as the Pod **`router`** in namespace **`edge`**, wired directly onto the node
@@ -298,31 +321,48 @@ exercises:
   kind: fix
   tags: [calico, bgp, frr, troubleshooting]
   tutorial: |
-    **Concept.** A BGP failure at the edge is usually one of a few things, and each one has a
-    different signature on the router.
+    **What you're learning.** Diagnosing a broken BGP edge from the router's view, and mapping each symptom to a Calico object.
 
-    - A session that won't come up shows `Active`, `Idle` or `Connect` in `show bgp summary`. A
-      peering is two-sided: each side declares the other's AS, and a mismatch tears the session
-      down right after the `OPEN`. Check what each side *really* says with `show bgp neighbors`.
-    - If a session comes up for some nodes and not others, look at what selects the nodes that
-      peer: Calico's `BGPPeer.spec.node` and `spec.nodeSelector`.
-    - A session that's up but carries nothing is a filtering question. `PfxRcd` of `0`, or a route
-      that's merely absent, points at a policy. Calico's **BGPFilter** applies import and export
-      rules to the peers that reference it.
-    - A prefix that's present but wrong is an announcement question: what did you ask the
-      cluster to announce? A Service range is only announced when listed in `BGPConfiguration`,
-      and it has to be the cluster's actual Service CIDR.
+    ### Method: read the router, then find the object
 
-    Work from the outside in: read the router first, then find the Kubernetes object that
-    explains what it's seeing.
+    | router shows | cause | object |
+    |---|---|---|
+    | neighbour `Active`/`Idle`, flapping right after OPEN | AS mismatch | `BGPPeer.spec.asNumber`, `BGPConfiguration.spec.asNumber` |
+    | only some nodes peer | the peer is limited to some nodes | `BGPPeer.spec.node` / `spec.nodeSelector` |
+    | session up, `PfxRcd 0` or pod blocks missing | a filter rejects them | `BGPFilter` referenced in `BGPPeer.spec.filters` |
+    | a Service prefix that's wrong | the announced range isn't the real Service CIDR | `BGPConfiguration.spec.serviceClusterIPs` vs kubeadm's `serviceSubnet` |
 
-    **Read up on:**
-    - `show bgp summary`, `show bgp neighbors <ip>`, `show ip bgp` on the router
-    - `kubectl get bgppeers.crd.projectcalico.org,bgpfilters.crd.projectcalico.org -o yaml`
-    - `kubectl get bgpconfigurations.crd.projectcalico.org default -o yaml`
-    - `kubectl get cm -n kube-system kubeadm-config -o yaml` for the Service CIDR
-    - `kubectl -n kube-system logs ds/calico-node -c calico-node | grep -i bgp`, and
-      `kubectl -n kube-system exec ds/calico-node -c calico-node -- birdcl -s /var/run/calico/bird.ctl show protocols`
+    ### Commands you'll use
+
+    ```bash
+    kubectl -n edge exec router -c frr -- vtysh -c 'show bgp summary'
+    kubectl -n edge exec router -c frr -- vtysh -c 'show bgp neighbors 192.168.50.12' | grep -iE 'remote AS|state|notification'
+    ```
+    ```text
+      BGP neighbor is 192.168.50.12, remote AS 64520, local AS 65010
+      BGP state = Active
+      Notification sent: OPEN Message Error/Bad Peer AS
+    ```
+
+    ```bash
+    kubectl get bgppeers.crd.projectcalico.org,bgpfilters.crd.projectcalico.org -o yaml
+    kubectl get bgpconfigurations.crd.projectcalico.org default -o jsonpath='{.spec}'; echo
+    kubectl -n kube-system get cm kubeadm-config -o jsonpath='{.data.ClusterConfiguration}' | grep serviceSubnet
+    kubectl -n kube-system exec ds/calico-node -c calico-node -- birdcl -s /var/run/calico/bird.ctl show protocols
+    ```
+    `birdcl show protocols` lists BIRD's sessions from the node's side.
+
+    JSON patches to remove a field: `[{"op":"remove","path":"/spec/nodeSelector"}]`.
+
+    ### Common mistakes
+
+    - Changing the router: it's the reference.
+    - Deleting and recreating the BGPPeer under another name (the task says keep `edge-router`).
+    - Listing extra ranges in `serviceClusterIPs`.
+
+    ### Check your work
+
+    On the router: both nodes `Established`, every pod block present with its owner as next hop, only the real Service range, and HTTP works to a pod IP and to the ClusterIP.
   scenario: |
     Yesterday someone "tidied up" the BGP configuration between this cluster and the edge
     router. It worked before. Now nothing outside the cluster can reach pods or Services.
@@ -488,39 +528,66 @@ exercises:
   kind: build
   tags: [metallb, bgp, frr, loadbalancer, service]
   tutorial: |
-    **Concept.** A `Service` of type `LoadBalancer` needs something to hand it an address and
-    make that address reach the cluster. On bare metal that something is **MetalLB**: the
-    **controller** assigns addresses from an `IPAddressPool`, and a **speaker** on every
-    eligible node tells the network where to send them. In BGP mode each speaker opens a BGP
-    session to your router and announces each assigned address as a `/32` with itself as the next
-    hop. The router sees one path per node and spreads traffic across them with ECMP.
+    **What you're learning.** **MetalLB** in BGP mode: LoadBalancer IPs for bare-metal clusters, announced to a router, with communities and `externalTrafficPolicy`.
 
-    Three objects drive this, all in `metallb-system`:
+    ### The idea
 
-    - `IPAddressPool` — the addresses MetalLB may hand out.
-    - `BGPPeer` — a router to peer with (`myASN`, `peerASN`, `peerAddress`).
-    - `BGPAdvertisement` — says which pools are announced, and how. It can tag routes with BGP
-      communities, for instance, which the router can act on.
+    A `type: LoadBalancer` Service needs something to give it an external address and make that address reach the cluster. On bare metal, **MetalLB**:
 
-    *Which nodes announce.* A speaker runs on every node, but not every node is allowed to
-    announce: MetalLB skips nodes carrying the label
-    `node.kubernetes.io/exclude-from-external-load-balancers`, which `kubeadm` puts on
-    control-plane nodes.
+    - the **controller** assigns an address from an **IPAddressPool**;
+    - a **speaker** on each eligible node announces it over BGP as a `/32` with itself as next hop; the router sees one path per node (ECMP).
 
-    *`externalTrafficPolicy`.* `Cluster` (the default) lets every node accept traffic and forward
-    it to a backend anywhere, with SNAT, so backends see the node's address. `Local` keeps traffic
-    on nodes that host a ready backend, which preserves the client's address, and MetalLB follows
-    that: it only announces from nodes that have one.
+    Objects (in `metallb-system`):
 
-    MetalLB's `bgppeers` CRD shares a name with Calico's. Spell it `bgppeers.metallb.io`.
+    | kind | says |
+    |---|---|
+    | `IPAddressPool` | the addresses MetalLB may hand out |
+    | `BGPPeer` (`bgppeers.metallb.io`) | the router: `myASN`, `peerASN`, `peerAddress` |
+    | `BGPAdvertisement` | which pools to announce, plus options like `communities` |
 
-    **Read up on:**
-    - `kubectl explain ipaddresspools.metallb.io.spec`, `bgppeers.metallb.io.spec`,
-      `bgpadvertisements.metallb.io.spec`
-    - `kubectl -n metallb-system logs ds/speaker`
-    - On the router: `show bgp summary`, `show ip bgp <prefix>`, `show ip route <prefix>`
-    - `kubectl get svc`, `.spec.externalTrafficPolicy`
-    - `kubectl get node controlplane --show-labels`
+    **Who announces.** Nodes labelled `node.kubernetes.io/exclude-from-external-load-balancers` don't (kubeadm puts it on control-plane nodes).
+
+    **`externalTrafficPolicy: Local`** (k8s-056): only nodes with a ready backend accept traffic, the client address is preserved, and MetalLB announces only from those nodes.
+
+    ### Commands you'll use
+
+    ```bash
+    kubectl apply -f - <<EOF
+    apiVersion: metallb.io/v1beta1
+    kind: IPAddressPool
+    metadata: {name: lab, namespace: metallb-system}
+    spec: {addresses: [198.18.0.0/24]}
+    ---
+    apiVersion: metallb.io/v1beta2
+    kind: BGPPeer
+    metadata: {name: core, namespace: metallb-system}
+    spec: {myASN: 64700, peerASN: 65100, peerAddress: 192.168.50.1}
+    ---
+    apiVersion: metallb.io/v1beta1
+    kind: BGPAdvertisement
+    metadata: {name: lab, namespace: metallb-system}
+    spec:
+      ipAddressPools: [lab]
+      communities: ["64700:200"]
+    EOF
+    kubectl get node controlplane --show-labels | tr ',' '\n' | grep exclude
+    kubectl label node controlplane node.kubernetes.io/exclude-from-external-load-balancers-
+    kubectl -n demo expose deploy web --type=LoadBalancer --port=80
+    kubectl -n demo get svc web                         # EXTERNAL-IP from the pool
+    kubectl -n edge exec router -c frr -- vtysh -c 'show ip bgp 198.18.0.0/24 longer-prefixes'
+    kubectl -n edge exec router -c frr -- vtysh -c 'show ip bgp 198.18.0.1/32' | grep -i community
+    kubectl -n metallb-system logs ds/speaker --tail=20
+    ```
+
+    ### Common mistakes
+
+    - `bgppeers` without the group: kubectl may pick Calico's CRD.
+    - Forgetting the BGPAdvertisement: the peer is up but nothing is announced.
+    - Changing the Service to `Local` and expecting both nodes to announce.
+
+    ### Check your work
+
+    On the router: both sessions up, the first Service's `/32` with two next hops and the community, the `Local` Service's `/32` from node01 only, and HTTP through both addresses (the `Local` one shows the router's address as client).
   scenario: |
     MetalLB (`v0.16.1`) is already installed in **`metallb-system`** with no configuration. The
     edge router is FRR, Pod **`router`** in namespace **`edge`**, AS **65010**, and it's waiting for
@@ -732,39 +799,48 @@ exercises:
   kind: fix
   tags: [capstone, calico, bgp, frr, routing, ippool, bgpfilter, troubleshooting, egress]
   tutorial: |
-    **Concept.** Peering a cluster with the network is a contract with two sides, and each
-    direction of it is a separate decision:
+    **What you're learning.** A full BGP contract with a partner: sessions, honest announcements, import filtering, Service ranges, and a namespace with its own routable address range.
 
-    - **The session.** Each side states its own AS and the AS it expects from the other.
-      Calico's own AS is `BGPConfiguration.spec.asNumber` (64512 when unset); a `BGPPeer`
-      states the router's. A BGPPeer applies to every node unless `node` or `nodeSelector`
-      narrows it down.
-    - **What the cluster announces.** Each node announces the pod blocks of every IP pool, and
-      the Service ranges listed in `BGPConfiguration` (`serviceClusterIPs`). `nextHopMode: Keep`
-      on the peer makes every block point at the node that owns it. A `BGPFilter` referenced by
-      the peer can drop routes on the way out (`exportV4`).
-    - **What the cluster accepts.** Whatever the router announces, BIRD installs into every
-      peering node's kernel (`ip route`, `proto bird`), unless the peer's filter rejects it on
-      the way in (`importV4`). Rules are tried in order; `matchOperator` is `Equal`, `NotEqual`,
-      `In` (inside the CIDR) or `NotIn`, and a route that matches no rule is accepted.
-    - **Who a pod is outside.** `natOutgoing` on a pool decides whether pods leaving the pod
-      network are hidden behind their node's address. A second pool without SNAT gives some
-      workloads an address the outside world can see, filter and route back to, and the
-      annotation `cni.projectcalico.org/ipv4pools` picks the pool, on a pod or on its
-      **namespace** (for every pod created there afterwards: existing pods keep their address).
+    ### The idea
 
-    Read the router first, then the Calico objects. There's no `calicoctl` here: these are CRDs,
-    spelled in full, e.g. `bgppeers.crd.projectcalico.org`, and they get no defaults, so a new
-    IPPool needs every field the default pool has.
+    Each direction is a separate decision:
 
-    **Read up on:**
-    - On the router: `show bgp summary`, `show bgp neighbors <ip>`, `show ip route`,
-      `show ip route 10.244.0.0/16 longer-prefixes`
-    - `kubectl explain bgppeers.spec --api-version=crd.projectcalico.org/v1`, likewise
-      `bgpfilters.spec.importV4`, `bgpconfigurations.spec` and `ippools.spec`
-    - `kubectl get ippools.crd.projectcalico.org default-ipv4-ippool -o yaml`
-    - `ip route` on each node (`ssh node01`)
-    - Calico docs: BGP filter, IP pools per namespace (`cni.projectcalico.org/ipv4pools`)
+    | direction | controlled by |
+    |---|---|
+    | the session (both ASes) | `BGPConfiguration.spec.asNumber`, `BGPPeer.spec.asNumber`, `BGPPeer.spec.node`/`nodeSelector` |
+    | what the cluster **announces** | pod blocks, `serviceClusterIPs`, `nextHopMode: Keep`, `BGPFilter.exportV4` |
+    | what the cluster **accepts** | `BGPFilter.importV4` (BIRD installs everything else into each node's kernel, `proto bird`) |
+    | who a pod is outside | the pool's `natOutgoing`; the pool chosen by `cni.projectcalico.org/ipv4pools` on the pod **or its namespace** |
+
+    **BGPFilter rules** are tried in order; `matchOperator` is `Equal`, `NotEqual`, `In` or `NotIn`; a route matching no rule is **accepted**. "Accept only X" is therefore one rule: `{action: Reject, matchOperator: NotIn, cidr: X}`.
+
+    ```yaml
+    apiVersion: crd.projectcalico.org/v1
+    kind: BGPFilter
+    metadata: {name: only-internet}
+    spec:
+      importV4:
+      - {action: Reject, matchOperator: NotIn, cidr: 203.0.113.0/24}
+    ```
+
+    ### Method
+
+    1. Router first: `show bgp summary`, `show bgp neighbors IP`, `show ip route`.
+    2. Sessions and next hops (k8s-331, k8s-332).
+    3. Import filter: fix `edge-policy` (don't remove it from the peer); check `ip route | grep bird` on **both** nodes (`ssh node01 ip route`).
+    4. Services: `serviceClusterIPs` with a merge patch, nothing else changed.
+    5. Partner range: IPPool with every field of the default pool (CRDs get no defaults), `natOutgoing: false`; annotate the **namespace**; restart the Deployment so new pods get new addresses.
+
+    ### Check your work
+
+    ```bash
+    kubectl -n edge exec router -c frr -- vtysh -c 'show bgp summary'
+    kubectl -n edge exec router -c frr -- vtysh -c 'show ip route 10.244.0.0/16 longer-prefixes'
+    ip route | grep -E '198.51.100|203.0.113|192.0.2'; ssh node01 "ip route | grep -E '198.51.100|203.0.113|192.0.2'"
+    kubectl -n partners get pods -o wide                        # 10.245.8.x addresses
+    for p in $(kubectl -n partners get pods -l app=feed -o name); do kubectl -n partners exec "$p" -- wget -qO- http://198.51.100.1/ | grep RemoteAddr; done
+    kubectl -n demo exec client -- wget -qO- http://198.51.100.1/ | grep RemoteAddr   # a node address
+    ```
   scenario: |
     **NET-2207**, from Tomás (network team): *"Our partner Ledgerline goes live on Monday.
     They only accept traffic from addresses they have on file, so their feed must reach them
