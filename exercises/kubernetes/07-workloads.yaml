@@ -12,16 +12,60 @@ exercises:
   kind: build
   tags: [job, troubleshooting]
   tutorial: |
-    **Concept.** A Job runs pods until they finish successfully, then stops. Unlike a Deployment it doesn't restart completed work, and its pod keeps its logs after completion. When a Job's pods fail, it retries until `backoffLimit` is reached and is then marked failed. The cause is almost always visible in the pod's logs or events. A Job's pod template is immutable, so fixing it means recreating the Job under the same name.
+    **What you're learning.** **Jobs**: pods that run to completion, how they retry, and how to fix a failed one.
 
-    **Read up on:**
-    - `kubectl create job --help` — imperative creation with a command after `--`
-    - `kubectl wait --help` — waiting for `--for=condition=complete`
-    - `kubectl logs job/NAME` and `kubectl logs -l job-name=NAME` — output of a finished or failed Job
-    - `kubectl describe pod` — events and exit codes
-    - `kubectl get configmap -o yaml` — see what is in a mounted script
-    - `kubectl get job -o json` — export a Job, strip generated fields and re-apply
-    - `kubectl explain job.spec.template.spec.restartPolicy` — allowed values for Jobs
+    ### Jobs from zero
+
+    A Deployment keeps pods running forever. A **Job** runs a pod until it **succeeds** (exit code 0), then stops. The finished pod stays (status `Completed`) so you can read its logs.
+
+    - If the pod fails, the Job retries with a new pod, up to `backoffLimit` (default 6), waiting longer each time. Then the Job is marked **Failed**.
+    - A Job's pods must use `restartPolicy: Never` or `OnFailure`.
+    - The Job's pod template is **immutable**: to fix one, delete it and create it again under the same name.
+
+    ```
+    Job ─► pod (exit 1) ─► pod (exit 1) ─► ... backoffLimit reached → Failed
+    Job ─► pod (exit 0) → Complete
+    ```
+
+    ### Commands you'll use
+
+    ```bash
+    kubectl create job hello -n demo --image=busybox:1.37 -- echo "hello from a job"
+    kubectl wait --for=condition=complete job/hello -n demo --timeout=60s
+    kubectl get job,pods -n demo
+    ```
+    ```text
+    NAME              STATUS     COMPLETIONS   DURATION
+    job.batch/hello   Complete   1/1           4s
+    NAME              READY   STATUS      RESTARTS
+    pod/hello-x7k2p   0/1     Completed   0
+    ```
+
+    ```bash
+    kubectl logs job/hello -n demo
+    ```
+
+    A failed Job:
+    ```bash
+    kubectl get job import -n demo                            # STATUS Failed
+    kubectl logs -n demo -l job-name=import --tail=5          # pods carry the label job-name=NAME
+    kubectl get job import -n demo -o json > /lab/import.json
+    ```
+    Before re-creating from the export, remove what the API generated: `.status`, `.metadata.resourceVersion`, `.metadata.uid`, `.spec.selector` and the `controller-uid` / `batch.kubernetes.io/controller-uid` labels (in metadata and in the template). Then:
+    ```bash
+    kubectl delete job import -n demo
+    kubectl apply -f /lab/import.json
+    ```
+
+    ### Common mistakes
+
+    - `kubectl run` for a one-off task: creates a pod, not a Job.
+    - Re-applying the export with the old selector: "field is immutable" or "selector does not match".
+    - Fixing the ConfigMap when the task says it's correct: read the logs, the error usually names a path.
+
+    ### Check your work
+
+    `kubectl get job NAME` shows `Complete` and `1/1`, and its logs show the expected output.
   scenario: |
     Two small tasks around Jobs.
 
@@ -89,13 +133,55 @@ exercises:
   kind: build
   tags: [job, completions, parallelism]
   tutorial: |
-    **Concept.** A Job can require several successful completions and limit how many pods run concurrently. Two fields control the total count and the concurrency independently.
+    **What you're learning.** Running a Job several times, with a limit on how many pods run at once.
 
-    **Read up on:**
-    - `kubectl explain job.spec` — read completions and parallelism
-    - `kubectl get pods -w -n NS` — watch pods start in batches
-    - `kubectl get job NAME` — the COMPLETIONS column
-    - Kubernetes docs: Jobs, parallel execution
+    ### The idea
+
+    | field | meaning |
+    |---|---|
+    | `completions` | how many pods must **succeed** in total |
+    | `parallelism` | how many pods may **run** at the same time |
+
+    `completions: 6, parallelism: 3` = two waves of three.
+
+    ```yaml
+    apiVersion: batch/v1
+    kind: Job
+    metadata: {name: encode, namespace: demo}
+    spec:
+      completions: 6
+      parallelism: 3
+      template:
+        spec:
+          restartPolicy: Never
+          containers:
+          - name: enc
+            image: busybox:1.37
+            command: ["sh", "-c", "echo encoding; sleep 3"]
+    ```
+
+    ### Commands you'll use
+
+    ```bash
+    kubectl apply -f /lab/encode.yaml
+    kubectl get pods -n demo -l job-name=encode -w
+    kubectl get job encode -n demo
+    ```
+    ```text
+    NAME     STATUS     COMPLETIONS   DURATION
+    encode   Complete   6/6           9s
+    ```
+
+    `kubectl create job` can't set these fields; generate with `--dry-run=client -o yaml` and add them.
+
+    ### Common mistakes
+
+    - Swapping the two fields.
+    - Putting them under `template.spec`: they belong to the Job's `spec`.
+
+    ### Check your work
+
+    `COMPLETIONS` reaches the number, and `kubectl get job NAME -o jsonpath='{.spec.parallelism}'` shows the limit.
   scenario: |
     Create a Job **`thumbnails`** in namespace **`media`** that runs a pod **5 times**
     successfully, with at most **2 pods running at once**. Each pod (`busybox:1.37`) runs
@@ -147,13 +233,46 @@ exercises:
   kind: build
   tags: [job, backoffLimit, activeDeadlineSeconds]
   tutorial: |
-    **Concept.** Jobs have three independent safeguards: how many retries are allowed, how long the Job may run in total, and when finished Jobs get garbage-collected. Each is a separate field in the Job spec.
+    **What you're learning.** A Job's three safety limits: retries, total run time, and automatic clean-up.
 
-    **Read up on:**
-    - `kubectl explain job.spec` — scan for retry, deadline and TTL fields
-    - `kubectl describe job NAME` — how failure reasons are reported
-    - `kubectl get job NAME -o yaml` — verify the fields were stored
-    - Kubernetes docs: Jobs, Clean up finished jobs
+    ### The idea
+
+    | field | stops... |
+    |---|---|
+    | `backoffLimit: N` | after N failed retries, the Job is Failed |
+    | `activeDeadlineSeconds: S` | after S seconds in total, all its pods are killed and the Job is Failed (`DeadlineExceeded`) |
+    | `ttlSecondsAfterFinished: S` | S seconds after finishing (success or failure), the Job and its pods are **deleted** |
+
+    All three go in the Job's `spec` (not the pod template).
+
+    ```yaml
+    spec:
+      backoffLimit: 2
+      activeDeadlineSeconds: 300
+      ttlSecondsAfterFinished: 3600
+      template:
+        spec:
+          restartPolicy: Never
+          containers:
+          - {name: fetch, image: busybox:1.37, command: ["sh", "-c", "echo fetching; sleep 5"]}
+    ```
+
+    ### Commands you'll use
+
+    ```bash
+    kubectl apply -f /lab/fetch.yaml
+    kubectl get job fetch -n demo -o jsonpath='{.spec.backoffLimit} {.spec.activeDeadlineSeconds} {.spec.ttlSecondsAfterFinished}'; echo
+    kubectl describe job fetch -n demo | tail -5
+    ```
+
+    ### Common mistakes
+
+    - `activeDeadlineSeconds` on the **pod** spec: it exists there too, but limits only that pod.
+    - Minutes vs seconds: 10 minutes = 600.
+
+    ### Check your work
+
+    The three fields read back with the requested values, and the Job completes.
   scenario: |
     The **`sync-crm`** Job (namespace **`integrations`**) talks to a flaky partner API.
     Create it so that:
@@ -204,13 +323,52 @@ exercises:
   kind: build
   tags: [cronjob]
   tutorial: |
-    **Concept.** A CronJob creates Jobs on a cron schedule. Its policy fields govern overlap, how many finished Jobs to keep, and what to do when a run is missed.
+    **What you're learning.** **CronJobs**: running Jobs on a schedule, and the fields that make them safe.
 
-    **Read up on:**
-    - `kubectl explain cronjob.spec` — schedule, concurrency, history limits, start deadline
-    - `man 5 crontab` — the five-field schedule syntax
-    - `kubectl create cronjob --help` — imperative starting point
-    - Kubernetes docs: CronJob, concurrency policy
+    ### The idea
+
+    A CronJob creates a Job from its `jobTemplate` each time its `schedule` matches the clock (the cluster's time zone, UTC here, unless `timeZone` is set).
+
+    **Cron syntax**: five fields `minute hour day-of-month month day-of-week`.
+
+    | schedule | runs |
+    |---|---|
+    | `0 * * * *` | every hour, on the hour |
+    | `*/15 * * * *` | every 15 minutes |
+    | `45 3 * * 1` | Mondays at 03:45 |
+
+    | field | meaning |
+    |---|---|
+    | `concurrencyPolicy` | `Allow` (default), `Forbid` (skip a run while the previous is still running), `Replace` |
+    | `successfulJobsHistoryLimit` / `failedJobsHistoryLimit` | how many finished Jobs to keep |
+    | `startingDeadlineSeconds` | if a run is missed (controller down), start it late only within this many seconds |
+    | `suspend` | `true` stops new runs |
+
+    ### Commands you'll use
+
+    ```bash
+    kubectl create cronjob tidy -n demo --image=busybox:1.37 --schedule="45 3 * * 1" \
+      --dry-run=client -o yaml -- sh -c 'echo tidying' > /lab/tidy.yaml
+    vi /lab/tidy.yaml       # add the policy fields under the CronJob's spec
+    kubectl apply -f /lab/tidy.yaml
+    kubectl get cronjob tidy -n demo
+    ```
+    ```text
+    NAME   SCHEDULE     TIMEZONE   SUSPEND   ACTIVE   LAST SCHEDULE
+    tidy   45 3 * * 1   <none>     False     0        <none>
+    ```
+
+    Note the nesting: `CronJob.spec.jobTemplate.spec.template.spec.containers`.
+
+    ### Common mistakes
+
+    - `30 2 * * *` vs `2 30 * * *`: minute first.
+    - Policy fields inside `jobTemplate`: they belong to the CronJob's own `spec`.
+    - An unquoted schedule in YAML: `*` at the start of a value must be quoted.
+
+    ### Check your work
+
+    `kubectl get cronjob NAME -o yaml` shows the schedule and every policy field.
   scenario: |
     Create a CronJob **`db-backup`** in namespace **`ops`** that runs **every day at
     02:30** (`busybox:1.37`, `sh -c 'echo backing up'`), with these safety settings:
@@ -272,15 +430,46 @@ exercises:
   kind: fix
   tags: [cronjob, manual-trigger, suspend, schedule]
   tutorial: |
-    **Concept.** A CronJob creates Jobs on a cron schedule, but you operate it with a few simple levers. You can create a one-off Job from its template without waiting for the schedule or touching the CronJob. You can pause it by flipping a spec field (existing Jobs continue; only new runs stop). And it only fires when its five-field schedule expression actually matches the clock, so a wrong expression means it silently never runs.
+    **What you're learning.** Operating CronJobs: run one now, pause one, and fix a schedule that never matches.
 
-    **Read up on:**
-    - `kubectl create job --help` — look for a flag that copies a template from another object
-    - `kubectl explain cronjob.spec` — find the field that pauses scheduling
-    - `kubectl patch --help` — changing a single field
-    - `kubectl get cronjob -o wide` — SCHEDULE, SUSPEND and LAST SCHEDULE columns
-    - `man 5 crontab` — field order and step syntax
-    - `kubectl get jobs` — manual and scheduled Jobs show together
+    ### The idea
+
+    | task | command |
+    |---|---|
+    | run now, from the CronJob's template | `kubectl create job NAME --from=cronjob/CRON` |
+    | pause / resume | patch `spec.suspend` to `true` / `false` (running Jobs continue) |
+    | check when it last ran | `LAST SCHEDULE` column |
+
+    A schedule that is valid but **never matches** (the 31st of February, `0 0 30 2 *`) makes a CronJob silently never run. Read the five fields carefully.
+
+    ### Commands you'll use
+
+    ```bash
+    kubectl create job report-now --from=cronjob/report -n demo
+    kubectl wait --for=condition=complete job/report-now -n demo
+    kubectl patch cronjob sync -n demo -p '{"spec":{"suspend":true}}'
+    kubectl get cronjob -n demo
+    ```
+    ```text
+    NAME     SCHEDULE      SUSPEND   ACTIVE   LAST SCHEDULE
+    report   0 6 * * 1     False     0        3d
+    sync     0 * * * *     True      0        25m
+    purge    0 0 30 2 *    False     0        <none>
+    ```
+
+    ```bash
+    kubectl patch cronjob purge -n demo -p '{"spec":{"schedule":"*/5 * * * *"}}'
+    kubectl get cronjob purge -n demo -w     # LAST SCHEDULE fills in within 5 minutes
+    ```
+
+    ### Common mistakes
+
+    - Deleting the CronJob to stop it.
+    - `kubectl create job ... --image=...` instead of `--from`: a different template.
+
+    ### Check your work
+
+    The manual Job is Complete, the paused CronJob shows `SUSPEND True`, and the fixed one shows a recent `LAST SCHEDULE`.
   scenario: |
     Three CronJobs in namespace **`billing`** need attention.
 
@@ -330,13 +519,61 @@ exercises:
   kind: build
   tags: [daemonset, tolerations]
   tutorial: |
-    **Concept.** A DaemonSet runs one pod on each node. Control-plane nodes carry a taint that repels ordinary pods, so a DaemonSet needs a matching toleration to land there. Hosts' files are reachable through hostPath volumes.
+    **What you're learning.** **DaemonSets**: one pod per node, for node agents (log collectors, monitoring, networking).
 
-    **Read up on:**
-    - `kubectl describe node NAME` — read the Taints line
-    - `kubectl explain pod.spec.tolerations` — key, operator, effect
-    - `kubectl explain pod.spec.volumes.hostPath` — path and type
-    - `kubectl get ds` and `kubectl get pods -o wide` — one pod per node?
+    ### The idea
+
+    A DaemonSet runs **one copy of a pod on every eligible node**, and adds one automatically when a node joins. It has no `replicas`: the number of nodes decides. Like other pods, DaemonSet pods are kept off the control plane by its taint unless they **tolerate** it.
+
+    Node agents often need the node's own files: a **`hostPath`** volume mounts a directory of the node into the pod.
+
+    ```yaml
+    apiVersion: apps/v1
+    kind: DaemonSet
+    metadata: {name: agent, namespace: demo}
+    spec:
+      selector: {matchLabels: {app: agent}}
+      template:
+        metadata: {labels: {app: agent}}
+        spec:
+          tolerations:
+          - {key: node-role.kubernetes.io/control-plane, operator: Exists, effect: NoSchedule}
+          containers:
+          - name: agent
+            image: busybox:1.37
+            command: ["sh", "-c", "ls /host/etc; sleep 3600"]
+            volumeMounts: [{name: etc, mountPath: /host/etc, readOnly: true}]
+          volumes:
+          - name: etc
+            hostPath: {path: /etc}
+    ```
+
+    ### Commands you'll use
+
+    ```bash
+    kubectl apply -f /lab/agent.yaml
+    kubectl get ds -n demo
+    ```
+    ```text
+    NAME    DESIRED   CURRENT   READY   UP-TO-DATE   AVAILABLE
+    agent   2         2         2       2            2
+    ```
+    `DESIRED` = the number of eligible nodes.
+
+    ```bash
+    kubectl get pods -n demo -l app=agent -o wide       # one per node
+    ```
+
+    `kubectl create` has no DaemonSet generator: start from a Deployment's YAML (`kubectl create deployment ... --dry-run=client -o yaml`), change `kind`, and delete `replicas`, `strategy` and `status`.
+
+    ### Common mistakes
+
+    - `DESIRED 1`: the control-plane toleration is missing.
+    - Leaving `replicas:` in the YAML: rejected.
+
+    ### Check your work
+
+    `DESIRED` and `READY` equal the number of nodes, and each pod can read the mounted host path.
   scenario: |
     Deploy the node log collector **`node-logger`** as a **DaemonSet** in namespace
     **`logging`** (`busybox:1.37`, `sh -c 'tail -F /host/var/log/syslog'`) with the
@@ -401,13 +638,52 @@ exercises:
   kind: build
   tags: [init-containers]
   tutorial: |
-    **Concept.** Init containers run to completion, one after another, before the main containers start. They are a good place to wait for dependencies. Service names resolve through cluster DNS.
+    **What you're learning.** **Init containers**: steps that must finish before the app starts, such as waiting for a dependency.
 
-    **Read up on:**
-    - `kubectl explain pod.spec.initContainers` — same shape as containers
-    - busybox `nc` applet — testing whether a TCP port is open
-    - `kubectl get pod` — Init:0/1 status meaning
-    - `kubectl logs POD -c INIT` — log of a specific container
+    ### The idea
+
+    `initContainers` run **one after another, each to completion**, before any of the main containers start. If one fails, the kubelet retries it (the pod shows `Init:Error` / `Init:CrashLoopBackOff`). While they run, the pod shows `Init:0/1`.
+
+    Waiting for a service is a classic use: loop until its port accepts a connection.
+
+    ```yaml
+    spec:
+      initContainers:
+      - name: wait-for-cache
+        image: busybox:1.37
+        command: ["sh", "-c", "until nc -z -w 2 cache 6379; do echo waiting for cache; sleep 2; done"]
+      containers:
+      - name: app
+        image: traefik/whoami:v1.10
+    ```
+    `nc -z -w 2 HOST PORT` succeeds if a TCP connection opens within 2 seconds. `until CMD; do ...; done` repeats until CMD succeeds.
+
+    ### Commands you'll use
+
+    ```bash
+    kubectl apply -f /lab/app.yaml
+    kubectl get pod app -n demo -w
+    ```
+    ```text
+    NAME   READY   STATUS     RESTARTS
+    app    0/1     Init:0/1   0
+    app    0/1     PodInitializing   0
+    app    1/1     Running    0
+    ```
+
+    ```bash
+    kubectl logs app -n demo -c wait-for-cache       # -c picks the container
+    ```
+
+    ### Common mistakes
+
+    - Putting the wait loop in the **main** container's command: then it's no longer the app.
+    - A loop that never ends because of a wrong service name: check the init container's logs.
+    - `sleep` without the loop: a fixed delay isn't waiting for readiness.
+
+    ### Check your work
+
+    The init container's logs show the waiting messages and then stop, and the main container is Running.
   scenario: |
     The **`orders`** pod (namespace **`shop`**) crashes if it starts before its database
     is reachable. Create pod **`orders`** (`traefik/whoami:v1.10`) with an **init
@@ -466,13 +742,48 @@ exercises:
   kind: build
   tags: [init-containers, emptydir]
   tutorial: |
-    **Concept.** Containers in a pod can share files through a volume. An init container can write into it, and the main container then serves that content. The volume must be mounted in both, at paths of your choosing.
+    **What you're learning.** Sharing files between an init container and the main container through an `emptyDir`.
 
-    **Read up on:**
-    - `kubectl explain pod.spec.volumes.emptyDir` — pod-scoped scratch space
-    - `kubectl explain pod.spec.initContainers` — ordering guarantees
-    - `kubectl exec POD -- cat /path` — inspect the result
-    - `kubectl logs POD -c NAME` — logs from each container
+    ### The idea
+
+    Containers in a pod don't share filesystems, but they can mount the **same volume**. An init container can write files into an `emptyDir`; the main container, starting afterwards, finds them. Each container chooses its own mount path.
+
+    ```
+    init "build"  writes /out/index.html  ┐
+                                           ├── emptyDir "site"
+    nginx         serves /usr/share/nginx/html ┘
+    ```
+
+    ```yaml
+    spec:
+      volumes: [{name: site, emptyDir: {}}]
+      initContainers:
+      - name: build
+        image: busybox:1.37
+        command: ["sh", "-c", "echo '<p>built at start</p>' > /out/index.html"]
+        volumeMounts: [{name: site, mountPath: /out}]
+      containers:
+      - name: nginx
+        image: nginx:1.28-alpine
+        volumeMounts: [{name: site, mountPath: /usr/share/nginx/html}]
+    ```
+
+    ### Commands you'll use
+
+    ```bash
+    kubectl apply -f /lab/page.yaml
+    kubectl exec page -n demo -c nginx -- cat /usr/share/nginx/html/index.html
+    kubectl exec page -n demo -c nginx -- wget -qO- http://127.0.0.1/
+    ```
+
+    ### Common mistakes
+
+    - Different volume names in the two mounts.
+    - Quoting: inside `sh -c "..."` with single quotes around the HTML, the `<` and `>` are safe.
+
+    ### Check your work
+
+    Fetching `/` from inside the pod returns exactly the generated HTML.
   scenario: |
     The **`landing`** pod (namespace **`web`**) must serve a page that is generated at
     start-up. Create pod **`landing`** with:
@@ -528,13 +839,38 @@ exercises:
   kind: fix
   tags: [job, ttl, cleanup]
   tutorial: |
-    **Concept.** Finished Jobs pile up unless something removes them. Jobs can be deleted in bulk by selecting on status, and Job specs can expire themselves automatically after completion.
+    **What you're learning.** Cleaning up finished Jobs in bulk, and making future Jobs clean up themselves.
 
-    **Read up on:**
-    - `kubectl delete --help` — `--field-selector` and `-l` options
-    - `kubectl get jobs --field-selector=` — test a selector with get first
-    - `kubectl explain cronjob.spec.jobTemplate.spec` — fields that apply to generated Jobs
-    - `kubectl patch --help` — nested changes
+    ### The idea
+
+    Finished Jobs (and their pods) stay until deleted. Two tools:
+
+    - **Bulk delete by status** with a field selector: `status.successful=1` matches Jobs that completed.
+    - `ttlSecondsAfterFinished` in a Job spec (for a CronJob: in `jobTemplate.spec`) deletes each Job automatically some time after it finishes.
+
+    ### Commands you'll use
+
+    ```bash
+    kubectl get jobs -n demo
+    kubectl get jobs -n demo --field-selector status.successful=1    # preview what will go
+    kubectl delete jobs -n demo --field-selector status.successful=1
+    kubectl get jobs -n demo                                         # running ones remain
+    ```
+
+    ```bash
+    kubectl patch cronjob nightly -n demo -p '{"spec":{"jobTemplate":{"spec":{"ttlSecondsAfterFinished":600}}}}'
+    kubectl get cronjob nightly -n demo -o jsonpath='{.spec.jobTemplate.spec.ttlSecondsAfterFinished}'; echo
+    ```
+
+    ### Common mistakes
+
+    - `kubectl delete jobs --all`: also kills the running one.
+    - Setting the TTL on the CronJob's own spec instead of `jobTemplate.spec`.
+    - `successfulJobsHistoryLimit` is a different tool (it keeps the N newest); the task asks for a time-based TTL.
+
+    ### Check your work
+
+    Only the running Job is left, and the CronJob's `jobTemplate.spec.ttlSecondsAfterFinished` is 300.
   scenario: |
     Namespace **`ci`** is full of hundreds of finished Jobs from the build pipeline.
 
@@ -569,13 +905,48 @@ exercises:
   kind: build
   tags: [lifecycle, preStop, graceful-shutdown]
   tutorial: |
-    **Concept.** When a pod is deleted, Kubernetes runs preStop hooks, then signals the container, and force-kills it after the termination grace period. Hooks let in-flight traffic drain first.
+    **What you're learning.** Graceful shutdown: what happens when a pod is deleted, and `preStop` hooks.
 
-    **Read up on:**
-    - `kubectl explain pod.spec.containers.lifecycle.preStop` — hook types
-    - `kubectl explain pod.spec.terminationGracePeriodSeconds` — the hard limit
-    - Kubernetes docs: Container Lifecycle Hooks, Pod termination
-    - `kubectl create deployment --help` — generate YAML with `--dry-run=client -o yaml`
+    ### The idea
+
+    When a pod is deleted:
+
+    1. It's removed from Service endpoints (but load balancers may take a few seconds to notice).
+    2. Each container's **`preStop`** hook runs, if any.
+    3. The container gets **SIGTERM**.
+    4. If it's still running when `terminationGracePeriodSeconds` (default 30) has passed since step 2, it gets **SIGKILL**.
+
+    A `preStop` that just sleeps a few seconds keeps the pod serving while traffic drains away. The grace period must be longer than the hook plus the app's own shutdown.
+
+    ```yaml
+    spec:
+      terminationGracePeriodSeconds: 40
+      containers:
+      - name: nginx
+        image: nginx:1.28-alpine
+        lifecycle:
+          preStop:
+            sleep:
+              seconds: 8
+    ```
+    `preStop.sleep` is built in (no `sleep` binary needed in the image). The older way is `exec: {command: ["sleep", "8"]}`.
+
+    ### Commands you'll use
+
+    ```bash
+    kubectl apply -f /lab/edge.yaml
+    kubectl get deploy edge -n demo -o jsonpath='{.spec.template.spec.terminationGracePeriodSeconds} {.spec.template.spec.containers[0].lifecycle}'; echo
+    time kubectl delete pod -n demo -l app=edge --wait
+    ```
+
+    ### Common mistakes
+
+    - A grace period shorter than the preStop sleep: the container is killed mid-hook.
+    - `lifecycle` at the pod level: it's per container.
+
+    ### Check your work
+
+    The template shows the grace period and the preStop hook, and deleting a pod takes at least the sleep time.
   scenario: |
     When a **`gateway`** pod is terminated, the load balancer needs ~10 seconds to stop
     sending it traffic. Create deployment **`gateway`** in namespace **`edge`**
@@ -633,15 +1004,49 @@ exercises:
   kind: fix
   tags: [daemonset, tolerations, rolling-update, troubleshooting]
   tutorial: |
-    **Concept.** A DaemonSet's DESIRED count is the number of nodes its pods are eligible to run on. Scheduling rules on both the node and the pod side decide eligibility: control-plane nodes carry a taint that repels ordinary pods, so a DaemonSet needs a matching toleration to land there. DaemonSets also update with a strategy: `OnDelete` never replaces pods by itself, while `RollingUpdate` controls how many nodes may be without a ready pod at once. Changing the pod template (for example the image) triggers the rollout.
+    **What you're learning.** Why a DaemonSet runs on fewer nodes than expected, and how DaemonSets roll out updates.
 
-    **Read up on:**
-    - `kubectl get nodes` and `kubectl describe node` — labels and taints
-    - `kubectl get pods -o wide` — which nodes have a pod
-    - `kubectl describe ds NAME` — events and node counts
-    - `kubectl explain pod.spec.tolerations` — key, operator, effect
-    - `kubectl explain daemonset.spec.updateStrategy` — type and rolling update settings
-    - `kubectl set image --help` and `kubectl rollout status ds/NAME` — change an image and follow progress
+    ### The idea
+
+    `DESIRED` counts nodes the pod is **eligible** for: taints without tolerations, nodeSelectors and affinity all reduce it.
+
+    **Update strategies**:
+
+    | `updateStrategy.type` | on a template change |
+    |---|---|
+    | `OnDelete` | nothing happens until you delete each pod yourself |
+    | `RollingUpdate` | pods are replaced node by node; `rollingUpdate.maxUnavailable` = how many nodes may lack a ready pod at once |
+
+    ### Commands you'll use
+
+    ```bash
+    kubectl get ds collector -n demo
+    kubectl get ds collector -n demo -o jsonpath='{.spec.updateStrategy}'; echo
+    ```
+    ```text
+    {"type":"OnDelete"}
+    ```
+
+    ```bash
+    kubectl patch ds collector -n demo --type=json -p \
+      '[{"op":"add","path":"/spec/template/spec/tolerations","value":[{"key":"node-role.kubernetes.io/control-plane","operator":"Exists","effect":"NoSchedule"}]}]'
+    kubectl patch ds collector -n demo -p \
+      '{"spec":{"updateStrategy":{"type":"RollingUpdate","rollingUpdate":{"maxUnavailable":1}}}}'
+    kubectl set image ds/collector -n demo agent=nginx:1.29-alpine
+    kubectl rollout status ds/collector -n demo
+    kubectl get pods -n demo -l app=collector -o custom-columns=NAME:.metadata.name,NODE:.spec.nodeName,IMAGE:.spec.containers[0].image
+    ```
+
+    The JSON-patch `add` on `.../tolerations` **replaces** the list if one exists; use `.../tolerations/-` to append one entry.
+
+    ### Common mistakes
+
+    - Changing the image while the strategy is `OnDelete`: no pod changes.
+    - The container name in `set image` must match the DaemonSet's container.
+
+    ### Check your work
+
+    `DESIRED` equals the node count, every pod runs the new image, and the strategy reads `RollingUpdate` with `maxUnavailable: 1`.
   scenario: |
     The metrics agent DaemonSet **`node-exporter`** (namespace **`monitoring`**, container
     `exporter`, currently `nginx:1.28-alpine`) shows `DESIRED 1` — but the cluster has
@@ -697,13 +1102,45 @@ exercises:
   kind: build
   tags: [sidecar, init-containers, restartPolicy]
   tutorial: |
-    **Concept.** Native sidecars are init containers marked to keep running after startup. They start before the main container, stay up alongside it, and are stopped once the main containers exit, which lets Jobs finish.
+    **What you're learning.** **Native sidecars**: helper containers that start first, run alongside the app, and don't keep a Job alive.
 
-    **Read up on:**
-    - `kubectl explain pod.spec.initContainers.restartPolicy` — what it allows
-    - Kubernetes docs: Sidecar Containers
-    - `kubectl get pod -w` — watch status transitions
-    - `kubectl get job` — confirm completion
+    ### The idea
+
+    A sidecar (log shipper, proxy) as a normal second container has two problems: no guarantee it starts **before** the app, and in a Job it keeps running after the app exits, so the pod (and the Job) never completes.
+
+    A **native sidecar** is an **init container with `restartPolicy: Always`**. Kubernetes starts it in init order, but doesn't wait for it to exit: once it's running, the next init containers and the main containers start. When all main containers have finished, sidecars are stopped, and the Job can complete.
+
+    ```yaml
+    initContainers:
+    - name: shipper
+      image: busybox:1.37
+      restartPolicy: Always            ← this makes it a sidecar
+      command: ["sh", "-c", "touch /var/log/app/out.log; tail -F /var/log/app/out.log"]
+      volumeMounts: [{name: logs, mountPath: /var/log/app}]
+    containers:
+    - name: task
+      image: busybox:1.37
+      command: ["sh", "-c", "for i in 1 2; do echo line $i >> /var/log/app/out.log; sleep 1; done"]
+      volumeMounts: [{name: logs, mountPath: /var/log/app}]
+    ```
+
+    ### Commands you'll use
+
+    ```bash
+    kubectl apply -f /lab/sidecar-job.yaml
+    kubectl get pods -n demo -l job-name=NAME -w
+    kubectl logs -n demo -l job-name=NAME -c shipper       # the sidecar saw the lines
+    kubectl get job NAME -n demo                           # Complete
+    ```
+
+    ### Common mistakes
+
+    - The sidecar under `containers:`: the Job never completes.
+    - `restartPolicy: Always` on the **pod**: Jobs don't allow it (and it would mean something else).
+
+    ### Check your work
+
+    The Job is Complete and the sidecar's logs contain what the main container wrote.
   scenario: |
     Classic sidecars (a second container) have two problems: they may start **after** the
     app, and in Jobs they keep the pod running forever.
@@ -777,13 +1214,52 @@ exercises:
   kind: build
   tags: [job, indexed]
   tutorial: |
-    **Concept.** In Indexed completion mode every pod of a Job gets a unique index from 0 to completions minus one, exposed to the container. That lets each pod handle its own slice of work.
+    **What you're learning.** **Indexed** Jobs: each pod gets its own number, so it knows which piece of work is its.
 
-    **Read up on:**
-    - `kubectl explain job.spec.completionMode` — modes available
-    - Kubernetes docs: Jobs, Indexed Job
-    - `kubectl get pod -o yaml` — see annotations and environment set on indexed pods
-    - `kubectl logs -l job-name=NAME` — read output of all pods
+    ### The idea
+
+    With `completionMode: Indexed`, a Job with `completions: N` creates pods numbered **0 to N-1**. Each one gets its index in the environment variable `JOB_COMPLETION_INDEX` (and the annotation `batch.kubernetes.io/job-completion-index`). The Job is complete when every index has succeeded once.
+
+    ```yaml
+    spec:
+      completions: 4
+      parallelism: 4
+      completionMode: Indexed
+      template:
+        spec:
+          restartPolicy: Never
+          containers:
+          - name: part
+            image: busybox:1.37
+            command: ["sh", "-c", "echo handling part $JOB_COMPLETION_INDEX"]
+    ```
+
+    ### Commands you'll use
+
+    ```bash
+    kubectl apply -f /lab/parts.yaml
+    kubectl get pods -n demo -l job-name=parts
+    ```
+    ```text
+    NAME            READY   STATUS      RESTARTS
+    parts-0-abcde   0/1     Completed   0
+    parts-1-fghij   0/1     Completed   0
+    ...
+    ```
+    Pod names include the index.
+
+    ```bash
+    for p in $(kubectl get pods -n demo -l job-name=parts -o name); do kubectl logs -n demo $p; done
+    ```
+
+    ### Common mistakes
+
+    - `$JOB_COMPLETION_INDEX` in a YAML `command` list **without** `sh -c`: no shell expands it.
+    - Single quotes around the whole `sh -c` argument are fine; the variable is expanded inside the container's shell.
+
+    ### Check your work
+
+    Each pod's log shows a different index, 0 to N-1.
   scenario: |
     Three shards of a dataset must be processed, one pod per shard, each knowing **which**
     shard it is.
@@ -838,13 +1314,44 @@ exercises:
   kind: build
   tags: [statefulset, scaling, podManagementPolicy]
   tutorial: |
-    **Concept.** StatefulSets normally create pods one by one in order and wait for each to be ready. Applications that coordinate themselves can ask for a different policy.
+    **What you're learning.** StatefulSet **pod management policy**: starting replicas one by one or all at once.
 
-    **Read up on:**
-    - `kubectl explain statefulset.spec` — read podManagementPolicy
-    - `kubectl get pods -w` — compare start order
-    - Kubernetes docs: StatefulSets, Pod Management Policies
-    - `kubectl explain service.spec.clusterIP` — headless service
+    ### The idea
+
+    | `podManagementPolicy` | scaling up / down |
+    |---|---|
+    | `OrderedReady` (default) | `x-0`, wait until Ready, then `x-1`... (and the reverse on scale-down) |
+    | `Parallel` | create or delete all at once |
+
+    Ordering matters for databases that bootstrap from the first member. Apps that coordinate themselves start faster with `Parallel`. Updates still follow the update strategy. The field is set at creation (immutable afterwards).
+
+    ```yaml
+    spec:
+      serviceName: peers
+      replicas: 3
+      podManagementPolicy: Parallel
+    ```
+
+    ### Commands you'll use
+
+    ```bash
+    kubectl apply -f /lab/peers.yaml          # headless Service + StatefulSet
+    kubectl get pods -n demo -l app=peers -w
+    ```
+    With `Parallel` all three appear at the same moment; with `OrderedReady` they appear one after another.
+
+    ```bash
+    kubectl get sts peers -n demo -o jsonpath='{.spec.podManagementPolicy}'; echo
+    ```
+
+    ### Common mistakes
+
+    - Forgetting the headless Service named by `serviceName`.
+    - Trying to change the policy on an existing StatefulSet: "Forbidden".
+
+    ### Check your work
+
+    The policy reads `Parallel` and three pods are Running.
   scenario: |
     Create a StatefulSet **`cassandra-lite`** in namespace **`nosql`** (`busybox:1.37`,
     `sleep infinity`, headless service `cassandra-lite`) with **3 replicas** whose pods are
@@ -906,13 +1413,44 @@ exercises:
   kind: build
   tags: [statefulset, rolling-update, partition]
   tutorial: |
-    **Concept.** StatefulSets update pods in reverse ordinal order. The rolling update strategy has a partition setting: only pods at or above that ordinal receive the new template, which allows staged canaries.
+    **What you're learning.** Canarying a StatefulSet update with a **partition**.
 
-    **Read up on:**
-    - `kubectl explain statefulset.spec.updateStrategy.rollingUpdate` — partition
-    - `kubectl get pods -L controller-revision-hash` — which revision each pod runs
-    - `kubectl rollout status sts/NAME` — progress
-    - Kubernetes docs: StatefulSets, Partitioned updates
+    ### The idea
+
+    StatefulSets update pods in **reverse ordinal order** (highest first). With `updateStrategy.rollingUpdate.partition: P`, only pods with ordinal **≥ P** get the new template; lower ones keep the old revision, even if they're deleted and recreated.
+
+    ```
+    replicas 3, partition 2:   x-0 old   x-1 old   x-2 NEW
+    partition 1:               x-0 old   x-1 NEW   x-2 NEW
+    partition 0:               all new
+    ```
+
+    ### Commands you'll use
+
+    ```bash
+    kubectl patch sts store -n demo -p '{"spec":{"updateStrategy":{"type":"RollingUpdate","rollingUpdate":{"partition":2}}}}'
+    kubectl set image sts/store -n demo nginx=nginx:1.29-alpine
+    kubectl rollout status sts/store -n demo --watch=false
+    kubectl get pods -n demo -l app=store -L controller-revision-hash \
+      -o custom-columns=NAME:.metadata.name,IMAGE:.spec.containers[0].image
+    ```
+    ```text
+    NAME      IMAGE
+    store-0   nginx:1.28-alpine
+    store-1   nginx:1.28-alpine
+    store-2   nginx:1.29-alpine
+    ```
+
+    Set the partition **before** changing the image, or all pods start updating at once.
+
+    ### Common mistakes
+
+    - Partition 1 when only the last pod may update (with 3 replicas, that's 2).
+    - Container name in `set image` not matching.
+
+    ### Check your work
+
+    Only the highest-ordinal pod runs the new image.
   scenario: |
     The **`ledger`** StatefulSet (namespace **`fin`**, 3 replicas, `nginx:1.28-alpine`) must
     be upgraded to **`nginx:1.29-alpine`** carefully: for now **only `ledger-2`** may get
@@ -959,14 +1497,34 @@ exercises:
   kind: fix
   tags: [cronjob, job, incident]
   tutorial: |
-    **Concept.** Failing CronJobs pile up because nothing limits overlap, runtime or history. Fix the cause of the failure from logs first, then add the policy fields, then clean up the backlog.
+    **What you're learning.** Stopping a failing CronJob from piling up, then fixing its cause.
 
-    **Read up on:**
-    - `kubectl logs` and `kubectl describe pod` — why runs fail
-    - `kubectl explain cronjob.spec` — concurrency and history limits
-    - `kubectl explain job.spec` — bounding a run
-    - `kubectl delete jobs --help` — selecting Jobs to remove
-    - `kubectl create job --help` — manual run from a CronJob
+    ### Method
+
+    1. **Find why it fails**: `kubectl -n NS logs -l job-name=JOB --tail=5` on one of the pods. A "not found" path usually means a mount path and a command disagree (k8s-121).
+    2. **Stop the pile-up** with policy (k8s-123, k8s-125):
+       - `concurrencyPolicy: Forbid`: no new run while one is active;
+       - `jobTemplate.spec.activeDeadlineSeconds`: each run is killed after the limit;
+       - history limits: how many finished Jobs remain.
+    3. **Fix the template**: a JSON patch on the exact path inside `jobTemplate` (`/spec/jobTemplate/spec/template/spec/containers/0/...`).
+    4. **Clear the backlog**: `kubectl delete jobs -n NS --all` (deleting a Job deletes its pods).
+    5. **Prove it**: `kubectl create job NAME --from=cronjob/CRON` and wait for `Complete` (k8s-126).
+
+    Field locations (easy to get wrong):
+
+    | field | path |
+    |---|---|
+    | `concurrencyPolicy`, history limits, `schedule` | `spec` |
+    | `activeDeadlineSeconds`, `backoffLimit`, `ttlSecondsAfterFinished` | `spec.jobTemplate.spec` |
+    | containers, volumes | `spec.jobTemplate.spec.template.spec` |
+
+    ### Check your work
+
+    ```bash
+    kubectl -n finance get cronjob reconcile -o yaml | grep -E 'concurrencyPolicy|HistoryLimit|activeDeadline|mountPath'
+    kubectl -n finance get job reconcile-now        # Complete
+    kubectl -n finance get pods                     # no pile of failing pods
+    ```
   scenario: |
     The **`reconcile`** CronJob (namespace **`finance`**) runs every minute. Every run
     fails, runs forever, and they pile up: there are already a dozen pods.
