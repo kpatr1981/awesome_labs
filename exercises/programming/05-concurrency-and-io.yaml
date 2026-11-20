@@ -12,12 +12,31 @@ exercises:
   kind: fix
   tags: [python, threading, lock]
   tutorial: |
-    **Concept.** Several threads updating the same variable can interleave in the middle of a read-modify-write, so some updates overwrite others and are lost. A lock makes the whole update one indivisible step.
+    **What you're learning.** Thread-safe counting in Python with a `Lock`.
 
-    **Read up on:**
-    - `python3 -c "import threading; help(threading.Lock)"` — acquire and release
-    - the `with lock:` statement — why it is safer than calling `acquire`/`release` by hand
-    - what a "critical section" is, and why it should be kept small
+    ### The idea
+
+    `self.n += 1` is not atomic across threads (read, add, write can interleave), so counts are lost. Guard it with a lock:
+
+    ```python
+    import threading
+    class Counter:
+        def __init__(self): self.n = 0; self._lock = threading.Lock()
+        def inc(self):
+            with self._lock: self.n += 1
+        def value(self):
+            with self._lock: return self.n
+    ```
+    The GIL doesn't save you: `+=` is several bytecodes with a context switch possible between them.
+
+    ### Common mistakes
+
+    - Relying on the GIL: `+=` isn't atomic.
+    - Locking `inc` but not `value`.
+
+    ### Check your work
+
+    After `threads * per_thread` increments, the total is exact.
   scenario: |
     **`/lab/counter.py`** has a `Counter` class and a helper `count_with_threads(threads, per_thread)` that starts that many threads, each incrementing one shared counter `per_thread` times, and returns the final value.
 
@@ -147,12 +166,30 @@ exercises:
   kind: build
   tags: [python, concurrent.futures, threads]
   tutorial: |
-    **Concept.** When each task spends its time waiting (network, disk, sleeping) a pool of threads finishes a batch far sooner than a plain loop. A good helper hides the pool but still hands results back in the order the inputs were given, however the tasks happened to finish.
+    **What you're learning.** An order-preserving parallel map with a thread pool.
 
-    **Read up on:**
-    - `python3 -c "import concurrent.futures as c; help(c.ThreadPoolExecutor)"` — `max_workers`, `map`, `submit`
-    - `Executor.map` versus `as_completed` — which one preserves input order
-    - the context-manager form `with ThreadPoolExecutor(...) as pool:`
+    ### The idea
+
+    `concurrent.futures.ThreadPoolExecutor.map` runs `fn` concurrently and yields results **in input order**:
+
+    ```python
+    from concurrent.futures import ThreadPoolExecutor
+    def parallel_map(fn, items, workers=4):
+        items = list(items)
+        if not items: return []
+        with ThreadPoolExecutor(max_workers=workers) as ex:
+            return list(ex.map(fn, items))
+    ```
+    `ex.map` preserves order regardless of completion order; `as_completed` does not.
+
+    ### Common mistakes
+
+    - `as_completed` then collecting: loses order.
+    - Not materialising a generator `items` (map needs to index them).
+
+    ### Check your work
+
+    The result equals `[fn(x) for x in items]`, computed concurrently.
   scenario: |
     **`/lab/pmap.py`** contains a stub `parallel_map(fn, items, workers=4)`. Implement it:
 
@@ -248,13 +285,29 @@ exercises:
   kind: fix
   tags: [go, sync, mutex, data-race]
   tutorial: |
-    **Concept.** Go maps are not safe for concurrent use: two goroutines writing at once can corrupt the map (the runtime may even abort the program), and read-modify-write sequences lose updates. A `sync.Mutex` serialises access so only one goroutine touches the data at a time.
+    **What you're learning.** A concurrent-safe tally in Go (`sync.RWMutex` or `sync.Map`).
 
-    **Read up on:**
-    - `go doc sync.Mutex` and `go doc sync.RWMutex`
-    - `defer mu.Unlock()` — releasing on every return path
-    - embedding the mutex as a field next to the data it guards
-    - `go help testrace` — the race detector and what it reports
+    ### The idea
+
+    A plain `map[string]int` panics under concurrent writes ("concurrent map writes"). Guard it:
+
+    ```go
+    type Tally struct { mu sync.RWMutex; m map[string]int }
+    func NewTally() *Tally { return &Tally{m: map[string]int{}} }
+    func (t *Tally) Inc(k string) { t.mu.Lock(); t.m[k]++; t.mu.Unlock() }
+    func (t *Tally) Get(k string) int { t.mu.RLock(); defer t.mu.RUnlock(); return t.m[k] }
+    func (t *Tally) Total() int { t.mu.RLock(); defer t.mu.RUnlock(); s := 0; for _, v := range t.m { s += v }; return s }
+    ```
+    `RWMutex` lets many readers run together, with writers exclusive.
+
+    ### Common mistakes
+
+    - A read method without `RLock`: still races with writers.
+    - `sync.Map` where a plain map + mutex is simpler.
+
+    ### Check your work
+
+    Any mix of `Inc`/`Get`/`Total` is safe, and `go test -race` is clean.
   scenario: |
     **`/lab/tally.go`** (package `main`) has a `Tally` type that counts occurrences of string keys. It works from a single goroutine, but when many goroutines call `Inc` at once, counts go missing or the program dies with `fatal error: concurrent map writes`.
 
@@ -459,13 +512,39 @@ exercises:
   kind: build
   tags: [python, queue, threading, producer-consumer]
   tutorial: |
-    **Concept.** A producer thread puts work on a queue and several consumer threads take it off. The queue does its own locking, so threads can share it safely. The hard part is stopping: consumers block forever on an empty queue unless the producer tells each of them that no more work is coming.
+    **What you're learning.** A producer/consumer pipeline with a bounded queue and clean shutdown.
 
-    **Read up on:**
-    - `python3 -c "import queue; help(queue.Queue)"` — `put`, `get`, `maxsize`, blocking behaviour
-    - the "sentinel" (poison pill) pattern for ending consumers
-    - `threading.Thread.join` — waiting for threads to finish
-    - `threading.Lock` — protecting a total shared between consumers
+    ### The idea
+
+    One producer puts items on a **bounded** `queue.Queue(maxsize=10)` (backpressure); consumers take them; a sentinel (or `task_done`/`join`) signals the end:
+
+    ```python
+    import queue, threading
+    def sum_of_squares(numbers, consumers):
+        q = queue.Queue(maxsize=10); total = 0; lock = threading.Lock()
+        def work():
+            nonlocal total
+            while True:
+                n = q.get()
+                if n is None: q.task_done(); break
+                with lock: total += n * n
+                q.task_done()
+        ts = [threading.Thread(target=work) for _ in range(consumers)]
+        for t in ts: t.start()
+        for n in numbers: q.put(n)
+        for _ in ts: q.put(None)       # one sentinel per consumer
+        for t in ts: t.join()
+        return total
+    ```
+
+    ### Common mistakes
+
+    - Too few sentinels: some consumers never exit.
+    - An unbounded queue: no backpressure, memory blows up.
+
+    ### Check your work
+
+    The sum is correct, consumers shut down cleanly, and the queue stays bounded.
   scenario: |
     **`/lab/pipeline.py`** contains a stub `sum_of_squares(numbers, consumers)`. Implement it so that:
 
@@ -589,12 +668,30 @@ exercises:
   kind: build
   tags: [python, asyncio, semaphore]
   tutorial: |
-    **Concept.** `asyncio` can run thousands of coroutines at once, which is usually too many for a remote service or a file-descriptor limit. A semaphore is a counter of permits: a coroutine waits for a permit before starting its work and gives it back afterwards, so only a fixed number are inside at any moment.
+    **What you're learning.** Limiting concurrency with an `asyncio.Semaphore`.
 
-    **Read up on:**
-    - `python3 -c "import asyncio; help(asyncio.Semaphore)"` — and `async with sem:`
-    - `asyncio.gather` — result order, and how to pass it a list of coroutines (`*coros`)
-    - the difference between creating a coroutine object and awaiting it
+    ### The idea
+
+    To run many coroutines but never more than `limit` at once, wrap each in a semaphore:
+
+    ```python
+    import asyncio
+    async def gather_limited(fn, items, limit):
+        sem = asyncio.Semaphore(limit)
+        async def run(x):
+            async with sem: return await fn(x)
+        return await asyncio.gather(*(run(x) for x in items))
+    ```
+    `gather` preserves order; the semaphore caps concurrency.
+
+    ### Common mistakes
+
+    - A semaphore created per call inside `run`: no limit.
+    - `limit` tasks launched in batches (loses overlap): the semaphore overlaps them smoothly.
+
+    ### Check your work
+
+    Results are in order, and at most `limit` calls to `fn` run at once.
   scenario: |
     **`/lab/limited.py`** contains a stub `async def gather_limited(fn, items, limit)`. `fn` is an `async` function taking one item. Implement it so that:
 
@@ -702,12 +799,30 @@ exercises:
   kind: fix
   tags: [python, asyncio, timeout, cancellation]
   tutorial: |
-    **Concept.** Waiting on a slow operation forever is a bug in its own right. In `asyncio` a timeout is applied around an awaitable, and when it expires the awaited task is cancelled, which raises `CancelledError` inside it so it can clean up.
+    **What you're learning.** Bounding a coroutine with `asyncio.wait_for`.
 
-    **Read up on:**
-    - `python3 -c "import asyncio; help(asyncio.wait_for)"` — what it raises on expiry
-    - `asyncio.timeout` (Python 3.11+) as the context-manager alternative
-    - `asyncio.CancelledError` — why a task should let it propagate
+    ### The idea
+
+    `asyncio.wait_for(coro, timeout)` cancels the coroutine and raises `TimeoutError` if it runs too long:
+
+    ```python
+    import asyncio
+    async def fetch_or_default(factory, timeout, default):
+        try:
+            return await asyncio.wait_for(factory(), timeout)
+        except (asyncio.TimeoutError, Exception):
+            return default
+    ```
+    `factory()` returns the coroutine; `wait_for` enforces the deadline and cancels on timeout.
+
+    ### Common mistakes
+
+    - Catching only `TimeoutError` when the task wants any failure to fall back.
+    - Awaiting `factory()` before passing it (then there's nothing to time out).
+
+    ### Check your work
+
+    A slow factory returns the default after the timeout; a fast one returns its value.
   scenario: |
     **`/lab/lookup.py`** has `fetch_or_default(factory, timeout, default)`. It should call `factory()` (which returns a coroutine), wait at most `timeout` seconds, and return `default` if the call is too slow. A call that finishes in time returns its own result.
 
@@ -810,12 +925,31 @@ exercises:
   kind: build
   tags: [python, multiprocessing, pool]
   tutorial: |
-    **Concept.** Threads share one interpreter, so CPU-heavy Python code does not speed up with them. Separate processes each have their own interpreter and can use several cores. Work is cut into chunks, each chunk is handled by a worker process, and the partial results are combined by the parent.
+    **What you're learning.** CPU-bound parallelism with `multiprocessing`.
 
-    **Read up on:**
-    - `python3 -c "import multiprocessing; help(multiprocessing.Pool)"` — `map`, `starmap`, and why the worker function must be defined at module top level
-    - `os.getpid()` — telling processes apart
-    - slicing lists into equal-sized pieces with a step
+    ### The idea
+
+    Threads don't parallelise CPU work in CPython (the GIL). **Processes** do. `multiprocessing.Pool` runs a function over chunks in separate processes:
+
+    ```python
+    import multiprocessing, math
+    def _work(chunk): return sum(chunk)
+    def map_chunks(data, procs):
+        size = math.ceil(len(data) / procs)
+        chunks = [data[i:i+size] for i in range(0, len(data), size)]
+        with multiprocessing.Pool(procs) as p:
+            return sum(p.map(_work, chunks))
+    ```
+    The worker function must be at module level (picklable).
+
+    ### Common mistakes
+
+    - A nested or lambda worker: not picklable.
+    - Threads for CPU work: no speedup under the GIL.
+
+    ### Check your work
+
+    The total equals `sum(data)`, computed across `procs` processes.
   scenario: |
     **`/lab/chunks.py`** contains a stub `map_chunks(data, procs)`. Implement it:
 
@@ -917,13 +1051,35 @@ exercises:
   kind: build
   tags: [go, goroutines, channels, sync]
   tutorial: |
-    **Concept.** A worker pool starts a fixed number of goroutines that all read jobs from one channel, so the amount of concurrent work is capped no matter how many jobs there are. Results come back over another channel, or are accumulated under a lock, and a `sync.WaitGroup` tells you when every worker has finished.
+    **What you're learning.** A bounded worker pool summing with a shared channel.
 
-    **Read up on:**
-    - `go doc sync.WaitGroup` — `Add`, `Done`, `Wait`
-    - `go doc builtin close` — what closing a channel means for `range` loops
-    - ranging over a channel: `for v := range ch`
-    - why only the sender should close a channel
+    ### The idea
+
+    ```go
+    func MapSum(nums []int, workers int, f func(int) int) int {
+        if workers < 1 { workers = 1 }
+        in := make(chan int)
+        var wg sync.WaitGroup
+        var mu sync.Mutex; sum := 0
+        for w := 0; w < workers; w++ {
+            wg.Add(1)
+            go func() { defer wg.Done(); for n := range in { v := f(n); mu.Lock(); sum += v; mu.Unlock() } }()
+        }
+        for _, n := range nums { in <- n }
+        close(in); wg.Wait()
+        return sum
+    }
+    ```
+    Or accumulate per-worker partial sums and add them at the end (no lock on the hot path).
+
+    ### Common mistakes
+
+    - `sum += f(n)` without a lock: a data race.
+    - Not closing `in`: deadlock.
+
+    ### Check your work
+
+    The result is the sum of `f(n)`, at most `workers` run at once, and `-race` is clean.
   scenario: |
     **`/lab/pool.go`** (package `main`) contains a stub:
 
@@ -1112,13 +1268,38 @@ exercises:
   kind: fix
   tags: [go, io, bufio, streams]
   tutorial: |
-    **Concept.** Reading from an `io.Reader` gives no guarantee about how much arrives per call, how long a line is, or whether the data ends with a newline. Robust stream code processes data incrementally, never assumes a size limit, and reports errors from the reader instead of swallowing them.
+    **What you're learning.** A streaming `wc`: lines, words, bytes with `bufio`.
 
-    **Read up on:**
-    - `go doc bufio.Scanner` — the default token size limit and `Scanner.Buffer`
-    - `go doc bufio.Reader.ReadString` — returns data together with `io.EOF`
-    - `go doc io.EOF` — end of input is not a failure
-    - `go doc testing/iotest` — readers that misbehave on purpose
+    ### The idea
+
+    Read the stream without buffering it all. Count bytes as you read, split into words, and count lines (a final line without a newline still counts):
+
+    ```go
+    func Count(r io.Reader) (lines, words, bytes int) {
+        br := bufio.NewReader(r)
+        inWord := false
+        for {
+            b, err := br.ReadByte()
+            if err != nil { break }
+            bytes++
+            if b == '\n' { lines++ }
+            if b == ' ' || b == '\t' || b == '\n' { inWord = false } else if !inWord { inWord = true; words++ }
+        }
+        // a final non-empty line without '\n' counts as a line:
+        // track whether the last byte was a newline and adjust.
+        return
+    }
+    ```
+    `bufio.Scanner` with a word split function also works, but mind its token-size limit (prog-054).
+
+    ### Common mistakes
+
+    - Missing the final line without a trailing newline.
+    - Counting an empty final piece as a line.
+
+    ### Check your work
+
+    Counts match `wc` for inputs with and without a trailing newline.
   scenario: |
     **`/lab/stats.go`** (package `main`) has:
 
@@ -1312,13 +1493,36 @@ exercises:
   kind: build
   tags: [go, context, cancellation, goroutine-leak]
   tutorial: |
-    **Concept.** A goroutine that sends on a channel blocks until someone receives. If the receiver walks away, the goroutine is stuck forever: a leak. A `context.Context` carries a cancellation signal; the producer `select`s between sending a value and noticing `ctx.Done()`, so it can stop and close its channel as soon as it is cancelled.
+    **What you're learning.** A cancellable generator channel in Go.
 
-    **Read up on:**
-    - `go doc context` — `WithCancel`, `Context.Done`, `Context.Err`
-    - the `select` statement with several channel cases
-    - `defer close(ch)` in the goroutine that owns the channel
-    - `go doc runtime.NumGoroutine`
+    ### The idea
+
+    Same as prog-015: a goroutine yields values on a channel, watching `ctx.Done()` so it exits and closes the channel on cancel:
+
+    ```go
+    func Numbers(ctx context.Context) <-chan int {
+        out := make(chan int)
+        go func() {
+            defer close(out)
+            for i := 0; ; i++ {
+                select {
+                case out <- i:
+                case <-ctx.Done(): return
+                }
+            }
+        }()
+        return out
+    }
+    ```
+
+    ### Common mistakes
+
+    - Sending outside a `select`: blocks and leaks when the receiver stops.
+    - Not closing the channel: receivers using `range` hang.
+
+    ### Check your work
+
+    Values arrive in order; after cancel the channel closes and the goroutine exits.
   scenario: |
     **`/lab/gen.go`** (package `main`) contains a stub:
 
@@ -1513,37 +1717,22 @@ exercises:
   kind: build
   tags: [capstone, go, goroutines, worker-pool, context, timeout, cancellation, goroutine-leak, mutex, bufio, io]
   tutorial: |
-    **Concept.** A tool that checks thousands of slow, flaky remote things
-    needs four habits at once:
+    **What you're learning.** A concurrent link checker: bounded parallelism, context cancellation, race-free aggregation.
 
-    - **A bounded worker pool.** A fixed number of goroutines pull work from
-      one channel, so 40,000 links never mean 40,000 connections. Each
-      worker writes its own slot of a results slice, which keeps the input
-      order without a lock.
-    - **A deadline per job.** `context.WithTimeout(parent, d)` gives one job
-      its own clock. The job code (here, the fetcher) watches `ctx.Done()`
-      and gives up; `ctx.Err()` then says why (`context.DeadlineExceeded`).
-      One shared deadline for the whole run is a different, wrong thing.
-    - **Cancellation that reaches everything.** When the caller cancels the
-      parent context, every child context is cancelled too. The code that
-      hands out work must stop handing it out (`select` on `ctx.Done()`
-      next to the send), work not started must not start, and every
-      goroutine must end: a worker blocked forever on a channel is a leak.
-    - **Streams and shared state.** An `io.Reader` may deliver any amount
-      per call, lines may be huge, and a read error must reach the caller.
-      State that several goroutines touch (a map of counters) needs one
-      lock around **every** access, reads included.
+    ### Method
 
-    **Read up on:**
-    - `go doc context.WithTimeout`, `go doc context.Context` (`Done`, `Err`, `Deadline`)
-    - `go doc errors.Is` — matching `context.Canceled` and `context.DeadlineExceeded`
-    - `go doc sync.WaitGroup`, `go doc sync.Mutex`
-    - the `select` statement with a send case and a `<-ctx.Done()` case
-    - `go doc bufio.Reader.ReadString` versus `bufio.Scanner`'s token limit
-    - `go doc runtime.NumGoroutine` — how the tests spot a leak
+    | fault | fix (exercise) |
+    |---|---|
+    | one connection per link, 40k at once | a bounded worker pool (prog-042, prog-035) |
+    | `concurrent map writes` crash | race-free aggregation: per-worker results or a mutex (prog-043) |
+    | one slow server stalls the run | the `Fetcher` honours `ctx`; propagate cancellation (prog-044, prog-014) |
+    | Ctrl-C leaves it running | watch `ctx.Done()` and stop workers |
 
-    Compile and vet your file with
-    `docker run --rm -v /lab:/src -w /src golang:1.24-alpine go vet linkcheck.go`.
+    Feed link indices to N workers over a channel, each calling the context-aware `Fetcher`, collect results without a shared unguarded map, and stop promptly when `ctx` is cancelled.
+
+    ### Check your work
+
+    The check runs with a bounded number of concurrent fetches, aggregates results without a race (`-race` clean), skips past unresponsive servers via the context, and stops cleanly on cancellation.
   scenario: |
     **DOCS-340**, from Marek on the docs platform team: *"The nightly
     broken-link check over our 40,000 doc links takes six hours because it
