@@ -12,13 +12,46 @@ exercises:
   kind: fix
   tags: [scheduling-gates, scheduling, pod-lifecycle]
   tutorial: |
-    **Concept.** A pod can be created with **scheduling gates**: names listed in `spec.schedulingGates`. As long as one gate is left, the scheduler doesn't even look at the pod. It stays `Pending` with the status `SchedulingGated`, and no `FailedScheduling` event is ever written. Gates are how an external controller (a quota system, a batch queue) says "not yet". Gates can only be removed after the pod is created, never added, and once the last one is gone the pod is scheduled like any other.
+    **What you're learning.** **Scheduling gates**: pods the scheduler deliberately ignores until a controller lets them through.
 
-    **Read up on:**
-    - Kubernetes docs: Pod Scheduling Readiness
-    - `kubectl explain pod.spec.schedulingGates`
-    - `kubectl get pod` — the `SchedulingGated` status
-    - `kubectl patch --help` — JSON and merge patches
+    ### The idea
+
+    A pod created with `spec.schedulingGates: [{name: X}]` isn't even considered by the scheduler while any gate remains. It's `Pending` with the status **`SchedulingGated`**, and **no** `FailedScheduling` event is written. External controllers (batch queues, quota systems) use gates to say "not yet", and remove their gate when ready.
+
+    Gates can be **removed** from an existing pod, never added. If the controller that owns a gate is gone, you remove it yourself.
+
+    ### Commands you'll use
+
+    ```bash
+    kubectl get pod job-a -n demo
+    ```
+    ```text
+    NAME    READY   STATUS            RESTARTS
+    job-a   0/1     SchedulingGated   0
+    ```
+
+    ```bash
+    kubectl get pod job-a -n demo -o jsonpath='{.spec.schedulingGates}'; echo
+    ```
+    ```text
+    [{"name":"queue.example.com/admitted"}]
+    ```
+
+    ```bash
+    kubectl -n demo patch pod job-a --type=merge -p '{"spec":{"schedulingGates":null}}'
+    kubectl -n demo get pod job-a -o jsonpath='{.metadata.uid}'; echo      # same UID as before
+    kubectl -n demo wait --for=condition=Ready pod/job-a --timeout=60s
+    ```
+    With several gates, a JSON patch can remove one: `[{"op":"remove","path":"/spec/schedulingGates/0"}]`.
+
+    ### Common mistakes
+
+    - Looking for scheduler events: there are none for gated pods.
+    - Deleting and recreating the pod: forbidden here, and a recreated pod from the same manifest would be gated again.
+
+    ### Check your work
+
+    Same UID, no gates, `Running` and Ready.
   scenario: |
     In namespace **`gated`** the pod **`report`** has been `Pending` all morning. It waits for a
     quota controller that was uninstalled last week, so nothing is ever going to let it through.
@@ -64,13 +97,48 @@ exercises:
   kind: build
   tags: [termination-message, debugging, pod-lifecycle]
   tutorial: |
-    **Concept.** When a container terminates, the kubelet copies a short **termination message** into the pod status (`state.terminated.message`, or `lastState` after a restart). Monitoring and `kubectl describe` show it next to the exit code, so it survives even when the logs are rotated away or the node is gone. By default the message is read from the file `/dev/termination-log` (`terminationMessagePath`), which most applications never write. The `terminationMessagePolicy` can tell the kubelet to fall back to the tail of the container's log when the file is empty and the container failed.
+    **What you're learning.** **Termination messages**: putting a container's last words into the pod status.
 
-    **Read up on:**
-    - Kubernetes docs: Determine the Reason for Pod Failure
-    - `kubectl explain pod.spec.containers.terminationMessagePolicy`
-    - `kubectl explain pod.spec.containers.terminationMessagePath`
-    - `kubectl get pod -o jsonpath='{.status.containerStatuses[0].state.terminated}'`
+    ### The idea
+
+    When a container terminates, the kubelet copies a short message into `status.containerStatuses[].state.terminated.message` (or `lastState` after a restart). `kubectl describe` shows it beside the exit code, and it survives log rotation and node loss.
+
+    | field | default | meaning |
+    |---|---|---|
+    | `terminationMessagePath` | `/dev/termination-log` | the file the kubelet reads |
+    | `terminationMessagePolicy` | `File` | `FallbackToLogsOnError`: if the file is empty **and** the container failed, use the tail of its log |
+
+    Most programs never write `/dev/termination-log`, so `FallbackToLogsOnError` is the easy way to get their error into the status.
+
+    ### Commands you'll use
+
+    ```yaml
+    containers:
+    - name: loader
+      image: busybox:1.37
+      command: ["sh", "-c", "echo starting; echo 'error: cannot open db.sqlite' >&2; exit 2"]
+      terminationMessagePolicy: FallbackToLogsOnError
+    ```
+
+    ```bash
+    kubectl apply -f /lab/loader.yaml
+    kubectl get pod loader -n demo -o jsonpath='{.status.containerStatuses[0].state.terminated.exitCode}{"\n"}{.status.containerStatuses[0].state.terminated.message}'
+    ```
+    ```text
+    2
+    starting
+    error: cannot open db.sqlite
+    ```
+
+    ### Common mistakes
+
+    - Changing the command to write the file: the task says keep it exactly.
+    - `restartPolicy: Always`: the container restarts and the message moves to `lastState`.
+    - Quoting: inside `command` YAML strings, escape inner double quotes (`\"`).
+
+    ### Check your work
+
+    The pod is `Error`/`Failed` with exit code 3 and the message contains the fatal line.
   scenario: |
     The on-call team wants crash reasons in the pod status, without having to fetch logs.
 
@@ -138,12 +206,39 @@ exercises:
   kind: fix
   tags: [job, suspend, batch]
   tutorial: |
-    **Concept.** A Job can be **suspended** by setting `spec.suspend: true`. The Job controller then deletes the Job's running pods and creates no new ones, but the Job object itself, with its history and its completion count, stays. Setting the field back to `false` resumes it. The Job reports the state through a `Suspended` condition. Deleting the Job would also stop the pods, but it throws away the record of what was already done.
+    **What you're learning.** **Suspending** a Job: stopping its pods without losing the Job.
 
-    **Read up on:**
-    - Kubernetes docs: Jobs — Suspending a Job
-    - `kubectl explain job.spec.suspend`
-    - `kubectl get job -o jsonpath='{.status.conditions}'`
+    ### The idea
+
+    `spec.suspend: true` on a Job makes the controller **delete its running pods** and create no new ones; the Job object, its history and completed count stay. `false` resumes it. The Job reports a `Suspended` condition.
+
+    Deleting the Job would also stop the pods, but loses what was already done.
+
+    ### Commands you'll use
+
+    ```bash
+    kubectl -n demo get job reindex
+    kubectl -n demo patch job reindex --type=merge -p '{"spec":{"suspend":true}}'
+    kubectl -n demo get job reindex -o jsonpath='{.status.conditions[?(@.type=="Suspended")].status}'; echo
+    ```
+    ```text
+    True
+    ```
+
+    ```bash
+    kubectl -n demo get pods -l job-name=reindex       # terminating, then none
+    # later:
+    kubectl -n demo patch job reindex --type=merge -p '{"spec":{"suspend":false}}'
+    ```
+
+    ### Common mistakes
+
+    - Scaling something: Jobs have no replicas; `parallelism: 0` also stops new pods but isn't "suspended".
+    - Deleting pods by hand: the Job creates new ones.
+
+    ### Check your work
+
+    No pod of the Job is Running or Pending, the condition is `Suspended=True`, and the Job's UID is unchanged.
   scenario: |
     In namespace **`export`** the Job **`nightly-export`** started late and now runs during business
     hours, hammering the database.
@@ -203,13 +298,67 @@ exercises:
   kind: build
   tags: [job, pod-failure-policy, backoff, batch]
   tutorial: |
-    **Concept.** A Job retries failed pods up to `backoffLimit` times, with a growing delay. That is right for flaky failures and wrong for a bug, where every retry fails the same way and only wastes time. The opposite also happens: a pod evicted by a node drain or preempted by a higher priority pod didn't fail by its own fault, yet it uses up a retry. A **pod failure policy** decides, rule by rule, what a failed pod means: match on the container's **exit code** or on a **pod condition** (such as `DisruptionTarget`, set on pods killed by a disruption), and act with `FailJob`, `Ignore` (don't count it), `Count` (the default behaviour) or `FailIndex`. Rules are checked in order and the first match wins. The policy needs `restartPolicy: Never`.
+    **What you're learning.** **Pod failure policies**: telling a Job which failures to give up on immediately and which not to count.
 
-    **Read up on:**
-    - Kubernetes docs: Handling retriable and non-retriable pod failures with Pod failure policy
-    - `kubectl explain job.spec.podFailurePolicy.rules`
-    - `kubectl explain job.spec.podFailurePolicy.rules.onExitCodes`
-    - `kubectl explain job.spec.podFailurePolicy.rules.onPodConditions`
+    ### The idea
+
+    `backoffLimit` retries every failure the same way. That's wrong for:
+
+    - **bugs** (a known exit code): every retry fails identically;
+    - **disruptions** (evictions, preemption): not the pod's fault, yet they use up retries.
+
+    `spec.podFailurePolicy.rules` are checked in order; the first match decides:
+
+    | action | effect |
+    |---|---|
+    | `FailJob` | fail the whole Job now |
+    | `Ignore` | don't count this failure against `backoffLimit` |
+    | `Count` | normal behaviour |
+    | `FailIndex` | (Indexed Jobs) fail only this index (k8s-366) |
+
+    Rules match `onExitCodes` (container, operator `In`/`NotIn`, values) or `onPodConditions` (e.g. `DisruptionTarget`). Pod failure policies need `restartPolicy: Never`.
+
+    ```yaml
+    spec:
+      backoffLimit: 4
+      podFailurePolicy:
+        rules:
+        - action: FailJob
+          onExitCodes: {containerName: check, operator: In, values: [9]}
+        - action: Ignore
+          onPodConditions: [{type: DisruptionTarget}]
+      template:
+        spec:
+          restartPolicy: Never
+          containers:
+          - name: check
+            image: busybox:1.37
+            command: ["sh", "-c", "echo bad input; exit 9"]
+    ```
+
+    ### Commands you'll use
+
+    ```bash
+    kubectl apply -f /lab/check.yaml
+    kubectl -n demo get job check -o jsonpath='{.status.conditions[?(@.type=="Failed")].reason}'; echo
+    ```
+    ```text
+    PodFailurePolicy
+    ```
+
+    ```bash
+    kubectl -n demo get pods -l job-name=check          # exactly one pod
+    ```
+
+    ### Common mistakes
+
+    - `restartPolicy: OnFailure`: the API rejects the policy.
+    - A `containerName` that doesn't match.
+    - Exit codes as strings.
+
+    ### Check your work
+
+    The Job is Failed with reason `PodFailurePolicy` after a single pod.
   scenario: |
     The data-validation tool exits with code **42** when the data itself is wrong. Retrying
     can't help, yet the current pipeline retries six times and pages someone an hour later.
@@ -306,13 +455,51 @@ exercises:
   kind: build
   tags: [job, indexed, backoff-limit-per-index, batch]
   tutorial: |
-    **Concept.** In an **Indexed** Job every index is a separate piece of work, but by default the retries are shared: `backoffLimit` counts failures across all indexes, so one hopeless shard can use them all up and fail the Job while the others were fine. With **`backoffLimitPerIndex`** each index gets its own retry budget. An index that runs out is marked failed and listed in `status.failedIndexes`, the other indexes carry on, and when every index is done the Job ends `Failed` (reason `FailedIndexes`) if any index failed. `status.completedIndexes` lists the ones that succeeded, as ranges such as `0-2,4`.
+    **What you're learning.** **Per-index retries** in Indexed Jobs: one bad shard doesn't sink the others.
 
-    **Read up on:**
-    - Kubernetes docs: Jobs — Backoff limit per index
-    - `kubectl explain job.spec.backoffLimitPerIndex`
-    - `kubectl explain job.status.failedIndexes` and `job.status.completedIndexes`
-    - the pod label `batch.kubernetes.io/job-completion-index`
+    ### The idea
+
+    By default `backoffLimit` is shared by all indexes. With `backoffLimitPerIndex: N`, each index gets its own N retries. An index that runs out is marked failed (`status.failedIndexes`); the others continue. When all are done, the Job ends `Failed` (reason `FailedIndexes`) if any index failed; `status.completedIndexes` lists the successful ones as ranges (`0-2,4`).
+
+    Pods carry the label `batch.kubernetes.io/job-completion-index=N`, so you can count tries per index.
+
+    ```yaml
+    spec:
+      completionMode: Indexed
+      completions: 4
+      parallelism: 4
+      backoffLimitPerIndex: 1
+      template:
+        spec:
+          restartPolicy: Never
+          containers:
+          - name: w
+            image: busybox:1.37
+            command: ["sh", "-c", "[ \"$JOB_COMPLETION_INDEX\" = 2 ] && exit 1; echo ok $JOB_COMPLETION_INDEX"]
+    ```
+
+    ### Commands you'll use
+
+    ```bash
+    kubectl apply -f /lab/shards.yaml
+    kubectl -n demo get job shards -o jsonpath='{.status.completedIndexes} / {.status.failedIndexes}'; echo
+    ```
+    ```text
+    0-1,3 / 2
+    ```
+
+    ```bash
+    kubectl -n demo get pods -l batch.kubernetes.io/job-completion-index=2      # 2 pods: first try + 1 retry
+    ```
+
+    ### Common mistakes
+
+    - Setting only `backoffLimit`: retries are shared and the Job may fail early.
+    - Changing the command: keep it exactly.
+
+    ### Check your work
+
+    `completedIndexes` lists every good shard, `failedIndexes` the bad one, and the bad shard has exactly 2 pods.
   scenario: |
     Five storage shards must be verified. Shard 3 currently fails its checksum every time, and
     the team wants the other four verified anyway, each with its own small retry budget.
@@ -402,12 +589,53 @@ exercises:
   kind: build
   tags: [job, indexed, success-policy, batch]
   tutorial: |
-    **Concept.** An Indexed Job normally succeeds only when **every** index has succeeded. Some workloads don't work that way: in a leader/worker simulation or a distributed training run, the result is ready when the leader finishes, and the workers never exit on their own. A **success policy** declares when the Job counts as successful: by a set of indexes (`succeededIndexes`), a number of them (`succeededCount`), or both. Once a rule is met the Job gets the `SuccessCriteriaMet` condition, the remaining pods are terminated, and the Job ends `Complete`. It only applies to Indexed Jobs.
+    **What you're learning.** **Success policies**: an Indexed Job that's done when the leader is done.
 
-    **Read up on:**
-    - Kubernetes docs: Jobs — Success policy
-    - `kubectl explain job.spec.successPolicy.rules`
-    - `kubectl get job -o jsonpath='{.status.conditions}'` — `SuccessCriteriaMet`, `Complete`
+    ### The idea
+
+    Normally an Indexed Job succeeds only when **all** indexes succeed. `spec.successPolicy.rules` define success differently:
+
+    | rule field | meaning |
+    |---|---|
+    | `succeededIndexes: "0"` (or `"0-2,5"`) | these indexes succeeded |
+    | `succeededCount: N` | at least N indexes succeeded (optionally within `succeededIndexes`) |
+
+    When a rule is met, the Job gets the `SuccessCriteriaMet` condition, the remaining pods are terminated, and the Job ends `Complete`. Only for Indexed Jobs.
+
+    ```yaml
+    spec:
+      completionMode: Indexed
+      completions: 3
+      parallelism: 3
+      successPolicy:
+        rules:
+        - succeededIndexes: "0"
+    ```
+
+    ### Commands you'll use
+
+    ```bash
+    kubectl apply -f /lab/run.yaml
+    kubectl -n demo wait --for=condition=complete job/run --timeout=90s
+    kubectl -n demo get job run -o jsonpath='{range .status.conditions[*]}{.type}={.status} {end}{"\n"}{.status.completedIndexes}{"\n"}'
+    ```
+    ```text
+    SuccessCriteriaMet=True Complete=True
+    0
+    ```
+
+    ```bash
+    kubectl -n demo get pods -l job-name=run          # workers terminated
+    ```
+
+    ### Common mistakes
+
+    - `succeededIndexes: 0` unquoted: it's a string field.
+    - Using a success policy on a non-Indexed Job: rejected.
+
+    ### Check your work
+
+    The Job is Complete with `SuccessCriteriaMet`, `completedIndexes` is `0`, and no pod of the Job is running.
   scenario: |
     A simulation runs as one leader (index 0) and three workers. The leader exits when the
     simulation has converged; the workers just wait for it and never exit.
@@ -491,12 +719,49 @@ exercises:
   kind: fix
   tags: [statefulset, pvc, retention-policy, storage]
   tutorial: |
-    **Concept.** A StatefulSet creates one PersistentVolumeClaim per replica from its `volumeClaimTemplates`. By default it never deletes them: scale from 3 to 1 and the claims of replicas 1 and 2 stay, still holding their volumes, so a later scale-up finds the old data again. That is safe, but on a cluster that scales a lot it leaks disk. The **`persistentVolumeClaimRetentionPolicy`** chooses separately what happens to the claims **when the StatefulSet is scaled down** (`whenScaled`) and **when it is deleted** (`whenDeleted`): `Retain` (the default) or `Delete`. It only acts on future events; claims already orphaned have to be cleaned up by hand.
+    **What you're learning.** StatefulSet PVC **retention**: cleaning up claims left by a scale-down, and choosing what happens next time.
 
-    **Read up on:**
-    - Kubernetes docs: StatefulSets — PersistentVolumeClaim retention
-    - `kubectl explain statefulset.spec.persistentVolumeClaimRetentionPolicy`
-    - `kubectl get pvc` — claim names are `<template>-<statefulset>-<ordinal>`
+    ### The idea
+
+    StatefulSets never delete the PVCs they create (k8s-111), by default. Scale from 3 to 1 and `data-x-1`, `data-x-2` stay, holding disk. Safe, but it leaks.
+
+    `spec.persistentVolumeClaimRetentionPolicy`:
+
+    | field | event | values |
+    |---|---|---|
+    | `whenScaled` | replicas removed by scale-down | `Retain` (default) / `Delete` |
+    | `whenDeleted` | the StatefulSet is deleted | `Retain` (default) / `Delete` |
+
+    It only affects **future** events; existing orphans must be deleted by hand.
+
+    ### Commands you'll use
+
+    ```bash
+    kubectl -n demo get sts store
+    kubectl -n demo get pvc
+    ```
+    ```text
+    NAME           STATUS   VOLUME
+    data-store-0   Bound    pvc-1a...
+    data-store-1   Bound    pvc-2b...    ← no pod uses it
+    data-store-2   Bound    pvc-3c...
+    ```
+
+    ```bash
+    kubectl -n demo delete pvc data-store-1 data-store-2
+    kubectl -n demo patch sts store --type=merge -p \
+      '{"spec":{"persistentVolumeClaimRetentionPolicy":{"whenScaled":"Delete","whenDeleted":"Retain"}}}'
+    kubectl -n demo get sts store -o jsonpath='{.spec.persistentVolumeClaimRetentionPolicy}'; echo
+    ```
+
+    ### Common mistakes
+
+    - Deleting `data-store-0`: it's still in use (and protected while the pod runs).
+    - Swapping the two fields.
+
+    ### Check your work
+
+    Only the replica 0 claim remains (same UID), `x-0` is Ready, and the policy reads `whenScaled: Delete, whenDeleted: Retain`.
   scenario: |
     In namespace **`ledger`**, the StatefulSet **`ledger`** was scaled from 3 replicas to 1. Its
     claims **`data-ledger-1`** and **`data-ledger-2`** are still there, holding disk that nobody
@@ -574,12 +839,33 @@ exercises:
   kind: build
   tags: [deployment, replicaset, scaling, pod-deletion-cost]
   tutorial: |
-    **Concept.** When a ReplicaSet scales down it has to pick victims. It prefers pods that are not scheduled, not running or not ready; among equal pods it looks at the annotation **`controller.kubernetes.io/pod-deletion-cost`** (an integer, default 0) and removes the pods with the **lowest** cost first; after that it spreads the removals over nodes and prefers the newest pods. The annotation lets an application, or an operator, mark which replicas are expensive to lose (a warm cache, a long session) before shrinking. It is a hint for scale-down only, not a protection against deletion or eviction.
+    **What you're learning.** Choosing which pod a scale-down removes with `pod-deletion-cost`.
 
-    **Read up on:**
-    - Kubernetes docs: ReplicaSet — Pod deletion cost
-    - `kubectl annotate --help`
-    - `kubectl scale --help`
+    ### The idea
+
+    When a ReplicaSet scales down it prefers to remove pods that are unscheduled, not running or not ready. Among equal pods it removes those with the **lowest** `controller.kubernetes.io/pod-deletion-cost` annotation first (an integer, default 0), then spreads across nodes and prefers newer pods. Give the pod you want to keep a **high** cost before scaling down.
+
+    It's a hint for scale-down only: it doesn't protect against deletion or eviction.
+
+    ### Commands you'll use
+
+    ```bash
+    KEEP=$(cat /lab/keep.txt); echo "$KEEP"
+    kubectl -n demo get pods -l app=cache -o custom-columns=NAME:.metadata.name,UID:.metadata.uid
+    kubectl -n demo annotate pod "$KEEP" controller.kubernetes.io/pod-deletion-cost=1000 --overwrite
+    kubectl -n demo scale deploy cache --replicas=1
+    kubectl -n demo get pods -l app=cache
+    ```
+
+    ### Common mistakes
+
+    - A negative or low cost on the pod to keep: it's removed **first**.
+    - Annotating the Deployment: the annotation goes on the **pod**.
+    - Deleting the other pods by hand: works but the task asks for a scale-down.
+
+    ### Check your work
+
+    One pod remains, with the name (and UID) from the file, and it's Ready.
   scenario: |
     In namespace **`scale`**, the Deployment **`workers`** runs 3 replicas. The pod named in
     **`/lab/keep.txt`** holds a warm in-memory cache that takes an hour to rebuild.
@@ -622,12 +908,44 @@ exercises:
   kind: build
   tags: [service, internal-traffic-policy, daemonset, networking]
   tutorial: |
-    **Concept.** A Service normally spreads traffic over all its ready endpoints, on any node. For a **node-local agent** (a log or metrics collector run as a DaemonSet, a node-level cache) that is wrong: a client must talk to the agent on its own node, both for speed and because the agent only knows about its node. **`internalTrafficPolicy: Local`** tells kube-proxy to send traffic from inside the cluster only to endpoints on the client's node. If the node has no such endpoint the traffic is dropped, not sent elsewhere. (`externalTrafficPolicy` is the counterpart for traffic from outside the cluster.)
+    **What you're learning.** `internalTrafficPolicy: Local`: keeping in-cluster traffic on the client's own node.
 
-    **Read up on:**
-    - Kubernetes docs: Service Internal Traffic Policy
-    - `kubectl explain service.spec.internalTrafficPolicy`
-    - `kubectl get pods -o wide` — which pod runs on which node
+    ### The idea
+
+    A Service normally spreads traffic over all ready endpoints. For a **node-local agent** (a DaemonSet log or metrics collector), each client must reach the agent on **its own node**. `internalTrafficPolicy: Local` makes kube-proxy send traffic from inside the cluster only to endpoints on the client's node; if there's none, the traffic is **dropped** (not sent elsewhere).
+
+    (`externalTrafficPolicy` is the counterpart for traffic from outside: k8s-056.)
+
+    ```yaml
+    apiVersion: v1
+    kind: Service
+    metadata: {name: collector, namespace: demo}
+    spec:
+      selector: {app: collector}
+      internalTrafficPolicy: Local
+      ports: [{port: 80, targetPort: 80}]
+    ```
+
+    ### Commands you'll use
+
+    ```bash
+    kubectl apply -f /lab/collector-svc.yaml
+    for n in controlplane node01; do
+      kubectl run "t-$n" -n demo --rm -i --restart=Never --image=busybox:1.37 \
+        --overrides="{\"spec\":{\"nodeName\":\"$n\",\"tolerations\":[{\"operator\":\"Exists\"}]}}" \
+        -- sh -c 'for i in 1 2 3; do wget -qO- http://collector | grep Hostname; done'
+    done
+    ```
+    Each node's client only ever sees its own node's agent.
+
+    ### Common mistakes
+
+    - `externalTrafficPolicy` instead: affects only outside traffic.
+    - A DaemonSet that doesn't run on every node: clients there get nothing (k8s-368).
+
+    ### Check your work
+
+    Repeated requests from a client on each node always return that node's agent.
   scenario: |
     In namespace **`nodelocal`** a DaemonSet **`node-agent`** (label `app=node-agent`, port 80)
     runs one agent on each node. It answers HTTP with its own host name (`Hostname: ...`).
@@ -718,13 +1036,51 @@ exercises:
   kind: build
   tags: [readiness-gates, pod-conditions, service, endpoints]
   tutorial: |
-    **Concept.** A pod is Ready when all its containers are ready, and, if it declares **readiness gates**, when every gate's condition in the pod status is also `True`. A readiness gate (`spec.readinessGates[].conditionType`) is a condition type that some other controller owns, typically a cloud load-balancer controller that registers the pod with an external balancer and only then sets the condition. Until then the pod stays out of the Service's ready endpoints, and a rolling update waits. Conditions live in the pod's **status**, which is written through the `status` subresource, not by editing the spec.
+    **What you're learning.** **Readiness gates**: pod readiness that also waits for a condition set by another controller.
 
-    **Read up on:**
-    - Kubernetes docs: Pod Lifecycle — Pod readiness gates
-    - `kubectl explain pod.spec.readinessGates`
-    - `kubectl patch --help` — the `--subresource` flag
-    - `kubectl get endpointslices -l kubernetes.io/service-name=NAME`
+    ### The idea
+
+    A pod is Ready when all containers are ready **and** every condition listed in `spec.readinessGates[].conditionType` is `True` in its status. A cloud load-balancer controller typically sets such a condition after registering the pod. Until then the pod stays out of the Service's ready endpoints, and rolling updates wait.
+
+    Conditions live in the pod's **status**, written through the `status` subresource (`kubectl patch --subresource=status`), not by editing the spec.
+
+    ```yaml
+    spec:
+      readinessGates:
+      - conditionType: example.com/warmed
+      containers:
+      - {name: web, image: nginx:1.29-alpine}
+    ```
+
+    ### Commands you'll use
+
+    ```bash
+    kubectl apply -f /lab/web.yaml
+    kubectl get pods -n demo -o wide
+    ```
+    ```text
+    NAME                  READY   STATUS    ...   READINESS GATES
+    web-6c8d9f7b4-abcde   1/1     Running   ...   0/1
+    ```
+    `READY 1/1` counts containers; the pod isn't Ready until the gate is `1/1` too.
+
+    ```bash
+    for p in $(kubectl -n demo get pods -l app=web -o name); do
+      kubectl -n demo patch "$p" --subresource=status --type=strategic \
+        -p '{"status":{"conditions":[{"type":"example.com/warmed","status":"True"}]}}'
+    done
+    kubectl get pods -n demo -o wide                                   # READINESS GATES 1/1
+    kubectl get endpointslices -n demo -l kubernetes.io/service-name=web
+    ```
+
+    ### Common mistakes
+
+    - Patching without `--subresource=status`: the status change is ignored.
+    - Removing the gate from the Deployment to make pods Ready: the task says keep it.
+
+    ### Check your work
+
+    Both pods show `READINESS GATES 1/1`, are Ready, and are the 2 ready endpoints of the Service.
   scenario: |
     The team's load-balancer integration will set a pod condition **`lb.example.com/registered`**
     once a pod is registered. The controller isn't installed in this cluster yet, so you will
@@ -826,13 +1182,51 @@ exercises:
   kind: fix
   tags: [pdb, eviction, drain, unhealthy-pod-eviction-policy]
   tutorial: |
-    **Concept.** A PodDisruptionBudget protects **healthy** pods, but by default it also stands guard over unhealthy ones. With the default policy (`IfHealthyBudget`) a Running pod that is not Ready may only be evicted while the application still has enough healthy pods. When every pod is unready, for example because they all wait for a database that is down, the budget is never met and a node drain hangs forever on pods that serve nothing. **`unhealthyPodEvictionPolicy: AlwaysAllow`** lets the eviction API remove Running-but-not-Ready pods regardless of the budget, while Ready pods stay protected as before. The eviction API also takes a **dry run**, which tells you whether an eviction would be allowed without doing it.
+    **What you're learning.** `unhealthyPodEvictionPolicy`: letting drains evict pods that are already broken.
 
-    **Read up on:**
-    - Kubernetes docs: Specifying a Disruption Budget — Unhealthy Pod Eviction Policy
-    - `kubectl explain pdb.spec.unhealthyPodEvictionPolicy`
-    - Kubernetes docs: API-initiated Eviction
-    - `kubectl get pdb` — `ALLOWED DISRUPTIONS`
+    ### The idea
+
+    With the default `IfHealthyBudget`, a Running-but-not-Ready pod may only be evicted while the app still has enough **healthy** pods. When **all** pods are unready, the budget is never met and a drain hangs forever on pods that serve nothing.
+
+    `unhealthyPodEvictionPolicy: AlwaysAllow` lets the eviction API remove not-Ready pods regardless of the budget; Ready pods stay protected as before.
+
+    The **eviction API** can be called directly with a dry run, to test without evicting:
+
+    ```bash
+    cat > /tmp/evict.json <<EOF
+    {"apiVersion":"policy/v1","kind":"Eviction",
+     "metadata":{"name":"POD","namespace":"demo"},
+     "deleteOptions":{"dryRun":["All"]}}
+    EOF
+    kubectl create --raw /api/v1/namespaces/demo/pods/POD/eviction -f /tmp/evict.json
+    ```
+
+    ### Commands you'll use
+
+    ```bash
+    kubectl -n demo get pdb api-pdb
+    ```
+    ```text
+    NAME      MIN AVAILABLE   MAX UNAVAILABLE   ALLOWED DISRUPTIONS
+    api-pdb   2               N/A               0
+    ```
+
+    ```bash
+    kubectl -n demo patch pdb api-pdb --type=merge -p '{"spec":{"unhealthyPodEvictionPolicy":"AlwaysAllow"}}'
+    POD=$(kubectl -n demo get pods -l app=api -o jsonpath='{.items[0].metadata.name}')
+    sed -i "s/POD/$POD/" /tmp/evict.json
+    kubectl create --raw "/api/v1/namespaces/demo/pods/$POD/eviction" -f /tmp/evict.json
+    ```
+    A refused eviction answers `429 Too Many Requests ... would violate the pod's disruption budget`; an accepted one returns the Eviction object.
+
+    ### Common mistakes
+
+    - Lowering `minAvailable` or deleting the PDB: healthy pods would lose protection.
+    - Fixing the pods: the task says leave them.
+
+    ### Check your work
+
+    The PDB keeps its name, selector and `minAvailable: 2`, has `AlwaysAllow`, and a dry-run eviction of a not-Ready pod is accepted.
   scenario: |
     In namespace **`reports`**, the 3 pods of Deployment **`reports`** are Running but not Ready:
     they wait for a database that is offline until a migration finishes tomorrow. That is
@@ -916,13 +1310,40 @@ exercises:
   kind: fix
   tags: [job, suspend, node-selector, scheduling, batch]
   tutorial: |
-    **Concept.** A Job's pod template is immutable: once a Job exists you can't change what its pods look like. There is one exception, built for batch queueing systems: while a Job is **suspended and has never started**, its **scheduling directives** (node selector, node affinity, tolerations, scheduling gates, labels and annotations of the template) may still be changed. A queue controller creates Jobs suspended, decides where they should run, writes that into the template, and only then resumes them. Resume first and the template is frozen again.
+    **What you're learning.** The one time a Job's pod template **can** change: while it's suspended and has never started.
 
-    **Read up on:**
-    - Kubernetes docs: Jobs — Mutable Scheduling Directives
-    - `kubectl explain job.spec.suspend`
-    - `kubectl explain job.spec.template.spec.nodeSelector`
-    - `kubectl get nodes --show-labels` — the `kubernetes.io/hostname` label
+    ### The idea
+
+    A Job's pod template is immutable, except for queueing systems: while a Job is **suspended and has never started**, its **scheduling directives** (node selector, node affinity, tolerations, scheduling gates, template labels and annotations) may still be changed. A queue controller creates Jobs suspended, decides where they run, writes that, then resumes them. After resuming, the template is frozen again.
+
+    ### Commands you'll use
+
+    ```bash
+    kubectl -n demo get job encode -o jsonpath='{.spec.suspend} {.status.startTime} {.spec.template.spec.nodeSelector}'; echo
+    ```
+    ```text
+    true  {"gpu":"h100"}
+    ```
+    Suspended, no `startTime`: still editable.
+
+    ```bash
+    kubectl -n demo get job encode -o jsonpath='{.metadata.uid}'; echo
+    kubectl -n demo patch job encode --type=json -p \
+      '[{"op":"replace","path":"/spec/template/spec/nodeSelector","value":{"kubernetes.io/hostname":"node01"}}]'
+    kubectl -n demo patch job encode --type=merge -p '{"spec":{"suspend":false}}'
+    kubectl -n demo wait --for=condition=complete job/encode --timeout=120s
+    kubectl -n demo get pods -l job-name=encode -o wide
+    ```
+    A JSON patch `replace` of the whole `nodeSelector` drops the old key; a merge patch would keep it.
+
+    ### Common mistakes
+
+    - Resuming first: then the template can't be changed.
+    - Deleting and recreating: forbidden here (the UID must stay).
+
+    ### Check your work
+
+    Same UID, the template's nodeSelector is only the hostname, and all pods ran on node01 and completed.
   scenario: |
     In namespace **`render`**, the Job **`frames`** was queued (suspended) for a GPU node pool that
     was never bought: its pods select the node label `accelerator=nvidia-a100`, which no node has.
@@ -988,13 +1409,49 @@ exercises:
   kind: fix
   tags: [job, indexed, pod-failure-policy, backoff-limit-per-index, batch]
   tutorial: |
-    **Concept.** Per-index retries and pod failure policies combine. With `backoffLimitPerIndex` set, a pod failure policy rule may use the action **`FailIndex`**: the index whose pod matched is marked failed at once, without using up its retries, and the other indexes go on. Ordinary failures still get their per-index retries. **`maxFailedIndexes`** adds a safety net: once more indexes than that have failed, the whole Job stops, because the input is clearly broken. Note that the Job-wide `backoffLimit` still applies if you set it, and that most of a Job's spec is immutable, so changing its failure handling means recreating it.
+    **What you're learning.** Combining per-index retries with `FailIndex` and `maxFailedIndexes`.
 
-    **Read up on:**
-    - Kubernetes docs: Jobs — Backoff limit per index, Pod failure policy
-    - `kubectl explain job.spec.maxFailedIndexes`
-    - `kubectl explain job.spec.podFailurePolicy.rules.action` — `FailIndex`
-    - `kubectl get job -o yaml` — strip `status`, `selector` and generated labels before reusing it
+    ### The idea
+
+    With `backoffLimitPerIndex` (k8s-358), a pod failure policy (k8s-357) may use **`FailIndex`**: a matching failure marks **that index** failed at once, without using its retries; other failures still get them. `maxFailedIndexes: N` stops the whole Job once more than N indexes have failed (the input is clearly broken).
+
+    ```yaml
+    spec:
+      completionMode: Indexed
+      completions: 5
+      parallelism: 2
+      backoffLimitPerIndex: 3
+      maxFailedIndexes: 1
+      podFailurePolicy:
+        rules:
+        - action: FailIndex
+          onExitCodes: {operator: In, values: [7]}
+      template:
+        spec:
+          restartPolicy: Never
+          ...
+    ```
+    Most of a Job's spec is immutable: changing its failure handling means **recreating** it (same name, same template).
+
+    ### Commands you'll use
+
+    ```bash
+    kubectl -n demo get job load -o yaml > /lab/load.yaml        # keep image, command, volumes
+    kubectl -n demo delete job load
+    vi /lab/load.yaml        # add the fields above; remove status, selector, uid, controller-uid labels; drop backoffLimit or keep it high
+    kubectl apply -f /lab/load.yaml
+    kubectl -n demo get job load -o jsonpath='{.status.completedIndexes} / {.status.failedIndexes}'; echo
+    kubectl -n demo get pods -l batch.kubernetes.io/job-completion-index=4
+    ```
+
+    ### Common mistakes
+
+    - Leaving a small Job-wide `backoffLimit`: it still applies and may stop the Job early.
+    - `FailJob` instead of `FailIndex`: kills the whole import.
+
+    ### Check your work
+
+    All good shards are in `completedIndexes`, the corrupt one is in `failedIndexes`, and it has exactly one pod.
   scenario: |
     In namespace **`import`**, the Indexed Job **`import`** loads 6 shards, 3 at a time, with the
     script in ConfigMap **`import-script`**. One shard has corrupt input: the script then exits
@@ -1144,13 +1601,34 @@ exercises:
   kind: fix
   tags: [incident, troubleshooting, job, scheduling-gates, readiness-gates, suspend]
   tutorial: |
-    **Concept.** Batch pipelines fail quietly. A Job that never starts, one that gave up, and one that nobody resumed all look the same from far away: the report isn't there in the morning. Work through each object: `kubectl get jobs` (completions, age), `kubectl get pods` (status column: `SchedulingGated`, `Pending`, `Running` but not Ready), `kubectl describe` and the Job's conditions (reasons such as `DeadlineExceeded`). Then look for what was supposed to move it forward: a controller that removes a gate, sets a condition or resumes a Job. If that controller is gone, the fix belongs in the spec, not in one-off patches that the next run will need again.
+    **What you're learning.** Recovering batch work whose controllers were decommissioned: gates, deadlines, readiness gates, suspended Jobs.
 
-    **Read up on:**
-    - `kubectl get job -o jsonpath='{.status.conditions}'` — `Failed` reasons
-    - `kubectl explain job.spec.activeDeadlineSeconds`, `job.spec.suspend`
-    - `kubectl explain pod.spec.schedulingGates`, `pod.spec.readinessGates`
-    - `kubectl get pods -o wide` — the `READINESS GATES` column
+    ### Method
+
+    For each object, find what was supposed to move it forward, and fix the **spec** if that thing is gone for good:
+
+    | symptom | cause | fix (exercise) |
+    |---|---|---|
+    | pod `SchedulingGated` for hours | a gate nobody removes | remove the gate from the pod (k8s-354) |
+    | Job `Failed`, reason `DeadlineExceeded` | `activeDeadlineSeconds` too short | recreate with a longer deadline (k8s-123); the template is immutable |
+    | pods Running, never Ready, `READINESS GATES 0/1` | the controller that set the condition is gone | remove `readinessGates` from the Deployment (k8s-363) |
+    | Job with no pods, `Suspended=True` | left suspended | `suspend: false` (k8s-356) |
+
+    ```bash
+    kubectl -n nightly get jobs,pods,deploy -o wide
+    kubectl -n nightly get jobs -o custom-columns=NAME:.metadata.name,SUSPEND:.spec.suspend,DEADLINE:.spec.activeDeadlineSeconds,REASON:.status.conditions[0].reason
+    kubectl -n nightly describe pod -l job-name=extract | grep -i gate
+    ```
+
+    Recreating a Job from its export: remove `status`, `.spec.selector`, and the `controller-uid` / `batch.kubernetes.io/controller-uid` / `job-name` labels from the template (k8s-121).
+
+    ### Check your work
+
+    ```bash
+    kubectl -n nightly wait --for=condition=complete job --all --timeout=180s
+    kubectl -n nightly get deploy status-page -o jsonpath='{.spec.template.spec.readinessGates}'; echo   # empty
+    kubectl -n nightly get endpointslices -l kubernetes.io/service-name=status-page
+    ```
   scenario: |
     Namespace **`nightly`** runs the nightly batch and its status page. Nothing has worked since
     two platform controllers were decommissioned last week: the **quota operator** (it released
@@ -1329,13 +1807,30 @@ exercises:
   kind: fix
   tags: [incident, troubleshooting, pdb, daemonset, internal-traffic-policy, statefulset, pvc]
   tutorial: |
-    **Concept.** Maintenance is when the fine print of an object starts to matter: how a budget treats pods that are already broken, what a node-local Service does on a node with no local endpoint, what a StatefulSet does with the disks of replicas it no longer runs. None of these show up while everything is healthy and nothing moves. Before you change anything, find out for each symptom which object is responsible and which field decides its behaviour; the fix is usually one field, and the wrong fix (removing the budget, sending node-local traffic across nodes) creates the next incident.
+    **What you're learning.** Maintenance-night fine print: budgets and broken pods, node-local Services and missing endpoints, StatefulSet disks.
 
-    **Read up on:**
-    - `kubectl explain pdb.spec.unhealthyPodEvictionPolicy`
-    - `kubectl explain service.spec.internalTrafficPolicy`, `kubectl explain daemonset.spec.template.spec.tolerations`
-    - `kubectl explain statefulset.spec.persistentVolumeClaimRetentionPolicy`
-    - `kubectl describe node controlplane` — `Taints`
+    ### Method
+
+    Each symptom has one responsible object and one deciding field:
+
+    | symptom | object | field (exercise) |
+    |---|---|---|
+    | drain hangs on not-Ready pods | PDB | `unhealthyPodEvictionPolicy: AlwaysAllow` (k8s-364) |
+    | clients on one node time out, others fine | a `Local` Service whose DaemonSet doesn't run on that node | the DaemonSet's control-plane toleration (k8s-129, k8s-362) |
+    | claims of removed replicas still there | StatefulSet | delete the orphans + `persistentVolumeClaimRetentionPolicy` (k8s-360) |
+
+    The wrong fixes create the next incident: deleting the budget, switching the Service to `Cluster`, deleting `data-ledger-0`.
+
+    ```bash
+    kubectl -n maint get pdb reports-pdb -o yaml | grep -E 'minAvailable|unhealthy|selector' -A1
+    kubectl -n maint get ds agent -o wide                       # DESIRED vs node count
+    kubectl -n maint get svc agent -o jsonpath='{.spec.internalTrafficPolicy}'; echo
+    kubectl -n maint get pvc
+    ```
+
+    ### Check your work
+
+    A dry-run eviction of a `reports` pod is accepted (k8s-364); the DaemonSet has one Ready agent per node and a client on each node reaches its own; only `data-ledger-0` remains and the StatefulSet's retention policy is `whenScaled: Delete, whenDeleted: Retain`.
   scenario: |
     Tonight is maintenance night in namespace **`maint`**, and three things stand in the way:
 
