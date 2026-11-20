@@ -12,18 +12,48 @@ exercises:
   kind: fix
   tags: [capabilities, systemd, ambient, setcap, hardening]
   tutorial: |
-    **Concept.** Root's power is split into about forty **capabilities**: `CAP_NET_BIND_SERVICE` to bind ports below 1024, `CAP_NET_RAW` for raw sockets, `CAP_SYS_ADMIN` for nearly everything else. A process has several sets: **effective** (what it can do now), **permitted** (what it may turn on), **bounding** (the ceiling for anything it executes later) and **ambient** (what survives `execve` into a normal program, for a non-root user).
+    **What you're learning.** Linux **capabilities**: why `setcap` on an interpreter is a hole, and granting exactly two capabilities to one service.
 
-    There are two ways to give a program a capability, and one is much worse:
+    ### The idea
 
-    - **File capabilities** (`setcap cap_net_bind_service+ep /usr/bin/python3.12`) attach the capability to the *binary*. Every user who runs that binary gets it, for any script. On an interpreter that is a hole: any user can now run code with the capability.
-    - **Ambient capabilities** attach it to *one service*. In systemd, `User=` plus `AmbientCapabilities=` runs the service as a plain user holding only those capabilities, and `CapabilityBoundingSet=` caps everything it starts. `NoNewPrivileges=yes` stops it regaining anything through setuid or file-capability binaries.
+    Root's power is split into about 40 **capabilities** (`CAP_NET_BIND_SERVICE`: ports < 1024, `CAP_NET_RAW`: raw sockets, `CAP_SYS_ADMIN`: nearly everything...). A process has several sets: **effective** (in use), **permitted**, **bounding** (the ceiling) and **ambient** (kept across `exec` for non-root users).
 
-    **Read up on:**
-    - `man 7 capabilities`: the sets and how they change across `execve`
-    - `getcap`, `setcap -r`, and `getcap -r / 2>/dev/null` to find file capabilities
-    - `man systemd.exec`: `User=`, `AmbientCapabilities=`, `CapabilityBoundingSet=`, `NoNewPrivileges=`
-    - `grep Cap /proc/PID/status` and `capsh --decode=HEX`
+    **File capabilities** (`setcap cap_net_raw+ep /usr/bin/python3`) apply to **everyone** who runs that binary. On an interpreter, any user's script gets them.
+
+    In a systemd unit, give them to **one service**:
+
+    ```ini
+    [Service]
+    User=kl-probe
+    AmbientCapabilities=CAP_NET_BIND_SERVICE CAP_NET_RAW
+    CapabilityBoundingSet=CAP_NET_BIND_SERVICE CAP_NET_RAW
+    NoNewPrivileges=yes
+    ```
+
+    ### Commands you'll use
+
+    ```bash
+    getcap -r /usr /opt 2>/dev/null
+    sudo setcap -r /usr/bin/python3.12
+    sudo systemctl edit kl-svc
+    sudo systemctl daemon-reload && sudo systemctl restart kl-svc
+    pid=$(systemctl show -p MainPID --value kl-svc)
+    grep -E 'Cap(Eff|Bnd|Amb)|NoNewPrivs' /proc/$pid/status
+    capsh --decode=0000000000003400
+    ```
+    ```text
+    0x0000000000003400=cap_net_bind_service,cap_net_raw
+    ```
+
+    ### Common mistakes
+
+    - `setcap -r` on a symlink: it must be the real binary (`readlink -f $(which python3)`).
+    - `AmbientCapabilities` without `CapabilityBoundingSet`: the bounding set stays full.
+    - Removing `User=`: then it runs as root again.
+
+    ### Check your work
+
+    `getcap -r /usr` lists no Python binary, `curl -s 127.0.0.1:443` returns `ping ok`, and `/proc/PID/status` shows `CapEff` and `CapBnd` `0000000000003400` with `NoNewPrivs: 1`.
   scenario: |
     **`kl-probe.service`** is a health prober: it serves its results over HTTP on
     **127.0.0.1:443** (a privileged port) and pings `127.0.0.1` with a raw ICMP socket.
@@ -162,21 +192,43 @@ exercises:
   kind: build
   tags: [namespaces, unshare, pivot_root, containers, proc]
   tutorial: |
-    **Concept.** A container runtime does three things before it runs your program: it gives the process **new namespaces**, so it has its own process tree, hostname, mounts and network; it **swaps the root filesystem** for the image's; and it **mounts the pseudo-filesystems** the program expects, such as `/proc`.
+    **What you're learning.** What a container runtime does before running your program: namespaces with `unshare`, a new root with `pivot_root`, and `/proc`.
 
-    `unshare` creates the namespaces. Two of them need care:
+    ### The idea
 
-    - **PID namespace.** The process that calls `unshare --pid` stays in the old namespace; only its *children* land in the new one, and the first child becomes PID 1 there. That is what `--fork` is for. `/proc` still shows the host's processes until a new `proc` is mounted inside the new mount namespace.
-    - **Mount namespace.** It starts as a copy of the host's mount table. If the mounts are *shared* with the host, which is the default on systemd hosts, a mount made inside also appears outside. `--propagation private` stops that.
+    1. **New namespaces**: `unshare --pid --fork --mount --uts --ipc --net` (PID 1 needs `--fork`, so the command is a child of `unshare`).
+    2. **Private mounts**: make the mount tree private (`--mount-proc` or `mount --make-rprivate /`), so nothing you mount leaks to the host.
+    3. **New root**: `pivot_root NEW PUT_OLD` swaps `/` for `NEW` (which must be a **mount point**: bind-mount it onto itself), then `umount -l PUT_OLD` drops the host's filesystem entirely. `chroot` only changes the path lookup, and the old root stays mounted.
+    4. **/proc** for the new PID namespace: `mount -t proc proc /proc` inside.
+    5. **Loopback up** in the new network namespace: `ip link set lo up`.
 
-    `chroot` only changes how paths are resolved, and the old root is still mounted and reachable. **`pivot_root NEW PUT_OLD`** really swaps the root mount of the mount namespace: the new root must be a mount point, so a runtime bind-mounts the image directory onto itself first, then pivots, then **unmounts the old root** so nothing of the host is left in the container's mount table.
+    ### Commands you'll use
 
-    **Read up on:**
-    - `man unshare`: `--pid --fork`, `--mount`, `--uts`, `--ipc`, `--net`, `--propagation`
-    - `man 2 pivot_root` and `man 8 pivot_root`, and why the new root must be a mount point
-    - `umount -l` (lazy unmount) for the old root after the pivot
-    - `/proc/self/mountinfo`: one line per mount, the fifth field is the mount point
-    - `man 7 pid_namespaces`: PID 1 and what `/proc` shows
+    ```bash
+    sudo unshare --pid --fork --mount --uts --ipc --net bash -c '
+      mount --make-rprivate /
+      hostname demo
+      mount --bind /srv/rootfs /srv/rootfs
+      mkdir -p /srv/rootfs/.old
+      cd /srv/rootfs && pivot_root . .old
+      mount -t proc proc /proc
+      umount -l /.old && rmdir /.old
+      ip link set lo up 2>/dev/null || true
+      exec /bin/sh -c "echo pid=\$\$; hostname; ls /; cat /proc/mounts | wc -l"
+    '
+    findmnt | grep rootfs || echo "host mount table untouched"
+    ```
+    `ip` must exist inside the new root (Alpine has busybox `ip`), or bring `lo` up before `pivot_root`.
+
+    ### Common mistakes
+
+    - `chroot` instead of `pivot_root`: the host's filesystem is still mounted inside.
+    - No `--fork`: "cannot allocate memory" when the shell forks.
+    - Forgetting `make-rprivate`: mounts propagate to the host.
+
+    ### Check your work
+
+    `sudo /lab/box.sh c1 sh -c 'echo $$; hostname; ip link; cat /etc/alpine-release; ls /proc'` shows PID 1, `c1`, only `lo` (UP), the Alpine release and only the container's processes, its exit code passes through, and the host's `findmnt` shows nothing new.
   scenario: |
     **`/srv/kl-root`** holds an unpacked Alpine root filesystem. There is no container runtime
     in this lab: write the part of one that matters, as the script **`/lab/box.sh`**.
@@ -319,21 +371,47 @@ exercises:
   kind: build
   tags: [cgroups, cgroup-v2, memory, pids, cpu, oom]
   tutorial: |
-    **Concept.** cgroup v2 is a single tree of directories under **`/sys/fs/cgroup`**. Each directory is a group of processes, and the files in it are its limits and its statistics. There's no command to learn: you `mkdir` a group, write limits into its files, and write a PID into its **`cgroup.procs`** to move that process in. Children a process forks stay in its group.
+    **What you're learning.** **cgroup v2** by hand: creating a group, writing its limit files and moving a process into it.
 
-    Two rules trip everyone up:
+    ### The idea
 
-    - **Controllers are handed down explicitly.** A group only has `memory.max`, `pids.max` or `cpu.max` if its *parent* lists that controller in **`cgroup.subtree_control`** (`echo '+memory +pids +cpu' > parent/cgroup.subtree_control`).
-    - **No internal processes.** A group that hands controllers to its children can't hold processes itself. Put processes only in the leaves.
+    cgroup v2 is a directory tree under `/sys/fs/cgroup`. Each directory is a group, and its files are its limits and statistics:
 
-    The limits behave differently. Past **`memory.max`** the kernel reclaims, then the OOM killer kills a process *in that group*, and `memory.events` counts it in `oom_kill`. At **`pids.max`** `fork()` simply fails with `EAGAIN`, and `pids.events` counts it in `max`. **`cpu.max`** is a quota per period, `"25000 100000"` meaning 25 ms of CPU every 100 ms: the group is throttled, not killed, and `cpu.stat` shows the time used and throttled.
+    | file | example | meaning |
+    |---|---|---|
+    | `memory.max` | `67108864` | hard memory cap (OOM inside the group) |
+    | `memory.swap.max` | `0` | no swap |
+    | `pids.max` | `20` | process and thread count |
+    | `cpu.max` | `25000 100000` | 25 ms of CPU per 100 ms = ¼ CPU |
+    | `cgroup.procs` | write a PID | move that process in |
 
-    **Read up on:**
-    - The kernel's cgroup v2 documentation (`Documentation/admin-guide/cgroup-v2.rst`): "Controlling Controllers", "No Internal Process Constraint"
-    - `memory.max`, `memory.swap.max`, `memory.events`
-    - `pids.max`, `pids.events`
-    - `cpu.max`, `cpu.stat` (`usage_usec`, `nr_throttled`)
-    - `cgroup.procs`, and moving the current shell with `echo $$`
+    A parent must **enable** controllers for its children: `echo '+memory +pids +cpu' > PARENT/cgroup.subtree_control`.
+
+    Running a command inside: write the shell's own PID (`$$`) into `cgroup.procs`, then `exec` the command, so it starts in the group.
+
+    ### Commands you'll use
+
+    ```bash
+    sudo mkdir -p /sys/fs/cgroup/demo
+    echo '+memory +pids +cpu' | sudo tee /sys/fs/cgroup/demo/cgroup.subtree_control
+    sudo mkdir /sys/fs/cgroup/demo/j1
+    echo 33554432 | sudo tee /sys/fs/cgroup/demo/j1/memory.max
+    echo '50000 100000' | sudo tee /sys/fs/cgroup/demo/j1/cpu.max
+    sudo sh -c 'echo $$ > /sys/fs/cgroup/demo/j1/cgroup.procs; exec python3 /opt/hog.py'
+    cat /sys/fs/cgroup/demo/j1/memory.events          # oom_kill 1
+    cat /sys/fs/cgroup/demo/j1/pids.events            # max N: hits on pids.max
+    ```
+    The parent's own `subtree_control` must allow the controllers too, from `/sys/fs/cgroup` down.
+
+    ### Common mistakes
+
+    - `cgroup.procs` written **after** starting the command: its children may already exist outside.
+    - Missing `subtree_control`: the limit files don't exist in the child.
+    - `memory.swap.max` doesn't exist without swap accounting: write it only if it exists.
+
+    ### Check your work
+
+    `leak.py` in a job is OOM-killed (`memory.events` shows `oom_kill`) while the host is fine, `forker.py` stops at 20 (`pids.events`), `spin.py` stays at about 25% CPU, and each job has its own `/sys/fs/cgroup/kl/NAME`.
   scenario: |
     Three badly behaved programs live in **`/opt/kl-cg`**: `leak.py` allocates memory
     forever, `forker.py` forks as many children as it can, and `spin.py` burns CPU.
@@ -487,21 +565,51 @@ exercises:
   kind: build
   tags: [overlayfs, image-layers, whiteouts, oci, containers]
   tutorial: |
-    **Concept.** An image is a stack of layers, each a tar of the files that changed. Stacked with **overlayfs**, `lowerdir=TOP:...:BOTTOM` gives one merged view: the leftmost directory wins, and a writable `upperdir` (with its scratch `workdir`) on top takes every change the container makes.
+    **What you're learning.** Image layers and **whiteouts**: converting OCI deletion markers to overlayfs's form, and stacking the layers.
 
-    Additions and edits are easy: a file in a higher layer hides the same path below. **Deletions** are the hard part, because a tar can't contain "nothing". The OCI image format records them with marker files that overlayfs doesn't understand:
+    ### The idea
 
-    - **`.wh.NAME`** (a *whiteout*) means "`NAME` was deleted in this layer". Overlayfs's own whiteout is a **character device 0:0** called `NAME`.
-    - **`.wh..wh..opq`** in a directory (an *opaque* marker) means "this directory was replaced: ignore everything below it in lower layers". Overlayfs marks an opaque directory with the extended attribute **`trusted.overlay.opaque=y`**.
+    Each layer is a tar of the files that changed. Deletions use markers:
 
-    Unpack a layer without converting these and the deleted files come back, and the marker files turn up as junk in the container. Container runtimes convert them as they unpack each layer; that's what you'll do here.
+    | OCI (in the tar) | overlayfs (in a lower directory) |
+    |---|---|
+    | `dir/.wh.NAME`: NAME was deleted | a **character device 0:0** named `NAME` |
+    | `dir/.wh..wh..opq`: the directory's earlier contents are hidden | the directory with xattr `trusted.overlay.opaque=y` |
 
-    **Read up on:**
-    - The kernel's overlayfs documentation: multiple lower layers, whiteouts and opaque directories
-    - The OCI image spec, "Image Layer Filesystem Changeset": whiteouts and opaque whiteouts
-    - `mknod NAME c 0 0`, and `setfattr` or Python's `os.setxattr`
-    - `mount -t overlay overlay -o lowerdir=...,upperdir=...,workdir=... TARGET`
-    - `tar --numeric-owner`, so ownership inside the image survives unpacking
+    Stack them with `lowerdir=TOP:MIDDLE:BOTTOM` (**leftmost is the top**).
+
+    ### Commands you'll use
+
+    ```bash
+    tar -tf /srv/img/layer-2.tar | grep '\.wh\.'
+    ```
+    ```text
+    etc/.wh.legacy.conf
+    srv/assets/.wh..wh..opq
+    ```
+    ```bash
+    d=/srv/layers/2; sudo mkdir -p $d && sudo tar -xpf /srv/img/layer-2.tar -C $d
+    cd $d
+    for w in $(sudo find . -name '.wh.*' ! -name '.wh..wh..opq'); do
+      sudo mknod "$(dirname "$w")/$(basename "$w" | sed 's/^\.wh\.//')" c 0 0 && sudo rm "$w"
+    done
+    for o in $(sudo find . -name '.wh..wh..opq'); do
+      sudo setfattr -n trusted.overlay.opaque -v y "$(dirname "$o")" && sudo rm "$o"
+    done
+    sudo mount -t overlay overlay -o lowerdir=/srv/layers/3:/srv/layers/2:/srv/layers/1,upperdir=/srv/rw/upper,workdir=/srv/rw/work /srv/merged
+    ls /srv/merged/etc
+    ```
+    `tar -p` keeps permissions. Run as root to keep owners.
+
+    ### Common mistakes
+
+    - `lowerdir=1:2:3`: the base would hide the later layers.
+    - Leaving `.wh.` files: overlayfs shows them as ordinary files.
+    - Names with spaces in the loops above: use `find -print0` if the layers have them.
+
+    ### Check your work
+
+    No `.wh.` file is left under `/srv/kl-layers`, the merged view matches `NOTES.md`, and `chroot /srv/kl-merged /app/run.sh` prints the expected line.
   scenario: |
     **`/srv/kl-image`** holds an image the way a registry ships it: `layer-1.tar` (the base),
     `layer-2.tar` and `layer-3.tar`, applied in that order. `/srv/kl-image/NOTES.md` says what
@@ -663,21 +771,52 @@ exercises:
   kind: build
   tags: [runc, oci, bundle, config.json, containers]
   tutorial: |
-    **Concept.** Under Docker and containerd sits **runc**, which runs one container from an **OCI bundle**: a directory with a `rootfs/` and a **`config.json`** describing the process and its isolation. Everything `docker run` flags turn into ends up in that file:
+    **What you're learning.** The **OCI runtime spec**: writing `config.json` for `runc` by hand.
 
-    - **`process`**: `args`, `env`, `cwd`, `user.uid`/`gid`, `terminal`, `capabilities`, `noNewPrivileges`
-    - **`root`**: the path of the root filesystem and `readonly`
-    - **`hostname`** and **`mounts`**: each with a `destination`, `type`, `source` and `options` (`bind`, `ro`, `nosuid` ...)
-    - **`linux.namespaces`**: which namespaces are new. Leave one out and the container *shares the host's*: no `network` entry means the host's network stack
-    - **`linux.resources`**: cgroup limits such as `memory.limit` and `pids.limit`
+    ### The idea
 
-    `runc spec` writes a starting template, `runc run -d ID` starts the bundle in the current directory in the background, and `runc list`, `runc state ID`, `runc exec ID CMD` and `runc delete -f ID` manage it. The template has `"terminal": true`, which needs a console; a background service needs `false`, with its output sent somewhere.
+    `runc` runs one container from a **bundle**: `rootfs/` plus `config.json`. `runc spec` writes a default config to edit. The parts that matter:
 
-    **Read up on:**
-    - The OCI runtime spec: `config.md` and `config-linux.md`
-    - `runc spec`, `runc run -d`, `runc state`, `runc delete`
-    - `jq` for editing JSON in place: `jq '.process.terminal=false' config.json > tmp && mv tmp config.json`
-    - What a `bind` mount entry looks like in `config.json`
+    | field | controls |
+    |---|---|
+    | `process.args`, `.cwd`, `.env`, `.user.uid/gid`, `.noNewPrivileges`, `.terminal` | what runs and as whom |
+    | `hostname` | UTS name |
+    | `root.readonly` | read-only rootfs |
+    | `mounts[]` | tmpfs and bind mounts (`"options": ["rbind","ro"]`) |
+    | `linux.namespaces[]` | which namespaces are **new** (leave `network` out to use the host's) |
+    | `linux.resources.memory.limit`, `.pids.limit` | cgroup limits |
+
+    `terminal: false` is needed for `runc run -d` (detached).
+
+    ### Commands you'll use
+
+    ```bash
+    cd /srv/bundle && sudo runc spec
+    sudo jq '.process.terminal=false
+      | .process.args=["python3","/app/main.py"] | .process.cwd="/app"
+      | .process.env += ["MODE=test"]
+      | .process.user={uid:1000,gid:1000} | .process.noNewPrivileges=true
+      | .hostname="demo" | .root.readonly=true
+      | .mounts += [{destination:"/tmp",type:"tmpfs",source:"tmpfs",options:["nosuid","nodev","mode=1777"]},
+                    {destination:"/data",type:"bind",source:"/srv/data",options:["rbind","ro"]}]
+      | .linux.namespaces |= map(select(.type!="network"))
+      | .linux.resources.memory={limit:134217728} | .linux.resources.pids={limit:32}' \
+      config.json | sudo tee config.json.new >/dev/null && sudo mv config.json.new config.json
+    sudo runc run -d demo
+    sudo runc list
+    curl -s 127.0.0.1:18053
+    ```
+    The default spec has a `PATH` in `process.env`. Keep it, or `python3` isn't found.
+
+    ### Common mistakes
+
+    - `terminal: true` with `-d`: "cannot allocate tty if runc will detach".
+    - `jq ... config.json > config.json`: truncates the file before reading it.
+    - Removing the `network` namespace by setting `path` instead of deleting the entry.
+
+    ### Check your work
+
+    `curl -s 127.0.0.1:18053` reports uid 1000, hostname `kl-web`, `APP_MODE=production`, a read-only root, writable `/tmp`, read-only `/data` and the limits.
   scenario: |
     **`/srv/kl-bundle`** has a `rootfs/` with Python and a small service in `/app/server.py`,
     and no `config.json`. Write the config, then run the bundle with **`runc`** (as root,
@@ -856,21 +995,47 @@ exercises:
   kind: fix
   tags: [debugging, strace, nsenter, distroless, containers]
   tutorial: |
-    **Concept.** Minimal images ship no shell, no `ls`, no `ps`, so `docker exec -it app sh` gets you nowhere. You don't need them: the container is a process on the host, and the host has every tool.
+    **What you're learning.** Debugging a container with no tools: `strace` from the host, and reaching into its filesystem through `/proc/PID/root`.
 
-    - **`strace -f -p PID`** on the container's host PID shows every system call: `open` and `openat` reveal which files it looks for, and `connect` which addresses it calls.
-    - **`/proc/PID/root`** is the container's root filesystem, readable from the host. **`/proc/PID/environ`** and **`/proc/PID/cmdline`** show how it was started.
-    - **`nsenter -t PID -n`** runs a host tool (`ss`, `ip`, `curl`) inside its network namespace.
-    - **A sidecar** sharing its namespaces (`docker run --network container:NAME`, `--pid container:NAME`) brings your tools along without touching the image.
-    - **`docker cp`** copies files in and out with no shell in the container at all.
+    ### The idea
 
-    `docker inspect -f '{{.State.Pid}}' NAME` gives the host PID.
+    A container's process is visible on the host, so **host** tools work on it:
 
-    **Read up on:**
-    - `man strace`: `-f`, `-p`, `-e trace=%file,connect` (musl calls `open`, glibc `openat`; `%file` catches both), `-s`
-    - `man 5 proc`: `/proc/PID/root`, `/proc/PID/environ`
-    - `docker run --network container:NAME` and what a shared network namespace means for `127.0.0.1`
-    - `docker cp` into a running container
+    | need | tool |
+    |---|---|
+    | which files does it try to open, whom does it connect to? | `sudo strace -f -p PID -e trace=%file,connect` |
+    | its filesystem | `/proc/PID/root/` (the container's `/` as the host sees it) |
+    | copy a file in | `docker cp FILE NAME:/path` (no shell needed) |
+
+    `ENOENT` on an `open` means "no such file": that's the path it wants.
+
+    ### Commands you'll use
+
+    ```bash
+    P=$(docker inspect -f '{{.State.Pid}}' minimal)
+    sudo timeout 5 strace -f -p "$P" -e trace=%file,connect -o /tmp/st.txt &
+    sleep 1; curl -s 127.0.0.1:18099 >/dev/null; wait
+    grep -E 'ENOENT|connect\(' /tmp/st.txt | head
+    ```
+    ```text
+    openat(AT_FDCWD, "/etc/app/conf.d/main.ini", O_RDONLY|O_CLOEXEC) = -1 ENOENT (No such file or directory)
+    connect(5, {sa_family=AF_INET, sin_port=htons(9100), sin_addr=inet_addr("10.1.2.3")}, 16) = -1 ECONNREFUSED
+    ```
+    ```bash
+    sudo ls /proc/$P/root/etc/app/
+    docker cp /lab/main.ini minimal:/etc/app/conf.d/main.ini      # if the directory exists
+    ```
+    To answer on the address it calls, a second container can join its network (`--network container:NAME`), or sit on a network where that name or IP resolves.
+
+    ### Common mistakes
+
+    - Restarting the container to "see what happens": the task forbids it.
+    - `strace` without `-f`: the work happens in a thread or child.
+    - Reading `connect` lines before the configuration is in place: the backend call only happens afterwards.
+
+    ### Check your work
+
+    `config-path.txt` and `backend.txt` match what `strace` showed, `curl 127.0.0.1:18056` returns 200, and `kl-report` has the same start time.
   scenario: |
     The container **`kl-report`** runs the report service, published on
     **127.0.0.1:18056**. Every request fails with `500 configuration error`, and its log
@@ -1005,19 +1170,43 @@ exercises:
   kind: fix
   tags: [mounts, propagation, bind-mounts, docker, rslave, rshared]
   tutorial: |
-    **Concept.** A bind mount copies a directory into a container's mount namespace, but what happens to mounts made *later*, under that directory, depends on its **propagation**:
+    **What you're learning.** **Mount propagation**: why a bind mount doesn't see later mounts, and `rslave` / `rshared`.
 
-    - **private** (Docker's default, `rprivate`): no mount events cross in either direction. A disk mounted on the host after the container started is an empty directory inside.
-    - **slave** (`rslave`): mounts on the host propagate *into* the container, but nothing the container mounts comes back out.
-    - **shared** (`rshared`): mounts propagate both ways. Needed when a container, such as a storage driver, mounts things the host must see.
+    ### The idea
 
-    Propagation is fixed when the mount is created, so a running container can't be switched: it has to be recreated with `--mount type=bind,src=...,dst=...,bind-propagation=rslave` (or `-v SRC:DST:rslave`). The *source* side must allow it: for `rshared` and `rslave` the host mount the source lives on must itself be shared, which `findmnt -o TARGET,PROPAGATION` shows.
+    A bind mount copies the mount tree at that moment. What happens to mounts made **later** depends on propagation:
 
-    **Read up on:**
-    - The kernel's "Shared Subtrees" documentation, and `man 7 mount_namespaces`
-    - `findmnt -o TARGET,SOURCE,PROPAGATION`
-    - Docker's bind mount docs: "Configure bind propagation"
-    - `docker inspect -f '{{json .Mounts}}' NAME`, and its `Propagation` field
+    | mode | later host mounts appear inside | container mounts appear on the host |
+    |---|---|---|
+    | `private` (Docker's default, `rprivate`) | no | no |
+    | **`rslave`** | yes | no |
+    | **`rshared`** | yes | yes |
+
+    The host side must be **shared** for either direction to work: `findmnt -o TARGET,PROPAGATION /srv/x`. Make it shared with `sudo mount --make-rshared /srv/x`. systemd makes `/` shared by default, so it's usually fine.
+
+    Docker: `-v /host/path:/c/path:ro,rslave`. `rshared` also needs the container to be allowed to mount (privileged here).
+
+    ### Commands you'll use
+
+    ```bash
+    findmnt -o TARGET,PROPAGATION /srv/disks
+    docker inspect idx --format '{{json .Mounts}}' | jq '.[] | {Source, Destination, Propagation, RW}'
+    docker inspect idx --format '{{.Config.Image}} {{json .Config.Cmd}} {{json .HostConfig.PortBindings}} {{.HostConfig.Privileged}}'
+    docker rm -f idx
+    docker run -d --name idx ... -v /srv/disks:/disks:ro,rslave ...
+    sudo mount /dev/loop7 /srv/disks/d3
+    docker exec idx ls /disks/d3
+    ```
+
+    ### Common mistakes
+
+    - `rshared` for the indexer: it could push mounts back to the host.
+    - Losing `ro` or other options when recreating.
+    - The host directory isn't a shared mount point: propagation has nothing to follow.
+
+    ### Check your work
+
+    A disk mounted on the host after `kl-indexer` starts shows up in its listing, `kl-indexer` still can't write, and `/srv/kl-media/cache/ready` exists on the host after `kl-mounter` starts.
   scenario: |
     Disks for the media library are mounted on this host under **`/srv/kl-media`**, one
     directory per disk, and new disks get mounted while everything is running.
@@ -1139,20 +1328,50 @@ exercises:
   kind: fix
   tags: [cgroups, io, psi, systemd, io.max, performance]
   tutorial: |
-    **Concept.** CPU and memory have obvious tools, but when a host is slow because of the disk, `top` shows little: processes waiting on I/O just sit there. cgroup v2 has the answers:
+    **What you're learning.** Finding the disk hog with cgroup **I/O stats** and **PSI**, and limiting reads with `IOReadBandwidthMax=`.
 
-    - **PSI** (pressure stall information): `io.pressure` in a cgroup says what share of time its tasks were stalled waiting for I/O (`some avg10=...`). `/proc/pressure/io` is the same for the whole host.
-    - **`io.stat`**: per-device counters for each cgroup, `rbytes`, `wbytes`, `rios`, `wios`. Read it twice and subtract to get a rate.
-    - **`io.max`**: a hard limit per device, `MAJ:MIN rbps=... wbps=... riops=... wiops=...`.
+    ### The idea
 
-    systemd puts each service in its own cgroup under `system.slice`, and sets `io.max` for you with `IOReadBandwidthMax=`, `IOWriteBandwidthMax=`, `IOReadIOPSMax=` and `IOWriteIOPSMax=`, given a device or a file on it. `systemctl set-property` applies a property at once and saves it as a drop-in (with `--runtime`, only until reboot).
+    `top` shows CPU, not disk. Per-service I/O lives in the service's cgroup:
 
-    **Read up on:**
-    - The kernel's PSI documentation (`Documentation/accounting/psi.rst`)
-    - The cgroup v2 documentation: the IO controller, `io.stat` and `io.max`
-    - `man systemd.resource-control`: `IOReadBandwidthMax=` and friends
-    - `systemctl set-property`, and where it stores what it sets
-    - `lsblk -o NAME,MAJ:MIN` and `findmnt -T PATH`
+    | file | shows |
+    |---|---|
+    | `io.stat` | bytes and operations per device: `rbytes`, `wbytes`, `rios`, `wios` |
+    | `io.pressure` | **PSI**: the share of time tasks were stalled waiting for I/O |
+
+    Compare two snapshots a few seconds apart: the counters only grow. systemd's limit:
+
+    ```bash
+    sudo systemctl set-property kl-x IOReadBandwidthMax="/dev/vdb 10M"
+    ```
+    It persists (like CPUQuota, linux-011) and applies at once. The device is the disk the service **reads from**: `findmnt -no SOURCE PATH`, then the whole disk (`lsblk -no PKNAME`).
+
+    ### Commands you'll use
+
+    ```bash
+    for s in a b c; do
+      echo "$s $(awk '{for(i=2;i<=NF;i++) if($i ~ /^rbytes=/) print $i}' /sys/fs/cgroup/system.slice/kl-$s.service/io.stat)"
+    done
+    sleep 5    # and again: compare the deltas
+    cat /sys/fs/cgroup/system.slice/kl-a.service/io.pressure
+    systemctl cat kl-a | grep ExecStart
+    findmnt -no SOURCE /srv/data; lsblk -no PKNAME /dev/vdb1
+    sudo systemctl set-property kl-a IOReadBandwidthMax="/dev/vdb 10M"
+    cat /sys/fs/cgroup/system.slice/kl-a.service/io.max
+    ```
+    ```text
+    253:16 rbps=10485760 wbps=max riops=max wiops=max
+    ```
+
+    ### Common mistakes
+
+    - Picking the top CPU user.
+    - Limiting a partition when the cgroup counts the disk (or the reverse): check `io.stat`'s `MAJ:MIN` against `lsblk -o NAME,MAJ:MIN`.
+    - `--runtime`: lost at reboot.
+
+    ### Check your work
+
+    `culprit.txt` names the service with the biggest `rbytes` growth, its `io.max` shows `rbps` at 10 MB/s on that device, it's still running and progressing, and the others are unchanged.
   scenario: |
     The ingest service on this host has become sluggish. Three services of ours run here:
     **`kl-ingest`**, **`kl-backup`** and **`kl-report`**. Find the one hogging the disk and
@@ -1251,20 +1470,48 @@ exercises:
   kind: build
   tags: [pid1, init, signals, zombies, namespaces, docker]
   tutorial: |
-    **Concept.** PID 1 of a PID namespace has two jobs no other process has:
+    **What you're learning.** Writing an init: reaping every child and forwarding signals, as PID 1.
 
-    - **It adopts orphans.** When a process dies, its children are reparented to PID 1. When they exit, they stay as **zombies** until someone `wait()`s for them, and only PID 1 can. An init must reap *every* child, not only the one it started: `waitpid(-1, ...)` in a loop.
-    - **The kernel protects it from signals.** A signal with no handler installed is simply *ignored* when sent to PID 1, `SIGTERM` included. That's why `docker stop` on an app running as PID 1 often waits the full ten seconds and then sends `SIGKILL`, and the app never gets to clean up. An init installs handlers and **forwards** the signals to its child.
+    ### The idea
 
-    Finally, an init must **exit with its child's status**, so the exit code a supervisor sees is the app's: the same code if the child exited, `128 + N` if signal `N` killed it, the shell convention.
+    PID 1 of a PID namespace has two jobs (docker-186):
 
-    Tiny inits such as `tini` (`docker run --init`) do exactly this. Writing one makes the rules stick.
+    1. **reap**: orphans are re-parented to it, and it must `wait` for them or they stay zombies;
+    2. **signals**: the kernel ignores signals sent to PID 1 that it has no handler for, so it must **catch** them and **forward** them to the real program.
 
-    **Read up on:**
-    - `man 7 pid_namespaces`: "The namespace init process"
-    - `man 2 waitpid`: `-1`, `WNOHANG`; and `os.waitstatus_to_exitcode` in Python
-    - Python's `signal.signal`, `os.kill`, `subprocess.Popen`
-    - `unshare --pid --fork --mount-proc`, to test your init as a real PID 1 without Docker
+    Exit status: the child's code, or `128 + N` if signal N killed it (`Popen.returncode` is `-N` then).
+
+    ```python
+    import os, signal, subprocess, sys
+    child = subprocess.Popen(sys.argv[1:])
+    for s in (signal.SIGTERM, signal.SIGINT, signal.SIGHUP, signal.SIGQUIT, signal.SIGUSR1, signal.SIGUSR2):
+        signal.signal(s, lambda n, f: child.send_signal(n))
+    while True:
+        pid, status = os.wait()                 # reaps ANY child, orphans included
+        if pid == child.pid:
+            sys.exit(os.waitstatus_to_exitcode(status) if os.WIFEXITED(status) else 128 + os.WTERMSIG(status))
+    ```
+    `os.wait()` can be interrupted by a signal, which Python retries automatically (PEP 475).
+
+    ### Commands you'll use
+
+    ```bash
+    sudo unshare --pid --fork --mount-proc python3 /lab/init.py python3 /opt/demo/forker.py &
+    sleep 3; ps -eo pid,stat,cmd | grep -c ' Z'                         # 0
+    docker run -d --name w -v /lab/init.py:/init.py:ro -v /srv/out:/out \
+      -v /opt/demo/app.py:/app.py:ro --entrypoint python3 python:3.12-alpine /init.py python3 /app.py /out/f
+    time docker stop w; cat /srv/out/f
+    ```
+
+    ### Common mistakes
+
+    - `child.wait()` only: other orphans become zombies.
+    - Not forwarding: `docker stop` waits 10 s and SIGKILLs.
+    - Exiting 0 when the child was killed by a signal.
+
+    ### Check your work
+
+    No zombies last more than a second, `docker stop kl-worker` finishes in a few seconds with the buffer in `/srv/kl-worker/flushed`, and `kl-worker` is running again with your init as PID 1.
   scenario: |
     **`/opt/kl-pid1/app.py`** is a worker that hands jobs to short-lived background processes
     and doesn't wait for them, and that flushes its buffer to a file when it gets `SIGTERM`.
@@ -1447,17 +1694,44 @@ exercises:
   kind: fix
   tags: [user-namespaces, uid-mapping, runc, idmap, containers]
   tutorial: |
-    **Concept.** A **user namespace** gives a process its own set of user IDs, translated to host IDs by a map. With the map `0 100000 65536`, uid 0 *inside* is uid 100000 *outside*, uid 1000 inside is 101000 outside, and so on for 65536 IDs. The container's "root" can do root things to what its namespace owns, but to the host it's an unprivileged nobody: escape the container and you're uid 100000.
+    **What you're learning.** **User namespaces**: mapping container root to an unprivileged host UID, and shifting file ownership to match.
 
-    The catch is the files. The kernel stores *host* IDs on disk. A root filesystem unpacked by host root is owned by host uid 0, which is **not in the map**, so inside it shows up as the overflow user `nobody` (65534) and container root can't write it. Runtimes solve this by **shifting** the image: every file owned by uid N is chowned to `100000 + N`, which keeps the ownership structure (root files stay root's, the app user's files stay the app user's) instead of flattening everything to one owner. Newer kernels can do it without copying, with idmapped mounts.
+    ### The idea
 
-    In runc, a user namespace is a `{"type": "user"}` entry in `linux.namespaces` plus `linux.uidMappings` and `linux.gidMappings`, each a list of `{"containerID", "hostID", "size"}`.
+    A user namespace translates IDs with a map: `containerID hostID size`. With `0 200000 65536`, container uid 0 is host uid **200000**, and uid 1000 inside is host 201000. Root inside has no power over the host's files.
 
-    **Read up on:**
-    - `man 7 user_namespaces`: `uid_map`, unmapped IDs and the overflow user
-    - `/proc/PID/uid_map` and the `Uid:` line of `/proc/PID/status`
-    - The OCI runtime spec, `config-linux.md`: "User namespace mappings"
-    - `chown -h` and why symlinks must be shifted too, and `find -printf '%U'`
+    In an OCI config:
+    ```json
+    "linux": {
+      "namespaces": [ ..., {"type": "user"} ],
+      "uidMappings": [{"containerID": 0, "hostID": 200000, "size": 65536}],
+      "gidMappings": [{"containerID": 0, "hostID": 200000, "size": 65536}]
+    }
+    ```
+    The **files** must be owned by mapped IDs, or the container sees them as `nobody` (65534) and can't write. **Shift** each file's owner by the offset, keeping the original relationship: host uid = old uid + 200000.
+
+    ### Commands you'll use
+
+    ```bash
+    sudo find /srv/b/rootfs -printf '%U:%G %p\n' | sort | uniq -c -w 12 | head
+    sudo find /srv/b/rootfs -exec sh -c 'for f; do
+      u=$(stat -c %u "$f"); g=$(stat -c %g "$f"); chown -h $((u+200000)):$((g+200000)) "$f"; done' sh {} +
+    sudo chown 200000:200000 /srv/b-data
+    sudo runc run -d nsdemo
+    ps -o user:12,pid,cmd -C sleep | head -3          # 200000
+    sudo runc exec nsdemo id                          # uid=0(root) inside
+    ```
+    `chown` clears setuid bits. Re-check any that the image needs (`find -perm -4000` before and after).
+
+    ### Common mistakes
+
+    - A `size` of 1000: uid 1000 itself isn't mapped.
+    - `chown -R 200000:200000`: flattens ownership, so `app`'s files become root's.
+    - `chmod 777` on `/data`.
+
+    ### Check your work
+
+    `config.json` has the user namespace and both maps, `kl-ns` runs as host uid 200000, the worker writes its state, `app` appends its log, `/data` writes work, and `find rootfs ! -uid +199999` finds nothing.
   scenario: |
     **`/srv/kl-ns`** is a runc bundle for a small worker, **`kl-ns`**. It runs as root inside the
     container, and so it runs as **real root on the host**: a break-out would own the machine.
@@ -1613,21 +1887,30 @@ exercises:
   kind: build
   tags: [capstone, image-layers, whiteouts, oci, runc, config.json, capabilities, ambient, cgroups, namespaces, systemd, signals]
   tutorial: |
-    **Concept.** Take Docker away and a container is still the same few things: a root filesystem built from the image's layers, a process with an identity and a set of capabilities, some namespaces, some cgroup limits, and something that starts it at boot and stops it cleanly. Each one is a skill from this module; here you put them together by hand.
+    **What you're learning.** A container without Docker: flattened layers, a hand-written OCI config, capabilities, limits and a systemd service around runc.
 
-    - **Layers without overlayfs.** A runtime that can't stack layers (a "vfs" storage driver, `umoci unpack`) *flattens* them: it extracts each layer over the previous ones, in order. The deletion markers then become operations: **`.wh.NAME`** means "remove `NAME` (file or whole directory) from what's there so far", and **`.wh..wh..opq`** means "empty this directory of everything the lower layers put in it" before this layer's own files go in. The markers themselves must never land in the result. Ownership in the image is numeric: extract as root with `--numeric-owner`.
-    - **The process in `config.json`.** `process.args`, `cwd`, `user`, `hostname`, `root.readonly`, extra `mounts`; leave the `network` namespace out to share the host's.
-    - **Capabilities for a non-root process.** The OCI config has five sets. For a process running as a normal uid to *use* a capability after `execve`, it has to be **ambient**, and the kernel only allows an ambient capability that is also **permitted and inheritable**. `bounding` caps everything else.
-    - **Limits.** `linux.resources.memory.limit` (bytes), `pids.limit`, and `cpu.quota`/`cpu.period` (microseconds), which runc writes to the container's cgroup as `memory.max`, `pids.max` and `cpu.max`.
-    - **Supervision.** `runc run ID` (without `-d`) stays in the foreground for as long as the container runs, forwards the signals it receives to the container's process, and removes the container when it exits. That is exactly what a systemd service wants as its main process: `systemctl stop` sends `SIGTERM`, the app handles it, and runc exits with the app's status.
+    ### Method
 
-    **Read up on:**
-    - The OCI image spec, "Applying Changesets" and "Whiteouts"; `tar -t`, `tar --exclude`, `tar --numeric-owner`
-    - The OCI runtime spec, `config.md` (`process.capabilities`) and `config-linux.md` (`resources`)
-    - `man 7 capabilities`: "Ambient capability set", and the rule that ambient ⊆ permitted ∩ inheritable
-    - `runc spec`, `runc run`, `runc state`, `runc list`, `runc delete`
-    - `/proc/PID/status` (`Cap*`, `NoNewPrivs`), `/proc/PID/cgroup`, `/proc/PID/ns/*`
-    - `man systemd.service`: `ExecStart=`, `ExecStopPost=`; what `systemctl stop` sends
+    | requirement | approach (exercise) |
+    |---|---|
+    | 1. rootfs as a plain directory | extract the layers **in order** into one directory, carrying out deletions **before** extracting each layer: `.wh.NAME` → `rm -rf NAME`, `.wh..wh..opq` → empty the directory. Then remove the markers. `tar -p` as root keeps ownership (linux-052) |
+    | 2. process | `runc spec`, then `args`, `cwd`, `user`, `hostname` (linux-053) |
+    | 3. capabilities | `process.capabilities.{effective,permitted,bounding,ambient} = ["CAP_NET_BIND_SERVICE"]`, `inheritable` empty, `noNewPrivileges` true. Drop the `network` namespace (linux-055) |
+    | 4. filesystem | `root.readonly`, a tmpfs `/tmp`, a bind `/spool` (rw). Make the spool owned by 1000 on the host, not world-writable |
+    | 5. limits | `memory.limit 100663296`, `pids.limit 16`, `cpu: {quota: 50000, period: 100000}` (linux-051) |
+    | 6. service | `ExecStart=/usr/bin/runc run kl-meter` (foreground), `WorkingDirectory=` the bundle (or `runc run --bundle DIR`), `KillSignal=SIGTERM`, `ExecStopPost=-/usr/bin/runc delete -f kl-meter` so nothing is left behind |
+
+    Read the image's config for the status port, and check that release 1's config was really deleted (the agent refuses to start otherwise).
+
+    ### Check your work
+
+    ```bash
+    sudo find /srv/kl-meter/bundle/rootfs -name '.wh.*' | wc -l        # 0
+    stat -c %u /srv/kl-meter/bundle/rootfs/home/meter                  # 1000
+    systemctl is-active kl-meter; systemctl is-enabled kl-meter
+    curl -s 127.0.0.1:PORT/
+    sudo systemctl stop kl-meter; tail -1 /srv/kl-meter/spool/readings.log; sudo runc list
+    ```
   scenario: |
     **Ticket EDGE-31** — from Priyanka, edge platform:
 
