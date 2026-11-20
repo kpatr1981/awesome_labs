@@ -12,17 +12,46 @@ exercises:
   kind: build
   tags: [aws, s3, metadata, encryption, presign]
   tutorial: |
-    **Concept.** An object in S3 is more than its bytes. It carries user metadata, tags and an encryption setting, all of which can be given when it is written; metadata is fixed at upload, while tags can be changed later. Who may read it is a separate question, and it doesn't always need an AWS account. A presigned URL carries a signature and an expiry in its query string, so anyone holding it can fetch one object without credentials until it lapses. It is computed locally from your keys, and it never changes what is stored.
+    **What you're learning.** Everything an S3 object carries besides its bytes (metadata, tags, encryption), and **presigned URLs** for sharing.
 
-    **Read up on:**
-    - `aws s3api put-object help` — metadata, tagging and encryption options
-    - `aws s3api head-object` — reading back metadata and encryption
-    - `aws s3api get-object-tagging` — the TagSet shape
-    - Server-side encryption with S3-managed keys — the algorithm name
-    - `aws s3 presign help` — what the command prints and its options
-    - Signature version 4 query parameters — which one holds the lifetime
-    - The default lifetime of a presigned URL — and how to change it
-    - `curl -fsS URL` — testing a link without any AWS tooling
+    ### The idea
+
+    | property | set | changeable later? |
+    |---|---|---|
+    | user metadata (`x-amz-meta-*`) | at upload (`--metadata k=v`) | only by rewriting the object |
+    | tags | at upload (`--tagging 'k=v&k2=v2'`) or later | yes (`put-object-tagging`) |
+    | server-side encryption | at upload (`--server-side-encryption AES256` = S3-managed keys) | by rewriting |
+    | content type | at upload (`--content-type`) | by rewriting |
+
+    A **presigned URL** lets someone without AWS credentials download **one** object for a limited time: your credentials sign the request in advance. `aws s3 presign` makes one; the default lifetime is **3600 s**, `--expires-in SECONDS` changes it (`X-Amz-Expires` in the URL).
+
+    ### Commands you'll use
+
+    ```bash
+    cd /lab
+    aws s3api put-object --bucket acme-docs --key contracts/2026/c1.pdf --body /lab/c1.pdf \
+      --metadata client="$(cat client.txt)" --tagging 'class=legal' --server-side-encryption AES256
+    aws s3api head-object --bucket acme-docs --key contracts/2026/c1.pdf
+    ```
+    ```json
+    { "ServerSideEncryption": "AES256", "Metadata": {"client": "northwind"}, ... }
+    ```
+
+    ```bash
+    aws s3api get-object-tagging --bucket acme-docs --key contracts/2026/c1.pdf
+    aws s3 presign s3://acme-docs/contracts/2026/c1.pdf --expires-in 900 > /lab/share.txt
+    curl -s "$(cat /lab/share.txt)" | head -c 100
+    ```
+
+    ### Common mistakes
+
+    - `aws s3 cp` then `put-object-tagging`: fine for tags, but metadata and encryption must be set when writing.
+    - `--expires-in 10`: that's 10 seconds, not minutes.
+    - Writing extra text around the URL in the file.
+
+    ### Check your work
+
+    `head-object` shows the metadata and AES256, `get-object-tagging` the tag, and `curl` through the saved link returns the file.
   scenario: |
     The `aws` command talks to a local emulator. The bucket **`kl-books`** exists,
     **`/lab/invoice.txt`** needs filing, and an external auditor needs to read it afterwards.
@@ -109,13 +138,38 @@ exercises:
   kind: build
   tags: [aws, dynamodb, ttl]
   tutorial: |
-    **Concept.** DynamoDB can delete items for you once a timestamp attribute has passed. You name the attribute at the table level, and each item stores its own expiry as a number.
+    **What you're learning.** DynamoDB **time to live**: items that delete themselves after a timestamp.
 
-    **Read up on:**
-    - `aws dynamodb update-time-to-live help` — the specification argument
-    - `aws dynamodb describe-time-to-live` — checking the status
-    - The expected format of a TTL value — which unit and which type
-    - `date +%s` and shell arithmetic — computing a future time
+    ### The idea
+
+    TTL is enabled **per table** and names **one attribute**. Each item stores its own expiry in that attribute as a **Number** holding **epoch seconds** (seconds since 1970-01-01 UTC). After that time DynamoDB deletes the item (usually within hours; the emulator may be faster or slower). Items without the attribute never expire.
+
+    `date +%s` prints the current epoch seconds; `$(( $(date +%s) + 3600 ))` is one hour from now.
+
+    ### Commands you'll use
+
+    ```bash
+    A=$(cat /lab/ttl-name.txt)
+    aws dynamodb update-time-to-live --table-name carts \
+      --time-to-live-specification "Enabled=true,AttributeName=$A"
+    aws dynamodb describe-time-to-live --table-name carts
+    aws dynamodb update-item --table-name carts --key '{"id":{"S":"c-7"}}' \
+      --update-expression 'SET #a = :v' \
+      --expression-attribute-names "{\"#a\":\"$A\"}" \
+      --expression-attribute-values "{\":v\":{\"N\":\"$(( $(date +%s) + 3600 ))\"}}"
+    aws dynamodb get-item --table-name carts --key '{"id":{"S":"c-7"}}'
+    ```
+    `update-item` with `SET` changes one attribute and keeps the others (`put-item` would replace the whole item).
+
+    ### Common mistakes
+
+    - Milliseconds (`date +%s%3N`): the item would "expire" in the year 50000.
+    - Storing it as a String (`"S"`): TTL ignores it.
+    - `put-item` with only the key and the TTL: the other data is lost.
+
+    ### Check your work
+
+    `describe-time-to-live` shows ENABLED with the attribute, and the item has it as a Number about 3600 above now, with its other fields intact.
   scenario: |
     The `aws` command talks to a local emulator. The table **`sessions`** (key **`id`**) holds
     login sessions, and nothing ever removes the old ones.
@@ -174,13 +228,47 @@ exercises:
   kind: build
   tags: [aws, dynamodb, conditional-write]
   tutorial: |
-    **Concept.** A conditional write succeeds only if an expression about the item's current state is true, so two clients cannot both win a race. A failed condition comes back as a specific error.
+    **What you're learning.** **Conditional writes**: letting DynamoDB refuse a write atomically.
 
-    **Read up on:**
-    - `aws dynamodb update-item help` — update and condition expressions
-    - `--expression-attribute-names` and `--expression-attribute-values` — placeholders
-    - DynamoDB reserved words — which common attribute names need a placeholder
-    - `ConditionalCheckFailedException` — what it means
+    ### The idea
+
+    "Read, check, then write" loses races: two clients both see `free` and both write. A **condition expression** is checked **by the database, atomically, with the write**. If it's false, the write fails with `ConditionalCheckFailedException` and nothing changes.
+
+    ```text
+    --condition-expression '#s = :free'                 only if status is free
+    --condition-expression 'attribute_not_exists(id)'   only if the item doesn't exist
+    ```
+
+    `status` is a reserved word in DynamoDB expressions: use a placeholder `#s` with `--expression-attribute-names`.
+
+    ### Commands you'll use
+
+    ```bash
+    VALS=$(jq -nc --arg u "$(cat /lab/user.txt)" '{":t":{S:"taken"},":f":{S:"free"},":u":{S:$u}}')
+    claim() {
+      aws dynamodb update-item --table-name desks --key "{\"desk\":{\"S\":\"$1\"}}" \
+        --update-expression 'SET #s = :t, owner_name = :u' \
+        --condition-expression '#s = :f' \
+        --expression-attribute-names '{"#s":"status"}' \
+        --expression-attribute-values "$VALS"
+    }
+    claim D1
+    claim D2 2> /lab/denied.txt; echo "exit $?"
+    cat /lab/denied.txt
+    ```
+    ```text
+    An error occurred (ConditionalCheckFailedException) when calling the UpdateItem operation: The conditional request failed
+    ```
+    `jq -nc --arg` builds the JSON safely even if the name has quotes or spaces.
+
+    ### Common mistakes
+
+    - Checking with `get-item` first and skipping the second write yourself: the task wants the **database** to refuse.
+    - `2>` vs `>`: the error goes to stderr.
+
+    ### Check your work
+
+    The first seat shows the new holder, the second keeps its old one, and the error file contains `ConditionalCheckFailedException`.
   scenario: |
     The `aws` command talks to a local emulator. The table **`seats`** (key **`seat`**) lists
     each seat with a **`status`** of `free` or `taken`, plus a **`holder`** once taken.
@@ -245,13 +333,41 @@ exercises:
   kind: build
   tags: [aws, sqs, attributes, visibility]
   tutorial: |
-    **Concept.** SQS messages carry a body plus typed message attributes, and a received message is hidden from other consumers for a visibility timeout. A queue-level default applies unless a receive overrides it.
+    **What you're learning.** SQS **message attributes** and the **visibility timeout**.
 
-    **Read up on:**
-    - `aws sqs send-message help` — the `--message-attributes` structure
-    - Message attribute data types — String, Number and Binary
-    - `aws sqs set-queue-attributes help` — queue-wide defaults
-    - `--message-attribute-names` — why a receive returns no attributes by default
+    ### The idea
+
+    A message has a **body** (text) and optional typed **attributes** (`String`, `Number`, `Binary`) that consumers can read without parsing the body.
+
+    When a consumer **receives** a message, it's hidden from others for the **visibility timeout**. If the consumer doesn't **delete** it in time, it reappears for someone else. The queue attribute `VisibilityTimeout` is the default; a receive can override it.
+
+    ```
+    send ─► queue ─► receive (hidden for 120 s) ─► delete   (done)
+                                           └── not deleted → visible again
+    ```
+
+    ### Commands you'll use
+
+    ```bash
+    URL=$(aws sqs get-queue-url --queue-name tasks --query QueueUrl --output text)
+    aws sqs send-message --queue-url "$URL" --message-body "$(cat /lab/task.txt)" \
+      --message-attributes '{"weight":{"DataType":"Number","StringValue":"5"}}'
+    aws sqs set-queue-attributes --queue-url "$URL" --attributes VisibilityTimeout=90
+    aws sqs get-queue-attributes --queue-url "$URL" \
+      --attribute-names VisibilityTimeout ApproximateNumberOfMessages
+    ```
+    A Number attribute is still sent as a string in `StringValue`.
+
+    Peeking without consuming isn't really possible: a `receive-message` hides it. To check, look at `ApproximateNumberOfMessages`.
+
+    ### Common mistakes
+
+    - Receiving the message to "check": it's hidden for the timeout (and the check may not see it).
+    - `DataType: "Integer"`: the types are `String`, `Number`, `Binary`.
+
+    ### Check your work
+
+    The queue reports 1 message and `VisibilityTimeout` 120.
   scenario: |
     The `aws` command talks to a local emulator. The queue **`jobs`** exists and is empty.
 
@@ -303,13 +419,43 @@ exercises:
   kind: build
   tags: [aws, sns, sqs, filter-policy]
   tutorial: |
-    **Concept.** An SNS subscription can carry a filter policy, so it receives only messages whose attributes match. Without one, a subscriber gets everything published to the topic.
+    **What you're learning.** SNS **subscription filter policies**: each subscriber gets only the messages it cares about.
 
-    **Read up on:**
-    - `aws sns set-subscription-attributes help` — which attribute name holds the policy
-    - Subscription filter policy syntax — a JSON object of attribute to array of values
-    - `aws sns list-subscriptions-by-topic` — finding a subscription ARN
-    - `aws sns get-subscription-attributes` — reading a policy back
+    ### The idea
+
+    Without a filter policy, a subscription receives **every** message published to the topic (cloud-011). A **filter policy** (a subscription attribute) is a JSON object: attribute name → list of accepted values. Only messages whose **message attributes** match are delivered.
+
+    ```json
+    {"country": ["GR", "CY"]}
+    ```
+
+    ### Commands you'll use
+
+    ```bash
+    TOPIC=$(aws sns list-topics --query "Topics[?ends_with(TopicArn, ':signups')].TopicArn" --output text)
+    aws sns list-subscriptions-by-topic --topic-arn "$TOPIC" --query 'Subscriptions[].[Endpoint,SubscriptionArn]' --output table
+    SUB=$(aws sns list-subscriptions-by-topic --topic-arn "$TOPIC" \
+      --query "Subscriptions[?ends_with(Endpoint, ':greece-q')].SubscriptionArn" --output text)
+    aws sns set-subscription-attributes --subscription-arn "$SUB" --attribute-name FilterPolicy \
+      --attribute-value "$(jq -nc --arg c "$(cat /lab/country.txt)" '{country: [$c]}')"
+    aws sns get-subscription-attributes --subscription-arn "$SUB" --query Attributes.FilterPolicy
+    ```
+
+    Test:
+    ```bash
+    aws sns publish --topic-arn "$TOPIC" --message hi \
+      --message-attributes '{"country":{"DataType":"String","StringValue":"FR"}}'
+    ```
+
+    ### Common mistakes
+
+    - A filter on the subscription that must receive everything.
+    - `{"region": "eu"}` (a string): values must be in a list.
+    - Filtering on the **body**: filter policies match message attributes by default.
+
+    ### Check your work
+
+    The filtered subscription has the policy, the other has none, and test publishes land where expected.
   scenario: |
     The `aws` command talks to a local emulator. The topic **`orders`** has two SQS
     subscribers: **`regional-q`** and **`all-q`**.
@@ -367,13 +513,42 @@ exercises:
   kind: build
   tags: [aws, kinesis, streams]
   tutorial: |
-    **Concept.** A Kinesis stream splits records across shards by partition key. You write with a producer call and read with a shard iterator that points at a position in a shard.
+    **What you're learning.** **Kinesis** streams: shards, partition keys, and putting a record.
 
-    **Read up on:**
-    - `aws kinesis create-stream help` — shard count
-    - `aws kinesis put-record help` — and how the CLI expects the data blob to be encoded
-    - `aws kinesis get-shard-iterator` — iterator types such as TRIM_HORIZON
-    - `aws kinesis get-records` — what comes back, and in which encoding
+    ### The idea
+
+    A Kinesis stream is an ordered, replayable log. It's split into **shards**; each record has a **partition key** that decides its shard (same key → same shard → kept in order). Consumers read a shard from a position (`TRIM_HORIZON` = the oldest record).
+
+    | | SQS | Kinesis |
+    |---|---|---|
+    | consumption | a message goes to one consumer and is deleted | records stay (retention), many consumers can replay them |
+    | order | best effort (FIFO queues aside) | per shard |
+
+    ### Commands you'll use
+
+    ```bash
+    aws kinesis create-stream --stream-name views --shard-count 1
+    aws kinesis describe-stream-summary --stream-name views --query 'StreamDescriptionSummary.StreamStatus'
+    aws kinesis put-record --stream-name views --partition-key page-12 --data fileb:///lab/view.json
+    ```
+    `fileb://` sends the file's **bytes** as-is; `--data 'text'` would be treated as base64 by AWS CLI v2.
+
+    Reading back:
+    ```bash
+    SHARD=$(aws kinesis list-shards --stream-name views --query 'Shards[0].ShardId' --output text)
+    IT=$(aws kinesis get-shard-iterator --stream-name views --shard-id "$SHARD" \
+      --shard-iterator-type TRIM_HORIZON --query ShardIterator --output text)
+    aws kinesis get-records --shard-iterator "$IT" --query 'Records[0].Data' --output text | base64 -d
+    ```
+
+    ### Common mistakes
+
+    - `file://` instead of `fileb://`: the data may be mangled.
+    - Putting before the stream is `ACTIVE`.
+
+    ### Check your work
+
+    The stream has one shard, and reading from `TRIM_HORIZON` returns exactly the file's content with the right partition key.
   scenario: |
     The `aws` command talks to a local emulator.
 
@@ -415,13 +590,52 @@ exercises:
   kind: build
   tags: [aws, ecr, lifecycle]
   tutorial: |
-    **Concept.** An ECR repository stores container images, and a lifecycle policy deletes images automatically by rules. Each rule has a priority, a selection of which images it covers, and an action.
+    **What you're learning.** **ECR** repositories: scan on push and lifecycle policies.
 
-    **Read up on:**
-    - `aws ecr put-lifecycle-policy help` — the policy text argument
-    - ECR lifecycle policy rule format — `rulePriority`, `selection` and `action`
-    - `aws ecr put-image-scanning-configuration` — scan on push
-    - `aws ecr get-lifecycle-policy` — reading the policy back
+    ### The idea
+
+    ECR stores container images. Two settings keep a repository healthy:
+
+    - **scan on push**: each pushed image is scanned for known vulnerabilities;
+    - **lifecycle policy**: rules that **expire** images automatically.
+
+    A rule:
+    ```json
+    {"rules": [{
+      "rulePriority": 1,
+      "description": "drop old untagged",
+      "selection": {"tagStatus": "untagged", "countType": "sinceImagePushed", "countUnit": "days", "countNumber": 3},
+      "action": {"type": "expire"}
+    }]}
+    ```
+
+    | `countType` | selects |
+    |---|---|
+    | `sinceImagePushed` (+ `countUnit: days`) | images older than N days |
+    | `imageCountMoreThan` | images beyond the newest N |
+
+    `tagStatus`: `untagged`, `tagged` (with `tagPrefixList`), or `any`.
+
+    ### Commands you'll use
+
+    ```bash
+    aws ecr put-image-scanning-configuration --repository-name web/front --image-scanning-configuration scanOnPush=true
+    jq -n --argjson d "$(cat /lab/keep-days.txt)" '{rules:[{rulePriority:1,description:"expire untagged",
+      selection:{tagStatus:"untagged",countType:"sinceImagePushed",countUnit:"days",countNumber:$d},
+      action:{type:"expire"}}]}' > /lab/lc.json
+    aws ecr put-lifecycle-policy --repository-name web/front --lifecycle-policy-text file:///lab/lc.json
+    aws ecr get-lifecycle-policy --repository-name web/front --query lifecyclePolicyText --output text | jq .
+    ```
+    `--argjson` inserts the number as a number, not a string.
+
+    ### Common mistakes
+
+    - `countNumber: "7"` as a string: rejected.
+    - Forgetting to write the policy file when the task asks for it.
+
+    ### Check your work
+
+    `describe-repositories` shows `scanOnPush: true`, and the stored policy has the rule with the number of days from the file.
   scenario: |
     The `aws` command talks to a local emulator. The ECR repository **`app/api`** exists.
 
@@ -470,13 +684,43 @@ exercises:
   kind: build
   tags: [aws, ssm, parameter-store]
   tutorial: |
-    **Concept.** Parameter Store names look like file paths, so settings can be grouped by environment and service and fetched together by path. Secret values are stored encrypted and need an explicit flag to read.
+    **What you're learning.** Fetching a whole environment's settings by **path** from Parameter Store, and reshaping them with `jq`.
 
-    **Read up on:**
-    - `aws ssm get-parameters-by-path help` — path, recursion and decryption options
-    - Parameter types — String versus SecureString
-    - `--query` and `--output text` — shaping the result
-    - `jq` string functions such as `ltrimstr` and `gsub`
+    ### The idea
+
+    Parameter names look like paths (`/app/stage/db/host`), so one environment is one **prefix**. `get-parameters-by-path --path P --recursive` returns everything under it; `--with-decryption` returns SecureString values in clear (cloud-017).
+
+    `jq` string tools for renaming:
+
+    | filter | does |
+    |---|---|
+    | `ltrimstr("/app/stage/")` | remove a prefix |
+    | `gsub("/"; "_")` | replace every `/` |
+    | `ascii_upcase` | upper case |
+
+    ### Commands you'll use
+
+    ```bash
+    aws ssm get-parameters-by-path --path /app/stage --recursive --with-decryption \
+      --query 'Parameters[].[Name,Type]' --output table
+    aws ssm get-parameters-by-path --path /app/stage --recursive --with-decryption \
+      | jq -r '.Parameters[] | (.Name | ltrimstr("/app/stage/") | gsub("/"; "_") | ascii_upcase) + "=" + .Value'
+    ```
+    ```text
+    DB_HOST=db.stage.internal
+    DB_PASSWORD=s3cr3t
+    FEATURE_X=on
+    ```
+
+    ### Common mistakes
+
+    - Without `--recursive`: only direct children (no `a/b`).
+    - Without `--with-decryption`: encrypted blobs instead of values.
+    - `--path /app/stage` also matching `/app/stage2/...`? No: paths match whole segments, but double-check your prefix trimming.
+
+    ### Check your work
+
+    `/lab/prod.env` has one `NAME=value` line per prod parameter, with real values and no dev entries.
   scenario: |
     The `aws` command talks to a local emulator. Parameter Store holds settings for a shop
     under paths like **`/shop/prod/...`** and **`/shop/dev/...`**, nested several levels deep.
@@ -522,13 +766,46 @@ exercises:
   kind: fix
   tags: [aws, stepfunctions, asl]
   tutorial: |
-    **Concept.** A Step Functions state machine is defined in Amazon States Language: a start state and a map of named states, each pointing at its successor or ending the flow. Every pointer must name a state that exists.
+    **What you're learning.** **Step Functions** state machines in Amazon States Language, and fixing a broken transition.
 
-    **Read up on:**
-    - `aws stepfunctions describe-state-machine` — reading the stored definition
-    - `aws stepfunctions update-state-machine help` — replacing a definition
-    - ASL fields `StartAt`, `Next` and `Type` — how states link together
-    - `jq` — inspecting or editing the definition JSON
+    ### The idea
+
+    A state machine is JSON: `StartAt` names the first state, `States` maps names to states, and each state points at the next with `Next` or ends with `"End": true`. A `Next` naming a state that doesn't exist may be accepted at creation in a lax emulator, but every execution fails there.
+
+    ```json
+    {
+      "StartAt": "Fetch",
+      "States": {
+        "Fetch":  {"Type": "Pass", "Next": "Parse"},
+        "Parse":  {"Type": "Pass", "Next": "Store"},
+        "Store":  {"Type": "Pass", "End": true}
+      }
+    }
+    ```
+
+    ### Commands you'll use
+
+    ```bash
+    ARN=$(aws stepfunctions list-state-machines --query "stateMachines[?name=='ingest'].stateMachineArn | [0]" --output text)
+    aws stepfunctions describe-state-machine --state-machine-arn "$ARN" --query definition --output text | jq .
+    jq -r '.StartAt, (.States | keys[]), [.States[] | .Next // empty][]' /lab/ingest.json
+    ```
+    That prints the start, the defined states, and every `Next`: any `Next` not among the states is the bug.
+
+    ```bash
+    vi /lab/ingest.json
+    aws stepfunctions update-state-machine --state-machine-arn "$ARN" --definition file:///lab/ingest.json
+    aws stepfunctions start-execution --state-machine-arn "$ARN"
+    ```
+
+    ### Common mistakes
+
+    - Renaming the state to match the typo: keep the intended names.
+    - Fixing the file but not updating the stored definition.
+
+    ### Check your work
+
+    `describe-state-machine` shows every `Next` pointing at an existing state, in the order validate → charge → done.
   scenario: |
     The `aws` command talks to a local emulator. The state machine **`order-flow`** was created
     from **`/lab/flow.json`** with the states `Validate`, `Charge` and `Done`. It was accepted,
@@ -585,53 +862,40 @@ exercises:
   kind: build
   tags: [aws, capstone, ssm, parameter-store, dynamodb, ttl, conditional-write, sqs, sns, filter-policy, kinesis, s3, presign, ecr, lifecycle]
   tutorial: |
-    **Concept.** A ticket presale is a small, unforgiving data system: a
-    seat may be sold once, a hold must vanish on its own, every decision
-    has to be told to the right consumers, and none of it may leak a
-    secret. Each AWS piece has one job, and each has a classic mistake:
+    **What you're learning.** A small, unforgiving data system end to end: settings, atomic seat holds with TTL, queue, filtered events, an audit stream, a shared file, and image hygiene.
 
-    - **settings** (Parameter Store). Names are paths, so one environment
-      is one prefix. Secrets go in as `SecureString`, everything else as
-      `String`. A parameter in the wrong path is not "close enough": the
-      app reads the exact prefix, and a plain-text copy of a secret is a
-      finding.
-    - **the race for a seat** (DynamoDB). Checking first and writing
-      afterwards loses races. A **conditional write** with
-      `attribute_not_exists(...)` lets the table refuse a second hold
-      atomically, and the refusal comes back as
-      `ConditionalCheckFailedException`, which is an expected answer, not
-      a crash.
-    - **holds that clean themselves up** (TTL). Time to live is switched on
-      per table and names an attribute; each item stores its own expiry as
-      **epoch seconds** in a Number. An item without the attribute never
-      expires.
-    - **work for the ticketing workers** (SQS). A message is a body plus
-      typed attributes; the queue's `VisibilityTimeout` is the default
-      time a worker has before the message reappears.
-    - **events for many consumers** (SNS). A subscription with a **filter
-      policy** only gets messages whose attributes match; a subscription
-      without one (or with `{}`) gets everything.
-    - **an audit trail** (Kinesis). Records are spread over shards by
-      partition key and stay readable from `TRIM_HORIZON`.
-    - **files for partners** (S3). Metadata, tags, encryption and content
-      type are set when the object is written; a presigned URL shares one
-      object for a set number of seconds.
-    - **the release images** (ECR). Lifecycle rules run in priority order
-      and select by tag status, tag prefix and age or count.
+    ### Method
 
-    Scripting with this lab's `aws` command: it runs in a container that
-    only sees `/lab`, and it is started with `-i`, so inside a
-    `while read` loop it swallows the rest of the loop's input unless you
-    give it `</dev/null`.
+    | item | exercise | trap |
+    |---|---|---|
+    | settings | cloud-017, cloud-035 | exact prefix; the secret as `SecureString`; delete the misspelt copies; don't touch dev |
+    | holds | cloud-028, cloud-029 | `attribute_not_exists(seat)` so existing holds are refused by the **table**; epoch **seconds** as Numbers; process in file order |
+    | confirmations | cloud-030 | one message per **accepted** hold; queue default 300 s |
+    | routing | cloud-031 | a filter with two values for one queue; **remove** the filter that blocks the other (`{}` or delete the attribute) |
+    | audit | cloud-032 | 2 shards; partition key = seat |
+    | seating chart | cloud-026 | content type, metadata, tag, AES256 in one write; 1800 s link |
+    | images | cloud-034 | two rules, priority 1 and 2; `tagPrefixList: ["release-"]` + `imageCountMoreThan: 20` |
 
-    **Read up on:**
-    - `aws ssm put-parameter --type --overwrite`, `get-parameters-by-path --recursive --with-decryption`, `delete-parameters`
-    - `aws dynamodb update-time-to-live`, `put-item --condition-expression`, `attribute_not_exists`
-    - `aws sqs set-queue-attributes`, `send-message --message-attributes`
-    - `aws sns list-subscriptions-by-topic`, `set-subscription-attributes`, filter policy syntax
-    - `aws kinesis create-stream --shard-count`, `put-record`, `get-shard-iterator`, `get-records`
-    - `aws s3api put-object` (`--metadata`, `--tagging`, `--server-side-encryption`, `--content-type`), `aws s3 presign --expires-in`
-    - `aws ecr put-image-scanning-configuration`, `put-lifecycle-policy`, the `tagPrefixList` and `imageCountMoreThan` selections
+    **Scripting with the lab's `aws`**: it runs in a container started with `-i`; inside `while read` it eats the loop's input unless each call gets `</dev/null`. Paths must be under `/lab`.
+
+    ```bash
+    tail -n +2 requests.csv | while IFS=, read -r req seat cust; do
+      aws dynamodb put-item ... --condition-expression 'attribute_not_exists(seat)' </dev/null 2>err.txt \
+        && echo "$req,$seat" >> accepted.txt \
+        || { grep -q ConditionalCheckFailed err.txt && echo "$req" >> refused.txt; }
+    done
+    ```
+
+    ### Check your work
+
+    ```bash
+    aws ssm get-parameters-by-path --path /presale --recursive --query 'Parameters[].[Name,Type]' --output table
+    aws dynamodb describe-time-to-live --table-name presale-holds
+    cat /lab/presale/refused.txt
+    aws sqs get-queue-attributes --queue-url "$(aws sqs get-queue-url --queue-name presale-confirm --query QueueUrl --output text)" --attribute-names All
+    aws ecr get-lifecycle-policy --repository-name presale/api --query lifecyclePolicyText --output text | jq .
+    curl -s -o /dev/null -w '%{http_code}\n' "$(cat /lab/presale/venue-link.txt)"
+    ```
   scenario: |
     The `aws` command talks to a local emulator. It runs in `/lab` and can
     only see files under `/lab`, so give it absolute paths such as
