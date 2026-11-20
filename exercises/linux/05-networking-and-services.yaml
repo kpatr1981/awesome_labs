@@ -12,22 +12,48 @@ exercises:
   kind: fix
   tags: [hosts, resolver, getent, nsswitch, dnsmasq, dns]
   tutorial: |
-    **Concept.** An application doesn't ask DNS for a name, it asks the C library, and the library works through a list of sources. The order is configured in one small file, so an entry can be correct and still never be consulted. Always start from what the resolver itself returns, which is what `getent` shows, rather than from what DNS alone says.
+    **What you're learning.** How a name really resolves: NSS (`/etc/nsswitch.conf`), `/etc/hosts`, and checking a dnsmasq config.
 
-    The first source is usually a static table, the quickest way to give a machine a name that no DNS server knows about. When a host needs more, it can run a small local DNS cache, and that daemon has its own configuration with its own failure modes.
+    ### The idea
 
-    Most daemons can parse their configuration without starting. A test mode catches typos and bad values before they take the service down, and the error names the line at fault. Fix the first error, test again, and repeat.
+    Programs don't query DNS directly. They call the C library, which follows the **`hosts:`** line in `/etc/nsswitch.conf`:
 
-    **Read up on:**
-    - `man 5 nsswitch.conf` — the `hosts:` line, its sources and their order
-    - `getent hosts NAME` — resolves through the same path applications use
-    - `man 5 hosts` — the format of `/etc/hosts`, which is what the `files` source reads
-    - Why an answer from DNS may differ from the one in a local file
-    - How `getent` differs from `dig`, which talks to DNS only
-    - `dnsmasq --test -C FILE` — check a configuration file without starting the server
-    - `man dnsmasq` — `listen-address`, `port`, `address=/name/ip` and `cache-size`
-    - The difference between `address=` (a local answer) and `server=` (forward elsewhere)
-    - Why a daemon bound to loopback only is not reachable from other hosts
+    ```text
+    hosts: files dns        # first /etc/hosts ("files"), then DNS
+    ```
+    Without `files`, `/etc/hosts` is never read. `getent hosts NAME` resolves exactly the way programs do. `dig` and `nslookup` ask DNS only and skip NSS.
+
+    A private name for one machine: a line in `/etc/hosts`, `IP NAME [ALIASES]`.
+
+    **dnsmasq**: a small DNS cache. `dnsmasq --test -C FILE` checks the syntax. Common directives: `listen-address=127.0.0.1`, `port=5353`, `bind-interfaces`, `address=/name/IP`.
+
+    ### Commands you'll use
+
+    ```bash
+    grep ^hosts: /etc/nsswitch.conf
+    getent hosts wiki.corp.test || echo "not found"
+    sudo sed -i 's/^hosts:.*/hosts: files dns/' /etc/nsswitch.conf      # keep any other sources you need
+    echo '10.9.8.7 builds.corp.test' | sudo tee -a /etc/hosts
+    getent hosts builds.corp.test
+
+    dnsmasq --test -C /lab/cache.conf
+    ```
+    ```text
+    dnsmasq: bad option at line 3 of /lab/cache.conf
+    ```
+    ```bash
+    sed -n 3p /lab/cache.conf
+    ```
+
+    ### Common mistakes
+
+    - Testing with `dig`: it ignores `/etc/hosts`.
+    - Replacing the `hosts:` line without `dns`.
+    - `address=app.lab.test/10.0.0.5`: the syntax is `address=/app.lab.test/10.0.0.5`.
+
+    ### Check your work
+
+    `getent hosts` resolves both names (from the hosts file), and `dnsmasq --test -C /lab/dnsmasq.conf` says *syntax check OK* with the required address, port and record.
   scenario: |
     Names on this host resolve in layers, and every layer needs attention before the deployment can go ahead. Work from the bottom up, because Part 2 depends on Part 1.
 
@@ -170,25 +196,50 @@ exercises:
   kind: fix
   tags: [ss, sockets, systemd, ports, iptables, firewall]
   tutorial: |
-    **Concept.** A port problem always comes down to the same questions: who holds it, who wants it, and who is allowed to reach it.
+    **What you're learning.** Port triage: who listens on a port, moving a service off a taken port, and blocking a port with the firewall.
 
-    Every listening socket belongs to a process and the kernel keeps the link, so when several daemons look identical in the process list, the port is the reliable handle on the one you want. Only one process can listen on a given address and port, which is why a service can die with "address already in use". The cure is to find the holder and then decide whether the newcomer or the incumbent should move.
+    ### The idea
 
-    Reachability is a separate layer. A packet filter walks an ordered list of rules in a chain, and the first matching rule with a verdict wins, so you can retire a port without touching the service behind it. Rejecting tells the sender to give up at once, while dropping leaves it waiting for a timeout.
+    | question | tool |
+    |---|---|
+    | who listens on PORT? | `sudo ss -ltnp 'sport = :PORT'` (`-l` listening, `-t` TCP, `-n` numeric, `-p` process) |
+    | why won't a service bind? | its log: `Address already in use` |
+    | stop connections to PORT, without touching the service | a firewall rule (nftables, or iptables) |
 
-    **Read up on:**
-    - `man ss` — listing sockets, the listening and TCP filters, and process information
-    - `ss` filter expressions such as `sport = :PORT`
-    - Why seeing the owning process of a socket needs privileges
-    - `/proc/PID/fd` — where the same link lives in the kernel
-    - `systemctl status` and `journalctl -u UNIT` — the error the service ended with
-    - `ss -ltnp` — who is listening where
-    - `man systemd.exec` — `EnvironmentFile=` and `${VAR}` in `ExecStart=`
-    - `systemctl restart` — apply a changed environment file
-    - `man iptables` — chains, matches such as `-p tcp --dport`, and the `-j` targets
-    - `iptables -L -n -v --line-numbers` — read the rules in order
-    - `-I` versus `-A` — where a new rule lands
-    - `REJECT` versus `DROP`, and what the client sees in each case
+    nftables basics:
+
+    ```bash
+    sudo nft add table inet kl
+    sudo nft add chain inet kl input '{ type filter hook input priority 0; }'
+    sudo nft add rule inet kl input tcp dport 9100 reject
+    ```
+    `reject` refuses at once ("connection refused"). `drop` makes clients wait until they time out. Traffic to `127.0.0.1` goes through the `input` hook too.
+
+    ### Commands you'll use
+
+    ```bash
+    sudo ss -ltnpH 'sport = :7002'
+    ```
+    ```text
+    LISTEN 0 128 127.0.0.1:7002 0.0.0.0:* users:(("helper",pid=1888,fd=3))
+    ```
+    ```bash
+    journalctl -u kl-svc -n 5 --no-pager            # bind: Address already in use
+    systemctl cat kl-svc | grep -E 'ExecStart|EnvironmentFile'
+    grep -rn port /etc/kl-svc/                      # where the port really comes from
+    sudo nft list ruleset
+    curl -s -m 2 localhost:9100 || echo blocked
+    ```
+
+    ### Common mistakes
+
+    - Killing the legacy server: it must keep running.
+    - Changing the port in the unit when the config file decides.
+    - A rule that blocks both ports, or all of loopback.
+
+    ### Check your work
+
+    `pid.txt` matches `ss`, `kl-api` is active on a free port and answers, and connections fail to the blocked port but work to the kept one.
   scenario: |
     Support has a list of three port problems on this host. Each needs a different tool.
 
@@ -351,13 +402,45 @@ exercises:
   kind: fix
   tags: [routing, ip, forwarding, netns]
   tutorial: |
-    **Concept.** A host sends a packet straight to a neighbour only when the destination is on a directly attached network. Anything else needs a route naming the next hop, and a router must be willing to forward packets that are not addressed to itself. Replies need a way home as well.
+    **What you're learning.** Routing between networks: routes via a gateway, and IP forwarding on the router.
 
-    **Read up on:**
-    - `man ip-route` — adding a route through a gateway
-    - `ip route get ADDR` — which route the kernel would pick
-    - `net.ipv4.ip_forward` — the sysctl that turns a host into a router
-    - `ip netns exec` and `ip -n NS` — acting inside a network namespace
+    ### The idea
+
+    A host delivers directly only to networks it's **attached** to (the routes created with its addresses). Anything else needs a **route** pointing at a **gateway** on an attached network. The router in the middle must **forward** packets between interfaces (`net.ipv4.ip_forward=1`). And the **reply** needs a route back.
+
+    ```
+    client 10.0.1.1 ── 10.0.1.254 [router] 10.0.2.254 ── 10.0.2.1 server
+    client: 10.0.2.0/24 via 10.0.1.254        server: 10.0.1.0/24 via 10.0.2.254
+    router: ip_forward=1
+    ```
+    `ip -n NS ...` runs `ip` inside a network namespace. `ip netns exec NS CMD` runs any command there.
+
+    ### Commands you'll use
+
+    ```bash
+    sudo ip -n lab-a route
+    ```
+    ```text
+    10.0.1.0/24 dev veth0 proto kernel scope link src 10.0.1.1
+    ```
+    ```bash
+    sudo ip -n lab-a route get 10.0.2.1        # RTNETLINK answers: Network is unreachable
+    sudo ip -n lab-a route add 10.0.2.0/24 via 10.0.1.254
+    sudo ip netns exec lab-r sysctl net.ipv4.ip_forward
+    sudo ip netns exec lab-r sysctl -w net.ipv4.ip_forward=1
+    sudo ip -n lab-b route add 10.0.1.0/24 via 10.0.2.254
+    sudo ip netns exec lab-a ping -c1 -W1 10.0.2.1
+    ```
+    A ping that times out after the forward route is added often means the **return** route is missing.
+
+    ### Common mistakes
+
+    - Only the client's route: the server's replies have nowhere to go.
+    - Forwarding on the host instead of in the router namespace.
+
+    ### Check your work
+
+    `ip netns exec klr-cl ping -c1 10.60.2.1` succeeds, and `traceroute` (if installed) shows the router as the first hop.
   scenario: |
     Three network namespaces model a small network:
 
@@ -407,13 +490,53 @@ exercises:
   kind: build
   tags: [ssh, config, proxyjump]
   tutorial: |
-    **Concept.** The SSH client reads per-user settings from a config file, so long command lines can be replaced with short host aliases. A host can also be reached through an intermediate "jump" host, and the client can print the settings it would use without connecting anywhere.
+    **What you're learning.** The SSH client config: host aliases, per-host settings and **ProxyJump**.
 
-    **Read up on:**
-    - `man ssh_config` — `Host`, `HostName`, `Port`, `User`, `IdentityFile`, `ProxyJump`, `ServerAliveInterval`
-    - `ssh -G ALIAS` — print the effective configuration without connecting
-    - File ownership and permissions that the client insists on for `~/.ssh/config`
-    - How settings from several matching `Host` blocks combine
+    ### The idea
+
+    `~/.ssh/config` replaces long command lines with named blocks:
+
+    ```text
+    Host bastion
+        HostName 203.0.113.10
+        User ops
+        Port 2222
+        IdentityFile ~/.ssh/id_ed25519
+
+    Host db-internal
+        HostName 10.0.5.20
+        User admin
+        ProxyJump bastion          # connect through bastion first
+    ```
+    `ssh -G ALIAS` prints the **final** settings ssh would use, without connecting: the way to check a config. The first value found for a setting wins, so put specific `Host` blocks before `Host *`.
+
+    The file must not be writable by others (`chmod 600`), or ssh refuses it.
+
+    ### Commands you'll use
+
+    ```bash
+    cat /lab/ssh-spec.txt
+    mkdir -p ~/.ssh && chmod 700 ~/.ssh
+    $EDITOR ~/.ssh/config && chmod 600 ~/.ssh/config
+    ssh -G db-internal | grep -iE '^(hostname|user|port|proxyjump|identityfile) '
+    ```
+    ```text
+    user admin
+    hostname 10.0.5.20
+    port 22
+    proxyjump bastion
+    identityfile ~/.ssh/id_ed25519
+    ```
+
+    ### Common mistakes
+
+    - `Host` names with the real address: the alias is the `Host` line, the target is `HostName`.
+    - Settings indented under the wrong block.
+    - `ProxyCommand` when `ProxyJump` is asked for.
+
+    ### Check your work
+
+    `ssh -G kl-jump` and `ssh -G kl-inner` show every value listed in `/lab/ssh-spec.txt`.
   scenario: |
     Your team reaches an internal machine through a jump host. The required aliases and
     settings are listed in **`/lab/ssh-spec.txt`**.
@@ -502,13 +625,46 @@ exercises:
   kind: build
   tags: [systemd, socket-activation, services]
   tutorial: |
-    **Concept.** With socket activation, systemd opens the listening port itself and starts the service only when a client connects, handing the connection over. The service needs no networking code, and nothing runs while nobody is connecting.
+    **What you're learning.** **Socket activation**: systemd holds the port and starts the service per connection.
 
-    **Read up on:**
-    - `man systemd.socket` — `ListenStream=` and `Accept=`
-    - Template units: `NAME@.service` is started once per accepted connection
-    - `man systemd.exec` — `StandardInput=` and `StandardOutput=` with `socket`
-    - `systemctl enable --now` on a `.socket` unit, and `daemon-reload` after writing units
+    ### The idea
+
+    A `.socket` unit makes systemd open the listening socket itself. With **`Accept=yes`**, every incoming connection starts one instance of a **template** service, `NAME@.service`, with the connection as its **stdin and stdout**. A script that only reads and writes its terminal becomes a network service.
+
+    ```ini
+    # kl-echo.socket
+    [Socket]
+    ListenStream=127.0.0.1:7070
+    Accept=yes
+    [Install]
+    WantedBy=sockets.target
+
+    # kl-echo@.service
+    [Service]
+    ExecStart=/opt/echo/reply.sh
+    StandardInput=socket
+    ```
+
+    ### Commands you'll use
+
+    ```bash
+    sudo systemctl daemon-reload
+    sudo systemctl enable --now kl-echo.socket
+    sudo ss -ltnp 'sport = :7070'                 # users:(("systemd",pid=1,...))
+    nc -q1 127.0.0.1 7070 </dev/null              # the script's output
+    systemctl list-units 'kl-echo@*' --all --no-pager | tail -3
+    ```
+    `StandardOutput` defaults to the same as `StandardInput`, so the output goes back to the client.
+
+    ### Common mistakes
+
+    - A plain `kl-hello.service` (no `@`) with `Accept=yes`: systemd needs a template.
+    - Starting the service yourself: only the socket should be started.
+    - `Accept=no` with a script that can't accept connections itself.
+
+    ### Check your work
+
+    `ss` shows `systemd` listening on the port, and each `nc` connection gets the greeting.
   scenario: |
     **`/opt/kl-sock/hello.sh`** prints a one-line greeting and exits. It knows nothing about
     networks. Expose it on the local TCP port in **`/lab/port.txt`** (address `127.0.0.1`),
@@ -580,13 +736,41 @@ exercises:
   kind: fix
   tags: [systemd, dependencies, ordering]
   tutorial: |
-    **Concept.** systemd keeps two separate ideas apart. A *requirement* says which other units must also be started, and *ordering* says which one finishes starting first. Having one without the other gives a race or a missing service.
+    **What you're learning.** systemd **requirement** versus **ordering**: `Requires=` and `After=`.
 
-    **Read up on:**
-    - `man systemd.unit` — `Requires=`, `Wants=`, `After=` and `Before=`
-    - `systemctl list-dependencies UNIT` — the requirement tree
-    - `systemctl show -p After -p Requires UNIT` — the effective values
-    - `systemctl cat UNIT` and `systemctl daemon-reload` — reading and applying unit changes
+    ### The idea
+
+    | directive | answers |
+    |---|---|
+    | `Requires=B` (or the softer `Wants=B`) | **which** units to start along with this one |
+    | `After=B` | **when**: start this one after B has finished starting |
+
+    They're independent. `Requires=` alone starts both **at the same time**, so the web service may still race the database. Use both. "Finished starting" depends on B's `Type=`: for `Type=notify` or `oneshot`, systemd waits for a real readiness signal.
+
+    ### Commands you'll use
+
+    ```bash
+    systemctl cat kl-app | sed -n '/\[Unit\]/,/\[Service\]/p'
+    sudo systemctl edit kl-app        # drop-in:
+    #   [Unit]
+    #   Requires=kl-cache.service
+    #   After=kl-cache.service
+    sudo systemctl daemon-reload
+    sudo systemctl stop kl-app kl-cache
+    sudo systemctl start kl-app
+    systemctl is-active kl-cache kl-app
+    systemctl list-dependencies kl-app --no-pager | head -5
+    ```
+
+    ### Common mistakes
+
+    - `After=` only: it doesn't start the database at all.
+    - `Requires=` only: both start at once, and it fails sometimes.
+    - Editing the database unit.
+
+    ### Check your work
+
+    With both stopped, `systemctl start kl-web` brings up `kl-db` first and `kl-web` becomes active.
   scenario: |
     **`kl-web.service`** needs **`kl-db.service`**. Starting `kl-web` on its own fails with
     "database not reachable", because the database is not running, and the database also takes a
@@ -671,21 +855,25 @@ exercises:
   kind: fix
   tags: [capstone, routing, netns, iptables, firewall, hosts, getent, ss, systemd, dependencies, oneshot, ports]
   tutorial: |
-    **Concept.** "The service is down" on a networked host is never one problem. Work through it in the order a request travels, and prove each layer before you move on:
+    **What you're learning.** Bringing a networked service up layer by layer, in the order a request travels.
 
-    - **Who holds the port.** Only one socket can listen on an address and port. `ss` names the process, and that process's cgroup names the systemd unit behind it, which is what you stop and disable when something has to go for good. A supervised service simply comes back if you kill it.
-    - **What the name means.** The C library reads `/etc/hosts` top to bottom and stops at the **first** line that names the host. A correct line further down changes nothing.
-    - **How the packet gets there.** A route names the next hop for a network that isn't directly attached. The router must forward, its own packet filter can still drop what it forwards, and the far end needs a route *back*. A ping that gets through proves the routing, not the port: a filter can let ICMP through and drop one TCP port.
-    - **What makes it permanent.** A route added by hand is gone after a reboot. A small `Type=oneshot` unit with `RemainAfterExit=yes` can own it, and a service that can't work without it declares both a requirement and an ordering on that unit.
-    - **Who may connect.** Filtering on the *destination port* of new connections is how you shut one service off from one network. Filtering a whole source network also drops the *replies* to connections your host opens towards it.
+    ### Method
 
-    **Read up on:**
-    - `ss -ltnp`, `ps -o unit= -p PID`, `systemctl status PID`; `systemctl disable --now`, `systemctl mask`
-    - `man 5 hosts`, `getent hosts NAME`
-    - `man ip-route`: `ip route get`, `ip route replace`; `ip -n NS ...` and `ip netns exec NS ...`
-    - `iptables -L CHAIN -n -v --line-numbers`, `iptables -D CHAIN N`; the `FORWARD` chain versus `INPUT`
-    - `man systemd.service`: `Type=oneshot`, `RemainAfterExit=`; `man systemd.unit`: `Requires=`, `After=`; drop-ins with `systemctl edit`
-    - `iptables -I INPUT -s NET -p tcp --dport PORT -j REJECT`, and why `-s NET -j DROP` alone would break outgoing connections to that network
+    | layer | check | fix (exercise) |
+    |---|---|---|
+    | 1. port free | `ss -ltnp 'sport = :8443'` | `disable --now kl-old-ledger` (linux-010) |
+    | 2. name | `getent hosts ledger-db.pay.internal` | `/etc/hosts` is read **top to bottom, and the first match wins**: remove the old line (linux-036) |
+    | 3. path | `ip route get 10.77.2.10`, `nc 10.77.2.10 6432` | a host route via `10.77.1.254`, forwarding in `kln-rt`, a **return route** in `kln-db`, and no MASQUERADE so the database sees `10.77.1.1` (linux-041) |
+    | 4. reboot-proof route | a `Type=oneshot` + `RemainAfterExit=yes` unit running `ip route replace ...`, enabled | |
+    | 5. dependencies | `Requires=` + `After=kl-ledger-route.service` on the API, enabled (linux-044) | |
+    | 6. API | `systemctl status`, `ss -ltnp` shows the API's own PID, `curl 127.0.0.1:8443/` | |
+    | 7. firewall | an nftables input rule: `ip saddr 10.77.0.0/16 tcp dport 8443 drop` (linux-038), keeping loopback and the API's outgoing traffic | |
+
+    `ip route replace` is idempotent (`add` fails if the route exists), which suits a oneshot unit.
+
+    ### Check your work
+
+    Stop both units, delete the route, then `systemctl start kl-ledger-api`: it must come up, and `curl http://127.0.0.1:8443/` must show `ledger ok:` with a greeting naming `10.77.1.1`.
   scenario: |
     **Ticket PAY-512** — from Omar, payments platform:
 
