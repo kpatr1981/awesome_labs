@@ -12,18 +12,42 @@ exercises:
   kind: fix
   tags: [permissions, find, world-writable, nouser, audit]
   tutorial: |
-    **Concept.** Two findings come up in every permissions audit. **World-writable**
-    files and directories (the `w` in the "other" triplet) let any local user tamper
-    with them. Shared scratch directories are the exception: they carry the **sticky
-    bit** (`1777`, like `/tmp`) so users can't delete each other's files. **Orphaned**
-    files belong to a UID or GID that no longer exists. If a new account later gets that
-    number, it inherits them. `find` finds both: `-perm -0002` matches "other can write",
-    and `-nouser` / `-nogroup` match unknown owners.
+    **What you're learning.** Two standard permission audits: world-writable paths and orphaned owners, fixed without touching other bits.
 
-    **Read up on:**
-    - `man find`: `-perm -MODE`, `-nouser`, `-nogroup`, `-type l`, `-exec ... {} +`
-    - `chmod o-w` (remove one bit, keep the rest)
-    - `chown -h` and symbolic links
+    ### The idea
+
+    | finding | find test | fix |
+    |---|---|---|
+    | writable by others | `-perm -0002` (the `o+w` bit is set; `-` means "at least these bits") | `chmod o-w` (removes just that bit) |
+    | owner or group no longer exists | `-nouser`, `-nogroup` | `chown USER:GROUP` |
+
+    Skip symlinks (`! -type l`): their mode is always 777 and doesn't matter. Exclude allowed exceptions with `! -path`.
+
+    ### Commands you'll use
+
+    ```bash
+    sudo find /srv/web ! -type l -perm -0002 -ls
+    sudo find /srv/web ! -type l -perm -0002 ! -path /srv/web/scratch -exec chmod o-w {} +
+    sudo find /srv/web \( -nouser -o -nogroup \) -ls
+    ```
+    ```text
+      1200  4 -rw-r--r--   1 1007  1007   12 Mar  2 10:00 /srv/web/old.cfg
+    ```
+    Numbers instead of names = no such user or group.
+    ```bash
+    sudo find /srv/web \( -nouser -o -nogroup \) -exec chown web:web {} +
+    stat -c '%a' /srv/web/scratch
+    ```
+
+    ### Common mistakes
+
+    - `chmod -R 755`: changes every other bit too.
+    - Excluding the scratch directory's **contents** as well: only the directory itself is the exception.
+    - `-perm 0002` (exact mode) instead of `-perm -0002`.
+
+    ### Check your work
+
+    `find /srv/kl-app ! -type l -perm -0002` lists only `/srv/kl-app/tmp` (mode 1777), and `-nouser -o -nogroup` finds nothing.
   scenario: |
     An audit of **`/srv/kl-app`** (the application tree of the `kl-app` user) found
     problems. Fix them **without changing any other permission bits**:
@@ -94,17 +118,38 @@ exercises:
   kind: fix
   tags: [umask, systemd, drop-in, permissions]
   tutorial: |
-    **Concept.** A program usually creates files with mode `0666` (or `0777` for
-    directories), and the process's **umask** removes bits from that. With the common
-    umask `0022` new files come out `0644`, readable by everyone. systemd starts each
-    service with **`UMask=0022`** unless the unit says otherwise. `UMask=0027` removes
-    write for the group and everything for others, so files come out `0640`. A umask
-    only affects **new** files. Existing ones keep their mode until you `chmod` them.
+    **What you're learning.** The **umask**: default modes for new files, set per service with `UMask=`.
 
-    **Read up on:**
-    - `man systemd.exec`: `UMask=`
-    - `umask` in the shell, and how it combines with the requested mode
-    - `systemctl show -p UMask UNIT`
+    ### The idea
+
+    Programs usually create files with mode `0666` (directories `0777`). The **umask** removes bits from that:
+
+    ```
+    0666 & ~0022 = 0644     (the common default: world-readable)
+    0666 & ~0027 = 0640     (group read, nothing for others)
+    ```
+    A systemd service's umask comes from `UMask=` in its unit (default `0022`). Existing files aren't affected: fix them separately with `chmod`.
+
+    ### Commands you'll use
+
+    ```bash
+    umask                                    # yours, e.g. 0022
+    systemctl show -p UMask kl-export
+    sudo systemctl edit kl-export            # [Service] UMask=0077
+    sudo systemctl daemon-reload
+    sudo systemctl start kl-export
+    ls -l /var/lib/kl-export/
+    sudo find /var/lib/kl-export -type f -exec chmod 600 {} +
+    ```
+
+    ### Common mistakes
+
+    - `UMask=0640`: that's a mode, not a mask.
+    - Adding `chmod` to the script: the task says don't change it.
+
+    ### Check your work
+
+    A new run creates `0640` files, the old reports are `0640`, and `systemctl show -p UMask kl-reports` says `0027`.
   scenario: |
     **`kl-reports.service`** (a oneshot that runs as `kl-reports`) writes revenue reports to
     **`/var/lib/kl-reports/`**. Every report comes out world-readable.
@@ -181,18 +226,41 @@ exercises:
   kind: build
   tags: [sudo, sudoers, visudo, least-privilege]
   tutorial: |
-    **Concept.** `sudo` reads its rules from `/etc/sudoers` and every file in
-    `/etc/sudoers.d/`. A rule reads **who where = (as whom) what**, for example
-    `%ops ALL=(root) NOPASSWD: /usr/bin/systemctl restart web.service`. A `%` marks a
-    group. A command listed **with arguments** allows exactly those arguments and no
-    others. Write sudoers files with **`visudo`** (`visudo -f FILE` checks the syntax
-    before saving, `visudo -cf FILE` checks a file). A broken file makes sudo refuse to
-    work for everyone. Drop-in files should be mode `0440`, owned by root.
+    **What you're learning.** Narrow `sudo` rules for a group, and editing them safely with `visudo`.
 
-    **Read up on:**
-    - `man sudoers`: user specifications, `Cmnd_List`, `NOPASSWD`, `%group`
-    - `visudo -f`, `visudo -c`
-    - `sudo -l`, `sudo -l -U USER`, `sudo -l COMMAND`
+    ### The idea
+
+    A sudoers rule:
+
+    ```text
+    %GROUP  HOST=(RUNAS)  NOPASSWD: /full/path/cmd args, /full/path/cmd2 args
+    ```
+    `%` means a group. With arguments listed, **only those exact arguments** are allowed. A command with no arguments listed allows **any** arguments, so be explicit. Files in `/etc/sudoers.d/` must be mode `0440` and contain no `.` or `~` in their name, or they're skipped.
+
+    `visudo -f FILE` checks the syntax before saving. A broken file can lock everyone out of sudo.
+
+    ### Commands you'll use
+
+    ```bash
+    command -v systemctl                       # /usr/bin/systemctl: use the full path
+    sudo visudo -f /etc/sudoers.d/kl-deploy
+    #   %kl-deploy ALL=(root) NOPASSWD: /usr/bin/systemctl reload kl-web.service
+    sudo chmod 0440 /etc/sudoers.d/kl-deploy
+    sudo visudo -c                              # parse everything
+    sudo -l -U erin                             # what erin may run
+    sudo -u erin sudo -n systemctl reload kl-web.service && echo allowed
+    sudo -u erin sudo -n systemctl stop kl-web.service || echo refused
+    ```
+
+    ### Common mistakes
+
+    - `systemctl *`: wildcards let through far more than you meant.
+    - Naming the user instead of `%group`.
+    - Writing the file with `echo > ...` and a typo: sudo stops working.
+
+    ### Check your work
+
+    `sudo -l -U dana` lists exactly the two commands, `stop` and other services are refused, and the file is `root:root 0440`.
   scenario: |
     The members of the group **`kl-oncall`** (today only `dana`) must be able to
     handle **`kl-api.service`** at night without a root password. Create
@@ -268,25 +336,44 @@ exercises:
   kind: build
   tags: [systemd, sandboxing, protectsystem, privatetmp, hardening]
   tutorial: |
-    **Concept.** systemd can confine a service with mount namespaces and kernel flags,
-    without changing the program:
+    **What you're learning.** Sandboxing a service with systemd: `ProtectSystem=`, `ProtectHome=`, `PrivateTmp=` and `NoNewPrivileges=`.
 
-    - **`ProtectSystem=strict`** mounts the whole filesystem read-only for the service,
-      apart from `/dev`, `/proc` and `/sys`.
-    - **`ReadWritePaths=`** opens up the paths the service really has to write.
-    - **`ProtectHome=yes`** makes `/home`, `/root` and `/run/user` empty and
-      inaccessible.
-    - **`PrivateTmp=yes`** gives the service its own `/tmp` and `/var/tmp`.
-    - **`NoNewPrivileges=yes`** makes sure setuid binaries and file capabilities can
-      never raise its privileges.
+    ### The idea
 
-    You can see the result from outside: `nsenter -t PID -m` enters the service's mount
-    namespace, and `/proc/PID/status` shows `NoNewPrivs`.
+    | directive | effect |
+    |---|---|
+    | `ProtectSystem=strict` | the **whole** filesystem is read-only for the service |
+    | `ReadWritePaths=/var/lib/x` | …except these paths |
+    | `ProtectHome=yes` | `/home`, `/root` and `/run/user` look empty |
+    | `PrivateTmp=yes` | its own `/tmp` and `/var/tmp` |
+    | `NoNewPrivileges=yes` | setuid and file capabilities can't raise privileges (docker-234) |
 
-    **Read up on:**
-    - `man systemd.exec`: the "Sandboxing" section
-    - `systemd-analyze security UNIT`
-    - `nsenter -t PID -m`
+    `systemd-analyze security UNIT` scores a unit's exposure and lists what's still open.
+
+    ### Commands you'll use
+
+    ```bash
+    sudo systemctl edit kl-sync
+    #   [Service]
+    #   ProtectSystem=strict
+    #   ReadWritePaths=/var/lib/kl-sync
+    #   ProtectHome=yes
+    #   PrivateTmp=yes
+    #   NoNewPrivileges=yes
+    sudo systemctl daemon-reload && sudo systemctl restart kl-sync
+    systemctl is-active kl-sync
+    journalctl -u kl-sync -n 5 --no-pager           # Read-only file system? → a missing ReadWritePaths
+    systemd-analyze security kl-sync | tail -1
+    ```
+
+    ### Common mistakes
+
+    - `ProtectSystem=full`: `/etc` and `/usr` read-only, but the rest stays writable.
+    - Forgetting `ReadWritePaths`: the service can't write its state.
+
+    ### Check your work
+
+    `systemctl show kl-notes` has all four settings, it's active, and the heartbeat keeps updating.
   scenario: |
     **`kl-notes.service`** runs as root. All it needs is to write its state to
     **`/var/lib/kl-notes`** (it updates `/var/lib/kl-notes/heartbeat` every second).
@@ -379,18 +466,38 @@ exercises:
   kind: build
   tags: [openssl, x509, certificates, expiry, der, pem]
   tutorial: |
-    **Concept.** An X.509 certificate is valid between its `notBefore` and `notAfter`
-    dates. `openssl x509 -noout -enddate` prints the end date, and
-    **`openssl x509 -checkend SECONDS`** returns a failure if the certificate expires
-    within that many seconds (or has already expired). Certificates come in two
-    encodings: **PEM** (base64 between `-----BEGIN CERTIFICATE-----` lines) and binary
-    **DER** (`-inform der`). A PEM file can also hold a **bundle** of several
-    certificates, and `openssl x509` reads only the **first** one.
+    **What you're learning.** Checking certificate expiry across formats: PEM, DER and bundles.
 
-    **Read up on:**
-    - `openssl x509 -noout -subject -enddate`, `-checkend`, `-inform der`
-    - `openssl storeutl -certs FILE` or `openssl crl2pkcs7 -nocrl -certfile FILE | openssl pkcs7 -print_certs`
-    - Splitting a PEM bundle with `awk` or `csplit`
+    ### The idea
+
+    | format | looks like | read with |
+    |---|---|---|
+    | PEM | `-----BEGIN CERTIFICATE-----` base64 text | `openssl x509 -in F` |
+    | DER | binary | `openssl x509 -inform DER -in F` |
+    | bundle | several PEM blocks in one file | `openssl x509` reads only the **first**; split them first |
+
+    `openssl x509 -checkend SECONDS -noout` exits **1** if the certificate expires within that time (or already has), and **0** otherwise. 30 days = 2592000.
+
+    ### Commands you'll use
+
+    ```bash
+    file /etc/certs/*
+    openssl x509 -in /etc/certs/web.pem -noout -subject -enddate
+    openssl x509 -inform DER -in /etc/certs/legacy.cer -noout -enddate
+    csplit -s -z -f /tmp/part- /etc/certs/chain.pem '/-----BEGIN CERTIFICATE-----/' '{*}'
+    for p in /tmp/part-*; do openssl x509 -in "$p" -noout -checkend 2592000 >/dev/null || echo "expiring: $p"; done
+    ```
+    A file that isn't a certificate makes `openssl x509` fail with "unable to load certificate". Don't count that as "expiring".
+
+    ### Common mistakes
+
+    - Checking only the first certificate in a bundle.
+    - Treating a parse error (not a certificate) the same as an expiry.
+    - Writing full paths instead of file names.
+
+    ### Check your work
+
+    `renew.txt` lists exactly the files that contain a certificate failing `-checkend 2592000`, sorted.
   scenario: |
     **`/etc/kl-certs`** holds the certificates of the internal services, in whatever
     format each team delivered them. Some are bundles, some are binary DER, and there are
@@ -500,18 +607,45 @@ exercises:
   kind: build
   tags: [gpg, signatures, fingerprint, supply-chain, integrity]
   tutorial: |
-    **Concept.** A detached signature (`file.asc`) proves that a file is unchanged
-    since someone signed it, but only someone holding **a** key. Anyone can create a key
-    with any name and e-mail address, so "Good signature from Vendor" means nothing
-    until you have checked that the signing key's **fingerprint** is the one the
-    vendor published through a channel you trust. `gpg --verify FILE.asc FILE` checks a
-    signature, and `--status-fd 1` prints machine-readable lines. The
-    `VALIDSIG <fingerprint> ...` line names the exact key that made a good signature.
+    **What you're learning.** Verifying detached GPG signatures, and why the **fingerprint**, not the name, identifies the signer.
 
-    **Read up on:**
-    - `gpg --import`, `gpg --list-keys --with-fingerprint`
-    - `gpg --verify SIG FILE`, `--status-fd 1` (`GOODSIG`, `BADSIG`, `VALIDSIG`)
-    - Using a throw-away keyring: `GNUPGHOME=$(mktemp -d)`
+    ### The idea
+
+    `gpg --verify FILE.asc FILE` checks that FILE matches the signature and reports **which key** signed it. Anyone can make a key with the vendor's **name and email**, so trust only the **fingerprint** you got from an independent source (the vendor's web site).
+
+    For scripts, `gpg --status-fd 1 --verify` prints machine-readable lines: `[GNUPG:] VALIDSIG <FPR> ...` for a good signature, with the full fingerprint. Use a temporary `GNUPGHOME` so your own keyring isn't touched.
+
+    ### Commands you'll use
+
+    ```bash
+    export GNUPGHOME=$(mktemp -d)
+    gpg --import /srv/dl/KEYS.asc
+    gpg --list-keys --with-fingerprint
+    ```
+    ```text
+    pub   ed25519 2026-01-01 [SC]
+          3A9F 0C1D 22B4 ... 81E6
+    uid           Tool Vendor <release@vendor.test>
+    pub   ed25519 2026-02-01 [SC]
+          77D0 4E12 ... 09AA
+    uid           Tool Vendor <release@vendor.test>
+    ```
+    ```bash
+    fpr=$(tr -d ' ' < /lab/fpr.txt)
+    for t in /srv/dl/*.tar.gz; do
+      gpg --status-fd 1 --verify "$t.asc" "$t" 2>/dev/null | grep -q "VALIDSIG $fpr" && basename "$t"
+    done | sort
+    ```
+
+    ### Common mistakes
+
+    - Trusting "Good signature from Tool Vendor": the impostor key prints the same.
+    - Spaces in the fingerprint when comparing.
+    - Counting a good signature on a **different** file (a swapped `.asc`).
+
+    ### Check your work
+
+    `verified.txt` lists only tarballs with a `VALIDSIG` from the published fingerprint, sorted.
   scenario: |
     The mirror **`/srv/kl-dl`** carries the releases of `kl-tool` (`kl-tool-*.tar.gz`), a
     detached signature for each (`.tar.gz.asc`) and the vendor's key file `KEYS.asc`.
@@ -586,20 +720,41 @@ exercises:
   kind: build
   tags: [ssh, sshd, hardening, authentication]
   tutorial: |
-    **Concept.** `sshd_config` decides **who** may log in and **how**. On a hardened
-    server, password logins are off (`PasswordAuthentication no`, plus
-    `KbdInteractiveAuthentication no`, which PAM would otherwise use to ask for a
-    password), root can't log in directly (`PermitRootLogin no`), only an allow-listed
-    group gets in (`AllowGroups`), and a client gets only a few attempts
-    (`MaxAuthTries`). `sshd -t` checks a configuration, and **`sshd -T`** prints the
-    settings in effect. A running `sshd` re-reads its file on `SIGHUP`
-    (`systemctl reload`). A client shows the methods a server offers in its
-    *Permission denied (...)* message.
+    **What you're learning.** Hardening `sshd_config`: no passwords, no root, only one group, few attempts.
 
-    **Read up on:**
-    - `man sshd_config`: `PasswordAuthentication`, `KbdInteractiveAuthentication`, `PermitRootLogin`, `AllowGroups`, `MaxAuthTries`
-    - `sshd -t -f FILE`, `sshd -T -f FILE`
-    - `ssh -o PreferredAuthentications=none HOST` to see the offered methods
+    ### The idea
+
+    | directive | value |
+    |---|---|
+    | `PasswordAuthentication` | `no` |
+    | `KbdInteractiveAuthentication` | `no` (otherwise PAM can still ask for a password) |
+    | `PermitRootLogin` | `no` |
+    | `AllowGroups` | `kl-ssh` (only members may log in) |
+    | `MaxAuthTries` | `3` |
+
+    For most keywords **the first value found wins**, so a later line doesn't override an earlier one. Remove or replace existing lines. `sshd -t -f FILE` checks the config, and `sshd -T -f FILE` prints the effective settings.
+
+    ### Commands you'll use
+
+    ```bash
+    f=/etc/kl-ssh2/sshd_config
+    grep -nE '^(PasswordAuthentication|KbdInteractive|PermitRootLogin|AllowGroups|MaxAuthTries)' $f
+    sudoedit $f
+    sudo sshd -t -f $f && sudo sshd -T -f $f | grep -E 'passwordauth|kbdinteractive|permitrootlogin|allowgroups|maxauthtries'
+    sudo systemctl restart kl-ssh2
+    ssh -i /lab/key -p 2223 -o BatchMode=yes dev@127.0.0.1 true && echo key ok
+    ssh -p 2223 -o PreferredAuthentications=password -o BatchMode=yes temp@127.0.0.1 true || echo refused
+    ```
+
+    ### Common mistakes
+
+    - Appending settings while an earlier line has the old value: the first one wins.
+    - A `Match` block above your lines that changes them.
+    - Restarting with a broken config: the daemon doesn't come back.
+
+    ### Check your work
+
+    `sshd -T` shows all five settings, `kl-dev` logs in with the key, and `kl-temp` and root can't log in.
   scenario: |
     Besides the system SSH server, this host runs a second daemon for internal tooling:
     **`kl-sshd.service`**, listening on **127.0.0.1:2222**, configured by
@@ -703,18 +858,38 @@ exercises:
   kind: fix
   tags: [ssh, authorized_keys, strictmodes, permissions, journald]
   tutorial: |
-    **Concept.** Before `sshd` trusts an `authorized_keys` file, **`StrictModes`** (on by
-    default) checks that nobody else could have planted a key in it. The file, the
-    `~/.ssh` directory **and the home directory** must be owned by the user (or root)
-    and must not be writable by group or others. If that check fails, the key is
-    silently ignored and the client falls back to a password. The reason is only in the
-    **server's** log (`Authentication refused: bad ownership or modes ...`). Each key
-    must also sit on **one line**. `ssh-keygen -l -f FILE` lists the keys it can parse.
+    **What you're learning.** `StrictModes`: why sshd ignores an `authorized_keys` file with loose permissions.
 
-    **Read up on:**
-    - `man sshd`: the `AUTHORIZED_KEYS FILE FORMAT` section
-    - `man sshd_config`: `StrictModes`
-    - `journalctl -u UNIT`, `ssh -v`, `ssh-keygen -l -f`
+    ### The idea
+
+    Before trusting `~/.ssh/authorized_keys`, sshd checks that **nobody but the user (or root)** can write the file **or any directory above it**: the home, `~/.ssh` and the file. Group- or world-writable anywhere on that path means the key is ignored (and the log says why).
+
+    Typical modes: home `755` (or `700`), `.ssh` `700`, `authorized_keys` `600`, all owned by the user.
+
+    ### Commands you'll use
+
+    ```bash
+    sudo journalctl -u kl-ssh2 -n 10 --no-pager | grep -i 'bad ownership\|modes'
+    ```
+    ```text
+    Authentication refused: bad ownership or modes for directory /home/deploy/.ssh
+    ```
+    ```bash
+    sudo namei -l /home/deploy/.ssh/authorized_keys
+    sudo chown -R deploy:deploy /home/deploy/.ssh
+    sudo chmod 755 /home/deploy; sudo chmod 700 /home/deploy/.ssh; sudo chmod 600 /home/deploy/.ssh/authorized_keys
+    ssh -i /lab/key -p 2223 -o BatchMode=yes deploy@127.0.0.1 true && echo ok
+    ```
+    `namei -l` shows owner and mode of every component of a path.
+
+    ### Common mistakes
+
+    - Fixing only the file: a group-writable home also breaks it.
+    - `StrictModes no`: forbidden here, and unsafe.
+
+    ### Check your work
+
+    The key login works with `BatchMode=yes`, and the sshd config is unchanged.
   scenario: |
     The CI system logs in to **`kl-deploy`** on the tooling SSH daemon
     (**`kl-sshd.service`**, 127.0.0.1:2222) with the key **`/lab/deploy_key`**. The key
@@ -812,18 +987,44 @@ exercises:
   kind: fix
   tags: [systemd, sandboxing, statedirectory, logsdirectory, runtimedirectory]
   tutorial: |
-    **Concept.** With `ProtectSystem=strict` a service sees a read-only filesystem, and
-    that includes `/var` and `/run`. Instead of opening holes with `ReadWritePaths=`
-    (where you would also have to create the directories and set their owner), let
-    systemd manage the service's directories:
-    **`StateDirectory=NAME`** (`/var/lib/NAME`), **`LogsDirectory=NAME`**
-    (`/var/log/NAME`), **`RuntimeDirectory=NAME`** (`/run/NAME`, removed when the service
-    stops) and **`CacheDirectory=`**. systemd creates them, gives them to the service's
-    `User=`, and makes them writable inside the sandbox.
+    **What you're learning.** Giving a sandboxed service the directories it needs: `StateDirectory=`, `LogsDirectory=`, `RuntimeDirectory=`.
 
-    **Read up on:**
-    - `man systemd.exec`: `StateDirectory=`, `LogsDirectory=`, `RuntimeDirectory=`, `ReadWritePaths=`
-    - `journalctl -u UNIT` — "Read-only file system", "Permission denied"
+    ### The idea
+
+    With `ProtectSystem=strict` everything is read-only. systemd can create and open up the standard directories for the service, owned by its `User=`:
+
+    | directive | path | lifetime |
+    |---|---|---|
+    | `StateDirectory=kl-x` | `/var/lib/kl-x` | kept |
+    | `LogsDirectory=kl-x` | `/var/log/kl-x` | kept |
+    | `RuntimeDirectory=kl-x` | `/run/kl-x` | removed when the service stops |
+    | `CacheDirectory=kl-x` | `/var/cache/kl-x` | kept |
+
+    These are writable even under `strict`, and systemd fixes their ownership. Existing files are kept.
+
+    ### Commands you'll use
+
+    ```bash
+    journalctl -u kl-store -n 10 --no-pager           # Read-only file system / Permission denied
+    sudo systemctl edit kl-store
+    #   [Service]
+    #   StateDirectory=kl-store
+    #   LogsDirectory=kl-store
+    #   RuntimeDirectory=kl-store
+    sudo systemctl daemon-reload && sudo systemctl restart kl-store
+    ls -ld /var/lib/kl-store /var/log/kl-store /run/kl-store
+    systemctl show kl-store -p ProtectSystem -p ProtectHome -p PrivateTmp -p NoNewPrivileges -p User
+    ```
+
+    ### Common mistakes
+
+    - Removing the sandbox settings.
+    - `ReadWritePaths=` on a directory owned by root: writable through the sandbox, but still not by the user.
+    - Deleting the database to "start clean".
+
+    ### Check your work
+
+    `kl-ledger` is active as `kl-ledger` with all four sandbox settings, `ledger.db` keeps its old entries and grows, and the log and PID file exist.
   scenario: |
     After a security review, **`kl-ledger.service`** (runs as user `kl-ledger`) got a
     sandbox: `ProtectSystem=strict`, `ProtectHome=yes`, `PrivateTmp=yes` and
@@ -924,21 +1125,40 @@ exercises:
   kind: build
   tags: [ssh, authorized_keys, forced-command, restrict, least-privilege]
   tutorial: |
-    **Concept.** Each line of `authorized_keys` can start with **options** that limit
-    what that one key may do, whatever the client asks for:
+    **What you're learning.** Restricting one SSH key with `authorized_keys` options: a forced command, `restrict`, and `from=`.
 
-    - **`command="..."`** forces a command. The client's request is passed to it in
-      `$SSH_ORIGINAL_COMMAND`.
-    - **`from="pattern"`** accepts the key only from matching client addresses.
-    - **`restrict`** turns off port, agent and X11 forwarding and PTY allocation in one
-      word (you can then switch single features back on).
+    ### The idea
 
-    This is how backup and CI keys get exactly one job, while the same account keeps
-    other, unrestricted keys.
+    Options go at the start of a key's line, comma-separated:
 
-    **Read up on:**
-    - `man sshd`: `AUTHORIZED_KEYS FILE FORMAT` — `command=`, `from=`, `restrict`, `no-pty`, `no-port-forwarding`
-    - `ssh -W host:port` (stdio forwarding), `ssh -tt`, `ssh -b ADDRESS`
+    | option | effect |
+    |---|---|
+    | `command="/path/prog"` | always run this, whatever the client asks (the request is in `$SSH_ORIGINAL_COMMAND`) |
+    | `restrict` | no PTY, no port/agent/X11 forwarding, no `~/.ssh/rc` |
+    | `from="127.0.0.1"` | accept the key only from these addresses |
+
+    Other lines (keys) in the file keep their own options, or none.
+
+    ### Commands you'll use
+
+    ```bash
+    f=/home/archive/.ssh/authorized_keys
+    echo "restrict,command=\"/usr/local/bin/recv-dump\",from=\"127.0.0.1\" $(cat /lab/dump_key.pub)" | sudo tee -a $f
+    sudo chown archive:archive $f && sudo chmod 600 $f
+    echo payload | ssh -i /lab/dump_key -p 2223 archive@127.0.0.1 'rm -rf /'      # runs recv-dump instead
+    ssh -i /lab/dump_key -p 2223 -L 9000:localhost:22 archive@127.0.0.1 true      # forwarding refused
+    ssh -i /lab/admin_key -p 2223 archive@127.0.0.1 id                            # unrestricted
+    ```
+
+    ### Common mistakes
+
+    - Quotes inside `command=` not escaped in the shell.
+    - Options after the key: they must come **before** `ssh-ed25519 ...`.
+    - Changing the admin key's line.
+
+    ### Check your work
+
+    Any command with the backup key stores stdin as `latest.dat`, a PTY and forwarding are refused, and the admin key still runs commands normally.
   scenario: |
     The NAS pushes its nightly backup to **`kl-backup`** on the tooling SSH daemon
     (**127.0.0.1:2222**) with the key pair **`/lab/backup_key`** /
@@ -1055,20 +1275,43 @@ exercises:
   kind: fix
   tags: [tls, openssl, nginx, certificate-chain, private-key, docker]
   tutorial: |
-    **Concept.** A TLS server needs two things that belong together: a **private key**
-    and the **certificate** for its public half. If they don't match, nginx refuses to
-    start (`key values mismatch`). Compare the public keys to see which key belongs to a
-    certificate. The server must also send the **chain**: its own certificate first,
-    then the intermediate CA certificates that link it to a root the clients trust.
-    Clients don't fetch missing intermediates, so a server that sends only its own
-    certificate fails with *unable to get local issuer certificate*. In nginx,
-    `ssl_certificate` points at that "full chain" file.
+    **What you're learning.** TLS server files that belong together: matching the key to the certificate, and serving the full chain.
 
-    **Read up on:**
-    - `openssl x509 -noout -pubkey`, `openssl pkey -pubout`, comparing them
-    - `openssl x509 -noout -subject -issuer`, `openssl verify -CAfile ROOT -untrusted INTERMEDIATE CERT`
-    - nginx `ssl_certificate` (full chain, leaf first) and `ssl_certificate_key`
-    - `openssl s_client -connect HOST:PORT -servername NAME -showcerts`
+    ### The idea
+
+    1. The private key and the certificate must be a **pair**: their public keys are identical. Compare hashes:
+       ```bash
+       openssl x509 -in server.crt -noout -pubkey | sha256sum
+       openssl pkey -in KEY -pubout | sha256sum
+       ```
+    2. A client trusting only the **root** CA needs the **intermediate** too. The server sends it: put the server certificate **first**, then the issuing CA, in one file (`fullchain.pem`).
+
+    nginx says `key values mismatch` when 1 is wrong. curl says `unable to get local issuer certificate` when 2 is.
+
+    ### Commands you'll use
+
+    ```bash
+    docker logs site 2>&1 | tail -2
+    c=$(openssl x509 -in /lab/certs/server.crt -noout -pubkey | sha256sum)
+    for k in /lab/certs/server.key /lab/certs/old/*.key; do
+      [ "$(openssl pkey -in "$k" -pubout 2>/dev/null | sha256sum)" = "$c" ] && echo "match: $k"
+    done
+    cat server.crt issuing-ca.crt > fullchain.pem
+    openssl verify -CAfile root-ca.crt -untrusted issuing-ca.crt server.crt
+    grep -n ssl_certificate /lab/certs/nginx.conf
+    docker restart site
+    curl --cacert root-ca.crt --resolve web.test:8443:127.0.0.1 https://web.test:8443/
+    ```
+
+    ### Common mistakes
+
+    - Issuing a new certificate: the task says keep `server.crt`.
+    - The chain in the wrong order (CA first).
+    - Including the root in the chain: harmless, but not needed.
+
+    ### Check your work
+
+    The curl command trusting only the root CA succeeds, and the served certificate is the existing `server.crt` (`openssl s_client ... | openssl x509 -noout -fingerprint`).
   scenario: |
     The container **`kl-tls`** (nginx) serves **https://web.kl.test:8443/** from the files in
     **`/lab/tls`** (mounted at `/etc/nginx/tls`, configuration
@@ -1169,17 +1412,44 @@ exercises:
   kind: build
   tags: [mount, fstab, noexec, nosuid, nodev, bind-mount]
   tutorial: |
-    **Concept.** Mount options limit what a filesystem can be used for, whatever the
-    file permissions say. **`noexec`** forbids executing programs from it, **`nosuid`**
-    ignores setuid/setgid bits, and **`nodev`** ignores device files. They suit any
-    directory that untrusted users or a web application can write to. A directory that
-    is not its own filesystem can still get them: **bind-mount it onto itself** and apply
-    the options. In `/etc/fstab` a line like `SRC DIR none bind,OPTIONS 0 0` does both
-    in one step, and `mount DIR` then reads that line.
+    **What you're learning.** Mount options as a security boundary: `noexec`, `nosuid`, `nodev` on a bind mount, now and in fstab.
 
-    **Read up on:**
-    - `man mount`: `--bind`, `-o remount,bind,...`, `noexec`, `nosuid`, `nodev`
-    - `man fstab`, `findmnt`, `findmnt --fstab`
+    ### The idea
+
+    | option | blocks |
+    |---|---|
+    | `noexec` | running programs from this filesystem |
+    | `nosuid` | setuid/setgid bits taking effect |
+    | `nodev` | device files working |
+
+    A directory on the root filesystem can get its own options by **bind-mounting it onto itself**. The fstab line:
+
+    ```text
+    /srv/x/uploads  /srv/x/uploads  none  bind,nosuid,nodev,noexec  0 0
+    ```
+    After editing fstab, `systemctl daemon-reload` (systemd generates mount units from it), then `mount /srv/x/uploads`.
+
+    `noexec` stops direct execution (`./x.sh`), not an interpreter reading the file (`sh x.sh`). It's one layer, not a cure.
+
+    ### Commands you'll use
+
+    ```bash
+    echo '/srv/app/files /srv/app/files none bind,nosuid,nodev,noexec 0 0' | sudo tee -a /etc/fstab
+    sudo systemctl daemon-reload
+    sudo mount /srv/app/files
+    findmnt -o TARGET,SOURCE,OPTIONS /srv/app/files
+    /srv/app/files/evil.sh                    # Permission denied
+    sudo umount /srv/app/files && sudo mount /srv/app/files && findmnt /srv/app/files
+    ```
+
+    ### Common mistakes
+
+    - A tmpfs: the existing files disappear.
+    - `mount --bind` then expecting options in the same command to apply (older util-linux needs a remount, linux-031).
+
+    ### Check your work
+
+    `findmnt /srv/kl-www/uploads` shows a bind with `nosuid,nodev,noexec`, the uploaded script can't run, the files are still there, and `umount` plus `mount` restores it from fstab.
   scenario: |
     The web application stores user uploads in **`/srv/kl-www/uploads`**, a plain
     directory on the root filesystem. Someone already uploaded an executable script.
@@ -1248,23 +1518,42 @@ exercises:
   kind: fix
   tags: [iptables, firewall, conntrack, netns, stateful]
   tutorial: |
-    **Concept.** A host firewall with a **default-deny** `INPUT` policy accepts only what
-    the rules allow, and the **first** rule that matches decides. Three rules are easy to
-    forget:
+    **What you're learning.** Reading and fixing an iptables ruleset: default deny, rule order, interfaces, loopback and replies.
 
-    - **loopback** (`-i lo`): local programs talk to each other over it
-    - **`-m conntrack --ctstate ESTABLISHED,RELATED`**: replies to connections the host
-      opened itself come in through `INPUT` too, and without this rule they're dropped
-    - **narrow sources**: a broad `-s` network rule placed early matches before the
-      specific rules below it, which then never run
+    ### The idea
 
-    `iptables-save` / `iptables-restore` write and load a whole ruleset from a file. Here
-    the "server" is a network namespace, so its firewall is separate from the host's.
+    With `:INPUT DROP`, only what a rule **accepts** gets in. Rules are checked **top to bottom, and the first match decides**. A working default-deny set needs:
 
-    **Read up on:**
-    - `man iptables`, `man iptables-extensions`: `conntrack`, `-i`, `-s`, `--dport`
-    - `iptables -L -n -v --line-numbers`, `iptables-restore`, `iptables-save`
-    - `ip netns exec NS COMMAND`
+    ```text
+    -A INPUT -i lo -j ACCEPT                                         # the host talking to itself
+    -A INPUT -m conntrack --ctstate ESTABLISHED,RELATED -j ACCEPT    # replies to its own connections
+    -A INPUT -p icmp --icmp-type echo-request -j ACCEPT              # ping
+    -A INPUT -p tcp --dport 8080 -j ACCEPT                           # web from anywhere
+    -A INPUT -s 10.77.1.0/24 -p tcp --dport 9100 -j ACCEPT           # metrics from the office only
+    ```
+    Anything not accepted (the database from the networks) falls to the policy. The **ESTABLISHED** rule is what lets the server's own outgoing requests receive their answers.
+
+    ### Commands you'll use
+
+    ```bash
+    cat /etc/kl-fw/rules.v4
+    sudo ip netns exec kl-fw iptables-restore --test < /etc/kl-fw/rules.v4 && echo parses
+    sudo ip netns exec kl-fw iptables-restore < /etc/kl-fw/rules.v4
+    sudo ip netns exec kl-fw iptables -L INPUT -n -v --line-numbers
+    sudo ip netns exec kl-office nc -z -w2 10.77.1.1 9100 && echo open
+    sudo ip netns exec kl-guest nc -z -w2 10.77.2.1 9100 || echo blocked
+    ```
+    `-v` shows packet counters per rule, which tell you which rule matched.
+
+    ### Common mistakes
+
+    - An early broad `ACCEPT` that makes later restrictions pointless.
+    - Filtering metrics by **destination** address only: both networks hit the same port.
+    - No ESTABLISHED rule: the update fetch never gets its reply.
+
+    ### Check your work
+
+    From the office: web, metrics and ping work, the database doesn't. From guests: web and ping only. On the server: `127.0.0.1:5432` and the update URL work, and the policy is still `DROP`.
   scenario: |
     The server lives in the network namespace **`kl-fw`**. It serves **web on TCP
     8080**, **metrics on TCP 9100** and a **database on TCP 5432**. Two networks reach
@@ -1381,24 +1670,48 @@ exercises:
   kind: build
   tags: [tls, pki, openssl, mtls, nginx, x509-extensions, docker]
   tutorial: |
-    **Concept.** A small private **certificate authority** is a key plus a self-signed
-    certificate marked `basicConstraints=CA:TRUE`. It signs certificates for your
-    services, and anything that trusts the CA certificate trusts them. Extensions say
-    what each certificate is for:
+    **What you're learning.** Building a small private CA, issuing server and client certificates with the right extensions, and **mutual TLS** in nginx.
 
-    - **`subjectAltName`**: the DNS names and IP addresses a server certificate covers.
-      Clients ignore the CN.
-    - **`extendedKeyUsage`**: `serverAuth` for servers, `clientAuth` for clients.
+    ### The idea
 
-    In **mutual TLS** the server also asks the *client* for a certificate and checks it
-    against the CA (`ssl_client_certificate` + `ssl_verify_client on` in nginx). Without
-    a valid client certificate, nginx answers `400`.
+    | certificate | key extensions |
+    |---|---|
+    | CA | `basicConstraints=critical,CA:TRUE`, `keyUsage=critical,keyCertSign,cRLSign` |
+    | server | `subjectAltName=DNS:name,IP:addr`, `extendedKeyUsage=serverAuth` |
+    | client | CN = identity, `extendedKeyUsage=clientAuth` |
 
-    **Read up on:**
-    - `openssl genpkey`, `openssl req -x509 -new`, `openssl req -new`
-    - `openssl x509 -req -CA -CAkey -CAcreateserial -extfile`, `man x509v3_config`
-    - `openssl verify -CAfile ca.crt -purpose sslserver|sslclient`
-    - nginx `ssl_client_certificate`, `ssl_verify_client`; `curl --cert --key --cacert`
+    Sign with `openssl x509 -req -in CSR -CA ca.crt -CAkey ca.key -CAcreateserial -extfile EXT`.
+
+    nginx mTLS:
+    ```nginx
+    ssl_certificate         /etc/nginx/pki/server.crt;
+    ssl_certificate_key     /etc/nginx/pki/server.key;
+    ssl_client_certificate  /etc/nginx/pki/ca.crt;     # CAs accepted for clients
+    ssl_verify_client       on;
+    ```
+
+    ### Commands you'll use
+
+    ```bash
+    openssl genpkey -algorithm EC -pkeyopt ec_paramgen_curve:P-256 -out ca.key && chmod 600 ca.key
+    openssl req -x509 -new -key ca.key -days 365 -subj '/CN=Test CA' \
+      -addext 'basicConstraints=critical,CA:TRUE' -addext 'keyUsage=critical,keyCertSign,cRLSign' -out ca.crt
+    openssl req -new -key svc.key -subj '/CN=svc.test' -out svc.csr
+    printf 'subjectAltName=DNS:svc.test,IP:127.0.0.1\nextendedKeyUsage=serverAuth\n' > svc.ext
+    openssl x509 -req -in svc.csr -CA ca.crt -CAkey ca.key -CAcreateserial -days 90 -extfile svc.ext -out svc.crt
+    openssl x509 -in svc.crt -noout -ext subjectAltName,extendedKeyUsage
+    curl --cacert ca.crt --cert cli.crt --key cli.key --resolve svc.test:9443:127.0.0.1 https://svc.test:9443/
+    ```
+
+    ### Common mistakes
+
+    - Server certificate without an IP SAN: `https://127.0.0.1:9443/` fails.
+    - `extendedKeyUsage=serverAuth,clientAuth` on the client: the task says clientAuth only.
+    - Key files the nginx worker can't read inside the container (mode 600 owned by your UID): check `docker logs`.
+
+    ### Check your work
+
+    With the client certificate both URLs return `kl-api ok`. Without one, or with a certificate from another CA, nginx refuses (400). `openssl x509 -text` shows the required extensions.
   scenario: |
     The internal API **`api.kl.test`** must only answer clients that present a
     certificate from your own CA. Build everything in **`/lab/pki`**:
@@ -1550,20 +1863,29 @@ exercises:
   kind: fix
   tags: [incident, tls, systemd, sandboxing, permissions, hosts]
   tutorial: |
-    **Concept.** Hardening changes break things in layers: fix one and the next one
-    shows. Work from the evidence (`systemctl status`, `journalctl -u`, then the client's
-    error message) and fix each cause properly, **without undoing the hardening that
-    caused it**. For TLS, read the client's error carefully. *Could not resolve*,
-    *connection timed out*, *certificate has expired* and *unable to get local issuer*
-    each point somewhere else.
+    **What you're learning.** A hardened service broken in layers: sandbox paths, key permissions, and an expired or mismatched certificate.
 
-    **Read up on:**
-    - `systemctl status`, `journalctl -u UNIT -n 50`, `systemctl reset-failed`
-    - `ReadWritePaths=` / `StateDirectory=` with `ProtectSystem=strict`
-    - `getent hosts NAME`, `/etc/hosts`
-    - `openssl x509 -noout -dates -ext subjectAltName`, issuing a certificate with
-      `openssl req -new` + `openssl x509 -req -CA ... -CAkey ...`
-    - `curl -v --cacert`
+    ### Method
+
+    Read the service's error, fix that layer, restart, and repeat:
+
+    | layer | check | fix (exercise) |
+    |---|---|---|
+    | sandbox | `journalctl -u kl-inventory`: `Read-only file system` on the cache | `ReadWritePaths=` / `StateDirectory=` in a drop-in, sandbox kept (linux-083, linux-088) |
+    | key access | `Permission denied` on `server.key` | owner root, group `kl-inventory`, mode `640`: readable by the service, not by others |
+    | certificate | `openssl x509 -noout -subject -ext subjectAltName -enddate -checkend 2592000` | issue a new one from the internal CA with `DNS:inventory.kl.test`, matching the key (linux-090, linux-093) |
+    | name | `getent hosts inventory.kl.test` | it must resolve to 127.0.0.1 for the curl to reach the service (linux-036) |
+
+    The CA key stays mode 600 root. Use `sudo` to sign, don't loosen it.
+
+    ```bash
+    sudo openssl x509 -in /etc/kl-inventory/tls/server.crt -noout -subject -issuer -ext subjectAltName -enddate
+    sudo openssl verify -CAfile /etc/kl-ca/ca.crt /etc/kl-inventory/tls/server.crt
+    ```
+
+    ### Check your work
+
+    `curl --cacert /etc/kl-ca/ca.crt https://inventory.kl.test:8444/health` prints `ok`, the unit keeps its four sandbox settings and user, `server.key` isn't readable by others, `ca.key` is still 600, and the certificate has at least 30 days left.
   scenario: |
     Since last week's security review, the internal **inventory API** is down.
 
