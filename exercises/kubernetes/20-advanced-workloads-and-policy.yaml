@@ -12,15 +12,40 @@ exercises:
   kind: build
   tags: [init-container, ordering, dependency]
   tutorial: |
-    **Concept.** **Init containers** run to completion, in order, before the
-    app containers start. They're the clean way to express a start-up
-    dependency: block until a service answers, run a migration, fetch a
-    secret. If an init container fails it is retried, and the pod shows
-    `Init:Error`/`Init:CrashLoopBackOff` so the reason is visible.
+    **What you're learning.** Expressing a start-up dependency with an **init container** that waits for a TCP port.
 
-    **Read up on:**
-    - `spec.initContainers`
-    - Pod status phases `Init:0/N`
+    ### The idea
+
+    Init containers run to completion, in order, before the app containers start (k8s-132). A wait loop is the clean way to say "don't start until the database answers":
+
+    ```yaml
+    initContainers:
+    - name: wait-cache
+      image: busybox:1.37
+      command: ["sh", "-c", "until nc -z -w 2 cache 6379; do echo waiting for cache; sleep 1; done"]
+    ```
+
+    While it loops, the pod shows `Init:0/1`; once it exits 0, the app starts. `nc -z HOST PORT` only tests that a TCP connection opens.
+
+    ### Commands you'll use
+
+    ```bash
+    kubectl get svc cache -n demo                   # name and port to wait for
+    kubectl create deployment api -n demo --image=nginx:1.29-alpine --dry-run=client -o yaml > /lab/api.yaml
+    vi /lab/api.yaml                                # add initContainers under spec.template.spec
+    kubectl apply -f /lab/api.yaml
+    kubectl get pods -n demo -w
+    kubectl logs -n demo -l app=api -c wait-cache --tail=3
+    ```
+
+    ### Common mistakes
+
+    - The loop in the main container: then nginx never runs.
+    - A typo in the service name: the loop never ends (the init container's logs show it waiting forever).
+
+    ### Check your work
+
+    The pod went through `Init:0/1` to `1/1 Running`, and its init container's state is `Terminated, Completed`.
   scenario: |
     In namespace **`k334`** there is a Service **`db`** (it is up). Create a
     Deployment **`web`** (1 replica, image **`nginx:1.29-alpine`**) with an
@@ -96,16 +121,49 @@ exercises:
   kind: build
   tags: [downward-api, env, metadata]
   tutorial: |
-    **Concept.** The **downward API** exposes a pod's own metadata to its
-    containers without hardcoding it. As **env vars** via
-    `valueFrom.fieldRef` (`metadata.name`, `metadata.namespace`,
-    `status.podIP`, `spec.nodeName`) and resource fields via
-    `resourceFieldRef`; as **files** through a `downwardAPI` volume. Apps use
-    it for self-identification in logs and metrics.
+    **What you're learning.** The **downward API** as environment variables: a pod learning its own name, namespace, node and IP.
 
-    **Read up on:**
-    - `valueFrom.fieldRef`, `fieldPath`
-    - `downwardAPI` volumes
+    ### The idea
+
+    `env[].valueFrom.fieldRef.fieldPath` fills a variable from the pod's own fields, so nothing is hard-coded:
+
+    | fieldPath | value |
+    |---|---|
+    | `metadata.name` | the pod's name |
+    | `metadata.namespace` | its namespace |
+    | `spec.nodeName` | the node it runs on |
+    | `status.podIP` | its IP |
+    | `metadata.labels['app']` | one label |
+
+    (`resourceFieldRef` gives requests/limits; a `downwardAPI` **volume** gives the same as files, k8s-076.)
+
+    ```yaml
+    env:
+    - name: MY_POD
+      valueFrom: {fieldRef: {fieldPath: metadata.name}}
+    - name: MY_NODE
+      valueFrom: {fieldRef: {fieldPath: spec.nodeName}}
+    ```
+
+    ### Commands you'll use
+
+    ```bash
+    kubectl apply -f /lab/me.yaml
+    kubectl exec me -n demo -- env | grep -E '^MY_'
+    ```
+    ```text
+    MY_POD=me
+    MY_NODE=node01
+    ```
+
+    ### Common mistakes
+
+    - `fieldPath: name` (missing `metadata.`).
+    - `status.podIP` is empty until the pod has an IP; it's filled when the container starts, so it's fine for env.
+
+    ### Check your work
+
+    `kubectl exec POD -- env` shows all four variables with the pod's real values (compare with `kubectl get pod -o wide`).
   scenario: |
     In namespace **`k335`**, create a Pod **`whoami`** (image
     **`busybox:1.37`**, command `sleep infinity`) whose container has these
@@ -168,15 +226,38 @@ exercises:
   kind: fix
   tags: [startup-probe, liveness, probes]
   tutorial: |
-    **Concept.** A **startup probe** protects a slow-starting container from
-    the liveness probe. While the startup probe is still failing, liveness and
-    readiness are **held off**, so the kubelet won't kill a process that just
-    needs time to warm up. Once the startup probe passes, liveness takes over.
-    Size it with `failureThreshold × periodSeconds` ≥ the worst-case boot time.
+    **What you're learning.** A startup probe that holds the liveness probe off while a slow app boots.
 
-    **Read up on:**
-    - `startupProbe`, and how it gates `livenessProbe`
-    - `failureThreshold`, `periodSeconds`
+    ### The idea
+
+    While a `startupProbe` hasn't succeeded, liveness and readiness aren't run (k8s-143). Size it so `failureThreshold × periodSeconds` is at least the worst-case boot time:
+
+    ```yaml
+    startupProbe:
+      httpGet: {path: /healthz, port: 8080}
+      periodSeconds: 5
+      failureThreshold: 8          # 40 s
+    ```
+
+    ### Commands you'll use
+
+    ```bash
+    kubectl get pods -n demo -l app=boot        # CrashLoopBackOff, RESTARTS climbing
+    kubectl describe pod -n demo -l app=boot | grep -E 'Liveness|Unhealthy' | tail -2
+    kubectl -n demo patch deploy boot --type=json -p '[{"op":"add",
+      "path":"/spec/template/spec/containers/0/startupProbe",
+      "value":{"httpGet":{"path":"/healthz","port":8080},"periodSeconds":3,"failureThreshold":12}}]'
+    kubectl -n demo rollout status deploy/boot
+    ```
+
+    ### Common mistakes
+
+    - Removing or weakening the liveness probe.
+    - A budget smaller than the boot time.
+
+    ### Check your work
+
+    The new pod is Ready with RESTARTS 0, and both probes are in the template.
   scenario: |
     In namespace **`k341`** the Deployment **`slowapp`** runs a container that
     takes about **20 seconds** before it serves `/healthz`, but its liveness
@@ -256,15 +337,40 @@ exercises:
   kind: build
   tags: [service, externalname, dns]
   tutorial: |
-    **Concept.** A **Service of type `ExternalName`** is a DNS alias: it has
-    no selector and no cluster IP, and resolving it returns a **CNAME** to the
-    `externalName` you set. Apps use the in-cluster name (`db.k342.svc`) while
-    the real target — a managed database, another cluster — can change in one
-    place.
+    **What you're learning.** An `ExternalName` Service: an in-cluster name that's a DNS alias for an outside host.
 
-    **Read up on:**
-    - `Service` `type: ExternalName`, `spec.externalName`
-    - CoreDNS CNAME resolution
+    ### The idea
+
+    An ExternalName Service has no selector and no ClusterIP; cluster DNS answers its name with a **CNAME** to `spec.externalName` (k8s-049). Apps use the stable in-cluster name; the real target can change in one place.
+
+    ```yaml
+    apiVersion: v1
+    kind: Service
+    metadata: {name: queue, namespace: demo}
+    spec:
+      type: ExternalName
+      externalName: mq.vendor.example.com
+    ```
+
+    ### Commands you'll use
+
+    ```bash
+    kubectl apply -f /lab/queue.yaml
+    kubectl get svc queue -n demo
+    kubectl run t --rm -it --image=busybox:1.37 -n demo -- nslookup queue.demo.svc.cluster.local
+    ```
+    ```text
+    queue.demo.svc.cluster.local	canonical name = mq.vendor.example.com
+    ```
+
+    ### Common mistakes
+
+    - An IP or URL in `externalName`: it must be a hostname.
+    - Adding `ports` and expecting port mapping: ExternalName only affects DNS.
+
+    ### Check your work
+
+    `nslookup` from a pod in the namespace shows the CNAME.
   scenario: |
     In namespace **`k342`**, create a Service **`db`** of type
     **`ExternalName`** that aliases to **`postgres.prod.example.com`**. From a
@@ -305,16 +411,38 @@ exercises:
   kind: build
   tags: [configmap, immutable, rollout]
   tutorial: |
-    **Concept.** An **immutable** ConfigMap or Secret (`immutable: true`)
-    can't be edited after creation — only deleted and recreated. It prevents
-    accidental in-place edits that would silently change running pods, and it
-    lets the kubelet skip watching it, which scales better. To change config
-    you create a **new** object and point the Deployment at it, getting a
-    controlled rollout.
+    **What you're learning.** Changing configuration held in an immutable ConfigMap: a new versioned object and a rollout.
 
-    **Read up on:**
-    - `ConfigMap`/`Secret` `immutable: true`
-    - Versioned config objects (`app-config-v2`) + a rollout
+    ### The idea
+
+    An immutable ConfigMap can't be edited (k8s-074). The update path is a **new** ConfigMap (`-v2`) and pointing the Deployment at it (k8s-315); that's a template change, so it rolls out new pods with the new value, and rolling back is pointing back at `-v1`.
+
+    ### Commands you'll use
+
+    ```bash
+    kubectl get cm -n demo
+    kubectl get deploy site -n demo -o jsonpath='{.spec.template.spec.containers[0].env}'; echo
+    kubectl apply -f - <<'EOF'
+    apiVersion: v1
+    kind: ConfigMap
+    metadata: {name: site-config-v2, namespace: demo}
+    immutable: true
+    data: {THEME: dark}
+    EOF
+    kubectl -n demo patch deploy site --type=json -p '[{"op":"replace",
+      "path":"/spec/template/spec/containers/0/env/0/valueFrom/configMapKeyRef/name","value":"site-config-v2"}]'
+    kubectl -n demo rollout status deploy/site
+    kubectl -n demo exec deploy/site -- printenv THEME
+    ```
+
+    ### Common mistakes
+
+    - Editing `-v1`: "field is immutable".
+    - Forgetting `immutable: true` on the new one.
+
+    ### Check your work
+
+    The running pod prints the new value, and both ConfigMaps are immutable.
   scenario: |
     In namespace **`k349`** a Deployment **`app`** reads config from the
     ConfigMap **`app-config-v1`** (env var `MODE`, currently `blue`), which is
@@ -393,16 +521,43 @@ exercises:
   kind: build
   tags: [cordon, drain, node, day-two]
   tutorial: |
-    **Concept.** Before patching a node you **cordon** it
-    (`SchedulingDisabled`) so no new pods land there, then **drain** it to
-    evict the running pods elsewhere (honouring PodDisruptionBudgets). When the
-    work is done, **uncordon** returns it to service. On a one-worker cluster,
-    draining leaves pods Pending — which is exactly why you cordon during
-    windows, not casually.
+    **What you're learning.** Cordoning a node for a maintenance window, and putting it back into service.
 
-    **Read up on:**
-    - `kubectl cordon|uncordon|drain NODE`
-    - `--ignore-daemonsets`, `--delete-emptydir-data`
+    ### The idea
+
+    | command | effect |
+    |---|---|
+    | `kubectl cordon NODE` | no new pods (`SchedulingDisabled`); running pods stay |
+    | `kubectl drain NODE` | cordon + evict pods (k8s-093) |
+    | `kubectl uncordon NODE` | schedulable again |
+
+    On a cluster with one worker, draining leaves workloads Pending, so a short window often uses only cordon.
+
+    ### Commands you'll use
+
+    ```bash
+    kubectl cordon node01
+    kubectl get node node01
+    ```
+    ```text
+    NAME     STATUS                     ROLES    AGE
+    node01   Ready,SchedulingDisabled   worker   3d
+    ```
+
+    ```bash
+    echo cordoned > /lab/note.txt
+    kubectl uncordon node01
+    kubectl get node node01         # Ready
+    ```
+
+    ### Common mistakes
+
+    - Leaving the node cordoned: the task ends with it schedulable.
+    - Draining when only cordon is asked.
+
+    ### Check your work
+
+    The note file holds the word, `kubectl get node node01` shows plain `Ready`, and the pod still runs.
   scenario: |
     Node **`node01`** needs a quick maintenance window. In namespace
     **`k352`** a Deployment **`web`** runs on it. Do this and leave the node
@@ -457,15 +612,42 @@ exercises:
   kind: build
   tags: [projected-volume, configmap, secret, downward-api]
   tutorial: |
-    **Concept.** A **projected volume** mounts several sources into one
-    directory: ConfigMap keys, Secret keys, downward-API files and service-
-    account tokens, each at a path you choose. It keeps an app's config in a
-    single mount instead of several, and each source stays independently
-    managed.
+    **What you're learning.** One **projected** volume holding ConfigMap, Secret and downward-API files.
 
-    **Read up on:**
-    - `volumes[].projected.sources` (`configMap`, `secret`, `downwardAPI`)
-    - `items` with `key`/`path`
+    ### The idea
+
+    A `projected` volume merges several sources into one directory (k8s-076). Without `items`, a source contributes **all** its keys, each as a file named after the key.
+
+    ```yaml
+    volumes:
+    - name: settings
+      projected:
+        sources:
+        - configMap: {name: web-cfg}
+        - secret: {name: web-sec}
+        - downwardAPI:
+            items:
+            - path: annotations
+              fieldRef: {fieldPath: metadata.annotations}
+    ```
+
+    ### Commands you'll use
+
+    ```bash
+    kubectl get cm web-cfg -n demo -o jsonpath='{.data}' | jq keys
+    kubectl apply -f /lab/web.yaml
+    kubectl exec web -n demo -- ls /settings
+    kubectl exec web -n demo -- cat /settings/annotations
+    ```
+
+    ### Common mistakes
+
+    - Two separate volumes at the same path.
+    - The downward API needs `items` (with `path`); config sources don't.
+
+    ### Check your work
+
+    `ls` in the mount shows the three files and each has the expected content.
   scenario: |
     In namespace **`k336`** there is a ConfigMap **`app-cfg`** (key
     `app.properties`) and a Secret **`app-sec`** (key `api.key`). Create a Pod
@@ -535,15 +717,48 @@ exercises:
   kind: build
   tags: [security-context, non-root, capabilities, read-only-rootfs]
   tutorial: |
-    **Concept.** A hardened container runs as a **non-root** user, can't
-    **escalate** privileges, **drops all capabilities**, and has a
-    **read-only root filesystem** (with writable `emptyDir`s only where it
-    truly needs them). These `securityContext` settings shrink the blast
-    radius if the process is compromised, and they're what Pod Security's
-    `restricted` level expects.
+    **What you're learning.** A hardened container: non-root, no escalation, no capabilities, read-only root filesystem, with a writable `/tmp`.
 
-    **Read up on:**
-    - `securityContext`: `runAsNonRoot`, `runAsUser`, `allowPrivilegeEscalation`, `capabilities.drop`, `readOnlyRootFilesystem`, `seccompProfile`
+    ### The idea
+
+    The securityContext fields of k8s-209 and k8s-210, plus an `emptyDir` where the program must write (k8s-225):
+
+    ```yaml
+    containers:
+    - name: app
+      image: busybox:1.37
+      command: ["sleep", "infinity"]
+      securityContext:
+        runAsUser: 20001
+        runAsNonRoot: true
+        allowPrivilegeEscalation: false
+        readOnlyRootFilesystem: true
+        capabilities: {drop: [ALL]}
+      volumeMounts: [{name: tmp, mountPath: /tmp}]
+    volumes:
+    - {name: tmp, emptyDir: {}}
+    ```
+
+    ### Commands you'll use
+
+    ```bash
+    kubectl apply -f /lab/locked.yaml
+    kubectl exec locked -n demo -- id
+    kubectl exec locked -n demo -- sh -c 'echo ok > /tmp/t && cat /tmp/t'
+    kubectl exec locked -n demo -- sh -c 'echo no > /t'
+    ```
+    ```text
+    sh: can't create /t: Read-only file system
+    ```
+
+    ### Common mistakes
+
+    - `capabilities` at the pod level (it's per container).
+    - Forgetting the `/tmp` volume.
+
+    ### Check your work
+
+    `id` shows the uid, writing `/tmp` works, writing `/` fails.
   scenario: |
     In namespace **`k337`**, create a Pod **`hardened`** running
     **`busybox:1.37`** (`sleep infinity`) whose container:
@@ -609,15 +824,40 @@ exercises:
   kind: build
   tags: [pod-disruption-budget, availability, drain]
   tutorial: |
-    **Concept.** A **PodDisruptionBudget** limits how many pods of an
-    application may be **voluntarily** disrupted at once (a node drain, a
-    rollout). `minAvailable` / `maxUnavailable` set the floor/ceiling, and the
-    eviction API refuses a disruption that would breach it. It protects
-    availability during cluster maintenance.
+    **What you're learning.** A PodDisruptionBudget that keeps a minimum number of replicas during voluntary disruptions.
 
-    **Read up on:**
-    - `PodDisruptionBudget` (`minAvailable`, `maxUnavailable`, `selector`)
-    - `kubectl get pdb` (`ALLOWED DISRUPTIONS`)
+    ### The idea
+
+    `minAvailable: N` = at least N selected pods must stay up during drains and evictions (k8s-144, k8s-322). With 3 replicas and `minAvailable: 2`, `ALLOWED DISRUPTIONS` is 1.
+
+    ```yaml
+    apiVersion: policy/v1
+    kind: PodDisruptionBudget
+    metadata: {name: cart-pdb, namespace: demo}
+    spec:
+      minAvailable: 2
+      selector: {matchLabels: {app: cart}}
+    ```
+
+    ### Commands you'll use
+
+    ```bash
+    kubectl apply -f /lab/pdb.yaml                     # or: kubectl create pdb cart-pdb -n demo --selector=app=cart --min-available=2
+    kubectl get pdb -n demo
+    ```
+    ```text
+    NAME       MIN AVAILABLE   MAX UNAVAILABLE   ALLOWED DISRUPTIONS
+    cart-pdb   2               N/A               1
+    ```
+
+    ### Common mistakes
+
+    - A selector that doesn't match the pods' labels: `ALLOWED DISRUPTIONS 0`, protecting nothing.
+    - `apiVersion: policy/v1beta1`: removed.
+
+    ### Check your work
+
+    `ALLOWED DISRUPTIONS` is 1 once all replicas are Ready.
   scenario: |
     In namespace **`k339`** a Deployment **`api`** runs **3** replicas
     (label `app=api`). Create a **PodDisruptionBudget** named **`api-pdb`**
@@ -674,15 +914,47 @@ exercises:
   kind: build
   tags: [resource-quota, limit-range, multi-tenancy]
   tutorial: |
-    **Concept.** A **ResourceQuota** caps total resource use in a namespace
-    (sum of requests/limits, object counts). A **LimitRange** supplies
-    **default** requests/limits to pods that don't set them, and can enforce
-    min/max per container. Together they make a namespace a safe tenant:
-    nothing runs without requests, and no tenant can exhaust the cluster.
+    **What you're learning.** Making a namespace a safe tenant: a ResourceQuota for totals and a LimitRange for defaults.
 
-    **Read up on:**
-    - `ResourceQuota` (`hard`: `requests.cpu`, `requests.memory`, `pods`)
-    - `LimitRange` (`default`, `defaultRequest`)
+    ### The idea
+
+    - **ResourceQuota** caps sums and counts (k8s-146). Once it covers `requests.cpu`, every pod must declare it...
+    - ...which a **LimitRange** with defaults supplies (k8s-145, k8s-147).
+
+    ```yaml
+    apiVersion: v1
+    kind: ResourceQuota
+    metadata: {name: q, namespace: demo}
+    spec:
+      hard: {requests.cpu: "2", requests.memory: 2Gi, pods: "10"}
+    ---
+    apiVersion: v1
+    kind: LimitRange
+    metadata: {name: d, namespace: demo}
+    spec:
+      limits:
+      - type: Container
+        defaultRequest: {cpu: 50m, memory: 64Mi}
+        default: {cpu: 250m, memory: 128Mi}
+    ```
+
+    ### Commands you'll use
+
+    ```bash
+    kubectl apply -f /lab/tenant.yaml
+    kubectl run plain -n demo --image=nginx:1.29-alpine
+    kubectl get pod plain -n demo -o jsonpath='{.spec.containers[0].resources}'; echo
+    kubectl describe quota q -n demo
+    ```
+
+    ### Common mistakes
+
+    - Creating the pod **before** the LimitRange: it's rejected by the quota (no requests).
+    - Quoting: `pods: "5"` and `requests.cpu: "1"` as strings in YAML are fine; unquoted numbers too.
+
+    ### Check your work
+
+    The pod is Running with the default request, and the quota shows it under Used.
   scenario: |
     In namespace **`k340`**, create:
 
@@ -750,16 +1022,38 @@ exercises:
   kind: build
   tags: [statefulset, headless-service, dns, storage]
   tutorial: |
-    **Concept.** A **StatefulSet** gives pods **stable identities**:
-    ordered names (`web-0`, `web-1`), and with a **headless Service**
-    (`clusterIP: None`) each pod gets its own DNS record
-    `POD.SERVICE.NS.svc`. Add `volumeClaimTemplates` and every pod gets its
-    own persistent volume that follows its identity. This is how databases and
-    queues run on Kubernetes.
+    **What you're learning.** A StatefulSet with a headless Service and a volume per replica.
 
-    **Read up on:**
-    - `StatefulSet` `serviceName`, `volumeClaimTemplates`
-    - Headless Service (`clusterIP: None`) and per-pod DNS
+    ### The idea
+
+    Stable names (`web-0`, `web-1`), a headless Service (`clusterIP: None`) giving each pod a DNS name `POD.SERVICE.NS.svc.cluster.local`, and `volumeClaimTemplates` creating one PVC per pod (`data-web-0`...) (k8s-111).
+
+    ### Commands you'll use
+
+    ```bash
+    kubectl apply -f /lab/sts.yaml
+    kubectl get sts,pods,pvc -n demo
+    ```
+    ```text
+    statefulset.apps/db   2/2
+    pod/db-0   1/1   Running
+    pod/db-1   1/1   Running
+    persistentvolumeclaim/data-db-0   Bound   100Mi
+    persistentvolumeclaim/data-db-1   Bound   100Mi
+    ```
+
+    ```bash
+    kubectl run t --rm -it --image=busybox:1.37 -n demo -- nslookup db-0.db.demo.svc.cluster.local
+    ```
+
+    ### Common mistakes
+
+    - `serviceName` not matching the headless Service's name.
+    - A normal ClusterIP Service: per-pod DNS doesn't exist.
+
+    ### Check your work
+
+    Two pods Ready, two PVCs Bound, and the per-pod DNS name resolves to `web-0`'s IP.
   scenario: |
     In namespace **`k343`**, create:
 
@@ -843,15 +1137,32 @@ exercises:
   kind: build
   tags: [rbac, service-account, role, authorization]
   tutorial: |
-    **Concept.** Give an app only the API access it needs. A
-    **ServiceAccount** is the pod's identity; a **Role** lists allowed verbs
-    on resources in a namespace; a **RoleBinding** ties them together. A
-    read-only monitor gets `get`/`list`/`watch` on pods and nothing else.
-    `kubectl auth can-i --as=system:serviceaccount:NS:SA` tests the result.
+    **What you're learning.** A read-only identity for an app: ServiceAccount, Role, RoleBinding, verified with `can-i`.
 
-    **Read up on:**
-    - `ServiceAccount`, `Role` (`rules`), `RoleBinding`
-    - `kubectl auth can-i --as=...`
+    ### The idea
+
+    ServiceAccount = the pod's identity (k8s-203); Role = verbs on resources (k8s-201); RoleBinding = the link. Read-only on pods = `get`, `list`, `watch` on `pods`.
+
+    ### Commands you'll use
+
+    ```bash
+    kubectl -n demo create serviceaccount monitor
+    kubectl -n demo create role pods-ro --verb=get,list,watch --resource=pods
+    kubectl -n demo create rolebinding monitor-pods-ro --role=pods-ro --serviceaccount=demo:monitor
+    SA=system:serviceaccount:demo:monitor
+    kubectl -n demo auth can-i list pods --as=$SA       # yes
+    kubectl -n demo auth can-i create pods --as=$SA     # no
+    kubectl -n demo auth can-i get secrets --as=$SA     # no
+    ```
+
+    ### Common mistakes
+
+    - `--serviceaccount=monitor` without the namespace.
+    - Binding the built-in `view` ClusterRole: it grants more than pods.
+
+    ### Check your work
+
+    `can-i` says yes for list pods, no for create pods and get secrets.
   scenario: |
     In namespace **`k345`**, create:
 
@@ -895,15 +1206,43 @@ exercises:
   kind: build
   tags: [job, indexed, parallelism, batch]
   tutorial: |
-    **Concept.** An **Indexed** Job runs `completions` pods, each with a
-    unique **completion index** in `JOB_COMPLETION_INDEX`, up to `parallelism`
-    at a time. It's the pattern for partitioned batch work: shard *N* over the
-    indices, and each pod handles its slice. The Job is complete when every
-    index has succeeded.
+    **What you're learning.** An **Indexed** Job: N pods, each with its own index.
 
-    **Read up on:**
-    - `Job` `completionMode: Indexed`, `completions`, `parallelism`
-    - The `JOB_COMPLETION_INDEX` environment variable
+    ### The idea
+
+    `completionMode: Indexed` with `completions: N` runs pods 0..N-1, each with `JOB_COMPLETION_INDEX` set; `parallelism` limits how many at once (k8s-136, k8s-122).
+
+    ```yaml
+    spec:
+      completionMode: Indexed
+      completions: 4
+      parallelism: 2
+      template:
+        spec:
+          restartPolicy: Never
+          containers:
+          - name: w
+            image: busybox:1.37
+            command: ["sh", "-c", "echo part $JOB_COMPLETION_INDEX"]
+    ```
+
+    ### Commands you'll use
+
+    ```bash
+    kubectl apply -f /lab/parts.yaml
+    kubectl get job parts -n demo -w
+    kubectl logs -n demo -l job-name=parts --prefix
+    ```
+    `--prefix` labels each log line with its pod.
+
+    ### Common mistakes
+
+    - Forgetting `sh -c`: no shell to expand the variable.
+    - `restartPolicy: Always`: not allowed in a Job.
+
+    ### Check your work
+
+    `COMPLETIONS` reaches 6/6, and the logs show indices 0 to 5.
   scenario: |
     In namespace **`k346`**, create an **Indexed** Job **`shard`** with
     **`completions: 6`** and **`parallelism: 2`** (image **`busybox:1.37`**).
@@ -961,16 +1300,30 @@ exercises:
   kind: build
   tags: [cronjob, concurrency, history-limits]
   tutorial: |
-    **Concept.** A **CronJob** schedules Jobs. `concurrencyPolicy: Forbid`
-    skips a run if the previous one is still going (vital for backups that
-    must not overlap), and `successfulJobsHistoryLimit` /
-    `failedJobsHistoryLimit` bound how many finished Jobs are kept so old pods
-    don't pile up. `startingDeadlineSeconds` caps how late a missed run may
-    still start.
+    **What you're learning.** A CronJob that never overlaps itself, with bounded history, and triggering it by hand.
 
-    **Read up on:**
-    - `CronJob` `schedule`, `concurrencyPolicy`, `successfulJobsHistoryLimit`
-    - `kubectl create job --from=cronjob/...` to trigger one now
+    ### The idea
+
+    `concurrencyPolicy: Forbid` skips a run while the previous is still active; the history limits cap kept Jobs; `kubectl create job --from=cronjob/X` runs one now (k8s-125, k8s-126).
+
+    ### Commands you'll use
+
+    ```bash
+    kubectl apply -f /lab/sync-cron.yaml
+    kubectl get cronjob sync -n demo -o jsonpath='{.spec.concurrencyPolicy} {.spec.successfulJobsHistoryLimit} {.spec.failedJobsHistoryLimit}'; echo
+    kubectl -n demo create job sync-now --from=cronjob/sync
+    kubectl -n demo wait --for=condition=complete job/sync-now --timeout=60s
+    kubectl -n demo logs job/sync-now
+    ```
+
+    ### Common mistakes
+
+    - Policy fields inside `jobTemplate` (they're on the CronJob's `spec`).
+    - An unquoted schedule `* * * * *` in YAML: quote it.
+
+    ### Check your work
+
+    The CronJob shows the three settings, and the manual Job is `Complete`.
   scenario: |
     In namespace **`k347`**, create a CronJob **`backup`** that:
 
@@ -1034,14 +1387,33 @@ exercises:
   kind: build
   tags: [deployment, rollout, pause, undo]
   tutorial: |
-    **Concept.** `kubectl rollout pause` freezes a Deployment so you can make
-    **several changes** (image, env, resources) without triggering a new
-    rollout after each one. `rollout resume` then rolls them out together.
-    `rollout undo` reverts to the previous revision when a change goes wrong.
+    **What you're learning.** Batching several template changes into one rollout with pause/resume.
 
-    **Read up on:**
-    - `kubectl rollout pause|resume|status|undo`, `--to-revision`
-    - `kubectl rollout history`
+    ### The idea
+
+    Pause → change image, env, resources → resume = **one** new ReplicaSet and one new revision (k8s-032).
+
+    ### Commands you'll use
+
+    ```bash
+    kubectl -n demo rollout history deploy/site
+    kubectl -n demo rollout pause deploy/site
+    kubectl -n demo set image deploy/site site=nginx:1.29-alpine
+    kubectl -n demo set env deploy/site REGION=eu
+    kubectl -n demo rollout resume deploy/site
+    kubectl -n demo rollout status deploy/site
+    kubectl -n demo rollout history deploy/site         # exactly one new revision
+    ```
+    `set image` takes `CONTAINER=IMAGE`; check the container's name first (`kubectl get deploy site -o jsonpath='{..containers[*].name}'`).
+
+    ### Common mistakes
+
+    - Forgetting `resume`: nothing rolls out.
+    - A wrong container name in `set image`: "unable to find container".
+
+    ### Check your work
+
+    History shows one new revision, and pods run the new image with the variable.
   scenario: |
     In namespace **`k348`** the Deployment **`web`** runs
     **`nginx:1.27-alpine`**. Without causing two separate rollouts:
@@ -1099,16 +1471,30 @@ exercises:
   kind: build
   tags: [ephemeral-container, kubectl-debug, troubleshooting]
   tutorial: |
-    **Concept.** You can't `exec` a shell into a container that doesn't ship
-    one (distroless, scratch). **`kubectl debug`** attaches an **ephemeral
-    container** to a running pod — sharing its network namespace, and with
-    `--target` its process namespace — so you can troubleshoot with a full
-    toolbox image without changing the pod spec. The ephemeral container shows
-    up under `spec.ephemeralContainers`.
+    **What you're learning.** `kubectl debug` with an ephemeral container to test a pod from **inside its network namespace**.
 
-    **Read up on:**
-    - `kubectl debug POD --image=... --target=...`
-    - `spec.ephemeralContainers`
+    ### The idea
+
+    All containers of a pod, including an ephemeral one, share the pod's network: `localhost` inside the ephemeral container is the pod itself (k8s-316). Useful when the app's image has no tools.
+
+    ### Commands you'll use
+
+    ```bash
+    kubectl -n demo debug api --image=busybox:1.37 -c net -- wget -qO- http://localhost:8080/health
+    kubectl -n demo logs api -c net
+    kubectl -n demo get pod api -o jsonpath='{.spec.ephemeralContainers[*].name}'; echo
+    kubectl -n demo logs api -c net > /lab/health.txt
+    ```
+    The ephemeral container runs the command once and exits; its output stays in its logs.
+
+    ### Common mistakes
+
+    - `kubectl run` a separate pod: it has its **own** localhost.
+    - Re-using an ephemeral container name: each `debug` needs a new `-c`.
+
+    ### Check your work
+
+    The pod lists the ephemeral container, and the file holds the page.
   scenario: |
     In namespace **`k351`** the pod **`web`** runs nginx and serves on port
     80, but you need to probe it from inside its network namespace. Use
@@ -1157,15 +1543,42 @@ exercises:
   kind: build
   tags: [priority-class, preemption, scheduling]
   tutorial: |
-    **Concept.** A **PriorityClass** attaches a numeric priority to pods.
-    When a high-priority pod can't be scheduled because the node is full, the
-    scheduler **preempts** (evicts) lower-priority pods to make room.
-    `preemptionPolicy` controls whether a class preempts. It's how you
-    guarantee capacity for critical workloads on a busy cluster.
+    **What you're learning.** PriorityClasses and **preemption** on a full node.
 
-    **Read up on:**
-    - `PriorityClass`, `priorityClassName`
-    - Scheduler preemption
+    ### The idea
+
+    A higher-priority pod that can't fit makes the scheduler **evict** lower-priority pods to make room (k8s-092). Priority comes from a PriorityClass named in `priorityClassName`.
+
+    ### Commands you'll use
+
+    ```bash
+    kubectl create priorityclass batch-low --value=10
+    kubectl create priorityclass ops-high --value=500000
+    kubectl describe node node01 | sed -n '/Allocated resources/,/Events/p' | grep memory
+    kubectl -n demo apply -f - <<'EOF'
+    apiVersion: v1
+    kind: Pod
+    metadata: {name: urgent}
+    spec:
+      priorityClassName: ops-high
+      containers:
+      - name: urgent
+        image: busybox:1.37
+        command: ["sleep", "infinity"]
+        resources: {requests: {memory: 512Mi}}
+    EOF
+    kubectl -n demo get pods -o wide
+    kubectl get events -n demo --field-selector reason=Preempted
+    ```
+
+    ### Common mistakes
+
+    - Creating the PriorityClasses after the pods that use them: those pods are rejected ("no PriorityClass with name ... was found").
+    - The high-priority pod requesting less than the free memory: no preemption happens (it just fits).
+
+    ### Check your work
+
+    `urgent` is Running and some low-priority pods were preempted (fewer Ready than desired).
   scenario: |
     Node **`node01`** is the only schedulable node. In namespace **`k338`**:
 
@@ -1248,16 +1661,39 @@ exercises:
   kind: build
   tags: [network-policy, egress, calico]
   tutorial: |
-    **Concept.** An **egress** NetworkPolicy restricts where pods may
-    **connect out** to. A default-deny egress policy (empty `egress`, with
-    `policyTypes: [Egress]`) blocks everything; you then allow only what's
-    needed — **DNS** (UDP/TCP 53 to kube-system) and the specific services the
-    app talks to. It stops a compromised pod from reaching the internet or
-    other tenants.
+    **What you're learning.** An egress allow-list for one workload: DNS plus one service.
 
-    **Read up on:**
-    - NetworkPolicy `policyTypes: [Egress]`, `egress` rules
-    - Allowing DNS: `to` kube-system `namespaceSelector` + `ports` 53
+    ### The idea
+
+    `policyTypes: [Egress]` on the client's pods, then one rule for DNS (UDP and TCP 53 to kube-system) and one for the allowed pods' **container** port (k8s-184).
+
+    ### Commands you'll use
+
+    ```yaml
+    spec:
+      podSelector: {matchLabels: {app: frontend}}
+      policyTypes: [Egress]
+      egress:
+      - to: [{namespaceSelector: {matchLabels: {kubernetes.io/metadata.name: kube-system}}}]
+        ports: [{protocol: UDP, port: 53}, {protocol: TCP, port: 53}]
+      - to: [{podSelector: {matchLabels: {app: backend}}}]
+        ports: [{protocol: TCP, port: 80}]
+    ```
+
+    ```bash
+    kubectl apply -f /lab/egress.yaml
+    kubectl -n demo exec client -- wget -qO- -T 3 http://backend | head -1    # works
+    kubectl -n demo exec client -- wget -qO- -T 3 http://other                # times out
+    ```
+
+    ### Common mistakes
+
+    - No DNS rule: both requests fail with "bad address".
+    - Selecting the wrong pods with `podSelector` (the client, not the servers, is what the policy selects).
+
+    ### Check your work
+
+    From the client pod: the allowed service answers, the other one times out.
   scenario: |
     Namespace **`k344`** has a client pod **`app`** (label `app=client`) and a
     Service **`allowed`** (an nginx pod, label `app=allowed`). Another Service
@@ -1354,16 +1790,51 @@ exercises:
   kind: build
   tags: [validating-admission-policy, cel, governance]
   tutorial: |
-    **Concept.** A **ValidatingAdmissionPolicy** enforces rules at the API
-    server using **CEL** expressions — no webhook server to run. A
-    `ValidatingAdmissionPolicy` defines the check; a
-    `ValidatingAdmissionPolicyBinding` says where it applies and whether it
-    `Deny`s. It's the built-in way to require labels, forbid `:latest`, or
-    enforce limits across a namespace.
+    **What you're learning.** Requiring a label with a ValidatingAdmissionPolicy written in CEL.
 
-    **Read up on:**
-    - `ValidatingAdmissionPolicy` (`matchConstraints`, `validations[].expression`)
-    - `ValidatingAdmissionPolicyBinding` (`validationActions: [Deny]`, `matchResources`)
+    ### The idea
+
+    Policy = what to check (CEL); binding = where and with which action (k8s-294). Checking a label safely in CEL:
+
+    ```text
+    has(object.metadata.labels) && 'owner' in object.metadata.labels && object.metadata.labels['owner'] != ''
+    ```
+    `has(...)` first: objects without any labels have no `labels` map at all, and reading it would be an error.
+
+    To target one namespace by name, the binding's `namespaceSelector` uses the automatic label `kubernetes.io/metadata.name`.
+
+    ### Commands you'll use
+
+    ```bash
+    kubectl apply -f /lab/require-owner.yaml        # policy + binding
+    kubectl -n demo create deployment nolabel --image=nginx:1.29-alpine --dry-run=server
+    ```
+    ```text
+    error: ... denied request: every Deployment must have a non-empty 'owner' label
+    ```
+
+    ```bash
+    kubectl -n demo apply --dry-run=server -f - <<'EOF'
+    apiVersion: apps/v1
+    kind: Deployment
+    metadata: {name: ok, labels: {owner: web}}
+    spec:
+      selector: {matchLabels: {app: ok}}
+      template:
+        metadata: {labels: {app: ok}}
+        spec: {containers: [{name: n, image: nginx:1.29-alpine}]}
+    EOF
+    ```
+
+    ### Common mistakes
+
+    - Forgetting the binding, or `validationActions: [Deny]`.
+    - The expression on `object.spec.template.metadata.labels` when the Deployment's own labels are meant.
+    - Testing immediately: the policy can take a few seconds to take effect.
+
+    ### Check your work
+
+    A Deployment without the label is rejected in that namespace, one with it is admitted, and other namespaces aren't affected.
   scenario: |
     Enforce that every **Deployment** in namespace **`k350`** carries a
     non-empty **`team`** label. Create:
@@ -1474,16 +1945,29 @@ exercises:
   kind: fix
   tags: [incident, troubleshooting, deployment, probes, resources]
   tutorial: |
-    **Concept.** A stuck rollout has a cause the API will tell you, if you
-    read in order: `kubectl rollout status`, then `kubectl get pods`/`describe`
-    for the new ReplicaSet's pods, then events. Common culprits: a wrong image
-    tag (ImagePullBackOff), a readiness probe hitting the wrong path/port, or
-    requests the node can't satisfy (Pending/Unschedulable). Fix the one cause,
-    and the rollout finishes.
+    **What you're learning.** Unblocking a wedged rollout with three independent faults.
 
-    **Read up on:**
-    - `kubectl rollout status`, `describe pod`, `get events`
-    - Reading `ImagePullBackOff`, probe failures, `FailedScheduling`
+    ### Method
+
+    Read in order: `rollout status`, the new pods' status and `describe`, the events (k8s-028, k8s-100).
+
+    | symptom | cause | fix |
+    |---|---|---|
+    | `ImagePullBackOff` | tag typo | `kubectl set image` |
+    | Running, `0/1` | readiness probe on the wrong port | JSON patch the probe port |
+    | `Pending`, `Insufficient memory` | request bigger than the node | lower the request |
+
+    One JSON patch can carry several operations; `set image` first, then the patch, then `rollout status`.
+
+    ```bash
+    kubectl -n k353 get pods
+    kubectl -n k353 describe pod -l app=payments | grep -E 'Failed|Unhealthy|Insufficient' | head
+    kubectl -n k353 get deploy payments -o json | jq '.spec.template.spec.containers[0] | {image, readinessProbe, resources}'
+    ```
+
+    ### Check your work
+
+    `kubectl -n k353 rollout status deploy/payments` finishes, `3/3` Ready, with the right image, probe port 80 and a 64Mi request.
   scenario: |
     In namespace **`k353`** the Deployment **`payments`** is stuck mid-rollout
     after a bad change. It has **three** problems the last commit introduced:
