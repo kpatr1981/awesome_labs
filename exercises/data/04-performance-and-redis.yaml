@@ -12,23 +12,49 @@ exercises:
   kind: fix
   tags: [postgres, explain, index, partial, vacuum]
   tutorial: |
-    **Concept.** Performance work starts with reading what the database really did, and only then changing something. `EXPLAIN` shows the plan the planner chose; `EXPLAIN ANALYZE` also runs the query and reports what each node actually did, including how many rows a filter threw away. A scan that discards almost everything it reads is the classic sign of a missing index.
+    **What you're learning.** Reading `EXPLAIN ANALYZE`, composite and partial indexes, and vacuum and autovacuum.
 
-    **Indexes are shaped by the query.** A B-tree index stores rows ordered by its key columns. A multicolumn index can answer an equality filter and hand rows back already ordered, so the planner skips the sort step entirely. Column order decides whether that works.
+    ### The idea
 
-    **Indexes have a cost.** Every index takes space and slows writes. When a query always targets a small subset of a big table, a *partial* index (`WHERE` in the index definition) contains only those rows, so it is far smaller. The planner uses it only when it can prove the query's condition matches the index's.
+    **`EXPLAIN ANALYZE`** runs the query and reports what really happened: each node's actual rows and time, and lines like `Rows Removed by Filter: N` (rows read and thrown away, a sign that an index would help).
 
-    **Dead rows.** PostgreSQL never overwrites a row on `UPDATE`: it writes a new version and leaves the old one as a dead tuple until `VACUUM` marks the space reusable. Autovacuum normally does this, but it can be switched off per table, and heavy batch updates pile up bloat quickly.
+    | problem | index |
+    |---|---|
+    | `WHERE a = ? ORDER BY b DESC LIMIT n` | **composite** `(a, b DESC)`: the rows come out of the index already in order, so no `Sort` node |
+    | a query only ever filters on a rare value | **partial** `... WHERE status = 'open'`: tiny, because it holds only those rows |
 
-    **Read up on:**
-    - `EXPLAIN (ANALYZE)` — actual time, `rows`, `loops`, and the lines under a filtered scan
-    - `CREATE INDEX` with several columns — why column order matters, `ASC` / `DESC`
-    - `Sort` versus `Limit` nodes — what a top-N sort costs
-    - `CREATE INDEX ... WHERE` — the partial index syntax and predicate matching
-    - `pg_relation_size` and `pg_size_pretty` — measure an index
-    - `VACUUM` — what it reclaims and whether it locks the table
-    - `pg_stat_user_tables` — `n_dead_tup`, `last_vacuum`
-    - Storage parameters (`reloptions`) and `ALTER TABLE ... RESET`
+    **Dead tuples**: an `UPDATE` writes a new row version and leaves the old one **dead**. `VACUUM` reclaims them, and autovacuum does it automatically unless a table's storage parameters turn it off (`autovacuum_enabled=false`). `pg_stat_user_tables.n_dead_tup` counts them. `ALTER TABLE t RESET (param)` removes an override.
+
+    ### Commands you'll use
+
+    ```bash
+    q() { docker exec kl-pg psql -U lab -d lab -c "$1"; }
+    q "EXPLAIN ANALYZE SELECT * FROM sensors WHERE kind = 'cold'"
+    ```
+    ```text
+    Seq Scan on sensors  (actual time=0.01..9.8 rows=120 loops=1)
+      Filter: (kind = 'cold'::text)
+      Rows Removed by Filter: 49880
+    ```
+    ```bash
+    q "CREATE INDEX ON logs (host_id, at DESC)"
+    q "EXPLAIN SELECT * FROM logs WHERE host_id = 7 ORDER BY at DESC LIMIT 10"     # Index Scan, no Sort
+    q "CREATE INDEX ON orders (placed_at) WHERE state = 'new'"
+    q "SELECT pg_size_pretty(pg_indexes_size('orders'))"
+    q "SELECT relname, n_dead_tup, last_vacuum, last_autovacuum FROM pg_stat_user_tables WHERE relname = 'batches'"
+    q "SELECT reloptions FROM pg_class WHERE relname = 'batches'"
+    q "ALTER TABLE batches RESET (autovacuum_enabled)" ; q "VACUUM (ANALYZE) batches"
+    ```
+
+    ### Common mistakes
+
+    - A full index on `status`: far over the size budget.
+    - `(user_id)` alone: still needs a `Sort`.
+    - `VACUUM FULL`: rewrites the table under an exclusive lock. Not needed here.
+
+    ### Check your work
+
+    The filter count is in the file, `events`' plan has no `Sort`, `tickets` uses an index with all non-PK indexes under 64 kB, and `jobs_log` has under 500 dead tuples with no autovacuum override.
   scenario: |
     PostgreSQL runs in the container **`kl-pg`** (database, user and password: `lab`):
 
@@ -199,20 +225,41 @@ exercises:
   kind: build
   tags: [redis, hyperloglog, hash, hincrby]
   tutorial: |
-    **Concept.** Picking the right Redis structure turns a job that would need a lot of client-side bookkeeping into a couple of commands. Two end-of-day jobs show the range.
+    **What you're learning.** HyperLogLog for counting distinct items, and applying a batch of changes to a hash atomically.
 
-    A **HyperLogLog** estimates the number of distinct elements in a tiny, fixed amount of memory. It stores no elements, so you can't list them, but several can be merged to count distinct elements across all of them. That matters because daily unique counts can't simply be added: a visitor who came on two days would be counted twice. The estimate has a small standard error, which is the price of the tiny size.
+    ### The idea
 
-    A **hash** stores many field/value pairs under one key. Single fields can be read, changed or removed atomically, without rewriting the whole object, so `HINCRBY` is safe even with several writers. It also returns the new value, which is useful when a result triggers a further step.
+    **HyperLogLog** counts **distinct** elements in about 12 KB, whatever the count, with ~0.8% error:
 
-    **Read up on:**
-    - `PFADD` and `PFCOUNT` — adding elements and reading the estimate
-    - `PFMERGE destkey sourcekey...` — union of several HyperLogLogs
-    - Why a plain sum of daily counts overcounts returning visitors
-    - `HGET`, `HGETALL` and `HLEN` — inspecting a hash
-    - `HINCRBY key field increment` — atomic arithmetic, negative values too
-    - `HDEL` — remove a single field
-    - Shell loops over `redis-cli` — applying many commands from a file
+    | command | does |
+    |---|---|
+    | `PFADD key elem...` | add |
+    | `PFCOUNT key...` | estimated distinct count (of the union, if several keys) |
+    | `PFMERGE dest src...` | store the union |
+
+    **Hashes**: `HINCRBY hash field -N` changes a counter atomically. Several changes to the same field must all be applied, so sum them first or send them all. `MULTI` … `EXEC` runs a batch as one unit.
+
+    ### Commands you'll use
+
+    ```bash
+    r() { docker exec kl-redis redis-cli "$@"; }
+    r PFMERGE kl:uniq:q1 kl:uniq:jan kl:uniq:feb kl:uniq:mar
+    r PFCOUNT kl:uniq:q1
+    r HGETALL kl:inventory | paste - - | head -3
+    awk '{s[$1]+=$2} END {for (k in s) print "HINCRBY kl:inventory", k, -s[k]}' /lab/sold.txt \
+      | (echo MULTI; cat; echo EXEC) | docker exec -i kl-redis redis-cli
+    ```
+    `redis-cli` reads commands from stdin when it's piped.
+
+    ### Common mistakes
+
+    - `PFCOUNT` of each day added up: visitors on several days count more than once.
+    - `HSET` to a computed value: wrong if anything else changes stock meanwhile.
+    - Ignoring a SKU that appears on several lines.
+
+    ### Check your work
+
+    `kl:visitors:week` exists and `visitors.txt` holds its `PFCOUNT`, and each SKU's stock dropped by its total sold.
   scenario: |
     Redis is running in **`kl-redis`** (`docker exec -it kl-redis redis-cli`).
 
@@ -322,22 +369,43 @@ exercises:
   kind: build
   tags: [postgres, generated-column, upsert, on-conflict, listen-notify, trigger]
   tutorial: |
-    **Concept.** A lot of application code exists to keep data consistent: recalculating a derived value, checking whether a row exists before writing it, polling a table for changes. Each of those is racy or easy to forget, and PostgreSQL can do all three itself, for every client.
+    **What you're learning.** Letting PostgreSQL maintain data: generated columns, `INSERT ... ON CONFLICT` upserts, and `LISTEN`/`NOTIFY` triggers.
 
-    **Derived values.** A generated column is computed from other columns of the same row by the database, so it can never drift out of sync. A stored one is calculated on write and kept on disk. Its expression may only use the row's own columns and immutable functions.
+    ### The idea
 
-    **Insert or update.** An upsert inserts a row, or, when it collides with an existing key, updates the existing row instead. It is atomic, so concurrent writers can't create duplicates or lose updates. The conflict needs a primary key or unique constraint, and `EXCLUDED` is the pseudo-table holding the row you tried to insert.
+    | need | feature |
+    |---|---|
+    | a column always derived from others | `ADD COLUMN x int GENERATED ALWAYS AS (expr) STORED`: computed on every write. The expression may only use the **same row** and immutable functions, not other tables |
+    | insert or add to an existing row | `INSERT ... ON CONFLICT (key) DO UPDATE SET hits = t.hits + EXCLUDED.hits` (`EXCLUDED` = the row you tried to insert) |
+    | tell listeners about new rows | an `AFTER INSERT` trigger calling `pg_notify('channel', NEW.id::text)`. Clients `LISTEN channel` |
 
-    **Telling others.** PostgreSQL has a lightweight message channel built in. A session subscribes to a named channel, and any session can send a message with an optional text payload. Messages are delivered when the sender's transaction commits. Combined with a trigger, every insert announces itself, whoever does it.
+    Since a generated column can't read `settings`, a value it needs from there must be **known at definition time**. Read it first and write it into the expression.
 
-    **Read up on:**
-    - `GENERATED ALWAYS AS (...) STORED` and `ALTER TABLE ... ADD COLUMN`
-    - Integer division in PostgreSQL — how results are truncated
-    - `INSERT ... ON CONFLICT (col) DO UPDATE` — the conflict target and action
-    - `EXCLUDED`, and referring to the existing row by table name in `SET`
-    - `LISTEN`, `NOTIFY` and `pg_notify()` — subscribing and sending, payload limits
-    - `CREATE TRIGGER` and trigger functions in PL/pgSQL — `NEW`
-    - `AFTER INSERT ... FOR EACH ROW` — when a trigger fires
+    ### Commands you'll use
+
+    ```bash
+    q() { docker exec -i kl-pg psql -U lab -d lab -v ON_ERROR_STOP=1 "$@"; }
+    q -Atc "SELECT value FROM config WHERE key = 'fee_pct'"
+    q -c "ALTER TABLE parts ADD COLUMN cost_total int GENERATED ALWAYS AS (base_cents * 105 / 100) STORED"
+    q -c "INSERT INTO visits(path, n) VALUES ('/a', 3), ('/b', 1)
+          ON CONFLICT (path) DO UPDATE SET n = visits.n + EXCLUDED.n"
+    q <<'SQL'
+    CREATE FUNCTION tell_new() RETURNS trigger LANGUAGE plpgsql AS $$
+    BEGIN PERFORM pg_notify('new_ticket', NEW.id::text); RETURN NEW; END $$;
+    CREATE TRIGGER tickets_notify AFTER INSERT ON tickets FOR EACH ROW EXECUTE FUNCTION tell_new();
+    SQL
+    ```
+    To test a notification: in one psql, `LISTEN new_ticket;` then, after an insert elsewhere, run any query (`SELECT 1;`). psql prints `Asynchronous notification "new_ticket" with payload "42" received`.
+
+    ### Common mistakes
+
+    - A duplicate path twice in the same `INSERT ... ON CONFLICT`: "cannot affect row a second time". Aggregate the CSV first.
+    - Integer division rounding: check the expected result for one row by hand.
+    - `BEFORE` trigger returning `NULL`: the insert is discarded.
+
+    ### Check your work
+
+    `price_with_vat` updates when a price changes, `page_hits` holds old + new counts, and `LISTEN new_order` receives each new order's id.
   scenario: |
     PostgreSQL runs in the container **`kl-pg`** (`docker exec -it kl-pg psql -U lab -d lab`).
 
@@ -496,13 +564,44 @@ exercises:
   kind: build
   tags: [postgres, window, frame]
   tutorial: |
-    **Concept.** A window function computes over a set of rows related to the current one. The frame clause narrows that set, for instance to the current row and the rows just before it, which gives moving averages.
+    **What you're learning.** Moving averages with **window frames**: `ROWS BETWEEN 6 PRECEDING AND CURRENT ROW`.
 
-    **Read up on:**
-    - `OVER (ORDER BY ...)` — default frame versus an explicit frame
-    - `ROWS BETWEEN n PRECEDING AND CURRENT ROW` — counting rows
-    - `ROWS` versus `RANGE` frames — how each treats neighbours
-    - Filtering on a window result — why it needs a subquery or CTE
+    ### The idea
+
+    A window function with a **frame** looks at a sliding set of rows around the current one:
+
+    ```sql
+    avg(amount) OVER (ORDER BY day ROWS BETWEEN 6 PRECEDING AND CURRENT ROW)
+    ```
+    That's a 7-day trailing average. The first six days have fewer than seven rows in their frame. If only **full** windows count, exclude them: number the rows (`row_number() OVER (ORDER BY day)`) and keep `rn >= 7`. A named window (`WINDOW w AS (...)`) avoids repeating the definition.
+
+    ### Commands you'll use
+
+    ```bash
+    docker exec kl-pg psql -U lab -d lab -c "
+      SELECT day, amount,
+             round(avg(amount) OVER w, 2) AS avg3,
+             count(*) OVER w AS n
+      FROM visits_daily
+      WINDOW w AS (ORDER BY day ROWS BETWEEN 2 PRECEDING AND CURRENT ROW)
+      ORDER BY day LIMIT 5"
+    ```
+    ```text
+        day     | amount | avg3  | n
+     2026-01-01 |    100 | 100.0 | 1
+     2026-01-02 |    130 | 115.0 | 2
+     2026-01-03 |     90 | 106.7 | 3
+    ```
+
+    ### Common mistakes
+
+    - `RANGE` with a date ordering and gaps: use `ROWS` for "the last 7 rows".
+    - Counting partial windows at the start.
+    - `ORDER BY avg DESC LIMIT 1` without a tie rule: read the task for which day to report.
+
+    ### Check your work
+
+    `answer.txt` holds the day whose full 7-day trailing average is highest, and the same query with `rn >= 7` confirms it.
   scenario: |
     PostgreSQL runs in the container **`kl-pg`** (`docker exec -it kl-pg psql -U lab -d lab`).
 
@@ -548,49 +647,29 @@ exercises:
   kind: fix
   tags: [capstone, postgres, explain, index, partial, vacuum, reloptions, upsert, listen-notify, trigger, redis, hash, hyperloglog]
   tutorial: |
-    **Concept.** A readiness review goes through every hot path of a system and fixes what
-    the load test found, without changing what the application sends. Each fix is small, but
-    each one rests on knowing how the store works underneath: what the planner can use, what
-    an index costs, what `VACUUM` leaves alone, and which Redis structure fits a job.
+    **What you're learning.** A readiness checklist across PostgreSQL and Redis: index budgets, online vacuum, counter folding, set-to-HLL conversion, and change notifications.
 
-    **An index shaped by the query and by its budget.** A multicolumn B-tree answers an
-    equality filter on its first column and returns rows already ordered by the second, so a
-    `LIMIT` query needs no `Sort`. When the query always targets a small subset (only active
-    rows), a **partial** index holds only that subset and is a fraction of the size. Every
-    index costs disk and slows writes, and `pg_stat_user_indexes.idx_scan` tells you which
-    ones were never used.
+    ### Method
 
-    **Vacuum without a rewrite.** Plain `VACUUM` marks dead row versions reusable while the
-    table stays online. `VACUUM FULL` rewrites the whole table into a new file under an
-    exclusive lock: a fix that takes the shop down. Per-table storage parameters
-    (`reloptions`) can switch autovacuum off or make it wait so long that it never runs;
-    `ALTER TABLE ... RESET (...)` removes individual ones and leaves the rest alone.
+    | part | approach (exercise) |
+    |---|---|
+    | 1. category page | a **partial** composite index matching the query's `WHERE` and `ORDER BY`, within the size budget, so drop superfluous indexes if needed (keep the PK and `products_sku_key`). `EXPLAIN` shows `Index Cond` (data-026) |
+    | 2. carts | plain `VACUUM` (online, not `FULL`), `ALTER TABLE ... RESET` every `autovacuum_*` option, keep `fillfactor` (data-026) |
+    | 3. view counters | read the hash, fold it into `product_stats` with `INSERT ... ON CONFLICT DO UPDATE SET views = views + EXCLUDED.views`, then remove **exactly** the fields you folded (`HDEL`), so concurrent increments aren't lost (data-030) |
+    | 4. visitor sets | per key: `SMEMBERS` → `PFADD tmp ...` → `RENAME tmp key` (an atomic replace) (data-034) |
+    | 5. price feed | an `AFTER UPDATE OF price` trigger with `WHEN (OLD.price IS DISTINCT FROM NEW.price)` calling `pg_notify('price_changed', NEW.id || ':' || NEW.price)` (data-030) |
 
-    **Counters that move between stores.** Redis hashes are a cheap place to count with
-    `HINCRBY`. A nightly job folds them into PostgreSQL with an upsert (`ON CONFLICT ... DO
-    UPDATE`), which adds to existing rows and creates new ones in one statement. Renaming the
-    hash before reading it means increments that arrive meanwhile land in a fresh key and are
-    not lost when you delete the old one.
+    `reloptions` in `pg_class` shows a table's storage parameters, so you can see which autovacuum overrides exist.
 
-    **Exact or estimated.** A Redis set of visitor IDs gives an exact count but grows with
-    every visitor. A HyperLogLog gives the distinct count with a small standard error in at
-    most about 12 kB, whatever the number of visitors. Converting means feeding every member
-    into a new HyperLogLog and swapping it in with `RENAME`, which replaces the destination
-    whatever its type.
+    ### Check your work
 
-    **Announcing changes, but only real ones.** A trigger can call `pg_notify()` for every
-    change. A `WHEN (OLD.col IS DISTINCT FROM NEW.col)` condition on the trigger keeps it
-    quiet for updates that don't change that column, including `SET col = col`.
-
-    **Read up on:**
-    - `EXPLAIN` — `Index Cond`, `Filter`, `Sort` and `Limit` nodes
-    - `CREATE INDEX ... (a, b) WHERE ...` — multicolumn partial indexes and predicate matching
-    - `pg_stat_user_indexes` (`idx_scan`), `pg_relation_size()`, `pg_size_pretty()`, `DROP INDEX`
-    - `VACUUM` versus `VACUUM FULL`; `pg_relation_filenode()`; `pg_stat_user_tables` (`n_dead_tup`, `last_vacuum`)
-    - `pg_class.reloptions`, `ALTER TABLE ... RESET (param, ...)`, `fillfactor`
-    - Redis `HGETALL`, `RENAME`, `DEL`; `INSERT ... ON CONFLICT (...) DO UPDATE` and `EXCLUDED`
-    - Redis `SMEMBERS`, `SCARD`, `PFADD`, `PFCOUNT`, `TYPE`, `MEMORY USAGE`
-    - `CREATE TRIGGER ... AFTER UPDATE ... FOR EACH ROW WHEN (...)`, `pg_notify()`, `LISTEN`
+    ```bash
+    q() { docker exec kl-pg psql -U lab -d lab -Atc "$1"; }
+    q "SELECT pg_size_pretty(pg_indexes_size('products'))"
+    q "SELECT reloptions, (SELECT n_dead_tup FROM pg_stat_user_tables WHERE relname = 'cart_items') FROM pg_class WHERE relname = 'cart_items'"
+    docker exec kl-redis redis-cli TYPE kl:visitors:2026-11-25          # string (HLL)
+    docker exec kl-redis redis-cli HLEN kl:views:pending
+    ```
   scenario: |
     **Ticket PERF-1127**, from Marta (storefront lead):
 

@@ -12,18 +12,36 @@ exercises:
   kind: fix
   tags: [postgres, replication, lag, replication-slot, wal, netem]
   tutorial: |
-    **Concept.** A streaming standby is behind for one of three reasons, and `pg_stat_replication` on the primary tells you which. It reports four positions in the WAL for each standby: `sent_lsn` (what the primary has sent), `write_lsn` and `flush_lsn` (what the standby has received and saved) and `replay_lsn` (what it has applied). If `sent_lsn` trails the primary's `pg_current_wal_lsn()`, the network or the sender is the bottleneck. If the standby has received the WAL but `replay_lsn` trails, the standby is choosing not to apply it, or can't apply it fast enough. On the standby, `pg_last_wal_receive_lsn()` and `pg_last_wal_replay_lsn()` show the same split.
+    **What you're learning.** Replication lag, `recovery_min_apply_delay`, and an abandoned **replication slot** that retains WAL.
 
-    A **replication slot** makes the primary keep every WAL segment its consumer hasn't confirmed yet, so a standby that disconnects can always catch up. The cost is that a slot whose consumer is gone keeps WAL forever, and `pg_wal` grows until the disk fills and the primary stops. `pg_replication_slots` shows each slot, whether something is connected (`active`) and how far back it holds WAL (`restart_lsn`). `max_slot_wal_keep_size` caps what any slot may hold; a slot past the cap is invalidated instead of filling the disk.
+    ### The idea
 
-    Traffic control (`tc`) can shape a Linux interface. Its `netem` queueing discipline adds delay, loss or a bandwidth limit, which is useful for tests and easy to forget afterwards. Each container's `eth0` is one end of a veth pair whose other end lives on the host.
+    - A standby can be **delayed on purpose**: `recovery_min_apply_delay` makes it replay WAL only after that delay. `ALTER SYSTEM RESET ...` + `pg_reload_conf()` removes it.
+    - A **replication slot** makes the primary keep WAL until the slot's consumer has received it. A slot whose consumer is gone keeps WAL **forever**, and the disk fills. `pg_replication_slots` shows each slot, whether it's `active`, and how far behind it is.
 
-    **Read up on:**
-    - `pg_stat_replication` and its `*_lsn` and `*_lag` columns; `pg_wal_lsn_diff()`
-    - `recovery_min_apply_delay`, and `ALTER SYSTEM` / `ALTER SYSTEM RESET` with `pg_reload_conf()`
-    - `pg_replication_slots`, `pg_drop_replication_slot()`, `max_slot_wal_keep_size`
-    - `pg_ls_waldir()` and `CHECKPOINT`
-    - `tc qdisc show` and `tc qdisc del`; finding a container's host-side veth from `/sys/class/net/eth0/iflink`
+    ```sql
+    SELECT slot_name, active, pg_size_pretty(pg_wal_lsn_diff(pg_current_wal_lsn(), restart_lsn)) AS retained
+    FROM pg_replication_slots;
+    ```
+    `pg_drop_replication_slot(name)` removes one (it must be inactive).
+
+    ### Commands you'll use
+
+    ```bash
+    docker exec stby psql -U lab -d lab -Atc 'SHOW recovery_min_apply_delay'
+    docker exec stby psql -U lab -d lab -Atc 'SELECT now() - pg_last_xact_replay_timestamp()'
+    docker exec prim psql -U lab -d lab -c "SELECT slot_name, active, pg_size_pretty(pg_wal_lsn_diff(pg_current_wal_lsn(), restart_lsn)) FROM pg_replication_slots"
+    docker exec prim psql -U lab -d lab -c 'SELECT client_addr, application_name, state, replay_lag FROM pg_stat_replication'
+    ```
+
+    ### Common mistakes
+
+    - Dropping the slot the real replica uses.
+    - Setting the delay to `0` with `SET` (session-only) instead of in the server config.
+
+    ### Check your work
+
+    The replica's replay lag is near zero and a new row on the primary appears there at once, the orphan slot is gone, and the replica's own slot remains `active`.
   scenario: |
     The primary **`kl-pg`** streams to the standby **`kl-replica`** on the Docker network
     `kl-repl`, through the replication slot **`replica_slot`**. Connect to either with
@@ -137,18 +155,44 @@ exercises:
   kind: fix
   tags: [postgres, backup, pitr, wal, archive, recovery]
   tutorial: |
-    **Concept.** A dump restores the database as it was when the dump ran. Point-in-time recovery (PITR) restores it as it was at *any* moment you choose. It needs two things taken before the accident: a **base backup** (a copy of the data directory, from `pg_basebackup`) and a continuous **WAL archive** (every write-ahead log segment, copied away by `archive_command` as it fills).
+    **What you're learning.** **Point-in-time recovery**: base backup + archived WAL + a recovery target, in a separate container.
 
-    To recover, you lay the base backup down in an empty data directory, create a `recovery.signal` file and tell the server where the archive is (`restore_command`) and where to stop (`recovery_target_time`, `recovery_target_xid` or `recovery_target_lsn`). On start it replays the archived WAL from the backup forward and stops at the first transaction that committed **after** the target. What happens then is set by `recovery_target_action`: by default it **pauses**, read-only, so you can look before deciding.
+    ### The idea
 
-    A recovered copy is rarely the new production database: everything written after the target would be lost. The usual move is to recover a side copy to just before the mistake and copy the damaged rows back.
+    With a **base backup** (a physical copy) and **every WAL segment** archived since, PostgreSQL can replay history up to any moment:
 
-    **Read up on:**
-    - Continuous archiving and point-in-time recovery, in the PostgreSQL manual
-    - `pg_basebackup -Ft`: what `base.tar.gz` and `pg_wal.tar.gz` contain
-    - `recovery.signal`, `restore_command`, `recovery_target_time`, `recovery_target_action`
-    - `pg_get_wal_replay_pause_state()` and `pg_is_in_recovery()`
-    - `COPY ... TO STDOUT` and `COPY ... FROM STDIN` for moving rows between servers
+    1. restore the base backup into a new data directory;
+    2. set `restore_command = 'cp /archive/%f %p'` (how to fetch archived WAL), `recovery_target_time = '...'` and `recovery_target_action = 'promote'` (or `pause`), and create `recovery.signal`;
+    3. start it: it replays WAL until the target and stops there.
+
+    Recover into a **separate** server, then copy only the lost rows back, so newer changes in production stay.
+
+    `recovery_target_inclusive` (default `on`) decides whether a transaction committed exactly at that time is included. Pick a time just **before** the bad statement, as given in the incident notes, with its time zone.
+
+    ### Commands you'll use
+
+    ```bash
+    cat /lab/INCIDENT.md
+    docker run --rm -v kl-backup:/backup -v pitr-data:/var/lib/postgresql/data postgres:16-alpine sh -c '
+      cp -a /backup/base/. /var/lib/postgresql/data/ &&
+      echo "restore_command = '\''cp /archive/%f %p'\''" >> /var/lib/postgresql/data/postgresql.auto.conf &&
+      echo "recovery_target_time = '\''2026-03-02 14:07:59+00'\''" >> /var/lib/postgresql/data/postgresql.auto.conf &&
+      echo "recovery_target_action = '\''promote'\''" >> /var/lib/postgresql/data/postgresql.auto.conf &&
+      touch /var/lib/postgresql/data/recovery.signal && chown -R postgres:postgres /var/lib/postgresql/data'
+    docker run -d --name pitr -v pitr-data:/var/lib/postgresql/data -v kl-archive:/archive:ro postgres:16-alpine
+    docker logs pitr 2>&1 | grep -E 'recovery stopping|archive recovery complete'
+    ```
+    The base backup may be a tar (`base.tar.gz`): extract it instead of copying.
+
+    ### Common mistakes
+
+    - Recovering over the production data directory.
+    - No time zone in the target: interpreted in the server's zone.
+    - Copying back rows that still exist (`ON CONFLICT DO NOTHING` or `WHERE NOT EXISTS`).
+
+    ### Check your work
+
+    `kl-pitr` has the orders as they were just before the DELETE, and `kl-pg` has them back alongside everything written since.
   scenario: |
     PostgreSQL runs in **`kl-pg`** (`docker exec -it kl-pg psql -U lab -d lab`). Its data is in
     the volume `kl-pg-data`. Every WAL segment is archived to the volume **`kl-archive`**
@@ -301,22 +345,41 @@ exercises:
   kind: fix
   tags: [postgres, replication, synchronous, quorum, synchronous_commit, netem]
   tutorial: |
-    **Concept.** With **synchronous replication** a commit doesn't return to the client until a standby confirms it has the WAL, so an acknowledged write survives the loss of the primary. `synchronous_standby_names` says which standbys count, matched against each standby's `application_name`:
+    **What you're learning.** **Synchronous replication**: quorum settings, and per-role `synchronous_commit`.
 
-    - `'s1'` or `'FIRST 1 (s1, s2)'`: priority. The first listed standby that is connected is the synchronous one; the others are spares.
-    - `'ANY 1 (s1, s2)'`: quorum. A commit waits for any one of them, whichever answers first.
-    - `''`: no synchronous replication at all.
+    ### The idea
 
-    If no standby that counts is reachable, commits wait forever. They are already durable on the primary, but the client never hears back, and in `pg_stat_activity` the session waits with `wait_event = 'SyncRep'`. The setting is reloadable, so changing it releases waiting commits at once.
+    With `synchronous_standby_names` set, a commit waits until standbys confirm it:
 
-    `synchronous_commit` decides, per transaction, how long a commit waits: `remote_apply`, `on` (the default: flushed on the standby), `remote_write`, `local` (only the primary's own disk) or `off`. It can be set for the whole server, a database, a role (`ALTER ROLE ... SET`) or a session, so data that can afford to lose its last few seconds doesn't have to pay for the round trip.
+    | setting | waits for |
+    |---|---|
+    | `'s1, s2'` or `FIRST 2 (s1, s2)` | both: one down means writes **hang** |
+    | `FIRST 1 (s1, s2)` | the first available in priority order |
+    | `ANY 1 (s1, s2)` | any one of them (quorum) |
 
-    **Read up on:**
-    - `synchronous_standby_names`: the `FIRST` and `ANY` syntax
-    - `pg_stat_replication.sync_state`: `sync`, `potential`, `quorum`, `async`
-    - `synchronous_commit` and its levels
-    - `ALTER ROLE ... SET`, and `wal_sender_timeout`
-    - `pg_stat_activity.wait_event`
+    Names match the standbys' `application_name`. `synchronous_commit` can be lowered **per role, database or session** for data that doesn't need it: `local` (flush locally, don't wait for standbys) or `off`.
+
+    ### Commands you'll use
+
+    ```bash
+    q() { docker exec kl-pri psql -U lab -d lab -c "$1"; }
+    q 'SHOW synchronous_standby_names'
+    q 'SELECT application_name, sync_state, state FROM pg_stat_replication'
+    q "ALTER SYSTEM SET synchronous_standby_names = 'ANY 1 (a1, a2)'"
+    q 'SELECT pg_reload_conf()'
+    q "ALTER ROLE logger SET synchronous_commit = local"
+    docker stop kl-a2; q "INSERT INTO t VALUES (1)"                  # completes
+    docker exec kl-pri psql -U logger -d lab -Atc 'SHOW synchronous_commit'
+    ```
+
+    ### Common mistakes
+
+    - Emptying `synchronous_standby_names`: every write becomes asynchronous, which drops the durability requirement.
+    - `ALTER ROLE` affects **new** sessions only.
+
+    ### Check your work
+
+    With either standby stopped, writes by `lab` complete. `audit` sessions show `synchronous_commit = local`.
   scenario: |
     The primary **`kl-pg`** replicates to two standbys on the Docker network `kl-repl`:
     **`kl-s1`** (application name `s1`) and **`kl-s2`** (application name `s2`). Commits are
@@ -419,23 +482,40 @@ exercises:
   kind: fix
   tags: [postgres, vacuum, xmin, prepared-transactions, replication-slot, bloat, operations]
   tutorial: |
-    **Concept.** An `UPDATE` or `DELETE` in PostgreSQL leaves the old row version behind, and `VACUUM` reclaims it once **no transaction could still see it**. The oldest snapshot anyone might still use is the **xmin horizon**, and VACUUM can't remove anything newer than it. One old holder anywhere stops cleanup in every table of the database, so tables bloat, queries slow down and, left long enough, the server heads toward transaction ID wraparound.
+    **What you're learning.** What stops `VACUUM` from removing dead rows: prepared transactions, old open transactions, and stale replication slots.
 
-    Three holders are easy to forget, because none of them shows up as a busy query:
+    ### The idea
 
-    - **A session idle in a transaction.** An open `REPEATABLE READ` transaction keeps its snapshot until it ends. `pg_stat_activity` shows it with `state = 'idle in transaction'` and a `backend_xmin`. `idle_in_transaction_session_timeout` ends such sessions automatically, and it can be set per role.
-    - **A prepared transaction.** `PREPARE TRANSACTION` (two-phase commit) detaches a transaction from its session, and it lives on, across restarts, until someone runs `COMMIT PREPARED` or `ROLLBACK PREPARED`. They are listed in `pg_prepared_xacts`.
-    - **A replication slot.** A standby with `hot_standby_feedback = on` reports its oldest snapshot to the primary, and the slot stores it in `pg_replication_slots.xmin`. If the standby goes away, the slot keeps that old xmin forever.
+    VACUUM can only remove a dead row if **no transaction might still need to see it**. The oldest such "snapshot holder" sets the limit (the **xmin horizon**):
 
-    `VACUUM (VERBOSE)` reports dead row versions it found but couldn't remove, and the oldest xmin that stopped it.
+    | holder | find it | clear it |
+    |---|---|---|
+    | a **prepared** transaction (two-phase commit) | `pg_prepared_xacts` | `ROLLBACK PREPARED 'gid'` (or `COMMIT PREPARED`) |
+    | an old open transaction | `pg_stat_activity` (`backend_xmin`, `xact_start`) | terminate it, and set `idle_in_transaction_session_timeout` |
+    | a replication slot | `pg_replication_slots` (`xmin`, `catalog_xmin`) | drop the abandoned slot |
+    | a standby with `hot_standby_feedback` | `pg_stat_replication.backend_xmin` | |
 
-    **Read up on:**
-    - `VACUUM (VERBOSE)` output: "dead but not yet removable" and "removable cutoff"
-    - `pg_stat_activity.backend_xmin`, `pg_prepared_xacts`, `pg_replication_slots.xmin`
-    - `COMMIT PREPARED` and `ROLLBACK PREPARED`
-    - `pg_terminate_backend()`
-    - `idle_in_transaction_session_timeout` and `ALTER ROLE ... SET`
-    - `pg_stat_user_tables.n_dead_tup`
+    `VACUUM (VERBOSE) t` reports "N dead row versions cannot be removed yet, oldest xmin: X".
+
+    ### Commands you'll use
+
+    ```bash
+    q() { docker exec kl-pg psql -U lab -d lab -c "$1"; }
+    q 'VACUUM (VERBOSE) big' 2>&1 | grep -E 'cannot be removed|oldest xmin'
+    q 'SELECT gid, prepared, owner FROM pg_prepared_xacts'
+    q "SELECT pid, usename, state, backend_xmin, xact_start FROM pg_stat_activity WHERE backend_xmin IS NOT NULL ORDER BY xact_start"
+    q 'SELECT slot_name, active, xmin, catalog_xmin FROM pg_replication_slots'
+    ```
+    Prepared transactions survive restarts, so they're easy to forget.
+
+    ### Common mistakes
+
+    - `VACUUM FULL`: it can't remove those rows either.
+    - Committing a half-finished import's prepared transaction when the task wants it discarded (read the task).
+
+    ### Check your work
+
+    After clearing all three, `VACUUM (VERBOSE)` removes the dead rows, `n_dead_tup` drops, and the report role has an idle-in-transaction timeout.
   scenario: |
     PostgreSQL runs in **`kl-pg`** (`docker exec -it kl-pg psql -U lab -d lab`). The
     `events` table is updated constantly and is now several times its real size: `VACUUM`
@@ -565,21 +645,37 @@ exercises:
   kind: fix
   tags: [postgres, pgbouncer, connection-pooling, pool_mode, operations]
   tutorial: |
-    **Concept.** Every PostgreSQL connection is a process, so applications put a pooler such as **PgBouncer** in front: clients connect to PgBouncer, and it hands them one of a small number of real server connections. The pool mode decides how long a client keeps the server connection it was given:
+    **What you're learning.** **PgBouncer** pooling modes, timeouts and pool sizes.
 
-    - `session`: until the client disconnects. A client that connects and then sits idle holds a server connection the whole time.
-    - `transaction`: only until the end of each transaction, so idle clients cost nothing. Features that live in a session (session-level `SET`, advisory locks held across transactions, `LISTEN`, and depending on the version prepared statements) don't work reliably.
-    - `statement`: after every statement; multi-statement transactions aren't allowed.
+    ### The idea
 
-    When every server connection in a pool is taken, new requests **queue inside PgBouncer**. PostgreSQL itself looks idle, because the waiting is in front of it. Even in transaction mode a client that opens a transaction and then goes quiet pins its server connection; `idle_transaction_timeout` makes PgBouncer close such clients. Separately, `max_client_conn` caps how many clients PgBouncer accepts at all, and past it new clients are refused at once.
+    PgBouncer sits between clients and PostgreSQL and shares a few server connections among many clients:
 
-    PgBouncer has an admin console: connect to the special database `pgbouncer` as a user listed in `admin_users` and run `SHOW POOLS`, `SHOW CLIENTS`, `SHOW SERVERS`, `SHOW CONFIG` or `RELOAD`.
+    | `pool_mode` | a server connection is held for |
+    |---|---|
+    | `session` | the whole client session: idle clients pin connections |
+    | **`transaction`** | one transaction, then returned to the pool |
+    | `statement` | one statement |
 
-    **Read up on:**
-    - PgBouncer pool modes and their feature limits
-    - `default_pool_size`, `max_client_conn`, `idle_transaction_timeout` in `pgbouncer.ini`
-    - The admin console: `SHOW POOLS` (`cl_active`, `cl_waiting`, `sv_active`, `sv_idle`) and `RELOAD`
-    - `pgbench -n -f FILE -c CLIENTS -t TRANSACTIONS` for load tests with your own script
+    Other knobs in `pgbouncer.ini`: `default_pool_size` (server connections per user/db), `max_client_conn` (clients accepted), `idle_transaction_timeout` (disconnect a client idle **inside** a transaction). Apply changes with the admin console: `psql -p 6432 -U ADMIN pgbouncer -c 'RELOAD'`, or restart the container.
+
+    ### Commands you'll use
+
+    ```bash
+    grep -vE '^\s*(;|$)' /lab/pgbouncer/pgbouncer.ini
+    docker run --rm --network kl-pool -e PGPASSWORD=lab postgres:16-alpine psql -h kl-pgb -p 6432 -U lab pgbouncer -c 'SHOW POOLS' -c 'SHOW CONFIG' | grep -E 'pool_mode|max_client|default_pool|idle_transaction'
+    docker run --rm --network kl-pool -e PGPASSWORD=lab postgres:16-alpine psql -h kl-pgb -p 6432 -U lab pgbouncer -c 'RELOAD'
+    ```
+    `SHOW POOLS` shows `cl_waiting` (clients waiting for a server connection) and `sv_active`/`sv_idle`.
+
+    ### Common mistakes
+
+    - Transaction mode with session features (prepared statements, `SET`, advisory locks) in the app: check what the client uses.
+    - Raising `default_pool_size` beyond the server's `max_connections`.
+
+    ### Check your work
+
+    Idle clients no longer block others (`cl_waiting` is 0 under the test load), a forgotten transaction gets cut off by the timeout, and every client in the test can connect.
   scenario: |
     PostgreSQL runs in **`kl-pg`**, and the application reaches it only through PgBouncer in
     **`kl-pgb`** on port 6432 of the Docker network `kl-pool`. PgBouncer's configuration is
@@ -742,18 +838,33 @@ exercises:
   kind: fix
   tags: [postgres, migration, index, concurrently, lock_timeout, operations]
   tutorial: |
-    **Concept.** A migration runner applies numbered SQL files in order and records each one in a table such as `schema_migrations`. Wrapping each file and its record in one transaction makes it all-or-nothing: a failure leaves no trace and the file can simply run again.
+    **What you're learning.** Recovering from a half-applied migration, and `lock_timeout` so migrations fail fast instead of queuing.
 
-    Some statements can't run in a transaction. `CREATE INDEX CONCURRENTLY` builds an index without blocking writes, but it commits in several steps of its own. If it fails part way (a duplicate value for a unique index, a cancelled session), PostgreSQL leaves the index behind marked **invalid**: it isn't used for queries, but it is still updated on every write, and its name is taken, so running the migration again fails with "already exists". `pg_index.indisvalid` shows it, as does `\d table` in psql.
+    ### The idea
 
-    Schema changes also need locks. `ALTER TABLE` takes an `ACCESS EXCLUSIVE` lock, which has to wait for every transaction that has touched the table, even one that only read it and has been idle for hours. While it waits, it queues **in front of** everyone else, so ordinary queries on that table stop too. `lock_timeout` makes the statement give up after a bounded wait instead, so a migration fails fast and harmlessly and can be retried later.
+    1. **Half-applied**: a migration file that ran outside a transaction (or did DDL then failed) leaves part of its change behind. Read what's there (`\d table`, the migrations bookkeeping table) and finish the missing steps idempotently (`IF NOT EXISTS`), then record it as applied the way the tool does.
+    2. **Lock queues**: `ALTER TABLE` needs an exclusive lock. Waiting for it blocks **every** query that arrives after it. `SET lock_timeout = '5s'` makes the DDL give up instead, and the migration can be retried later. Set it per session (`PGOPTIONS='-c lock_timeout=5s'`) or in the script.
 
-    **Read up on:**
-    - `CREATE INDEX CONCURRENTLY` and what happens when it fails; `pg_index.indisvalid`
-    - `ALTER TABLE ... ADD CONSTRAINT ... UNIQUE USING INDEX`
-    - `lock_timeout`, and setting it with `SET`, or `PGOPTIONS='-c lock_timeout=5s'` for a whole client
-    - `pg_locks`, `pg_blocking_pids()` and `pg_terminate_backend()`
-    - Merging duplicate rows that other tables reference: `UPDATE ... FROM` then `DELETE`
+    ### Commands you'll use
+
+    ```bash
+    cat /lab/migrate.sh; ls /lab/migrations
+    docker exec kl-pg psql -U lab -d lab -c 'SELECT * FROM schema_migrations ORDER BY version'
+    docker exec kl-pg psql -U lab -d lab -c '\d orders'
+    docker exec -e PGOPTIONS='-c lock_timeout=5s' -i kl-pg psql -U lab -d lab -v ON_ERROR_STOP=1 < /lab/migrations/005_x.sql
+    ```
+    ```text
+    ERROR:  canceling statement due to lock timeout
+    ```
+
+    ### Common mistakes
+
+    - Re-running the failed file as it is: steps that did succeed fail now ("already exists").
+    - `statement_timeout` instead of `lock_timeout`: kills long legitimate statements too.
+
+    ### Check your work
+
+    Migration 004's end state is complete and recorded, every statement in `migrate.sh` runs with a 5 s lock timeout, and the remaining migrations are applied.
   scenario: |
     PostgreSQL runs in **`kl-pg`** (`docker exec -it kl-pg psql -U lab -d lab`). The schema
     is managed by **`/lab/migrate.sh`**, which applies the files in **`/lab/migrations`** in
@@ -941,18 +1052,35 @@ exercises:
   kind: fix
   tags: [redis, aof, persistence, corruption, recovery]
   tutorial: |
-    **Concept.** With `appendonly yes`, Redis logs every write command to the **append-only file** (AOF) and rebuilds its data at start-up by replaying it. Since Redis 7 the AOF is a directory (`appendonlydir`) of several files listed in a **manifest**: a **base** file (a snapshot, in RDB format by default) and one or more **incr** files holding the commands written since that snapshot, in the Redis protocol (RESP): `*3\r\n$3\r\nSET\r\n$3\r\nkey\r\n$5\r\nvalue\r\n` is `SET key value`.
+    **What you're learning.** A corrupted Redis AOF: `redis-check-aof --fix`, and recovering what the truncation drops.
 
-    If the last command in the file is cut short (a crash mid-write), Redis loads everything before it and carries on, because `aof-load-truncated` is on. Damage in the **middle** of a file is different: Redis refuses to start, because it can't know what the damaged bytes said. `redis-check-aof` finds the first bad offset. With `--fix` it repairs the file the only way it can: it **truncates** the file at the damage, which throws away the damaged command *and every command after it*, intact or not.
+    ### The idea
 
-    So a fix that "works" can silently lose far more than the damaged command. The commands after the damage are still in the original file, in order; `redis-cli --pipe` sends raw RESP to a server, so they can be replayed once the server is up again. Commands such as `INCRBY` or `RPUSH` are not idempotent: replaying one twice gives a different result from replaying it once.
+    If the AOF's last part is damaged, Redis refuses to start: `Bad file format reading the append only file`. **`redis-check-aof --fix FILE`** truncates the file at the first bad command, so **everything after it is lost**. Before fixing:
 
-    **Read up on:**
-    - Redis persistence: AOF, the multi-part AOF and its manifest, `aof-load-truncated`
-    - `redis-check-aof` and `--fix`
-    - The RESP protocol: arrays (`*N`) and bulk strings (`$len`)
-    - `redis-cli --pipe`
-    - Running a tool against a stopped container's volume: `docker run --rm -v VOLUME:/data ...`
+    1. **back up** the AOF directory;
+    2. after fixing, compare: the commands after the cut point are in the backup's damaged tail. Some may be recoverable (complete commands), others not.
+
+    Redis 7 uses a multi-part AOF: `appendonlydir/` with a base file, increment files and a manifest. Fix the **incr** file the error names.
+
+    ### Commands you'll use
+
+    ```bash
+    docker logs kl-cache 2>&1 | tail -3
+    docker run --rm -v cache-data:/data redis:7.4-alpine sh -c 'cp -a /data/appendonlydir /data/aof-backup; ls -l /data/appendonlydir'
+    docker run --rm -v cache-data:/data -w /data/appendonlydir redis:7.4-alpine sh -c 'yes | redis-check-aof --fix appendonly.aof.1.incr.aof'
+    docker run --rm -v cache-data:/data redis:7.4-alpine sh -c 'tail -c 600 /data/aof-backup/appendonly.aof.1.incr.aof | cat -v'
+    ```
+    AOF commands are RESP: `*3` (three parts), `$3` (length) `SET`, and so on. A complete command has all its parts.
+
+    ### Common mistakes
+
+    - Fixing without a backup: the dropped tail is gone for good.
+    - Inventing a value for a key whose command was cut off: the task says list it as lost.
+
+    ### Check your work
+
+    Redis starts, the complete commands from the dropped tail are replayed, and `lost.txt` names only the keys whose writes can't be recovered, which don't exist in Redis.
   scenario: |
     Redis ran in the container **`kl-redis`** (`redis:7.4-alpine`) with AOF persistence,
     its data in the volume **`kl-redis-data`** (mounted at `/data`). After a storage incident
@@ -1125,18 +1253,35 @@ exercises:
   kind: fix
   tags: [redis, replication, full-sync, output-buffer, backlog, netem]
   tutorial: |
-    **Concept.** A Redis replica starts with a **full synchronisation**: the master snapshots its whole dataset as an RDB and streams it to the replica. Every write the master takes meanwhile is held in that replica's **output buffer** and sent once the snapshot is loaded. `client-output-buffer-limit replica <hard> <soft> <seconds>` protects the master's memory: a replica whose buffer passes the hard limit, or stays over the soft limit for the given seconds, is disconnected at once. Over a slow link with steady writes the buffer grows for as long as the snapshot takes to send, so a limit that is too small kills every attempt partway, and the replica starts over, forever. Each attempt costs the master a fork and a full snapshot. The master's log says `scheduled to be closed ASAP for overcoming of output buffer limits`.
+    **What you're learning.** Redis replication: full syncs, the **replica output buffer** limit, and the **backlog** for partial resyncs.
 
-    Once a replica is in sync, a short disconnection doesn't need a full sync again. The master keeps the most recent part of its replication stream in the **replication backlog** (`repl-backlog-size`), and a reconnecting replica asks to continue from its offset (`PSYNC`). If that offset is still in the backlog, the master sends only the missing part (a **partial resync**); if not, it falls back to a full sync. The backlog has to hold everything written during the longest outage you want to survive cheaply: write rate times outage length.
+    ### The idea
 
-    `INFO stats` on the master counts `sync_full`, `sync_partial_ok` and `sync_partial_err`. `INFO replication` shows each replica's state and offset, and on the replica `master_link_status` and `master_sync_in_progress`.
+    - A **full sync** sends an RDB snapshot and **buffers** the writes made meanwhile. If that buffer passes `client-output-buffer-limit replica HARD SOFT SECONDS`, the master drops the replica and the sync starts over, forever.
+    - After a short disconnect, a replica can **partially** resync from the master's **backlog** (`repl-backlog-size`, default 1 MB), if the missed writes still fit. Otherwise it's a full sync again.
 
-    **Read up on:**
-    - Redis replication: full sync, `PSYNC`, the replication ID and offset
-    - `client-output-buffer-limit` and its `replica` class
-    - `repl-backlog-size` and `repl-backlog-ttl`
-    - `INFO stats` and `INFO replication`; `master_repl_offset`
-    - `CONFIG SET` and `CONFIG REWRITE`
+    `CONFIG SET` applies both at once. `CONFIG REWRITE` writes them to `redis.conf` if the server uses one.
+
+    ### Commands you'll use
+
+    ```bash
+    docker logs kl-m 2>&1 | grep -iE 'output buffer|scheduled to be closed|full resync|partial' | tail -5
+    docker exec kl-m redis-cli CONFIG GET client-output-buffer-limit
+    docker exec kl-m redis-cli CONFIG SET client-output-buffer-limit 'replica 512mb 128mb 60'
+    docker exec kl-m redis-cli CONFIG SET repl-backlog-size 32mb
+    docker exec kl-r redis-cli INFO replication | grep -E 'master_link_status|master_sync_in_progress'
+    docker exec kl-m redis-cli INFO stats | grep -E 'sync_full|sync_partial_ok'
+    ```
+    Size the backlog from the write rate: bytes written per second × the outage you want to cover.
+
+    ### Common mistakes
+
+    - `client-output-buffer-limit` with the `normal` or `pubsub` class instead of `replica`.
+    - Restarting the master: it loses the backlog.
+
+    ### Check your work
+
+    The replica reaches `master_link_status:up`, and after a short `docker pause`/`unpause` of it, `sync_partial_ok` increases instead of `sync_full`.
   scenario: |
     The master **`kl-rm`** and its replica **`kl-rr`** run on the Docker network `kl-rnet`.
     The master holds about 30 MB of data, and a writer service (`kl-writer`) adds roughly
@@ -1266,18 +1411,38 @@ exercises:
   kind: fix
   tags: [postgres, replication, failover, promote, pg_rewind, timeline]
   tutorial: |
-    **Concept.** Failing over is three jobs, not one. **Promote** a standby: `pg_promote()` (or `pg_ctl promote`) ends recovery, and the server starts a new **timeline**, a new branch of WAL history numbered one higher, and accepts writes. **Repoint** the other standbys: each one's `primary_conninfo` must name the new primary. A standby can follow the timeline switch because `recovery_target_timeline` defaults to `latest`, as long as it hasn't replayed past the point where the new timeline branched off. **Rejoin** the old primary as a standby, but only after it has been made consistent with the new history.
+    **What you're learning.** **Failover**: promoting a standby, repointing another, and rejoining the old primary with `pg_rewind`.
 
-    That last step is the dangerous one. If the old primary wrote WAL that never reached the standbys before it died, its history has **diverged**: started as a standby it refuses to follow the new timeline, and started as it was it becomes a second primary that accepts writes nobody else sees (split brain). `pg_rewind` repairs a diverged data directory by copying from the new primary only the blocks that changed since the fork, which is much faster than a new base backup. It needs `wal_log_hints = on` (or data checksums) on the old primary, and since PostgreSQL 13 it finishes the target's crash recovery itself if it was not shut down cleanly. `pg_rewind -R` also writes `standby.signal` and a `primary_conninfo` for you.
+    ### The idea
 
-    Replication slots belong to one server and are not replicated. A promoted standby has none, so standbys that use slots need them created on the new primary.
+    1. **Promote**: `SELECT pg_promote()` on the standby with the most WAL (compare `pg_last_wal_replay_lsn()`). It becomes a primary on a new **timeline**.
+    2. **Repoint** the other standby: change its `primary_conninfo` (and `primary_slot_name`) with `ALTER SYSTEM`, and reload. It follows the timeline switch (`recovery_target_timeline = 'latest'` is the default).
+    3. **Old primary**: it may have WAL the new primary never got, so it can't simply follow. **`pg_rewind`** rewinds its data directory to the divergence point (it needs `wal_log_hints` or data checksums), then it starts as a standby (`standby.signal`, `primary_conninfo`).
 
-    **Read up on:**
-    - `pg_promote()`, `pg_is_in_recovery()`, timelines and `.history` files
-    - `primary_conninfo` and `primary_slot_name` (both reloadable), `recovery_target_timeline`
-    - `pg_create_physical_replication_slot()`, `pg_replication_slots`
-    - `pg_rewind`: `--target-pgdata`, `--source-server`, `-R`, and what it needs
-    - `docker run --rm -v VOLUME:/var/lib/postgresql/data ...` to run a tool against a stopped container's data, and `su-exec postgres` in the alpine image
+    Create physical slots on the new primary first: `SELECT pg_create_physical_replication_slot('name')`.
+
+    ### Commands you'll use
+
+    ```bash
+    for c in kl-b kl-c; do docker exec $c psql -U lab -d lab -Atc "SELECT '$c', pg_last_wal_replay_lsn()"; done
+    docker exec kl-b psql -U lab -d lab -c 'SELECT pg_promote()'
+    docker exec kl-b psql -U lab -d lab -c "SELECT pg_create_physical_replication_slot('c')"
+    docker exec kl-c psql -U lab -d lab -c "ALTER SYSTEM SET primary_conninfo = 'host=kl-b user=lab password=lab application_name=c'" \
+      -c "ALTER SYSTEM SET primary_slot_name = 'c'" -c 'SELECT pg_reload_conf()'
+    docker exec kl-b psql -U lab -d lab -c 'SELECT application_name, state FROM pg_stat_replication'
+    # old primary, stopped: pg_rewind --target-pgdata=DATADIR --source-server='host=kl-b user=lab password=lab dbname=lab'
+    ```
+    `pg_rewind` runs as the postgres user against a **stopped** server's data directory, for example in a throwaway container on the same volume.
+
+    ### Common mistakes
+
+    - Promoting the standby that's further behind.
+    - Starting the old primary normally: two primaries (split brain).
+    - Rebuilding `kl-pg3` from scratch: the task says repoint it.
+
+    ### Check your work
+
+    `kl-pg2` accepts writes with every order, `kl-pg3` and `kl-pg1` show up in its `pg_stat_replication` through slots `pg3` and `pg1`, and a write on `kl-pg2` reaches both.
   scenario: |
     Three PostgreSQL servers run on the Docker network `kl-repl`: the primary **`kl-pg1`**
     and two streaming standbys, **`kl-pg2`** and **`kl-pg3`**. Each container keeps its
@@ -1415,17 +1580,39 @@ exercises:
   kind: fix
   tags: [redis, sentinel, failover, split-brain, replication, min-replicas]
   tutorial: |
-    **Concept.** **Redis Sentinel** watches a master and its replicas. When enough sentinels (the **quorum**) can't reach the master for `down-after-milliseconds`, they elect a leader, which promotes a replica and tells the others to follow it. Clients ask a sentinel where the master is (`SENTINEL get-master-addr-by-name`).
+    **What you're learning.** Redis Sentinel split brain: lost acknowledged writes, and `min-replicas-to-write` to stop an isolated master.
 
-    A network partition can leave the old master running on the far side, cut off from the sentinels and replicas but still reachable by some clients. Redis replication is asynchronous, and by default a master accepts writes whether or not any replica is listening. So for as long as the partition lasts there are **two masters**, and clients on the old one get `OK` for every write. When the partition heals, the sentinels find the old master and turn it into a replica of the new one. A replica that resyncs throws its data away and loads the master's, so every write the old master acknowledged during the partition **disappears**, with no error anywhere.
+    ### The idea
 
-    Redis can't prevent the split, but it can limit the damage. With `min-replicas-to-write N` and `min-replicas-max-lag S`, a master refuses writes (`NOREPLICAS`) unless at least N replicas have acknowledged it within the last S seconds. An isolated old master then stops accepting writes about S seconds after it is cut off, which bounds how much can be lost. Settings changed with `CONFIG SET` last until a restart, unless `CONFIG REWRITE` saves them to the configuration file.
+    When the master is cut off, the sentinels promote a replica. The **old** master keeps accepting writes from clients that can still reach it, and when it rejoins as a replica, it **discards** them. Acknowledged writes are lost.
 
-    **Read up on:**
-    - Redis Sentinel: `SENTINEL masters`, `SENTINEL get-master-addr-by-name`, the `+switch-master` and `+convert-to-slave` events in its log
-    - `INFO replication`: `role`, `master_host`, `connected_slaves`, `slaveN ... lag=`
-    - `min-replicas-to-write`, `min-replicas-max-lag`, and the `NOREPLICAS` error
-    - `CONFIG SET`, `CONFIG GET`, `CONFIG REWRITE`
+    1. **Find them**: compare what the clients logged as acknowledged (`OK`) with what the current master has.
+    2. **Replay** them on the current master.
+    3. **Prevent it**: on every node, `min-replicas-to-write 1` + `min-replicas-max-lag 10`. A master that can't see at least one replica for 10 s **refuses writes** (`NOREPLICAS`), so an isolated master stops taking them.
+
+    `SENTINEL get-master-addr-by-name shop` on any sentinel gives the current master.
+
+    ### Commands you'll use
+
+    ```bash
+    docker exec kl-s1 redis-cli -p 26379 SENTINEL get-master-addr-by-name shop
+    head -5 /lab/app.log
+    awk '$NF == "OK" {print $2}' /lab/app.log | sort -u > /tmp/acked
+    M=$(docker exec kl-s1 redis-cli -p 26379 SENTINEL get-master-addr-by-name shop | head -1)
+    while read -r k; do [ "$(docker exec kl-r1 redis-cli -h "$M" EXISTS "$k")" = 0 ] && echo "$k"; done < /tmp/acked
+    for n in kl-r1 kl-r2 kl-r3; do docker exec $n redis-cli CONFIG SET min-replicas-to-write 1; docker exec $n redis-cli CONFIG SET min-replicas-max-lag 10; done
+    ```
+    Read the log format first: which field is the key, which the value, which the reply. Replay with the logged values, in log order.
+
+    ### Common mistakes
+
+    - Setting the guard on the current master only: after the next failover another node is master.
+    - Replaying writes that failed (`NOREPLICAS`, errors).
+    - Writing directly to a replica: it's read-only.
+
+    ### Check your work
+
+    `lost.txt` lists exactly the acknowledged keys missing from the current master, they're back with their logged values, and every node has `min-replicas-to-write 1`.
   scenario: |
     Redis runs as a master and two replicas, **`kl-r1`** (172.31.77.11), **`kl-r2`** (.12) and
     **`kl-r3`** (.13), watched by three sentinels **`kl-s1`**, **`kl-s2`** and **`kl-s3`**
@@ -1630,41 +1817,29 @@ exercises:
   kind: fix
   tags: [capstone, postgres, wal, archive, archive_timeout, pitr, backup, recovery, replication, replication-slot, max_slot_wal_keep_size]
   tutorial: |
-    **Concept.** A recovery plan is only as good as its weakest link, and the links fail
-    silently: an archive that stopped accepting WAL, a standby that can't log in any more, a
-    slot that quietly keeps WAL forever. A restore drill finds them, and a real incident in
-    the middle of one shows why they matter: **point-in-time recovery needs every WAL
-    segment between the base backup and the target**, in the archive.
+    **What you're learning.** A restore drill that finds real gaps: broken archiving, an RPO setting, a PITR recovery, a stale standby, and a WAL safety limit.
 
-    **When archiving fails.** `archive_command` runs for each completed WAL segment. While it
-    fails, the server keeps the segment in `pg_wal` (marked `.ready` in
-    `pg_wal/archive_status`) and retries, so nothing is lost yet, but `pg_wal` grows and the
-    archive has a hole. `pg_stat_archiver` shows `last_archived_wal`, `last_failed_wal`
-    and their times. `archive_command` is reloadable; once it works the archiver catches up in
-    order. A quiet server may take a long time to fill a 16 MB segment, so
-    `archive_timeout` forces a segment switch after at most that many seconds: it bounds how
-    much committed work can be missing from the archive (the recovery point objective).
+    ### Method
 
-    **Recovering beside production.** Lay the base backup down in a new volume, add
-    `recovery.signal`, a `restore_command` and a `recovery_target_time`, and start a second
-    server. It replays to the target and, by default, **pauses** read-only there. If the
-    archive ends before the target, recovery fails instead. Copy the lost rows back into
-    production and leave everything written since untouched.
+    | item | approach (exercise) |
+    |---|---|
+    | 1. archiving | `SELECT * FROM pg_stat_archiver` (last failure), and the server log. Fix `archive_command` exactly as the runbook says, reload, then `SELECT pg_switch_wal()` and wait until no `.ready` file is left |
+    | 2. RPO 1 min | `archive_timeout = '60s'` |
+    | 3–4. PITR | the incident's time, base backup + archive in a new `kl-pitr`, then copy the deleted shipments back (data-046) |
+    | 5. standby | its log: a password failure after the rotation. Update `primary_conninfo` with the current password, reload. Check the slot is still there and still has the WAL it needs (data-047) |
+    | 6. WAL cap | `max_slot_wal_keep_size = '1GB'` |
 
-    **A standby that can't log in.** A standby connects with the `primary_conninfo` it was
-    given. After a password rotation on the primary its WAL receiver is refused, it falls
-    behind, and its replication slot makes the primary keep all WAL since. `primary_conninfo`
-    is reloadable, so no rebuild is needed. `max_slot_wal_keep_size` caps how much WAL any
-    slot may hold, so a standby that stays gone can't fill the primary's disk.
+    Order matters: archiving must work **before** you rely on the archive for the PITR.
 
-    **Read up on:**
-    - `pg_stat_archiver`, `pg_switch_wal()`, `pg_walfile_name()`, `pg_wal/archive_status`
-    - `archive_command`, `archive_timeout`, `ALTER SYSTEM`, `pg_reload_conf()`, `postgresql.auto.conf`
-    - Continuous archiving and point-in-time recovery (PostgreSQL manual); `pg_basebackup -Ft`
-    - `recovery.signal`, `restore_command`, `recovery_target_time`, `pg_get_wal_replay_pause_state()`
-    - `COPY ... TO STDOUT` / `COPY ... FROM STDIN`, `INSERT ... WHERE NOT EXISTS`
-    - `pg_stat_replication` (`usename`, `state`), `pg_replication_slots`, `primary_conninfo`, `docker logs`
-    - `max_slot_wal_keep_size`
+    ### Check your work
+
+    ```bash
+    q() { docker exec kl-pg psql -U lab -d lab -Atc "$1"; }
+    q 'SELECT archived_count, last_failed_wal, last_archived_time FROM pg_stat_archiver'
+    q 'SHOW archive_timeout'; q 'SHOW max_slot_wal_keep_size'
+    q 'SELECT application_name, state FROM pg_stat_replication'
+    docker exec kl-pitr psql -U lab -d lab -Atc 'SELECT count(*) FROM shipments'
+    ```
   scenario: |
     **Ticket DR-318**, from Kostas (SRE lead):
 

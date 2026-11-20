@@ -12,13 +12,40 @@ exercises:
   kind: fix
   tags: [postgres, transaction, atomicity, acid]
   tutorial: |
-    **Concept.** A transaction groups statements so they all take effect or none do. Without an explicit transaction every statement commits on its own, so a crash between two related statements leaves the data inconsistent.
+    **What you're learning.** **Transactions**: making a multi-step change atomic, and repairing one that stopped halfway.
 
-    **Read up on:**
-    - `BEGIN`, `COMMIT` and `ROLLBACK` — the transaction control statements
-    - Autocommit in psql — what happens when you do not open a transaction
-    - ACID — what the "A" for atomicity promises
-    - `psql -f` — running a script file
+    ### The idea
+
+    Without a transaction, each statement commits on its own. A failure in step 2 leaves step 1 applied: money debited, never credited. Wrap the steps:
+
+    ```sql
+    BEGIN;
+    UPDATE accounts SET balance = balance - 50 WHERE id = 3;
+    UPDATE accounts SET balance = balance + 50 WHERE id = 4;
+    INSERT INTO ledger (from_id, to_id, amount) VALUES (3, 4, 50);
+    COMMIT;
+    ```
+    If anything fails, nothing is kept (the transaction aborts). In a psql script, add **`\set ON_ERROR_STOP on`** (or run `psql -v ON_ERROR_STOP=1`) so psql stops at the first error instead of carrying on and committing what's left. `psql -1` (`--single-transaction`) wraps a whole file.
+
+    To repair a half-done run, find out **which steps happened** (balances, ledger) and apply only the rest.
+
+    ### Commands you'll use
+
+    ```bash
+    q() { docker exec -i kl-pg psql -U lab -d lab "$@"; }
+    q -c 'SELECT * FROM accounts ORDER BY id' -c 'SELECT * FROM ledger ORDER BY id DESC LIMIT 3'
+    cat /lab/move.sql
+    q -v ON_ERROR_STOP=1 < /lab/move.sql; echo "rc=$?"
+    ```
+
+    ### Common mistakes
+
+    - Running the whole script again to "finish": alice is debited twice.
+    - `BEGIN` without `ON_ERROR_STOP`: psql reports the error, carries on, and the final `COMMIT` turns into a rollback, but only if the error happened inside the transaction.
+
+    ### Check your work
+
+    alice is down 300 once, bob up 300, one ledger row, and `transfer.sql` is wrapped in a transaction that stops on error.
   scenario: |
     PostgreSQL runs in the container **`kl-pg`** (`docker exec -it kl-pg psql -U lab -d lab`).
 
@@ -77,19 +104,44 @@ exercises:
   kind: fix
   tags: [postgres, concurrency, lost-update, atomic, queue, skip-locked]
   tutorial: |
-    **Concept.** Code that is correct for one client can be wrong for ten. The dangerous pattern is any gap between *looking at* a row and *changing* it: another session can act in that gap. Both fixes here close the gap by making the database do the look and the change in one statement.
+    **What you're learning.** Lost updates versus atomic updates, and a race-free job claim with `SKIP LOCKED` and `RETURNING`.
 
-    **Lost updates.** Reading a value, changing it in the application and writing it back lets concurrent sessions overwrite each other's work. Doing the arithmetic inside the `UPDATE` makes the database apply every change in turn, because the row lock taken by `UPDATE` queues them up and each one sees the previous result.
+    ### The idea
 
-    **Claiming work.** Several workers can share one table as a queue if each claims a different row. `UPDATE ... RETURNING` claims a row and reports it in one statement. A subquery chooses the row, and that is where the race moves to. `SELECT ... FOR UPDATE` locks the chosen row, and `SKIP LOCKED` lets other workers pass over rows that are already taken instead of waiting.
+    "Read, compute in the script, write back" loses updates: two workers read 10, both write 9. Let the **database** compute it, in one statement:
 
-    **Read up on:**
-    - Lost updates — how read-modify-write races lose data
-    - `UPDATE ... SET col = col - 1` — expressions evaluated by the database
-    - Row locks taken by UPDATE, and what Read Committed sees when a row changed under it
-    - `SELECT ... FOR UPDATE SKIP LOCKED` — the queue-consumer locking clause
-    - `UPDATE ... RETURNING` — changing a row and reading it back in one statement
-    - Subqueries in `UPDATE ... WHERE id = (SELECT ...)` — selecting the row to claim
+    ```sql
+    UPDATE stock SET qty = qty - 1 WHERE sku = 'bolt' AND qty > 0;
+    ```
+    Row locks serialise concurrent updates to the same row, and each one sees the previous one's result.
+
+    **Claiming jobs** (data-025): select **and** lock the next pending job, skipping ones other workers hold, and get its id back in one statement:
+
+    ```sql
+    UPDATE jobs SET status = 'running'
+    WHERE id = (SELECT id FROM jobs WHERE status = 'pending' ORDER BY id LIMIT 1 FOR UPDATE SKIP LOCKED)
+    RETURNING id;
+    ```
+    `psql -qAt` prints just the returned value (`-q` hides `UPDATE 1`).
+
+    ### Commands you'll use
+
+    ```bash
+    cat /lab/take.sh
+    for i in $(seq 10); do bash /lab/take.sh & done; wait
+    docker exec kl-pg psql -U lab -d lab -Atc "SELECT qty FROM stock WHERE sku = 'bolt'"
+    for i in $(seq 8); do bash /lab/next.sh & done | sort -n; wait
+    ```
+
+    ### Common mistakes
+
+    - `SELECT qty` in the script then `UPDATE ... SET qty = $new`: the lost update.
+    - `FOR UPDATE` without `SKIP LOCKED`: workers queue up, and some get nothing.
+    - Printing `UPDATE 1` along with the id.
+
+    ### Check your work
+
+    Ten parallel reservations lower `qty` by exactly 10, and 20 parallel claims print 20 different ids, then nothing once the queue is empty.
   scenario: |
     PostgreSQL runs in **`kl-pg`** (`docker exec -it kl-pg psql -U lab -d lab`).
 
@@ -202,13 +254,39 @@ exercises:
   kind: build
   tags: [postgres, idempotency, on-conflict, import]
   tutorial: |
-    **Concept.** Message systems often deliver an event more than once. A load is idempotent when running it twice gives the same result as running it once. A unique key plus `ON CONFLICT` lets the database drop the repeats.
+    **What you're learning.** **Idempotent ingestion**: replayed events counted once with a unique key and `ON CONFLICT DO NOTHING`.
 
-    **Read up on:**
-    - `INSERT ... ON CONFLICT DO NOTHING` — skipping rows that violate a unique key
-    - `COPY ... FROM STDIN` and staging tables — bulk loading before merging
-    - Temporary tables — scratch tables that live for one session
-    - Idempotency keys — why retries need a stable identifier
+    ### The idea
+
+    Message brokers deliver **at least once**, so retries repeat events. If every event carries a unique key, the database can ignore repeats:
+
+    ```sql
+    INSERT INTO deliveries (msg_id, amount) VALUES ('m-17', 40)
+    ON CONFLICT (msg_id) DO NOTHING;
+    ```
+    A repeat hits the primary key and is silently skipped, so loading the same file twice gives the same result. `\copy` into a staging table, then `INSERT ... SELECT ... ON CONFLICT DO NOTHING`, does it for a whole file.
+
+    ### Commands you'll use
+
+    ```bash
+    q() { docker exec -i kl-pg psql -U lab -d lab -v ON_ERROR_STOP=1 "$@"; }
+    sort /lab/msgs.csv | uniq -d | head -3                    # literal duplicates
+    cut -d, -f1 /lab/msgs.csv | sort | uniq -d | wc -l        # repeated keys
+    q -c 'CREATE TEMP TABLE stage (k text, amount numeric)' \
+      -c '\copy stage FROM STDIN WITH (FORMAT csv)' \
+      -c 'INSERT INTO deliveries SELECT k, amount FROM stage ON CONFLICT (msg_id) DO NOTHING' < /lab/msgs.csv
+    q -c 'SELECT count(*), sum(amount) FROM deliveries'
+    ```
+    A `TEMP` table lives only in that session, so all three commands must run in **one** psql call.
+
+    ### Common mistakes
+
+    - `sort -u` on the file: a retry with a different line ending or field order still slips through. Rely on the key.
+    - `DO UPDATE SET amount = amount + EXCLUDED.amount`: counts retries twice.
+
+    ### Check your work
+
+    `payments` has one row per distinct key, and loading the file again leaves the count and the sum unchanged.
   scenario: |
     PostgreSQL runs in **`kl-pg`** (`docker exec -it kl-pg psql -U lab -d lab`).
 
@@ -266,24 +344,40 @@ exercises:
   kind: build
   tags: [postgres, constraint, check, unique, exclusion, integrity]
   tutorial: |
-    **Concept.** Application checks only protect against the code paths that remember to run them, and two concurrent requests can both pass a "does this exist yet?" test. Constraints live with the data: whichever client writes, the database refuses what breaks the rule, and it does so correctly under concurrency.
+    **What you're learning.** Constraints that make bad data impossible: `CHECK`, case-insensitive uniqueness, and **exclusion** constraints for overlapping ranges.
 
-    PostgreSQL has a ladder of them, each able to express more than the last:
+    ### The idea
 
-    - A **CHECK** constraint rejects any row for which a boolean expression over that row is false. Existing rows are validated when you add it.
-    - A **UNIQUE** constraint compares values exactly, so `Bob@x.com` and `bob@x.com` count as different. A **unique index on an expression** enforces uniqueness on a normalised form of the value, but existing duplicates have to go first.
-    - An **exclusion constraint** generalises uniqueness: it rejects a row that conflicts with an existing row under operators you choose, such as "same room **and** overlapping time". It is backed by a GiST index. Plain equality on integers or text inside GiST needs the `btree_gist` extension.
+    | rule | constraint |
+    |---|---|
+    | never negative | `CHECK (balance >= 0)` (fix existing rows first, or add it `NOT VALID` then `VALIDATE`) |
+    | unique regardless of case | `CREATE UNIQUE INDEX ON users (lower(email))` |
+    | no two bookings of a room overlap | `EXCLUDE USING gist (room WITH =, during WITH &&)`: `&&` = ranges overlap. Needs `btree_gist` for the `=` on a plain column |
 
-    Range types are half-open by default, which is why a booking ending at 10:00 doesn't clash with one starting at 10:00.
+    Range types (`tstzrange`, `daterange`) have bounds: `[)` includes the start and excludes the end, so back-to-back bookings don't overlap.
 
-    **Read up on:**
-    - `ALTER TABLE ... ADD CONSTRAINT ... CHECK`, and constraint names
-    - `\d table` in psql — listing a table's constraints
-    - `CREATE UNIQUE INDEX` and expression indexes such as `lower(column)`
-    - Unique violations, and `DELETE ... USING` for removing duplicates
-    - Range types such as `tstzrange` and the `&&` (overlaps) operator
-    - `EXCLUDE USING gist` — the syntax of exclusion constraints
-    - The `btree_gist` extension
+    ### Commands you'll use
+
+    ```bash
+    q() { docker exec -i kl-pg psql -U lab -d lab -v ON_ERROR_STOP=1 -c "$1"; }
+    q "SELECT id, balance FROM wallets WHERE balance < 0"
+    q "SELECT lower(email), array_agg(id ORDER BY id) FROM members GROUP BY 1 HAVING count(*) > 1"
+    q "CREATE EXTENSION IF NOT EXISTS btree_gist"
+    q "SELECT a.id, b.id FROM rentals a JOIN rentals b ON a.car = b.car AND a.id < b.id AND a.period && b.period"
+    q "ALTER TABLE rentals ADD CONSTRAINT no_overlap EXCLUDE USING gist (car WITH =, period WITH &&)"
+    q "INSERT INTO rentals (car, period) VALUES ('C1', '[2026-03-01 10:00, 2026-03-01 12:00)')"    # conflicting key value violates exclusion constraint
+    ```
+    The task's policy decides what to do with rows that already break a rule (fix, delete, or move them), and the constraint can only be added after that.
+
+    ### Common mistakes
+
+    - `UNIQUE (email)`: case variants slip through.
+    - An exclusion constraint without `btree_gist`: "data type text has no default operator class for access method gist".
+    - Deleting the wrong duplicate (keep the lowest `id`).
+
+    ### Check your work
+
+    A negative balance, a case-variant email and an overlapping booking are each refused, and the existing data satisfies every constraint.
   scenario: |
     PostgreSQL runs in **`kl-pg`** (`docker exec -it kl-pg psql -U lab -d lab`).
 
@@ -410,20 +504,40 @@ exercises:
   kind: fix
   tags: [postgres, locks, deadlock, ordering, pg_stat_activity, operations]
   tutorial: |
-    **Concept.** Row locks are held until the transaction ends, and that one rule produces two different kinds of trouble.
+    **What you're learning.** Two kinds of lock trouble: a session that never commits, and a **deadlock** from inconsistent lock order.
 
-    **Waiting behind someone.** A transaction that stays open keeps its locks, and every other session that wants the same row queues behind it, forever if nothing changes. The database can't call that a problem, because the holder might commit any moment. Operators find the culprit in the activity views and end it with a backend-termination function. Ending a session rolls its open transaction back.
+    ### The idea
 
-    **Waiting in a circle.** A deadlock happens when two transactions each hold a lock the other needs. This one PostgreSQL does detect: after `deadlock_timeout` it aborts one of them. Killing a session doesn't cure it, because the same code deadlocks again next time. The standard cure is to make every transaction take its locks in the same order, so a cycle becomes impossible.
+    1. **Idle in transaction**: a session that ran `BEGIN; UPDATE ...` and stopped holds its row locks forever. Find it in `pg_stat_activity` (`state = 'idle in transaction'`, old `xact_start`) and terminate it (data-009). `idle_in_transaction_session_timeout` prevents it in future.
+    2. **Deadlock**: T1 locks row 1 then wants row 2, while T2 locks row 2 then wants row 1. Each waits for the other. PostgreSQL detects the cycle and **aborts one**. The fix: every transaction takes locks **in the same order** (lowest id first), for example by locking both rows up front:
+       ```sql
+       SELECT 1 FROM accounts WHERE id IN (1, 2) ORDER BY id FOR UPDATE;
+       ```
 
-    **Read up on:**
-    - `pg_stat_activity` — one row per backend, with its state and current query
-    - `pg_locks` and `pg_blocking_pids()` — who is waiting for whom
-    - `pg_cancel_backend()` versus `pg_terminate_backend()`
-    - `lock_timeout` — making a statement give up instead of waiting forever
-    - Deadlocks in the PostgreSQL docs, section "Explicit Locking"
-    - `deadlock_timeout` — how long the server waits before checking
-    - Lock ordering — a global rule that makes cycles impossible
+    ### Commands you'll use
+
+    ```bash
+    docker exec kl-pg psql -U lab -d lab -c "
+      SELECT pid, state, now() - xact_start AS age, left(query, 40) FROM pg_stat_activity
+      WHERE datname = 'lab' AND pid <> pg_backend_pid() ORDER BY xact_start"
+    (docker exec -i kl-pg psql -U lab -d lab < /lab/a.sql &); docker exec -i kl-pg psql -U lab -d lab < /lab/b.sql
+    ```
+    ```text
+    ERROR:  deadlock detected
+    DETAIL:  Process 911 waits for ShareLock on transaction 7781; blocked by process 905.
+    ```
+    ```bash
+    docker logs kl-pg 2>&1 | grep -A3 deadlock | tail -4
+    ```
+
+    ### Common mistakes
+
+    - Retrying the deadlocked job: it may deadlock again.
+    - Terminating every session.
+
+    ### Check your work
+
+    Updates to account 1 in `savings` go through, and running both batch jobs together several times never deadlocks and adds 20 to each account.
   scenario: |
     PostgreSQL runs in **`kl-pg`** (`docker exec -it kl-pg psql -U lab -d lab`).
 
@@ -545,14 +659,38 @@ exercises:
   kind: fix
   tags: [postgres, write-skew, locking, isolation]
   tutorial: |
-    **Concept.** Two transactions can each read the same data, each decide the change is safe, and each write a different row. Neither overwrites the other, yet together they break a rule. This anomaly is called write skew. It is prevented by locking the rows that the decision depends on, or by using a stricter isolation level.
+    **What you're learning.** **Write skew**: two transactions each check a rule, both pass, together they break it. And how locking prevents it.
 
-    **Read up on:**
-    - Write skew — the "doctors on call" example in the literature
-    - `SELECT ... FOR UPDATE` — locking rows you only read
-    - Transaction isolation levels: Read Committed, Repeatable Read, Serializable
-    - Serialization failures (SQLSTATE 40001) — why Serializable needs retries
-    - `psql` variables and `\gset` — how the script below passes values around
+    ### The idea
+
+    "At least one doctor on call": each transaction counts on-call doctors (2), decides it may leave, and updates **its own** row. They touch different rows, so row locks don't conflict, and both commit: zero on call.
+
+    Fixes:
+
+    | approach | how |
+    |---|---|
+    | lock what you **read** | `SELECT ... FROM doctors WHERE on_call FOR UPDATE` before counting: the second transaction waits, then counts again and sees 1 |
+    | `SERIALIZABLE` isolation | the database detects the conflict and aborts one (retry needed) |
+
+    In psql, `\gset` stores a query's columns as variables, and `\if :var` branches on a boolean.
+
+    ### Commands you'll use
+
+    ```bash
+    cat /lab/offduty.sql
+    for who in ana ben; do docker exec -i kl-pg psql -U lab -d lab -v who=$who < /lab/offduty.sql & done; wait
+    docker exec kl-pg psql -U lab -d lab -Atc 'SELECT count(*) FROM nurses WHERE on_shift'
+    ```
+    `\if` needs a value like `t`/`f`, so compute the comparison in SQL: `SELECT :n >= 2 AS ok \gset`, then `\if :ok`.
+
+    ### Common mistakes
+
+    - `FOR UPDATE` on the leaving doctor's row only: the conflict is on the **others'** rows.
+    - `count(*) ... FOR UPDATE` directly: not allowed with aggregates, so lock in a subquery.
+
+    ### Check your work
+
+    Running both leave requests together, several times, always leaves exactly one doctor on call.
   scenario: |
     PostgreSQL runs in **`kl-pg`** (`docker exec -it kl-pg psql -U lab -d lab`).
 
@@ -631,46 +769,30 @@ exercises:
   kind: fix
   tags: [capstone, postgres, transaction, locks, idempotency, on-conflict, skip-locked, constraint, exclusion, deadlock, concurrency]
   tutorial: |
-    **Concept.** "Charged twice" is rarely one bug. It is a retry that wasn't idempotent, two
-    workers that grabbed the same job, a row that was inserted twice, and a lock that someone
-    forgot about. Every fix in this lab closes a gap between *deciding* and *writing*, either
-    by letting one statement do both, by taking locks in a fixed order, or by letting a
-    constraint refuse what must never exist.
+    **What you're learning.** A billing incident: a blocking session, duplicate webhooks, idempotent recording, concurrent claims, overlap rules and deadlock-free transfers.
 
-    **The forgotten lock.** A session that is *idle in transaction* holds every lock it took
-    until it ends. `ALTER TABLE` and even a `DELETE` of the rows it touched queue behind it.
-    `pg_stat_activity` (`state`, `application_name`, `xact_start`) and `pg_blocking_pids()`
-    show who it is; `pg_terminate_backend()` ends it and **rolls its work back**. End that
-    session, not every idle one.
+    ### Method
 
-    **Idempotent writes.** A webhook can arrive twice, even at the same moment. A unique key
-    makes the second insert collide; `ON CONFLICT DO NOTHING` turns the collision into a
-    no-op. But a *follow-up* statement that runs anyway (crediting the invoice) still counts
-    the retry. `INSERT ... RETURNING` inside a `WITH` clause feeds only the rows that were
-    really inserted into the next statement, all in one atomic statement.
+    | part | approach (exercise) |
+    |---|---|
+    | 1. blocker | terminate only `billing-migration`. Its uncommitted change rolls back (data-009, data-041) |
+    | 2. duplicates | delete by `provider_ref` keeping the lowest id, recompute `paid_amount` from `sum()` of payments, then `UNIQUE (provider_ref)` (data-008) |
+    | 3. record-payment | `INSERT ... ON CONFLICT (provider_ref) DO NOTHING` and update the invoice **only if a row was inserted** (a CTE with `RETURNING`) (data-045) |
+    | 4. claims | `UPDATE ... WHERE id IN (SELECT ... LIMIT 5 FOR UPDATE SKIP LOCKED) RETURNING id` (data-039) |
+    | 5. subscriptions | an exclusion constraint on `(customer_id WITH =, plan WITH =, period WITH &&)` (data-037) |
+    | 6. opposite transfers | lock both wallets **in id order** before the updates (data-041) |
+    | 7. no negatives | `CHECK (balance >= 0)`. A failing transfer must roll back completely (data-036, data-037) |
 
-    **Claiming work.** "Pick some rows, then update them" lets two workers pick the same rows.
-    Doing the pick in the same statement as the update, with `FOR UPDATE SKIP LOCKED`, lets
-    each worker skip what another has already locked.
+    ```sql
+    WITH ins AS (
+      INSERT INTO payments (provider_ref, invoice_id, amount) VALUES (:'ref', :inv, :amount)
+      ON CONFLICT (provider_ref) DO NOTHING RETURNING invoice_id, amount)
+    UPDATE invoices i SET paid_amount = paid_amount + ins.amount FROM ins WHERE i.id = ins.invoice_id;
+    ```
 
-    **Rules that hold under concurrency.** An exclusion constraint (`EXCLUDE USING gist`)
-    refuses a row that overlaps an existing one under the operators you choose, for example
-    the same customer and an overlapping period; integer equality inside GiST needs
-    `btree_gist`. A `CHECK` constraint refuses a negative balance whichever client writes it,
-    and the failed statement aborts its whole transaction.
+    ### Check your work
 
-    **Deadlocks.** Two transactions that lock the same two rows in opposite orders can each
-    wait for the other. PostgreSQL aborts one of them. The cure is to take the locks in one
-    global order, for instance with `SELECT ... ORDER BY id FOR UPDATE` before the updates.
-
-    **Read up on:**
-    - `pg_stat_activity`, `pg_blocking_pids()`, `pg_terminate_backend()`, "idle in transaction"
-    - `DELETE ... USING` for duplicates; `ALTER TABLE ... ADD CONSTRAINT ... UNIQUE`
-    - `INSERT ... ON CONFLICT DO NOTHING`, `RETURNING`, and data-modifying statements in `WITH`
-    - psql variables: `-v name=value`, `:name`, `:'name'`; `-v ON_ERROR_STOP=1` and exit codes
-    - `UPDATE ... FROM`, `SELECT ... FOR UPDATE SKIP LOCKED`
-    - `tstzrange`, `&&`, `EXCLUDE USING gist (col WITH =, period WITH &&)`, `CREATE EXTENSION btree_gist`
-    - Deadlocks and lock ordering (PostgreSQL docs, "Explicit Locking"); `CHECK` constraints
+    Run each script twice and in parallel, as the ticket describes: a replayed webhook changes nothing, two claim workers get disjoint invoices, opposite transfers both finish without a deadlock, and an overdraft is refused with balances unchanged.
   scenario: |
     **Ticket PAY-2210**, from Dimitra (head of payments), priority **urgent**:
 
