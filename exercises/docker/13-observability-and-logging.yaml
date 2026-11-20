@@ -12,22 +12,43 @@ exercises:
   kind: fix
   tags: [logging, logging-driver, json-file, rotation, local, stdout, twelve-factor]
   tutorial: |
-    **Concept.** A container's log is a small pipeline. The main process writes to its standard output and error, the daemon captures those two streams and hands them to the container's **logging driver**, and the driver stores or forwards them. `docker logs` is only one reader of that pipeline, and each stage can go wrong in its own way.
+    **What you're learning.** The container log pipeline: process → stdout/stderr → log driver → `docker logs`, and three ways it breaks.
 
-    - **How much is kept.** The default `json-file` driver stores every line in a JSON file on the host, and that file grows without bound. The driver accepts options that cap the size of each file and how many rotated files are kept.
-    - **Where it goes.** Every container has a driver, and which one is a property chosen when the container is created: it cannot be changed in place. Some drivers store the output where `docker logs` can read it back (`json-file`, and `local`, Docker's compact rotating format). Others forward it elsewhere or discard it, and then `docker logs` has nothing to show.
-    - **What goes in at all.** Only the main process's standard streams enter the pipeline. An application that writes to a file inside the container is invisible to `docker logs` and to every log forwarder built on the logging driver. A common remedy is to make the log file lead to the output streams, so the application keeps opening the same path and the lines still reach the driver.
+    ### The idea
 
-    Because logging settings are fixed at creation, every fix here means changing how the container is started and creating it again.
+    ```
+    main process ──stdout/stderr──► daemon ──► log driver ──► (json-file / local / journald ...) ──► docker logs
+    ```
 
-    **Read up on:**
-    - `docker run --help` — `--log-driver` and the logging driver options
-    - Docker docs 'JSON File logging driver' and 'Configure logging drivers' — the options and the trade-offs between the built-in drivers
-    - `docker inspect` — `.HostConfig.LogConfig`
-    - `docker logs` — what it captures and what it needs from the driver
-    - `/dev/stdout` and `/dev/stderr` — special files in a container
-    - `ln -s` — symbolic links; `tail -F` as the alternative
-    - The official `nginx` image's Dockerfile — how it handles its access log
+    | break | cause | fix |
+    |---|---|---|
+    | grows forever | json-file without rotation | `--log-opt max-size=Sm --log-opt max-file=N` |
+    | `docker logs` refuses ("does not support reading") | a driver that ships logs away (`syslog`, `none`, `gelf`...) | a readable driver: `json-file`, `local` or `journald` |
+    | nothing appears | the app writes to a **file**, not stdout | make that path point at stdout: `ln -sf /dev/stdout /path/app.log` |
+
+    The official nginx image uses the symlink trick for `/var/log/nginx/access.log`.
+
+    ### Commands you'll use
+
+    ```bash
+    docker inspect svc --format '{{json .HostConfig.LogConfig}}'
+    docker run -d --name svc2 --log-driver local busybox:1.37 sh -c 'echo started; sleep infinity'
+    docker logs svc2                                          # started
+    docker run -d --name filer busybox:1.37 sh -c \
+      'mkdir -p /var/log/x; ln -sf /dev/stdout /var/log/x/out.log; while true; do echo tick >> /var/log/x/out.log; sleep 1; done'
+    docker logs --tail 2 filer
+    docker exec filer ls -l /var/log/x/out.log              # -> /dev/stdout
+    ```
+    Each part changes **the start script**. Remove the old container (`docker rm -f NAME`) before running the script again.
+
+    ### Common mistakes
+
+    - Fixing the running container by hand: the next deployment undoes it.
+    - Creating the symlink **after** the app opened the file: the app keeps writing to the real file. Create it before the loop starts.
+
+    ### Check your work
+
+    `chatty` has `json-file` with the policy's limits, `docker logs audit` shows its startup line under `local`, and `docker logs app` shows `tick` lines while the command still names `/var/log/app/app.log`.
   scenario: |
     A log review of this host found three services whose logging is wrong. Each one has its own
     start script. For each part, **change the script and start the service again with it**, so
@@ -172,18 +193,42 @@ exercises:
   kind: build
   tags: [stats, cpu, monitoring, oom, memory, inspect, exit-code]
   tutorial: |
-    **Concept.** When a host misbehaves there are two different questions, answered from two different places: who is consuming resources *right now*, and who was already killed for consuming too much.
+    **What you're learning.** Live resource usage with `docker stats`, and telling an OOM kill from an operator's kill.
 
-    - **Live usage.** The daemon samples the CPU, memory, network and block I/O of every running container. A one-shot snapshot is enough to spot the heavy consumer without attaching to anything. It only covers containers that are running, so it says nothing about the ones that have died.
-    - **After the fact.** A container can be given a memory ceiling. When it goes over, the kernel kills a process in it and the container exits with code 137. The same code also appears when somebody sends SIGKILL, so the exit code alone cannot tell the two apart. The daemon records the difference separately, in the container's state, and that record stays until the container is removed.
+    ### The idea
 
-    **Read up on:**
-    - `docker stats --help` — streaming versus a single snapshot, and output formats
-    - `docker top` — the processes inside one container
-    - `sort -rn` — order lines by a leading number
-    - `docker inspect` — the `.State` block, including `.State.OOMKilled`
-    - `docker ps -a` — exit codes in the STATUS column
-    - `docker run --help` — `--memory` and `--memory-swap`
+    | question | source |
+    |---|---|
+    | who uses CPU **now**? | `docker stats --no-stream` (one snapshot) |
+    | who was killed for memory? | `State.OOMKilled` (docker-127). Exit 137 alone means only "SIGKILL" |
+
+    ### Commands you'll use
+
+    ```bash
+    docker stats --no-stream --format '{{.CPUPerc}}\t{{.Name}}'
+    ```
+    ```text
+    0.01%	api
+    98.73%	crunch
+    0.00%	db
+    ```
+    ```bash
+    docker stats --no-stream --format '{{.CPUPerc}} {{.Name}}' | sort -rn | head -1 | awk '{print $2}'
+    docker ps -a --filter status=exited --format '{{.Names}}' | while read n; do
+      docker inspect "$n" --format '{{.Name}} exit={{.State.ExitCode}} oom={{.State.OOMKilled}}'
+    done
+    ```
+    `sort -rn` reads the leading number of `98.73%` correctly.
+
+    ### Common mistakes
+
+    - `docker stats` without `--no-stream`: it keeps refreshing.
+    - `docker top`, or a single `ps`: it's harder to compare containers.
+    - Stopping the hog: the task says leave everything as found.
+
+    ### Check your work
+
+    `hog.txt` names the top CPU user, `oom.txt` names the container with `OOMKilled=true`, and all six containers are in the same state as before.
   scenario: |
     This host feels slow and some services have gone down. Six containers were started on it:
     **four are still running and two are dead**. Find out what happened, and leave all six as
@@ -273,12 +318,33 @@ exercises:
   kind: fix
   tags: [healthcheck, health, troubleshooting]
   tutorial: |
-    **Concept.** A healthcheck is a command the daemon runs inside the container on a schedule. Its exit status moves the container between `starting`, `healthy` and `unhealthy`. A check that probes the wrong thing reports a problem that is not there, or hides one that is.
+    **What you're learning.** Fixing a health check that probes the wrong address.
 
-    **Read up on:**
-    - `docker run --help` — the `--health-*` options
-    - `docker inspect` — `.State.Health` and its recent log
-    - `docker ps` — the health status in the STATUS column
+    ### The idea
+
+    The check runs **inside** the container, so `127.0.0.1` is the container itself, and it must use the port the server **listens on inside** (not the published host port). Find the real port and path from the server's command or from `netstat` in the container. The probe's own output says what it tried (docker-184).
+
+    ### Commands you'll use
+
+    ```bash
+    cat /lab/run-web.sh
+    docker inspect site --format '{{json .Config.Cmd}}'          # ["httpd","-f","-p","7070","-h","/www"]
+    docker inspect site --format '{{json .State.Health.Log}}' | jq -r '.[-1].Output'
+    docker exec site ls /www                                      # ready.txt
+    docker exec site wget -q -O /dev/null http://127.0.0.1:7070/ready.txt && echo ok
+    # put that URL into --health-cmd in the script, docker rm -f site, run the script
+    docker inspect site --format '{{.State.Health.Status}}'
+    ```
+
+    ### Common mistakes
+
+    - The **published** port in the check.
+    - Changing the server command instead of the check.
+    - Not recreating: health options are fixed at creation.
+
+    ### Check your work
+
+    `web` is `healthy`, and its health command requests the readiness file on the real port.
   scenario: |
     **`/lab/start.sh`** launches the **`web`** container, a tiny web server that serves a
     readiness file on its own port. The container is marked **unhealthy** although the server is
@@ -332,22 +398,41 @@ exercises:
   kind: build
   tags: [logs, stdout, stderr, redirection, json, structured-logging, tail, timestamps]
   tutorial: |
-    **Concept.** Stored logs are more than a pile of text, and `docker logs` plus a little shell can cut them along three different axes.
+    **What you're learning.** Cutting stored logs three ways: by stream, by field, and by recency with timestamps.
 
-    - **By stream.** Each stored line is tagged with whether it came from standard output or standard error. `docker logs` replays them on the matching streams of your terminal, so ordinary shell redirection can separate them again.
-    - **By field.** Structured logs put one JSON object on each line, with fields such as level, request id and message. That makes them searchable by field instead of by free text, but a naive text search can match the wrong lines when a word appears in several fields.
-    - **By position and time.** A container's log can be long. `docker logs` can limit how much it prints and can decorate each line with the time the daemon received it. Timestamps let someone else line the output up against other systems.
+    ### The idea
 
-    All of this works on a stopped container too: the log stays until the container is removed.
+    | cut | how |
+    |---|---|
+    | **stream** | `docker logs` replays stdout to **your stdout** and stderr to **your stderr**, so redirect them separately: `>out 2>err` |
+    | **field** in JSON lines | match the exact `"key":"value"` pair, not just a word |
+    | **recency** | `--tail N` (last N lines), `--timestamps` (RFC 3339 prefix), `--since` / `--until` |
 
-    **Read up on:**
-    - `docker logs --help` — `--tail`, `--since`, `--timestamps`
-    - Shell redirection — `>` for stdout and `2>` for stderr
-    - `diff` — compare two files line by line
-    - `grep` — fixed-string and regular-expression matching
-    - `sed -n 's/.../\1/p'` or `jq` — extract one field from a line
-    - `wc -l` — count lines
-    - `awk '{print $2}'` — pick one column out of a line
+    ### Commands you'll use
+
+    ```bash
+    docker logs task >/lab/o.log 2>/lab/e.log
+    wc -l /lab/o.log /lab/e.log
+
+    docker logs svc 2>&1 | grep '"level":"warn"' | head -2
+    docker logs svc 2>&1 | grep '"level":"warn"' | jq -r .id          # if every line is valid JSON
+    docker logs svc 2>&1 | grep '"level":"warn"' | sed 's/.*"id":"\([^"]*\)".*/\1/'
+
+    docker logs --tail 5 --timestamps worker
+    ```
+    ```text
+    2026-03-02T10:41:07.512Z record 36 ok
+    ```
+
+    ### Common mistakes
+
+    - `docker logs job 2>&1 > out`: the order matters, and stderr goes to the terminal.
+    - `grep error`: matches messages that mention "error".
+    - `tail -n` after `docker logs --timestamps` is fine too, but `--tail` is cheaper.
+
+    ### Check your work
+
+    The out and err files each hold only their own stream, `reqid.txt` holds one id, and `last.txt` has exactly the required number of timestamped lines, ending with the final record.
   scenario: |
     Last night's incident is being written up, and the on-call engineer needs three pieces of
     evidence taken from the logs of the containers on this host. Leave the containers in place.
@@ -472,12 +557,39 @@ exercises:
   kind: build
   tags: [events, exit-code, audit]
   tutorial: |
-    **Concept.** The daemon keeps a short history of what happened to containers, networks and images. Each event carries a timestamp, the object's name and a set of attributes. This is the only record left for containers that no longer exist.
+    **What you're learning.** Reconstructing removed containers from **`docker events`**, scoped to a time window.
 
-    **Read up on:**
-    - `docker events --help` — `--since`, `--until` and `--filter`
-    - `docker events --format` — pick fields out of the event with a Go template
-    - Docker docs 'docker events' — which attributes accompany a `die` event
+    ### The idea
+
+    The daemon keeps a history of recent events (a buffer of about 1000 events), even for removed containers. `die` events carry `exitCode` and the container `name`. `--since` and `--until` bound the window: a Unix timestamp or a date both work. `--until` makes the command print and exit.
+
+    ### Commands you'll use
+
+    ```bash
+    since=$(cat /lab/run-start)
+    docker events --since "$since" --until "$(date +%s)" --filter event=die \
+      --format '{{.Actor.Attributes.name}} {{.Actor.Attributes.exitCode}}'
+    ```
+    ```text
+    task-a 0
+    task-b 2
+    task-c 0
+    ```
+    ```bash
+    docker events --since "$since" --until "$(date +%s)" --filter event=die --filter 'container=task-b' \
+      --format '{{.Time}} {{.Status}}'
+    ... | awk '$1 ~ /^job-/ && $2 != 0 {print $1}' | sort
+    ```
+
+    ### Common mistakes
+
+    - No `--since`: older batches with the same names get mixed in.
+    - `docker ps -a`: they're removed.
+    - Counting `kill` or `stop` events instead of `die`.
+
+    ### Check your work
+
+    `failed.txt` lists only this batch's `job-*` names with a non-zero `exitCode`, sorted.
   scenario: |
     A few minutes ago five short-lived containers named **`job-<something>`** ran and were
     removed as soon as they finished, so `docker ps -a` shows nothing. Some of them failed.
@@ -538,24 +650,36 @@ exercises:
   kind: fix
   tags: [capstone, logs, stderr, structured-logging, oom, inspect, events, exit-code, stats, logging-driver, local, rotation, stdout, healthcheck]
   tutorial: |
-    **Concept.** An incident on a Docker host has two phases, and their order matters: first **preserve the evidence**, then **fix**. Each kind of evidence lives in a different place and survives for a different time:
+    **What you're learning.** An incident post-mortem on a Docker host: preserve the evidence first, then fix it in the start scripts.
 
-    - **Logs** belong to the container. They survive a stop, but removing or re-creating the container throws them away, so they must be read before any fix that re-creates it. A service may split its output between standard output and standard error, and `docker logs` replays each stream on the matching stream of your terminal.
-    - **State** (`docker inspect`) records how a container ended: its exit code, and separately whether the kernel killed it for memory. Exit code 137 alone does not tell an out-of-memory kill from a plain SIGKILL.
-    - **Events** are the daemon's own short history. For containers started with `--rm` they are the only record left: each `die` event carries the container's name and exit code. Scope the search in time so older events do not mix in.
-    - **Live usage** (`docker stats`) only covers what is running now, so it answers "who is hurting us right now", not "who died".
+    ### Method
 
-    The fixes then touch settings that are fixed when a container is created: its logging driver and options, and its healthcheck. They are changed in the start script and applied by creating the container again. Two classic traps: an application that writes its log to a file never reaches the logging driver, and a healthcheck can only call tools that exist inside the image.
+    **Evidence first.** Recreating a container throws away its log, and `--rm` containers are already gone:
 
-    **Read up on:**
-    - `docker logs --help`; shell redirection (`2>&1`, `2>/dev/null`)
-    - `grep` with a fixed string; `sed -n 's/.../\1/p'` or `jq` to pull one field out of a JSON line
-    - `docker inspect` — `.State.ExitCode`, `.State.OOMKilled`, `.HostConfig.LogConfig`, `.State.Health`
-    - `docker events --help` — `--since`, `--until`, `--filter`, `--format` and the attributes of a `die` event
-    - `docker stats --help` — a single snapshot and a custom format
-    - Docker docs 'Local file logging driver' — `max-size` and `max-file`
-    - `ln -s` and `/dev/stdout` in a container
-    - `docker run --help` — the `--health-*` options; which HTTP clients a `busybox` image ships
+    | evidence | where (exercise) |
+    |---|---|
+    | error-level request ids | `docker logs pay-api 2>&1` (**both** streams), match `"level":"error"` exactly, keep the order (docker-226) |
+    | OOM vs operator kill | `.State.OOMKilled` on both 137s (docker-222, docker-127) |
+    | exit codes of `--rm` runs | `docker events --since $(cat incident-started) --until now --filter event=die --filter container=pay-reconcile` (docker-224) |
+    | the CPU burner | `docker stats --no-stream`, then `docker stop` (not `rm`) (docker-222) |
+
+    **Then fix the scripts**, one at a time, `docker rm -f`, and run the script:
+
+    | fix | how (exercise) |
+    |---|---|
+    | logging policy | the driver and `max-size`/`max-file` from the policy file. The driver must be readable by `docker logs` (docker-221) |
+    | silent worker | `ln -sf /dev/stdout /var/log/worker/worker.log` before the loop (docker-221) |
+    | never healthy | the check targets the real port and path inside (docker-223) |
+
+    ### Check your work
+
+    ```bash
+    ls /lab/postmortem/; cat /lab/postmortem/*.txt
+    docker ps -a --format '{{.Names}}\t{{.Status}}' | grep pay-
+    docker inspect pay-api pay-worker --format '{{.Name}} {{json .HostConfig.LogConfig}}'
+    docker logs --tail 2 pay-worker
+    docker inspect pay-gateway --format '{{.State.Health.Status}}'
+    ```
   scenario: |
     **Ticket OPS-733** — *from Priya (SRE lead): payments outage, post-mortem and hardening*
 

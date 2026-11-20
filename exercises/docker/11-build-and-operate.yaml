@@ -12,15 +12,45 @@ exercises:
   kind: build
   tags: [logging, log-rotation, json-file, labels]
   tutorial: |
-    **Concept.** Whatever a container prints goes to a *log driver*. The default, json-file, appends one JSON object per line to a single file per container, and by default that file grows forever. Logging is configured per container at creation time, independently of the daemon-wide defaults, and it cannot be changed on a running container: to change it, recreate the container.
+    **What you're learning.** Log rotation per container, and adding labels to every log line with `--log-opt labels`.
 
-    A driver's options do two quite different jobs. Some control the **lifetime** of the log: how big one file may get and how many files are kept before the oldest is thrown away, so a chatty service cannot fill the disk. Others control the **content** of each record: the driver can copy selected container metadata into every line, so a log shipper reading those files can tell sources apart without parsing messages. Metadata can only be copied if the container actually has it, so that takes two settings working together.
+    ### The idea
 
-    **Read up on:**
-    - `docker run --help` — find `--log-driver`, `--log-opt` and `--label`
-    - Docker docs 'JSON File logging driver' — the options it accepts, for rotation and for adding attributes
-    - `docker inspect` — `.HostConfig.LogConfig` shows what was applied, `.LogPath` is the file the driver writes
-    - `head -n1` on that file — each line is JSON; look at its keys
+    The `json-file` driver writes one JSON object per line to `/var/lib/docker/containers/ID/ID-json.log`. With no options the file grows forever (docker-060). The options that matter here:
+
+    | option | effect |
+    |---|---|
+    | `max-size=4m`, `max-file=3` | rotation |
+    | `labels=team` | copies the container label `team` into each log record's `attrs` |
+    | `env=TEAM` | the same, for an environment variable |
+    | `tag=...` | a tag string (more useful for syslog and journald) |
+
+    `labels` only names **which** labels to copy. The container must also **have** the label (`--label team=payments`).
+
+    ### Commands you'll use
+
+    ```bash
+    cat /lab/limits.txt
+    docker run -d --name ticker --label team=search --log-opt labels=team \
+      --log-opt max-size=2m --log-opt max-file=4 busybox:1.37 sh -c 'while true; do echo tick; sleep 1; done'
+    sudo tail -1 "$(docker inspect -f '{{.LogPath}}' ticker)"
+    ```
+    ```json
+    {"log":"tick\n","stream":"stdout","attrs":{"team":"search"},"time":"2026-03-02T10:00:01.12Z"}
+    ```
+    ```bash
+    docker inspect ticker --format '{{json .HostConfig.LogConfig}}'
+    ```
+
+    ### Common mistakes
+
+    - `--log-opt labels=team=x`: the option takes **label names**, not values.
+    - Adding the label without `--log-opt labels`, or the other way round.
+    - Copying different limits for the two services.
+
+    ### Check your work
+
+    Both containers rotate with the limits from the file, and `checkout`'s log lines carry `"attrs":{"team":"<owner>"}`.
   scenario: |
     The disk on this host keeps filling up with container logs, and the central log shipper cannot
     tell one service's lines from another's. Fix both, for the two services below.
@@ -116,20 +146,41 @@ exercises:
   kind: build
   tags: [debugging, diff, cp, inspect, resources, memory]
   tutorial: |
-    **Concept.** You can learn a lot about a running container without entering it, because Docker keeps two records of its own.
+    **What you're learning.** Auditing a host from Docker's own records: `docker diff` for written files, and memory limits from `inspect`.
 
-    The **writable layer** records every change made on top of the image's filesystem. Docker can list those changes and copy files in and out of a container, which is often enough to investigate a service without extra tools, even when the image has no shell worth using.
+    ### The idea
 
-    The **configuration** holds what the container was started with, including its resource settings. These live in the container's metadata, not in the processes inside it. `docker inspect` exposes them as JSON and accepts a Go template, so you can audit many containers at once without parsing by hand. A soft reservation and a hard limit are different settings, and only one of them actually stops a container from using more memory.
+    - `docker diff NAME` lists every path added (`A`), changed (`C`) or deleted (`D`) in the container's writable layer. Filter it to find a file without searching the whole filesystem.
+    - `HostConfig.Memory` is the **hard** limit in bytes. `0` means none. `HostConfig.MemoryReservation` is only a **soft** setting. A container with a reservation but `Memory=0` still has no hard limit.
 
-    **Read up on:**
-    - `docker diff --help` — the A, C and D markers in the output
-    - `docker cp --help` — copying out of a container
-    - `docker exec` — run commands inside, and why it is not always needed
-    - `docker inspect --format` — Go templates and the `.HostConfig` fields
-    - `docker ps --format` — listing names for a loop
-    - Docker docs 'Resource constraints' — hard limits versus soft reservations
-    - What a value of 0 means for a limit field
+    ### Commands you'll use
+
+    ```bash
+    docker diff worker | grep -E '^A .*\.log$' | grep -v '^A /tmp'
+    docker cp worker:/srv/out/run-42.log /lab/run.log
+
+    docker ps -q | xargs docker inspect --format '{{.Name}} {{.HostConfig.Memory}} {{.HostConfig.MemoryReservation}}'
+    ```
+    ```text
+    /api 268435456 0
+    /cache 0 134217728
+    /worker 0 0
+    ```
+    ```bash
+    docker ps -q | xargs docker inspect --format '{{.Name}} {{.HostConfig.Memory}}' \
+      | awk '$2==0 {sub("^/","",$1); print $1}' | sort
+    ```
+    `.Name` starts with `/`: strip it.
+
+    ### Common mistakes
+
+    - Counting a container with only `--memory-reservation` as limited.
+    - Including stopped containers: the task says running.
+    - Limiting the review to `svc-*`.
+
+    ### Check your work
+
+    `/lab/job.dat` is the `.dat` file from the diff, and `/lab/unlimited.txt` lists every running container whose `Memory` is 0, sorted.
   scenario: |
     You have just taken over this Docker host. Nobody left any notes, so the answers have to come
     from Docker itself.
@@ -226,18 +277,44 @@ exercises:
   kind: fix
   tags: [restart-policy, on-failure, healthcheck, start-period]
   tutorial: |
-    **Concept.** Docker watches a container through two separate signals, and they do different things.
+    **What you're learning.** A bounded restart policy for crashes, and the health check **start period** for slow starters.
 
-    The first is the **exit of the main process**. A restart policy tells the daemon what to do when that happens. Policies differ in whether they care about the exit code and whether they ever stop trying, which matters for jobs that can fail for good: a worker that restarts forever hides the fault and burns resources.
+    ### The idea
 
-    The second is a **health check**, a command the daemon runs inside the container on a schedule. Enough consecutive failures flip the container to `unhealthy`. On a plain Docker host that status is only information: it does not restart anything, but deploy tooling and orchestrators act on it. Slow-starting software fails its first probes through no fault of its own, and Docker has a setting to tolerate exactly that, which is different from simply allowing more retries. Health settings are fixed at creation time.
+    Docker watches two different things:
 
-    **Read up on:**
-    - `docker run --help` — the restart option and its accepted values, and all the `--health-*` options
-    - Docker docs 'Start containers automatically' — compare each policy
-    - `docker inspect` — `.HostConfig.RestartPolicy` and `.RestartCount`, `.Config.Healthcheck` and `.State.Health`
-    - Docker docs on `HEALTHCHECK` — what each timing option means
-    - `docker update --help` — what it can and cannot change
+    | signal | about | setting |
+    |---|---|---|
+    | **exit** of the main process | crashes | restart policy: `on-failure:N` (docker-126) |
+    | **health check** result | a running but not-ready service | `--health-start-period` |
+
+    During the **start period**, failed checks **don't count** towards `retries`, so the container stays `starting` instead of turning `unhealthy`. The first success ends the start period and makes it `healthy`.
+
+    ### Commands you'll use
+
+    ```bash
+    docker inspect slow --format '{{json .Config.Healthcheck}} {{.Config.Image}} {{json .Config.Cmd}}'
+    ```
+    ```json
+    {"Test":["CMD-SHELL","test -f /tmp/ready"],"Interval":3000000000,"Timeout":2000000000,"Retries":2}
+    ```
+    ```bash
+    docker rm -f slow
+    docker run -d --name slow --health-cmd 'test -f /tmp/ready' --health-interval 3s \
+      --health-timeout 2s --health-retries 2 --health-start-period 30s IMAGE CMD...
+    watch -n2 "docker inspect slow --format '{{.State.Health.Status}}'"     # starting … healthy
+    ```
+    `Interval` and the other durations are in **nanoseconds** (3000000000 = 3s).
+
+    ### Common mistakes
+
+    - A longer interval or more retries instead of a start period: the container still turns unhealthy, only later.
+    - A start period shorter than the warm-up.
+    - A different health command than the original.
+
+    ### Check your work
+
+    `flaky` shows `on-failure` with the file's maximum and stops retrying after it, and `reports` goes `starting` → `healthy` with no `unhealthy` in between.
   scenario: |
     Two services on this host misbehave in opposite ways: one dies, the other is merely slow.
     The deploy tooling needs both to behave predictably.
@@ -331,23 +408,48 @@ exercises:
   kind: fix
   tags: [dockerignore, build-context, build-cache, build-args, layers, image-size]
   tutorial: |
-    **Concept.** A build has three stages where things go wrong, and each has its own mental model.
+    **What you're learning.** Three build reviews: an allow-list `.dockerignore`, `ARG` placement and the cache, and why deleting in a later layer doesn't shrink an image.
 
-    **What goes in.** Everything in the build context is sent to the builder and is available to COPY. A `.dockerignore` file filters the context, and its patterns can exclude broadly and then re-include specific paths with an exception rule.
+    ### The idea
 
-    **What reruns.** Docker reuses a cached layer only if its instruction and everything before it are unchanged. Once one layer is rebuilt, every layer after it is rebuilt too. A build argument that changes on every run therefore invalidates the cache from the point it takes effect, so its position in the Dockerfile matters.
+    | problem | model | fix |
+    |---|---|---|
+    | ships too much | the **context** is what `COPY .` can see | `.dockerignore` allow-list: `*` then `!public` (docker-035) |
+    | rebuilds too much | a changed `ARG` invalidates from where it's used (docker-193) | declare it after the slow step |
+    | weighs too much | each `RUN` is a layer, and `rm` in a later layer only hides the file (docker-039) | create, use and delete **in the same `RUN`** (or a multi-stage build) |
 
-    **What stays.** An image is a stack of read-only layers, one per filesystem-changing instruction. Deleting a file in a later layer only hides it; the earlier layer still carries its bytes, and the image keeps that weight.
+    ### Commands you'll use
 
-    **Read up on:**
-    - Docker docs 'Build context' — the `.dockerignore` section and its syntax
-    - `docker run --rm --entrypoint find IMAGE / -type f` — list what an image contains
-    - Docker docs 'Build cache' — what invalidates a layer
-    - Docker docs on `ARG` — 'Impact on build caching'
-    - `docker build --progress=plain` — see which steps say CACHED
-    - `docker history IMAGE` and `docker image ls` — size contributed by each layer, and the total
-    - Docker docs 'Best practices' — the sections on layers and multi-stage builds
-    - How `&&` chains commands inside one `RUN`
+    ```bash
+    printf '*\n!public\n' > /lab/docs/.dockerignore
+    docker build -t docs:1 /lab/docs
+    docker run --rm --entrypoint find docs:1 /srv -type f
+
+    docker history report:0 --format '{{.Size}}\t{{.CreatedBy}}' | head -5
+    ```
+    ```text
+    0B      RUN /bin/sh -c rm /tmp/work.bin
+    30MB    RUN /bin/sh -c wc -c < /tmp/work.bin > /report.txt
+    30MB    RUN /bin/sh -c head -c 30000000 /dev/zero > /tmp/work.bin
+    ```
+    ```dockerfile
+    RUN head -c 30000000 /dev/zero > /tmp/work.bin \
+     && wc -c < /tmp/work.bin > /report.txt \
+     && rm /tmp/work.bin
+    ```
+    ```bash
+    docker image ls report:1 --format '{{.Size}}'
+    ```
+
+    ### Common mistakes
+
+    - `.dockerignore` listing the bad files one by one: a new draft would slip through.
+    - Changing the Dockerfile's `COPY` in part 1: it's policy.
+    - Changing what the report prints (keep its byte count).
+
+    ### Check your work
+
+    `/srv` in `docsite:1` holds only `public/` files, a rebuild with a new `BUILD_ID` shows the slow step `CACHED` and the label has the id, and `report:1` is under 10 MB with identical output.
   scenario: |
     You have been asked to review the builds of three projects. Each has a different problem: one
     ships too much, one rebuilds too much, one weighs too much.
@@ -542,13 +644,30 @@ exercises:
   kind: fix
   tags: [incident, build-args, healthcheck, dockerignore, env]
   tutorial: |
-    **Concept.** Build-time and run-time settings are separate worlds: an ARG exists only while building, and a HEALTHCHECK runs inside the container with only what the image ships.
+    **What you're learning.** Build time versus run time: promoting an `ARG` to `ENV`, health checks that use what the image ships, and keeping development files out.
 
-    **Read up on:**
-    - Docker docs on `ARG` and `ENV` — carrying a build value to run time
-    - `docker inspect` — `.State.Health.Log` holds failed probe output
-    - `docker run --rm --entrypoint sh IMAGE -c 'which curl wget'` — tools present
-    - `.dockerignore`, `docker history` — what got copied
+    ### Method
+
+    | complaint | cause | fix (exercise) |
+    |---|---|---|
+    | always listens on 8000 | `ARG APP_PORT` exists only during the build, and the server reads an **environment** variable | `ENV PORT=$APP_PORT` (read `server.py` for the variable's name, docker-026) |
+    | never healthy | the check uses a tool the image lacks (`curl` on Alpine), or a hard-coded port | `wget` against `$PORT` in shell form, so the variable expands (docker-033, docker-184) |
+    | ships `vendor/` | the context includes it | `.dockerignore` (docker-035) |
+
+    Read the code first: `grep -n environ /lab/api/server.py`.
+
+    ```bash
+    for p in 8123 9001; do
+      docker build -q --build-arg APP_PORT=$p -t api:$p /lab/api
+      docker run -d --name t$p -p $p:$p api:$p
+    done
+    sleep 40; docker ps --filter name=t --format '{{.Names}} {{.Status}}'
+    docker run --rm --entrypoint ls api:8123 /app
+    ```
+
+    ### Check your work
+
+    For any `APP_PORT`, the container serves on that port and becomes healthy, and `/app` has no `vendor/`.
   scenario: |
     The release pipeline builds **`/lab/api`** once per environment with
     `docker build --build-arg APP_PORT=<port> /lab/api`, then runs the image with no other options.
