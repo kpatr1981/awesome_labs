@@ -12,13 +12,40 @@ exercises:
   kind: build
   tags: [info, daemon]
   tutorial: |
-    **Concept.** The docker CLI can print engine facts in structured form using Go templates. Version, storage driver, and cgroup details are all available from `docker info` and `docker version`.
+    **What you're learning.** How the Docker engine fits together, and reading its facts with `docker version` and `docker info`.
 
-    **Read up on:**
-    - `docker version --format` — client vs server fields
-    - `docker info --format` — storage driver and cgroup fields
-    - `docker info` (plain) — find the field names first
-    - Go template syntax: `{{.Field}}` and `{{json .}}`
+    ### The engine from zero
+
+    ```
+    docker CLI ──API over /var/run/docker.sock──► dockerd (the daemon) ──► containerd ──► runc ──► your process
+    ```
+    The **CLI** is only a client: every command is an HTTP request to the **daemon**, `dockerd`, a root systemd service. The daemon handles images, networks and volumes, and hands containers to **containerd**, which uses **runc** to create the namespaces and cgroups. Its configuration lives in `/etc/docker/daemon.json` and its data under `/var/lib/docker`.
+
+    `docker version` shows the client and server versions. `docker info` shows the daemon's state: storage driver, cgroup driver, registries, counts. Both accept `--format` with Go templates.
+
+    ### Commands you'll use
+
+    ```bash
+    docker version --format '{{.Client.Version}} / {{.Server.Version}}'
+    docker info --format '{{.Driver}} {{.CgroupDriver}} {{.CgroupVersion}}'
+    ```
+    ```text
+    overlay2 systemd 2
+    ```
+    ```bash
+    docker info --format '{{json .}}' | jq 'keys' | head -20       # every field name
+    docker info --format '{{.DockerRootDir}} {{.Containers}} {{.Images}}'
+    systemctl status docker --no-pager | head -3
+    ```
+
+    ### Common mistakes
+
+    - `docker version` with no format, then copying the **client** version.
+    - Spaces around `=` in the answer file.
+
+    ### Check your work
+
+    Each line of `/lab/engine.txt` matches what `docker info` and `docker version` print for the server.
   scenario: |
     A vendor's support form asks for some details about your docker installation.
 
@@ -56,17 +83,43 @@ exercises:
   kind: build
   tags: [pid, disk, events, observability]
   tutorial: |
-    **Concept.** A container is an ordinary process on the host, isolated by namespaces and cgroups, and the daemon keeps a record of everything that happens to it. Three questions come up constantly when you run a docker host: *which host process is this container?*, *which container is eating disk?* and *what happened while nobody was watching?* Each has a built-in answer.
+    **What you're learning.** Seeing containers from the host: main process PIDs, writable-layer sizes, and the daemon's event log.
 
-    - The daemon stores the container's PID **as seen from the host** in its state; inside the container the same process is PID 1.
-    - Anything a container writes outside a volume or bind mount lands in its **writable layer** on top of the image. Docker can report that layer's size per container.
-    - The daemon emits an **event stream** (create, start, die, destroy ...). Instead of watching live you can replay the past with `--since`/`--until` and filter on event type; a `die` event carries the `exitCode`.
+    ### The idea
 
-    **Read up on:**
-    - `docker inspect --format` — fields under `.State`, and `docker top <container>`
-    - `ps -fp <pid>` and `man pid_namespaces` — the host view vs the container view
-    - `docker ps --help` (the size option), `docker system df -v`, `docker diff <container>`
-    - `docker events --help` — `--since`, `--until`, `--filter`, `--format`; `{{json .}}` to discover fields
+    - A container is just a **process on the host**. `docker inspect -f '{{.State.Pid}}' NAME` gives its host PID, and `ps` sees it.
+    - `docker ps -s` adds a **SIZE** column: the writable layer (data written inside the container, not on volumes). `virtual` includes the image.
+    - `docker events` replays what the daemon did: create, start, die (with exit codes), destroy. It covers removed containers too, with `--since`.
+
+    ### Commands you'll use
+
+    ```bash
+    P=$(docker inspect -f '{{.State.Pid}}' cache); echo $P
+    ps -o pid,user,cmd -p $P
+    docker ps -s --format '{{.Names}}\t{{.Size}}'
+    ```
+    ```text
+    api       12.3kB (virtual 9.4MB)
+    worker    845MB (virtual 850MB)
+    ```
+    ```bash
+    docker events --since 30m --until now --filter event=die --format '{{.Actor.Attributes.name}} exit={{.Actor.Attributes.exitCode}}'
+    ```
+    ```text
+    batch-7 exit=0
+    batch-8 exit=3
+    ```
+    `--until now` makes `docker events` print the history and exit, instead of waiting for new events.
+
+    ### Common mistakes
+
+    - `docker top` PIDs are host PIDs too. The **main** process is `State.Pid`.
+    - Reading the `virtual` number as the writable size.
+    - `docker events` without `--until`: it keeps waiting.
+
+    ### Check your work
+
+    `ps -p $(cat /lab/db-pid.txt)` shows postgres, the fat container is the one with the biggest SIZE, and the exit-3 name matches the `die` event.
   scenario: |
     You've inherited a busy docker host and need three facts about it. Write each one to
     its own file in **`/lab`**:
@@ -125,13 +178,44 @@ exercises:
   kind: build
   tags: [daemon, logging, defaults]
   tutorial: |
-    **Concept.** Logging defaults for all new containers can be set in the daemon configuration, but only containers created afterwards use them. Option values in JSON have strict types.
+    **What you're learning.** Daemon-wide defaults in `daemon.json`: log rotation for every new container.
 
-    **Read up on:**
-    - Docker docs 'JSON File logging driver' — `max-size` and `max-file` options
-    - `/etc/docker/daemon.json` — `log-driver` and `log-opts` keys
-    - `docker inspect` — `.HostConfig.LogConfig` of a new container
-    - `systemctl restart docker` — apply the change
+    ### The idea
+
+    `/etc/docker/daemon.json` sets daemon options. The defaults it sets apply only to containers created **after** the restart:
+
+    ```json
+    {
+      "log-driver": "json-file",
+      "log-opts": { "max-size": "10m", "max-file": "3" }
+    }
+    ```
+    In `log-opts`, values must be **strings** (`"3"`, not `3`). Otherwise the daemon refuses to start.
+
+    ### Commands you'll use
+
+    ```bash
+    sudo cat /etc/docker/daemon.json 2>/dev/null || echo '(none)'
+    # write or merge the settings, then:
+    jq . /etc/docker/daemon.json                # valid JSON?
+    sudo systemctl restart docker
+    docker info --format '{{.LoggingDriver}}'
+    docker run -d --name t1 busybox:1.37 sleep infinity
+    docker inspect t1 --format '{{json .HostConfig.LogConfig}}'
+    ```
+    ```text
+    {"Type":"json-file","Config":{"max-file":"3","max-size":"10m"}}
+    ```
+    `sudo dockerd --validate --config-file /etc/docker/daemon.json` checks the file without starting the daemon.
+
+    ### Common mistakes
+
+    - `"max-file": 3`: "invalid log-opts value: must be a string".
+    - Expecting existing containers to change: recreate them.
+
+    ### Check your work
+
+    `probe`'s `LogConfig` shows the rotation, and you didn't pass any `--log-opt` to it.
   scenario: |
     After the "disk full" incident, management wants **every new container** to rotate
     its logs by default: **json-file** driver, at most **3 files of 10 MB**.
@@ -168,13 +252,43 @@ exercises:
   kind: fix
   tags: [socket, permissions, troubleshooting]
   tutorial: |
-    **Concept.** Access to the unix socket is governed by plain file permissions: owner, group and mode. Your user needs to be allowed to read and write it, normally through a group.
+    **What you're learning.** "permission denied ... docker.sock": the socket's owner, group and mode.
 
-    **Read up on:**
-    - `ls -l /var/run/docker.sock` — owner, group, mode
-    - `id` and `getent group docker` — your group membership
-    - `man chmod` and `man chown`
-    - `systemctl status docker.socket` — the unit that creates the socket, and its options
+    ### The idea
+
+    The CLI talks to `/var/run/docker.sock`, which is plain file permissions. Normally it is:
+
+    ```text
+    srw-rw---- 1 root docker 0 ... /var/run/docker.sock
+    ```
+    Owner root, group `docker`, mode 660. Members of `docker` can read and write it. If the group or mode changes, members are locked out even though `sudo` works.
+
+    systemd creates the socket from `docker.socket` (`SocketMode=0660`, `SocketGroup=docker`), so restarting that unit also restores it.
+
+    ### Commands you'll use
+
+    ```bash
+    id | tr ',' '\n' | grep docker
+    ls -l /var/run/docker.sock
+    ```
+    ```text
+    srw------- 1 root root 0 ... /var/run/docker.sock
+    ```
+    ```bash
+    sudo chown root:docker /var/run/docker.sock
+    sudo chmod 660 /var/run/docker.sock
+    docker ps
+    ```
+    If you were **just** added to the group, it only applies to new logins (`newgrp docker` or log in again).
+
+    ### Common mistakes
+
+    - `chmod 666`: every user on the host becomes root.
+    - Running everything with sudo from now on.
+
+    ### Check your work
+
+    `ls -l` shows `root docker` and `srw-rw----`, and `docker ps` works without sudo.
   scenario: |
     Since this morning every `docker` command you run fails with:
 
@@ -212,13 +326,40 @@ exercises:
   kind: build
   tags: [context, cli, bip, networking]
   tutorial: |
-    **Concept.** Two independent ideas meet here. A docker **context** stores the connection details of an engine (endpoint, description), so one CLI can manage several hosts by name; the current context is remembered per user. The **default bridge** `docker0`, on the other hand, is a property of the *daemon*: its address comes from daemon settings and changes only when the daemon restarts. Containers started on the default bridge draw their addresses from that subnet.
+    **What you're learning.** CLI **contexts** for managing several engines, and moving the default bridge subnet (`bip`).
 
-    **Read up on:**
-    - `docker context create --help` — the `--docker host=...` endpoint syntax and `--description`
-    - `docker context ls`, `docker context use`, `docker context inspect`, `docker context show`
-    - Docker docs 'Customize the default bridge network' — the `bip` key in `daemon.json`
-    - `ip -4 addr show docker0`, `docker network inspect bridge`, `docker run --rm busybox ip addr`
+    ### The idea
+
+    **Contexts**: a context stores how to reach an engine (endpoint and description). `docker context use NAME` makes every later command go there, and `docker --context NAME ...` does it for one command. The default context is the local socket.
+
+    **`bip`** in `daemon.json` sets the address and subnet of `docker0`, the default bridge, for example to avoid a clash with a LAN. User-defined networks use the address pools instead (docker-151).
+
+    ### Commands you'll use
+
+    ```bash
+    docker context create staging --description "staging engine" --docker host=ssh://ops@staging.test
+    docker context ls
+    docker context use staging
+    docker context inspect staging --format '{{.Endpoints.docker.Host}}'
+    docker context use default
+    ```
+
+    ```bash
+    echo '{"bip": "192.168.240.1/24"}' | sudo tee /etc/docker/daemon.json     # merge if the file exists
+    sudo systemctl restart docker
+    ip -4 addr show docker0
+    docker run --rm busybox:1.37 ip -4 addr show eth0
+    ```
+    `bip` is the **gateway address** with its prefix (`10.123.0.1/24`), not the network address (`10.123.0.0/24`).
+
+    ### Common mistakes
+
+    - Running `docker context use` with sudo: the current context is stored per user (`~/.docker`).
+    - `"bip": "10.123.0.0/24"`: the daemon rejects a network address.
+
+    ### Check your work
+
+    `docker context ls` marks `lab` as current with the description, `docker0` has `10.123.0.1/24`, and `edge` gets a `10.123.0.x` address.
   scenario: |
     You'll soon manage several docker engines from this machine, and this one's default
     bridge **`docker0`** (`172.17.0.1/16`) overlaps with the office printer network.
@@ -273,13 +414,50 @@ exercises:
   kind: fix
   tags: [daemon, daemon.json, systemd, troubleshooting]
   tutorial: |
-    **Concept.** The daemon reads its configuration from `/etc/docker/daemon.json`, and the daemon itself is a systemd service. Both layers can fail you. Invalid JSON (a trailing comma is the classic) stops the daemon from starting at all, and the reason is only in the service log. Separately, systemd can hold the service back: *stopped* (not running now), *disabled* (won't start at boot) or *masked* (can't be started by anyone). Docker also has a socket unit that can activate it. Finally, some settings such as `debug` can be applied with a reload signal, others need a restart.
+    **What you're learning.** Getting a broken daemon back: invalid `daemon.json`, a masked unit, and enabling at boot.
 
-    **Read up on:**
-    - `systemctl status docker` and `journalctl -u docker -n 30 --no-pager` — the real error
-    - `jq . /etc/docker/daemon.json` or `dockerd --validate` — check the config without starting
-    - `systemctl is-enabled docker`, `systemctl list-unit-files 'docker*'`, `man systemctl` — enable, unmask, `--now`, `reset-failed`
-    - Docker docs 'Daemon configuration file' — the `debug` key; `docker info` shows the Debug line
+    ### The idea
+
+    Two layers can stop Docker:
+
+    | layer | breaks by | diagnose |
+    |---|---|---|
+    | **systemd** | unit `masked` (can't start at all), `disabled` (doesn't start at boot) | `systemctl status docker`, `systemctl is-enabled docker` |
+    | **daemon.json** | invalid JSON (a trailing comma!), unknown keys, wrong types | `journalctl -u docker -n 20`, `jq . FILE`, `dockerd --validate` |
+
+    `debug: true` in daemon.json turns on debug mode, and `docker info` then reports `Debug Mode: true` for the server.
+
+    ### Commands you'll use
+
+    ```bash
+    systemctl status docker --no-pager | head -5
+    ```
+    ```text
+    ○ docker.service
+         Loaded: masked (Reason: Unit docker.service is masked.)
+    ```
+    ```bash
+    sudo systemctl unmask docker.service docker.socket
+    jq . /etc/docker/daemon.json
+    ```
+    ```text
+    jq: error: Expected another key-value pair at line 4, column 1
+    ```
+    ```bash
+    sudo dockerd --validate --config-file /etc/docker/daemon.json
+    sudo systemctl enable --now docker
+    docker info --format '{{.Debug}}'
+    ```
+
+    ### Common mistakes
+
+    - Deleting the file: the colleague's settings are lost.
+    - `systemctl start` only: not enabled at boot.
+    - A `--debug` flag in a drop-in **and** `debug` in the file: some options must not be set twice (docker-154).
+
+    ### Check your work
+
+    `systemctl is-active docker` and `is-enabled` both succeed, `docker info` shows the mirror, debug `true` and the log level, and the JSON is valid.
   scenario: |
     Docker support asked for **debug logs**, so a colleague edited
     **`/etc/docker/daemon.json`** to add a registry mirror, and "tested something with
@@ -336,13 +514,43 @@ exercises:
   kind: fix
   tags: [dns, sysctl, iptables, networking, troubleshooting]
   tutorial: |
-    **Concept.** A container reaches the outside world through the host, and three separate pieces must all be healthy. (1) **Name resolution:** containers on the default bridge get DNS servers from the daemon's `dns` setting or, if none, from the host's resolver, so a dead override breaks every new container while the host looks fine. (2) **Routing:** the host must forward packets between the bridge and the outside, which is the kernel setting `net.ipv4.ip_forward`; it is persisted under `/etc/sysctl.d/`. (3) **NAT:** docker writes its own iptables chains (`DOCKER`, MASQUERADE for outbound traffic, DNAT for published ports) when the daemon starts. If something flushes them, the daemon is what rebuilds them.
+    **What you're learning.** The three host pieces container networking depends on: the DNS setting, IP forwarding and Docker's iptables rules.
 
-    **Read up on:**
-    - `cat /etc/docker/daemon.json` and `docker run --rm busybox:1.37 cat /etc/resolv.conf` — what containers use
-    - `sysctl net.ipv4.ip_forward`, `/etc/sysctl.d/` and `sysctl --system` — read and persist a kernel setting
-    - `iptables -t nat -S` and `iptables -S DOCKER` — are docker's chains and MASQUERADE present?
-    - `systemctl restart docker` — what it re-creates, and what happens to running containers
+    ### The idea
+
+    | piece | what it does | broken → symptom |
+    |---|---|---|
+    | **DNS servers** for containers | default-bridge containers use the host's resolvers, or `"dns"` from daemon.json | a dead resolver → name lookups time out |
+    | **`net.ipv4.ip_forward=1`** | lets the host route traffic between `docker0` and the outside | 0 → no outbound traffic at all |
+    | **iptables NAT rules** (the `DOCKER` chain, `MASQUERADE`) | outbound NAT and **published ports** | flushed → no internet, `-p` stops working |
+
+    The daemon recreates its iptables rules when it starts. sysctl settings survive a reboot only if they're in `/etc/sysctl.d/*.conf`, and **the last file that sets a key wins** (files are read in lexical order).
+
+    ### Commands you'll use
+
+    ```bash
+    docker run --rm busybox:1.37 cat /etc/resolv.conf
+    grep -i dns /etc/docker/daemon.json
+    sysctl net.ipv4.ip_forward
+    grep -rn ip_forward /etc/sysctl.conf /etc/sysctl.d/
+    sudo iptables -t nat -S | grep -E 'DOCKER|MASQUERADE' | head
+    sudo iptables -t nat -S DOCKER | grep 8135
+    ```
+    ```bash
+    sudo sysctl --system              # reload every sysctl file in order
+    sudo systemctl restart docker     # rebuild the iptables rules
+    docker ps --filter name=web       # started again? (check its restart policy)
+    ```
+
+    ### Common mistakes
+
+    - `sysctl -w net.ipv4.ip_forward=1` only: lost on reboot, or overridden by the hardening file.
+    - Writing a new file that sorts **before** the one that sets 0.
+    - Recreating `web`.
+
+    ### Check your work
+
+    Containers resolve names and ping `1.1.1.1`, `curl localhost:8135` answers, `sysctl --system` leaves `ip_forward = 1`, and `web` has the same ID.
   scenario: |
     The docker host is fine, but containers are cut off. A hardening script and an admin
     "cleaning up" the firewall ran last night. Symptoms:
@@ -408,13 +616,35 @@ exercises:
   kind: build
   tags: [daemon, address-pools, networking]
   tutorial: |
-    **Concept.** The daemon picks subnets for new user-defined networks from an address pool. That pool can be configured with a base range and a prefix length for each network.
+    **What you're learning.** `default-address-pools`: where Docker takes the subnets for new networks.
 
-    **Read up on:**
-    - Docker docs 'Daemon configuration file' — options about network address pools
-    - `docker network create` then `docker network inspect` — see the assigned subnet
-    - `ip -4 route` — routes on the host
-    - Restart the daemon so the setting applies; existing networks keep their subnets
+    ### The idea
+
+    When you `docker network create` without `--subnet`, the daemon picks a free subnet from its **address pools**. The defaults are 172.17–31.0.0/16 and 192.168.0.0/16 in /20s, which often clash with corporate ranges. Configure them:
+
+    ```json
+    { "default-address-pools": [ { "base": "10.200.0.0/16", "size": 24 } ] }
+    ```
+    `size` is the prefix length of **each** network (/24 = 256 networks from a /16). Existing networks keep their subnets.
+
+    ### Commands you'll use
+
+    ```bash
+    docker network inspect $(docker network ls -q) --format '{{.Name}} {{range .IPAM.Config}}{{.Subnet}}{{end}}'
+    # merge the setting into daemon.json, then:
+    sudo systemctl restart docker
+    docker network create probe-net
+    docker network inspect probe-net --format '{{range .IPAM.Config}}{{.Subnet}}{{end}}'     # 10.200.x.0/24
+    ```
+
+    ### Common mistakes
+
+    - Expecting existing networks to move.
+    - Confusing it with `bip`, which sets only `docker0` (docker-144).
+
+    ### Check your work
+
+    `after-change` has a `/24` inside `10.200.0.0/16`.
   scenario: |
     Docker hands out subnets from `172.17.0.0/16` upwards for new networks — which collide
     with the corporate VPN (`172.16.0.0/12`).
@@ -447,13 +677,45 @@ exercises:
   kind: build
   tags: [daemon, api, systemd]
   tutorial: |
-    **Concept.** The daemon's listening addresses can be set by a `-H` flag in its service unit, but the packaged unit already passes one. A systemd drop-in lets you override part of a unit without editing it.
+    **What you're learning.** systemd **drop-ins**: overriding the daemon's command line without editing the packaged unit.
 
-    **Read up on:**
-    - `systemctl cat docker` — view the current ExecStart
-    - `man systemd.unit` — drop-ins and how to reset a list-type setting like ExecStart
-    - `man dockerd` — the `-H` / `--host` option
-    - `systemctl daemon-reload`, then `curl` or `docker -H` to test
+    ### The idea
+
+    The packaged `docker.service` runs `ExecStart=/usr/bin/dockerd -H fd:// --containerd=...`. To add flags, put a **drop-in** in `/etc/systemd/system/docker.service.d/NAME.conf`. Package upgrades don't overwrite it. For `ExecStart`, a drop-in must first **reset** the value with an empty `ExecStart=` line, then set the new one:
+
+    ```ini
+    [Service]
+    ExecStart=
+    ExecStart=/usr/bin/dockerd -H fd:// -H tcp://127.0.0.1:2375 --containerd=/run/containerd/containerd.sock
+    ```
+    `-H fd://` keeps the socket that systemd's `docker.socket` provides. **Never** bind 2375 to a non-loopback address: the plain-TCP API has no authentication and gives root to anyone who can reach it.
+
+    ### Commands you'll use
+
+    ```bash
+    systemctl cat docker | grep ExecStart          # the current command line
+    sudo mkdir -p /etc/systemd/system/docker.service.d
+    sudo tee /etc/systemd/system/docker.service.d/tcp.conf <<'EOF'
+    [Service]
+    ExecStart=
+    ExecStart=/usr/bin/dockerd -H fd:// -H tcp://127.0.0.1:2376 --containerd=/run/containerd/containerd.sock
+    EOF
+    sudo systemctl daemon-reload
+    sudo systemctl restart docker
+    curl -s localhost:2376/version | jq .Version
+    docker ps                                       # the unix socket still works
+    ```
+    `systemctl edit docker` opens an editor on a drop-in and reloads for you.
+
+    ### Common mistakes
+
+    - No empty `ExecStart=`: "Service has more than one ExecStart= setting".
+    - Forgetting `daemon-reload`.
+    - Dropping `-H fd://`: the unix socket stops working.
+
+    ### Check your work
+
+    `curl -s localhost:2375/version` returns JSON, `docker ps` works, and the packaged unit file is unchanged.
   scenario: |
     A local monitoring agent can only talk to docker over TCP. Make the daemon listen on
     **`tcp://127.0.0.1:2375`** *in addition to* the usual unix socket.
@@ -495,13 +757,42 @@ exercises:
   kind: fix
   tags: [daemon, systemd, troubleshooting]
   tutorial: |
-    **Concept.** The daemon can take its listening addresses from either the config file or command line flags, and specifying both is rejected. You need to choose one place and clear the other.
+    **What you're learning.** Settings given both as a flag and in daemon.json: why the daemon refuses, and how to choose one place.
 
-    **Read up on:**
-    - `journalctl -u docker -n 20` — the exact error
-    - `systemctl cat docker` — the ExecStart line with `-H`
-    - Docker docs 'Configure remote access' — the conflict explained
-    - `man systemd.service` — resetting ExecStart in a drop-in
+    ### The idea
+
+    Some options may be set **either** on the dockerd command line **or** in `daemon.json`, not both. `hosts` is the classic one: the packaged unit already passes `-H fd://`, so adding `"hosts"` to daemon.json gives:
+
+    ```text
+    unable to configure the Docker daemon with file /etc/docker/daemon.json:
+    the following directives are specified both as a flag and in the configuration file: hosts
+    ```
+    Choose one place:
+
+    - **A**: keep `hosts` in daemon.json (include the unix socket) and remove `-H` from `ExecStart` with a drop-in;
+    - **B**: remove `hosts` from daemon.json and add both `-H` flags in a drop-in (docker-153).
+
+    ### Commands you'll use
+
+    ```bash
+    sudo journalctl -u docker -n 5 --no-pager
+    jq . /etc/docker/daemon.json
+    sudo sh -c 'jq "del(.hosts)" /etc/docker/daemon.json > /tmp/d.json && mv /tmp/d.json /etc/docker/daemon.json'
+    # then add a drop-in with both -H flags (docker-153)
+    sudo systemctl daemon-reload && sudo systemctl restart docker
+    ss -ltnp | grep 2375
+    docker ps
+    ```
+    With option A, the unix socket in `hosts` is `unix:///var/run/docker.sock`.
+
+    ### Common mistakes
+
+    - Removing the TCP listener: the task needs both.
+    - Deleting the other daemon.json settings along with `hosts`.
+
+    ### Check your work
+
+    Docker runs, `docker ps` works over the socket, `curl localhost:2375/version` answers, and the other daemon.json keys are still there.
   scenario: |
     Someone tried to make docker listen on `tcp://127.0.0.1:2375` by adding a `hosts`
     entry to **`/etc/docker/daemon.json`**. Now docker doesn't start at all.
@@ -542,13 +833,45 @@ exercises:
   kind: build
   tags: [daemon, proxy, systemd]
   tutorial: |
-    **Concept.** Image pulls are performed by the daemon, not the CLI, so proxy settings must reach the daemon's environment. With systemd that is done through the service's environment.
+    **What you're learning.** Proxy settings for the **daemon**: pulls happen in dockerd, not the CLI.
 
-    **Read up on:**
-    - Docker docs 'Daemon proxy configuration'
-    - `man systemd.exec` — `Environment=` in a drop-in
-    - `systemctl show docker --property=Environment` — verify
-    - `docker info` — HTTP Proxy lines
+    ### The idea
+
+    `docker pull` asks the **daemon** to download, so the CLI's `HTTP_PROXY` environment variable doesn't matter. The daemon reads proxy variables from **its own** environment. With systemd, set them in a drop-in:
+
+    ```ini
+    [Service]
+    Environment="HTTP_PROXY=http://proxy.example:8080"
+    Environment="HTTPS_PROXY=http://proxy.example:8080"
+    Environment="NO_PROXY=localhost,127.0.0.1,.internal.example"
+    ```
+    `NO_PROXY` lists hosts and domains to reach directly (a leading `.` matches subdomains).
+
+    ### Commands you'll use
+
+    ```bash
+    sudo mkdir -p /etc/systemd/system/docker.service.d
+    sudo tee /etc/systemd/system/docker.service.d/http-proxy.conf <<'EOF'
+    [Service]
+    Environment="HTTP_PROXY=http://proxy.example:8080"
+    Environment="HTTPS_PROXY=http://proxy.example:8080"
+    Environment="NO_PROXY=localhost,127.0.0.1,.internal.example"
+    EOF
+    sudo systemctl daemon-reload && sudo systemctl restart docker
+    systemctl show docker --property=Environment
+    docker info --format '{{.HTTPProxy}} {{.HTTPSProxy}} {{.NoProxy}}'
+    ```
+    Newer daemons also accept `"proxies"` in daemon.json. Here the task asks for the drop-in.
+
+    ### Common mistakes
+
+    - `export HTTP_PROXY` in your shell: the daemon never sees it.
+    - A drop-in with a different name than the one asked for.
+    - Forgetting `daemon-reload`.
+
+    ### Check your work
+
+    `docker info` shows the proxy and the exceptions, and the drop-in is named `http-proxy.conf`.
   scenario: |
     In production, the docker host can only reach the internet through the proxy
     **`http://proxy.corp.example:3128`**. Configure the **daemon** (image pulls happen in
@@ -590,13 +913,41 @@ exercises:
   kind: build
   tags: [nsenter, namespaces, debugging]
   tutorial: |
-    **Concept.** A container's network namespace can be entered from the host with tools the container image lacks. The host sees the container's main PID and can run its own commands inside selected namespaces.
+    **What you're learning.** Inspecting a container with **host** tools: `nsenter` into its network namespace.
 
-    **Read up on:**
-    - `man nsenter` — option for the network namespace
-    - `docker inspect --format '{{.State.Pid}}'` — the host PID
-    - `ss -ltn` (`man ss`) — listing listening TCP sockets
-    - `/proc/<pid>/net/tcp` — raw alternative
+    ### The idea
+
+    Minimal images (distroless, scratch) have no shell, `ss` or `netstat`. But the container's namespaces belong to its main process, and the host can **enter** them:
+
+    ```bash
+    sudo nsenter -t PID -n COMMAND        # -n = network namespace only; COMMAND comes from the host
+    ```
+    The command runs from the host's filesystem but sees the container's network: its interfaces and listening sockets. A Docker-only alternative is a helper container that shares the namespace: `--network container:NAME` (docker-068).
+
+    ### Commands you'll use
+
+    ```bash
+    docker exec blackbox sh            # OCI runtime exec failed: "sh": executable file not found
+    PID=$(docker inspect -f '{{.State.Pid}}' blackbox)
+    sudo nsenter -t "$PID" -n ss -ltn
+    ```
+    ```text
+    State   Recv-Q  Send-Q  Local Address:Port  Peer Address:Port
+    LISTEN  0       128     0.0.0.0:7070        0.0.0.0:*
+    ```
+    ```bash
+    sudo nsenter -t "$PID" -n ip addr
+    docker run --rm --network container:blackbox busybox:1.37 netstat -tln
+    ```
+
+    ### Common mistakes
+
+    - `ss -ltn` on the host directly: it shows the host's sockets.
+    - Writing `0.0.0.0:7070` instead of the port number.
+
+    ### Check your work
+
+    The file contains only the port number, and it matches the `LISTEN` line inside the namespace.
   scenario: |
     **`mystery`** runs a minimal image with no shell. You need to know which **TCP port**
     its application is listening on (it's not documented and not published).
@@ -629,13 +980,29 @@ exercises:
   kind: fix
   tags: [daemon, incident, troubleshooting]
   tutorial: |
-    **Concept.** After an upgrade, check systemd status and logs first to get the daemon running, then check each container's configuration and the host settings it depends on.
+    **What you're learning.** A recovery method for a Docker host after an upgrade: daemon first, then containers, then access.
 
-    **Read up on:**
-    - `journalctl -u docker -n 30` — why startup fails
-    - `dockerd --validate` / `jq .` on the config file — find bad keys or value types
-    - `docker ps -a` and `docker logs` — container problems after the daemon returns
-    - `sysctl` and `iptables -S` — host networking prerequisites
+    ### Method
+
+    Work from the bottom up. Each layer depends on the one below:
+
+    | step | check | likely fault (exercise) |
+    |---|---|---|
+    | 1. unit | `systemctl status docker`, `is-enabled` | masked or disabled (docker-145) |
+    | 2. config | `journalctl -u docker -n 20`, `dockerd --validate` | a `log-opts` number instead of a string, a misspelled key (docker-146) |
+    | 3. containers | `docker ps -a`, `docker inspect NAME` (restart policy, ports), `docker logs` | `shop-db` had no restart policy, a dependency missing (docker-002) |
+    | 4. access | `ls -l /var/run/docker.sock`, `id` | socket group or mode wrong (docker-149) |
+
+    Keep the required settings (`log-opts` rotation). Fix the faults; don't delete the config. After each step, run the check again before moving to the next.
+
+    ```bash
+    sudo journalctl -u docker -n 20 --no-pager
+    sudo dockerd --validate --config-file /etc/docker/daemon.json
+    ```
+
+    ### Check your work
+
+    `systemctl is-enabled docker` and `is-active` succeed, daemon.json has the rotation settings, `curl localhost:8136` answers, `shop-db` is running, and `docker ps` works without sudo.
   scenario: |
     After an OS upgrade and some "tuning", the docker host is in a sorry state:
 
