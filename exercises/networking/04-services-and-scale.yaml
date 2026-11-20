@@ -12,23 +12,66 @@ exercises:
   kind: fix
   tags: [dns, dnsmasq, round-robin, split-horizon, cache, netem, netns]
   tutorial: |
-    **Concept.** A DNS server does more than look up a name. Three behaviours shape what clients experience, and each one is a small piece of configuration with a large effect.
+    **What you're learning.** Three DNS-server behaviours that clients depend on: returning several addresses for one name, giving different answers to different networks, and caching.
 
-    - **How many answers.** DNS can spread clients over several servers by answering one name with several A records. Resolvers return the records in a rotating order, so successive clients start with different addresses.
-    - **Which answer.** Split-horizon DNS answers the same name differently depending on who asks: private for internal clients, public for the rest. A multi-homed server can decide by where the query arrived.
-    - **How often it asks.** A caching resolver stores answers for their time-to-live, so repeat queries are served locally instead of crossing a slow link upstream.
+    ### The idea
 
-    All of them can be observed from a client with `dig`, by looking at the answer section, the source you queried from, and the query time.
+    **Round-robin DNS.** A name can have several A records. The server returns all of them (often in rotating order) and clients pick one, which spreads load across servers. If the server only knows one address, clients only ever use one server.
 
-    **Read up on:**
-    - `dig +short @SERVER name` — see every record in an answer
-    - `man dnsmasq` — `addn-hosts` and how several lines for one name are answered
-    - `man hosts` — the file format dnsmasq reads
-    - `man dnsmasq` — options that tie answers to the receiving interface
-    - `ip netns exec` — query from different vantage points; `ip -n NS addr` shows which subnet each side of the server is on
-    - `dig` — the `Query time` line in the statistics footer, and `dig +noall +answer` for the TTL column
-    - `man dnsmasq` — options controlling the size of the DNS cache
-    - `systemctl restart` — dnsmasq reads its config and data files at startup (a restart also clears the cache)
+    **Split-horizon DNS.** The same name gets a **different answer depending on who asks**: an internal address for clients inside, a public one for clients outside.
+
+    **Caching.** A caching resolver remembers answers for their **TTL**. The first lookup goes upstream (slow); repeats are answered from memory in about 0 ms. A cache size of 0 means every lookup goes upstream.
+
+    ### The tool: dnsmasq
+
+    | config | does |
+    |---|---|
+    | `addn-hosts=FILE` | read `IP NAME` lines from a hosts-style file; several lines with the same name = several A records |
+    | `host-record=NAME,IP` | one fixed answer, overriding anything forwarded |
+    | `localise-queries` | if a name has several addresses, answer with the one(s) on the **subnet of the interface the query arrived on** |
+    | `cache-size=N` | how many answers to cache (`0` disables caching) |
+    | `server=IP` | the upstream to forward to |
+
+    dnsmasq reads its config at start: `sudo systemctl restart UNIT` after editing.
+
+    ### Commands you'll use
+
+    ```bash
+    sudo ip netns exec client1 dig +short @10.5.0.1 api.demo.test
+    ```
+    ```text
+    10.5.1.11
+    10.5.1.12
+    ```
+    `+short` prints just the answers.
+
+    ```bash
+    cat /lab/demo/hosts                           # IP NAME lines
+    echo "10.5.1.13 api.demo.test" >> /lab/demo/hosts
+    sudo systemctl restart kl-demo-dns
+    sudo ip netns exec client1 dig @10.5.0.1 api.demo.test | grep -E 'Query time|^api'
+    ```
+    ```text
+    api.demo.test.  0  IN  A  10.5.1.11
+    ...
+    ;; Query time: 412 msec       ← first lookup: from upstream
+    ;; Query time: 0 msec         ← repeat: from the cache
+    ```
+
+    ```bash
+    grep -nE 'cache-size|localise|addn-hosts|server=' /lab/demo/dnsmasq.conf
+    journalctl -u kl-demo-dns -n 20                # dnsmasq logs its config errors here
+    ```
+
+    ### Common mistakes
+
+    - Editing the file but not restarting the unit.
+    - Adding a duplicate line for an address that's already there.
+    - Expecting `localise-queries` to work when the addresses aren't on the interfaces' subnets: it compares against the receiving interface's network.
+
+    ### Check your work
+
+    From each client, `dig +short` gives exactly the expected addresses, and a repeat lookup reports a query time near 0 ms.
   scenario: |
     Three small resolvers, each in its own network namespaces, each answering wrongly in
     its own way. Run commands inside a namespace with
@@ -220,22 +263,65 @@ exercises:
   kind: fix
   tags: [nginx, haproxy, reverse-proxy, health-checks, docker]
   tutorial: |
-    **Concept.** A load balancer has two ways of protecting clients from a failing backend, and both depend on its definition of "failing".
+    **What you're learning.** How load balancers deal with unhealthy backends: **retrying** a request elsewhere (passive) and **health checks** (active).
 
-    - **Retrying.** A reverse proxy can move on to the next backend, but only for failures it treats as retryable. By default a backend that answers with an error status has still answered, so the client gets that error.
-    - **Health checking.** HAProxy only sends traffic to servers whose health check passes. If the check asks for the wrong thing or expects the wrong answer, every server is marked down and clients get a 503, even though the backends are fine.
+    ### The idea
 
-    One mistake lets broken responses through; the other takes healthy servers out of service. In both cases you find the answer by comparing what the proxy thinks with what a backend really returns.
+    | approach | how it works | where |
+    |---|---|---|
+    | **retry on failure** (passive) | when a backend's response is an error, send the same request to the next backend | nginx `proxy_next_upstream` |
+    | **health checks** (active) | the balancer probes each backend regularly (e.g. `GET /health` must return 200) and stops sending traffic to failing ones | HAProxy `check` + `option httpchk` |
 
-    **Read up on:**
-    - nginx `proxy_next_upstream` — which conditions trigger a retry
-    - nginx `upstream` and the `server` parameters `max_fails`, `fail_timeout`
-    - `docker exec NAME nginx -t` and `nginx -s reload` — check and apply config
-    - `curl -s -o /dev/null -w '%{http_code}\n'` — print only the status
-    - HAProxy `option httpchk` and the `http-check send` / `http-check expect` rules
-    - `curl -i URL` — what a backend really returns for a given path
-    - `docker logs NAME` — state-change messages such as "is DOWN"
-    - `docker kill -s HUP NAME` — make HAProxy reload its config
+    A health check is only as good as its definition: probe a path the backend doesn't serve, or expect the wrong status, and **every** server is marked down, giving 503 for everything.
+
+    ### nginx
+
+    ```nginx
+    upstream app {
+        server 127.0.0.1:7001;
+        server 127.0.0.1:7002;
+    }
+    server {
+        listen 127.0.0.1:8080;
+        location / {
+            proxy_pass http://app;
+            proxy_next_upstream error timeout http_502 http_503;
+        }
+    }
+    ```
+    By default nginx only retries on connection **errors** and **timeouts**; list the HTTP statuses that should also count.
+
+    ```bash
+    docker exec CONTAINER nginx -t            # test the config
+    docker exec CONTAINER nginx -s reload     # apply it without a restart
+    ```
+
+    ### HAProxy
+
+    ```haproxy
+    backend web
+        option httpchk
+        http-check send meth GET uri /status
+        http-check expect status 200
+        server a 127.0.0.1:7101 check
+        server b 127.0.0.1:7102 check
+    ```
+
+    ```bash
+    curl -s -o /dev/null -w '%{http_code}\n' http://127.0.0.1:7101/status   # what does a backend really answer?
+    docker logs CONTAINER | tail          # "Server web/a is DOWN, reason: Layer7 wrong status, code: 404"
+    docker kill -s HUP CONTAINER          # HAProxy reloads its config on SIGHUP
+    ```
+
+    ### Common mistakes
+
+    - Removing the broken `server` line: the task says keep all three.
+    - Removing `check`: HAProxy then sends traffic to dead backends.
+    - Editing the file inside the container: it's mounted read-only. Edit the host file, then reload.
+
+    ### Check your work
+
+    Loop `for i in $(seq 9); do curl -s URL; done`: every response is a backend name, never an error, and every healthy backend appears.
   scenario: |
     Two load balancers, each failing its clients in the opposite way. Both configurations
     are mounted read-only into their containers, so edit them on the host and apply the
@@ -412,13 +498,56 @@ exercises:
   kind: build
   tags: [tcp, keepalive, sysctl, ss, netns]
   tutorial: |
-    **Concept.** TCP keepalive probes an idle connection to detect a vanished peer. Idle time, probe interval and probe count come from kernel settings, which a socket reads when keepalive is switched on for it.
+    **What you're learning.** **TCP keepalive**: how an idle connection notices that the other side has disappeared, and the three kernel settings that control it.
 
-    **Read up on:**
-    - `sysctl net.ipv4.tcp_keepalive_time` and its two siblings
-    - `ip netns exec NS sysctl ...` — these settings exist per network namespace
-    - `ss -tno` — the `timer:(keepalive,...)` field of a connection
-    - `man 7 tcp` — `TCP_KEEPIDLE` and `SO_KEEPALIVE`
+    ### The idea
+
+    An idle TCP connection sends nothing. If the peer crashes or the network breaks, neither side notices until it tries to send. With keepalive enabled on the socket, the kernel sends small **probes** after the connection has been idle for a while:
+
+    ```
+    idle for tcp_keepalive_time ──► probe ── no answer ── wait tcp_keepalive_intvl ──► probe ...
+    after tcp_keepalive_probes unanswered probes ──► connection declared dead
+    ```
+
+    | sysctl | default |
+    |---|---|
+    | `net.ipv4.tcp_keepalive_time` | 7200 s (2 hours!) |
+    | `net.ipv4.tcp_keepalive_intvl` | 75 s |
+    | `net.ipv4.tcp_keepalive_probes` | 9 |
+
+    These are **per network namespace**: set them inside the namespace that runs the client. A socket reads them when it's **created**, so restart the program so it opens a new connection.
+
+    ### Commands you'll use
+
+    ```bash
+    sudo ip netns exec app sysctl net.ipv4.tcp_keepalive_time
+    ```
+    ```text
+    net.ipv4.tcp_keepalive_time = 7200
+    ```
+
+    ```bash
+    sudo ip netns exec app sysctl -w net.ipv4.tcp_keepalive_time=60 \
+      net.ipv4.tcp_keepalive_intvl=10 net.ipv4.tcp_keepalive_probes=3
+    sudo systemctl restart kl-demo-client
+    sudo ip netns exec app ss -tno
+    ```
+    ```text
+    ESTAB 0 0 10.6.0.1:41234 10.6.0.2:7000 timer:(keepalive,59sec,0)
+    ```
+    `-o` shows the timer: `keepalive,59sec,0` = next probe in 59 s, 0 probes sent so far.
+
+    `. FILE` (or `source FILE`) loads `name=value` lines from a file into shell variables.
+
+    ### Common mistakes
+
+    - Running `sysctl -w` on the host (without `ip netns exec`): changes the wrong namespace.
+    - Not restarting the client: the old socket keeps its old timer.
+    - The program must enable keepalive on its socket (`SO_KEEPALIVE`); the sysctls only tune it.
+
+    ### Check your work
+
+    `ss -tno` in the namespace shows a `keepalive` timer counting down from the idle time you set.
   scenario: |
     The service **`kl-ka-cl`** runs in the namespace **`cl`** and keeps one idle TCP
     connection open to a server at `10.40.0.2:7000` in namespace `srv`. The policy for
@@ -504,13 +633,50 @@ exercises:
   kind: fix
   tags: [dhcp, dnsmasq]
   tutorial: |
-    **Concept.** A DHCP server leases addresses from a pool and attaches options such as the default gateway, and it can pin a fixed address to a known MAC. dnsmasq expresses all of this in a few config directives, and it can check a file without serving.
+    **What you're learning.** What a DHCP server hands out, and how to configure the pool, the gateway and a fixed reservation in dnsmasq.
 
-    **Read up on:**
-    - `dnsmasq --test --conf-file=FILE` — validate a config without starting the server
-    - `dhcp-range` — pool start, end and lease time (`30m`, `12h`)
-    - `dhcp-option=option:router,...` — the default gateway handed to clients
-    - `dhcp-host` — a fixed address reserved for one MAC
+    ### The idea
+
+    A new machine on a network has no address. It broadcasts a **DHCP** request; the server answers with a **lease**:
+
+    | part of a lease | dnsmasq directive |
+    |---|---|
+    | an address from the **pool**, for a **lease time** | `dhcp-range=START,END,TIME` (e.g. `12h`, `30m`) |
+    | the default **gateway** (router) | `dhcp-option=option:router,IP` |
+    | DNS servers | `dhcp-option=option:dns-server,IP` |
+    | a **reservation**: this MAC always gets this IP | `dhcp-host=MAC,IP` |
+
+    A reserved address is usually **outside** the dynamic pool, so it can't be handed to someone else.
+
+    ### Commands you'll use
+
+    ```text
+    # /lab/demo/dnsmasq.conf
+    dhcp-range=192.168.40.100,192.168.40.150,8h
+    dhcp-option=option:router,192.168.40.1
+    dhcp-host=52:54:00:aa:bb:cc,192.168.40.20
+    ```
+
+    ```bash
+    cat /lab/demo/spec.txt                         # read the requirements
+    dnsmasq --test --conf-file=/lab/demo/dnsmasq.conf
+    ```
+    ```text
+    dnsmasq: syntax check OK.
+    ```
+
+    `--test` only checks syntax. Compare each value with the spec yourself.
+
+    ### Common mistakes
+
+    - `dhcp-option=3,IP`: also valid (option 3 = router), but easy to mistype; `option:router` is clearer.
+    - A lease time without a unit is in **seconds**.
+    - Uppercase/lowercase MACs are both fine; a typo is not.
+    - Writing the spec's variable names instead of their values: read `spec.txt` and copy the actual values.
+
+    ### Check your work
+
+    `dnsmasq --test` says OK, and `grep -E '^dhcp' FILE` shows each value from the spec exactly.
   scenario: |
     The DHCP config at **`/lab/dhcp/dnsmasq.conf`** is wrong, and the requirements are in
     **`/lab/lease-spec.txt`**. Fix the config so that:
@@ -584,12 +750,54 @@ exercises:
   kind: build
   tags: [tc, htb, shaping, qdisc, netns]
   tutorial: |
-    **Concept.** Shaping limits the rate a host sends at. A classful qdisc such as HTB divides the link into classes with their own rates, and filters pick the class for each packet.
+    **What you're learning.** Traffic shaping with `tc`: limiting the rate of one kind of traffic while leaving the rest alone.
 
-    **Read up on:**
-    - `man tc-htb` — root qdisc, classes, `rate`, `ceil` and the `default` class
-    - `man tc-u32` — classify packets by destination port
-    - `tc -s class show dev IF` — what went through which class
+    ### The idea
+
+    Each interface has a **queueing discipline** (qdisc) deciding how packets leave. **HTB** (Hierarchical Token Bucket) lets you build **classes** with their own rates and sort packets into them with **filters**:
+
+    ```
+    eth0 root qdisc 1: htb (default 20)
+     ├─ class 1:10  rate 5mbit  ceil 5mbit     ← filter: dport 8000 goes here
+     └─ class 1:20  rate 900mbit               ← everything else (the default)
+    ```
+
+    - `rate` is the guaranteed rate, `ceil` the maximum it may borrow up to. `rate = ceil` is a hard cap.
+    - `default 20` sends unmatched traffic to class `1:20`. Without a `default`, unmatched packets bypass the classes entirely (counted as "direct packets"), which makes the tree hard to reason about; give a default class.
+    - Shaping works on traffic **leaving** an interface: configure it on the sender.
+
+    ### Commands you'll use
+
+    ```bash
+    sudo ip netns exec up tc qdisc add dev eth0 root handle 1: htb default 20
+    sudo ip netns exec up tc class add dev eth0 parent 1: classid 1:10 htb rate 5mbit ceil 5mbit
+    sudo ip netns exec up tc class add dev eth0 parent 1: classid 1:20 htb rate 900mbit
+    sudo ip netns exec up tc filter add dev eth0 parent 1: protocol ip u32 \
+      match ip dport 8000 0xffff flowid 1:10
+    ```
+    `u32 match ip dport 8000 0xffff` = destination port exactly 8000 (`0xffff` is the mask).
+
+    ```bash
+    sudo ip netns exec up tc -s class show dev eth0
+    ```
+    ```text
+    class htb 1:10 root prio 0 rate 5Mbit ceil 5Mbit ...
+     Sent 1843200 bytes 1260 pkt ...
+    class htb 1:20 root prio 0 rate 900Mbit ...
+    ```
+    The `Sent` counters show which class the traffic used.
+
+    `tc qdisc del dev eth0 root` removes everything if you need to start over.
+
+    ### Common mistakes
+
+    - `mbit` vs `mbps`: in tc, `mbps` means mega**bytes** per second. Use `mbit` for megabits.
+    - Configuring the receiver instead of the sender.
+    - Running `tc ... add` twice: "File exists". Delete the root qdisc and rebuild.
+
+    ### Check your work
+
+    `tc -s class show` shows the capped class's counters growing when you send to the limited port, and the default class's for the other port.
   scenario: |
     Host **`cl`** (10.70.0.1) uploads to **`srv`** (10.70.0.2), which accepts data on
     two TCP ports:
@@ -683,13 +891,60 @@ exercises:
   kind: build
   tags: [routing, ecmp, anycast, sysctl, netns]
   tutorial: |
-    **Concept.** With anycast, several servers share one address and the network sends each connection to one of them. Equal-cost routes choose a next hop by hashing packet fields, and which fields decides whether one client's connections spread out.
+    **What you're learning.** **Anycast** (one address on several servers) and **ECMP** routes that spread connections across several next hops.
 
-    **Read up on:**
-    - `ip route` — multipath routes with several `nexthop` entries
-    - `sysctl net.ipv4.fib_multipath_hash_policy` — which header fields feed the hash
-    - `ip route get ADDR sport N dport M ip_proto tcp` — ask which path a flow would take
-    - `ip netns exec NS sysctl` — the setting is per namespace
+    ### The idea
+
+    With anycast, several servers own the **same** IP address. Which one you reach depends on the route you take. A route with **several next hops** (ECMP, equal-cost multipath) lets the kernel choose a path per flow:
+
+    ```
+                     ┌─ via 10.8.1.2 ─► server A [10.8.9.9]
+    client ─ route ──┤
+                     └─ via 10.8.2.2 ─► server B [10.8.9.9]
+    ```
+
+    The kernel hashes each flow to pick a next hop. The hash policy decides what counts as a flow:
+
+    | `net.ipv4.fib_multipath_hash_policy` | hashes on | effect |
+    |---|---|---|
+    | `0` (default) | source and destination **IP** | same client + same address = always the same path |
+    | `1` | IPs **and ports** (layer 4) | each new connection (new source port) can take a different path |
+
+    ### Commands you'll use
+
+    ```bash
+    sudo ip -n client route show 10.8.9.9
+    ```
+    ```text
+    10.8.9.9 via 10.8.1.2 dev eth0 src 10.8.0.1
+    ```
+
+    ```bash
+    sudo ip -n client route replace 10.8.9.9/32 src 10.8.0.1 \
+      nexthop via 10.8.1.2 dev eth0 nexthop via 10.8.2.2 dev eth1
+    sudo ip -n client route show 10.8.9.9
+    ```
+    ```text
+    10.8.9.9 src 10.8.0.1
+    	nexthop via 10.8.1.2 dev eth0 weight 1
+    	nexthop via 10.8.2.2 dev eth1 weight 1
+    ```
+
+    ```bash
+    sudo ip netns exec client sysctl -w net.ipv4.fib_multipath_hash_policy=1
+    for i in $(seq 10); do sudo ip netns exec client curl -s --interface 10.8.0.1 http://10.8.9.9/; done
+    ```
+    `ip -n NS` is short for `ip netns exec NS ip`.
+
+    ### Common mistakes
+
+    - `route add` when a route exists: "File exists". `replace` swaps it.
+    - Leaving the hash policy at 0: every connection from the same source goes the same way.
+    - Forgetting `src` when the task requires a specific source address.
+
+    ### Check your work
+
+    Ten curls return both server names.
   scenario: |
     Two servers, **`s1`** and **`s2`**, both own the anycast address **10.99.9.9** and run
     a web server on port 80 that answers with its name. The client **`cl`** reaches
@@ -763,13 +1018,60 @@ exercises:
   kind: build
   tags: [nftables, port-knocking, sets, netns]
   tutorial: |
-    **Concept.** Port knocking opens a firewalled service only after a client touches a secret sequence of ports. nftables can remember who completed each step in sets that rules fill as packets arrive.
+    **What you're learning.** Stateful firewall rules in nftables using **dynamic sets with timeouts**, by building port knocking.
 
-    **Read up on:**
-    - `man nft` — sets with `flags dynamic` and `timeout`
-    - The `add @set { ip saddr }` statement — filling a set from a rule
-    - Rule order in a chain and `drop` / `accept` verdicts
-    - `nft list ruleset` — watch the set contents change
+    ### The idea
+
+    Port knocking hides a service: the port stays closed until a client "knocks" on a secret sequence of other ports. You can build it with nftables **sets** that the rules themselves fill:
+
+    ```
+    connect to K1 ─► add source IP to set k1 (for 10 s), drop
+    connect to K2 ─► if source in k1: add to set ok (for 30 s), drop
+    connect to 2222 ─► if source in ok: accept, else drop
+    ```
+
+    | piece | syntax |
+    |---|---|
+    | a set that rules can add to, entries expiring | `set NAME { type ipv4_addr; flags dynamic; timeout 10s; }` |
+    | add the packet's source | `add @NAME { ip saddr }` |
+    | test membership | `ip saddr @NAME` |
+
+    Rules are checked **in order**; the first `accept` or `drop` ends the evaluation.
+
+    ### Commands you'll use
+
+    ```bash
+    sudo ip netns exec gw nft list ruleset
+    sudo ip netns exec gw nft -f - <<'EOF'
+    table inet guard {
+      set seen { type ipv4_addr; flags dynamic; timeout 15s; }
+      chain input {
+        type filter hook input priority 0; policy accept;
+        tcp dport 4000 add @seen { ip saddr } drop
+        tcp dport 8443 ip saddr @seen accept
+        tcp dport 8443 drop
+      }
+    }
+    EOF
+    sudo ip netns exec gw nft list set inet guard seen      # who is in the set right now
+    ```
+
+    Knock from a client (a connection attempt that times out is fine):
+    ```bash
+    sudo ip netns exec c1 timeout 1 bash -c 'echo > /dev/tcp/10.9.0.1/4000'
+    ```
+
+    `nft -f -` reads the ruleset from standard input; with `<<EOF` (unquoted) shell variables like `$K1` are filled in, with `<<'EOF'` they aren't.
+
+    ### Common mistakes
+
+    - Adding the new table but leaving the old blocking table: both apply. Delete the old one (`nft delete table inet NAME`) first.
+    - The second knock doesn't check the first set: then knocking only K2 opens the door.
+    - Wrong order: the final `drop` for the service must come **after** the `accept`.
+
+    ### Check your work
+
+    Without knocking: blocked. Knocking K2 then K1, or only one: blocked. K1 then K2: the service answers, and later a third host is still blocked.
   scenario: |
     The namespace **`srv`** runs a private service on **TCP port 2222** that is
     currently blocked by an nftables rule in `inet knock`. Two clients can reach it:
@@ -895,36 +1197,34 @@ exercises:
   kind: fix
   tags: [capstone, dns, dnsmasq, split-horizon, cache, haproxy, health-checks, tc, htb, shaping, netns]
   tutorial: |
-    **Concept.** A service that hundreds of machines hit at once is only as good as the
-    weakest piece in front of it. Scaling it is rarely one big change; it is a handful of
-    small ones, each in a different layer:
+    **What you're learning.** Making a service production-ready by combining this module's tools: DNS overrides and caching, load-balancer health checks, and traffic shaping.
 
-    - **Name resolution.** Clients find the service through DNS. A local resolver can
-      answer one name itself (the internal entry point) while forwarding everything else,
-      and its **cache** decides whether every lookup crosses a slow link or only the first.
-    - **Load balancing with health checks.** A load balancer without health checks sends
-      traffic to a server that is up but unable to serve. With them, it matters *what* you
-      check: a **liveness** endpoint says "the process runs", a **readiness** endpoint says
-      "I can serve requests now". Only the second one keeps a half-broken server out of
-      rotation, and lets it back in by itself once it recovers.
-    - **Health checks can hide mistakes.** A server that is configured wrongly (a wrong
-      port, say) is quietly marked down, and the remaining servers carry its share. Count
-      the servers that really answer, not just the errors.
-    - **Shaping.** Bulk traffic, such as a nightly sync, can starve everything else on a
-      link. A classful qdisc such as HTB caps one kind of traffic and leaves the rest alone.
+    ### Method
 
-    Work layer by layer, from the client outwards, and test each layer from where the
-    clients really are.
+    Take the requirements one at a time, test each before the next.
 
-    **Read up on:**
-    - `dig @SERVER name`, `+short`, and the `Query time` line
-    - `man dnsmasq` — `host-record=`, `address=`, `server=` and `cache-size=`
-    - `/etc/netns/NAME/resolv.conf` — the resolver that `ip netns exec NAME` uses
-    - HAProxy `option httpchk`, `http-check send` / `http-check expect`, and the `server` options `check`, `inter`, `rise`, `fall`
-    - Liveness versus readiness probes
-    - `docker kill -s HUP NAME` — make HAProxy reload its config; `docker logs NAME` shows servers going UP and DOWN
-    - `man tc-htb` and `man tc-u32` — a capped class, a default class and a port filter
-    - `tc -s class show dev IF`
+    | requirement | exercise | tool |
+    |---|---|---|
+    | a name answered locally | net-026 | dnsmasq `host-record=NAME,IP` (overrides what's forwarded) |
+    | fast repeat lookups | net-026 | `cache-size=N` > 0, restart the unit |
+    | no failed downloads, full capacity | net-029 | correct backend ports (read `MIRRORS.md`), `check` on every server |
+    | self-healing | net-029 | an **active** health check on the endpoint that reflects real readiness; `inter 1s rise 2 fall 2` |
+    | polite sync | net-032 | HTB on the sending side's interface, filter on the destination port |
+
+    Read the docs you're given: a "live" endpoint that answers 200 even on a broken node is not a health check. Compare what each endpoint returns on each mirror with `curl -s -o /dev/null -w '%{http_code}'` from the `lb` namespace.
+
+    Reload HAProxy with `docker kill -s HUP kl-mr-lb`; don't restart the container.
+
+    ### Check your work
+
+    ```bash
+    sudo ip netns exec ci dig +short @10.97.53.1 mirror.ci.test       # only 10.97.1.1
+    sudo ip netns exec ci dig @10.97.53.1 git.corp.test +short          # still from corp
+    for i in 1 2; do sudo ip netns exec ci dig @10.97.53.1 pypi.corp.test | grep 'Query time'; done
+    for i in $(seq 12); do sudo ip netns exec ci curl -s -o /dev/null -w '%{http_code}\n' \
+      http://10.97.1.1/pool/main/tool_1.0.deb; done | sort | uniq -c   # all 200
+    sudo ip netns exec mirrors tc -s class show dev eth1
+    ```
   scenario: |
     **Ticket BUILD-1187** (from Priya, Release Engineering): *"The build farm moves to the
     internal package mirror on Monday. Last dry run, a third of the downloads failed and

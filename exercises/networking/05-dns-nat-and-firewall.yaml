@@ -12,22 +12,55 @@ exercises:
   kind: build
   tags: [nat, masquerade, snat, nftables, troubleshooting, netns]
   tutorial: |
-    **Concept.** Hosts with private addresses can reach outside networks if the router rewrites their source address to its own. The outside network only has to know how to reach the router, and connection tracking un-translates the replies.
+    **What you're learning.** **Source NAT**: why private hosts need it to talk to the outside, and the two ways to do it in nftables (`masquerade` and `snat to`).
 
-    Source NAT has three details worth knowing, and each one is a common way to get it wrong:
+    ### The idea
 
-    - **Masquerade** picks the outgoing interface's address automatically, which makes it the simplest choice.
-    - **Rules only apply to packets that match them.** Matching on the wrong interface means the rule is loaded, shows up in the ruleset, and never fires.
-    - **Static source NAT** (`snat to`) lets the router choose the exact source. Sometimes a remote side accepts only one specific address, for example a published NAT address on an allow-list, and masquerade would use the wrong one.
+    A private host sends a packet from `10.1.0.2`. The outside host has no route back to `10.1.0.0/24`, so its reply goes nowhere. The router fixes this by **rewriting the source address** of outgoing packets to one of **its own** addresses, and remembering the mapping (in **conntrack**) so it can rewrite the replies back.
 
-    **Read up on:**
-    - `man nft` — the `nat` chain type, the `postrouting` hook, `masquerade`, and `snat to ADDRESS`
-    - `man nft` — `iifname` versus `oifname`, and which one a `postrouting` rule can rely on
-    - `nft list ruleset` — read the rules as the kernel has them
-    - `nft -a list ruleset` and `nft delete rule` — remove one rule by handle
-    - `nft flush chain` — empty a chain before rewriting it
-    - `ip -n NS route` and `ip -n NS addr` — which destinations a host can answer and which addresses a router owns
-    - Source NAT versus masquerade — when each is the better fit
+    ```
+    h1 10.1.0.2 ──► router: src 10.1.0.2 → 10.2.0.1 ──► h2 sees 10.2.0.1, replies to it
+    h1 ◄── router: dst 10.2.0.1 → 10.1.0.2 ◄── reply
+    ```
+
+    | rule | source becomes |
+    |---|---|
+    | `masquerade` | the address of the interface the packet **leaves** through (follows DHCP changes) |
+    | `snat to ADDR` | exactly `ADDR` (a fixed, possibly secondary, address) |
+
+    Source NAT happens in the **postrouting** hook, after the routing decision, so you match on the **outgoing** interface (`oifname`).
+
+    ### Commands you'll use
+
+    ```bash
+    sudo ip -n gw addr                          # which interface faces outside?
+    sudo ip netns exec gw nft list ruleset      # what's already there
+    sudo ip netns exec gw nft -f - <<'EOF'
+    table ip nat {
+      chain postrouting {
+        type nat hook postrouting priority srcnat;
+        oifname "eth1" masquerade
+      }
+    }
+    EOF
+    sudo ip netns exec lan1 ping -c1 192.0.2.2
+    ```
+
+    A fixed address instead: `oifname "eth1" snat to 192.0.2.100`.
+
+    To see the translation, watch conntrack: `sudo ip netns exec gw conntrack -L` (if installed), or capture on the far side: `sudo ip netns exec out1 tcpdump -ni eth0 icmp`.
+
+    `nft flush ruleset` empties everything in that namespace, useful before rewriting a broken setup.
+
+    ### Common mistakes
+
+    - Matching the **inside** interface in postrouting: packets to the outside never leave through it, so the rule never fires.
+    - Masquerade when the far side only accepts one specific address: use `snat to`.
+    - Forgetting the router must forward (`net.ipv4.ip_forward=1`). It already does here.
+
+    ### Check your work
+
+    The ping works, and a capture on the outside host shows the router's address as the source.
   scenario: |
     Three branch offices, each with a private host, a router and an outside host. They are
     separate networks, so each one has its own set of namespaces. Run commands inside a
@@ -231,22 +264,59 @@ exercises:
   kind: fix
   tags: [dns, dnsmasq, config, cname, sinkhole, hosts, nsswitch, getent]
   tutorial: |
-    **Concept.** The address an application gets for a name is decided in layers, and a mistake in any layer gives a wrong or missing answer.
+    **What you're learning.** Writing and checking a DNS server's configuration (dnsmasq), and how `/etc/hosts` fits into name resolution.
 
-    - **The resolver's configuration.** Most daemons can validate a configuration without starting. For dnsmasq, a syntax check reports the first bad line, so you can fix errors one by one before ever touching a running service.
-    - **The resolver's policy.** A caching resolver such as dnsmasq can answer some names itself, alias one name to another, block names by answering with a null address, and forward a single domain to a different upstream server. Combining these gives a small DNS policy for a network.
-    - **The local machine.** Before any DNS server is asked, the system resolver consults local sources in the order set by the name service switch. The hosts file usually comes first, so an outdated line there silently overrides the correct DNS answer.
+    ### The idea
 
-    **Read up on:**
-    - `dnsmasq --test -C FILE` — check a config file and exit
-    - `man dnsmasq` — `address=`, `host-record=`, `cname=` and `server=/domain/ip`, with their exact spelling
-    - IPv4 addresses — each octet is 0 to 255
-    - Sinkholing — answering `0.0.0.0` for a name you want to block
-    - Conditional forwarding — sending one domain to its own name server
-    - `getent hosts NAME` and `getent ahostsv4 NAME` — resolve the way applications do
-    - `man hosts` — the `/etc/hosts` file format
-    - `man nsswitch.conf` — the lookup order for `hosts`
-    - `sed -i` — edit a file in place
+    | dnsmasq directive | meaning |
+    |---|---|
+    | `address=/NAME/IP` | answer NAME **and every name under it** with IP (`0.0.0.0` = blocked) |
+    | `host-record=NAME,IP` | answer exactly NAME with IP (also creates the reverse record) |
+    | `cname=ALIAS,TARGET` | ALIAS is another name for TARGET (TARGET must be known locally) |
+    | `server=/DOMAIN/IP` | forward queries for DOMAIN to IP (conditional forwarding) |
+    | `no-resolv` / `no-hosts` | don't read `/etc/resolv.conf` / `/etc/hosts` |
+
+    `dnsmasq --test -C FILE` parses a file and reports the first error with its line.
+
+    **`/etc/hosts`** is consulted by programs **before** DNS (order set in `/etc/nsswitch.conf`). A stale line there wins over a correct DNS record. `getent hosts NAME` resolves the way programs do, so it shows exactly what they'll get.
+
+    ### Commands you'll use
+
+    ```bash
+    dnsmasq --test -C /lab/demo/site.conf
+    ```
+    ```text
+    dnsmasq: bad option at line 3 of /lab/demo/site.conf
+    ```
+
+    ```bash
+    sed -n 3p /lab/demo/site.conf             # look at that line
+    ```
+
+    ```text
+    # a small policy file
+    host-record=intranet.demo.test,10.7.0.10
+    cname=portal.demo.test,intranet.demo.test
+    address=/tracker.demo.test/0.0.0.0
+    server=/hq.test/10.7.0.53
+    ```
+
+    ```bash
+    grep -n 'files.demo.test' /etc/hosts
+    sudo sed -i 's/^10\.7\.9\.9 files.demo.test/10.7.0.40 files.demo.test/' /etc/hosts
+    getent hosts files.demo.test
+    ```
+
+    ### Common mistakes
+
+    - An IPv4 octet above 255: dnsmasq rejects the line.
+    - `address=` when only one exact name should match (it covers subdomains too).
+    - Appending a correct hosts line but leaving the stale one: the first match wins.
+    - Deleting other entries in `/etc/hosts`: edit only the line you need.
+
+    ### Check your work
+
+    `dnsmasq --test -C FILE` says `syntax check OK`; `grep` shows each directive; `getent hosts NAME` prints exactly one address.
   scenario: |
     The naming setup on this host needs attention at three levels.
 
@@ -382,18 +452,50 @@ exercises:
   kind: build
   tags: [nat, dnat, port-forwarding, nftables, firewall, forward, netns]
   tutorial: |
-    **Concept.** Port forwarding lets one public address front several private services: each public port is mapped to a different private address and port. The router rewrites the destination on the way in, and connection tracking restores the source on the way back.
+    **What you're learning.** **Destination NAT** (port forwarding), and why a default-drop forward chain must explicitly allow forwarded connections.
 
-    NAT and filtering are separate stages, though. Packets pass through prerouting, then forward, then postrouting, in that order. A DNAT rule can rewrite a packet correctly and the forward chain can still drop it, because the filter sees the packet with its **new** destination. A default-drop forward policy therefore needs an explicit allowance for the published service, and that allowance should be as narrow as the service itself.
+    ### The idea
 
-    **Read up on:**
-    - `man nft` — `dnat to ADDRESS:PORT` in a `prerouting` nat chain
-    - Matching the original destination port with `tcp dport`
-    - `man nft` — the `forward` hook, chain `policy` and `ct status dnat`
-    - `nft list ruleset` — read the nat table and the filter table together
-    - `nft add rule` — append a rule to an existing chain
-    - Packet flow — prerouting, forward, postrouting, and what each one sees
-    - `curl -s URL` — fetch each service from the client
+    To publish a private server, the router rewrites the **destination** of incoming packets: "to me on port 8081" becomes "to 10.2.0.2 port 9001". That's DNAT, done in the **prerouting** hook, **before** the routing decision, so the packet is then routed towards the private host.
+
+    ```
+    client ─► 10.1.0.1:8081 ─► router prerouting: dnat to 10.2.0.2:9001 ─► forward hook ─► server
+    ```
+
+    The rewritten packet then passes the **forward** chain like any routed packet. If that chain has `policy drop` and only accepts `ct state established,related`, the **first** packet of the connection is dropped (it's `new`). `ct status dnat` matches connections whose destination was translated: accept those, and only published services get through.
+
+    ### Commands you'll use
+
+    ```bash
+    sudo ip netns exec gw nft -f - <<'EOF'
+    table ip nat {
+      chain prerouting {
+        type nat hook prerouting priority dstnat;
+        tcp dport 2201 dnat to 10.8.0.5:22
+        tcp dport 8000 dnat to 10.8.0.6:80
+      }
+    }
+    EOF
+    sudo ip netns exec client curl -s http://10.7.0.1:8000/
+    ```
+
+    With a default-drop forward chain:
+    ```bash
+    sudo ip netns exec gw nft list chain inet filter forward
+    sudo ip netns exec gw nft add rule inet filter forward ct status dnat accept
+    ```
+
+    `nft add rule TABLE-FAMILY TABLE CHAIN ...` appends one rule to an existing chain.
+
+    ### Common mistakes
+
+    - DNAT in postrouting or SNAT in prerouting: hooks matter.
+    - Accepting **all** forwarding (`policy accept`) to make it work: the task requires keeping the drop policy, and direct pings must stay blocked.
+    - Testing from the router itself: locally generated packets don't pass prerouting.
+
+    ### Check your work
+
+    From the client, each published port returns its service, and pinging the private host directly still fails.
   scenario: |
     Two routers publish private services to the outside. The first has no port forwards
     yet, and the second has one that doesn't work. Run commands inside a namespace with
@@ -544,22 +646,62 @@ exercises:
   kind: build
   tags: [firewall, nftables, stateful, conntrack, netns]
   tutorial: |
-    **Concept.** A stateful host firewall defaults to dropping incoming traffic and then allows what is needed. Connection tracking is what makes that usable: it turns "incoming" into "answer to something I asked".
+    **What you're learning.** **Stateful** filtering: default-drop input chains, and the one rule that lets replies back in.
 
-    The same mechanism matters on both ends of a connection:
+    ### The idea
 
-    - On a **server**, the policy has to open specific services to specific sources, and let through the replies to any connections the server itself starts.
-    - On a **client**, a drop policy also drops the replies to its own outgoing requests, unless the firewall recognises them as part of a tracked connection. The request leaves, the answer arrives, and the firewall throws it away.
+    The kernel's **connection tracking** labels each packet:
 
-    In both cases you want the narrowest rule that works, so that unsolicited traffic stays blocked.
+    | `ct state` | meaning |
+    |---|---|
+    | `new` | first packet of a connection |
+    | `established` | part of a connection already seen in both directions |
+    | `related` | linked to an existing one (e.g. an ICMP error about it) |
+    | `invalid` | doesn't fit any known connection |
 
-    **Read up on:**
-    - `man nft` — `inet` tables, the `input` hook and a chain `policy drop`
-    - `ct state` and its values `new`, `established`, `related`
-    - Matching on `ip saddr`, `iifname`, `tcp dport` and `icmp type`
-    - `nft list ruleset` — verify the active policy and see what a chain accepts
-    - `nft add rule` — append to a chain without rewriting it
-    - `curl -m` — a client timeout shows which side is silent
+    A safe input chain drops everything by default, then accepts:
+
+    ```text
+    ct state established,related accept      ← replies to connections we opened, and ongoing ones
+    iifname "lo" accept                      ← the host talking to itself
+    icmp type echo-request accept            ← ping
+    ip saddr 10.5.1.2 tcp dport 8443 accept   ← one client, one service
+    ```
+
+    Without the first rule, a client with a drop policy can **send** requests but never **receive** the answers: `curl` times out.
+
+    ### Commands you'll use
+
+    ```bash
+    sudo ip netns exec srv nft -f - <<'EOF'
+    table inet fw {
+      chain input {
+        type filter hook input priority filter; policy drop;
+        ct state established,related accept
+        iifname "lo" accept
+        icmp type echo-request accept
+        ip saddr 10.5.1.2 tcp dport 8443 accept
+      }
+    }
+    EOF
+    sudo ip netns exec srv nft list ruleset
+    sudo ip netns exec good curl -s -m3 http://10.5.1.1:8443/    # works
+    sudo ip netns exec bad  curl -s -m3 http://10.5.2.1:8443/    # times out
+    ```
+
+    `nft list ruleset -a` adds handles; `nft delete rule inet fw input handle N` removes one rule.
+
+    `-m3` makes curl give up after 3 seconds instead of hanging.
+
+    ### Common mistakes
+
+    - Opening the client's input to the server's port: replies come **from** port 8000, not to it. `ct state established` is the right fix.
+    - `policy accept`: the task wants drop kept.
+    - Using `inet` vs `ip` inconsistently: name the table the same way when adding rules.
+
+    ### Check your work
+
+    The allowed client connects, the other times out, pings work as required, and unsolicited traffic (a ping from the server to the locked-down client) is dropped.
   scenario: |
     Two firewalls to sort out: one server that has none, and one client that is locked
     down too tightly. Run commands inside a namespace with
@@ -697,36 +839,31 @@ exercises:
   kind: fix
   tags: [capstone, nat, snat, dnat, masquerade, nftables, firewall, dmz, dns, dnsmasq, split-horizon, conditional-forwarding, netns]
   tutorial: |
-    **Concept.** A small office's edge router does four jobs at once, and they all meet in
-    one nftables ruleset and one resolver:
+    **What you're learning.** Designing a complete edge-router ruleset: zones, both kinds of NAT, a published service, and a local resolver.
 
-    - **Source NAT.** Private hosts go out with a public address. When the router owns
-      several public addresses, `snat to` picks one per network, which matters when a
-      remote side allow-lists a specific address. NAT rules are first-match: a broad rule
-      above a narrow one wins.
-    - **Destination NAT.** A published service maps one public address and port to a private
-      server. Match the public address too, or the rule also catches the office's own
-      outgoing traffic to that port.
-    - **Zones and a default-drop forward chain.** LAN, DMZ and internet are zones, and the
-      forward chain says which zone may *open* connections to which. Replies come back
-      through `ct state established,related`, and DNATed connections can be allowed with
-      `ct status dnat`. The DMZ exists so that a compromised web server can't reach the
-      office.
-    - **The router itself.** Traffic *to* the router goes through the input chain, not
-      forward. A drop policy there also drops the answers to the router's own queries,
-      including the ones its DNS resolver sends upstream.
-    - **The office resolver.** It can answer the office's own public name with the
-      internal address (split horizon, so no hairpin NAT is needed), and send one domain to
-      a different name server (conditional forwarding).
+    ### Method
 
-    **Read up on:**
-    - `man nft` — `snat to`, `dnat to`, `masquerade`, the `prerouting` / `postrouting` nat hooks and rule order
-    - `man nft` — `iifname` / `oifname`, anonymous sets such as `{ "eth1", "eth2" }`, `ct state` and `ct status dnat`
-    - `nft list ruleset`, `nft -f FILE` and `flush ruleset` — rewrite a ruleset in one go
-    - Packet flow: prerouting, input or forward, output, postrouting
-    - `man dnsmasq` — `host-record=` and `server=/domain/address`
-    - `/etc/netns/NAME/resolv.conf` — the resolver that `ip netns exec NAME` uses
-    - `dig +short @SERVER name`, `curl -m`, bash's `/dev/tcp/HOST/PORT`
+    Write down the **zones** and what may start connections where; then one rule per arrow.
+
+    | from → to | allowed? | rule (exercise) |
+    |---|---|---|
+    | LAN → internet | yes | forward accept + `snat to` the office address (net-036) |
+    | DMZ → internet | yes | forward accept + `snat to` the website address (net-036) |
+    | internet → web server | port 80 on one address only | `ip daddr ADDR tcp dport 80 dnat to ...` + `ct status dnat accept` (net-039) |
+    | LAN → DMZ | yes | forward accept, no NAT |
+    | DMZ → LAN | no | nothing (default drop) |
+    | replies, anywhere | yes | `ct state established,related accept` (net-044) |
+    | LAN → router: ssh, ping, DNS | yes | input rules on `iifname "eth0"` (net-044) |
+
+    Order matters in postrouting: the **more specific** source match comes first (each rule ends evaluation for that packet).
+
+    **Resolver** (net-041): `host-record=` for the internal answer, `server=/corp.test/IP` for HQ. The router's own DNS queries come back as replies: the input chain's `established` rule covers them.
+
+    Read `NOTES.md` and the current ruleset first (`nft list ruleset`): the contractor's mistakes are listed or easy to spot. Rewriting from `flush ruleset` is often cleaner than patching.
+
+    ### Check your work
+
+    Run every test from the ticket's requirements, from the right namespace: what the updates site reports for `desk` and `www`, the website from `inet` on both public addresses (only `.11` serves), DMZ → LAN blocked, ssh/ping from LAN, no ssh from the internet, and the three kinds of DNS answers from `desk`.
   scenario: |
     **Ticket NET-512** (from Marco, the studio's office manager): *"The contractor who was
     setting up our new router left halfway through. Nobody can browse, the website we host
