@@ -175,6 +175,9 @@ not fit. It commits nothing: download the `verify-results` artifact (the updated
 | `git_home_guard` | the next reset restores the lab user's `~/.gitconfig` and removes stored credentials |
 | `tf_aws_start` | Moto plus `terraform`, `tofu`, `terragrunt` and `conftest` from the kl-terraform-aws image (aws provider 6.72.0). AWS calls always go to Moto; don't tag `aws_s3_bucket` (Moto drops tags sent at creation) |
 | `tf_s3_state BUCKET KEY` | print a state file kept in S3 (Moto), to feed `tf_has`/`tf_get` |
+| `kgitea_start`, `kgitea_seed REPO DIR MSG` | Gitea in the k8s lab (NodePort 30300; `gitea.gitea.svc:3000` for pods); the `gitea_*` helpers follow `GITEA_URL` |
+| `argo_install`, `argo_status APP`, `argo_ok APP [SECONDS]` | Argo CD v3.5.7 without Dex/notifications, polling Git every 30s; an Application's sync/health |
+| `kyverno_install`, `prom_install`, `prom_query`, `prom_value`, `prom_api` | Kyverno v1.19.2 (exceptions on); Prometheus Operator + kube-state-metrics + Prometheus `lab` (selects `release: lab`) and its API (prepared, not yet used by exercises) |
 | `cm_install` | install cert-manager (bundled chart `$CM_CHART`, release and namespace `cert-manager`, CRDs on, leader election in its own namespace) and wait for the webhook; registers `cm_cleanup` |
 | `cm_cleanup` | remove a cert-manager install's leftovers in kube-system (leader-election Roles and Leases). Register it with `on_reset cm_cleanup` when the learner installs cert-manager |
 | `cm_lab_ca` | ClusterIssuer `selfsigned`, CA Certificate `cert-manager/lab-root` and ClusterIssuer `lab-ca` |

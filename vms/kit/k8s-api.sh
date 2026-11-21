@@ -37,6 +37,19 @@ heal_static_pods() {
   done
 }
 
+# apiserver_trim — exercises that install large CRD sets (Argo CD, Kyverno, Prometheus…) and
+# the reset that deletes them again make the API server's memory grow each round, until the
+# control plane runs out. Restart it when it holds more than 1 GiB (the kubelet starts it again).
+apiserver_trim() {
+  local rss
+  rss=$(ps -C kube-apiserver -o rss= 2>/dev/null | sort -n | tail -1)
+  [ -n "$rss" ] && [ "$rss" -gt 1048576 ] || return 0
+  echo "restarting kube-apiserver (using $((rss / 1024)) MiB)"
+  crictl ps --name kube-apiserver -q 2>/dev/null | xargs -r crictl stop >/dev/null 2>&1
+  sleep 5
+  wait_api 240 || { heal_static_pods; wait_api 240; }
+}
+
 # kubeadm's discovery ConfigMap + its RBAC are needed to join nodes
 ensure_cluster_info() {
   if ! kubectl -n kube-public get configmap cluster-info >/dev/null 2>&1 ||
@@ -120,6 +133,7 @@ reset() {
   # PVs left behind (Retain policy etc.)
   kubectl get pv -o name | sort >/tmp/kl-now
   comm -13 "$P/persistentvolumes.txt" /tmp/kl-now | xargs -r kubectl patch --type=merge -p '{"metadata":{"finalizers":null}}' >/dev/null 2>&1
+  apiserver_trim
   # wait for system pods to settle
   kubectl -n kube-system wait --for=condition=Ready pod --all --timeout=180s >/dev/null 2>&1 || echo "warning: some kube-system pods not ready"
   kubectl wait --for=condition=Ready node --all --timeout=180s >/dev/null 2>&1 || echo "warning: some nodes not ready"

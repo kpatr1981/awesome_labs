@@ -8,12 +8,12 @@ what to consolidate. The target doesn't lower the bar: a lab should carry a real
 scenario and teach a concept. The parts of this list that the existing exercises don't cover
 are not started.
 
-Exercise counts (<!-- count:total -->1,727<!-- /count --> total):
+Exercise counts (<!-- count:total -->1,735<!-- /count --> total):
 
 | Topic | Exercises | Target | Track | Module files |
 |---|---|---|---|---|
 | Docker | <!-- count:docker -->186<!-- /count --> | 250 | `docker` | `exercises/docker/` |
-| Kubernetes | <!-- count:kubernetes -->294<!-- /count --> | 250 | `kubernetes` | `exercises/kubernetes/` |
+| Kubernetes | <!-- count:kubernetes -->302<!-- /count --> | 250 | `kubernetes` | `exercises/kubernetes/` |
 | Offensive security | <!-- count:offsec -->83<!-- /count --> | 250 | `offsec` | `exercises/offsec/` |
 | Linux & systems | <!-- count:linux -->86<!-- /count --> | 250 | `linux` | `exercises/linux/` |
 | Networking | <!-- count:networking -->106<!-- /count --> | 250 | `networking` | `exercises/networking/` |
@@ -354,7 +354,7 @@ then GitOps for Kubernetes, then Git LFS.
 
 | Gap | The lab | Runs on | Notes |
 |---|---|---|---|
-| **GitOps with Argo CD or Flux** | Sync an app from a Git repository, drift that self-heals, a sync wave that hangs, an app-of-apps, a Secret that can't live in Git | k8s lab; Gitea | The biggest Kubernetes gap. See *CI/CD & GitOps* (Cloud & platform). Argo CD needs a memory test on these nodes first; Flux is lighter |
+| **GitOps with Argo CD or Flux** | Done with Argo CD in `exercises/kubernetes/24-gitops-argocd.yaml` (k8s-394..401), on an in-cluster Gitea | | |
 | **Prometheus and Grafana in the cluster** | Prometheus with kube-state-metrics, a ServiceMonitor that scrapes nothing, an alert that never fires, a Grafana dashboard with no data | k8s lab; may need more memory | See *Observability* (Cloud & platform) and *Prometheus and alerting* (Shared lab foundations). kube-prometheus-stack is probably too heavy; plain Prometheus first |
 | **Policy engines** | Kyverno validate, mutate and generate rules, audit vs enforce, a policy exception; or Gatekeeper constraint templates | k8s lab | Built-in CEL policies are covered already; *Supply chain* (Security) mentions Kyverno |
 | **CKS-level security** | AppArmor profiles on pods, custom seccomp profiles from the kubelet's directory, Falco catching a shell in a container, cosign-signed images with signature checks at admission, Trivy scans, kube-bench findings | k8s lab | seccomp has two exercises so far. See *Supply chain* (Security) |

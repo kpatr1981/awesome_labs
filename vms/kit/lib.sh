@@ -1209,7 +1209,12 @@ EOF
   case "$d" in "$LAB"/*) chown -R "$(lab_user)": "$LAB" ;; esac
 }
 
-# ---------- Gitea helpers (Git track: LFS, credentials, pull requests) ----------
+# ---------- Gitea helpers (Git track: LFS, credentials, pull requests; k8s: GitOps) ----------
+# GITEA_URL is where the lab's Gitea answers: on the Docker host it runs in a container
+# (gitea_start), on the Kubernetes lab in the cluster behind NodePort 30300 (kgitea_start).
+if [ -z "${GITEA_URL:-}" ]; then
+  if [ -d /etc/kubernetes ]; then GITEA_URL=http://node01:30300; else GITEA_URL=http://localhost:3000; fi
+fi
 # gitea_start -> a Gitea server on http://localhost:3000 (also reachable from the host's
 # browser through Lima's port forwarding), with LFS, no self-registration, and the admin
 # account lab-admin (password in $KL_STATE/gitea-admin). Containers go with the host reset.
@@ -1223,7 +1228,7 @@ gitea_start() {
     -e GITEA__service__DISABLE_REGISTRATION=true -e GITEA__repository__DEFAULT_BRANCH=main \
     -e GITEA__log__LEVEL=Warn -e GITEA__security__PASSWORD_COMPLEXITY=off \
     gitea/gitea:28.2.0-rootless >/dev/null || return 1
-  eventually 90 'curl -fsS -m 2 http://localhost:3000/api/healthz >/dev/null' || return 1
+  eventually 90 'curl -fsS -m 2 $GITEA_URL/api/healthz >/dev/null' || return 1
   pw="Adm-$(head -c8 /dev/urandom | od -An -tx1 | tr -d ' \n')"
   docker exec kl-gitea gitea admin user create --username lab-admin --password "$pw" \
     --email admin@lab.test --admin --must-change-password=false >/dev/null || return 1
@@ -1240,11 +1245,11 @@ git_home_guard() {
 # gitea_api METHOD PATH [JSON] -> call the API as lab-admin (PATH after /api/v1), print the body
 gitea_api() {
   curl -fsS -m 10 -u "lab-admin:$(cat "$KL_STATE/gitea-admin")" -X "$1" -H 'Content-Type: application/json' \
-    "http://localhost:3000/api/v1$2" ${3:+-d "$3"}
+    "$GITEA_URL/api/v1$2" ${3:+-d "$3"}
 }
 # gitea_as USER PASS METHOD PATH [JSON] -> the same, as another user
 gitea_as() {
-  curl -fsS -m 10 -u "$1:$2" -X "$3" -H 'Content-Type: application/json' "http://localhost:3000/api/v1$4" ${5:+-d "$5"}
+  curl -fsS -m 10 -u "$1:$2" -X "$3" -H 'Content-Type: application/json' "$GITEA_URL/api/v1$4" ${5:+-d "$5"}
 }
 # gitea_user NAME PASSWORD [FULL NAME] -> a user account (email NAME@lab.test)
 gitea_user() {
@@ -1258,7 +1263,7 @@ gitea_repo() {
     gitea_api POST "/orgs/$1/repos" "{\"name\":\"$2\",\"default_branch\":\"main\",\"private\":$p}" >/dev/null
 }
 # gitea_url OWNER/REPO [USER:PASS] -> its clone URL (with credentials only when given, for setups)
-gitea_url() { if [ -n "${2:-}" ]; then echo "http://${2}@localhost:3000/$1.git"; else echo "http://localhost:3000/$1.git"; fi; }
+gitea_url() { if [ -n "${2:-}" ]; then echo "http://${2}@${GITEA_URL#http://}/$1.git"; else echo "$GITEA_URL/$1.git"; fi; }
 # gitea_token USER PASS NAME -> create an access token (scopes: repository and issue write, user read)
 gitea_token() {
   gitea_as "$1" "$2" POST "/users/$1/tokens" "{\"name\":\"$3\",\"scopes\":[\"write:repository\",\"write:issue\",\"read:user\"]}" | jq -r .sha1
@@ -1270,14 +1275,14 @@ gitea_dev() {
   local pw="dev-$(head -c6 /dev/urandom | od -An -tx1 | tr -d ' \n')"
   gitea_user dev "$pw" "Lab Developer" || return 1
   printf '%s\n' "$pw" >"$KL_STATE/dev-pass"
-  printf 'http://dev:%s@localhost:3000\n' "$pw" | lab_file /lab/.gitea-credentials 0600
+  printf 'http://dev:%s@%s\n' "$pw" "${GITEA_URL#http://}" | lab_file /lab/.gitea-credentials 0600
 }
 # gitea_clone OWNER/REPO DIR [git clone options] -> a clone as the lab user that authenticates
 # with /lab/.gitea-credentials (repo-local credential.helper), with a lab identity
 gitea_clone() {
   local r=$1 d=$2; shift 2
   sudo -u "$(lab_user)" -H git -c credential.helper="store --file=/lab/.gitea-credentials" \
-    clone -q "$@" "http://localhost:3000/$r.git" "$d" || return 1
+    clone -q "$@" "$GITEA_URL/$r.git" "$d" || return 1
   sudo -u "$(lab_user)" -H git -C "$d" config credential.helper "store --file=/lab/.gitea-credentials"
   sudo -u "$(lab_user)" -H git -C "$d" config user.name "Lab Developer"
   sudo -u "$(lab_user)" -H git -C "$d" config user.email dev@lab.test
@@ -1289,7 +1294,7 @@ gitea_mirror() {
 }
 # gitea_media OWNER/REPO PATH [REF] -> the file's real content as served by Gitea (LFS resolved)
 gitea_media() {
-  curl -fsS -m 20 -u "lab-admin:$(cat "$KL_STATE/gitea-admin")" "http://localhost:3000/api/v1/repos/$1/media/$2?ref=${3:-main}"
+  curl -fsS -m 20 -u "lab-admin:$(cat "$KL_STATE/gitea-admin")" "$GITEA_URL/api/v1/repos/$1/media/$2?ref=${3:-main}"
 }
 # is_lfs_pointer GITDIR REV:PATH -> the blob is a Git LFS pointer
 is_lfs_pointer() { git --git-dir="$1" cat-file -p "$2" 2>/dev/null | head -1 | grep -qx 'version https://git-lfs.github.com/spec/v1'; }
@@ -1298,6 +1303,184 @@ max_blob() {
   git --git-dir="$1" rev-list --objects --all 2>/dev/null |
     git --git-dir="$1" cat-file --batch-check='%(objecttype) %(objectsize)' 2>/dev/null |
     awk '$1 == "blob" && $2 > m {m = $2} END {print m + 0}'
+}
+
+# kgitea_start -> Gitea in the cluster (namespace gitea, NodePort 30300 on the nodes, Service
+# gitea.gitea.svc:3000 for pods such as Argo CD), with the admin lab-admin like gitea_start
+kgitea_start() {
+  local pw
+  k_ns gitea
+  kapply <<'EOF'
+apiVersion: apps/v1
+kind: Deployment
+metadata: {name: gitea, namespace: gitea}
+spec:
+  selector: {matchLabels: {app: gitea}}
+  template:
+    metadata: {labels: {app: gitea}}
+    spec:
+      containers:
+      - name: gitea
+        image: gitea/gitea:28.2.0-rootless
+        env:
+        - {name: GITEA__security__INSTALL_LOCK, value: "true"}
+        - {name: GITEA__database__DB_TYPE, value: sqlite3}
+        - {name: GITEA__server__ROOT_URL, value: "http://node01:30300/"}
+        - {name: GITEA__server__HTTP_PORT, value: "3000"}
+        - {name: GITEA__server__DISABLE_SSH, value: "true"}
+        - {name: GITEA__server__START_SSH_SERVER, value: "false"}
+        - {name: GITEA__service__DISABLE_REGISTRATION, value: "true"}
+        - {name: GITEA__repository__DEFAULT_BRANCH, value: main}
+        - {name: GITEA__security__PASSWORD_COMPLEXITY, value: "off"}
+        - {name: GITEA__log__LEVEL, value: Warn}
+        ports: [{containerPort: 3000}]
+        readinessProbe: {httpGet: {path: /api/healthz, port: 3000}}
+---
+apiVersion: v1
+kind: Service
+metadata: {name: gitea, namespace: gitea}
+spec:
+  type: NodePort
+  selector: {app: gitea}
+  ports: [{port: 3000, targetPort: 3000, nodePort: 30300}]
+EOF
+  wait_deploy gitea gitea 300 || return 1
+  eventually 60 "curl -fsS -m 2 $GITEA_URL/api/healthz >/dev/null" || return 1
+  pw="Adm-$(head -c8 /dev/urandom | od -An -tx1 | tr -d ' \n')"
+  kubectl -n gitea exec deploy/gitea -- gitea admin user create --username lab-admin --password "$pw" \
+    --email admin@lab.test --admin --must-change-password=false >/dev/null || return 1
+  printf '%s\n' "$pw" >"$KL_STATE/gitea-admin"; chmod 600 "$KL_STATE/gitea-admin"
+}
+# kgitea_seed OWNER/REPO DIR MESSAGE -> create the repository and push DIR's files to its main
+kgitea_seed() {
+  local t; t=$(mktemp -d)
+  gitea_repo "${1%%/*}" "${1#*/}" || return 1
+  cp -r "$2"/. "$t"/ && git -C "$t" init -q -b main && git -C "$t" add -A &&
+    git -C "$t" -c user.name="Lab Developer" -c user.email=dev@lab.test commit -qm "$3" &&
+    git -C "$t" push -q "$(gitea_url "$1" "dev:$(cat "$KL_STATE/dev-pass")")" main 2>/dev/null
+  local rc=$?; rm -rf "$t"; return $rc
+}
+# argo_install -> Argo CD v3.5.7 in namespace argocd (bundled manifest, without Dex and
+# notifications), ready, with its default AppProject
+argo_install() {
+  k_ns argocd
+  zcat /opt/kubelab/argocd-v3.5.7.yaml.gz | kubectl -n argocd apply --server-side --force-conflicts -f - >/dev/null || return 1
+  # look at Git every 30 seconds instead of the default 3 minutes, so labs don't wait
+  kubectl -n argocd patch configmap argocd-cm --type merge -p '{"data":{"timeout.reconciliation":"30s"}}' >/dev/null
+  kubectl -n argocd rollout restart statefulset/argocd-application-controller deploy/argocd-repo-server >/dev/null 2>&1
+  kubectl -n argocd rollout status deploy/argocd-repo-server --timeout=300s >/dev/null &&
+    kubectl -n argocd rollout status statefulset/argocd-application-controller --timeout=300s >/dev/null &&
+    kubectl -n argocd rollout status deploy/argocd-server --timeout=300s >/dev/null || return 1
+  eventually 60 'kubectl -n argocd get appproject default'
+}
+# argo_status APP -> "SYNC HEALTH" of an Argo CD Application, e.g. "Synced Healthy"
+argo_status() { kubectl -n argocd get application "$1" -o jsonpath='{.status.sync.status} {.status.health.status}' 2>/dev/null; }
+# argo_ok APP [SECONDS] -> wait until the Application is Synced and Healthy
+argo_ok() { eventually "${2:-90}" "[ \"\$(argo_status $1)\" = 'Synced Healthy' ]"; }
+
+# ---------- Kyverno and Prometheus helpers ----------
+# kyverno_install -> Kyverno v1.19.2 (bundled manifest) in namespace kyverno, webhooks answering
+kyverno_install() {
+  # policy exceptions are off by default; the exceptions exercise needs them
+  zcat /opt/kubelab/kyverno-v1.19.2.yaml.gz | sed 's/--enablePolicyException=false/--enablePolicyException=true/' |
+    kubectl apply --server-side --force-conflicts -f - >/dev/null || return 1
+  local d
+  for d in kyverno-admission-controller kyverno-background-controller kyverno-cleanup-controller kyverno-reports-controller; do
+    kubectl -n kyverno rollout status deploy/$d --timeout=300s >/dev/null || return 1
+  done
+  # the webhooks answer a little after the pods are Ready
+  eventually 120 'kubectl apply --dry-run=server -f - >/dev/null 2>&1 <<EOF
+apiVersion: kyverno.io/v1
+kind: ClusterPolicy
+metadata: {name: kl-probe}
+spec:
+  rules:
+  - name: probe
+    match: {any: [{resources: {kinds: [ConfigMap], names: [kl-probe-none]}}]}
+    validate: {message: probe, pattern: {metadata: {name: "?*"}}}
+EOF'
+}
+# prom_install -> the Prometheus Operator v0.94.2 and kube-state-metrics in namespace
+# monitoring, plus a Prometheus "lab" (v3.15.1) that picks up ServiceMonitors and
+# PrometheusRules labelled release=lab in any namespace, reachable as Service prometheus:9090
+prom_install() {
+  k_ns monitoring
+  zcat /opt/kubelab/prometheus-operator-v0.94.2.yaml.gz | sed -E 's/^( +)namespace: default$/\1namespace: monitoring/' |
+    kubectl apply --server-side --force-conflicts -f - >/dev/null || return 1
+  zcat /opt/kubelab/kube-state-metrics-v2.20.0.yaml.gz | kubectl apply -f - >/dev/null || return 1
+  kubectl -n monitoring rollout status deploy/prometheus-operator --timeout=300s >/dev/null || return 1
+  kapply <<'EOF'
+apiVersion: v1
+kind: ServiceAccount
+metadata: {name: prometheus, namespace: monitoring}
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRole
+metadata: {name: lab-prometheus}
+rules:
+- apiGroups: [""]
+  resources: [nodes, nodes/metrics, services, endpoints, pods]
+  verbs: [get, list, watch]
+- apiGroups: [discovery.k8s.io]
+  resources: [endpointslices]
+  verbs: [get, list, watch]
+- nonResourceURLs: [/metrics]
+  verbs: [get]
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRoleBinding
+metadata: {name: lab-prometheus}
+roleRef: {apiGroup: rbac.authorization.k8s.io, kind: ClusterRole, name: lab-prometheus}
+subjects: [{kind: ServiceAccount, name: prometheus, namespace: monitoring}]
+---
+apiVersion: monitoring.coreos.com/v1
+kind: Prometheus
+metadata: {name: lab, namespace: monitoring}
+spec:
+  image: quay.io/prometheus/prometheus:v3.15.1
+  version: v3.15.1
+  replicas: 1
+  serviceAccountName: prometheus
+  scrapeInterval: 15s
+  evaluationInterval: 15s
+  retention: 2h
+  serviceMonitorSelector: {matchLabels: {release: lab}}
+  serviceMonitorNamespaceSelector: {}
+  podMonitorSelector: {matchLabels: {release: lab}}
+  podMonitorNamespaceSelector: {}
+  ruleSelector: {matchLabels: {release: lab}}
+  ruleNamespaceSelector: {}
+  resources: {requests: {memory: 150Mi}}
+---
+apiVersion: v1
+kind: Service
+metadata: {name: prometheus, namespace: monitoring}
+spec:
+  selector: {app.kubernetes.io/name: prometheus, prometheus: lab}
+  ports: [{name: web, port: 9090, targetPort: 9090}]
+---
+apiVersion: monitoring.coreos.com/v1
+kind: ServiceMonitor
+metadata: {name: kube-state-metrics, namespace: monitoring, labels: {release: lab}}
+spec:
+  selector: {matchLabels: {app.kubernetes.io/name: kube-state-metrics}}
+  endpoints: [{port: http-metrics, honorLabels: true}]
+EOF
+  eventually 240 'kubectl -n monitoring get pod prometheus-lab-0 >/dev/null 2>&1' || return 1
+  wait_pod monitoring prometheus-lab-0 240 && wait_deploy monitoring kube-state-metrics 180
+  eventually 120 '[ "$(prom_query up | jq -r ".data.result | length")" -gt 0 ]'
+}
+# prom_query 'PROMQL' -> Prometheus's JSON answer (instant query)
+prom_query() {
+  local ip; ip=$(kubectl -n monitoring get svc prometheus -o jsonpath='{.spec.clusterIP}' 2>/dev/null) || return 1
+  curl -fsS -m 10 -G "http://$ip:9090/api/v1/query" --data-urlencode "query=$1" 2>/dev/null
+}
+# prom_value 'PROMQL' -> the first result's value, or nothing
+prom_value() { prom_query "$1" | jq -r '.data.result[0].value[1] // empty'; }
+# prom_api PATH -> any Prometheus API path, e.g. /api/v1/alerts or /api/v1/targets
+prom_api() {
+  local ip; ip=$(kubectl -n monitoring get svc prometheus -o jsonpath='{.spec.clusterIP}' 2>/dev/null) || return 1
+  curl -fsS -m 10 "http://$ip:9090$1" 2>/dev/null
 }
 
 # ---------- cert-manager helpers ----------
