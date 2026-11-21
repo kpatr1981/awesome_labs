@@ -1,0 +1,1323 @@
+track: terraform
+module: OpenTofu, Terragrunt & policy checks
+profile: docker
+order: 10
+exercises:
+
+# ===== Intermediate =====
+
+- id: tf-111
+  title: Switch a project to OpenTofu
+  difficulty: 2
+  kind: build
+  tags: [opentofu, tofu, migration, lock-file, registry]
+  tutorial: |
+    **What you're learning.** What **OpenTofu** is, how a Terraform project moves to it, and what changes in the lock file and the state when it does.
+
+    ### OpenTofu
+
+    In 2023 HashiCorp changed Terraform's licence. **OpenTofu** is the open-source fork that the Linux Foundation now maintains. It reads the same `.tf` files and the same state, and its command is **`tofu`** instead of `terraform`. The two have drifted apart a little since: each has features the other lacks (OpenTofu's state encryption is in tf-112).
+
+    | | Terraform | OpenTofu |
+    |---|---|---|
+    | command | `terraform` | `tofu` |
+    | provider registry | `registry.terraform.io` | `registry.opentofu.org` |
+    | `hashicorp/aws` comes from | HashiCorp's registry | OpenTofu's mirror of the same releases |
+
+    ### What changes when you switch
+
+    - **`.terraform.lock.hcl`**: provider addresses become `registry.opentofu.org/...`. `tofu init` rewrites the entries and says so in a warning. Commit the new lock file.
+    - **The state**: OpenTofu reads Terraform's state as it is. The first `tofu apply` writes it back with OpenTofu's version in `terraform_version`. After that, an older Terraform may refuse it, so switch **the whole team and CI** at once.
+
+    ### Commands you'll use
+
+    ```bash
+    cd /lab/catalog
+    tofu version
+    tofu init
+    ```
+    ```text
+    Warning: Dependency lock file entries automatically updated
+    OpenTofu automatically rewrote some entries in your dependency lock file:
+      - registry.terraform.io/hashicorp/aws => registry.opentofu.org/hashicorp/aws
+    ```
+    ```bash
+    tofu plan          # the same plan Terraform would make
+    tofu apply
+    grep 'provider "' .terraform.lock.hcl
+    jq -r .terraform_version terraform.tfstate
+    ```
+
+    ### Common mistakes
+
+    - Running `terraform` and `tofu` on the same state, back and forth. Pick one.
+    - Deleting `.terraform.lock.hcl` to "fix" the warning. Let `tofu init` rewrite it, and keep it.
+    - Expecting the lab's `terraform` command to be OpenTofu. They are two different programs.
+
+    ### Check your work
+
+    The lock file names `registry.opentofu.org`, and the state was last written by OpenTofu 1.13.8.
+  scenario: |
+    The company is moving from Terraform to **OpenTofu**. **`/lab/notes`** was deployed with
+    Terraform. From now on, it is managed with `tofu`:
+
+    1. Initialise it with OpenTofu, keeping the lock file (updated for OpenTofu).
+    2. With **`tofu`**, add a second IAM user **`notes-backup`** next to the existing
+       `notes-app` (same resource, using its `for_each`), and apply it.
+  hints:
+    - "`tofu init` rewrites the lock file's provider addresses. Then edit the `for_each` set."
+    - "`for_each = toset([\"app\", \"backup\"])` makes `notes-app` and `notes-backup`. Run `tofu apply`, not `terraform apply`."
+  solution: |
+    ```bash
+    cd /lab/notes
+    tofu init
+    sed -i 's/toset(\["app"\])/toset(["app", "backup"])/' main.tf
+    tofu plan        # 1 to add
+    tofu apply
+    grep 'provider "' .terraform.lock.hcl
+    jq -r .terraform_version terraform.tfstate
+    ```
+  setup: |
+    tf_aws_start
+    rm -rf /lab/notes
+    lab_file /lab/notes/main.tf <<'EOF'
+    terraform {
+      required_providers {
+        aws = {
+          source  = "hashicorp/aws"
+          version = "6.72.0"
+        }
+      }
+    }
+
+    provider "aws" {
+      region            = "us-east-1"
+      s3_use_path_style = true
+    }
+
+    resource "aws_iam_user" "notes" {
+      for_each = toset(["app"])
+      name     = "notes-${each.key}"
+    }
+    EOF
+    tf_as_user /lab/notes init -input=false -no-color >/dev/null
+    tf_as_user /lab/notes apply -auto-approve -input=false -no-color >/dev/null
+    aws iam get-user --user-name notes-app --query User.UserId --output text > "$KL_STATE/uid"
+  check: |
+    S=/lab/notes/terraform.tfstate
+    check "the lock file is OpenTofu's (registry.opentofu.org)" 'grep -q "provider \"registry.opentofu.org/hashicorp/aws\"" /lab/notes/.terraform.lock.hcl'
+    check_eq "the state was last written by OpenTofu 1.13.8" "$(jq -r '.terraform_version // empty' $S 2>/dev/null)" 1.13.8
+    check_eq "the state holds notes-app and notes-backup" "$(tf_addrs $S | paste -sd, -)" 'aws_iam_user.notes["app"],aws_iam_user.notes["backup"]'
+    check "IAM user notes-backup exists" 'aws iam get-user --user-name notes-backup'
+    check_eq "notes-app was not re-created" "$(aws iam get-user --user-name notes-app --query User.UserId --output text 2>/dev/null)" "$(cat $KL_STATE/uid)"
+    check "tofu plan shows no changes" '(cd /lab/notes && tofu plan -detailed-exitcode -lock=false -input=false -no-color) >/dev/null 2>&1'
+  solve: |
+    cd /lab/notes
+    tofu init -input=false -no-color >/dev/null 2>&1
+    sed -i 's/toset(\["app"\])/toset(["app", "backup"])/' main.tf
+    tofu apply -auto-approve -input=false -no-color >/dev/null
+
+- id: tf-112
+  title: Encrypt the state with OpenTofu
+  difficulty: 3
+  kind: build
+  tags: [opentofu, state-encryption, pbkdf2, aes_gcm, secrets, migration]
+  tutorial: |
+    **What you're learning.** OpenTofu's **state encryption**: why you'd want it, how to configure a key provider and a method, and how to move existing plain state to encrypted state without losing it.
+
+    ### Why
+
+    State holds every attribute of every resource, including secrets that write-only arguments (tf-102) don't cover. Normally it's protected only by whoever controls the bucket or disk. OpenTofu can **encrypt the state itself**, so a leaked file or a too-broad bucket permission exposes nothing.
+
+    ### The pieces
+
+    ```hcl
+    variable "state_key" {
+      type      = string
+      sensitive = true
+    }
+
+    terraform {
+      encryption {
+        key_provider "pbkdf2" "team" {        # derives a key from a passphrase
+          passphrase = var.state_key          # at least 16 characters
+        }
+        method "aes_gcm" "team" {             # the cipher
+          keys = key_provider.pbkdf2.team
+        }
+        state {
+          method = method.aes_gcm.team        # encrypt the state with it
+        }
+      }
+    }
+    ```
+    - A **key provider** produces the key: `pbkdf2` from a passphrase, or `aws_kms`, `gcp_kms`, `openbao` for managed keys.
+    - A **method** encrypts with it (`aes_gcm`).
+    - `state { … }` applies it to the state, and `plan { … }` to saved plan files.
+    - Variables can be used here, so the passphrase comes from the environment: `export TF_VAR_state_key=…`.
+
+    ### Migrating existing state
+
+    The current state isn't encrypted, and with only the block above OpenTofu refuses to read it. A **fallback** says "if it isn't encrypted with the new method, read it as plain":
+
+    ```hcl
+        method "unencrypted" "migrate" {}
+        state {
+          method = method.aes_gcm.team
+          fallback {
+            method = method.unencrypted.migrate
+          }
+        }
+    ```
+    Run `tofu apply` once: it reads the plain state and writes it encrypted. Then **remove the fallback and the unencrypted method**, or a plain state would still be accepted.
+
+    ### Commands you'll use
+
+    ```bash
+    export TF_VAR_state_key="$(cat ~/.state-key)"
+    tofu apply
+    head -c 120 terraform.tfstate; echo
+    tofu state list                  # still works, with the passphrase
+    ```
+    ```text
+    {"serial":4,"lineage":"…","meta":{"key_provider.pbkdf2.team":"eyJzYWx0…"},"encrypted_data":"…
+    ```
+
+    ### Common mistakes
+
+    - The passphrase written in a `.tf` file. Anyone with the repository can decrypt the state.
+    - Leaving the fallback in after the migration.
+    - Losing the passphrase. Encrypted state can't be recovered without it, so keep it in your secret manager.
+
+    ### Check your work
+
+    `terraform.tfstate` shows `encrypted_data` and no resource names, `tofu state list` still shows everything, and the config has no `unencrypted` method left.
+  scenario: |
+    **`/lab/vault-config`** is managed with OpenTofu (local state). The security team wants
+    its state **encrypted**:
+
+    - use a `pbkdf2` key provider and `aes_gcm`, with the passphrase in
+      **`/lab/.state-passphrase`**, passed through an **environment variable**, never in a
+      `.tf` file
+    - the existing state must be migrated, keeping every resource
+    - at the end, OpenTofu must **no longer accept** unencrypted state
+  hints:
+    - "Declare `variable \"state_passphrase\"`, use it in `key_provider \"pbkdf2\"`, and `export TF_VAR_state_passphrase=\"$(cat /lab/.state-passphrase)\"`."
+    - "First apply with a `fallback { method = method.unencrypted.migrate }` (and `method \"unencrypted\" \"migrate\" {}`), then delete both and run `tofu plan` again."
+  solution: |
+    ```bash
+    cd /lab/vault-config
+    export TF_VAR_state_passphrase="$(cat /lab/.state-passphrase)"
+    cat > encryption.tf <<'EOF'
+    variable "state_passphrase" {
+      type      = string
+      sensitive = true
+    }
+
+    terraform {
+      encryption {
+        key_provider "pbkdf2" "main" {
+          passphrase = var.state_passphrase
+        }
+        method "aes_gcm" "main" {
+          keys = key_provider.pbkdf2.main
+        }
+        method "unencrypted" "migrate" {}
+        state {
+          method = method.aes_gcm.main
+          fallback {
+            method = method.unencrypted.migrate
+          }
+        }
+      }
+    }
+    EOF
+    tofu apply                    # rewrites the state, encrypted
+    # now remove the fallback block and the unencrypted method
+    sed -i '/method "unencrypted"/d; /fallback {/,/}/d' encryption.tf
+    tofu plan
+    head -c 100 terraform.tfstate; echo
+    ```
+  setup: |
+    tf_aws_start
+    rm -rf /lab/vault-config
+    head -c 24 /dev/urandom | base64 | tr -d '/+=' | lab_file /lab/.state-passphrase 0600
+    lab_file /lab/vault-config/main.tf <<'EOF'
+    terraform {
+      required_providers {
+        aws = {
+          source  = "hashicorp/aws"
+          version = "6.72.0"
+        }
+      }
+    }
+
+    provider "aws" {
+      region            = "us-east-1"
+      s3_use_path_style = true
+    }
+
+    resource "aws_iam_user" "operator" {
+      for_each = toset(["unseal", "audit"])
+      name     = "vault-${each.key}"
+    }
+    EOF
+    sudo -u "$(lab_user)" -H bash -c 'cd /lab/vault-config && tofu init -input=false -no-color >/dev/null && tofu apply -auto-approve -input=false -no-color >/dev/null'
+  check: |
+    S=/lab/vault-config/terraform.tfstate
+    pp=$(cat /lab/.state-passphrase)
+    check "terraform.tfstate is encrypted" 'jq -e "has(\"encrypted_data\")" $S'
+    check_not "no resource names are readable in it" 'grep -q "vault-unseal" $S'
+    list=$(cd /lab/vault-config && TF_VAR_state_passphrase="$pp" tofu state list -no-color 2>/dev/null | paste -sd, -)
+    check_eq "tofu still reads every resource" "$list" 'aws_iam_user.operator["audit"],aws_iam_user.operator["unseal"]'
+    check_not "the passphrase is not in any .tf file" 'grep -RqsF -- "$pp" /lab/vault-config --include=*.tf'
+    check_not "unencrypted state is no longer accepted (no unencrypted method)" 'grep -Rqs "\"unencrypted\"" /lab/vault-config --include=*.tf'
+    check "tofu plan shows no changes" "(cd /lab/vault-config && TF_VAR_state_passphrase='$pp' tofu plan -detailed-exitcode -lock=false -input=false -no-color) >/dev/null 2>&1"
+  solve: |
+    cd /lab/vault-config
+    export TF_VAR_state_passphrase="$(cat /lab/.state-passphrase)"
+    cat > encryption.tf <<'EOF'
+    variable "state_passphrase" {
+      type      = string
+      sensitive = true
+    }
+    terraform {
+      encryption {
+        key_provider "pbkdf2" "main" {
+          passphrase = var.state_passphrase
+        }
+        method "aes_gcm" "main" {
+          keys = key_provider.pbkdf2.main
+        }
+        method "unencrypted" "migrate" {}
+        state {
+          method = method.aes_gcm.main
+          fallback {
+            method = method.unencrypted.migrate
+          }
+        }
+      }
+    }
+    EOF
+    tofu apply -auto-approve -input=false -no-color >/dev/null
+    sed -i '/method "unencrypted"/d; /fallback {/,/^ *}$/d' encryption.tf
+    tofu plan -input=false -no-color >/dev/null
+
+- id: tf-113
+  title: "Terragrunt: write the backend once"
+  difficulty: 3
+  kind: build
+  tags: [terragrunt, remote_state, generate, include, dry, s3]
+  tutorial: |
+    **What you're learning.** What **Terragrunt** adds on top of Terraform/OpenTofu, and how one `root.hcl` gives every stack its own state key and provider without copying them.
+
+    ### The problem it solves
+
+    With ten stacks (staging and production of five services), every one needs the same `backend` and `provider` blocks, differing only in the state key. Copy-paste drifts. Terragrunt is a thin wrapper: each stack has a small **`terragrunt.hcl`**, and shared settings live once, in a parent file.
+
+    ```
+    live/
+    ├── root.hcl                     # backend + provider, written once
+    ├── qa/search/terragrunt.hcl     # include root, source the module, inputs
+    └── prod/search/terragrunt.hcl
+    modules/search/main.tf           # the plain Terraform module
+    ```
+
+    ### root.hcl
+
+    ```hcl
+    remote_state {
+      backend = "s3"
+      generate = {
+        path      = "backend.tf"                   # Terragrunt writes this file into the stack
+        if_exists = "overwrite_terragrunt"
+      }
+      config = {
+        bucket         = "example-tg-state"
+        key            = "${path_relative_to_include()}/terraform.tfstate"   # qa/search/terraform.tfstate
+        region         = "eu-central-1"
+        use_lockfile   = true
+        use_path_style = true
+      }
+    }
+
+    generate "provider" {
+      path      = "provider.tf"
+      if_exists = "overwrite_terragrunt"
+      contents  = <<EOF
+    provider "aws" {
+      region            = "eu-central-1"
+      s3_use_path_style = true
+    }
+    EOF
+    }
+    ```
+    `path_relative_to_include()` is the stack's folder relative to `root.hcl`, so each stack gets a different key automatically.
+
+    ### A stack
+
+    ```hcl
+    include "root" {
+      path = find_in_parent_folders("root.hcl")
+    }
+    terraform {
+      source = "../../../modules/search"
+    }
+    inputs = {                     # become the module's variables
+      env = "qa"
+    }
+    ```
+
+    ### Commands you'll use
+
+    ```bash
+    cd live/qa/search && terragrunt plan            # one stack
+    cd live && terragrunt run --all plan             # every stack below here
+    terragrunt run --all --non-interactive -- apply -auto-approve
+    aws s3 ls s3://example-tg-state --recursive
+    ```
+    Terragrunt copies the module into a `.terragrunt-cache` folder and runs OpenTofu there (or Terraform when OpenTofu isn't installed).
+
+    ### Common mistakes
+
+    - A fixed `key` in `root.hcl`: every stack writes the same state (tf-109).
+    - Naming the parent `terragrunt.hcl`. Then `run --all` treats it as a stack too. Use `root.hcl`.
+    - Editing files inside `.terragrunt-cache`. They're regenerated on every run.
+
+    ### Check your work
+
+    One state object per stack, at `ENV/api/terraform.tfstate`, each holding its own IAM user.
+  scenario: |
+    **`/lab/live`** has two Terragrunt stacks, `staging/api` and `production/api`, using the
+    module in `/lab/modules/api`. Their `terragrunt.hcl` files include a **`root.hcl`** that
+    doesn't exist yet.
+
+    Write **`/lab/live/root.hcl`** so that every stack:
+
+    - keeps its state in bucket **`acme-tg-state`**, at **`<stack path>/terraform.tfstate`**
+      (for example `staging/api/terraform.tfstate`), with S3 locking
+    - gets the AWS provider for `us-east-1` (path-style S3) generated for it
+
+    Then deploy **both** stacks with one Terragrunt command.
+  hints:
+    - "`remote_state { backend = \"s3\"  generate = {…}  config = { … key = \"${path_relative_to_include()}/terraform.tfstate\" … } }` and a `generate \"provider\"` block."
+    - "`cd /lab/live && terragrunt run --all --non-interactive -- apply -auto-approve`."
+  solution: |
+    ```bash
+    cd /lab/live
+    cat > root.hcl <<'EOF'
+    remote_state {
+      backend = "s3"
+      generate = {
+        path      = "backend.tf"
+        if_exists = "overwrite_terragrunt"
+      }
+      config = {
+        bucket         = "acme-tg-state"
+        key            = "${path_relative_to_include()}/terraform.tfstate"
+        region         = "us-east-1"
+        use_lockfile   = true
+        use_path_style = true
+      }
+    }
+
+    generate "provider" {
+      path      = "provider.tf"
+      if_exists = "overwrite_terragrunt"
+      contents  = <<P
+    provider "aws" {
+      region            = "us-east-1"
+      s3_use_path_style = true
+    }
+    P
+    }
+    EOF
+    terragrunt run --all --non-interactive -- apply -auto-approve
+    aws s3 ls s3://acme-tg-state --recursive
+    ```
+  setup: |
+    tf_aws_start
+    rm -rf /lab/live /lab/modules
+    aws s3api create-bucket --bucket acme-tg-state >/dev/null
+    aws s3api put-bucket-versioning --bucket acme-tg-state --versioning-configuration Status=Enabled
+    lab_file /lab/modules/api/main.tf <<'EOF'
+    terraform {
+      required_providers {
+        aws = {
+          source  = "hashicorp/aws"
+          version = "6.72.0"
+        }
+      }
+    }
+
+    variable "env" {
+      type = string
+    }
+
+    resource "aws_iam_user" "svc" {
+      name = "api-${var.env}"
+    }
+    EOF
+    for e in staging production; do
+      lab_file /lab/live/$e/api/terragrunt.hcl <<EOF
+    include "root" {
+      path = find_in_parent_folders("root.hcl")
+    }
+
+    terraform {
+      source = "../../../modules/api"
+    }
+
+    inputs = {
+      env = "$e"
+    }
+    EOF
+    done
+  check: |
+    for e in staging production; do
+      st=$(mktemp); tf_s3_state acme-tg-state $e/api/terraform.tfstate >"$st"
+      check_eq "the $e stack's state is at $e/api/terraform.tfstate, holding api-$e" "$(tf_addrs "$st" | paste -sd, -) $(tf_get "$st" aws_iam_user.svc name)" "aws_iam_user.svc api-$e"
+      check "IAM user api-$e exists" "aws iam get-user --user-name api-$e"
+      rm -f "$st"
+    done
+    check "root.hcl derives the key from the stack's path" 'grep -q "path_relative_to_include()" /lab/live/root.hcl'
+    check "root.hcl turns on S3 locking" 'grep -Eq "use_lockfile *= *true" /lab/live/root.hcl'
+    check_not "the stacks don't hard-code a backend or provider" 'grep -Eqs "backend|provider \"aws\"" /lab/live/staging/api/terragrunt.hcl /lab/live/production/api/terragrunt.hcl /lab/modules/api/main.tf'
+  solve: |
+    cd /lab/live
+    cat > root.hcl <<'EOF'
+    remote_state {
+      backend = "s3"
+      generate = {
+        path      = "backend.tf"
+        if_exists = "overwrite_terragrunt"
+      }
+      config = {
+        bucket         = "acme-tg-state"
+        key            = "${path_relative_to_include()}/terraform.tfstate"
+        region         = "us-east-1"
+        use_lockfile   = true
+        use_path_style = true
+      }
+    }
+    generate "provider" {
+      path      = "provider.tf"
+      if_exists = "overwrite_terragrunt"
+      contents  = <<P
+    provider "aws" {
+      region            = "us-east-1"
+      s3_use_path_style = true
+    }
+    P
+    }
+    EOF
+    terragrunt run --all --non-interactive -- apply -auto-approve -no-color >/dev/null 2>&1
+
+- id: tf-114
+  title: "Terragrunt: one stack feeds the next"
+  difficulty: 4
+  kind: build
+  tags: [terragrunt, dependency, mock_outputs, run-all, ordering]
+  tutorial: |
+    **What you're learning.** How Terragrunt passes one stack's **outputs** into another's inputs with a `dependency` block, and how it orders `run --all` because of it.
+
+    ### dependency blocks
+
+    ```hcl
+    # live/prod/workers/terragrunt.hcl
+    include "root" {
+      path = find_in_parent_folders("root.hcl")
+    }
+    terraform {
+      source = "../../../modules/workers"
+    }
+
+    dependency "net" {
+      config_path = "../net"                       # the other stack's folder
+
+      # used while "net" has no outputs yet (a first plan, or validate)
+      mock_outputs = {
+        vpc_id = "vpc-00000000"
+      }
+      mock_outputs_allowed_terraform_commands = ["init", "validate", "plan"]
+    }
+
+    inputs = {
+      vpc_id = dependency.net.outputs.vpc_id
+    }
+    ```
+
+    Terragrunt reads `net`'s outputs from **its** state. This replaces `terraform_remote_state` data sources and their hard-coded bucket and key.
+
+    ### Ordering
+
+    `terragrunt run --all apply` builds a graph from the `dependency` blocks and applies `net` before `workers`. `destroy` goes the other way round. Terragrunt prints the order before running:
+
+    ```text
+    Group 1
+    - Unit ./net
+    Group 2
+    - Unit ./workers
+    ```
+
+    ### Commands you'll use
+
+    ```bash
+    cd live/prod && terragrunt run --all --non-interactive -- apply -auto-approve
+    cd net && terragrunt output vpc_id
+    terragrunt dag graph                 # the dependency graph
+    ```
+
+    ### Common mistakes
+
+    - Mocks allowed for `apply`: the real stack gets the fake `vpc-00000000`, and the apply fails or builds in the wrong place.
+    - Using an output the other stack doesn't define: `Unsupported attribute`.
+    - Hard-coding the VPC id in `inputs` "for now".
+
+    ### Check your work
+
+    The security group sits in the VPC the network stack made, and `terragrunt dag graph` shows the edge.
+  scenario: |
+    **`/lab/stack`** has two Terragrunt units: **`network`** (a VPC; outputs `vpc_id` and
+    `vpc_cidr`) and **`app`** (a security group that needs both as inputs). `root.hcl` is
+    done.
+
+    Wire `app` to `network` with a **`dependency`** block (with mock outputs for plans
+    only), so that one `terragrunt run --all` deploys both in the right order. Deploy them.
+  hints:
+    - "`dependency \"network\" { config_path = \"../network\"  mock_outputs = {…}  mock_outputs_allowed_terraform_commands = [\"init\", \"validate\", \"plan\"] }`."
+    - "`inputs = { vpc_id = dependency.network.outputs.vpc_id  vpc_cidr = dependency.network.outputs.vpc_cidr }`, then `terragrunt run --all --non-interactive -- apply -auto-approve` from /lab/stack."
+  solution: |
+    ```bash
+    cd /lab/stack
+    cat >> app/terragrunt.hcl <<'EOF'
+
+    dependency "network" {
+      config_path = "../network"
+      mock_outputs = {
+        vpc_id   = "vpc-00000000"
+        vpc_cidr = "10.0.0.0/16"
+      }
+      mock_outputs_allowed_terraform_commands = ["init", "validate", "plan"]
+    }
+
+    inputs = {
+      vpc_id   = dependency.network.outputs.vpc_id
+      vpc_cidr = dependency.network.outputs.vpc_cidr
+    }
+    EOF
+    terragrunt run --all --non-interactive -- apply -auto-approve
+    ```
+  setup: |
+    tf_aws_start
+    rm -rf /lab/stack
+    aws s3api create-bucket --bucket acme-tg-state >/dev/null
+    lab_file /lab/stack/root.hcl <<'EOF'
+    remote_state {
+      backend = "s3"
+      generate = {
+        path      = "backend.tf"
+        if_exists = "overwrite_terragrunt"
+      }
+      config = {
+        bucket         = "acme-tg-state"
+        key            = "stack/${path_relative_to_include()}/terraform.tfstate"
+        region         = "us-east-1"
+        use_lockfile   = true
+        use_path_style = true
+      }
+    }
+
+    generate "provider" {
+      path      = "provider.tf"
+      if_exists = "overwrite_terragrunt"
+      contents  = <<P
+    provider "aws" {
+      region            = "us-east-1"
+      s3_use_path_style = true
+    }
+    P
+    }
+    EOF
+    lab_file /lab/stack/modules/network/main.tf <<'EOF'
+    terraform {
+      required_providers {
+        aws = {
+          source  = "hashicorp/aws"
+          version = "6.72.0"
+        }
+      }
+    }
+
+    resource "aws_vpc" "main" {
+      cidr_block = "10.90.0.0/16"
+      tags       = { Name = "stack" }
+    }
+
+    output "vpc_id" {
+      value = aws_vpc.main.id
+    }
+
+    output "vpc_cidr" {
+      value = aws_vpc.main.cidr_block
+    }
+    EOF
+    lab_file /lab/stack/modules/app/main.tf <<'EOF'
+    terraform {
+      required_providers {
+        aws = {
+          source  = "hashicorp/aws"
+          version = "6.72.0"
+        }
+      }
+    }
+
+    variable "vpc_id" {
+      type = string
+    }
+
+    variable "vpc_cidr" {
+      type = string
+    }
+
+    resource "aws_security_group" "app" {
+      name   = "stack-app"
+      vpc_id = var.vpc_id
+      ingress {
+        from_port   = 8080
+        to_port     = 8080
+        protocol    = "tcp"
+        cidr_blocks = [var.vpc_cidr]
+      }
+    }
+    EOF
+    for u in network app; do
+      lab_file /lab/stack/$u/terragrunt.hcl <<EOF
+    include "root" {
+      path = find_in_parent_folders("root.hcl")
+    }
+
+    terraform {
+      source = "../modules/$u"
+    }
+    EOF
+    done
+  check: |
+    vpc=$(aws ec2 describe-vpcs --filters Name=tag:Name,Values=stack --query 'Vpcs[0].VpcId' --output text 2>/dev/null)
+    sgj=$(aws ec2 describe-security-groups --filters Name=group-name,Values=stack-app --output json 2>/dev/null)
+    check "the network unit made its VPC" '[ -n "$vpc" ] && [ "$vpc" != None ]'
+    check_eq "the app's security group is in that VPC" "$(jq -r '.SecurityGroups[0].VpcId // empty' <<<"$sgj")" "$vpc"
+    check_eq "it allows 8080 from the VPC's range" "$(jq -r '[.SecurityGroups[0].IpPermissions[]? | "\(.FromPort) \(.IpRanges[0].CidrIp)"] | join(",")' <<<"$sgj")" "8080 10.90.0.0/16"
+    f=/lab/stack/app/terragrunt.hcl
+    check "app has a dependency on ../network" 'grep -Eq "dependency +\"[a-z_-]+\"" $f && grep -Eq "config_path *= *\"\.\./network\"" $f'
+    check "the inputs come from the dependency's outputs" 'grep -Eq "dependency\.[a-z_-]+\.outputs\.vpc_id" $f && grep -Eq "dependency\.[a-z_-]+\.outputs\.vpc_cidr" $f'
+    check_not "mock outputs are not allowed for apply" 'grep -E "mock_outputs_allowed_terraform_commands" $f | grep -q apply'
+  solve: |
+    cd /lab/stack
+    cat >> app/terragrunt.hcl <<'EOF'
+
+    dependency "network" {
+      config_path = "../network"
+      mock_outputs = {
+        vpc_id   = "vpc-00000000"
+        vpc_cidr = "10.0.0.0/16"
+      }
+      mock_outputs_allowed_terraform_commands = ["init", "validate", "plan"]
+    }
+
+    inputs = {
+      vpc_id   = dependency.network.outputs.vpc_id
+      vpc_cidr = dependency.network.outputs.vpc_cidr
+    }
+    EOF
+    terragrunt run --all --non-interactive -- apply -auto-approve -no-color >/dev/null 2>&1
+
+- id: tf-115
+  title: A policy gate for plans with Conftest
+  difficulty: 3
+  kind: build
+  tags: [conftest, opa, rego, policy-as-code, plan-json, security]
+  tutorial: |
+    **What you're learning.** **Policy as code**: rules written in **Rego** that check a Terraform plan before it's applied, run with **Conftest**.
+
+    ### Why
+
+    Reviewers miss things. A policy runs on **every** plan and blocks the dangerous ones, such as a database open to the internet or a role that can do anything, before they reach AWS. The input is the plan as JSON:
+
+    ```bash
+    terraform plan -out=tf.plan
+    terraform show -json tf.plan > plan.json
+    conftest test plan.json -p policy/
+    ```
+
+    The interesting part of `plan.json` is `resource_changes`:
+
+    ```json
+    { "resource_changes": [
+        { "address": "aws_security_group.db",
+          "type": "aws_security_group",
+          "change": { "actions": ["create"],
+                      "after": { "ingress": [ { "from_port": 5432, "to_port": 5432,
+                                                "protocol": "tcp", "cidr_blocks": ["0.0.0.0/0"] } ] } } } ] }
+    ```
+    `change.after` is the resource as it will be after the apply.
+
+    ### Rego in five minutes
+
+    Conftest evaluates every rule called **`deny`** in package **`main`**. Each message a `deny` produces is a failure:
+
+    ```rego
+    package main
+
+    deny contains msg if {
+      rc := input.resource_changes[_]              # for each changed resource…
+      rc.type == "aws_security_group"
+      rule := rc.change.after.ingress[_]           # …and each of its ingress rules
+      rule.from_port <= 5432
+      rule.to_port >= 5432                         # the range covers 5432
+      rule.cidr_blocks[_] == "0.0.0.0/0"
+      msg := sprintf("%s exposes Postgres to the internet", [rc.address])
+    }
+    ```
+    - Every line in the body must be true for the rule to fire. `[_]` means "some element".
+    - Port **ranges** matter: `0`–`65535` covers 5432 too.
+    - Embedded JSON strings (an IAM policy's `policy`) need `json.unmarshal(…)` first. A statement's `Action` may be a string **or** a list. Handle both: `st.Action == "*"` and `st.Action[_] == "*"` as two rules.
+
+    ```bash
+    conftest test plan.json -p policy/ --no-color
+    ```
+    ```text
+    FAIL - plan.json - main - aws_security_group.db exposes Postgres to the internet
+    1 test, 0 passed, 0 warnings, 1 failure, 0 exceptions
+    ```
+    The exit code is non-zero when anything fails, which is what a pipeline needs.
+
+    ### Common mistakes
+
+    - Checking `from_port == 22` only, so a rule for "all ports" slips through.
+    - Looking at `change.before`: that's the old version, and it's `null` for new resources.
+    - Comparing a list to a string: `cidr_blocks == "0.0.0.0/0"` is never true.
+
+    ### Check your work
+
+    The example plan in `/lab/gate/plans` fails with both messages, and a plan with safe rules passes.
+  scenario: |
+    Write **`/lab/gate/policy/terraform.rego`** (package `main`) with `deny` rules that fail a
+    plan when:
+
+    1. an **`aws_security_group`** has an ingress rule that lets **port 22** in from
+       **`0.0.0.0/0`** (also when 22 is inside a wider port range)
+    2. an **`aws_iam_policy`** has an `Allow` statement whose action is **`"*"`** (as a string
+       or in a list)
+
+    Every message must include the resource's **address**. Safe plans must pass. A plan that
+    breaks both rules is in `/lab/gate/plans/example.json`.
+  hints:
+    - "For rule 1, require `rule.from_port <= 22` and `rule.to_port >= 22`, then `rule.cidr_blocks[_] == \"0.0.0.0/0\"`."
+    - "For rule 2: `doc := json.unmarshal(rc.change.after.policy)`, `st := doc.Statement[_]`, `st.Effect == \"Allow\"`, then one rule for `st.Action == \"*\"` and one for `st.Action[_] == \"*\"`."
+  solution: |
+    ```bash
+    mkdir -p /lab/gate/policy
+    cat > /lab/gate/policy/terraform.rego <<'EOF'
+    package main
+
+    deny contains msg if {
+      rc := input.resource_changes[_]
+      rc.type == "aws_security_group"
+      rule := rc.change.after.ingress[_]
+      rule.from_port <= 22
+      rule.to_port >= 22
+      rule.cidr_blocks[_] == "0.0.0.0/0"
+      msg := sprintf("%s lets SSH in from the internet", [rc.address])
+    }
+
+    admin_statement(st) if {
+      st.Effect == "Allow"
+      st.Action == "*"
+    }
+
+    admin_statement(st) if {
+      st.Effect == "Allow"
+      st.Action[_] == "*"
+    }
+
+    deny contains msg if {
+      rc := input.resource_changes[_]
+      rc.type == "aws_iam_policy"
+      doc := json.unmarshal(rc.change.after.policy)
+      admin_statement(doc.Statement[_])
+      msg := sprintf("%s allows every action", [rc.address])
+    }
+    EOF
+    cd /lab/gate && conftest test plans/example.json -p policy --no-color
+    ```
+  setup: |
+    tf_aws_start
+    rm -rf /lab/gate /lab/.kl-cases
+    mkdir -p "$KL_STATE/cases"
+    hdr='terraform {
+      required_providers {
+        aws = {
+          source  = "hashicorp/aws"
+          version = "6.72.0"
+        }
+      }
+    }
+    provider "aws" {
+      region            = "us-east-1"
+      s3_use_path_style = true
+    }
+    resource "aws_vpc" "v" {
+      cidr_block = "10.0.0.0/16"
+    }
+    '
+    sg() { printf 'resource "aws_security_group" "%s" {\n  vpc_id = aws_vpc.v.id\n  ingress {\n    from_port   = %s\n    to_port     = %s\n    protocol    = "tcp"\n    cidr_blocks = ["%s"]\n  }\n}\n' "$1" "$2" "$3" "$4"; }
+    pol() { printf 'resource "aws_iam_policy" "%s" {\n  name   = "%s"\n  policy = jsonencode({ Version = "2012-10-17", Statement = [{ Effect = "Allow", Action = %s, Resource = "*" }] })\n}\n' "$1" "$1" "$2"; }
+    mkcase() {
+      local n=$1; shift
+      mkdir -p /lab/.kl-cases/$n
+      { printf '%s\n' "$hdr"; "$@"; } > /lab/.kl-cases/$n/main.tf
+    }
+    good() { sg web 443 443 0.0.0.0/0; sg ssh_inside 22 22 10.0.0.0/8; pol reader '["s3:GetObject"]'; }
+    wide() { sg web 443 443 0.0.0.0/0; sg everything 0 65535 0.0.0.0/0; }
+    admin() { pol ops '"*"'; pol reader '["s3:GetObject"]'; }
+    adminlist() { pol breakglass '["s3:GetObject", "*"]'; }
+    example() { sg bastion 22 22 0.0.0.0/0; pol admin '["*"]'; }
+    for c in good wide admin adminlist example; do mkcase $c $c; done
+    chown -R "$(lab_user):" /lab/.kl-cases
+    for c in good wide admin adminlist example; do
+      tf_as_user /lab/.kl-cases/$c init -input=false -no-color >/dev/null
+      tf_as_user /lab/.kl-cases/$c plan -input=false -no-color -out=p >/dev/null
+      tf_as_user /lab/.kl-cases/$c show -json p > "$KL_STATE/cases/$c.json"
+    done
+    mkdir -p /lab/gate/plans
+    cp "$KL_STATE/cases/example.json" /lab/gate/plans/example.json
+    chown -R "$(lab_user):" /lab/gate
+    rm -rf /lab/.kl-cases
+  check: |
+    ct() { local d; d=$(mktemp -d /lab/.kl-ct.XXXX); cp "$KL_STATE/cases/$1.json" "$d/"; chmod -R a+rX "$d"
+      (cd /lab && conftest test "${d#/lab/}/$1.json" -p gate/policy --no-color 2>&1); local rc=$?; rm -rf "$d"; return $rc; }
+    check "/lab/gate/policy/terraform.rego exists" '[ -s /lab/gate/policy/terraform.rego ]'
+    out=$(ct good); rc=$?
+    check "a plan with safe rules passes (got: $(tail -1 <<<"$out"))" '[ $rc -eq 0 ]'
+    out=$(ct wide); rc=$?
+    check "SSH inside an all-ports rule from anywhere fails, naming aws_security_group.everything" '[ $rc -ne 0 ] && grep -q "aws_security_group.everything" <<<"$out" && ! grep -q "aws_security_group.web" <<<"$out"'
+    out=$(ct admin); rc=$?
+    check "Action \"*\" as a string fails, naming aws_iam_policy.ops" '[ $rc -ne 0 ] && grep -q "aws_iam_policy.ops" <<<"$out" && ! grep -q "aws_iam_policy.reader" <<<"$out"'
+    out=$(ct adminlist); rc=$?
+    check "\"*\" inside an action list fails, naming aws_iam_policy.breakglass" '[ $rc -ne 0 ] && grep -q "aws_iam_policy.breakglass" <<<"$out"'
+    out=$(ct example); rc=$?
+    check "the example plan fails on both rules" '[ $rc -ne 0 ] && grep -q "aws_security_group.bastion" <<<"$out" && grep -q "aws_iam_policy.admin" <<<"$out"'
+  solve: |
+    mkdir -p /lab/gate/policy
+    cat > /lab/gate/policy/terraform.rego <<'EOF'
+    package main
+
+    deny contains msg if {
+      rc := input.resource_changes[_]
+      rc.type == "aws_security_group"
+      rule := rc.change.after.ingress[_]
+      rule.from_port <= 22
+      rule.to_port >= 22
+      rule.cidr_blocks[_] == "0.0.0.0/0"
+      msg := sprintf("%s lets SSH in from the internet", [rc.address])
+    }
+
+    admin_statement(st) if {
+      st.Effect == "Allow"
+      st.Action == "*"
+    }
+
+    admin_statement(st) if {
+      st.Effect == "Allow"
+      st.Action[_] == "*"
+    }
+
+    deny contains msg if {
+      rc := input.resource_changes[_]
+      rc.type == "aws_iam_policy"
+      doc := json.unmarshal(rc.change.after.policy)
+      admin_statement(doc.Statement[_])
+      msg := sprintf("%s allows every action", [rc.address])
+    }
+    EOF
+
+- id: tf-116
+  title: The policy that never fails anything
+  difficulty: 4
+  kind: fix
+  tags: [conftest, opa, rego, policy-as-code, troubleshooting]
+  tutorial: |
+    **What you're learning.** How to debug a Rego policy that passes everything, by testing each line of the rule against the real input.
+
+    ### Why a policy passes silently
+
+    A Rego rule fires only when **every** line of its body is true. One wrong field name, one wrong type, or one package Conftest never looks at, and the rule simply never fires. There's no error, just a green result. The usual suspects:
+
+    | Bug | Effect |
+    |---|---|
+    | `package` isn't the one Conftest evaluates (`main` by default) | no rule runs at all |
+    | a typo in a type or field name (`aws_security_groups`) | the line is never true |
+    | `change.before` instead of `change.after` | `null` for new resources |
+    | comparing a list to a string | never equal |
+
+    ### Commands you'll use
+
+    Ask Conftest which namespaces it evaluated, and make it fail loudly when none match:
+
+    ```bash
+    conftest test plan.json -p policy --all-namespaces       # evaluate every package
+    conftest test plan.json -p policy --namespace checks     # one specific package
+    ```
+
+    Then take the rule apart. `conftest` can't evaluate an expression, so look at the input itself with `jq`, step by step along the rule's path:
+
+    ```bash
+    jq '[.resource_changes[].type] | unique' plan.json
+    jq '.resource_changes[] | select(.type == "aws_db_instance") | .change.after.publicly_accessible' plan.json
+    jq '.resource_changes[0].change.before' plan.json            # null for a create
+    ```
+    Every line of the rule must match something real in that output.
+
+    **Test the gate on a plan that must fail.** A gate that has never failed proves nothing.
+
+    ### Common mistakes
+
+    - Running the policy only on good plans and calling it done.
+    - Renaming the package to `main` but leaving the other bugs: the rule runs and still matches nothing.
+
+    ### Check your work
+
+    The example bad plan fails with the right address, and the good one still passes.
+  scenario: |
+    The security team's gate in **`/lab/policy-gate`** has never failed a pipeline, and
+    yesterday a security group open to the world on all ports went through.
+
+    The policy **`policy/network.rego`** is meant to fail any **`aws_security_group`** that
+    lets **anything** in from **`0.0.0.0/0`** except HTTPS (443 only). Find why it matches
+    nothing, and fix it. Messages must name the resource's address.
+
+    Last night's plan is in `plans/last-night.json` (it must fail), and `plans/ok.json` must
+    pass.
+  hints:
+    - "Run `conftest test plans/last-night.json -p policy --all-namespaces`. If it suddenly finds something, the package name is one problem."
+    - "Compare each line of the rule with `jq '.resource_changes[] | {type, after: .change.after.ingress}' plans/last-night.json`. Look at the type name, `before` vs `after`, and how `cidr_blocks` is compared."
+  solution: |
+    ```bash
+    cd /lab/policy-gate
+    conftest test plans/last-night.json -p policy --no-color         # passes: wrong
+    jq '.resource_changes[] | {type, after: .change.after.ingress}' plans/last-night.json
+    # fixes in policy/network.rego:
+    #   package network         -> package main
+    #   "aws_security_groups"   -> "aws_security_group"
+    #   rc.change.before        -> rc.change.after
+    #   rule.cidr_blocks == "0.0.0.0/0"  ->  rule.cidr_blocks[_] == "0.0.0.0/0"
+    conftest test plans/last-night.json -p policy --no-color         # FAIL, naming the group
+    conftest test plans/ok.json -p policy --no-color                 # passes
+    ```
+  setup: |
+    tf_aws_start
+    rm -rf /lab/policy-gate /lab/.kl-cases
+    mkdir -p "$KL_STATE/cases"
+    hdr='terraform {
+      required_providers {
+        aws = {
+          source  = "hashicorp/aws"
+          version = "6.72.0"
+        }
+      }
+    }
+    provider "aws" {
+      region            = "us-east-1"
+      s3_use_path_style = true
+    }
+    resource "aws_vpc" "v" {
+      cidr_block = "10.0.0.0/16"
+    }
+    '
+    sg() { printf 'resource "aws_security_group" "%s" {\n  vpc_id = aws_vpc.v.id\n  ingress {\n    from_port   = %s\n    to_port     = %s\n    protocol    = "tcp"\n    cidr_blocks = ["%s"]\n  }\n}\n' "$1" "$2" "$3" "$4"; }
+    lastnight() { sg web 443 443 0.0.0.0/0; sg debug 0 65535 0.0.0.0/0; }
+    ok() { sg web 443 443 0.0.0.0/0; sg admin 22 22 10.0.0.0/8; }
+    redis() { sg web 443 443 0.0.0.0/0; sg cache 6379 6379 0.0.0.0/0; }
+    for c in lastnight ok redis; do
+      mkdir -p /lab/.kl-cases/$c; { printf '%s\n' "$hdr"; $c; } > /lab/.kl-cases/$c/main.tf
+    done
+    chown -R "$(lab_user):" /lab/.kl-cases
+    for c in lastnight ok redis; do
+      tf_as_user /lab/.kl-cases/$c init -input=false -no-color >/dev/null
+      tf_as_user /lab/.kl-cases/$c plan -input=false -no-color -out=p >/dev/null
+      tf_as_user /lab/.kl-cases/$c show -json p > "$KL_STATE/cases/$c.json"
+    done
+    rm -rf /lab/.kl-cases
+    mkdir -p /lab/policy-gate/plans
+    cp "$KL_STATE/cases/lastnight.json" /lab/policy-gate/plans/last-night.json
+    cp "$KL_STATE/cases/ok.json" /lab/policy-gate/plans/ok.json
+    lab_file /lab/policy-gate/policy/network.rego <<'EOF'
+    package network
+
+    # Fail any security group that lets something other than HTTPS in from the internet.
+    deny contains msg if {
+      rc := input.resource_changes[_]
+      rc.type == "aws_security_groups"
+      rule := rc.change.before.ingress[_]
+      rule.cidr_blocks == "0.0.0.0/0"
+      not https_only(rule)
+      msg := sprintf("%s is open to the internet on ports %d-%d", [rc.address, rule.from_port, rule.to_port])
+    }
+
+    https_only(rule) if {
+      rule.from_port == 443
+      rule.to_port == 443
+    }
+    EOF
+    chown -R "$(lab_user):" /lab/policy-gate
+  check: |
+    ct() { local d; d=$(mktemp -d /lab/.kl-ct.XXXX); cp "$KL_STATE/cases/$1.json" "$d/"; chmod -R a+rX "$d"
+      (cd /lab && conftest test "${d#/lab/}/$1.json" -p policy-gate/policy --no-color 2>&1); local rc=$?; rm -rf "$d"; return $rc; }
+    out=$(ct lastnight); rc=$?
+    check "last night's plan fails, naming aws_security_group.debug" '[ $rc -ne 0 ] && grep -q "aws_security_group.debug" <<<"$out"'
+    check_not "HTTPS from anywhere is still allowed" 'grep -q "aws_security_group.web" <<<"$out"'
+    out=$(ct ok); rc=$?
+    check "the ok plan passes" '[ $rc -eq 0 ]'
+    out=$(ct redis); rc=$?
+    check "a different open port (Redis 6379) fails too" '[ $rc -ne 0 ] && grep -q "aws_security_group.cache" <<<"$out"'
+  solve: |
+    cd /lab/policy-gate/policy
+    sed -i 's/^package network/package main/; s/"aws_security_groups"/"aws_security_group"/; s/rc.change.before/rc.change.after/; s/rule.cidr_blocks == "0.0.0.0\/0"/rule.cidr_blocks[_] == "0.0.0.0\/0"/' network.rego
+
+# ===== Capstone =====
+
+- id: tf-117
+  title: "Capstone: a policy-gated rollout with Terragrunt and OpenTofu"
+  difficulty: 5
+  kind: build
+  tags: [terragrunt, opentofu, conftest, policy-as-code, ci, capstone]
+  tutorial: |
+    **What you're learning.** How the pieces of this module fit into one pipeline step: Terragrunt runs every stack with OpenTofu, each plan goes through the policy gate, and nothing is applied unless all of them pass.
+
+    ### The gate script
+
+    ```
+    for each unit under the tree:
+        plan -out ──► show -json ──► conftest test  ──► any FAIL? exit 1
+    all passed ──► exit 0   (the pipeline's next step may apply)
+    ```
+
+    Terragrunt can run a command in every unit, and `run --all` with `--` passes the rest to OpenTofu. Saved plans go in each unit's cache folder, so the simplest loop finds the units itself:
+
+    ```bash
+    for unit in $(find "$TREE" -name terragrunt.hcl -not -path '*/.terragrunt-cache/*' -not -name root.hcl -exec dirname {} \;); do
+      (cd "$unit" && terragrunt plan -out=tf.plan >/dev/null && terragrunt show -json tf.plan > plan.json) || exit 2
+      conftest test "$unit/plan.json" -p "$POLICY" || failed=1
+    done
+    ```
+    - `terragrunt show -json tf.plan` runs `tofu show` inside the unit's cache folder, where the plan file is.
+    - Make the script **fail closed**: if planning itself fails, exit non-zero too.
+    - Terragrunt picks OpenTofu by itself when `tofu` is installed. `terraform_binary = "tofu"` in `root.hcl` makes it explicit.
+
+    | Piece | Taught in |
+    |---|---|
+    | `root.hcl`, generated backend | tf-113 |
+    | dependencies between units | tf-114 |
+    | Rego rules on plan JSON | tf-115, tf-116 |
+    | OpenTofu | tf-111 |
+
+    ### Common mistakes
+
+    - A gate that prints failures but exits 0.
+    - Running Conftest on the plan **text** instead of the JSON.
+    - Fixing a violation by editing the policy instead of the stack.
+
+    ### Check your work
+
+    The gate exits 1 on the tree as it is, naming the offending resource. After the fix it exits 0, and the apply goes through.
+  scenario: |
+    **`/lab/platform`** is a Terragrunt tree with two units, `edge` and `jobs`. The security
+    policy is in `/lab/platform-policy` (finished, don't change it).
+
+    1. Make `root.hcl` run the units with **OpenTofu** explicitly.
+    2. Write **`/lab/ci/gate.sh TREE`**: it plans every unit under `TREE`, runs Conftest with
+       `/lab/platform-policy` on each plan, and **exits non-zero if any plan fails the policy,
+       or if planning fails**. Otherwise it exits 0.
+    3. One unit breaks the policy today. Fix that **unit** (not the policy) so the gate passes,
+       then apply the whole tree.
+  hints:
+    - "`terraform_binary = \"tofu\"` at the top level of root.hcl."
+    - "In the gate, `find \"$1\" -name terragrunt.hcl -not -path '*/.terragrunt-cache/*'` lists the units. For each: `terragrunt plan -out=tf.plan` and `terragrunt show -json tf.plan > plan.json`, then `conftest test plan.json -p /lab/platform-policy`."
+    - "`conftest` names the resource. The fix is a narrower `cidr_blocks` in that unit's module input or code."
+  solution: |
+    ```bash
+    sed -i '1i terraform_binary = "tofu"\n' /lab/platform/root.hcl
+    mkdir -p /lab/ci
+    cat > /lab/ci/gate.sh <<'EOF'
+    #!/bin/bash
+    # gate.sh TREE: plan every Terragrunt unit under TREE and test it against the policy
+    set -u
+    tree=$(realpath "${1:?usage: gate.sh TREE}")
+    failed=0
+    for unit in $(find "$tree" -name terragrunt.hcl -not -path '*/.terragrunt-cache/*' -exec dirname {} \; | sort); do
+      echo "== $unit"
+      (cd "$unit" && terragrunt plan -out=tf.plan -no-color >/dev/null && terragrunt show -json tf.plan > plan.json) || { echo "plan failed"; exit 2; }
+      conftest test "$unit/plan.json" -p /lab/platform-policy --no-color || failed=1
+    done
+    exit $failed
+    EOF
+    chmod +x /lab/ci/gate.sh
+    /lab/ci/gate.sh /lab/platform          # FAIL: which unit and resource?
+    # fix that unit's inputs (the admin CIDR), then:
+    /lab/ci/gate.sh /lab/platform && (cd /lab/platform && terragrunt run --all --non-interactive -- apply -auto-approve)
+    ```
+  setup: |
+    tf_aws_start
+    rm -rf /lab/platform /lab/platform-policy /lab/ci
+    aws s3api create-bucket --bucket acme-tg-state >/dev/null
+    lab_file /lab/platform/root.hcl <<'EOF'
+    remote_state {
+      backend = "s3"
+      generate = {
+        path      = "backend.tf"
+        if_exists = "overwrite_terragrunt"
+      }
+      config = {
+        bucket         = "acme-tg-state"
+        key            = "platform/${path_relative_to_include()}/terraform.tfstate"
+        region         = "us-east-1"
+        use_lockfile   = true
+        use_path_style = true
+      }
+    }
+
+    generate "provider" {
+      path      = "provider.tf"
+      if_exists = "overwrite_terragrunt"
+      contents  = <<P
+    provider "aws" {
+      region            = "us-east-1"
+      s3_use_path_style = true
+    }
+    P
+    }
+    EOF
+    lab_file /lab/platform/modules/service/main.tf <<'EOF'
+    terraform {
+      required_providers {
+        aws = {
+          source  = "hashicorp/aws"
+          version = "6.72.0"
+        }
+      }
+    }
+
+    variable "name" {
+      type = string
+    }
+
+    variable "cidr" {
+      type = string
+    }
+
+    variable "admin_cidr" {
+      type        = string
+      description = "Who may SSH in"
+    }
+
+    resource "aws_vpc" "this" {
+      cidr_block = var.cidr
+      tags       = { Name = var.name }
+    }
+
+    resource "aws_security_group" "this" {
+      name   = var.name
+      vpc_id = aws_vpc.this.id
+      ingress {
+        from_port   = 443
+        to_port     = 443
+        protocol    = "tcp"
+        cidr_blocks = ["0.0.0.0/0"]
+      }
+      ingress {
+        from_port   = 22
+        to_port     = 22
+        protocol    = "tcp"
+        cidr_blocks = [var.admin_cidr]
+      }
+    }
+    EOF
+    unit() { lab_file /lab/platform/$1/terragrunt.hcl <<EOF
+    include "root" {
+      path = find_in_parent_folders("root.hcl")
+    }
+
+    terraform {
+      source = "../modules/service"
+    }
+
+    inputs = {
+      name       = "platform-$1"
+      cidr       = "$2"
+      admin_cidr = "$3"
+    }
+    EOF
+    }
+    unit edge 10.110.0.0/16 10.0.0.0/8
+    unit jobs 10.111.0.0/16 0.0.0.0/0
+    lab_file /lab/platform-policy/network.rego <<'EOF'
+    package main
+
+    deny contains msg if {
+      rc := input.resource_changes[_]
+      rc.type == "aws_security_group"
+      rule := rc.change.after.ingress[_]
+      rule.from_port <= 22
+      rule.to_port >= 22
+      rule.cidr_blocks[_] == "0.0.0.0/0"
+      msg := sprintf("%s lets SSH in from the internet", [rc.address])
+    }
+    EOF
+    sha256sum /lab/platform-policy/network.rego /lab/platform/modules/service/main.tf > "$KL_STATE/sums"
+  check: |
+    G=/lab/ci/gate.sh
+    check "root.hcl runs OpenTofu explicitly" 'grep -Eq "^ *terraform_binary *= *\"tofu\"" /lab/platform/root.hcl'
+    check "/lab/ci/gate.sh is executable" '[ -x $G ]'
+    check "the policy and the module are unchanged" 'sha256sum -c --quiet "$KL_STATE/sums"'
+    for u in edge jobs; do
+      st=$(mktemp); tf_s3_state acme-tg-state platform/$u/terraform.tfstate >"$st"
+      check "unit $u is applied" 'tf_has "$st" aws_security_group.this'
+      check_eq "unit $u was applied with OpenTofu" "$(jq -r '.terraform_version // empty' "$st")" 1.13.8
+      rm -f "$st"
+    done
+    open=$(aws ec2 describe-security-groups --output json 2>/dev/null | jq -r '[.SecurityGroups[] | select(.GroupName | startswith("platform-")) | . as $g | .IpPermissions[]? | select(.FromPort <= 22 and .ToPort >= 22) | .IpRanges[]? | select(.CidrIp == "0.0.0.0/0") | $g.GroupName] | join(",")')
+    check_eq "no platform security group lets SSH in from the internet" "$open" ""
+    check "the gate passes on the fixed tree" '[ -x $G ] && sudo -u "$(lab_user)" -H bash -c "$G /lab/platform" >/dev/null 2>&1'
+    # the gate must catch a violation: a copy of the tree with one unit broken again
+    t=$(mktemp -d /lab/.kl-gate.XXXX)
+    cp -r /lab/platform/. "$t/"; find "$t" -name .terragrunt-cache -prune -exec rm -rf {} +
+    sed -i 's|key            = "platform/|key            = "kl-gate-check/|' "$t/root.hcl"
+    sed -i 's|admin_cidr = ".*"|admin_cidr = "0.0.0.0/0"|' "$t/edge/terragrunt.hcl"
+    chown -R "$(lab_user):" "$t"
+    gout=$(sudo -u "$(lab_user)" -H bash -c "$G $t" 2>&1); grc=$?
+    check "the gate exits non-zero when a unit breaks the policy" '[ -x $G ] && [ $grc -ne 0 ] && grep -q "aws_security_group.this" <<<"$gout"'
+    echo 'resource "aws_s3_bucket" "broken" {' > "$t/modules/service/broken.tf"
+    sudo -u "$(lab_user)" -H bash -c "$G $t" >/dev/null 2>&1; prc=$?
+    check "the gate exits non-zero when planning fails" '[ -x $G ] && [ $prc -ne 0 ]'
+    rm -rf "$t"
+  solve: |
+    sed -i '1i terraform_binary = "tofu"\n' /lab/platform/root.hcl
+    mkdir -p /lab/ci
+    cat > /lab/ci/gate.sh <<'EOF'
+    #!/bin/bash
+    # gate.sh TREE: plan every Terragrunt unit under TREE and test it against the policy
+    set -u
+    tree=$(realpath "${1:?usage: gate.sh TREE}")
+    failed=0
+    for unit in $(find "$tree" -name terragrunt.hcl -not -path '*/.terragrunt-cache/*' -exec dirname {} \; | sort); do
+      echo "== $unit"
+      (cd "$unit" && terragrunt plan -out=tf.plan -no-color >/dev/null 2>&1 && terragrunt show -json tf.plan > plan.json 2>/dev/null) || { echo "plan failed in $unit"; exit 2; }
+      conftest test "$unit/plan.json" -p /lab/platform-policy --no-color || failed=1
+    done
+    exit $failed
+    EOF
+    chmod +x /lab/ci/gate.sh
+    sed -i 's|admin_cidr = "0.0.0.0/0"|admin_cidr = "10.0.0.0/8"|' /lab/platform/jobs/terragrunt.hcl
+    chown -R "$(lab_user):" /lab/platform /lab/ci
+    sudo -u "$(lab_user)" -H bash -c 'cd /lab/platform && terragrunt run --all --non-interactive -- apply -auto-approve -no-color' >/dev/null 2>&1

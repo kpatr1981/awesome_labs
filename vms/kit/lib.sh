@@ -347,6 +347,8 @@ WRAP
 # Every AWS call goes to Moto: the wrappers always set AWS_ENDPOINT_URL to it, so a lab
 # can never reach real AWS. Credentials default to Moto's dummies; set AWS_* to override.
 # S3 Control puts the account id in front of the host, hence the extra hosts entry.
+# Terragrunt's automatic provider cache lives in the container's HOME, which is gone after
+# each run, so it's turned off: providers are installed into each unit's .terraform.
 tf_aws_start() {
   moto_start || return 1
   local t
@@ -357,8 +359,9 @@ tf_aws_start() {
 wd=\$PWD
 case "\$wd/" in /lab/*) ;; *) wd=/lab ;; esac
 envs=(-e AWS_ENDPOINT_URL=http://localhost:5000 -e AWS_ACCESS_KEY_ID=\${AWS_ACCESS_KEY_ID:-test}
-      -e AWS_SECRET_ACCESS_KEY=\${AWS_SECRET_ACCESS_KEY:-test} -e AWS_REGION=\${AWS_REGION:-us-east-1})
-while IFS= read -r v; do envs+=(-e "\$v"); done < <(compgen -e | grep -E '^(TF_|TG_|AWS_|PG)' | grep -vxE 'TF_CLI_CONFIG_FILE|AWS_ENDPOINT_URL|AWS_ACCESS_KEY_ID|AWS_SECRET_ACCESS_KEY|AWS_REGION')
+      -e AWS_SECRET_ACCESS_KEY=\${AWS_SECRET_ACCESS_KEY:-test} -e AWS_REGION=\${AWS_REGION:-us-east-1}
+      -e TG_NO_AUTO_PROVIDER_CACHE_DIR=true)
+while IFS= read -r v; do envs+=(-e "\$v"); done < <(compgen -e | grep -E '^(TF_|TG_|AWS_|PG)' | grep -vxE 'TF_CLI_CONFIG_FILE|AWS_ENDPOINT_URL|AWS_ACCESS_KEY_ID|AWS_SECRET_ACCESS_KEY|AWS_REGION|TG_NO_AUTO_PROVIDER_CACHE_DIR')
 tty=()
 [ -t 0 ] && [ -t 1 ] && tty=(-t)
 exec docker run --rm -i "\${tty[@]}" --network host --init --add-host 123456789012.localhost:127.0.0.1 \\

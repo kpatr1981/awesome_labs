@@ -8,7 +8,7 @@ what to consolidate. The target doesn't lower the bar: a lab should carry a real
 scenario and teach a concept. The parts of this list that the existing exercises don't cover
 are not started.
 
-Exercise counts (<!-- count:total -->1,697<!-- /count --> total):
+Exercise counts (<!-- count:total -->1,704<!-- /count --> total):
 
 | Topic | Exercises | Target | Track | Module files |
 |---|---|---|---|---|
@@ -23,7 +23,7 @@ Exercise counts (<!-- count:total -->1,697<!-- /count --> total):
 | Programming | <!-- count:programming -->86<!-- /count --> | 250 | `programming` | `exercises/programming/` |
 | Data science | <!-- count:datascience -->83<!-- /count --> | 250 | `datascience` | `exercises/datascience/` |
 | Git | <!-- count:git -->255<!-- /count --> | 250 | `git` | `exercises/git/` |
-| Terraform | <!-- count:terraform -->110<!-- /count --> | 250 | `terraform` | `exercises/terraform/` |
+| Terraform | <!-- count:terraform -->117<!-- /count --> | 250 | `terraform` | `exercises/terraform/` |
 | Ansible | <!-- count:ansible -->89<!-- /count --> | 250 | `ansible` | `exercises/ansible/` |
 | Algorithms | <!-- count:algorithms -->70<!-- /count --> | 250 | `algorithms` | `exercises/algorithms/` |
 
@@ -345,9 +345,9 @@ then GitOps for Kubernetes, then Git LFS.
 | **Remote state backends with locking** | Done in `exercises/terraform/09-remote-state.yaml` (tf-104..110): S3 with `use_lockfile`, migrate, stale locks, partial config, versioned recovery, the `pg` backend, a shared key, and a capstone | | |
 | **Provider aliases** | Done in `exercises/terraform/08-aws.yaml` (tf-093..103) | | |
 | **Ephemeral values and write-only arguments** | Done in `exercises/terraform/08-aws.yaml` (tf-093..103) | | |
-| **OpenTofu differences** | Migrate a configuration both ways, state encryption, the registry and lock file differences | Docker VM | See *OpenTofu against Moto* |
-| **Policy checks on plans** | | | Already queued: *Policy as code (OPA/Conftest)* in *Next round* |
-| **Terragrunt** | Keep backend and provider settings in one place, `dependency` blocks between stacks, `run-all` ordering | Docker VM; pinned image | |
+| **OpenTofu differences** | Done in `exercises/terraform/10-opentofu-terragrunt-policy.yaml` (tf-111..117) | | |
+| **Policy checks on plans** | Done in `exercises/terraform/10-opentofu-terragrunt-policy.yaml` (tf-111..117) | | |
+| **Terragrunt** | Done in `exercises/terraform/10-opentofu-terragrunt-policy.yaml` (tf-111..117) | | |
 | **Plan and apply from pull requests** | An Atlantis-style flow on Gitea: plan on a pull request, apply on merge, a locked workspace | Docker VM; Gitea | Shares Gitea with *CI/CD & GitOps* (Cloud & platform) |
 
 ### Kubernetes gaps
@@ -1149,7 +1149,6 @@ infrastructure and build on the networking and Terraform modules.
 | Idea | The lab | Runs on | Builds on |
 |---|---|---|---|
 | **SSH tunnels & pivoting** | Reach a database two hops away with `-L`, `-R`, `-D` and `ProxyJump`, then lock the jump host down (`PermitOpen`, `AllowTcpForwarding`) | Docker or offsec VM; namespaces or containers as hosts | Networking essentials |
-| **Policy as code (OPA/Conftest)** | Write Rego that blocks a Terraform plan with a public bucket or an unpinned image, then debug a rule that matches nothing | Docker VM; pinned `conftest`/`opa` image | Terraform in automation (JSON plans) |
 | **Purging secrets from Git** | gitleaks finds a key in history; remove it with `git filter-repo`, force-push to a bare remote, and prove no ref, tag or reflog still holds it | Docker VM | Git recovery & plumbing |
 | **Linkerd service mesh** | Turn on mTLS between two apps, find the pod without its proxy, add retries and timeouts. Much lighter than Istio (see *Left out*), but **test the memory on the nodes first** | k8s lab | Services & DNS |
 | **Cluster backup with Velero** | Back up a namespace, delete it, restore it, then find why the volume data didn't come back | k8s lab + MinIO | The MinIO labs |
