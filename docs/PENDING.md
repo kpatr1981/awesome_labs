@@ -29,6 +29,7 @@ Exercise counts (<!-- count:total -->1,679<!-- /count --> total):
 
 - [Suggested order](#suggested-order)
 - [Deepen every module](#deepen-every-module)
+- [Gaps in Kubernetes, Terraform and Git](#gaps-in-kubernetes-terraform-and-git)
 - [Shared lab foundations](#shared-lab-foundations)
 - [Linux & systems](#linux--systems)
 - [Networking](#networking)
@@ -320,6 +321,57 @@ Tracks still under 250 after that reach it with new modules on topics they don't
 | Dynamic programming | 11 | 15 | 0 / 1 / 4 |
 | Strings, greedy & maths | 11 | 15 | 0 / 3 / 3 |
 | Recursion & backtracking | 15 | 15 | 2 / 0 / 0 |
+
+## Gaps in Kubernetes, Terraform and Git
+
+Added 2026-11-21 after a coverage review of the three tracks. Not started. Where an idea
+already has a row elsewhere in this file, the row here points to it rather than repeating it.
+
+- **Git** is close to complete: everything from first commits to plumbing, hooks, signing and
+  hosting. The gaps are small.
+- **Kubernetes** has the core done (all of CKA and CKAD, plus Helm, cert-manager, Gateway
+  API and BGP). What's missing is the tooling most production clusters run on top.
+- **Terraform** is the furthest from done: every exercise uses local or Docker providers, while
+  real Terraform work is mostly cloud infrastructure and shared remote state.
+
+Suggested order: Terraform's AWS provider and remote backends first (the biggest real-world gap),
+then GitOps for Kubernetes, then Git LFS.
+
+### Terraform gaps
+
+| Gap | The lab | Runs on | Notes |
+|---|---|---|---|
+| **The AWS provider against Moto** | A VPC with subnets and security groups, an S3 bucket with an IAM policy, a plan that fails on a missing permission, drift after a change in the "console" (the `aws` CLI) | Docker VM; Moto | Needs a provider mirror image with `hashicorp/aws` (~600 MB, see the Terraform track's infra notes). Moto's limits are under *AWS CLI notes*. The *OpenTofu against Moto* row (Shared lab foundations) builds on it |
+| **Remote state backends with locking** | Move local state to S3 on Moto with `init -migrate-state`; S3's own lock file (`use_lockfile`, since Terraform 1.10; the DynamoDB table is deprecated); the `pg` backend on Postgres; a lock left by a killed job and when `force-unlock` is safe; partial backend config per environment | Docker VM; Moto, Postgres | Today's state module only uses the `local` backend |
+| **Provider aliases** | Two regions or accounts in one configuration, passing aliased providers into a module (`configuration_aliases`), the "provider configuration not present" error after removing one | Docker VM; Moto, or two Docker hosts as a local stand-in | |
+| **Ephemeral values and write-only arguments** | Ephemeral variables and resources, `*_wo` arguments that keep a password out of the state, and proving it with `terraform show -json` | Docker VM | Terraform 1.10/1.11 features; one exercise touches ephemeral values so far |
+| **OpenTofu differences** | Migrate a configuration both ways, state encryption, the registry and lock file differences | Docker VM | See *OpenTofu against Moto* |
+| **Policy checks on plans** | | | Already queued: *Policy as code (OPA/Conftest)* in *Next round* |
+| **Terragrunt** | Keep backend and provider settings in one place, `dependency` blocks between stacks, `run-all` ordering | Docker VM; pinned image | |
+| **Plan and apply from pull requests** | An Atlantis-style flow on Gitea: plan on a pull request, apply on merge, a locked workspace | Docker VM; Gitea | Shares Gitea with *CI/CD & GitOps* (Cloud & platform) |
+
+### Kubernetes gaps
+
+| Gap | The lab | Runs on | Notes |
+|---|---|---|---|
+| **GitOps with Argo CD or Flux** | Sync an app from a Git repository, drift that self-heals, a sync wave that hangs, an app-of-apps, a Secret that can't live in Git | k8s lab; Gitea | The biggest Kubernetes gap. See *CI/CD & GitOps* (Cloud & platform). Argo CD needs a memory test on these nodes first; Flux is lighter |
+| **Prometheus and Grafana in the cluster** | Prometheus with kube-state-metrics, a ServiceMonitor that scrapes nothing, an alert that never fires, a Grafana dashboard with no data | k8s lab; may need more memory | See *Observability* (Cloud & platform) and *Prometheus and alerting* (Shared lab foundations). kube-prometheus-stack is probably too heavy; plain Prometheus first |
+| **Policy engines** | Kyverno validate, mutate and generate rules, audit vs enforce, a policy exception; or Gatekeeper constraint templates | k8s lab | Built-in CEL policies are covered already; *Supply chain* (Security) mentions Kyverno |
+| **CKS-level security** | AppArmor profiles on pods, custom seccomp profiles from the kubelet's directory, Falco catching a shell in a container, cosign-signed images with signature checks at admission, Trivy scans, kube-bench findings | k8s lab | seccomp has two exercises so far. See *Supply chain* (Security) |
+| **Autoscaling beyond the HPA** | VPA recommendations, an HPA on a custom metric (prometheus-adapter), scaling from zero | k8s lab | KEDA already has a row in *Even more ideas* |
+| **Volume snapshots and expansion** | Snapshot a PVC, restore it to a new claim, clone a volume, grow one that's full | k8s lab; csi-driver-host-path | local-path supports neither, so this needs a CSI driver |
+| **Secrets from outside the cluster** | External Secrets Operator syncing from Vault, a sync that silently stopped; or Sealed Secrets | k8s lab; Vault | See *Secrets management* (Security) |
+| **Write your own controller** | A small operator with controller-runtime (Go) or kopf (Python): the reconcile loop, finalizers, status conditions, a controller that hot-loops | k8s lab | CRDs are covered; nothing writes a controller yet |
+| **Already queued** | | | *Linkerd service mesh* and *Cluster backup with Velero* in *Next round*; *Canary releases with Argo Rollouts* in *Even more ideas* |
+| **Smaller** | kube-proxy in IPVS or nftables mode, dual-stack Services | k8s lab | |
+
+### Git gaps
+
+| Gap | The lab | Runs on | Notes |
+|---|---|---|---|
+| **Git LFS** | Track binaries, move existing ones out of history (`git lfs migrate import`), pointer files checked out instead of content, file locking | Docker VM; a local LFS server (Gitea) | No LFS exercises yet |
+| **Credential helpers and HTTPS auth** | `credential.helper` cache and store, a helper per host, an expired token that keeps being reused, `credential.useHttpPath` | Docker VM; `git http-backend` behind nginx basic auth | The hosting module has a smart-HTTP server to build on |
+| **Pull-request workflows** | Pull requests, CODEOWNERS, protected branches, required reviews and status checks, offline on Gitea | Docker VM; Gitea | Hosting-platform features, not Git itself; shares Gitea with the CI/CD labs |
 
 ## Shared lab foundations
 
