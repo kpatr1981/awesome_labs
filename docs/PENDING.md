@@ -8,7 +8,7 @@ what to consolidate. The target doesn't lower the bar: a lab should carry a real
 scenario and teach a concept. The parts of this list that the existing exercises don't cover
 are not started.
 
-Exercise counts (<!-- count:total -->1,690<!-- /count --> total):
+Exercise counts (<!-- count:total -->1,697<!-- /count --> total):
 
 | Topic | Exercises | Target | Track | Module files |
 |---|---|---|---|---|
@@ -23,7 +23,7 @@ Exercise counts (<!-- count:total -->1,690<!-- /count --> total):
 | Programming | <!-- count:programming -->86<!-- /count --> | 250 | `programming` | `exercises/programming/` |
 | Data science | <!-- count:datascience -->83<!-- /count --> | 250 | `datascience` | `exercises/datascience/` |
 | Git | <!-- count:git -->255<!-- /count --> | 250 | `git` | `exercises/git/` |
-| Terraform | <!-- count:terraform -->103<!-- /count --> | 250 | `terraform` | `exercises/terraform/` |
+| Terraform | <!-- count:terraform -->110<!-- /count --> | 250 | `terraform` | `exercises/terraform/` |
 | Ansible | <!-- count:ansible -->89<!-- /count --> | 250 | `ansible` | `exercises/ansible/` |
 | Algorithms | <!-- count:algorithms -->70<!-- /count --> | 250 | `algorithms` | `exercises/algorithms/` |
 
@@ -342,7 +342,7 @@ then GitOps for Kubernetes, then Git LFS.
 | Gap | The lab | Runs on | Notes |
 |---|---|---|---|
 | **The AWS provider against Moto** | Done in `exercises/terraform/08-aws.yaml` (tf-093..103) | | |
-| **Remote state backends with locking** | Move local state to S3 on Moto with `init -migrate-state`; S3's own lock file (`use_lockfile`, since Terraform 1.10; the DynamoDB table is deprecated); the `pg` backend on Postgres; a lock left by a killed job and when `force-unlock` is safe; partial backend config per environment | Docker VM; Moto, Postgres | Today's state module only uses the `local` backend |
+| **Remote state backends with locking** | Done in `exercises/terraform/09-remote-state.yaml` (tf-104..110): S3 with `use_lockfile`, migrate, stale locks, partial config, versioned recovery, the `pg` backend, a shared key, and a capstone | | |
 | **Provider aliases** | Done in `exercises/terraform/08-aws.yaml` (tf-093..103) | | |
 | **Ephemeral values and write-only arguments** | Done in `exercises/terraform/08-aws.yaml` (tf-093..103) | | |
 | **OpenTofu differences** | Migrate a configuration both ways, state encryption, the registry and lock file differences | Docker VM | See *OpenTofu against Moto* |

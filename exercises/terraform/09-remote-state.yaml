@@ -1,0 +1,1055 @@
+track: terraform
+module: Remote state & locking
+profile: docker
+order: 9
+exercises:
+
+# ===== Intermediate =====
+
+- id: tf-104
+  title: Move local state into S3
+  difficulty: 2
+  kind: build
+  tags: [terraform, backend, s3, remote-state, migrate-state, use_lockfile]
+  tutorial: |
+    **What you're learning.** Why teams keep state in a **remote backend**, how to configure the **S3 backend** with locking, and how to move existing local state into it without losing anything.
+
+    ### Why remote state
+
+    With the default `local` backend, `terraform.tfstate` sits next to the code on one machine. As soon as two people (or a person and CI) run Terraform, that breaks: each has a different copy, and nothing stops two applies running at once. A **remote backend** keeps one shared copy, and **locks** it while someone works.
+
+    ```
+    laptop ─┐
+            ├─► S3 bucket: acme-tf/app/terraform.tfstate   (+ .tflock while a run holds it)
+    CI ─────┘
+    ```
+
+    ### The S3 backend
+
+    ```hcl
+    terraform {
+      backend "s3" {
+        bucket         = "example-tf-state"
+        key            = "billing/terraform.tfstate"   # the object's path in the bucket
+        region         = "eu-central-1"
+        use_lockfile   = true                          # lock with a .tflock object next to the state
+        use_path_style = true                          # emulator only, as for the provider
+      }
+    }
+    ```
+    - `use_lockfile` (Terraform 1.10+) locks with S3 itself. Older setups used a DynamoDB table (`dynamodb_table`), which is now deprecated.
+    - A backend block **can't use variables**. Its values are fixed, or passed at `init` time (see tf-106).
+    - The state bucket should have **versioning** on, so every old state can be recovered (tf-107).
+
+    ### Moving existing state
+
+    Changing the backend needs `terraform init` again. Terraform notices the old state and offers to copy it:
+
+    ```bash
+    terraform init -migrate-state
+    ```
+    ```text
+    Initializing the backend...
+    Do you want to copy existing state to the new backend?
+      Enter a value: yes
+    Successfully configured the backend "s3"!
+    ```
+    ```bash
+    aws s3 ls s3://example-tf-state --recursive
+    terraform state list        # now reads from S3
+    terraform plan              # still "No changes": same resources, new home
+    ```
+
+    ### Common mistakes
+
+    - `terraform init -reconfigure`: it **ignores** the old state, and the next plan wants to create everything again.
+    - A state bucket without versioning. One bad push and the history is gone.
+    - Committing `terraform.tfstate` to Git "as a backup". It holds secrets, and it goes stale immediately.
+
+    ### Check your work
+
+    The state object is in the bucket, `terraform state list` still shows every resource, and the plan is clean.
+  scenario: |
+    **`/lab/app`** has been applied with local state on one engineer's machine. The team
+    created a versioned state bucket, **`acme-tfstate`**.
+
+    Move the project's state to that bucket, at key **`app/terraform.tfstate`**, with S3
+    locking (`use_lockfile`), keeping every resource. Nothing may be re-created.
+  hints:
+    - "Add `backend \"s3\" { bucket = \"acme-tfstate\"  key = \"app/terraform.tfstate\"  region = \"us-east-1\"  use_lockfile = true  use_path_style = true }` inside the `terraform {}` block."
+    - "`terraform init -migrate-state` copies the existing state across. `-reconfigure` would not."
+  solution: |
+    ```bash
+    cd /lab/app
+    # in the terraform {} block of main.tf:
+    #   backend "s3" {
+    #     bucket         = "acme-tfstate"
+    #     key            = "app/terraform.tfstate"
+    #     region         = "us-east-1"
+    #     use_lockfile   = true
+    #     use_path_style = true
+    #   }
+    terraform init -migrate-state
+    aws s3 ls s3://acme-tfstate --recursive
+    terraform plan
+    ```
+  setup: |
+    tf_aws_start
+    rm -rf /lab/app
+    aws s3api create-bucket --bucket acme-tfstate >/dev/null
+    aws s3api put-bucket-versioning --bucket acme-tfstate --versioning-configuration Status=Enabled
+    lab_file /lab/app/main.tf <<'EOF'
+    terraform {
+      required_providers {
+        aws = {
+          source  = "hashicorp/aws"
+          version = "6.72.0"
+        }
+      }
+    }
+
+    provider "aws" {
+      region            = "us-east-1"
+      s3_use_path_style = true
+    }
+
+    resource "aws_iam_user" "worker" {
+      for_each = toset(["ingest", "export", "report"])
+      name     = "app-${each.key}"
+    }
+
+    resource "aws_s3_bucket" "data" {
+      bucket = "acme-app-data"
+    }
+    EOF
+    tf_as_user /lab/app init -input=false -no-color >/dev/null
+    tf_as_user /lab/app apply -auto-approve -input=false -no-color >/dev/null
+    aws iam get-user --user-name app-ingest --query User.UserId --output text > "$KL_STATE/uid"
+  check: |
+    st=$(mktemp); tf_s3_state acme-tfstate app/terraform.tfstate >"$st"
+    check "the state is in s3://acme-tfstate/app/terraform.tfstate" '[ -s "$st" ]'
+    check_eq "it holds every resource" "$(tf_addrs "$st" | paste -sd, -)" 'aws_iam_user.worker["export"],aws_iam_user.worker["ingest"],aws_iam_user.worker["report"],aws_s3_bucket.data'
+    be=/lab/app/.terraform/terraform.tfstate
+    check_eq "the project uses the s3 backend" "$(jq -r '.backend.type // empty' $be 2>/dev/null)" s3
+    check_eq "with S3 locking" "$(jq -r '.backend.config.use_lockfile // empty' $be 2>/dev/null)" true
+    check_eq "nothing was re-created" "$(aws iam get-user --user-name app-ingest --query User.UserId --output text 2>/dev/null)" "$(cat $KL_STATE/uid)"
+    check "terraform plan shows no changes" '[ -s "$st" ] && tf_clean /lab/app'
+    rm -f "$st"
+  solve: |
+    cd /lab/app
+    sed -i '/^  required_providers {/i\  backend "s3" {\n    bucket         = "acme-tfstate"\n    key            = "app/terraform.tfstate"\n    region         = "us-east-1"\n    use_lockfile   = true\n    use_path_style = true\n  }\n' main.tf
+    terraform init -migrate-state -force-copy -input=false -no-color >/dev/null
+
+- id: tf-105
+  title: "Error acquiring the state lock: the job that died"
+  difficulty: 3
+  kind: fix
+  tags: [terraform, backend, s3, lock, force-unlock, ci]
+  tutorial: |
+    **What you're learning.** What a state lock is, how to read who holds one, how to tell a **stale** lock from a live one, and how to release it safely with `force-unlock`.
+
+    ### Locks
+
+    Every command that may write state (`plan`, `apply`, `import`, `state mv`…) takes the lock first and releases it at the end. With `use_lockfile`, the lock is an object next to the state: `KEY.tflock`. If the process is **killed** (a CI runner shut down, a laptop lid closed, `kill -9`), it never releases it, and everyone else is locked out:
+
+    ```text
+    Error: Error acquiring the state lock
+
+    Error message: operation error S3: PutObject, https response error StatusCode: 412 …
+    Lock Info:
+      ID:        6f1c2a9e-3b7d-4e21-9c55-0d8a7e1f4b32
+      Path:      example-tf-state/billing/terraform.tfstate
+      Operation: OperationTypeApply
+      Who:       runner@ci-worker-3
+      Version:   1.16.7
+      Created:   2026-11-21 03:12:44.103 +0000 UTC
+    ```
+    **Who**, **Operation** and **Created** say which run holds it.
+
+    ### Is it safe to unlock?
+
+    Unlocking while the holder is **still running** lets two applies write the state at once, which is how state gets corrupted. Before unlocking:
+
+    1. Find the run named in **Who** / **Created** (CI history, the person).
+    2. Make sure it is **finished or dead**, not just slow.
+    3. Only then release the lock, by its ID:
+
+    ```bash
+    terraform force-unlock 6f1c2a9e-3b7d-4e21-9c55-0d8a7e1f4b32
+    ```
+    ```text
+    Do you really want to force-unlock?
+      Enter a value: yes
+    Terraform state has been successfully unlocked!
+    ```
+
+    `-lock-timeout=5m` makes a command **wait** for a lock instead of failing at once, which is the right setting for CI jobs that queue behind each other.
+
+    ### Commands you'll use
+
+    ```bash
+    terraform plan                     # shows the Lock Info
+    aws s3 ls s3://example-tf-state/billing/
+    aws s3 cp s3://example-tf-state/billing/terraform.tfstate.tflock - | jq .
+    ```
+
+    ### Common mistakes
+
+    - `-lock=false` to "get past it". That skips locking for **your** run, and leaves the stale lock for everyone else.
+    - Deleting the `.tflock` object by hand. It works, but `force-unlock` checks the ID, so you can't remove someone else's newer lock by accident.
+    - Unlocking a lock whose job is still running.
+
+    ### Check your work
+
+    `terraform plan` runs again, and the state still holds every resource.
+  scenario: |
+    Last night's CI job for **`/lab/billing`** was killed in the middle of an apply. Since
+    then every run fails with **`Error acquiring the state lock`**.
+
+    The CI log of that job is in **`/lab/ci/job-4711.log`**. Confirm that the lock belongs to
+    that dead job, then release it so `terraform plan` works again. Don't disable locking.
+  hints:
+    - "`terraform plan` prints the Lock Info. Compare its Who, Created and ID with the job log."
+    - "`terraform force-unlock LOCK_ID` releases it."
+  solution: |
+    ```bash
+    cd /lab/billing
+    terraform plan                # Error acquiring the state lock … ID: <id> Who: …
+    cat /lab/ci/job-4711.log      # the job that held it was killed
+    terraform force-unlock <id>
+    terraform plan
+    ```
+  setup: |
+    tf_aws_start
+    rm -rf /lab/billing /lab/ci
+    aws s3api create-bucket --bucket acme-tfstate >/dev/null
+    aws s3api put-bucket-versioning --bucket acme-tfstate --versioning-configuration Status=Enabled
+    lab_file /lab/billing/main.tf <<'EOF'
+    terraform {
+      backend "s3" {
+        bucket         = "acme-tfstate"
+        key            = "billing/terraform.tfstate"
+        region         = "us-east-1"
+        use_lockfile   = true
+        use_path_style = true
+      }
+      required_providers {
+        aws = {
+          source  = "hashicorp/aws"
+          version = "6.72.0"
+        }
+        time = {
+          source  = "hashicorp/time"
+          version = "0.14.2"
+        }
+      }
+    }
+
+    provider "aws" {
+      region            = "us-east-1"
+      s3_use_path_style = true
+    }
+
+    resource "aws_iam_user" "invoicer" {
+      name = "billing-invoicer"
+    }
+
+    variable "wait" {
+      type    = string
+      default = "1s"
+    }
+
+    resource "time_sleep" "settle" {
+      create_duration = var.wait
+      triggers        = { wait = var.wait }
+    }
+    EOF
+    tf_as_user /lab/billing init -input=false -no-color >/dev/null
+    tf_as_user /lab/billing apply -auto-approve -input=false -no-color >/dev/null
+    # the "CI job": a slow apply, killed half-way, leaving its lock behind
+    ( tf_as_user /lab/billing apply -auto-approve -input=false -no-color -var wait=10m >/dev/null 2>&1 & )
+    eventually 60 'aws s3api head-object --bucket acme-tfstate --key billing/terraform.tfstate.tflock >/dev/null 2>&1'
+    sleep 2
+    docker ps -q --filter ancestor=kl-terraform-aws:1 | xargs -r docker kill >/dev/null 2>&1
+    sleep 1
+    aws s3 cp s3://acme-tfstate/billing/terraform.tfstate.tflock - 2>/dev/null > "$KL_STATE/lock.json"
+    id=$(jq -r .ID "$KL_STATE/lock.json"); who=$(jq -r .Who "$KL_STATE/lock.json"); at=$(jq -r .Created "$KL_STATE/lock.json")
+    lab_file /lab/ci/job-4711.log <<EOF
+    [job 4711] runner: $who
+    [job 4711] $at  terraform apply -auto-approve -var wait=10m
+    [job 4711] Acquiring state lock. This may take a few moments...
+    [job 4711] time_sleep.settle: Creating...
+    [job 4711] time_sleep.settle: Still creating... [10s elapsed]
+    [job 4711] ERROR: runner lost (node drained); job killed with SIGKILL
+    EOF
+    tf_s3_state acme-tfstate billing/terraform.tfstate | jq -c '[.serial, .lineage]' > "$KL_STATE/serial"
+  check: |
+    check_not "the stale lock is gone" 'aws s3api head-object --bucket acme-tfstate --key billing/terraform.tfstate.tflock'
+    st=$(mktemp); tf_s3_state acme-tfstate billing/terraform.tfstate >"$st"
+    check "the state still holds the IAM user" 'tf_has "$st" aws_iam_user.invoicer'
+    check_eq "the backend still locks (use_lockfile)" "$(grep -Eo 'use_lockfile *= *[a-z]+' /lab/billing/main.tf | tr -d ' ')" "use_lockfile=true"
+    check "terraform plan runs and takes the lock" '! aws s3api head-object --bucket acme-tfstate --key billing/terraform.tfstate.tflock >/dev/null 2>&1 && (cd /lab/billing && terraform plan -input=false -no-color -lock-timeout=5s >/dev/null 2>&1)'
+    rm -f "$st"
+  solve: |
+    cd /lab/billing
+    terraform force-unlock -force "$(jq -r .ID "$KL_STATE/lock.json")" >/dev/null
+
+- id: tf-106
+  title: One backend block, settings per environment
+  difficulty: 3
+  kind: build
+  tags: [terraform, backend, s3, partial-configuration, tfbackend, environments]
+  tutorial: |
+    **What you're learning.** **Partial backend configuration**: leaving settings out of the `backend` block and passing them at `init`, so one codebase keeps a separate state per environment.
+
+    ### Why
+
+    A `backend` block can't use variables, so staging and production can't simply "pass a different key". The usual answer is to leave the varying settings out, and pass them at `init` time from a small file per environment:
+
+    ```hcl
+    terraform {
+      backend "s3" {}             # everything comes from -backend-config
+    }
+    ```
+    ```hcl
+    # env/qa.s3.tfbackend
+    bucket         = "example-tf-state"
+    key            = "search/qa/terraform.tfstate"
+    region         = "eu-central-1"
+    use_lockfile   = true
+    use_path_style = true
+    ```
+    ```bash
+    terraform init -backend-config=env/qa.s3.tfbackend
+    terraform apply -var-file=env/qa.tfvars
+    ```
+    `.tfbackend` is the conventional extension. The file holds plain `key = value` lines, no block.
+
+    ### Switching environments
+
+    The working directory remembers **one** backend. To work on another environment, initialise again, with `-reconfigure`:
+
+    ```bash
+    terraform init -reconfigure -backend-config=env/live.s3.tfbackend
+    terraform apply -var-file=env/live.tfvars
+    ```
+    `-reconfigure` means "use this backend and don't copy the old state into it". Here that's exactly right: each environment already has, or should start with, its own state. (In tf-104, `-migrate-state` was right, because the state had to move.)
+
+    ### Commands you'll use
+
+    ```bash
+    jq .backend.config .terraform/terraform.tfstate    # which backend this directory uses now
+    aws s3 ls s3://example-tf-state --recursive
+    ```
+
+    ### Common mistakes
+
+    - `-migrate-state` when switching environments: Terraform offers to copy staging's state into production's key.
+    - Forgetting `-reconfigure`: `init` stops with "Backend configuration changed".
+    - Applying production's `.tfvars` while still initialised for staging. Check `.terraform/terraform.tfstate` first. That's why pipelines always run `init` with the environment's file right before `plan`.
+
+    ### Check your work
+
+    Two state objects at two keys, each holding its environment's bucket.
+  scenario: |
+    **`/lab/uploads`** creates one S3 bucket, named after `var.env`. Both environments must
+    have **separate state** in the bucket `acme-tfstate`, from the **same code**:
+
+    | Environment | State key | Bucket it creates |
+    |---|---|---|
+    | staging | `uploads/staging/terraform.tfstate` | `acme-uploads-staging` |
+    | production | `uploads/production/terraform.tfstate` | `acme-uploads-production` |
+
+    The `backend "s3"` block is empty on purpose. Write **`env/staging.s3.tfbackend`** and
+    **`env/production.s3.tfbackend`** (with S3 locking), then deploy both environments,
+    using the `.tfvars` files in `env/`.
+  hints:
+    - "Each `.tfbackend` file has `bucket`, `key`, `region`, `use_lockfile` and `use_path_style` as plain `name = value` lines."
+    - "`terraform init -backend-config=env/staging.s3.tfbackend`, apply with `-var-file=env/staging.tfvars`, then `terraform init -reconfigure -backend-config=env/production.s3.tfbackend`."
+  solution: |
+    ```bash
+    cd /lab/uploads
+    for e in staging production; do
+      cat > env/$e.s3.tfbackend <<EOF
+    bucket         = "acme-tfstate"
+    key            = "uploads/$e/terraform.tfstate"
+    region         = "us-east-1"
+    use_lockfile   = true
+    use_path_style = true
+    EOF
+    done
+    terraform init -backend-config=env/staging.s3.tfbackend
+    terraform apply -var-file=env/staging.tfvars
+    terraform init -reconfigure -backend-config=env/production.s3.tfbackend
+    terraform apply -var-file=env/production.tfvars
+    aws s3 ls s3://acme-tfstate --recursive
+    ```
+  setup: |
+    tf_aws_start
+    rm -rf /lab/uploads
+    aws s3api create-bucket --bucket acme-tfstate >/dev/null
+    aws s3api put-bucket-versioning --bucket acme-tfstate --versioning-configuration Status=Enabled
+    lab_file /lab/uploads/main.tf <<'EOF'
+    terraform {
+      backend "s3" {}
+      required_providers {
+        aws = {
+          source  = "hashicorp/aws"
+          version = "6.72.0"
+        }
+      }
+    }
+
+    provider "aws" {
+      region            = "us-east-1"
+      s3_use_path_style = true
+    }
+
+    variable "env" {
+      type = string
+    }
+
+    resource "aws_s3_bucket" "uploads" {
+      bucket = "acme-uploads-${var.env}"
+    }
+    EOF
+    echo 'env = "staging"' | lab_file /lab/uploads/env/staging.tfvars
+    echo 'env = "production"' | lab_file /lab/uploads/env/production.tfvars
+  check: |
+    for e in staging production; do
+      st=$(mktemp); tf_s3_state acme-tfstate uploads/$e/terraform.tfstate >"$st"
+      check_eq "the $e state holds only bucket acme-uploads-$e" "$(tf_addrs "$st" | paste -sd, -) $(tf_get "$st" aws_s3_bucket.uploads bucket)" "aws_s3_bucket.uploads acme-uploads-$e"
+      check "bucket acme-uploads-$e exists" "aws s3api head-bucket --bucket acme-uploads-$e"
+      f=/lab/uploads/env/$e.s3.tfbackend
+      check "env/$e.s3.tfbackend points at that key, with S3 locking" "grep -Eq 'key *= *\"uploads/$e/terraform.tfstate\"' $f && grep -Eq 'use_lockfile *= *true' $f"
+      rm -f "$st"
+    done
+    check "the backend block is still empty (settings come from the files)" 'grep -Eq "backend \"s3\" *\{ *\}" /lab/uploads/main.tf'
+    check_not "no state was left in the old default location" '[ -s /lab/uploads/terraform.tfstate ]'
+  solve: |
+    cd /lab/uploads
+    for e in staging production; do
+      printf 'bucket         = "acme-tfstate"\nkey            = "uploads/%s/terraform.tfstate"\nregion         = "us-east-1"\nuse_lockfile   = true\nuse_path_style = true\n' "$e" > env/$e.s3.tfbackend
+    done
+    terraform init -input=false -no-color -backend-config=env/staging.s3.tfbackend >/dev/null
+    terraform apply -auto-approve -input=false -no-color -var-file=env/staging.tfvars >/dev/null
+    terraform init -reconfigure -input=false -no-color -backend-config=env/production.s3.tfbackend >/dev/null
+    terraform apply -auto-approve -input=false -no-color -var-file=env/production.tfvars >/dev/null
+
+- id: tf-107
+  title: Bring back yesterday's state from S3 versioning
+  difficulty: 3
+  kind: fix
+  tags: [terraform, backend, s3, versioning, state-push, recovery]
+  tutorial: |
+    **What you're learning.** How a versioned state bucket saves you after the state is damaged, and how to put an old version back with `terraform state push`.
+
+    ### What went wrong, typically
+
+    Someone runs `terraform state rm` on the wrong addresses, or pushes an empty state file. The real infrastructure is still there, but Terraform has "forgotten" it. The next plan wants to **create everything again**, which fails on name clashes or, worse, makes duplicates.
+
+    ### Versions to the rescue
+
+    With versioning on, S3 keeps every state Terraform ever wrote:
+
+    ```bash
+    aws s3api list-object-versions --bucket example-tf-state --prefix search/terraform.tfstate \
+      --query 'Versions[].[VersionId,LastModified,Size]' --output text
+    ```
+    ```text
+    3Yt0…   2026-11-21T09:40:12Z   212       ← the broken one (tiny: no resources)
+    9aKd…   2026-11-20T17:03:55Z   5873      ← the last good one
+    ```
+    ```bash
+    aws s3api get-object --bucket example-tf-state --key search/terraform.tfstate \
+      --version-id 9aKd… good.tfstate
+    jq '.serial, (.resources | length)' good.tfstate
+    ```
+
+    ### Putting it back
+
+    `terraform state push FILE` uploads a state file through the backend, taking the lock as usual. It refuses a file whose **serial** is lower than the current one, because that normally means someone's state is out of date:
+
+    ```text
+    Failed to write state: cannot overwrite existing state with serial 9 with a different state that has serial 7
+    ```
+    Here, going back is exactly the point, so `-force` is correct, **after** you've checked the file is the right one.
+
+    ```bash
+    terraform state push -force good.tfstate
+    terraform plan          # should be "No changes"
+    ```
+
+    ### Common mistakes
+
+    - "Fixing" it by applying: Terraform tries to create everything again.
+    - Restoring the newest version instead of the last **good** one. Check the resource count first.
+    - Copying the old object over the state key with `aws s3 cp`. It works, but skips the lock and Terraform's checks.
+
+    ### Check your work
+
+    `terraform state list` shows every resource, and `terraform plan` is clean.
+  scenario: |
+    This morning someone "cleaned up" the state of **`/lab/search`** (S3 backend, versioned
+    bucket `acme-tfstate`, key `search/terraform.tfstate`). Now `terraform plan` wants to
+    create resources that already exist.
+
+    Restore the last good state from the bucket's history, so the state holds every resource
+    again and `terraform plan` is clean. Don't create, import or delete any AWS resources.
+  hints:
+    - "`aws s3api list-object-versions --bucket acme-tfstate --prefix search/terraform.tfstate` lists every state ever written. Compare their sizes."
+    - "Download the good version with `get-object --version-id`, check it with `jq '.resources | length'`, then `terraform state push -force FILE`."
+  solution: |
+    ```bash
+    cd /lab/search
+    terraform plan                                   # wants to create 4 things that exist
+    aws s3api list-object-versions --bucket acme-tfstate --prefix search/terraform.tfstate \
+      --query 'Versions[].[VersionId,LastModified,Size]' --output text
+    aws s3api get-object --bucket acme-tfstate --key search/terraform.tfstate --version-id <good id> /lab/good.tfstate
+    jq '.resources | length' /lab/good.tfstate
+    terraform state push -force /lab/good.tfstate
+    terraform plan
+    ```
+  setup: |
+    tf_aws_start
+    rm -rf /lab/search /lab/good.tfstate
+    aws s3api create-bucket --bucket acme-tfstate >/dev/null
+    aws s3api put-bucket-versioning --bucket acme-tfstate --versioning-configuration Status=Enabled
+    lab_file /lab/search/main.tf <<'EOF'
+    terraform {
+      backend "s3" {
+        bucket         = "acme-tfstate"
+        key            = "search/terraform.tfstate"
+        region         = "us-east-1"
+        use_lockfile   = true
+        use_path_style = true
+      }
+      required_providers {
+        aws = {
+          source  = "hashicorp/aws"
+          version = "6.72.0"
+        }
+      }
+    }
+
+    provider "aws" {
+      region            = "us-east-1"
+      s3_use_path_style = true
+    }
+
+    resource "aws_s3_bucket" "index" {
+      bucket = "acme-search-index"
+    }
+
+    resource "aws_iam_user" "indexer" {
+      for_each = toset(["crawler", "ranker", "api"])
+      name     = "search-${each.key}"
+    }
+    EOF
+    tf_as_user /lab/search init -input=false -no-color >/dev/null
+    tf_as_user /lab/search apply -auto-approve -input=false -no-color >/dev/null
+    sleep 1
+    tf_as_user /lab/search state rm aws_s3_bucket.index 'aws_iam_user.indexer["crawler"]' 'aws_iam_user.indexer["ranker"]' 'aws_iam_user.indexer["api"]' >/dev/null
+    aws iam get-user --user-name search-api --query User.UserId --output text > "$KL_STATE/uid"
+  check: |
+    st=$(mktemp); tf_s3_state acme-tfstate search/terraform.tfstate >"$st"
+    check_eq "the state holds every resource again" "$(tf_addrs "$st" | paste -sd, -)" 'aws_iam_user.indexer["api"],aws_iam_user.indexer["crawler"],aws_iam_user.indexer["ranker"],aws_s3_bucket.index'
+    check_eq "the IAM users are the original ones" "$(aws iam get-user --user-name search-api --query User.UserId --output text 2>/dev/null)" "$(cat $KL_STATE/uid)"
+    check "terraform plan shows no changes" 'tf_has "$st" aws_s3_bucket.index && tf_clean /lab/search'
+    check_not "no import blocks were used" 'grep -Rqs "^import" /lab/search/*.tf'
+    rm -f "$st"
+  solve: |
+    cd /lab/search
+    v=$(aws s3api list-object-versions --bucket acme-tfstate --prefix search/terraform.tfstate --output json |
+      jq -r '[.Versions[] | select(.Key == "search/terraform.tfstate")] | sort_by(.LastModified) | reverse | .[1].VersionId')
+    aws s3api get-object --bucket acme-tfstate --key search/terraform.tfstate --version-id "$v" /lab/good.tfstate >/dev/null
+    terraform state push -force /lab/good.tfstate >/dev/null
+
+- id: tf-108
+  title: State in Postgres with the pg backend and workspaces
+  difficulty: 3
+  kind: build
+  tags: [terraform, backend, pg, postgres, workspaces, secrets]
+  tutorial: |
+    **What you're learning.** The **`pg` backend**, which keeps state in PostgreSQL, how **workspaces** map onto it, and how to keep the database password out of the code.
+
+    ### The pg backend
+
+    Not every team runs on a cloud with S3. The `pg` backend stores each workspace's state as a row in a Postgres table and locks with Postgres advisory locks. It's built into Terraform, with no extra provider.
+
+    ```hcl
+    terraform {
+      backend "pg" {
+        schema_name = "inventory"          # default: terraform_remote_state
+      }
+    }
+    ```
+    The connection string has a password in it, so **don't write it in the block**. The backend reads it from the environment instead:
+
+    ```bash
+    export PG_CONN_STR="postgres://tf:s3cret@db.example.test:5432/tfstate?sslmode=disable"
+    terraform init
+    ```
+    (In real life, use `sslmode=require` or stricter.)
+
+    ### Workspaces
+
+    A **workspace** is another named state for the same configuration and backend. `terraform.workspace` holds the current name, so resources can differ per workspace:
+
+    ```hcl
+    resource "aws_iam_user" "svc" {
+      name = "inventory-${terraform.workspace}"
+    }
+    ```
+    ```bash
+    terraform workspace new qa         # create and switch
+    terraform apply
+    terraform workspace select default
+    terraform workspace list
+    ```
+    ```text
+    * default
+      qa
+    ```
+
+    In Postgres, each workspace is one row:
+
+    ```bash
+    psql "$PG_CONN_STR" -c 'select id, name from inventory.states'
+    ```
+    ```text
+     id |  name
+    ----+---------
+      1 | default
+      2 | qa
+    ```
+
+    ### Common mistakes
+
+    - `conn_str = "postgres://user:password@…"` in the code: the password goes into Git.
+    - Forgetting which workspace is selected before `apply`. `terraform workspace show` tells you.
+    - Expecting each workspace to have its own backend settings. Workspaces share the backend; they only change the state's name.
+
+    ### Check your work
+
+    The `states` table has one row per workspace, and each workspace's IAM user exists.
+  scenario: |
+    The on-premises team has no S3, but it has Postgres. A database for Terraform state is
+    running on **`127.0.0.1:5433`** (database **`tfstate`**, user **`tf`**, password in
+    **`/lab/.pgpass-tf`**).
+
+    In **`/lab/inventory`**:
+
+    1. Use the **`pg` backend** with schema **`inventory`**. The password must **not** appear
+       in any `.tf` file: pass the connection string through the environment.
+    2. Deploy it in two workspaces, **`dev`** and **`prod`**. Each creates its own IAM user,
+       `inventory-dev` and `inventory-prod`.
+  hints:
+    - "`backend \"pg\" { schema_name = \"inventory\" }`, and `export PG_CONN_STR=\"postgres://tf:$(cat /lab/.pgpass-tf)@127.0.0.1:5433/tfstate?sslmode=disable\"`."
+    - "`terraform workspace new dev`, apply, then `terraform workspace new prod`, apply."
+  solution: |
+    ```bash
+    cd /lab/inventory
+    # in the terraform {} block:  backend "pg" { schema_name = "inventory" }
+    export PG_CONN_STR="postgres://tf:$(cat /lab/.pgpass-tf)@127.0.0.1:5433/tfstate?sslmode=disable"
+    terraform init
+    terraform workspace new dev  && terraform apply
+    terraform workspace new prod && terraform apply
+    terraform workspace list
+    ```
+  setup: |
+    tf_aws_start
+    rm -rf /lab/inventory
+    pw="tf-$(head -c6 /dev/urandom | od -An -tx1 | tr -d ' \n')"
+    printf '%s\n' "$pw" | lab_file /lab/.pgpass-tf 0600
+    docker rm -f kl-tfpg >/dev/null 2>&1 || true
+    docker run -d --name kl-tfpg -p 127.0.0.1:5433:5432 -e POSTGRES_USER=tf -e "POSTGRES_PASSWORD=$pw" -e POSTGRES_DB=tfstate postgres:16-alpine >/dev/null
+    eventually 60 "docker exec kl-tfpg psql -h 127.0.0.1 -U tf -d tfstate -c 'select 1'"
+    lab_file /lab/inventory/main.tf <<'EOF'
+    terraform {
+      required_providers {
+        aws = {
+          source  = "hashicorp/aws"
+          version = "6.72.0"
+        }
+      }
+    }
+
+    provider "aws" {
+      region            = "us-east-1"
+      s3_use_path_style = true
+    }
+
+    resource "aws_iam_user" "svc" {
+      name = "inventory-${terraform.workspace}"
+    }
+    EOF
+  check: |
+    pw=$(cat /lab/.pgpass-tf)
+    rows=$(docker exec kl-tfpg psql -h 127.0.0.1 -U tf -d tfstate -qAt -c 'select name from inventory.states order by name' 2>/dev/null | paste -sd, -)
+    check "the inventory schema holds the state (pg backend)" '[ -n "$rows" ]'
+    check "workspaces dev and prod are stored in it" '[[ ",$rows," == *",dev,"* && ",$rows," == *",prod,"* ]]'
+    for w in dev prod; do
+      check "IAM user inventory-$w exists" "aws iam get-user --user-name inventory-$w"
+      d=$(docker exec kl-tfpg psql -h 127.0.0.1 -U tf -d tfstate -qAt -c "select data from inventory.states where name = '$w'" 2>/dev/null)
+      check "the $w state manages inventory-$w" "jq -e '.resources[] | select(.type == \"aws_iam_user\") | .instances[0].attributes.name == \"inventory-$w\"' <<<'$d'"
+    done
+    check_eq "the backend is pg" "$(jq -r '.backend.type // empty' /lab/inventory/.terraform/terraform.tfstate 2>/dev/null)" pg
+    check_not "the password is not in any .tf file" 'grep -RqsF -- "$pw" /lab/inventory --include=*.tf'
+  solve: |
+    cd /lab/inventory
+    sed -i '/^  required_providers {/i\  backend "pg" {\n    schema_name = "inventory"\n  }\n' main.tf
+    export PG_CONN_STR="postgres://tf:$(cat /lab/.pgpass-tf)@127.0.0.1:5433/tfstate?sslmode=disable"
+    terraform init -input=false -no-color >/dev/null
+    terraform workspace new dev -no-color >/dev/null
+    terraform apply -auto-approve -input=false -no-color >/dev/null
+    terraform workspace new prod -no-color >/dev/null
+    terraform apply -auto-approve -input=false -no-color >/dev/null
+
+# ===== Advanced =====
+
+- id: tf-109
+  title: Two pipelines, one state key
+  difficulty: 4
+  kind: fix
+  tags: [terraform, backend, s3, state-key, import, route53, troubleshooting]
+  tutorial: |
+    **What you're learning.** What happens when two configurations share one state key, and how to separate them without re-creating anything.
+
+    ### The symptom
+
+    A state file belongs to **one** configuration. If two projects point at the same `bucket` and `key`, each one sees the other's resources in "its" state, and since they aren't in its code, it plans to **destroy** them:
+
+    ```text
+    # aws_vpc.core will be destroyed
+    # (because aws_vpc.core is not in configuration)
+    Plan: 2 to add, 0 to change, 1 to destroy.
+    ```
+    Whichever pipeline applied last "owns" the state. The other one's resources are in AWS, but in no state at all.
+
+    ### The way out
+
+    1. **Don't apply** either project until it's sorted.
+    2. Look at what the shared state holds now (`terraform state list`): it belongs to the project that applied last. That one keeps the key.
+    3. Give the other project its **own key**, and `terraform init -reconfigure` (not `-migrate-state`: the old key's state isn't its own).
+    4. **Import** that project's existing resources into its new, empty state (tf-099).
+
+    Import ids for the DNS resources used here:
+
+    | Resource | Import id | Example |
+    |---|---|---|
+    | `aws_route53_zone` | the zone id | `Z0123456789ABCDEF` |
+    | `aws_route53_record` | `ZONEID_NAME_TYPE` | `Z0123456789ABCDEF_db.corp.test_A` |
+
+    ```bash
+    aws route53 list-hosted-zones --query 'HostedZones[].[Id,Name]' --output text
+    aws route53 list-resource-record-sets --hosted-zone-id Z0123456789ABCDEF
+    ```
+    The zone id comes back as `/hostedzone/Z0123…`. Import uses only the part after the last `/`.
+
+    ### Common mistakes
+
+    - `-migrate-state` to the new key: you copy the *other* project's resources, and the plan still wants to destroy them.
+    - Applying "to see what happens": the VPC is deleted.
+    - Re-creating the DNS zone instead of importing it. A new zone gets new name servers, which breaks delegation.
+
+    ### Check your work
+
+    Each project has its own key, each state holds only its own resources, both plans are clean, and the VPC and zone ids haven't changed.
+  scenario: |
+    **`/lab/network`** (a VPC) and **`/lab/dns`** (a private DNS zone with a record) were
+    copied from the same template, and both keep their state at
+    **`acme-tfstate/shared/terraform.tfstate`**. The network pipeline applied last.
+
+    Now **`terraform plan` in `/lab/dns` wants to destroy the VPC**, and the DNS zone isn't in
+    any state.
+
+    Separate them: each project gets **its own state key**, holding only its own resources,
+    and both plans are clean. Nothing may be destroyed or re-created.
+  hints:
+    - "The shared state holds the VPC, so the network keeps the key. Change the key in /lab/dns/main.tf, then `terraform init -reconfigure`."
+    - "The dns state is now empty: import the zone (by zone id) and the record (`ZONEID_api.corp.internal_A`)."
+  solution: |
+    ```bash
+    cd /lab/dns
+    terraform state list                   # aws_vpc.core: not ours
+    sed -i 's|shared/terraform.tfstate|dns/terraform.tfstate|' main.tf
+    terraform init -reconfigure
+    z=$(aws route53 list-hosted-zones --query 'HostedZones[?Name==`corp.internal.`].Id' --output text | sed 's|.*/||')
+    cat > import.tf <<EOF
+    import {
+      to = aws_route53_zone.internal
+      id = "$z"
+    }
+    import {
+      to = aws_route53_record.api
+      id = "${z}_api.corp.internal_A"
+    }
+    EOF
+    terraform plan        # 2 to import, nothing else
+    terraform apply
+    cd /lab/network && terraform plan
+    ```
+  setup: |
+    tf_aws_start
+    rm -rf /lab/network /lab/dns /lab/.dns-seed
+    aws s3api create-bucket --bucket acme-tfstate >/dev/null
+    aws s3api put-bucket-versioning --bucket acme-tfstate --versioning-configuration Status=Enabled
+    hdr='terraform {
+      backend "s3" {
+        bucket         = "acme-tfstate"
+        key            = "shared/terraform.tfstate"
+        region         = "us-east-1"
+        use_lockfile   = true
+        use_path_style = true
+      }
+      required_providers {
+        aws = {
+          source  = "hashicorp/aws"
+          version = "6.72.0"
+        }
+      }
+    }
+
+    provider "aws" {
+      region            = "us-east-1"
+      s3_use_path_style = true
+    }
+    '
+    { printf '%s\n' "$hdr"; cat <<'EOF'
+    resource "aws_vpc" "core" {
+      cidr_block = "10.70.0.0/16"
+      tags       = { Name = "core" }
+    }
+    EOF
+    } | lab_file /lab/network/main.tf
+    dns='resource "aws_route53_zone" "internal" {
+      name = "corp.internal"
+    }
+
+    resource "aws_route53_record" "api" {
+      zone_id = aws_route53_zone.internal.zone_id
+      name    = "api.corp.internal"
+      type    = "A"
+      ttl     = 300
+      records = ["10.70.0.10"]
+    }
+    '
+    { printf '%s\n' "$hdr"; printf '%s' "$dns"; } | lab_file /lab/dns/main.tf
+    # the DNS pipeline ran first (into its own throw-away state here), the network one last
+    { printf '%s\n' "$hdr" | sed '/backend "s3"/,/^  }/d'; printf '%s' "$dns"; } | lab_file /lab/.dns-seed/main.tf
+    tf_as_user /lab/.dns-seed init -input=false -no-color >/dev/null
+    tf_as_user /lab/.dns-seed apply -auto-approve -input=false -no-color >/dev/null
+    rm -rf /lab/.dns-seed
+    tf_as_user /lab/network init -input=false -no-color >/dev/null
+    tf_as_user /lab/network apply -auto-approve -input=false -no-color >/dev/null
+    tf_as_user /lab/dns init -input=false -no-color >/dev/null
+    aws ec2 describe-vpcs --filters Name=tag:Name,Values=core --query 'Vpcs[0].VpcId' --output text > "$KL_STATE/vpc"
+    aws route53 list-hosted-zones --query 'HostedZones[0].Id' --output text > "$KL_STATE/zone"
+  check: |
+    key() { jq -r '.backend.config.key // empty' "$1/.terraform/terraform.tfstate" 2>/dev/null; }
+    nk=$(key /lab/network); dk=$(key /lab/dns)
+    check "the two projects use different state keys" '[ -n "$nk" ] && [ -n "$dk" ] && [ "$nk" != "$dk" ]'
+    ns=$(mktemp); ds=$(mktemp)
+    tf_s3_state acme-tfstate "${nk:-none}" >"$ns"; tf_s3_state acme-tfstate "${dk:-none}" >"$ds"
+    check_eq "the network state holds only the VPC" "$(tf_addrs "$ns" | paste -sd, -)" "aws_vpc.core"
+    check_eq "the dns state holds only the zone and the record" "$(tf_addrs "$ds" | paste -sd, -)" "aws_route53_record.api,aws_route53_zone.internal"
+    check_eq "the VPC is the original one" "$(aws ec2 describe-vpcs --filters Name=tag:Name,Values=core --query 'Vpcs[0].VpcId' --output text 2>/dev/null)" "$(cat $KL_STATE/vpc)"
+    check_eq "the zone is the original one" "$(aws route53 list-hosted-zones --query 'HostedZones[0].Id' --output text 2>/dev/null) $(aws route53 list-hosted-zones --query 'length(HostedZones)' --output text 2>/dev/null)" "$(cat $KL_STATE/zone) 1"
+    check "terraform plan in /lab/network shows no changes" 'tf_has "$ns" aws_vpc.core && tf_clean /lab/network'
+    check "terraform plan in /lab/dns shows no changes" 'tf_has "$ds" aws_route53_zone.internal && tf_clean /lab/dns'
+    rm -f "$ns" "$ds"
+  solve: |
+    cd /lab/dns
+    sed -i 's|shared/terraform.tfstate|dns/terraform.tfstate|' main.tf
+    terraform init -reconfigure -input=false -no-color >/dev/null
+    z=$(aws route53 list-hosted-zones --query 'HostedZones[0].Id' --output text | sed 's|.*/||')
+    printf 'import {\n  to = aws_route53_zone.internal\n  id = "%s"\n}\nimport {\n  to = aws_route53_record.api\n  id = "%s_api.corp.internal_A"\n}\n' "$z" "$z" > import.tf
+    terraform apply -auto-approve -input=false -no-color >/dev/null
+
+# ===== Capstone =====
+
+- id: tf-110
+  title: "Capstone: move the platform's state to S3"
+  difficulty: 5
+  kind: build
+  tags: [terraform, backend, s3, remote-state, terraform_remote_state, migrate-state, capstone]
+  tutorial: |
+    **What you're learning.** How to take a small platform from local state to a proper shared setup: a hardened state bucket, one key per stack, locking, and stacks that read each other's outputs from S3.
+
+    ### Order of work
+
+    1. **The state bucket first.** It can't keep its own state in itself. Create it with the CLI or a tiny separate configuration, with **versioning** on and **public access blocked**.
+    2. **Upstream stacks before downstream ones.** `app` reads `network`'s outputs, so move `network` first, and check it.
+    3. **Point the readers at the new place.** A `terraform_remote_state` data source has its own backend settings:
+
+    ```hcl
+    data "terraform_remote_state" "core" {
+      backend = "s3"
+      config = {
+        bucket         = "example-tf-state"
+        key            = "core/terraform.tfstate"
+        region         = "eu-central-1"
+        use_path_style = true
+      }
+    }
+
+    resource "aws_subnet" "jobs" {
+      vpc_id     = data.terraform_remote_state.core.outputs.vpc_id
+      cidr_block = "10.9.40.0/24"
+    }
+    ```
+    4. **Move each stack with `terraform init -migrate-state`** (tf-104), and check `terraform plan` is clean after each one.
+    5. **Clean up the local copies.** After a successful migration, delete leftover `terraform.tfstate` and `terraform.tfstate.backup` files, so nobody uses them by mistake.
+
+    | Step | Taught in |
+    |---|---|
+    | S3 backend, locking, migrate | tf-104 |
+    | versioned, private bucket | tf-095, tf-107 |
+    | `terraform_remote_state` | the Working with state module |
+
+    ### Common mistakes
+
+    - Moving `app` first, while it still reads `network`'s local state. It works today and breaks once that file is deleted.
+    - `-reconfigure` instead of `-migrate-state`: an empty state, and a plan that re-creates everything.
+    - Forgetting `use_lockfile`.
+
+    ### Check your work
+
+    `aws s3 ls s3://acme-platform-state --recursive` shows two state files, both stacks plan clean, and no local state files are left.
+  scenario: |
+    The platform in **`/lab/platform`** has two stacks with **local** state: **`network`**
+    (a VPC and a subnet) and **`app`** (a security group in that VPC, which reads network's
+    outputs from its local state file).
+
+    Move it to shared state:
+
+    1. A state bucket **`acme-platform-state`**, with **versioning** on and **all four public
+       access blocks** on.
+    2. `network`'s state at **`network/terraform.tfstate`** and `app`'s at
+       **`app/terraform.tfstate`** in it, both with **S3 locking**.
+    3. `app` reads network's outputs **from S3**.
+    4. No local state files left in either stack.
+
+    Nothing may be re-created, and both plans must be clean.
+  hints:
+    - "Create the bucket with the `aws` CLI: `create-bucket`, `put-bucket-versioning`, `put-public-access-block`."
+    - "Move network first (`backend \"s3\"` + `terraform init -migrate-state`), then change app's `terraform_remote_state` to `backend = \"s3\"` with bucket/key/region/use_path_style, then move app."
+    - "After both plans are clean, delete `terraform.tfstate` and `terraform.tfstate.backup` in both stacks."
+  solution: |
+    ```bash
+    aws s3api create-bucket --bucket acme-platform-state
+    aws s3api put-bucket-versioning --bucket acme-platform-state --versioning-configuration Status=Enabled
+    aws s3api put-public-access-block --bucket acme-platform-state --public-access-block-configuration \
+      BlockPublicAcls=true,IgnorePublicAcls=true,BlockPublicPolicy=true,RestrictPublicBuckets=true
+
+    cd /lab/platform/network
+    # add backend "s3" { bucket = "acme-platform-state"  key = "network/terraform.tfstate"
+    #                    region = "us-east-1"  use_lockfile = true  use_path_style = true }
+    terraform init -migrate-state && terraform plan
+
+    cd ../app
+    # data "terraform_remote_state" "network": backend = "s3",
+    #   config = { bucket = "acme-platform-state", key = "network/terraform.tfstate",
+    #              region = "us-east-1", use_path_style = true }
+    # and its own backend "s3" with key = "app/terraform.tfstate"
+    terraform init -migrate-state && terraform plan
+
+    rm -f /lab/platform/*/terraform.tfstate /lab/platform/*/terraform.tfstate.backup
+    ```
+  setup: |
+    tf_aws_start
+    rm -rf /lab/platform
+    hdr='terraform {
+      required_providers {
+        aws = {
+          source  = "hashicorp/aws"
+          version = "6.72.0"
+        }
+      }
+    }
+
+    provider "aws" {
+      region            = "us-east-1"
+      s3_use_path_style = true
+    }
+    '
+    { printf '%s\n' "$hdr"; cat <<'EOF'
+    resource "aws_vpc" "main" {
+      cidr_block = "10.80.0.0/16"
+      tags       = { Name = "platform" }
+    }
+
+    resource "aws_subnet" "app" {
+      vpc_id     = aws_vpc.main.id
+      cidr_block = "10.80.1.0/24"
+    }
+
+    output "vpc_id" {
+      value = aws_vpc.main.id
+    }
+
+    output "vpc_cidr" {
+      value = aws_vpc.main.cidr_block
+    }
+    EOF
+    } | lab_file /lab/platform/network/main.tf
+    { printf '%s\n' "$hdr"; cat <<'EOF'
+    data "terraform_remote_state" "network" {
+      backend = "local"
+      config = {
+        path = "../network/terraform.tfstate"
+      }
+    }
+
+    resource "aws_security_group" "app" {
+      name   = "platform-app"
+      vpc_id = data.terraform_remote_state.network.outputs.vpc_id
+      ingress {
+        from_port   = 8080
+        to_port     = 8080
+        protocol    = "tcp"
+        cidr_blocks = [data.terraform_remote_state.network.outputs.vpc_cidr]
+      }
+    }
+    EOF
+    } | lab_file /lab/platform/app/main.tf
+    for s in network app; do
+      tf_as_user /lab/platform/$s init -input=false -no-color >/dev/null
+      tf_as_user /lab/platform/$s apply -auto-approve -input=false -no-color >/dev/null
+    done
+    aws ec2 describe-vpcs --filters Name=tag:Name,Values=platform --query 'Vpcs[0].VpcId' --output text > "$KL_STATE/vpc"
+    aws ec2 describe-security-groups --filters Name=group-name,Values=platform-app --query 'SecurityGroups[0].GroupId' --output text > "$KL_STATE/sg"
+  check: |
+    B=acme-platform-state
+    check_eq "bucket $B is versioned" "$(aws s3api get-bucket-versioning --bucket $B --query Status --output text 2>/dev/null)" Enabled
+    pab=$(aws s3api get-public-access-block --bucket $B --output json 2>/dev/null | jq -r '.PublicAccessBlockConfiguration | [.BlockPublicAcls, .BlockPublicPolicy, .IgnorePublicAcls, .RestrictPublicBuckets] | map(tostring) | join(",")')
+    check_eq "all four public access blocks are on" "$pab" "true,true,true,true"
+    ns=$(mktemp); as=$(mktemp)
+    tf_s3_state $B network/terraform.tfstate >"$ns"; tf_s3_state $B app/terraform.tfstate >"$as"
+    check_eq "network's state is at network/terraform.tfstate" "$(tf_addrs "$ns" | paste -sd, -)" "aws_subnet.app,aws_vpc.main"
+    check_eq "app's state is at app/terraform.tfstate" "$(tf_addrs "$as" | paste -sd, -)" "aws_security_group.app"
+    for s in network app; do
+      be=/lab/platform/$s/.terraform/terraform.tfstate
+      check_eq "$s uses the s3 backend with locking" "$(jq -r '"\(.backend.type) \(.backend.config.use_lockfile)"' $be 2>/dev/null)" "s3 true"
+      check_not "no local state file is left in $s" "[ -e /lab/platform/$s/terraform.tfstate ] || [ -e /lab/platform/$s/terraform.tfstate.backup ]"
+    done
+    check "app reads network's outputs from S3" 'jq -e "any(.resources[]; .mode == \"data\" and .type == \"terraform_remote_state\" and .instances[0].attributes.backend == \"s3\")" "$as"'
+    check_eq "the VPC and security group are the original ones" "$(aws ec2 describe-vpcs --filters Name=tag:Name,Values=platform --query 'Vpcs[0].VpcId' --output text 2>/dev/null) $(aws ec2 describe-security-groups --filters Name=group-name,Values=platform-app --query 'SecurityGroups[0].GroupId' --output text 2>/dev/null)" "$(cat $KL_STATE/vpc) $(cat $KL_STATE/sg)"
+    check "terraform plan in network shows no changes" 'tf_has "$ns" aws_vpc.main && tf_clean /lab/platform/network'
+    check "terraform plan in app shows no changes" 'tf_has "$as" aws_security_group.app && tf_clean /lab/platform/app'
+    rm -f "$ns" "$as"
+  solve: |
+    B=acme-platform-state
+    aws s3api create-bucket --bucket $B >/dev/null
+    aws s3api put-bucket-versioning --bucket $B --versioning-configuration Status=Enabled
+    aws s3api put-public-access-block --bucket $B --public-access-block-configuration BlockPublicAcls=true,IgnorePublicAcls=true,BlockPublicPolicy=true,RestrictPublicBuckets=true
+    cd /lab/platform/network
+    sed -i "/^  required_providers {/i\\  backend \"s3\" {\n    bucket         = \"$B\"\n    key            = \"network/terraform.tfstate\"\n    region         = \"us-east-1\"\n    use_lockfile   = true\n    use_path_style = true\n  }\n" main.tf
+    terraform init -migrate-state -force-copy -input=false -no-color >/dev/null
+    cd /lab/platform/app
+    sed -i "/^  required_providers {/i\\  backend \"s3\" {\n    bucket         = \"$B\"\n    key            = \"app/terraform.tfstate\"\n    region         = \"us-east-1\"\n    use_lockfile   = true\n    use_path_style = true\n  }\n" main.tf
+    sed -i 's|  backend = "local"|  backend = "s3"|; s|    path = "../network/terraform.tfstate"|    bucket         = "'$B'"\n    key            = "network/terraform.tfstate"\n    region         = "us-east-1"\n    use_path_style = true|' main.tf
+    terraform init -migrate-state -force-copy -input=false -no-color >/dev/null
+    terraform apply -auto-approve -input=false -no-color >/dev/null
+    rm -f /lab/platform/*/terraform.tfstate /lab/platform/*/terraform.tfstate.backup
