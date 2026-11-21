@@ -342,6 +342,38 @@ WRAP
   chmod 755 /usr/local/bin/terraform
   on_reset 'rm -f /usr/local/bin/terraform'
 }
+# tf_aws_start -> the Moto AWS emulator (moto_start) plus `terraform`, `tofu`, `terragrunt` and
+# `conftest` commands from the kl-terraform-aws image (aws provider 6.72.0 in the mirror).
+# Every AWS call goes to Moto: the wrappers always set AWS_ENDPOINT_URL to it, so a lab
+# can never reach real AWS. Credentials default to Moto's dummies; set AWS_* to override.
+# S3 Control puts the account id in front of the host, hence the extra hosts entry.
+tf_aws_start() {
+  moto_start || return 1
+  local t
+  for t in terraform tofu terragrunt conftest; do
+    cat >"/usr/local/bin/$t" <<WRAP
+#!/bin/bash
+# Lab $t (kl-terraform-aws image). AWS calls go to the Moto emulator, never to real AWS.
+wd=\$PWD
+case "\$wd/" in /lab/*) ;; *) wd=/lab ;; esac
+envs=(-e AWS_ENDPOINT_URL=http://localhost:5000 -e AWS_ACCESS_KEY_ID=\${AWS_ACCESS_KEY_ID:-test}
+      -e AWS_SECRET_ACCESS_KEY=\${AWS_SECRET_ACCESS_KEY:-test} -e AWS_REGION=\${AWS_REGION:-us-east-1})
+while IFS= read -r v; do envs+=(-e "\$v"); done < <(compgen -e | grep -E '^(TF_|TG_|AWS_|PG)' | grep -vxE 'TF_CLI_CONFIG_FILE|AWS_ENDPOINT_URL|AWS_ACCESS_KEY_ID|AWS_SECRET_ACCESS_KEY|AWS_REGION')
+tty=()
+[ -t 0 ] && [ -t 1 ] && tty=(-t)
+exec docker run --rm -i "\${tty[@]}" --network host --init --add-host 123456789012.localhost:127.0.0.1 \\
+  -u "\$(id -u):\$(id -g)" --group-add "\$(stat -c %g /var/run/docker.sock)" \\
+  -e HOME=/tmp "\${envs[@]}" \\
+  -v /lab:/lab -v /var/run/docker.sock:/var/run/docker.sock \\
+  -w "\$wd" --entrypoint $t kl-terraform-aws:1 "\$@"
+WRAP
+    chmod 755 "/usr/local/bin/$t"
+    on_reset "rm -f /usr/local/bin/$t"
+  done
+}
+# tf_s3_state BUCKET KEY -> a state file kept in S3 (Moto), for tf_has/tf_get/tf_addrs:
+#   st=$(mktemp); tf_s3_state tf-state app.tfstate >"$st"; tf_has "$st" aws_vpc.main
+tf_s3_state() { aws s3 cp "s3://$1/$2" - 2>/dev/null; }
 # tf_as_user DIR CMD... -> run terraform as the lab user in DIR (for setups)
 tf_as_user() { local d=$1; shift; sudo -u "$(lab_user)" -H bash -c 'cd "$1" && shift && terraform "$@"' _ "$d" "$@"; }
 # Checks read the local state file directly (fast, and works before `init`).

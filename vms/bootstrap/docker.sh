@@ -68,6 +68,24 @@ RUN set -e; m=/usr/share/terraform/providers; \
 ENV TF_CLI_CONFIG_FILE=/etc/terraform.rc CHECKPOINT_DISABLE=1
 DOCKERFILE
 fi
+# The same plus the AWS provider (against the Moto emulator), OpenTofu (sharing the mirror),
+# Terragrunt and Conftest, for the Terraform track's AWS, backend and tooling modules.
+if ! docker image inspect kl-terraform-aws:1 >/dev/null 2>&1; then
+  echo "==> building the Terraform AWS image (aws provider 6.72.0, OpenTofu, Terragrunt, Conftest)"
+  docker build -q -t kl-terraform-aws:1 - <<'DOCKERFILE'
+FROM kl-terraform:1
+RUN set -e; m=/usr/share/terraform/providers; mkdir -p /tmp/c; \
+    printf 'terraform {\n  required_providers {\n    aws = { source = "hashicorp/aws", version = "6.72.0" }\n  }\n}\n' > /tmp/c/main.tf; \
+    cd /tmp/c && terraform providers mirror "$m"; rm -rf /tmp/c; \
+    cp -al "$m/registry.terraform.io" "$m/registry.opentofu.org"; \
+    case "$(uname -m)" in aarch64) a=arm64; c=arm64 ;; *) a=amd64; c=x86_64 ;; esac; \
+    cd /tmp; wget -q "https://github.com/opentofu/opentofu/releases/download/v1.13.8/tofu_1.13.8_linux_$a.zip"; \
+    unzip -q "tofu_1.13.8_linux_$a.zip" tofu -d /usr/local/bin; rm -f tofu_*.zip; \
+    wget -q -O /usr/local/bin/terragrunt "https://github.com/gruntwork-io/terragrunt/releases/download/v1.2.1/terragrunt_linux_$a"; \
+    wget -q -O- "https://github.com/open-policy-agent/conftest/releases/download/v0.71.0/conftest_0.71.0_Linux_$c.tar.gz" | tar -xz -C /usr/local/bin conftest; \
+    chmod 755 /usr/local/bin/tofu /usr/local/bin/terragrunt /usr/local/bin/conftest; chmod -R a+rX "$m"
+DOCKERFILE
+fi
 # Ansible for the Ansible track: the controller image (ansible-core, ansible-lint and
 # collections) and the managed-node image (Debian with sshd; nginx, tree, jq and cron
 # are pre-downloaded so the apt module works offline).

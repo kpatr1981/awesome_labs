@@ -8,7 +8,7 @@ what to consolidate. The target doesn't lower the bar: a lab should carry a real
 scenario and teach a concept. The parts of this list that the existing exercises don't cover
 are not started.
 
-Exercise counts (<!-- count:total -->1,679<!-- /count --> total):
+Exercise counts (<!-- count:total -->1,690<!-- /count --> total):
 
 | Topic | Exercises | Target | Track | Module files |
 |---|---|---|---|---|
@@ -23,7 +23,7 @@ Exercise counts (<!-- count:total -->1,679<!-- /count --> total):
 | Programming | <!-- count:programming -->86<!-- /count --> | 250 | `programming` | `exercises/programming/` |
 | Data science | <!-- count:datascience -->83<!-- /count --> | 250 | `datascience` | `exercises/datascience/` |
 | Git | <!-- count:git -->255<!-- /count --> | 250 | `git` | `exercises/git/` |
-| Terraform | <!-- count:terraform -->92<!-- /count --> | 250 | `terraform` | `exercises/terraform/` |
+| Terraform | <!-- count:terraform -->103<!-- /count --> | 250 | `terraform` | `exercises/terraform/` |
 | Ansible | <!-- count:ansible -->89<!-- /count --> | 250 | `ansible` | `exercises/ansible/` |
 | Algorithms | <!-- count:algorithms -->70<!-- /count --> | 250 | `algorithms` | `exercises/algorithms/` |
 
@@ -341,10 +341,10 @@ then GitOps for Kubernetes, then Git LFS.
 
 | Gap | The lab | Runs on | Notes |
 |---|---|---|---|
-| **The AWS provider against Moto** | A VPC with subnets and security groups, an S3 bucket with an IAM policy, a plan that fails on a missing permission, drift after a change in the "console" (the `aws` CLI) | Docker VM; Moto | Needs a provider mirror image with `hashicorp/aws` (~600 MB, see the Terraform track's infra notes). Moto's limits are under *AWS CLI notes*. The *OpenTofu against Moto* row (Shared lab foundations) builds on it |
+| **The AWS provider against Moto** | Done in `exercises/terraform/08-aws.yaml` (tf-093..103) | | |
 | **Remote state backends with locking** | Move local state to S3 on Moto with `init -migrate-state`; S3's own lock file (`use_lockfile`, since Terraform 1.10; the DynamoDB table is deprecated); the `pg` backend on Postgres; a lock left by a killed job and when `force-unlock` is safe; partial backend config per environment | Docker VM; Moto, Postgres | Today's state module only uses the `local` backend |
-| **Provider aliases** | Two regions or accounts in one configuration, passing aliased providers into a module (`configuration_aliases`), the "provider configuration not present" error after removing one | Docker VM; Moto, or two Docker hosts as a local stand-in | |
-| **Ephemeral values and write-only arguments** | Ephemeral variables and resources, `*_wo` arguments that keep a password out of the state, and proving it with `terraform show -json` | Docker VM | Terraform 1.10/1.11 features; one exercise touches ephemeral values so far |
+| **Provider aliases** | Done in `exercises/terraform/08-aws.yaml` (tf-093..103) | | |
+| **Ephemeral values and write-only arguments** | Done in `exercises/terraform/08-aws.yaml` (tf-093..103) | | |
 | **OpenTofu differences** | Migrate a configuration both ways, state encryption, the registry and lock file differences | Docker VM | See *OpenTofu against Moto* |
 | **Policy checks on plans** | | | Already queued: *Policy as code (OPA/Conftest)* in *Next round* |
 | **Terragrunt** | Keep backend and provider settings in one place, `dependency` blocks between stacks, `run-all` ordering | Docker VM; pinned image | |
@@ -689,6 +689,12 @@ Moto only emulates the API, so these limits apply:
   Networking labs won't work.
 - IAM isn't enforced by default.
 - Service coverage varies, so prove each exercise with `awesome_labs verify`.
+- With Terraform's AWS provider 6, Moto 5.2.4 drops the tags sent when a bucket is created
+  (they go in CreateBucket and are read back through S3 Control), so a tagged `aws_s3_bucket`
+  never plans clean. Keep tags off buckets in Terraform labs; tags on other resources work.
+- Terraform's wrapper (`tf_aws_start`) uses `http://localhost:5000` plus a hosts entry for
+  `123456789012.localhost`: S3 Control puts the account id in front of the host name, and Moto
+  reads an unknown host's first label as a bucket name.
 
 ## Data
 
