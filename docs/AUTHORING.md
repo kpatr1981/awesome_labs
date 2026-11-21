@@ -173,6 +173,7 @@ not fit. It commits nothing: download the `verify-results` artifact (the updated
 | `gitea_clone REPO DIR`, `gitea_mirror REPO DIR`, `gitea_media REPO PATH` | a lab-user clone that authenticates; a bare mirror for checks; a file's LFS-resolved content |
 | `is_lfs_pointer GITDIR REV:PATH`, `max_blob GITDIR` | LFS checks without needing git-lfs set up for root |
 | `git_home_guard` | the next reset restores the lab user's `~/.gitconfig` and removes stored credentials |
+| `py_test <<'PY' … PY` | run hidden `unittest` code against `/lab` (PYTHONPATH=/lab); prints the tail on failure |
 | `tf_aws_start` | Moto plus `terraform`, `tofu`, `terragrunt` and `conftest` from the kl-terraform-aws image (aws provider 6.72.0). AWS calls always go to Moto; don't tag `aws_s3_bucket` (Moto drops tags sent at creation) |
 | `tf_s3_state BUCKET KEY` | print a state file kept in S3 (Moto), to feed `tf_has`/`tf_get` |
 | `kgitea_start`, `kgitea_seed REPO DIR MSG` | Gitea in the k8s lab (NodePort 30300; `gitea.gitea.svc:3000` for pods); the `gitea_*` helpers follow `GITEA_URL` |

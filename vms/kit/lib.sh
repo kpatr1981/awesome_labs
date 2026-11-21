@@ -662,6 +662,18 @@ go_test() {
   return "$rc"
 }
 
+# py_test <<'PY' ... PY -> run hidden unittest code (ending in unittest.main()) with /lab on
+# PYTHONPATH, from /lab; prints the end of the output when it fails
+py_test() {
+  local d rc out
+  d=$(mktemp -d)
+  cat >"$d/t.py"
+  out=$(cd /lab && PYTHONPATH=/lab timeout 120 python3 -B "$d/t.py" 2>&1); rc=$?
+  rm -rf "$d"
+  [ "$rc" -ne 0 ] && printf '%s\n' "$out" | tail -20
+  return "$rc"
+}
+
 # ---------- algorithms helper ----------
 # algo_check <<'EOF' ... EOF -> stdin holds hidden Python tests, a line "---GO---", then
 # hidden Go tests. They run against /lab/solution.py and /lab/solution.go; the check
