@@ -376,6 +376,7 @@ For Networking, Degraded networks, VPN creation and DNS & email.
 | **Performance debugging** | `strace`, `perf`, `bpftrace`, memory leaks, I/O bottlenecks, CPU throttling | Docker VM; checks are harder to write |
 | **Container internals** | Done in `exercises/linux/07-container-internals.yaml`: namespaces, cgroups, overlay layers, `runc`, user namespaces, capabilities, mount propagation, PID 1. Still to do: `ctr` and `crictl` against containerd | Docker VM or k8s nodes |
 | **QEMU & virtualization** | See below | Docker VM or a dedicated VM; needs nested KVM |
+| **Hardware health** | See below: failing RAM, CPUs, disks, motherboards and power supplies, found from Linux | Docker VM, a QEMU guest and recorded data |
 
 Linux admin relies on other tracks for two topics: routing, DNS and firewalls are in
 Networking and DNS & email, and boot failures are built with the QEMU rescue module.
@@ -444,6 +445,70 @@ Rescue is the most valuable module: it breaks a throwaway guest and not the lab 
   boot time will make `awesome_labs verify` slower.
 - **macOS:** expect no KVM inside the VMs, so guests fall back to much slower software
   emulation. Timing-sensitive exercises may not work there.
+
+### Hardware health modules
+
+Added 2026-11-21. Not started. These labs teach how to tell, from inside Linux, whether a server's
+RAM, CPU, disks, motherboard or power supply is failing, and which part to replace. Lab VMs
+have no real hardware to break, so the faults come from three places, and each one is read
+with the real tools:
+
+1. **Emulated hardware that fails on cue.** This uses a guest from the QEMU modules. The
+   monitor's `mce` command injects machine-check errors into a CPU, and `pcie_aer_inject_error`
+   raises a PCIe error. `blkdebug` returns I/O errors at chosen sectors or events. Setting an
+   NVMe drive's `smart_critical_warning` property over QMP raises a SMART warning. A
+   simulated BMC gives `ipmitool` sensors, an event log and FRU data. The BMC is OpenIPMI's
+   `ipmi_sim`, whose sensor values can be scripted, or QEMU's `ipmi-bmc-sim` for the
+   in-guest KCS path.
+2. **Kernel fault injection in the VM itself.** `scsi_debug` disks have medium errors at
+   chosen sectors, and `dm-dust` and `dm-flakey` act as disks with bad blocks or ones that
+   come and go. `madvise(MADV_HWPOISON)` or `hwpoison-inject` poisons a memory page. A CPU
+   can be hot-unplugged through `/sys/devices/system/cpu/cpuN/online`.
+3. **Recordings from real machines,** replayed by the real tools where they can read a
+   recording: `dmidecode --from-dump` and `lspci -F`. Where they can't, generated
+   `smartctl -x --json`, `sensors`, `edac-util` output, `rasdaemon` databases and kernel logs
+   stand in. The faulty DIMM, slot or disk changes on every run, so the answer can't be
+   memorised.
+
+| Level | Lab | What you practise |
+|---|---|---|
+| Beginner | **Inventory a server** | Write a hardware report with `lscpu`, `lsmem`, `dmidecode -t bios,baseboard,memory`, `lspci`, `lsblk -o +MODEL,SERIAL`, `lshw -short` and `inxi`. It covers the board and BIOS version, each DIMM's slot, size, speed and part number, the empty slots, and the disks with serials. The check compares it with the dump |
+| Beginner | **Hardware errors in the kernel log** | `dmesg -T --level=err,warn` and `journalctl -k -b -1`. Pick out the real hardware lines (MCE, EDAC, `ata`/`nvme` timeouts, AER, thermal) from driver noise and red herrings that have been there for months |
+| Beginner | **SMART basics** | Read `smartctl -x` and `nvme smart-log`, and learn which attributes matter: 5 reallocated, 197 pending, 198 offline uncorrectable, NVMe media errors, percentage used and the critical warning. Attribute 199 (CRC errors) points to the cable, not the disk. Of several disks, say which to replace, which needs a new cable and which is fine |
+| Beginner | **Temperatures, fans and voltages** | `sensors`, plus `ipmitool sdr` and `ipmitool sensor` against the simulated BMC. Spot a fan below its lower-critical threshold and a 12 V rail out of range, and learn what the thresholds mean |
+| Beginner | **Is the CPU throttling?** | `lscpu`, `cpupower frequency-info`, a `turbostat` recording and the `thermal_throttle` counters. Tell heat from a `powersave` governor or a power cap, which are the more usual causes |
+| Intermediate | **Which DIMM do I pull?** | EDAC's per-DIMM `dimm_ce_count` and `dimm_label`, `ras-mc-ctl --summary` and `--errors`, then mapping the controller, channel and slot to the `dmidecode` locator and the label printed on the board. One DIMM's corrected errors keep rising while another had one error a year ago. The answer is the slot label |
+| Intermediate | **Testing memory** | `memtester` (it can't test memory the kernel is using), `stress-ng --vm --verify`, and `memtest=` on a guest's kernel command line. Know what a pass does and doesn't prove |
+| Intermediate | **A poisoned memory page** | Poison a page under a running process. Read the `Memory failure: … recovery action` line, `HardwareCorrupted` in `/proc/meminfo`, and the process's `SIGBUS`. Compare soft-offlining and hard-offlining a page |
+| Intermediate | **Machine checks** | Inject MCEs into an x86 guest with QEMU's `mce` command and decode them with `rasdaemon` or `mcelog`. Tell corrected from uncorrected errors, find the bank, CPU and socket, and tell a cache error from a memory-controller error |
+| Intermediate | **Bad sectors** | A `dm-dust` or `scsi_debug` disk with bad blocks. Run read-only `badblocks -sv` and a `smartctl -t short` self-test, find which file sits on the bad sector with `debugfs icheck`/`ncheck`, and save the rest of it with `ddrescue` |
+| Intermediate | **Flaky, not dead** | `dm-flakey` or `blkdebug` timeouts show up as link resets and timeouts in the log, latency spikes in `iostat -x`, and md RAID failing a member. Use the pattern to decide between disk, cable and controller, such as CRC errors, or every disk on one controller failing together |
+| Intermediate | **PCIe errors and slow links** | A NIC at x1 2.5 GT/s in an x8 slot (`lspci -vvv` `LnkCap` vs `LnkSta`), correctable and uncorrectable AER errors from `pcie_aer_inject_error`, and the `aer_dev_*` counters in sysfs |
+| Intermediate | **The BMC's event log** | `ipmitool sel elist`, `chassis status` and `fru`. Rebuild an overnight power-supply failure and reboot from the event log, find the board serial for the RMA, and save the log before clearing it |
+| Advanced | **Alert before it breaks** | `smartd.conf` with scheduled self-tests and an `-M exec` alert, `rasdaemon` running, and an alert on a rising corrected-error rate from `smartctl_exporter` or the node_exporter textfile collector. The check injects a fault and the alert must fire |
+| Advanced | **Burn in a new server** | A pass/fail script that runs `stress-ng` and `fio --verify` and watches temperatures and the error counters while they run. The check runs it on a guest with a hidden fault, and it must fail |
+| Advanced | **Firmware and microcode** | The BIOS version against an advisory, `microcode` in `/proc/cpuinfo` and the early-load log line, `/sys/devices/system/cpu/vulnerabilities/*`, and `fwupdmgr get-devices` and `get-updates` against fwupd's test plugin. Nothing real is flashed |
+| Advanced | **Hardware or software?** | Random segfaults and corrupted downloads across unrelated programs point to RAM. One binary crashing at the same code address points to a bug. Decide which from the logs, `coredumpctl` and checksums |
+| Capstone | **Triage a dying server** | A sosreport-style bundle and a live guest with several injected faults and red herrings. Write the RMA ticket: the parts (DIMM slot label, disk serial, PSU), the evidence for each, and what to leave alone. The check grades the parts and the evidence |
+
+- **Architecture:** Apple Silicon hosts run arm64 VMs. MCE, `mcelog`, `turbostat` and
+  `thermal_throttle` are x86, so those labs use a small x86 QEMU guest under software
+  emulation, or recordings. Slow is fine there: one kernel and an initramfs boot in seconds.
+  On arm64, memory errors arrive through APEI/GHES, so the recordings cover both.
+- **Packages:** `smartmontools`, `nvme-cli`, `ipmitool`, OpenIPMI, `lm-sensors`, `rasdaemon`,
+  `edac-utils`, `dmidecode`, `pciutils`, `memtester`, `stress-ng`, `fio`, `gddrescue` and
+  `fwupd`. `scsi_debug` and `dm-dust` need `linux-modules-extra` on the Ubuntu VM kernel, and
+  hwpoison needs `CONFIG_MEMORY_FAILURE`. Check both at bootstrap.
+- **Recordings:** build a small library from real machines with `dmidecode --dump-bin` and
+  `lspci -xxxx` (`-F` needs the full config space). Scrub the serials and MACs, and generate
+  variants with the fault moved.
+- **Answers:** the learner writes `/lab/answer.yaml` (slot, serial, part, and evidence for the
+  capstone). This ties into the *Critical-thinking labs*.
+- **Safety:** tutorials say which commands harm real hardware or destroy evidence:
+  `badblocks -w`, `hdparm --write-sector`, a long self-test on a busy disk, and clearing the
+  event log. The labs only run them on emulated devices.
+- **Relies on:** the QEMU modules for the guest and QMP helpers, the `mdadm` RAID idea, and
+  *Prometheus and alerting* for the monitoring lab.
 
 ## Networking
 
