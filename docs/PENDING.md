@@ -809,6 +809,30 @@ starting point.
 | **Security** | SSH certificates from a small CA in place of `authorized_keys`; WAF tuning that blocks an attack and not real users; writing a detection from a real attack's logs and proving it catches a variant |
 | **Networking** | BGP hijack, then stopping it with RPKI route validation |
 
+### Next round
+
+Added 2026-11-21. Not started. The first three are the suggested starting point: they need almost no
+new infrastructure and build on the TLS & PKI, networking and Terraform modules.
+
+| Idea | The lab | Runs on | Builds on |
+|---|---|---|---|
+| **cert-manager** | Install it with Helm, issue certificates from a CA issuer, then fix an Ingress certificate that never becomes Ready (the TLS & PKI row's "still to do") | k8s lab | TLS & PKI, Helm |
+| **SSH tunnels & pivoting** | Reach a database two hops away with `-L`, `-R`, `-D` and `ProxyJump`, then lock the jump host down (`PermitOpen`, `AllowTcpForwarding`) | Docker or offsec VM; namespaces or containers as hosts | Networking essentials |
+| **Policy as code (OPA/Conftest)** | Write Rego that blocks a Terraform plan with a public bucket or an unpinned image, then debug a rule that matches nothing | Docker VM; pinned `conftest`/`opa` image | Terraform in automation (JSON plans) |
+| **Purging secrets from Git** | gitleaks finds a key in history; remove it with `git filter-repo`, force-push to a bare remote, and prove no ref, tag or reflog still holds it | Docker VM | Git recovery & plumbing |
+| **Linkerd service mesh** | Turn on mTLS between two apps, find the pod without its proxy, add retries and timeouts. Much lighter than Istio (see *Left out*), but **test the memory on the nodes first** | k8s lab | Services & DNS |
+| **Cluster backup with Velero** | Back up a namespace, delete it, restore it, then find why the volume data didn't come back | k8s lab + MinIO | The MinIO labs |
+| **Backups with restic or borg** | Encrypted repository, a retention policy that deletes too much, a restore drill against a deadline, a repository locked by a dead job | Docker VM | Linux admin |
+| **Podman** | Rootless containers, Quadlet systemd units, a port below 1024 that won't bind, `podman generate kube` | Docker VM (pinned package) | Docker containers |
+| **Load testing (k6 or wrk)** | Find the request rate where p99 latency breaks, spot coordinated omission, then fix the connection-pool limit behind it | Docker VM | Web servers & proxies |
+| **SLOs & error budgets** | Work out the error budget from access logs, then write a multi-window burn-rate alert that fires on a fast burn and stays quiet on a blip | Docker VM; with Prometheus | Prometheus and alerting |
+| **HTTP for developers** | CORS preflight failures, `SameSite` cookies, cache headers, redirect loops, content negotiation, all diagnosed with `curl` | Docker VM | Web servers & proxies |
+| **Distributed systems** | A 3-node etcd cluster under netem partitions: lose quorum, read stale data, restore it; idempotency keys for a client that retries | Docker VM; netem | Degraded networks |
+| **gRPC & Protobuf** | A schema change that breaks old clients (caught with `buf breaking`), reflection and `grpcurl` debugging, deadlines that never propagate | Docker VM | Programming |
+| **ZFS or Btrfs on loop devices** | Snapshots, send/receive replication, a full pool, scrubbing after injected corruption | Docker VM; loop devices (risky for `verify -local`) | Linux disks & LVM |
+| **Packaging** | Build a `.deb`, host a signed apt repository, fix a pinning or dependency conflict, a postinst script that fails halfway | Docker VM | Linux admin |
+| **dbt with DuckDB** | Fix broken model lineage, failing data tests, and an incremental model that double-counts | Docker VM; data-science image | Data, SQL in depth |
+
 ### Useful but niche
 
 Problems that are rare until they ruin your day. The first three are the suggested starting point.
@@ -903,7 +927,7 @@ or a lightweight proxy, since a service mesh is too heavy for these nodes.
 
 | Lab | What goes wrong |
 |---|---|
-| **Find the slow service** | Distributed tracing across several services |
+| **Find the slow service** | Distributed tracing across several services: find the slow span in Jaeger, then fix a trace that's broken into pieces (a service that drops the trace context). OpenTelemetry SDKs and Collector |
 | **Cascading failure** | One slow dependency takes everything down, fixed with timeouts and circuit breakers |
 | **Retry storms** | Retries turn a blip into an outage |
 | **Partial failure** | Degrade gracefully when one service is gone |
