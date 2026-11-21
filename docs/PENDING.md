@@ -8,7 +8,7 @@ what to consolidate. The target doesn't lower the bar: a lab should carry a real
 scenario and teach a concept. The parts of this list that the existing exercises don't cover
 are not started.
 
-Exercise counts (<!-- count:total -->1,724<!-- /count --> total):
+Exercise counts (<!-- count:total -->1,727<!-- /count --> total):
 
 | Topic | Exercises | Target | Track | Module files |
 |---|---|---|---|---|
@@ -23,7 +23,7 @@ Exercise counts (<!-- count:total -->1,724<!-- /count --> total):
 | Programming | <!-- count:programming -->86<!-- /count --> | 250 | `programming` | `exercises/programming/` |
 | Data science | <!-- count:datascience -->83<!-- /count --> | 250 | `datascience` | `exercises/datascience/` |
 | Git | <!-- count:git -->275<!-- /count --> | 250 | `git` | `exercises/git/` |
-| Terraform | <!-- count:terraform -->117<!-- /count --> | 250 | `terraform` | `exercises/terraform/` |
+| Terraform | <!-- count:terraform -->120<!-- /count --> | 250 | `terraform` | `exercises/terraform/` |
 | Ansible | <!-- count:ansible -->89<!-- /count --> | 250 | `ansible` | `exercises/ansible/` |
 | Algorithms | <!-- count:algorithms -->70<!-- /count --> | 250 | `algorithms` | `exercises/algorithms/` |
 
@@ -348,7 +348,7 @@ then GitOps for Kubernetes, then Git LFS.
 | **OpenTofu differences** | Done in `exercises/terraform/10-opentofu-terragrunt-policy.yaml` (tf-111..117) | | |
 | **Policy checks on plans** | Done in `exercises/terraform/10-opentofu-terragrunt-policy.yaml` (tf-111..117) | | |
 | **Terragrunt** | Done in `exercises/terraform/10-opentofu-terragrunt-policy.yaml` (tf-111..117) | | |
-| **Plan and apply from pull requests** | An Atlantis-style flow on Gitea: plan on a pull request, apply on merge, a locked workspace | Docker VM; Gitea | Shares Gitea with *CI/CD & GitOps* (Cloud & platform) |
+| **Plan and apply from pull requests** | Done in `exercises/terraform/11-pull-requests.yaml` (tf-118..120), on Gitea | | |
 
 ### Kubernetes gaps
 

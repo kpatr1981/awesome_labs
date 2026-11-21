@@ -1,0 +1,605 @@
+track: terraform
+module: Terraform from pull requests
+profile: docker
+order: 11
+exercises:
+
+- id: tf-118
+  title: Post the plan on the pull request
+  difficulty: 3
+  kind: build
+  tags: [terraform, ci, pull-request, plan, gitea, atlantis]
+  tutorial: |
+    **What you're learning.** The **plan-on-PR** half of a Terraform pull-request workflow, the way Atlantis and similar tools do it: check out the PR's code, run `terraform plan`, and post the result where reviewers read it.
+
+    ### The flow
+
+    ```
+    PR opened/updated ─► CI: fetch the PR head ─► terraform init + plan ─► comment on the PR
+                                                                           "Plan: 1 to add…"
+    reviewers read the plan, approve ─► merge ─► CI applies main (tf-119)
+    ```
+    The plan is **read-only**: it never applies, and it must not change the state.
+
+    ### The PR's code
+
+    Hosting services publish each PR's head as a ref, `refs/pull/N/head`, so CI can fetch it without knowing the branch name:
+
+    ```bash
+    git clone -q http://localhost:3000/sam/infra.git work
+    git -C work fetch -q origin refs/pull/7/head
+    git -C work checkout -q FETCH_HEAD
+    sha=$(git -C work rev-parse HEAD)
+    ```
+
+    ### Planning and posting
+
+    ```bash
+    cd work
+    terraform init -input=false -no-color >/dev/null
+    terraform plan -input=false -no-color > plan.txt 2>&1; rc=$?
+    body=$(printf 'Terraform plan for %s\n\n```\n%s\n```\n' "$sha" "$(cat plan.txt)")
+    jq -n --arg b "$body" '{body: $b}' |
+      curl -s -H "Authorization: token $TOKEN" -H 'Content-Type: application/json' \
+        -X POST http://localhost:3000/api/v1/repos/sam/infra/issues/7/comments -d @-
+    exit $rc
+    ```
+    - A PR is also an **issue** in Gitea's API, so comments go to `/issues/N/comments`.
+    - `jq -n --arg` builds valid JSON from text with quotes and newlines in it.
+    - Exit with the plan's status, so a broken PR shows up as a failed job.
+
+    This lab's `terraform` only sees `/lab`, so do the checkout under `/lab` (for example `/lab/ci/work`).
+
+    ### Common mistakes
+
+    - `terraform apply` in the PR job: unreviewed code changes production.
+    - Planning the **base** branch instead of the PR head.
+    - Hand-building JSON with `"…$plan…"`: the first quote in the plan breaks it.
+
+    ### Check your work
+
+    Run your script for PR #1: a comment appears with the commit id and the `Plan:` line, and the state is unchanged.
+  scenario: |
+    The infrastructure repository **`dev/infra`** on Gitea (state in S3) gets its changes
+    through pull requests. Write **`/lab/ci/plan-pr.sh N`**, the job CI runs for pull request
+    number **N**:
+
+    - check out **the PR's head commit** (not its branch name, not main)
+    - run `terraform init` and `terraform plan` on it, **without changing the state**
+    - post a comment on PR N that starts with **`Terraform plan for <full commit id>`** and
+      contains the plan output
+    - exit **non-zero** if the plan fails
+
+    The CI bot's token is in **`/lab/ci/token`**. Try it on the open PR **#1**.
+  hints:
+    - "`git fetch origin refs/pull/$N/head` then `git checkout FETCH_HEAD` gets the PR's code. Work in a folder under /lab."
+    - "Post with `curl -H \"Authorization: token $(cat /lab/ci/token)\" -X POST .../repos/dev/infra/issues/$N/comments`, building the JSON with `jq -n --arg b \"$body\" '{body: $b}'`."
+  solution: |
+    ```bash
+    mkdir -p /lab/ci
+    cat > /lab/ci/plan-pr.sh <<'EOF'
+    #!/bin/bash
+    # plan-pr.sh N: plan pull request N of dev/infra and post the plan as a comment
+    set -u
+    n=${1:?usage: plan-pr.sh PR_NUMBER}
+    api=http://localhost:3000/api/v1/repos/dev/infra
+    w=/lab/ci/work-$n
+    rm -rf "$w"
+    git clone -q http://localhost:3000/dev/infra.git "$w" || exit 2
+    git -C "$w" fetch -q origin "refs/pull/$n/head" && git -C "$w" checkout -q FETCH_HEAD || exit 2
+    sha=$(git -C "$w" rev-parse HEAD)
+    cd "$w"
+    { terraform init -input=false -no-color >/dev/null && terraform plan -input=false -no-color; } > plan.txt 2>&1; rc=$?
+    body=$(printf 'Terraform plan for %s\n\n```\n%s\n```\n' "$sha" "$(cat plan.txt)")
+    jq -n --arg b "$body" '{body: $b}' |
+      curl -fsS -H "Authorization: token $(cat /lab/ci/token)" -H 'Content-Type: application/json' \
+        -X POST "$api/issues/$n/comments" -d @- >/dev/null
+    exit $rc
+    EOF
+    chmod +x /lab/ci/plan-pr.sh
+    /lab/ci/plan-pr.sh 1
+    ```
+  setup: |
+    tf_aws_start
+    gitea_start
+    gitea_dev
+    rm -rf /lab/ci /lab/.seed
+    aws s3api create-bucket --bucket acme-tfstate >/dev/null
+    gitea_user ci-bot "ci-bot-pass-1" "CI"
+    gitea_repo dev infra
+    gitea_api PUT /repos/dev/infra/collaborators/ci-bot '{"permission":"write"}' >/dev/null
+    gitea_token ci-bot ci-bot-pass-1 ci | lab_file /lab/ci/token 0600
+    mkdir -p /lab/.seed; cd /lab/.seed; git init -q -b main .
+    cat > main.tf <<'EOF'
+    terraform {
+      backend "s3" {
+        bucket         = "acme-tfstate"
+        key            = "infra/terraform.tfstate"
+        region         = "us-east-1"
+        use_lockfile   = true
+        use_path_style = true
+      }
+      required_providers {
+        aws = {
+          source  = "hashicorp/aws"
+          version = "6.72.0"
+        }
+      }
+    }
+
+    provider "aws" {
+      region            = "us-east-1"
+      s3_use_path_style = true
+    }
+
+    resource "aws_iam_user" "svc" {
+      for_each = toset(["api"])
+      name     = "infra-${each.key}"
+    }
+    EOF
+    c() { git -c user.name=Dev -c user.email=dev@lab.test "$@"; }
+    c add main.tf; c commit -qm "Service users"
+    chown -R "$(lab_user):" /lab/.seed
+    tf_as_user /lab/.seed init -input=false -no-color >/dev/null
+    tf_as_user /lab/.seed apply -auto-approve -input=false -no-color >/dev/null
+    u=$(gitea_url dev/infra "dev:$(cat $KL_STATE/dev-pass)")
+    git push -q "$u" main 2>/dev/null
+    c switch -qc add-worker; sed -i 's/toset(\["api"\])/toset(["api", "worker"])/' main.tf; c commit -qam "Add a worker user"
+    git push -q "$u" add-worker 2>/dev/null
+    gitea_api POST /repos/dev/infra/pulls '{"head":"add-worker","base":"main","title":"Add a worker user"}' >/dev/null
+    c switch -q main
+    cp main.tf "$KL_STATE/main.tf"
+    cd /; rm -rf /lab/.seed
+    tf_s3_state acme-tfstate infra/terraform.tfstate | jq -r .serial > "$KL_STATE/serial"
+  check: |
+    S=/lab/ci/plan-pr.sh
+    check "/lab/ci/plan-pr.sh is executable" '[ -x $S ]'
+    # two fresh pull requests of our own: a good one and a broken one
+    mk() { # BRANCH TITLE SEDEXPR -> PR number
+      local n; n=$(gitea_api GET "/repos/dev/infra/pulls?state=open" | jq -r --arg b "$1" '[.[] | select(.head.ref == $b)][0].number // empty')
+      if [ -z "$n" ]; then
+        local t; t=$(mktemp -d); git clone -q "$(gitea_url dev/infra "lab-admin:$(cat $KL_STATE/gitea-admin)")" $t/r 2>/dev/null
+        (cd $t/r && git switch -qc "$1" && sed -i "$3" main.tf && git -c user.name=Rev -c user.email=rev@lab.test commit -qam "$2" && git push -q origin "$1" 2>/dev/null)
+        rm -rf $t
+        n=$(gitea_api POST /repos/dev/infra/pulls "{\"head\":\"$1\",\"base\":\"main\",\"title\":\"$2\"}" | jq -r .number)
+      fi
+      echo "$n"
+    }
+    good=$(mk kl-check-reports "Reports bucket" '$a resource "aws_s3_bucket" "reports" {\n  bucket = "acme-infra-reports"\n}')
+    bad=$(mk kl-check-broken "Broken change" '$a resource "aws_iam_user" "oops" {')
+    gsha=$(gitea_api GET /repos/dev/infra/pulls/$good | jq -r .head.sha)
+    before=$(gitea_api GET "/repos/dev/infra/issues/$good/comments" | jq length)
+    sudo -u "$(lab_user)" -H bash -c "$S $good" >/dev/null 2>&1; grc=$?
+    cm=$(gitea_api GET "/repos/dev/infra/issues/$good/comments" | jq -r '.[-1].body // empty')
+    check "the script succeeds on a good pull request" '[ -x $S ] && [ $grc -eq 0 ]'
+    check "it posts a new comment on that PR" '[ "$(gitea_api GET "/repos/dev/infra/issues/$good/comments" | jq length)" -gt "$before" ]'
+    check "the comment starts with Terraform plan for <PR head commit>" 'head -1 <<<"$cm" | grep -q "^Terraform plan for $gsha"'
+    check "the comment has the plan for that PR (Plan: 1 to add)" 'grep -q "Plan: 1 to add, 0 to change, 0 to destroy" <<<"$cm" && grep -q "aws_s3_bucket.reports" <<<"$cm"'
+    sudo -u "$(lab_user)" -H bash -c "$S $bad" >/dev/null 2>&1; brc=$?
+    check "the script exits non-zero when the plan fails" '[ -x $S ] && [ $brc -ne 0 ]'
+    check_eq "planning never changed the state" "$(tf_s3_state acme-tfstate infra/terraform.tfstate | jq -r .serial)" "$(cat $KL_STATE/serial)"
+    check_not "nothing was created (no reports bucket)" 'aws s3api head-bucket --bucket acme-infra-reports'
+  solve: |
+    mkdir -p /lab/ci
+    cat > /lab/ci/plan-pr.sh <<'EOF'
+    #!/bin/bash
+    # plan-pr.sh N: plan pull request N of dev/infra and post the plan as a comment
+    set -u
+    n=${1:?usage: plan-pr.sh PR_NUMBER}
+    api=http://localhost:3000/api/v1/repos/dev/infra
+    w=/lab/ci/work-$n
+    rm -rf "$w"
+    git clone -q http://localhost:3000/dev/infra.git "$w" || exit 2
+    git -C "$w" fetch -q origin "refs/pull/$n/head" && git -C "$w" checkout -q FETCH_HEAD || exit 2
+    sha=$(git -C "$w" rev-parse HEAD)
+    cd "$w"
+    { terraform init -input=false -no-color >/dev/null && terraform plan -input=false -no-color; } > plan.txt 2>&1; rc=$?
+    body=$(printf 'Terraform plan for %s\n\n```\n%s\n```\n' "$sha" "$(cat plan.txt)")
+    jq -n --arg b "$body" '{body: $b}' |
+      curl -fsS -H "Authorization: token $(cat /lab/ci/token)" -H 'Content-Type: application/json' \
+        -X POST "$api/issues/$n/comments" -d @- >/dev/null
+    exit $rc
+    EOF
+    chmod +x /lab/ci/plan-pr.sh
+    /lab/ci/plan-pr.sh 1 >/dev/null 2>&1 || true
+
+- id: tf-119
+  title: Apply main, and only main
+  difficulty: 4
+  kind: build
+  tags: [terraform, ci, apply, main, lock-timeout, commit-status, atlantis]
+  tutorial: |
+    **What you're learning.** The **apply** half of the workflow: apply only reviewed code that is on `main`, wait for the state lock instead of failing, and report the result on the commit.
+
+    ### Rules for the apply job
+
+    1. **Only `main`, only its tip.** CI gets a commit id with the job. Before applying, check that it **is** the current tip of `main` on the server. An older `main` commit would roll back newer changes, and a PR commit isn't reviewed yet.
+       ```bash
+       tip=$(git ls-remote http://localhost:3000/sam/infra.git refs/heads/main | cut -f1)
+       [ "$sha" = "$tip" ] || { echo "$sha is not the tip of main ($tip)"; exit 3; }
+       ```
+    2. **Apply exactly that commit**: a fresh checkout of `$sha`, not whatever a shared folder had.
+    3. **Wait for the lock.** Two merges close together start two jobs. With `-lock-timeout=5m`, the second waits for the first instead of failing with `Error acquiring the state lock` (tf-105).
+    4. **Report it**: a commit status shows on the commit and in the PR that was merged:
+       ```bash
+       curl -s -H "Authorization: token $TOKEN" -H 'Content-Type: application/json' \
+         -X POST http://localhost:3000/api/v1/repos/sam/infra/statuses/$sha \
+         -d '{"context": "terraform/apply", "state": "success", "description": "applied"}'
+       ```
+       `state` is `success` or `failure`, depending on the apply's exit code.
+
+    ### Commands you'll use
+
+    ```bash
+    terraform apply -input=false -no-color -auto-approve -lock-timeout=5m
+    curl -s http://localhost:3000/api/v1/repos/sam/infra/commits/$sha/status | jq '.statuses[] | {context, status}'
+    ```
+
+    ### Common mistakes
+
+    - Applying when the commit is "somewhere in main's history". An older commit is still the wrong one.
+    - Reporting `success` without looking at the exit code.
+    - No lock timeout: every second job fails for no reason.
+
+    ### Check your work
+
+    The script refuses a PR commit, applies main's tip, waits out someone else's lock, and leaves a `terraform/apply` status on the commit.
+  scenario: |
+    Pull request #1 in **`dev/infra`** was reviewed and merged into `main`. Write
+    **`/lab/ci/apply-main.sh SHA`**, the job CI runs after a merge:
+
+    - **refuse** (exit non-zero, apply nothing) unless `SHA` is the **current tip of `main`** on
+      the server
+    - apply **exactly** that commit, **waiting up to 5 minutes** for the state lock if another
+      job holds it
+    - post the commit status **`terraform/apply`** on `SHA`: `success` or `failure`, matching
+      the apply's result; exit with the apply's exit code
+
+    The CI token is in **`/lab/ci/token`**. Run it for main's tip.
+  hints:
+    - "`git ls-remote http://localhost:3000/dev/infra.git refs/heads/main | cut -f1` is main's tip. Compare it with `$1` before doing anything else."
+    - "Clone into a fresh folder under /lab, `git checkout $SHA`, `terraform init`, then `terraform apply -auto-approve -lock-timeout=5m`. Post the status with `POST .../statuses/$SHA`."
+  solution: |
+    ```bash
+    cat > /lab/ci/apply-main.sh <<'EOF'
+    #!/bin/bash
+    # apply-main.sh SHA: apply dev/infra at SHA, which must be the tip of main
+    set -u
+    sha=${1:?usage: apply-main.sh SHA}
+    repo=http://localhost:3000/dev/infra.git
+    api=http://localhost:3000/api/v1/repos/dev/infra
+    tip=$(git ls-remote "$repo" refs/heads/main | cut -f1)
+    [ -n "$tip" ] && [ "$sha" = "$tip" ] || { echo "refusing: $sha is not the tip of main ($tip)" >&2; exit 3; }
+    w=/lab/ci/apply-work; rm -rf "$w"
+    git clone -q "$repo" "$w" && git -C "$w" checkout -q "$sha" || exit 2
+    cd "$w"
+    terraform init -input=false -no-color >/dev/null && terraform apply -input=false -no-color -auto-approve -lock-timeout=5m
+    rc=$?
+    state=success; [ $rc -eq 0 ] || state=failure
+    curl -fsS -H "Authorization: token $(cat /lab/ci/token)" -H 'Content-Type: application/json' \
+      -X POST "$api/statuses/$sha" -d "{\"context\":\"terraform/apply\",\"state\":\"$state\",\"description\":\"terraform apply: $state\"}" >/dev/null
+    exit $rc
+    EOF
+    chmod +x /lab/ci/apply-main.sh
+    /lab/ci/apply-main.sh "$(git ls-remote http://localhost:3000/dev/infra.git refs/heads/main | cut -f1)"
+    ```
+  setup: |
+    tf_aws_start
+    gitea_start
+    gitea_dev
+    rm -rf /lab/ci /lab/.seed
+    aws s3api create-bucket --bucket acme-tfstate >/dev/null
+    gitea_user ci-bot "ci-bot-pass-1" "CI"
+    gitea_repo dev infra
+    gitea_api PUT /repos/dev/infra/collaborators/ci-bot '{"permission":"write"}' >/dev/null
+    gitea_token ci-bot ci-bot-pass-1 ci | lab_file /lab/ci/token 0600
+    mkdir -p /lab/.seed; cd /lab/.seed; git init -q -b main .
+    cat > main.tf <<'EOF'
+    terraform {
+      backend "s3" {
+        bucket         = "acme-tfstate"
+        key            = "infra/terraform.tfstate"
+        region         = "us-east-1"
+        use_lockfile   = true
+        use_path_style = true
+      }
+      required_providers {
+        aws = {
+          source  = "hashicorp/aws"
+          version = "6.72.0"
+        }
+      }
+    }
+
+    provider "aws" {
+      region            = "us-east-1"
+      s3_use_path_style = true
+    }
+
+    resource "aws_iam_user" "svc" {
+      for_each = toset(["api"])
+      name     = "infra-${each.key}"
+    }
+    EOF
+    c() { git -c user.name=Dev -c user.email=dev@lab.test "$@"; }
+    c add main.tf; c commit -qm "Service users"
+    chown -R "$(lab_user):" /lab/.seed
+    tf_as_user /lab/.seed init -input=false -no-color >/dev/null
+    tf_as_user /lab/.seed apply -auto-approve -input=false -no-color >/dev/null
+    u=$(gitea_url dev/infra "dev:$(cat $KL_STATE/dev-pass)")
+    git push -q "$u" main 2>/dev/null
+    c switch -qc add-worker; sed -i 's/toset(\["api"\])/toset(["api", "worker"])/' main.tf; c commit -qam "Add a worker user"
+    git push -q "$u" add-worker 2>/dev/null
+    gitea_api POST /repos/dev/infra/pulls '{"head":"add-worker","base":"main","title":"Add a worker user"}' >/dev/null
+    gitea_api POST /repos/dev/infra/pulls/1/merge '{"Do":"merge"}' >/dev/null
+    c switch -q main; c switch -qc add-auditor; git reset -q --hard add-worker
+    sed -i 's/toset(\["api", "worker"\])/toset(["api", "worker", "auditor"])/' main.tf; c commit -qam "Add an auditor user"
+    git push -q "$u" add-auditor 2>/dev/null
+    gitea_api POST /repos/dev/infra/pulls '{"head":"add-auditor","base":"main","title":"Add an auditor user"}' >/dev/null
+    cd /; rm -rf /lab/.seed
+  check: |
+    S=/lab/ci/apply-main.sh
+    check "/lab/ci/apply-main.sh is executable" '[ -x $S ]'
+    tip=$(git ls-remote "$(gitea_url dev/infra)" refs/heads/main | cut -f1)
+    prsha=$(gitea_api GET /repos/dev/infra/pulls/2 | jq -r .head.sha)
+    old=$(git clone -q --bare "$(gitea_url dev/infra)" /tmp/kl-infra.$$ 2>/dev/null; git --git-dir=/tmp/kl-infra.$$ rev-parse main~1 2>/dev/null; rm -rf /tmp/kl-infra.$$)
+    sudo -u "$(lab_user)" -H bash -c "$S $prsha" >/dev/null 2>&1; r1=$?
+    check "it refuses an open PR's commit" '[ -x $S ] && [ $r1 -ne 0 ]'
+    check_not "…and applies nothing from it (no infra-auditor user)" 'aws iam get-user --user-name infra-auditor'
+    sudo -u "$(lab_user)" -H bash -c "$S $old" >/dev/null 2>&1; r2=$?
+    check "it refuses an older commit of main" '[ -x $S ] && [ -n "$old" ] && [ $r2 -ne 0 ]'
+    check "main's tip is applied (infra-worker exists)" 'aws iam get-user --user-name infra-worker'
+    st=$(gitea_api GET "/repos/dev/infra/commits/$tip/status" 2>/dev/null)
+    check_eq "main's tip has terraform/apply = success" "$(jq -r '[.statuses[]? | select(.context == "terraform/apply") | .status // .state] | first // empty' <<<"$st")" success
+    # someone else holds the lock for 15 seconds: the job must wait, not fail
+    lk=$(mktemp); printf '{"ID":"kl-check-lock","Operation":"OperationTypeApply","Info":"","Who":"other-job@ci","Version":"1.16.7","Created":"%s","Path":"acme-tfstate/infra/terraform.tfstate"}' "$(date -u +%FT%TZ)" > $lk
+    cp $lk /lab/.kl-lock.json; chmod a+r /lab/.kl-lock.json
+    aws s3 cp /lab/.kl-lock.json s3://acme-tfstate/infra/terraform.tfstate.tflock >/dev/null
+    ( sleep 15; aws s3 rm s3://acme-tfstate/infra/terraform.tfstate.tflock >/dev/null 2>&1 ) &
+    sudo -u "$(lab_user)" -H bash -c "$S $tip" >/dev/null 2>&1; r3=$?
+    wait; rm -f $lk /lab/.kl-lock.json
+    check "it waits for another job's lock instead of failing" '[ -x $S ] && [ $r3 -eq 0 ]'
+  solve: |
+    cat > /lab/ci/apply-main.sh <<'EOF'
+    #!/bin/bash
+    # apply-main.sh SHA: apply dev/infra at SHA, which must be the tip of main
+    set -u
+    sha=${1:?usage: apply-main.sh SHA}
+    repo=http://localhost:3000/dev/infra.git
+    api=http://localhost:3000/api/v1/repos/dev/infra
+    tip=$(git ls-remote "$repo" refs/heads/main | cut -f1)
+    [ -n "$tip" ] && [ "$sha" = "$tip" ] || { echo "refusing: $sha is not the tip of main ($tip)" >&2; exit 3; }
+    w=/lab/ci/apply-work; rm -rf "$w"
+    git clone -q "$repo" "$w" && git -C "$w" checkout -q "$sha" || exit 2
+    cd "$w"
+    terraform init -input=false -no-color >/dev/null && terraform apply -input=false -no-color -auto-approve -lock-timeout=5m
+    rc=$?
+    state=success; [ $rc -eq 0 ] || state=failure
+    curl -fsS -H "Authorization: token $(cat /lab/ci/token)" -H 'Content-Type: application/json' \
+      -X POST "$api/statuses/$sha" -d "{\"context\":\"terraform/apply\",\"state\":\"$state\",\"description\":\"terraform apply: $state\"}" >/dev/null
+    exit $rc
+    EOF
+    chmod +x /lab/ci/apply-main.sh
+    /lab/ci/apply-main.sh "$(git ls-remote http://localhost:3000/dev/infra.git refs/heads/main | cut -f1)" >/dev/null
+
+- id: tf-120
+  title: "Capstone: the CI jobs that apply unreviewed code"
+  difficulty: 5
+  kind: fix
+  tags: [terraform, ci, pull-request, security, atlantis, capstone]
+  tutorial: |
+    **What you're learning.** How to review CI scripts for the ways a Terraform pull-request pipeline goes wrong. Each bug here has caused real outages.
+
+    ### What to look for
+
+    | Smell | Why it's dangerous | Taught in |
+    |---|---|---|
+    | `apply` (or `-auto-approve`) in the PR job | anyone who opens a PR changes production, before review | tf-118 |
+    | the apply job uses a shared or stale checkout (`git checkout main` with no fetch, `git pull` into a folder other jobs use) | it applies yesterday's code, rolling back today's merge | tf-119 |
+    | no tip-of-main check | re-running an old job applies an old commit | tf-119 |
+    | no `-lock-timeout` | jobs that overlap fail at random | tf-105, tf-119 |
+    | the result isn't reported | nobody notices a failed apply | tf-119 |
+
+    Read each script top to bottom, and for each command ask: **which commit is this, and could it change anything?**
+
+    ### Testing CI scripts
+
+    Don't test them by hoping. Make the situations happen: a PR that adds a resource, an older commit of `main`, a lock held by someone else. Then check what changed in the state and in AWS.
+
+    ### Common mistakes
+
+    - Fixing the PR job by commenting out `apply` while leaving `-auto-approve` on a `plan` (harmless) or a `destroy` (not).
+    - Making the apply job fetch, but still applying whatever `main` points to **now** instead of the commit it was started for.
+
+    ### Check your work
+
+    A new PR gets a plan comment and changes nothing. The apply job refuses anything but main's tip, waits for locks, and reports its result.
+  scenario: |
+    The team's CI scripts for **`dev/infra`** are in **`/lab/ci`**: **`plan-pr.sh N`** (run for
+    every pull request) and **`apply-main.sh SHA`** (run after each merge). A security review
+    found they're unsafe, and last week a PR changed production before anyone reviewed it.
+
+    Fix both scripts (keep their names and arguments) so that:
+
+    - `plan-pr.sh N` plans **PR N's head**, posts a comment starting with
+      `Terraform plan for <commit id>`, **never changes anything**, and exits non-zero if the
+      plan fails
+    - `apply-main.sh SHA` applies **only if SHA is main's current tip**, applies **exactly
+      that commit**, **waits up to 5 minutes** for the state lock, and posts the status
+      `terraform/apply` (`success`/`failure`) on SHA
+
+    Then run `apply-main.sh` for main's tip to bring AWS in line.
+  hints:
+    - "Read plan-pr.sh: what does it run besides plan? Which commit does it check out?"
+    - "Read apply-main.sh: does it fetch? Does it compare SHA with `git ls-remote … refs/heads/main`? Does it use `-lock-timeout`?"
+  solution: |
+    ```bash
+    cd /lab/ci
+    # plan-pr.sh: it checked out the PR's *branch name* from a stale shared clone,
+    # and ran "terraform apply -auto-approve" after the plan. Plan refs/pull/N/head, never apply.
+    # apply-main.sh: it ran "git checkout main" in a clone that is never fetched, applied
+    # without checking SHA, without -lock-timeout, and always reported success.
+    $EDITOR plan-pr.sh apply-main.sh
+    ./apply-main.sh "$(git ls-remote http://localhost:3000/dev/infra.git refs/heads/main | cut -f1)"
+    ```
+  setup: |
+    tf_aws_start
+    gitea_start
+    gitea_dev
+    rm -rf /lab/ci /lab/.seed
+    aws s3api create-bucket --bucket acme-tfstate >/dev/null
+    gitea_user ci-bot "ci-bot-pass-1" "CI"
+    gitea_repo dev infra
+    gitea_api PUT /repos/dev/infra/collaborators/ci-bot '{"permission":"write"}' >/dev/null
+    gitea_token ci-bot ci-bot-pass-1 ci | lab_file /lab/ci/token 0600
+    mkdir -p /lab/.seed; cd /lab/.seed; git init -q -b main .
+    cat > main.tf <<'EOF'
+    terraform {
+      backend "s3" {
+        bucket         = "acme-tfstate"
+        key            = "infra/terraform.tfstate"
+        region         = "us-east-1"
+        use_lockfile   = true
+        use_path_style = true
+      }
+      required_providers {
+        aws = {
+          source  = "hashicorp/aws"
+          version = "6.72.0"
+        }
+      }
+    }
+
+    provider "aws" {
+      region            = "us-east-1"
+      s3_use_path_style = true
+    }
+
+    resource "aws_iam_user" "svc" {
+      for_each = toset(["api"])
+      name     = "infra-${each.key}"
+    }
+    EOF
+    c() { git -c user.name=Dev -c user.email=dev@lab.test "$@"; }
+    c add main.tf; c commit -qm "Service users"
+    chown -R "$(lab_user):" /lab/.seed
+    tf_as_user /lab/.seed init -input=false -no-color >/dev/null
+    tf_as_user /lab/.seed apply -auto-approve -input=false -no-color >/dev/null
+    u=$(gitea_url dev/infra "dev:$(cat $KL_STATE/dev-pass)")
+    git push -q "$u" main 2>/dev/null
+    cd /; rm -rf /lab/.seed
+    # the shared clone the old scripts use, made before the next merge
+    sudo -u "$(lab_user)" -H git clone -q "$(gitea_url dev/infra)" /lab/ci/repo
+    t=$(mktemp -d); git clone -q "$u" $t/r 2>/dev/null; cd $t/r
+    c switch -qc add-worker; sed -i 's/toset(\["api"\])/toset(["api", "worker"])/' main.tf; c commit -qam "Add a worker user"
+    git push -q origin add-worker 2>/dev/null; cd /; rm -rf $t
+    gitea_api POST /repos/dev/infra/pulls '{"head":"add-worker","base":"main","title":"Add a worker user"}' >/dev/null
+    gitea_api POST /repos/dev/infra/pulls/1/merge '{"Do":"merge"}' >/dev/null
+    lab_file /lab/ci/plan-pr.sh 0755 <<'EOF'
+    #!/bin/bash
+    # plan-pr.sh N: plan pull request N and post the plan
+    n=$1
+    api=http://localhost:3000/api/v1/repos/dev/infra
+    branch=$(curl -s "$api/pulls/$n" | jq -r .head.ref)
+    cd /lab/ci/repo
+    git checkout -q "$branch" 2>/dev/null || git checkout -q -b "$branch"
+    terraform init -input=false -no-color >/dev/null
+    terraform plan -input=false -no-color > /tmp/plan.txt 2>&1
+    sha=$(git rev-parse HEAD)
+    body=$(printf 'Terraform plan for %s\n\n```\n%s\n```\n' "$sha" "$(cat /tmp/plan.txt)")
+    jq -n --arg b "$body" '{body: $b}' | curl -s -H "Authorization: token $(cat /lab/ci/token)" \
+      -H 'Content-Type: application/json' -X POST "$api/issues/$n/comments" -d @- >/dev/null
+    # save the reviewers a step
+    terraform apply -input=false -no-color -auto-approve >/dev/null 2>&1
+    exit 0
+    EOF
+    lab_file /lab/ci/apply-main.sh 0755 <<'EOF'
+    #!/bin/bash
+    # apply-main.sh SHA: apply main after a merge
+    sha=$1
+    api=http://localhost:3000/api/v1/repos/dev/infra
+    cd /lab/ci/repo
+    git checkout -q main
+    terraform init -input=false -no-color >/dev/null
+    terraform apply -input=false -no-color -auto-approve
+    curl -s -H "Authorization: token $(cat /lab/ci/token)" -H 'Content-Type: application/json' \
+      -X POST "$api/statuses/$sha" -d '{"context":"terraform/apply","state":"success"}' >/dev/null
+    EOF
+  check: |
+    P=/lab/ci/plan-pr.sh; A=/lab/ci/apply-main.sh
+    mk() { # BRANCH TITLE SEDEXPR -> PR number (made once)
+      local n; n=$(gitea_api GET "/repos/dev/infra/pulls?state=open" | jq -r --arg b "$1" '[.[] | select(.head.ref == $b)][0].number // empty')
+      if [ -z "$n" ]; then
+        local t; t=$(mktemp -d); git clone -q "$(gitea_url dev/infra "lab-admin:$(cat $KL_STATE/gitea-admin)")" $t/r 2>/dev/null
+        (cd $t/r && git switch -qc "$1" && sed -i "$3" main.tf && git -c user.name=Rev -c user.email=rev@lab.test commit -qam "$2" && git push -q origin "$1" 2>/dev/null)
+        rm -rf $t
+        n=$(gitea_api POST /repos/dev/infra/pulls "{\"head\":\"$1\",\"base\":\"main\",\"title\":\"$2\"}" | jq -r .number)
+      fi
+      echo "$n"
+    }
+    tip=$(git ls-remote "$(gitea_url dev/infra)" refs/heads/main | cut -f1)
+    sudo -u "$(lab_user)" -H bash -c "$A $tip" >/dev/null 2>&1; ra=$?
+    check "apply-main.sh applies main's tip (infra-worker exists)" '[ $ra -eq 0 ] && aws iam get-user --user-name infra-worker'
+    st=$(gitea_api GET "/repos/dev/infra/commits/$tip/status" 2>/dev/null)
+    check_eq "main's tip has terraform/apply = success" "$(jq -r '[.statuses[]? | select(.context == "terraform/apply") | .status // .state] | first // empty' <<<"$st")" success
+    pr=$(mk kl-check-auditor "Auditor user" 's/"worker"\]/"worker", "auditor"]/')
+    psha=$(gitea_api GET /repos/dev/infra/pulls/$pr | jq -r .head.sha)
+    serial=$(tf_s3_state acme-tfstate infra/terraform.tfstate | jq -r .serial)
+    sudo -u "$(lab_user)" -H bash -c "$P $pr" >/dev/null 2>&1; rp=$?
+    cm=$(gitea_api GET "/repos/dev/infra/issues/$pr/comments" | jq -r '.[-1].body // empty')
+    check "plan-pr.sh comments the plan of the PR's head commit" '[ $rp -eq 0 ] && head -1 <<<"$cm" | grep -q "^Terraform plan for $psha" && grep -q "Plan: 1 to add" <<<"$cm"'
+    check_not "plan-pr.sh changed nothing (no infra-auditor user)" 'aws iam get-user --user-name infra-auditor'
+    check_eq "plan-pr.sh left the state alone" "$(tf_s3_state acme-tfstate infra/terraform.tfstate | jq -r .serial)" "$serial"
+    bad=$(mk kl-check-broken "Broken change" '$a resource "aws_iam_user" "oops" {')
+    sudo -u "$(lab_user)" -H bash -c "$P $bad" >/dev/null 2>&1; rb=$?
+    check "plan-pr.sh exits non-zero when the plan fails" '[ $rb -ne 0 ]'
+    sudo -u "$(lab_user)" -H bash -c "$A $psha" >/dev/null 2>&1; r1=$?
+    check "apply-main.sh refuses a PR's commit" '[ $r1 -ne 0 ] && ! aws iam get-user --user-name infra-auditor >/dev/null 2>&1'
+    lk=$(mktemp); printf '{"ID":"kl-check-lock","Operation":"OperationTypeApply","Info":"","Who":"other-job@ci","Version":"1.16.7","Created":"%s","Path":"acme-tfstate/infra/terraform.tfstate"}' "$(date -u +%FT%TZ)" > $lk
+    cp $lk /lab/.kl-lock.json; chmod a+r /lab/.kl-lock.json
+    aws s3 cp /lab/.kl-lock.json s3://acme-tfstate/infra/terraform.tfstate.tflock >/dev/null
+    ( sleep 15; aws s3 rm s3://acme-tfstate/infra/terraform.tfstate.tflock >/dev/null 2>&1 ) &
+    sudo -u "$(lab_user)" -H bash -c "$A $tip" >/dev/null 2>&1; r3=$?
+    wait; rm -f $lk /lab/.kl-lock.json
+    check "apply-main.sh waits for another job's lock" '[ $r3 -eq 0 ]'
+  solve: |
+    cat > /lab/ci/plan-pr.sh <<'EOF'
+    #!/bin/bash
+    # plan-pr.sh N: plan pull request N of dev/infra and post the plan as a comment
+    set -u
+    n=${1:?usage: plan-pr.sh PR_NUMBER}
+    api=http://localhost:3000/api/v1/repos/dev/infra
+    w=/lab/ci/work-$n
+    rm -rf "$w"
+    git clone -q http://localhost:3000/dev/infra.git "$w" || exit 2
+    git -C "$w" fetch -q origin "refs/pull/$n/head" && git -C "$w" checkout -q FETCH_HEAD || exit 2
+    sha=$(git -C "$w" rev-parse HEAD)
+    cd "$w"
+    { terraform init -input=false -no-color >/dev/null && terraform plan -input=false -no-color; } > plan.txt 2>&1; rc=$?
+    body=$(printf 'Terraform plan for %s\n\n```\n%s\n```\n' "$sha" "$(cat plan.txt)")
+    jq -n --arg b "$body" '{body: $b}' |
+      curl -fsS -H "Authorization: token $(cat /lab/ci/token)" -H 'Content-Type: application/json' \
+        -X POST "$api/issues/$n/comments" -d @- >/dev/null
+    exit $rc
+    EOF
+    cat > /lab/ci/apply-main.sh <<'EOF'
+    #!/bin/bash
+    # apply-main.sh SHA: apply dev/infra at SHA, which must be the tip of main
+    set -u
+    sha=${1:?usage: apply-main.sh SHA}
+    repo=http://localhost:3000/dev/infra.git
+    api=http://localhost:3000/api/v1/repos/dev/infra
+    tip=$(git ls-remote "$repo" refs/heads/main | cut -f1)
+    [ -n "$tip" ] && [ "$sha" = "$tip" ] || { echo "refusing: $sha is not the tip of main ($tip)" >&2; exit 3; }
+    w=/lab/ci/apply-work; rm -rf "$w"
+    git clone -q "$repo" "$w" && git -C "$w" checkout -q "$sha" || exit 2
+    cd "$w"
+    terraform init -input=false -no-color >/dev/null && terraform apply -input=false -no-color -auto-approve -lock-timeout=5m
+    rc=$?
+    state=success; [ $rc -eq 0 ] || state=failure
+    curl -fsS -H "Authorization: token $(cat /lab/ci/token)" -H 'Content-Type: application/json' \
+      -X POST "$api/statuses/$sha" -d "{\"context\":\"terraform/apply\",\"state\":\"$state\",\"description\":\"terraform apply: $state\"}" >/dev/null
+    exit $rc
+    EOF
+    chmod +x /lab/ci/plan-pr.sh /lab/ci/apply-main.sh
+    /lab/ci/apply-main.sh "$(git ls-remote http://localhost:3000/dev/infra.git refs/heads/main | cut -f1)" >/dev/null 2>&1

@@ -1259,9 +1259,9 @@ gitea_repo() {
 }
 # gitea_url OWNER/REPO [USER:PASS] -> its clone URL (with credentials only when given, for setups)
 gitea_url() { if [ -n "${2:-}" ]; then echo "http://${2}@localhost:3000/$1.git"; else echo "http://localhost:3000/$1.git"; fi; }
-# gitea_token USER PASS NAME -> create an access token (scopes: repository read/write, user read)
+# gitea_token USER PASS NAME -> create an access token (scopes: repository and issue write, user read)
 gitea_token() {
-  gitea_as "$1" "$2" POST "/users/$1/tokens" "{\"name\":\"$3\",\"scopes\":[\"write:repository\",\"read:user\"]}" | jq -r .sha1
+  gitea_as "$1" "$2" POST "/users/$1/tokens" "{\"name\":\"$3\",\"scopes\":[\"write:repository\",\"write:issue\",\"read:user\"]}" | jq -r .sha1
 }
 
 # gitea_dev -> the learner's Gitea account "dev" (password in $KL_STATE/dev-pass), and
