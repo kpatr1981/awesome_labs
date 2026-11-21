@@ -55,7 +55,7 @@ techniques on systems you own or are explicitly authorized to test.
 | Environment | VMs | What's inside |
 |-------------|-----|---------------|
 | **Docker host** | `kl-docker` (2 CPU, 4 GiB) | Ubuntu 24.04, Docker Engine + Compose + Buildx, common images pre-pulled, networking and diagnostic tools, a Python data-science image, Terraform 1.16 with an offline provider mirror, Ansible (ansible-core 2.21) with SSH-managed node containers |
-| **Kubernetes cluster** | `kl-cp` → `controlplane` (2 CPU, 3 GiB)<br>`kl-worker` → `node01` (2 CPU, 2.5 GiB) | kubeadm **v1.36**, containerd 2, Calico (enforces NetworkPolicies), metrics-server, local-path storage (default StorageClass), Traefik ingress + Gateway API (NodePorts 30080/30443), Helm |
+| **Kubernetes cluster** | `kl-cp` → `controlplane` (2 CPU, 3.5 GiB)<br>`kl-worker` → `node01` (2 CPU, 4 GiB) | kubeadm **v1.36**, containerd 2, Calico (enforces NetworkPolicies), metrics-server, local-path storage (default StorageClass), Traefik ingress + Gateway API (NodePorts 30080/30443), Helm |
 | **Offensive security lab** | `kl-offsec` (2 CPU, 3 GiB) | Ubuntu 24.04, Docker (hosts the vulnerable targets), attacker tooling (nmap, ncat, hydra, john, …) and wordlists under `/usr/share/kl`. Attacker and targets are the same isolated box |
 
 The cluster deliberately runs one minor release behind the newest Kubernetes, so the
@@ -94,7 +94,7 @@ shows the plan.
     to avoid a [QEMU crash on Lima's `user-v2` network](https://github.com/lima-vm/lima/issues/5722).
     Starting the `kl-cp` or `kl-worker` VMs with `limactl` directly skips it.
 - Go ≥ 1.27 to build
-- ~6 GiB of free RAM (one environment at a time; ~10 GiB with Docker and Kubernetes both up), ~40 GiB of disk
+- ~8 GiB of free RAM (one environment at a time; ~12 GiB with Docker and Kubernetes both up), ~40 GiB of disk
 - Internet access (packages and images are downloaded on first start)
 
 ## Download
@@ -276,8 +276,8 @@ on_exit: stop                  # stop · delete · keep — what ctrl+c does to 
 auto_stop: true                # stop idle lab VMs (see "Only what's needed runs")
 delete_stopped_after_days: 0   # delete lab VMs stopped this many days (0 = never)
 docker:       {cpus: 2, memory: 4GiB}   # applied when a VM is (re)created:
-controlplane: {cpus: 2, memory: 3GiB}   #   awesome_labs env rebuild docker|k8s
-worker:       {cpus: 2, memory: 2560MiB}
+controlplane: {cpus: 2, memory: 3584MiB} #   awesome_labs env rebuild docker|k8s
+worker:       {cpus: 2, memory: 4GiB}
 ```
 
 Changes apply at once, `on_exit` included. With

@@ -79,8 +79,8 @@ var (
 		{Name: "kl-docker", Role: "docker", Hostname: "docker-host", CPUs: 2, Memory: "4GiB"}, // room for Jupyter notebooks
 	}}
 	K8sEnv = Env{Profile: exercise.ProfileK8s, Title: "Kubernetes cluster", VMs: []VM{
-		{Name: "kl-cp", Role: "cp", Hostname: "controlplane", CPUs: 2, Memory: "3GiB"},
-		{Name: "kl-worker", Role: "worker", Hostname: "node01", CPUs: 2, Memory: "2560MiB"},
+		{Name: "kl-cp", Role: "cp", Hostname: "controlplane", CPUs: 2, Memory: "3584MiB"},
+		{Name: "kl-worker", Role: "worker", Hostname: "node01", CPUs: 2, Memory: "4GiB"}, // room for add-ons: Argo CD, Prometheus, Kyverno…
 	}}
 	OffsecEnv = Env{Profile: exercise.ProfileOffsec, Title: "Offensive security lab", VMs: []VM{
 		{Name: "kl-offsec", Role: "offsec", Hostname: "offsec", CPUs: 2, Memory: "3GiB"},

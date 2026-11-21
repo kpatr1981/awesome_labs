@@ -111,8 +111,8 @@ auto_stop: true
 #   awesome_labs env rebuild docker|k8s
 # afterwards. Defaults shown; the Kubernetes nodes need at least 2 CPUs / 2GiB.
 # docker:       {cpus: 2, memory: 4GiB}
-# controlplane: {cpus: 2, memory: 3GiB}
-# worker:       {cpus: 2, memory: 2560MiB}
+# controlplane: {cpus: 2, memory: 3584MiB}
+# worker:       {cpus: 2, memory: 4GiB}
 # offsec:       {cpus: 2, memory: 3GiB}
 `
 
