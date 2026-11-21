@@ -1066,6 +1066,65 @@ Added 2026-11-21. Not started.
 | **A mini Internet** | Capstone: several BGP autonomous systems meeting at an exchange point, a root DNS server and a CA, all on FRR and namespaces. Build it until a host in one AS can reach a TLS site in another by name, then fix faults injected at each layer | Docker VM; the FRR helpers |
 | **A key-value store that survives crashes** | Write one with a write-ahead log. The check `kill -9`s it in the middle of writes and restarts it: nothing that was acknowledged may be lost (`fsync`, atomic renames, a torn last record) | Docker VM; Python or Go |
 
+### Even more ideas
+
+Added 2026-11-21. Not started. The suggested first five: **radio from recordings**, **a tiny OS
+kernel**, **Open vSwitch**, **PostGIS** and **Suricata**: each is far from what the catalogue
+covers and needs no heavy infrastructure.
+
+**Low-level & building things**
+
+| Idea | The lab | Runs on |
+|---|---|---|
+| **A tiny OS kernel** | Boot your own kernel in QEMU (RISC-V is simplest: `qemu-system-riscv64 -machine virt`), print to the serial port, take a timer interrupt, switch between two tasks. The check reads the serial output | Docker VM; QEMU |
+| **Write an interpreter** | Tokenizer → parser → bytecode VM for a small language, graded by hidden test programs (output and error messages) | Docker VM; Python or Go |
+| **RISC-V assembly** | A cleaner instruction set to learn than x86: registers, calls, the stack, syscalls, run with `qemu-user` on the arm64 VMs | Docker VM; cross toolchain |
+| **Verilog in simulation** | A counter, a UART transmitter, VGA timing in Icarus Verilog or Verilator; the check runs a hidden testbench. No FPGA | Docker VM |
+| **Arduino without a board** | AVR firmware in `simavr`: timers, interrupts, UART; the check reads the simulated pins and serial | Docker VM; avr-gcc |
+| **WebAssembly & WASI** | Compile C or Go to wasm, run it in `wasmtime`, grant and deny file access, find why a module can't open a file | Docker VM |
+| **Rust** | Borrow-checker errors to fix, a data race that `unsafe` let through, an async task that never wakes up | Docker VM; Rust image |
+
+**Networking**
+
+| Idea | The lab | Runs on |
+|---|---|---|
+| **Open vSwitch & OpenFlow** | Program a switch's flows by hand with `ovs-ofctl`: VLANs, a mirror port, a flow rule that drops too much | Docker VM; namespaces |
+| **Multicast** | IGMP and PIM on FRR: a video stream (a UDP multicast sender) that never crosses the router | Docker VM; FRR helpers |
+| **Flow monitoring** | SNMP counters and NetFlow/sFlow (`softflowd`, `nfdump`): find the host saturating the uplink | Docker VM |
+| **IPv6-only with NAT64/DNS64** | An IPv6-only network that still reaches IPv4 sites (Tayga or Jool + DNS64 in Unbound), and an app that breaks on a hard-coded IPv4 literal | Docker VM |
+| **QUIC & HTTP/3** | `curl --http3` against a lab server, and why clients fall back to HTTP/2 when UDP 443 is blocked | Docker VM |
+
+**Security**
+
+| Idea | The lab | Runs on |
+|---|---|---|
+| **Suricata & Zeek** | Write an IDS rule that catches the attack in a capture without alerting on normal traffic; read Zeek's `conn.log` to find the beacon | Offsec VM; ties into packet capture |
+| **SSH honeypot (Cowrie)** | Run one, let a scripted attacker in, then reconstruct what it did from the session logs and the files it dropped | Offsec VM |
+| **Android APK reversing** | `apktool` and `jadx`, no emulator: find a hard-coded key in a lab-built app, patch a check, re-sign it | Docker VM; JDK |
+| **Passkeys (WebAuthn)** | Server-side registration and login, tested with a software authenticator (python-fido2); a relying-party ID mismatch to debug | Docker VM |
+| **GraphQL attacks** | Introspection leaks, brute force through batched queries and aliases, then depth and cost limits that stop it | Offsec VM; `web_target` |
+| **SOPS & age** | Encrypted secrets in Git, a key rotation, decrypting in a pipeline, the teammate who can't decrypt | Docker VM |
+
+**Cloud-native & data**
+
+| Idea | The lab | Runs on |
+|---|---|---|
+| **Canary releases with Argo Rollouts** | A rollout that rolls itself back when its error rate rises (analysis from Prometheus); test the nodes' memory first | k8s lab |
+| **KEDA** | Scale workers from a Redis queue's length, down to zero when it's empty, and back up when work arrives | k8s lab |
+| **PostGIS** | Nearest store, points in polygons, distances in metres vs degrees, and swapped latitude/longitude | Docker VM; PostgreSQL image with PostGIS |
+| **Parquet, Arrow & DuckDB** | Partitioned datasets, predicate pushdown, a schema change that breaks reading old files | Docker VM; data-science image |
+| **SQLite internals** | WAL mode, "database is locked" under concurrent writers, recovering a corrupt file with `.recover` | Docker VM |
+| **TimescaleDB** | Hypertables, continuous aggregates, retention and compression policies on PostgreSQL | Docker VM |
+
+**Just for fun**
+
+| Idea | The lab | Runs on |
+|---|---|---|
+| **Radio from recordings (SDR)** | Decode a 433 MHz weather station from a lab-generated IQ recording with `rtl_433`, demodulate FM with numpy, find a signal in a waterfall. No radio hardware | Docker VM |
+| **Quantum computing in a simulator** | Bell states, superposition and measurement, Grover's search on 3 qubits with Qiskit's simulator | Docker VM; data-science image |
+| **Nix** | Reproducible dev shells, pinning nixpkgs, why the same build gives different results | Docker VM; Nix in a container |
+| **Terminal fluency** | tmux sessions and panes, vim motions and macros, shell history tricks, graded by the files and sessions you end up with | Any VM |
+
 ### Useful but niche
 
 Problems that are rare until they ruin your day. The first three are the suggested starting point.
