@@ -770,6 +770,52 @@ system, then attacks it on the lab's own network, then secures it.
   Wireshark dissectors already in tshark.
 - **Start with** *MQTT & device fleets* and *Modbus & PLCs*: light, visual and easy to check.
 
+### ESP32 without external sensors
+
+Added 2026-11-21. Not started. ESP32 labs that need **no sensors or wiring**: only what is on the
+chip, and for the graded part no board at all.
+
+**Graded labs in an emulator (on the Docker VM).** Espressif's QEMU fork emulates the ESP32,
+ESP32-C3 and ESP32-S3, and `idf.py qemu` runs firmware in it: flash, eFuses and Ethernet
+networking (openeth) work, **Wi-Fi and Bluetooth don't**. Checks read the serial console, the
+flash image, the eFuse file and the device's network services, so they run unattended like
+every other track.
+
+| Module | Labs |
+|---|---|
+| **ESP-IDF & FreeRTOS from zero** | Build and run in QEMU, tasks pinned to two cores, queues and event groups, a mutex that deadlocks, a stack overflow the task watchdog catches, priorities that starve a task |
+| **Crashes & debugging** | Decode a Guru Meditation backtrace with `addr2line`, read a core dump saved to flash, step through with `gdb` on QEMU's gdb stub, find a heap corruption with heap tracing |
+| **Flash layout** | Partition tables, NVS key-value storage (and a namespace that fills up), a LittleFS filesystem out of space, firmware that no longer fits its partition |
+| **OTA updates** | Update over HTTP across QEMU's Ethernet, A/B app partitions, automatic rollback when the new firmware fails its self-test |
+| **Secure boot & flash encryption** | Turn both on, sign images, prove an unsigned or tampered image won't boot. **Emulator only:** on a real board these burn eFuses for good |
+| **Firmware reverse engineering** | Dump a lab-built image, parse its partition table, pull Wi-Fi credentials out of NVS, find a hard-coded API key, patch and re-flash. Ties into *Firmware analysis* under Reverse engineering |
+| **A networked device** | An HTTP server and REST API on the device, MQTT to a broker on the VM, mDNS, SNTP time, TLS with a client certificate from the lab CA. Ties into *MQTT & device fleets* |
+
+**Bring-your-own-board extras (optional).** For a bare devkit on the learner's desk. Lima VMs
+can't reach USB devices, so these flash and read the serial port from the Mac
+(`esptool`, `idf.py monitor`) and grade themselves from the serial output: the firmware prints
+a result line that a small host-side checker verifies.
+
+| Built-in part | Labs |
+|---|---|
+| **Wi-Fi** | Station and access-point modes, a captive provisioning portal, scanning channels and RSSI |
+| **Wi-Fi as a sensor** | Detect movement in the room from Wi-Fi channel state information (CSI) or RSSI changes, with no sensor at all |
+| **Promiscuous mode** | Capture your own network's beacons and probe requests to a pcap and open it in Wireshark |
+| **BLE** | A GATT server read from a phone (nRF Connect), advertising as a beacon, pairing and bonding |
+| **ESP-NOW** *(two boards)* | Messages between boards with no router, measuring range and latency |
+| **Touch pins** | A bare pin as a capacitive button: calibration, thresholds, waking from deep sleep on touch |
+| **Hardware accelerators** | The hardware RNG and the AES/SHA engines against software versions, in speed and output |
+| **On-chip sensors** | The internal temperature sensor (S2/S3/C3); the original ESP32's hall sensor (older ESP-IDF only) |
+| **LED & BOOT button** | LEDC PWM fading, debouncing GPIO0, a Morse beacon on the onboard LED |
+| **Power** | Deep sleep with timer, touch or button wake-up, the ULP coprocessor counting while the cores sleep, data kept in RTC memory across sleeps |
+| **DAC → ADC with one jumper** *(original ESP32)* | Generate a waveform on a DAC pin, measure it on an ADC pin, map the ADC's non-linearity |
+
+- **Tooling:** ESP-IDF (pinned, about 1–2 GB with toolchains) and Espressif's QEMU build in their
+  own image, pulled on first use rather than in bootstrap; check that the Xtensa/RISC-V
+  toolchains and QEMU build exist for arm64 Linux first.
+- **Start with** *ESP-IDF & FreeRTOS from zero* and *Firmware reverse engineering*: both work
+  entirely in QEMU.
+
 ## Event streaming
 
 Kafka-style event streaming, which the roadmap so far only touches through RabbitMQ.
