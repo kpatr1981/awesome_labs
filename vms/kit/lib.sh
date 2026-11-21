@@ -1174,6 +1174,88 @@ EOF
   case "$d" in "$LAB"/*) chown -R "$(lab_user)": "$LAB" ;; esac
 }
 
+# ---------- cert-manager helpers ----------
+CM_VERSION=v1.21.3
+CM_CHART=/opt/kubelab/cert-manager-$CM_VERSION.tgz
+# cm_cleanup — remove what a cert-manager install leaves outside its own namespace: the
+# leader-election Roles, RoleBindings and Leases in kube-system. The controllers are stopped
+# first, or they would take the Leases again. Registered by cm_install (and by exercises
+# where the learner installs it).
+cm_cleanup() {
+  kubectl delete deploy -A -l "helm.sh/chart=cert-manager-$CM_VERSION" --wait=true --timeout=60s >/dev/null 2>&1
+  kubectl -n kube-system delete role,rolebinding -l "helm.sh/chart=cert-manager-$CM_VERSION" --ignore-not-found >/dev/null 2>&1
+  kubectl -n kube-system delete lease cert-manager-controller cert-manager-cainjector-leader-election --ignore-not-found >/dev/null 2>&1
+}
+# cm_webhook_ok — does the cert-manager webhook answer? (a server-side dry run goes through it)
+cm_webhook_ok() {
+  kubectl apply --dry-run=server -f - >/dev/null 2>&1 <<'EOF'
+apiVersion: cert-manager.io/v1
+kind: Issuer
+metadata: {name: kl-probe, namespace: default}
+spec: {selfSigned: {}}
+EOF
+}
+# cm_install — install cert-manager (release cert-manager, namespace cert-manager, CRDs
+# included) from the bundled chart and wait until its webhook answers
+cm_install() {
+  on_reset cm_cleanup
+  helm install cert-manager "$CM_CHART" -n cert-manager --create-namespace \
+    --set crds.enabled=true --set startupapicheck.enabled=false \
+    --set global.leaderElection.namespace=cert-manager --wait --timeout 6m >/dev/null || return 1
+  eventually 120 cm_webhook_ok
+}
+# cm_lab_ca — a lab CA: ClusterIssuer "selfsigned", the CA certificate cert-manager/lab-root
+# (Secret lab-root) and the ClusterIssuer "lab-ca" that signs with it
+cm_lab_ca() {
+  kapply <<'EOF'
+apiVersion: cert-manager.io/v1
+kind: ClusterIssuer
+metadata: {name: selfsigned}
+spec: {selfSigned: {}}
+---
+apiVersion: cert-manager.io/v1
+kind: Certificate
+metadata: {name: lab-root, namespace: cert-manager}
+spec:
+  isCA: true
+  commonName: Lab Root CA
+  secretName: lab-root
+  duration: 87600h
+  privateKey: {algorithm: ECDSA, size: 256}
+  issuerRef: {name: selfsigned, kind: ClusterIssuer}
+---
+apiVersion: cert-manager.io/v1
+kind: ClusterIssuer
+metadata: {name: lab-ca}
+spec: {ca: {secretName: lab-root}}
+EOF
+  kubectl -n cert-manager wait --for=condition=Ready certificate/lab-root --timeout=90s >/dev/null &&
+    kubectl wait --for=condition=Ready clusterissuer/lab-ca --timeout=90s >/dev/null
+}
+# cm_ready NS NAME — the Certificate is Ready for its current spec
+cm_ready() {
+  kubectl -n "$1" get certificate "$2" -o json 2>/dev/null | jq -e '.metadata.generation as $g
+    | any(.status.conditions[]?; .type == "Ready" and .status == "True" and (.observedGeneration // $g) >= $g)' >/dev/null
+}
+# cm_issuer_ready clusterissuer NAME | issuer NAME NS
+cm_issuer_ready() {
+  [ "$(kubectl get "$1" "$2" ${3:+-n "$3"} -o jsonpath='{.status.conditions[?(@.type=="Ready")].status}' 2>/dev/null)" = True ]
+}
+# cm_crt NS SECRET [KEY] -> a PEM from a TLS Secret (tls.crt by default)
+cm_crt() { kubectl -n "$1" get secret "$2" -o json 2>/dev/null | jq -r --arg k "${3:-tls.crt}" '.data[$k] // empty' | base64 -d 2>/dev/null; }
+# cm_sans NS SECRET -> the certificate's SANs, one per line, sorted ("DNS:a.test", "IP Address:10.0.0.1")
+cm_sans() { cm_crt "$1" "$2" | openssl x509 -noout -ext subjectAltName 2>/dev/null | tail -n +2 | tr ',' '\n' | sed 's/^ *//' | grep -v '^$' | sort; }
+# cm_serial NS SECRET / cm_pubkey NS SECRET -> serial number / SHA-256 of the public key
+cm_serial() { cm_crt "$1" "$2" | openssl x509 -noout -serial 2>/dev/null | cut -d= -f2; }
+cm_pubkey() { cm_crt "$1" "$2" | openssl x509 -noout -pubkey 2>/dev/null | sha256sum | cut -d' ' -f1; }
+# cm_signed_by NS SECRET CAFILE — the Secret's certificate verifies against the CA in CAFILE
+cm_signed_by() {
+  local t; t=$(mktemp)
+  cm_crt "$1" "$2" >"$t"
+  [ -s "$t" ] && openssl verify -CAfile "$3" "$t" >/dev/null 2>&1; local rc=$?
+  rm -f "$t"; return $rc
+}
+
 # ---------- docker compose helpers ----------
 # cc_ids PROJECT SERVICE -> ids of running containers of a compose service
 cc_ids() { docker ps -q --filter "label=com.docker.compose.project=$1" --filter "label=com.docker.compose.service=$2"; }

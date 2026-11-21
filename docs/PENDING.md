@@ -8,12 +8,12 @@ what to consolidate. The target doesn't lower the bar: a lab should carry a real
 scenario and teach a concept. The parts of this list that the existing exercises don't cover
 are not started.
 
-Exercise counts (<!-- count:total -->1,668<!-- /count --> total):
+Exercise counts (<!-- count:total -->1,679<!-- /count --> total):
 
 | Topic | Exercises | Target | Track | Module files |
 |---|---|---|---|---|
 | Docker | <!-- count:docker -->186<!-- /count --> | 250 | `docker` | `exercises/docker/` |
-| Kubernetes | <!-- count:kubernetes -->283<!-- /count --> | 250 | `kubernetes` | `exercises/kubernetes/` |
+| Kubernetes | <!-- count:kubernetes -->294<!-- /count --> | 250 | `kubernetes` | `exercises/kubernetes/` |
 | Offensive security | <!-- count:offsec -->83<!-- /count --> | 250 | `offsec` | `exercises/offsec/` |
 | Linux & systems | <!-- count:linux -->86<!-- /count --> | 250 | `linux` | `exercises/linux/` |
 | Networking | <!-- count:networking -->106<!-- /count --> | 250 | `networking` | `exercises/networking/` |
@@ -52,7 +52,8 @@ Exercise counts (<!-- count:total -->1,668<!-- /count --> total):
    on the existing VMs and are easy to check.
 2. **Networking & IP routing**, which the rest of the networking group builds on.
 3. ~~**TLS & PKI**~~, before OpenVPN and the mail TLS exercises. Done in
-   `exercises/networking/10-tls-and-pki.yaml`, apart from cert-manager.
+   `exercises/networking/10-tls-and-pki.yaml`, and cert-manager in
+   `exercises/kubernetes/23-cert-manager.yaml`.
 4. **Degraded networks and VPN creation.**
 5. **DNS & email**, with DNS first, because MX records, SPF, DKIM and DMARC are all DNS.
 6. **Everything else**, in any order.
@@ -515,7 +516,7 @@ with the real tools:
 | Track | What you'd practise | Runs on | Relies on |
 |---|---|---|---|
 | **Networking & IP routing** | Addressing to BGP, firewalls, packet analysis | Docker VM; k8s lab for Calico and MetalLB | Nothing; the foundation |
-| **TLS & PKI** | Done in `exercises/networking/10-tls-and-pki.yaml`: keys and CSRs, SANs and wildcards, PKCS#12 and DER, SNI, picking intermediates, the system trust store, key pinning, `openssl ca` with a CRL, name constraints, OCSP, dual RSA/ECDSA certificates, root rollover with a cross-signed root. **Still to do:** cert-manager (k8s track) | Docker VM; k8s lab for cert-manager | Nothing |
+| **TLS & PKI** | Done in `exercises/networking/10-tls-and-pki.yaml`: keys and CSRs, SANs and wildcards, PKCS#12 and DER, SNI, picking intermediates, the system trust store, key pinning, `openssl ca` with a CRL, name constraints, OCSP, dual RSA/ECDSA certificates, root rollover with a cross-signed root. cert-manager is done in `exercises/kubernetes/23-cert-manager.yaml` | Docker VM; k8s lab for cert-manager | Nothing |
 | **Web servers & proxies** | nginx and HAProxy config, caching, load balancing, timeouts, 502 and 504 hunts | Docker VM; light | TLS & PKI, loosely |
 | **Degraded networks (netem)** | Delay, loss, reordering, corruption and bandwidth caps | Docker VM and k8s lab | Networking |
 | **VPN creation** | WireGuard, OpenVPN, IPsec, mesh VPNs | Docker VM; k8s lab for Calico | Networking, TLS & PKI |
@@ -1083,12 +1084,12 @@ starting point.
 
 ### Next round
 
-Added 2026-11-21. Not started. The first three are the suggested starting point: they need almost no
-new infrastructure and build on the TLS & PKI, networking and Terraform modules.
+Added 2026-11-21. cert-manager is done (`exercises/kubernetes/23-cert-manager.yaml`, k8s-383..393).
+The rest are not started; the first two are the suggested next step: they need almost no new
+infrastructure and build on the networking and Terraform modules.
 
 | Idea | The lab | Runs on | Builds on |
 |---|---|---|---|
-| **cert-manager** | Install it with Helm, issue certificates from a CA issuer, then fix an Ingress certificate that never becomes Ready (the TLS & PKI row's "still to do") | k8s lab | TLS & PKI, Helm |
 | **SSH tunnels & pivoting** | Reach a database two hops away with `-L`, `-R`, `-D` and `ProxyJump`, then lock the jump host down (`PermitOpen`, `AllowTcpForwarding`) | Docker or offsec VM; namespaces or containers as hosts | Networking essentials |
 | **Policy as code (OPA/Conftest)** | Write Rego that blocks a Terraform plan with a public bucket or an unpinned image, then debug a rule that matches nothing | Docker VM; pinned `conftest`/`opa` image | Terraform in automation (JSON plans) |
 | **Purging secrets from Git** | gitleaks finds a key in history; remove it with `git filter-repo`, force-push to a bare remote, and prove no ref, tag or reflog still holds it | Docker VM | Git recovery & plumbing |
