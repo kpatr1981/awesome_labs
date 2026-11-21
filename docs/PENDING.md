@@ -380,6 +380,51 @@ For Networking, Degraded networks, VPN creation and DNS & email.
 Linux admin relies on other tracks for two topics: routing, DNS and firewalls are in
 Networking and DNS & email, and boot failures are built with the QEMU rescue module.
 
+### Build your own container runtime
+
+Added 2026-11-21. Not started. *Container internals* (`exercises/linux/07-container-internals.yaml`)
+builds a container **by hand**, one command at a time. This module turns that into a **program**:
+a small Docker-like tool, `/lab/minibox`, written in Go or Python (or Bash for the first labs),
+that grows a feature per lab. Each lab's check runs the learner's tool, as root on the Docker VM,
+and inspects the result from outside: `/proc/PID/ns/*`, `/sys/fs/cgroup`, `ip netns`, mounts.
+Every check also runs the earlier labs' tests, so a later feature can't break an earlier one.
+
+| Level | Lab | What `minibox` learns to do |
+|---|---|---|
+| Beginner | **`run` = fork and exec** | `minibox run /bin/echo hi`: run a command, pass its exit code back, forward signals (Ctrl-C reaches the child) |
+| Beginner | **Its own hostname and PIDs** | New UTS and PID namespaces (`clone`/`unshare` flags): the command sees itself as PID 1 and a hostname given with `--hostname` |
+| Beginner | **Its own root filesystem** | `--rootfs DIR` from an exported busybox or alpine image: a mount namespace, `pivot_root` (not just `chroot`, and why), mounting `/proc` inside |
+| Beginner | **Images from a tarball** | `minibox pull` stand-in: unpack an image saved with `docker save` (manifest, layer tarballs) into a rootfs, whiteout files included |
+| Beginner | **Memory and process limits** | `--memory 64m --pids 20`: create a cgroup v2 group, write `memory.max` and `pids.max`, move the child in before it execs; the check runs a memory hog and a fork bomb |
+| Intermediate | **CPU limits and accounting** | `--cpus 0.5` via `cpu.max`, `minibox stats` reading `memory.current`, `cpu.stat` and `pids.current` |
+| Intermediate | **Overlay layers** | Several layers + a writable upper dir with `overlayfs`; changes stay out of the image, `--rm` removes the upper dir |
+| Intermediate | **Networking** | `--net bridge`: a network namespace, a veth pair onto a `minibox0` bridge, an address from a small pool, NAT out with nftables, `-p 8080:80` as a DNAT rule |
+| Intermediate | **Volumes and environment** | `-v HOST:CTR` bind mounts (read-only too), `-e KEY=VAL`, `-w DIR`, running as a non-root `--user` |
+| Intermediate | **Detached containers** | `run -d`, `ps`, `logs`, `stop` (SIGTERM, then SIGKILL after a timeout), `rm`: state kept in `/var/lib/minibox/ID/` |
+| Advanced | **Dropping privileges** | Drop capabilities (`capset`, the bounding set), `no_new_privs`, a read-only root, masked `/proc` paths; the check tries the escapes that should now fail |
+| Advanced | **A seccomp filter** | Block a list of syscalls with a BPF filter (libseccomp or a hand-built filter), so `unshare` or `mount` inside returns `EPERM` |
+| Advanced | **Rootless** | User namespaces with `uid_map`/`gid_map` (and `newuidmap`), so an ordinary user can run it; what breaks without root (cgroup delegation, networking) |
+| Advanced | **`exec` into a running container** | `minibox exec ID cmd` with `setns` into each namespace, joining its cgroup too |
+| Capstone | **Run a real image** | Run a two-container app (nginx in front of a small Python service) from saved images with limits, a private network, a published port and a volume, then `stop` and `rm` without leaking a mount, cgroup, veth or rule (the check looks for leftovers) |
+
+- **Language:** Go is the natural fit (`syscall.SysProcAttr` has `Cloneflags`, `Unshareflags`,
+  `UidMappings`; it is what runc and Docker are written in) and runs from the pinned
+  `golang:1.24-alpine` image already on the VM. Python works with `os.unshare`, `os.setns`,
+  `ctypes` for `pivot_root`/`mount`, and needs nothing new. Bash with `unshare`, `nsenter`
+  and `ip` covers the first labs. A `go_test`-style helper builds the tool and runs the
+  check's scenarios against it.
+- **Tutorials** carry the full picture once, in the first lab, as a diagram of what
+  `docker run` does (image → rootfs → namespaces → cgroup → network → exec), and each later
+  lab points to the step it adds. They link back to the *Container internals* lab that did
+  the same step by hand (linux-050 rootfs, linux-051 cgroups, linux-052 layers, linux-053
+  OCI config, linux-054 user namespaces, linux-055 capabilities).
+- **Cleanup:** cgroups under `/sys/fs/cgroup/minibox/`, the `minibox0` bridge, veths,
+  nftables table `minibox`, overlay mounts and `/var/lib/minibox` must all be removed on
+  reset (`on_reset`), since a learner's buggy tool will leak them.
+- **Grows into:** an OCI `config.json` mode that makes `minibox` a drop-in for `runc` (the
+  check runs it under containerd or Docker as a custom runtime), and a tiny image registry
+  client that pulls from the lab's `registry:2`.
+
 ### QEMU modules
 
 | Module | Exercises |
@@ -544,6 +589,45 @@ Moto only emulates the API, so these limits apply:
 | **Replication** | Done in `data-047` to `data-049`: a lagging replica and its slot, failover, stalled synchronous commits |
 | **Migrations** | A failed migration is done in `data-052` |
 
+### Statistics modules (Data science track)
+
+Added 2026-11-21. Not started. A **statistics ladder from zero to advanced** in the
+`datascience` track (Jupyter notebooks, like the rest of it): eight modules of 15 (the first
+one 20), about 125 exercises, which takes the track past its 250 target. Today statistics only
+appears in passing (`ds` outliers, the A/B test, the bootstrap median, chi-square, Simpson's
+paradox, Spearman); those stay where they are, and the new modules point back to them.
+
+**Every exercise teaches with a worked example.** The tutorial works through the idea on a
+small dataset of its own (6–10 numbers, small enough to follow by hand), with the arithmetic
+written out, then does the same in pandas/scipy/statsmodels and shows that the numbers match.
+Then it gives the reading: what the result means in a sentence a manager would understand, and
+the wrong conclusion people usually draw. The exercise then uses a different, per-run dataset,
+so the example never gives the answer away. Checks compare numbers with a tolerance, ask for
+the decision as well as the statistic ("ship / don't ship", "can't tell yet"), and where it
+fits, run the learner's function on hidden data.
+
+| Module | Labs, beginner → advanced |
+|---|---|
+| **Describing data** *(first module)* | Mean vs median when one value is huge · spread: range, IQR, variance and standard deviation (why `n-1`) · percentiles and the box plot's five numbers · skew, and which average to report · z-scores to compare across scales · frequency tables and histograms with honest bins · weighted averages (a mean of means that is wrong) · grouped summaries · correlation, and what a correlation of 0 still allows (Anscombe's quartet) · *capstone:* summarise a salary survey without misleading anyone |
+| **Probability** | Counting and simple probability · conditional probability from a two-way table · Bayes' rule on a medical test (the base-rate trap) · independence, checked rather than assumed · expected value and variance of a game · simulation to check an answer you derived (Monte Carlo) · the birthday problem · *capstone:* is the fraud alert worth acting on? |
+| **Distributions** | Binomial (defects in a batch) · Poisson (calls per hour) and when it fails (overdispersion) · normal, and the 68-95-99.7 rule · exponential waiting times · log-normal incomes and response times · fitting a distribution and checking the fit (Q-Q plots, KS test) · the central limit theorem by simulation · heavy tails, where the mean misleads · *capstone:* capacity planning from request-latency data |
+| **Estimation & confidence** | Sampling variability by simulation · standard error vs standard deviation · confidence intervals for a mean and a proportion (Wilson, not the textbook one, for small counts) · what 95% really means (simulated coverage) · the bootstrap for any statistic · sample size for a target margin of error · biased samples that no sample size fixes (survivorship, non-response) · *capstone:* an election poll with weights |
+| **Hypothesis testing** | Null, alternative and p-value, built from a permutation test first · one- and two-sample t-tests and their assumptions · paired vs unpaired (before/after) · proportions test · chi-square goodness of fit · non-parametric tests (Mann-Whitney, Wilcoxon) · ANOVA and post-hoc comparisons · effect size next to the p-value · multiple comparisons (Bonferroni, Benjamini-Hochberg) · p-hacking by simulation · *capstone:* review a colleague's "significant" findings |
+| **Experiments & A/B testing** | Randomisation and units of analysis · power and sample size before you start · minimum detectable effect · peeking stops a test too early (simulated false-positive rate) · sequential testing done right · a sample ratio mismatch that invalidates a test · metrics as ratios (delta method) · CUPED variance reduction · novelty effects over time · guardrail metrics · *capstone:* decide on a pricing experiment with three variants |
+| **Regression** | Simple linear regression by hand and with statsmodels · reading the coefficient table (estimate, SE, CI, p) · residual plots and the assumptions · categorical predictors and dummy coding · interactions · confounding: a coefficient that flips when a variable is added · multicollinearity (VIF) · transformations (log-log as elasticity) · logistic regression and odds ratios · Poisson regression for counts · robust standard errors · *capstone:* what drives delivery time, explained to operations |
+| **Bayesian & causal** *(advanced)* | Beta-binomial updating of a conversion rate · priors and how much they matter · credible vs confidence intervals · Bayesian A/B: probability B beats A and the expected loss · hierarchical shrinkage (ratings with few votes) · a tiny Metropolis sampler in NumPy · correlation vs causation with a DAG · difference-in-differences · propensity scores and matching · regression discontinuity · instrumental variables · *capstone:* did the loyalty programme really raise spend? |
+
+- **Tooling:** numpy, pandas and scipy are already in `kl-datascience:1`. Add **statsmodels**
+  (regression tables, ANOVA, proportion tests, power) pinned in the image; optional:
+  matplotlib for plots in tutorials (already in the Jupyter image). The image change needs an
+  `env rebuild docker`, or a pinned pip install on first use like `tshark_ready`, so saved VM
+  copies don't go stale.
+- **Data:** generated in setup with a per-run seed from known parameters, so the check knows
+  the true answer (the real effect, the real distribution) and can also grade "can't tell
+  yet" when the data can't settle it.
+- **Learning path:** a `statistics` path in `learning-paths.yaml` across the eight modules,
+  plus the existing ds labs that use statistics.
+
 ## Security
 
 | Track | What you'd practise | Runs on |
@@ -598,6 +682,39 @@ with a capstone.
   image pulled on first use.
 - **Start with** *Binary basics* and *Firmware analysis* — they need nothing heavier than
   the Docker VM and teach the triage every later module builds on.
+
+### Command-line disassemblers
+
+Added 2026-11-21. Not started. A from-zero ladder for **reading disassembly in a terminal**, to
+come before *Disassembly & decompilation* (which assumes it). Each lab gives a small program that
+setup compiles with per-run constants, so the answer is a value read out of the machine code, not
+looked up.
+
+| Level | Lab | What it teaches |
+|---|---|---|
+| Beginner | **Your first `objdump -d`** | `objdump -d --no-show-raw-insn`, `-M intel`, finding `main`, matching a 5-line C function to its instructions; answer: the constant it adds |
+| Beginner | **Sections and symbols** | `objdump -h`/`-t`, `readelf -S -s`, `.text` vs `.rodata` vs `.data`, `nm`; find which function a string belongs to |
+| Beginner | **Calls and the calling convention** | Arguments in registers (`rdi`, `rsi`… / `x0`, `x1`…), return values, `call`/`ret`, the PLT: which libc functions are called, with what |
+| Beginner | **Branches and loops** | `cmp`/`test` + `jcc` (or `cmp` + `b.cond`), reading an `if` and a `for` loop back into pseudo-code; answer: the loop's bound |
+| Intermediate | **`gdb` as a disassembler** | `disassemble`, `x/20i $pc`, `layout asm`, `break *ADDR`, `info registers`, stepping with `si`/`ni`; read a value computed at run time |
+| Intermediate | **radare2 / rizin basics** | `aaa`, `afl`, `pdf @ main`, `iz`, `axt` (cross-references), visual mode `V`/`VV`; find the function that uses a string |
+| Intermediate | **Stripped binaries** | No symbols: find `main` from `_start`/`__libc_start_main`, name functions by what they call, `strings -t x` and xrefs to anchor |
+| Intermediate | **Raw blobs** | Bytes with no ELF header: `objdump -D -b binary -m i386:x86-64` (or `aarch64`), `ndisasm`, `r2 -a x86 -b 64`, find where code starts |
+| Advanced | **Optimised code** | Compare `-O0` and `-O2` output of the same function: inlining, strength reduction (`lea` tricks, multiply-by-reciprocal for division), tail calls |
+| Advanced | **Switches and jump tables** | A `switch` compiled into a table in `.rodata`, follow it by hand; answer: which input reaches which case |
+| Advanced | **Patch it from the command line** | Change one conditional jump with `r2 -w` (`wa`/`wx`) or `printf | dd`, prove the binary's behaviour changed |
+| Capstone | **The crackme** | A stripped, optimised password checker: reverse the check with only terminal tools and write the password that the original binary accepts (per-run algorithm constants) |
+
+- **Architecture:** the lab VMs are **arm64** on Apple Silicon. Either teach AArch64 first
+  (native, runnable), or cross-compile x86-64 with `gcc-x86-64-linux-gnu`, disassemble with
+  `binutils-multiarch` (`objdump` for any architecture) and run with `qemu-user-static`. Best
+  is both: every lab ships the same program for both architectures and the tutorial shows
+  the two side by side, since x86-64 is what most guides and CTFs use.
+- **Tooling:** binutils, `gdb` (with `gdb-multiarch`), radare2 or rizin (pin one; their
+  commands differ slightly), `nasm` for `ndisasm`. All are light and fit on the Docker VM.
+- **Checks:** an answer file with a value read from the code, a pseudo-code answer replaced
+  by "what does it return for input X" (the check runs the binary with hidden inputs), or a
+  patched binary the check runs.
 
 ## Active Directory on Linux
 
@@ -739,6 +856,50 @@ which other sites already cover well. SQL is under [Data](#data).
 - **Toolchains:** run each language in a container on the Docker VM, so no new VM is
   needed.
 
+### C64 game programming (6502 assembly and C)
+
+Added 2026-11-21. Not started. A new track (`retro`) that teaches **making a game for the
+Commodore 64 from zero**: first 6502 assembly, then the machine, then a game, in assembly
+with ca65 or in C with cc65. Over the course the learner builds **one original single-screen
+game of their own design** (no recreation of an existing game), plus small throwaway programs
+for each new idea. Every tutorial works the idea through on a different example (other
+addresses, other values), with the listing, what each line does, and what you should see.
+
+| Module | Labs, beginner → advanced |
+|---|---|
+| **6502 from zero** *(first module, 20)* | Registers A/X/Y and the first `LDA`/`STA` · hex, binary and the byte · the flags (N, Z, C, V) after each instruction · branches and loops (`CPX`, `BNE`) · addressing modes (immediate, zero page, absolute, indexed, indirect-indexed) · 16-bit add and subtract with the carry · shifts for multiply/divide by 2 · subroutines, the stack and `JSR`/`RTS` · lookup tables instead of maths · BCD with `SED`/`ADC`/`CLD` for scores · *capstone:* a 16-bit multiply routine checked on hidden inputs |
+| **The C64 machine** | The memory map and banking (`$01`) · screen RAM `$0400` and colour RAM `$D800` · screen codes vs PETSCII · clearing and drawing with loops · reading the joystick (`$DC00`, active low) and the keyboard matrix · waiting for a raster line (`$D012`) for 50 Hz timing · border and background colours · custom character sets (`$D018`) · *capstone:* a playable maze screen with a moving character in characters only |
+| **Sprites** | Enable, position, colour and pointer (`$D000`–`$D02E`, `$07F8`) · X beyond 255 (`$D010`) · multicolour sprites and expansion · animation by changing the pointer · hardware collision (`$D01E`/`$D01F`) vs software boxes · priority against the background · *capstone:* the player and three enemies moving with the joystick and simple AI |
+| **Making it a game** | The game loop and a frame counter · raster interrupts (`$D01A`, `$D019`, the vector at `$0314` or `$FFFE`) · movement that feels right (acceleration, friction, a jump table) · collisions with characters (walls, pickups) · score, lives and a HUD · a pseudo-random generator (16-bit LFSR, seeded from SID voice 3 at `$D41B`) · title screen, game over, high score · *capstone:* the learner's game, complete and playable |
+| **Sound with the SID** | Voices, frequency tables and notes · ADSR envelopes · waveforms (triangle, saw, pulse, noise) · sound effects as frame-by-frame scripts · filters · playing a GoatTracker or SID Factory tune from the IRQ while keeping one voice for effects · hard restart for crisp notes · *capstone:* full sound for the game |
+| **C with cc65** | `cl65` and the C64 target · `conio` and `joystick` drivers · writing VIC and SID registers from C (`<c64.h>`, `PEEK`/`POKE` style) · why `int` is slow: `unsigned char`, globals and `register` · mixing C and assembly (`__fastcall__`) · measuring a routine's cycles · *capstone:* the same game in C, with its tightest loop rewritten in assembly |
+| **Advanced techniques** | Smooth scrolling (fine scroll in `$D016`/`$D011`, the coarse shift every 8 pixels, spreading the copy over frames) · raster splits for a status bar · double buffering by flipping the screen or VIC bank · animated characters · sprite multiplexing (sort by Y, re-use sprites from raster IRQs) · stable rasters · compressing the program (exomizer) and a loader · *capstone:* a scrolling level with more than 8 moving objects |
+
+- **Design numbers for the tutorials** come from measurements of real C64 games, with credit
+  to the game measured. Examples: input lag of at most 2 frames (Giana Sisters: 2 frames, 18
+  frames to a top speed of 2 px/frame, a 27 px skid, a jump that starts at −4 px/frame with
+  +0.12 px/frame² gravity); shooters move with no inertia (1942: 3 px/frame); hitboxes smaller
+  than the 24-pixel sprite (8–16 px reach is common); multiplexers placing 32–60 sprites a
+  frame (IK+, Bomberland, Bill & Ted); BCD scores with `SED`. Ideas and numbers only: no code,
+  graphics or music from those games.
+- **Toolchain:** cc65 (ca65, ld65, cl65), 64tass as an alternative assembler, VICE (`x64sc`)
+  for running, and exomizer. All are light, build on arm64, and fit in one pinned image on the
+  Docker VM.
+- **ROMs: decide first.** VICE needs KERNAL, BASIC and character ROMs, which are copyrighted;
+  Debian and Ubuntu's `vice` package ships without them. Options: the open-source
+  [MEGA65 Open ROMs](https://github.com/MEGA65/open-roms) (free, mostly compatible for loading and
+  running PRGs), or programs that take over the machine and need no KERNAL calls, so they run
+  on any ROM. Never download the original ROMs in setup.
+- **Checks** run the learner's PRG headless in VICE (`-warp`, `-limitcycles`, joystick and
+  key input scripted, VICE's binary monitor read from Python) and look at the machine: screen
+  and colour RAM, VIC and SID registers, a variable's address, cycles per frame. Pure 6502
+  labs can also run in a Python 6502 emulator (py65) on hidden inputs. A screenshot
+  (`-exitscreenshot`) saved to `/lab` lets the learner see the result.
+- **Seeing and playing it:** the VM has no screen, so learners run VICE on their own machine
+  (`brew install vice`, plus ROMs they own or Open ROMs) on the PRG that `awesome_labs sync`
+  mirrors to `~/.awesome_labs/vscode/<lab>/`. Later: a browser C64 emulator in the web
+  interface, so the game runs on the exercise page.
+
 ## Practice modes
 
 New ways to use exercises, most of them reusing existing content.
@@ -833,6 +994,32 @@ new infrastructure and build on the TLS & PKI, networking and Terraform modules.
 | **Packaging** | Build a `.deb`, host a signed apt repository, fix a pinning or dependency conflict, a postinst script that fails halfway | Docker VM | Linux admin |
 | **dbt with DuckDB** | Fix broken model lineage, failing data tests, and an incremental model that double-counts | Docker VM; data-science image | Data, SQL in depth |
 
+### New lab formats
+
+Added 2026-11-21. Not started. Ways of grading that existing tracks can reuse.
+
+| Format | How it works | Fits |
+|---|---|---|
+| **Zero-downtime labs** | A traffic generator runs for the whole lab and logs every failed request; the check fails if even one dropped during the change. Proves "it works" and "it never broke" together | nginx reload, swapping a container behind a proxy, a k8s rollout with `preStop` and readiness, a Postgres expand/contract schema migration |
+| **Famous outages, rebuilt** | Small versions of public incidents, each linking the real postmortem: Cloudflare 2019 (a regex that burned the CPU), GitLab 2017 (a deleted database and backups that didn't work), Facebook 2021 (a BGP withdrawal that took its DNS with it), left-pad (an unpublished dependency), AWS S3 2017 (a typo in an operational command), a leap-second bug | Every track; a natural incident at the end of a module |
+| **Build your own X** | Write a small Redis-compatible server (RESP), DNS server or load balancer in Python or Go. The check drives it with the real clients: `redis-cli` and `redis-benchmark`, `dig`, `curl` under load | Programming, networking, data |
+| **Make it 10x faster** | A slow script, query or service with hidden correctness tests and a time budget. Profile it (`cProfile`, `pprof`, `EXPLAIN ANALYZE`) and fix the real bottleneck, not the obvious one | Programming, data, algorithms |
+| **King of the hill** | A scripted attacker hits your service every 30 seconds. Patch it while it keeps serving; the score counts the attacks that got through while you worked, and downtime counts against you | Defensive, offsec |
+
+### More cool ideas
+
+Added 2026-11-21. Not started.
+
+| Idea | The lab | Runs on |
+|---|---|---|
+| **Kubernetes the hard way** | Bootstrap a cluster by hand: your own CA and certificates, etcd, the API server, controller manager, scheduler and kubelet, then the CNI. All the PKI from the TLS & PKI module, used for real. Destructive, so it runs on a cluster that is rebuilt afterwards | k8s lab (rebuilt after) |
+| **Malicious packages** | A typosquatted package on a local `pypiserver` steals a secret during install. Find what it did, then stop it from happening again with hash-pinned requirements and a lockfile. The attack side of the *Supply chain* row | Docker VM |
+| **Disk forensics with Sleuth Kit** | Recover a deleted file from an ext4 image with `fls` and `icat`, build a timeline from inode times with `mactime`, find a file hidden in slack space | Docker or offsec VM |
+| **Text encoding problems** | Garbled UTF-8 (mojibake from a double decode), a BOM that breaks a script or a CSV header, CRLF in a shebang (`bad interpreter: /bin/bash^M`), Unicode normalisation making two equal-looking usernames differ, `LC_ALL` changing how `sort` orders | Docker VM |
+| **Hardening scored by Lynis** | Raise the Lynis hardening index above a threshold while every service on the box keeps working (the check tests both) | Docker VM |
+| **A mini Internet** | Capstone: several BGP autonomous systems meeting at an exchange point, a root DNS server and a CA, all on FRR and namespaces. Build it until a host in one AS can reach a TLS site in another by name, then fix faults injected at each layer | Docker VM; the FRR helpers |
+| **A key-value store that survives crashes** | Write one with a write-ahead log. The check `kill -9`s it in the middle of writes and restarts it: nothing that was acknowledged may be lost (`fsync`, atomic renames, a torn last record) | Docker VM; Python or Go |
+
 ### Useful but niche
 
 Problems that are rare until they ruin your day. The first three are the suggested starting point.
@@ -865,6 +1052,47 @@ networking rows are still to do, and the Docker VM doesn't have `tshark` yet.
 | **Defensive** | Done: `sec-045` to `sec-049` |
 | **Offsec** | Sniff plaintext credentials on an isolated lab network; ARP spoofing between namespaces, then the defender's view of it; reverse a custom binary protocol from captures |
 | **Networking** | Diagnose faults from captures: retransmissions, zero windows, RST storms and MTU problems |
+
+### Scapy labs
+
+Added 2026-11-21. Not started. A **Packet crafting with Scapy** module for the Networking track
+(profile docker, after *Traffic & troubleshooting*, which teaches `tcpdump`): build packets layer
+by layer, send them from network namespaces, and read captures from Python. Scapy is on no VM
+yet.
+
+| Level | Lab | What it teaches |
+|---|---|---|
+| Beginner | **Ping by hand** | `sr1(IP()/ICMP()/payload)`, reading a reply's TTL (a per-run `ip_default_ttl` on the target) |
+| Beginner | **Dissect a capture** | `rdpcap`, `show()`, `haslayer`, indexing layers: count packets, find a DNS name, a SYN's port, one packet's TTL |
+| Beginner | **Write a capture file** | Stack layers with `/`, set fields, DNS queries with `DNSQR`, `wrpcap` to a spec in `/lab/spec.txt` |
+| Beginner | **ARP sweep** | `srp(Ether()/ARP())` on a LAN where hosts ignore ping; list every IP and MAC |
+| Beginner | **Send exactly this datagram** | IP `tos`/`flags`/`ttl`, UDP ports and a payload, recorded by a sink on the target |
+| Intermediate | **A SYN scan by hand** | SYN-ACK vs RST vs silence, so open, closed or filtered; why the kernel sends RSTs |
+| Intermediate | **Traceroute with TTL** | `ttl=(1,6)`, ICMP time-exceeded, through a chain of router namespaces with per-run addresses |
+| Intermediate | **DNS by hand** | `/lab/dnsq.py NAME TYPE` built on `DNS`/`DNSQR`, which the check runs against fresh dnsmasq records |
+| Intermediate | **Sniff the one that matters** | `sniff(filter=…, lfilter=…, prn=…)`: put a message back together from chunks that arrive shuffled and duplicated among noise |
+| Intermediate | **Reassemble the fragments** | MF and fragment offsets, `defragment()`, with two datagrams' fragments interleaved out of order |
+| Advanced | **Through the firewall** | Read an nftables ruleset and craft what it lets through (a spoofed source port and a DSCP value) |
+| Advanced | **ARP spoofing, then defend** | `poison.py TARGET GATEWAY` proven against a test client, then a permanent neighbour entry that resists it |
+| Advanced | **A custom protocol layer** | A `Packet` class with `fields_desc`, `bind_layers`, a length filled in by `post_build`, checked against a hidden capture |
+| Advanced | **Replay somewhere else** | Rewrite a capture to a new server: drop `Ether`, delete `chksum`/`len` so they're recomputed. A real UDP socket catches bad checksums, which a sniffer would miss |
+| Capstone | **The covert channel** | Decode data hidden in ICMP payloads and IP ids, write `detect.py PCAP` that the check runs on a hidden capture, then send the implant's kill packet |
+
+- **Install:** a `scapy_ready` kit helper, like `tshark_ready`, puts a pinned scapy (2.6.x) into
+  `/opt/kl-scapy` with `pip --target` run in the pre-pulled `python:3.12-slim` image, adds a `.pth`
+  file to the system Python and a `scapy` wrapper (`python3 -m scapy`). There's no bootstrap change,
+  so no saved VM copy goes stale. Resets don't touch it.
+- **Sending needs root:** learners run `sudo ip netns exec NS python3 script.py` or `scapy`. On
+  layer 2 (`srp`, `sendp`), pass `iface="eth0"`.
+- **Checks** read a `tcpdump -Z root` sink in the target namespace (a `pkt_sink NS FILE [BPF]`
+  helper, with the file under `/tmp` and ending `.pcap` because of tcpdump's AppArmor profile), or
+  a real socket where checksums matter. Script deliverables (`dnsq.py`, `poison.py`, `klp.py`,
+  `detect.py`) are run by the check on fresh per-run data, so a hard-coded answer fails.
+- **Cleanup:** background listeners and generators in namespaces need `on_reset` kills, because
+  deleting a namespace leaves its processes running.
+- **Later, offsec:** the same tool for the offensive track: sniffing plaintext credentials,
+  TCP RST injection, DHCP starvation against a lab dnsmasq, and a defender's view in the
+  capture.
 
 ### CI/CD pipeline labs
 
