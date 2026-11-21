@@ -1,0 +1,798 @@
+track: git
+module: Pull requests & protected branches
+profile: docker
+order: 25
+exercises:
+
+# ===== Beginner =====
+
+- id: git-269
+  title: Your first pull request
+  difficulty: 1
+  kind: build
+  tags: [git, pull-request, branch, push, gitea, review]
+  tutorial: |
+    **What you're learning.** What a **pull request** is, and the everyday flow: branch, commit, push the branch, open the pull request.
+
+    ### Pull requests
+
+    A pull request (PR; GitLab calls it a merge request) is a request on the **hosting service**, not a Git feature: "please merge my branch into `main`". It's where the team reviews the change, CI reports test results, and someone presses **Merge**. Git only provides the branches.
+
+    ```
+    main      A───B───────────────M      ← merged when approved
+                   \             /
+    feature         C───D───────┘        ← your branch, pushed; the PR shows C and D
+    ```
+
+    ### The flow
+
+    ```bash
+    git switch -c fix-typo
+    # … edit, git add, git commit …
+    git push -u origin fix-typo
+    ```
+    ```text
+    remote: Create a new pull request for 'fix-typo':
+    remote:   http://localhost:3000/sam/site/compare/main...fix-typo
+    ```
+    Open that link, or go to the repository in the browser → **New Pull Request**, choose `fix-typo` → `main`, add a title, create.
+
+    The same with the API (handy in scripts). Gitea's API is at `/api/v1`, and you can log in with your password or a token:
+
+    ```bash
+    curl -s -u sam:"$PASSWORD" -X POST -H 'Content-Type: application/json' \
+      http://localhost:3000/api/v1/repos/sam/site/pulls \
+      -d '{"head": "fix-typo", "base": "main", "title": "Fix a typo on the home page"}' | jq .number
+    ```
+
+    This lab's Gitea is at **http://localhost:3000** (in your browser too). Your account is `dev`, with the password in `/lab/dev-password.txt`.
+
+    ### Common mistakes
+
+    - Committing on `main` and pushing it: there's nothing to review, and (once main is protected, git-270) the push is refused.
+    - Opening the PR the wrong way round (`main` into `feature`).
+    - Pushing the branch without `-u`, then wondering why `git push` asks where to push next time.
+
+    ### Check your work
+
+    The PR shows your commit, and `main` on the server hasn't changed.
+  scenario: |
+    In **`/lab/app`** (a clone of `dev/app`), add the file **`/lab/search.py`** to the project
+    root on a new branch **`add-search`**, push the branch, and open a pull request from
+    `add-search` into **`main`** titled **`Add search`**.
+
+    Don't change `main`.
+  hints:
+    - "`git switch -c add-search`, `cp /lab/search.py .`, `git add search.py`, `git commit`, `git push -u origin add-search`."
+    - "Open the PR in the browser at http://localhost:3000/dev/app, or with `curl` and the `/api/v1/repos/dev/app/pulls` API."
+  solution: |
+    ```bash
+    cd /lab/app
+    git switch -c add-search
+    cp /lab/search.py .
+    git add search.py && git commit -m "Add search"
+    git push -u origin add-search
+    curl -s -u dev:"$(cat /lab/dev-password.txt)" -X POST -H 'Content-Type: application/json' \
+      http://localhost:3000/api/v1/repos/dev/app/pulls \
+      -d '{"head":"add-search","base":"main","title":"Add search"}' | jq .number
+    ```
+  setup: |
+    git_home_guard
+    gitea_start
+    gitea_dev
+    P=$(cat $KL_STATE/dev-pass)
+    cp $KL_STATE/dev-pass /lab/dev-password.txt; chown "$(lab_user):" /lab/dev-password.txt; chmod 600 /lab/dev-password.txt
+    rm -rf /lab/app /lab/.seed
+    gitea_repo dev app
+    git init -q -b main /lab/.seed
+    printf 'def main():\n    print("app")\n' > /lab/.seed/app.py
+    git -C /lab/.seed -c user.name=Dev -c user.email=dev@lab.test add .
+    git -C /lab/.seed -c user.name=Dev -c user.email=dev@lab.test commit -qm "App"
+    git -C /lab/.seed push -q "$(gitea_url dev/app "dev:$P")" main 2>/dev/null; rm -rf /lab/.seed
+    gitea_clone dev/app /lab/app
+    printf 'def search(items, term):\n    return [i for i in items if term in i]\n' | lab_file /lab/search.py
+    git -C /lab/app rev-parse origin/main > "$KL_STATE/main"
+  check: |
+    pr=$(gitea_api GET "/repos/dev/app/pulls?state=open" | jq -c '[.[] | select(.head.ref == "add-search" and .base.ref == "main")][0] // empty')
+    check "an open pull request from add-search into main exists" '[ -n "$pr" ]'
+    check_eq "it is titled Add search" "$(jq -r .title <<<"$pr" 2>/dev/null)" "Add search"
+    check "the branch has search.py exactly as given" '[ "$(gitea_api GET "/repos/dev/app/raw/search.py?ref=add-search" | sha256sum)" = "$(sha256sum < /lab/search.py)" ]'
+    check_eq "main on the server is unchanged" "$(gitea_api GET /repos/dev/app/branches/main | jq -r .commit.id)" "$(cat $KL_STATE/main)"
+  solve: |
+    cd /lab/app
+    git switch -qc add-search
+    cp /lab/search.py .
+    git add search.py && git commit -qm "Add search"
+    git push -q -u origin add-search 2>/dev/null
+    curl -fsS -u dev:"$(cat /lab/dev-password.txt)" -X POST -H 'Content-Type: application/json' \
+      http://localhost:3000/api/v1/repos/dev/app/pulls -d '{"head":"add-search","base":"main","title":"Add search"}' >/dev/null
+
+- id: git-270
+  title: Protect main
+  difficulty: 2
+  kind: build
+  tags: [git, branch-protection, review, approvals, gitea, pre-receive]
+  tutorial: |
+    **What you're learning.** **Branch protection**: server-side rules that stop changes reaching `main` except through a reviewed pull request, and how a refused push looks.
+
+    ### Why on the server
+
+    Git itself lets anyone with write access push anything. Hooks on your laptop are optional (the Hooks module). Branch protection is enforced **by the server** for everyone, the repository owner included.
+
+    The usual rules for `main`:
+
+    | Rule | Gitea setting | Effect |
+    |---|---|---|
+    | no direct pushes | `enable_push: false` | every change arrives through a PR |
+    | required approvals | `required_approvals: 1` | a PR can't be merged until someone else approves it |
+    | dismiss stale approvals | `dismiss_stale_approvals: true` | pushing a new commit cancels earlier approvals |
+    | required status checks | `enable_status_check`, `status_check_contexts` | CI must report success (git-273) |
+
+    In the browser: repository → **Settings → Branches → Add new rule**. With the API:
+
+    ```bash
+    curl -s -u sam:"$PASSWORD" -X POST -H 'Content-Type: application/json' \
+      http://localhost:3000/api/v1/repos/sam/site/branch_protections \
+      -d '{"rule_name": "main", "enable_push": false, "required_approvals": 2}'
+    curl -s -u sam:"$PASSWORD" http://localhost:3000/api/v1/repos/sam/site/branch_protections | jq
+    ```
+
+    ### What a refused push looks like
+
+    ```text
+    remote: error: Not allowed to push to protected branch main
+    To http://localhost:3000/sam/site.git
+     ! [remote rejected] main -> main (pre-receive hook declined)
+    ```
+    The server's **pre-receive hook** checked the rules and declined.
+
+    ### Common mistakes
+
+    - A rule for `master` in a repository whose branch is `main`.
+    - Allowing pushes for "admins only". The admins are exactly who'll push in a hurry.
+    - Required approvals without "dismiss stale approvals": an approval for version 1 also lets version 2 through.
+
+    ### Check your work
+
+    A direct `git push origin main` is declined, and the rule shows the settings in the API.
+  scenario: |
+    Protect **`main`** of **`dev/app`** (you own it; password in `/lab/dev-password.txt`):
+
+    - **nobody** may push to `main` directly, you included
+    - a pull request needs **at least one approval** before it can be merged
+    - pushing new commits to a pull request **dismisses** earlier approvals
+
+    Then try a direct push of the commit waiting in **`/lab/app`**, and see it refused.
+  hints:
+    - "Repository → Settings → Branches in the browser, or `POST /api/v1/repos/dev/app/branch_protections` with `rule_name`, `enable_push`, `required_approvals`, `dismiss_stale_approvals`."
+    - "`git push origin main` from /lab/app should end with `pre-receive hook declined`."
+  solution: |
+    ```bash
+    curl -s -u dev:"$(cat /lab/dev-password.txt)" -X POST -H 'Content-Type: application/json' \
+      http://localhost:3000/api/v1/repos/dev/app/branch_protections \
+      -d '{"rule_name":"main","enable_push":false,"required_approvals":1,"dismiss_stale_approvals":true}'
+    cd /lab/app && git push origin main       # ! [remote rejected] main -> main (pre-receive hook declined)
+    ```
+  setup: |
+    git_home_guard
+    gitea_start
+    gitea_dev
+    P=$(cat $KL_STATE/dev-pass)
+    cp $KL_STATE/dev-pass /lab/dev-password.txt; chown "$(lab_user):" /lab/dev-password.txt; chmod 600 /lab/dev-password.txt
+    rm -rf /lab/app /lab/.seed
+    gitea_repo dev app
+    git init -q -b main /lab/.seed
+    printf 'def main():\n    print("app")\n' > /lab/.seed/app.py
+    git -C /lab/.seed -c user.name=Dev -c user.email=dev@lab.test add .
+    git -C /lab/.seed -c user.name=Dev -c user.email=dev@lab.test commit -qm "App"
+    git -C /lab/.seed push -q "$(gitea_url dev/app "dev:$P")" main 2>/dev/null; rm -rf /lab/.seed
+    gitea_clone dev/app /lab/app
+    git -C /lab/app rev-parse origin/main > "$KL_STATE/main"
+    sudo -u "$(lab_user)" -H bash -c 'cd /lab/app && echo "# quick fix" >> app.py && git commit -qam "Quick fix straight on main"'
+  check: |
+    r=$(gitea_api GET /repos/dev/app/branch_protections | jq -c '[.[] | select(.rule_name == "main" or .branch_name == "main")][0] // empty')
+    check "main has a protection rule" '[ -n "$r" ]'
+    check_eq "direct pushes are off" "$(jq -r .enable_push <<<"$r" 2>/dev/null)" false
+    check "at least one approval is required" '[ "$(jq -r ".required_approvals // 0" <<<"$r" 2>/dev/null)" -ge 1 ]'
+    check_eq "new commits dismiss earlier approvals" "$(jq -r .dismiss_stale_approvals <<<"$r" 2>/dev/null)" true
+    check_eq "main on the server is unchanged" "$(gitea_api GET /repos/dev/app/branches/main | jq -r .commit.id)" "$(cat $KL_STATE/main)"
+    check_eq "Gitea refuses direct pushes to main from you" "$(gitea_as dev "$(cat $KL_STATE/dev-pass)" GET /repos/dev/app/branches/main | jq -r .user_can_push)" false
+  solve: |
+    curl -fsS -u dev:"$(cat /lab/dev-password.txt)" -X POST -H 'Content-Type: application/json' \
+      http://localhost:3000/api/v1/repos/dev/app/branch_protections \
+      -d '{"rule_name":"main","enable_push":false,"required_approvals":1,"dismiss_stale_approvals":true}' >/dev/null
+    cd /lab/app && ! git push -q origin main 2>/dev/null
+
+- id: git-271
+  title: Code owners request their own reviews
+  difficulty: 2
+  kind: build
+  tags: [git, codeowners, review, pull-request, gitea]
+  tutorial: |
+    **What you're learning.** What a **CODEOWNERS** file does, how its patterns work in Gitea, and how it makes the right people review the right changes automatically.
+
+    ### CODEOWNERS
+
+    A `CODEOWNERS` file on the **target branch** maps paths to people. When a pull request changes a matching file, the hosting service **requests a review** from those people by itself. Combined with protection rules, it can also make their approval required.
+
+    Gitea reads it from `CODEOWNERS`, `docs/CODEOWNERS` or `.gitea/CODEOWNERS`. Each line is a **pattern** and one or more owners. In Gitea the pattern is a **regular expression** matched against the file path (GitHub and GitLab use glob patterns instead):
+
+    ```text
+    # .gitea/CODEOWNERS
+    api/.*          @maria
+    .*\.sql         @dba-team-lead
+    deploy/.*       @ops1 @ops2
+    ```
+    - `.*` means "anything", and `\.` is a literal dot.
+    - The owners must have access to the repository.
+    - Only the file on the PR's **base** branch counts. A CODEOWNERS change inside the PR itself doesn't apply to that PR.
+
+    ### Commands you'll use
+
+    ```bash
+    git add .gitea/CODEOWNERS && git commit -m "Code owners" && git push origin main
+    curl -s -u sam:"$PASSWORD" http://localhost:3000/api/v1/repos/sam/site/pulls/4 | jq '[.requested_reviewers[].login]'
+    ```
+    ```text
+    ["maria"]
+    ```
+
+    ### Common mistakes
+
+    - Glob syntax (`/api/` or `*.sql`) that Gitea's regular expressions don't match the way you'd expect.
+    - Committing CODEOWNERS on the feature branch only.
+    - Opening the PR **before** CODEOWNERS is on `main`: reviews are requested when the PR is created or updated.
+
+    ### Check your work
+
+    Each PR has exactly the reviewers its files call for.
+  scenario: |
+    In **`dev/app`**, **`alice`** owns everything under **`payments/`** and **`bob`** owns
+    everything under **`docs/`**. Both are collaborators already.
+
+    1. Add a **`.gitea/CODEOWNERS`** file to `main` (in `/lab/app`) that requests their reviews
+       for changes in those folders.
+    2. Then open two pull requests into `main`: one from the pushed branch **`fee-update`**,
+       one from **`docs-typo`**.
+
+    Each PR must get exactly its owner as a requested reviewer.
+  hints:
+    - "Gitea CODEOWNERS patterns are regular expressions: `payments/.* @alice` and `docs/.* @bob`. Commit it on main and push."
+    - "Open the PRs only after CODEOWNERS is on main, in the browser or with `POST /api/v1/repos/dev/app/pulls`."
+  solution: |
+    ```bash
+    cd /lab/app
+    mkdir -p .gitea
+    printf 'payments/.* @alice\ndocs/.* @bob\n' > .gitea/CODEOWNERS
+    git add .gitea/CODEOWNERS && git commit -m "Code owners for payments and docs" && git push origin main
+    for b in fee-update docs-typo; do
+      curl -s -u dev:"$(cat /lab/dev-password.txt)" -X POST -H 'Content-Type: application/json' \
+        http://localhost:3000/api/v1/repos/dev/app/pulls -d "{\"head\":\"$b\",\"base\":\"main\",\"title\":\"$b\"}" | jq -c '[.number, [.requested_reviewers[].login]]'
+    done
+    ```
+  setup: |
+    git_home_guard
+    gitea_start
+    gitea_dev
+    P=$(cat $KL_STATE/dev-pass)
+    cp $KL_STATE/dev-pass /lab/dev-password.txt; chown "$(lab_user):" /lab/dev-password.txt; chmod 600 /lab/dev-password.txt
+    gitea_user alice alice-pass-1 "Alice Martin"; gitea_user bob bob-pass-1 "Bob Lee"
+    rm -rf /lab/app /lab/.seed
+    gitea_repo dev app
+    for u in alice bob; do gitea_api PUT /repos/dev/app/collaborators/$u '{"permission":"write"}' >/dev/null; done
+    git init -q -b main /lab/.seed; cd /lab/.seed
+    c() { git -c user.name=Dev -c user.email=dev@lab.test "$@"; }
+    mkdir -p payments docs; echo 'FEE = 0.029' > payments/fees.py; echo '# Payments guide' > docs/payments.md; echo 'app' > README.md
+    c add .; c commit -qm "App"
+    u=$(gitea_url dev/app "dev:$P")
+    git push -q "$u" main 2>/dev/null
+    c switch -qc fee-update; echo 'FEE = 0.025' > payments/fees.py; c commit -qam "Lower the card fee"; git push -q "$u" fee-update 2>/dev/null
+    c switch -q main; c switch -qc docs-typo; echo '# Payment guide' > docs/payments.md; c commit -qam "Fix a typo"; git push -q "$u" docs-typo 2>/dev/null
+    cd /; rm -rf /lab/.seed
+    gitea_clone dev/app /lab/app
+  check: |
+    co=$(gitea_api GET "/repos/dev/app/raw/.gitea/CODEOWNERS?ref=main" 2>/dev/null)
+    check ".gitea/CODEOWNERS is on main" '[ -n "$co" ]'
+    for b in fee-update:alice docs-typo:bob; do
+      br=${b%%:*}; who=${b#*:}
+      pr=$(gitea_api GET "/repos/dev/app/pulls?state=open" | jq -c --arg b "$br" '[.[] | select(.head.ref == $b and .base.ref == "main")][0] // empty')
+      check "an open pull request from $br into main exists" '[ -n "$pr" ]'
+      check_eq "its requested reviewers are exactly $who" "$(jq -r '[.requested_reviewers[]?.login] | sort | join(",")' <<<"$pr" 2>/dev/null)" "$who"
+    done
+  solve: |
+    cd /lab/app
+    mkdir -p .gitea
+    printf 'payments/.* @alice\ndocs/.* @bob\n' > .gitea/CODEOWNERS
+    git add .gitea/CODEOWNERS && git commit -qm "Code owners for payments and docs" && git push -q origin main 2>/dev/null
+    for b in fee-update docs-typo; do
+      curl -fsS -u dev:"$(cat /lab/dev-password.txt)" -X POST -H 'Content-Type: application/json' \
+        http://localhost:3000/api/v1/repos/dev/app/pulls -d "{\"head\":\"$b\",\"base\":\"main\",\"title\":\"$b\"}" >/dev/null
+    done
+
+# ===== Intermediate =====
+
+- id: git-272
+  title: The pull request with conflicts
+  difficulty: 3
+  kind: fix
+  tags: [git, pull-request, conflict, rebase, force-with-lease]
+  tutorial: |
+    **What you're learning.** Why a pull request becomes unmergeable, and the clean way to fix it on your side: rebase the branch onto the new `main`, resolve the conflict, and update the PR with `--force-with-lease`.
+
+    ### Why "This branch has conflicts"
+
+    While your PR waited, someone merged a change to the same lines into `main`. The server can't merge the two by itself, so the Merge button is disabled:
+
+    ```bash
+    curl -s -u sam:"$PASSWORD" http://localhost:3000/api/v1/repos/sam/shop/pulls/7 | jq .mergeable
+    ```
+    ```text
+    false
+    ```
+
+    ### Updating the branch
+
+    ```bash
+    git switch coupon
+    git fetch origin
+    git rebase origin/main          # replay your commits on today's main
+    ```
+    ```text
+    CONFLICT (content): Merge conflict in cart.py
+    ```
+    Edit the file so that **both** changes survive, then:
+
+    ```bash
+    git add cart.py
+    git rebase --continue
+    git push --force-with-lease     # the PR updates itself
+    ```
+    - Rebasing rewrites your branch's commits, so a plain push is refused. `--force-with-lease` overwrites the branch **only if** nobody else pushed to it since your last fetch. A plain `--force` would silently throw their work away.
+    - Merging `origin/main` into your branch also works, and adds a merge commit. Many teams prefer the linear history a rebase gives.
+
+    ### Common mistakes
+
+    - Resolving the conflict by keeping only your side, and undoing what `main` just got.
+    - `git push --force` onto a branch a colleague also pushes to.
+    - Merging `main` into the branch **and** rebasing: the history gets messy.
+
+    ### Check your work
+
+    The PR says it can be merged, its branch starts at the current `main`, and the file has both changes.
+  scenario: |
+    Pull request **#1** in **`dev/app`** (branch **`discount`** into `main`) can't be merged any
+    more: `main` changed the same lines in `prices.py` meanwhile.
+
+    In **`/lab/app`**, bring `discount` up to date by **rebasing** it onto the current `main`,
+    keeping **both** changes, and update the PR. Don't merge it yet, and keep the branch's
+    history linear (no merge commits).
+  hints:
+    - "`git switch discount`, `git fetch`, `git rebase origin/main`. Read the conflict in prices.py: main added VAT, the branch added a discount."
+    - "After `git add prices.py` and `git rebase --continue`, update the branch with `git push --force-with-lease`."
+  solution: |
+    ```bash
+    cd /lab/app
+    git switch discount
+    git fetch origin
+    git rebase origin/main          # CONFLICT in prices.py
+    # keep both: the VAT line from main and the discount from the branch
+    $EDITOR prices.py
+    git add prices.py
+    git rebase --continue
+    git push --force-with-lease
+    ```
+  setup: |
+    git_home_guard
+    gitea_start
+    gitea_dev
+    P=$(cat $KL_STATE/dev-pass)
+    cp $KL_STATE/dev-pass /lab/dev-password.txt; chown "$(lab_user):" /lab/dev-password.txt; chmod 600 /lab/dev-password.txt
+    rm -rf /lab/app /lab/.seed
+    gitea_repo dev app
+    git init -q -b main /lab/.seed; cd /lab/.seed
+    c() { git -c user.name=Dev -c user.email=dev@lab.test "$@"; }
+    printf 'def price(base):\n    total = base\n    return round(total, 2)\n' > prices.py
+    c add .; c commit -qm "Prices"
+    u=$(gitea_url dev/app "dev:$P")
+    git push -q "$u" main 2>/dev/null
+    c switch -qc discount
+    printf 'def price(base):\n    total = base * 0.9  # 10%% discount\n    return round(total, 2)\n' > prices.py
+    c commit -qam "Ten percent discount"; git push -q "$u" discount 2>/dev/null
+    gitea_api POST /repos/dev/app/pulls '{"head":"discount","base":"main","title":"Ten percent discount"}' >/dev/null
+    c switch -q main
+    printf 'VAT = 1.2\n\ndef price(base):\n    total = base * VAT\n    return round(total, 2)\n' > prices.py
+    c commit -qam "Prices include VAT"; git push -q "$u" main 2>/dev/null
+    cd /; rm -rf /lab/.seed
+    gitea_clone dev/app /lab/app
+    sudo -u "$(lab_user)" -H git -C /lab/app branch -q discount origin/discount
+  check: |
+    M=$(mktemp -d); gitea_mirror dev/app $M/g; g() { git --git-dir=$M/g "$@"; }
+    pr=$(gitea_api GET /repos/dev/app/pulls/1)
+    check_eq "PR #1 is still open" "$(jq -r .state <<<"$pr")" open
+    check "PR #1 can be merged now" 'eventually 20 "[ \"\$(gitea_api GET /repos/dev/app/pulls/1 | jq -r .mergeable)\" = true ]"'
+    check_eq "discount starts at the current main" "$(g merge-base main discount 2>/dev/null)" "$(g rev-parse main)"
+    check_eq "discount has no merge commits" "$(g rev-list --merges main..discount 2>/dev/null | wc -l)" 0
+    f=$(g show discount:prices.py 2>/dev/null)
+    check "prices.py on discount keeps main's VAT" 'grep -q "^VAT = 1.2" <<<"$f" && grep -q "VAT" <<<"$(grep "total =" <<<"$f")"'
+    check "prices.py on discount keeps the discount" 'grep "total =" <<<"$f" | grep -q "0.9"'
+    check "price(100) on discount is 108.0" '[ "$(cd $M && python3 -c "exec(open(\"/dev/stdin\").read()); print(price(100))" <<<"$f" 2>/dev/null)" = "108.0" ]'
+    rm -rf "$M"
+  solve: |
+    cd /lab/app
+    git switch -q discount
+    git fetch -q origin 2>/dev/null
+    git rebase origin/main >/dev/null 2>&1 || true
+    printf 'VAT = 1.2\n\ndef price(base):\n    total = base * VAT * 0.9  # 10%% discount\n    return round(total, 2)\n' > prices.py
+    git add prices.py
+    GIT_EDITOR=true git rebase --continue >/dev/null
+    git push -q --force-with-lease origin discount 2>/dev/null
+
+- id: git-273
+  title: "Required status: the tests must pass"
+  difficulty: 3
+  kind: fix
+  tags: [git, pull-request, status-check, ci, branch-protection, api]
+  tutorial: |
+    **What you're learning.** What a **commit status** is, how CI reports one, and how a **required status check** blocks a merge until the tests pass.
+
+    ### Commit statuses
+
+    CI systems report results by attaching a **status** to a **commit**: a `context` (the check's name), a `state` (`pending`, `success`, `failure`, `error`) and a description. The PR shows the statuses of its **head commit**. A protection rule can require some contexts to be `success` before merging:
+
+    ```bash
+    # what CI does when the tests finish
+    curl -s -u ci-bot:"$TOKEN" -X POST -H 'Content-Type: application/json' \
+      http://localhost:3000/api/v1/repos/sam/shop/statuses/$(git rev-parse HEAD) \
+      -d '{"context": "ci/unit", "state": "success", "description": "42 tests passed"}'
+    curl -s http://localhost:3000/api/v1/repos/sam/shop/commits/$(git rev-parse HEAD)/status | jq '.state, [.statuses[].context]'
+    ```
+    ```text
+    "success"
+    ["ci/unit"]
+    ```
+
+    - The status belongs to **one commit**. Push a new commit, and it has no statuses until CI runs again.
+    - Nothing stops anyone with write access from posting `success` by hand. That's why real CI posts with its own account and permissions. In this lab, **you** are the CI: run the tests, and report what they say.
+
+    ### Merging through the API
+
+    ```bash
+    curl -s -u sam:"$PASSWORD" -X POST -H 'Content-Type: application/json' \
+      http://localhost:3000/api/v1/repos/sam/shop/pulls/7/merge -d '{"Do": "merge"}'
+    ```
+    ```text
+    {"message":"Not all required status checks successful"}     ← 405 until the check is green
+    ```
+
+    ### Common mistakes
+
+    - Posting the status on your **local** commit before pushing it, or on the old head.
+    - Reporting `success` without running the tests.
+    - Fixing the test instead of the code.
+
+    ### Check your work
+
+    The PR's head commit shows `ci/tests: success`, the PR is merged, and `./test.sh` passes on `main`.
+  scenario: |
+    `main` of **`dev/app`** requires the status check **`ci/tests`**. Pull request **#1**
+    (branch **`retry`**) can't be merged, and when you run the project's tests (`./test.sh`) on
+    that branch, they fail.
+
+    Acting as the CI system:
+
+    1. In **`/lab/app`**, fix the **code** on `retry` (not the test) and push it.
+    2. Run `./test.sh`, and when it passes, report **`ci/tests`** as `success` for the PR's
+       new head commit.
+    3. Merge PR #1.
+  hints:
+    - "`git switch retry && ./test.sh` shows which assertion fails. The bug is in retry.py."
+    - "`POST /api/v1/repos/dev/app/statuses/<sha>` with `{\"context\":\"ci/tests\",\"state\":\"success\"}`, using the sha of the commit you pushed. Then `POST .../pulls/1/merge` with `{\"Do\":\"merge\"}`."
+  solution: |
+    ```bash
+    cd /lab/app
+    git switch retry
+    ./test.sh                         # FAIL: 3 attempts expected
+    sed -i 's/range(attempts - 1)/range(attempts)/' retry.py
+    ./test.sh && git commit -am "Retry the full number of attempts" && git push
+    sha=$(git rev-parse HEAD)
+    A=(-u dev:"$(cat /lab/dev-password.txt)" -H 'Content-Type: application/json')
+    curl -s "${A[@]}" -X POST http://localhost:3000/api/v1/repos/dev/app/statuses/$sha \
+      -d '{"context":"ci/tests","state":"success","description":"tests passed"}'
+    curl -s "${A[@]}" -X POST http://localhost:3000/api/v1/repos/dev/app/pulls/1/merge -d '{"Do":"merge"}'
+    ```
+  setup: |
+    git_home_guard
+    gitea_start
+    gitea_dev
+    P=$(cat $KL_STATE/dev-pass)
+    cp $KL_STATE/dev-pass /lab/dev-password.txt; chown "$(lab_user):" /lab/dev-password.txt; chmod 600 /lab/dev-password.txt
+    rm -rf /lab/app /lab/.seed
+    gitea_repo dev app
+    git init -q -b main /lab/.seed; cd /lab/.seed
+    c() { git -c user.name=Dev -c user.email=dev@lab.test "$@"; }
+    printf '#!/bin/sh\nset -e\npython3 test_retry.py\necho "tests passed"\n' > test.sh; chmod +x test.sh
+    printf 'def call(fn, attempts=3):\n    return fn()\n' > retry.py
+    printf 'from retry import call\n\nn = 0\ndef flaky():\n    global n\n    n += 1\n    if n < 3:\n        raise IOError("try again")\n    return "ok"\n\nassert call(flaky, attempts=3) == "ok", "3 attempts expected"\nprint("ok")\n' > test_retry.py
+    c add .; c commit -qm "Retry helper and its test"
+    u=$(gitea_url dev/app "dev:$P")
+    git push -q "$u" main 2>/dev/null
+    c switch -qc retry
+    printf 'def call(fn, attempts=3):\n    last = None\n    for _ in range(attempts - 1):\n        try:\n            return fn()\n        except IOError as e:\n            last = e\n    raise last\n' > retry.py
+    c commit -qam "Retry failed calls"; git push -q "$u" retry 2>/dev/null
+    gitea_api POST /repos/dev/app/pulls '{"head":"retry","base":"main","title":"Retry failed calls"}' >/dev/null
+    gitea_api POST /repos/dev/app/branch_protections '{"rule_name":"main","enable_push":false,"enable_status_check":true,"status_check_contexts":["ci/tests"]}' >/dev/null
+    cd /; rm -rf /lab/.seed
+    gitea_clone dev/app /lab/app
+    sudo -u "$(lab_user)" -H git -C /lab/app branch -q retry origin/retry
+    sha256sum /lab/app/test_retry.py | awk '{print $1}' > "$KL_STATE/testsum"
+  check: |
+    pr=$(gitea_api GET /repos/dev/app/pulls/1)
+    check_eq "PR #1 is merged" "$(jq -r .merged <<<"$pr")" true
+    head=$(jq -r .head.sha <<<"$pr")
+    st=$(gitea_api GET "/repos/dev/app/commits/$head/status" 2>/dev/null)
+    check_eq "the merged head commit has ci/tests = success" "$(jq -r '[.statuses[]? | select(.context == "ci/tests") | .status // .state] | first // empty' <<<"$st")" success
+    M=$(mktemp -d); gitea_mirror dev/app $M/g; git --git-dir=$M/g worktree add -q $M/w main 2>/dev/null
+    check "./test.sh passes on main" '(cd $M/w && ./test.sh) >/dev/null 2>&1'
+    check_eq "the test itself was not changed" "$(sha256sum < $M/w/test_retry.py 2>/dev/null | awk '{print $1}')" "$(cat $KL_STATE/testsum)"
+    rm -rf "$M"
+  solve: |
+    cd /lab/app
+    git switch -q retry
+    sed -i 's/range(attempts - 1)/range(attempts)/' retry.py
+    ./test.sh >/dev/null && git commit -qam "Retry the full number of attempts" && git push -q origin retry 2>/dev/null
+    sha=$(git rev-parse HEAD)
+    A=(-fsS -u dev:"$(cat /lab/dev-password.txt)" -H 'Content-Type: application/json')
+    curl "${A[@]}" -X POST http://localhost:3000/api/v1/repos/dev/app/statuses/$sha -d '{"context":"ci/tests","state":"success","description":"tests passed"}' >/dev/null
+    sleep 1
+    curl "${A[@]}" -X POST http://localhost:3000/api/v1/repos/dev/app/pulls/1/merge -d '{"Do":"merge"}' >/dev/null
+
+- id: git-274
+  title: Squash merges only
+  difficulty: 3
+  kind: build
+  tags: [git, pull-request, squash, merge-style, repository-settings]
+  tutorial: |
+    **What you're learning.** The three ways a hosting service can merge a pull request, what each does to `main`'s history, and how to make a repository allow only one.
+
+    ### Merge styles
+
+    ```
+    PR branch:  C1 "wip"  C2 "fix typo"  C3 "address review"
+
+    merge commit   main: A ─ B ─────────── M      (C1, C2, C3 kept, plus a merge commit M)
+                              \           /
+                               C1 ─ C2 ─ C3
+    rebase         main: A ─ B ─ C1' ─ C2' ─ C3'  (copied onto main, no merge commit)
+    squash         main: A ─ B ─ S                 (one new commit with all the changes)
+    ```
+
+    **Squash** keeps `main` at one commit per PR, with the PR's title as the message (`Add coupons (#12)`). The messy "wip" commits disappear from `main`. Many teams choose it for exactly that reason.
+
+    ### Repository settings
+
+    In the browser: repository → **Settings → Repository → Pull Requests**. With the API:
+
+    ```bash
+    curl -s -u sam:"$PASSWORD" -X PATCH -H 'Content-Type: application/json' \
+      http://localhost:3000/api/v1/repos/sam/shop -d '{
+        "allow_merge_commits": false, "allow_rebase": false, "allow_rebase_explicit": false,
+        "allow_squash_merge": true, "default_merge_style": "squash",
+        "default_delete_branch_after_merge": true }'
+    ```
+    Then merging:
+
+    ```bash
+    curl -s -u sam:"$PASSWORD" -X POST -H 'Content-Type: application/json' \
+      http://localhost:3000/api/v1/repos/sam/shop/pulls/12/merge \
+      -d '{"Do": "squash", "delete_branch_after_merge": true}'
+    ```
+    A style the repository doesn't allow is refused with `405`.
+
+    ### Common mistakes
+
+    - Squash-merging a PR whose individual commits matter (a big refactor in deliberate steps). Choose the style per repository, knowing why.
+    - Leaving merged branches around: the branch list fills with dead branches.
+
+    ### Check your work
+
+    `main` got exactly one new commit, named after the PR, and the branch is gone.
+  scenario: |
+    The team wants `main` of **`dev/app`** to get **one commit per pull request**:
+
+    1. Configure the repository so that **only squash merges** are allowed, they're the
+       default, and **branches are deleted after merging** by default.
+    2. Merge the open pull request **#1** (branch `tidy-readme`, three messy commits) that way.
+  hints:
+    - "`PATCH /api/v1/repos/dev/app` with `allow_merge_commits`, `allow_rebase`, `allow_rebase_explicit`, `allow_squash_merge`, `default_merge_style` and `default_delete_branch_after_merge`."
+    - "`POST /api/v1/repos/dev/app/pulls/1/merge` with `{\"Do\":\"squash\",\"delete_branch_after_merge\":true}`, or the browser's Squash button."
+  solution: |
+    ```bash
+    A=(-u dev:"$(cat /lab/dev-password.txt)" -H 'Content-Type: application/json')
+    curl -s "${A[@]}" -X PATCH http://localhost:3000/api/v1/repos/dev/app -d '{
+      "allow_merge_commits": false, "allow_rebase": false, "allow_rebase_explicit": false,
+      "allow_fast_forward_only_merge": false, "allow_manual_merge": false,
+      "allow_squash_merge": true, "default_merge_style": "squash",
+      "default_delete_branch_after_merge": true }'
+    curl -s "${A[@]}" -X POST http://localhost:3000/api/v1/repos/dev/app/pulls/1/merge \
+      -d '{"Do":"squash","delete_branch_after_merge":true}'
+    ```
+  setup: |
+    git_home_guard
+    gitea_start
+    gitea_dev
+    P=$(cat $KL_STATE/dev-pass)
+    cp $KL_STATE/dev-pass /lab/dev-password.txt; chown "$(lab_user):" /lab/dev-password.txt; chmod 600 /lab/dev-password.txt
+    rm -rf /lab/app /lab/.seed
+    gitea_repo dev app
+    git init -q -b main /lab/.seed; cd /lab/.seed
+    c() { git -c user.name=Dev -c user.email=dev@lab.test "$@"; }
+    echo "# app" > README.md; c add .; c commit -qm "App"
+    u=$(gitea_url dev/app "dev:$P")
+    git push -q "$u" main 2>/dev/null
+    c switch -qc tidy-readme
+    printf '# App\n\nInstall: pip install app\n' > README.md; c commit -qam "wip"
+    printf '# App\n\nInstall: `pip install app`\n' > README.md; c commit -qam "fix typo"
+    printf '# App\n\nInstall: `pip install app`\n\nRun: `app serve`\n' > README.md; c commit -qam "address review"
+    git push -q "$u" tidy-readme 2>/dev/null
+    gitea_api POST /repos/dev/app/pulls '{"head":"tidy-readme","base":"main","title":"Tidy the README"}' >/dev/null
+    git rev-parse main > "$KL_STATE/main"
+    cd /; rm -rf /lab/.seed
+    gitea_clone dev/app /lab/app
+  check: |
+    r=$(gitea_api GET /repos/dev/app)
+    check_eq "only squash merges are allowed" "$(jq -r '[.allow_merge_commits, .allow_rebase, .allow_rebase_explicit, .allow_squash_merge] | map(tostring) | join(",")' <<<"$r")" "false,false,false,true"
+    check_eq "squash is the default style" "$(jq -r .default_merge_style <<<"$r")" squash
+    check_eq "branches are deleted after merging by default" "$(jq -r .default_delete_branch_after_merge <<<"$r")" true
+    check_eq "PR #1 is merged" "$(gitea_api GET /repos/dev/app/pulls/1 | jq -r .merged)" true
+    M=$(mktemp -d); gitea_mirror dev/app $M/g; g() { git --git-dir=$M/g "$@"; }
+    check_eq "main got exactly one new commit" "$(g rev-list --count $(cat $KL_STATE/main)..main 2>/dev/null)" 1
+    check_eq "it is not a merge commit" "$(g rev-list --merges --count $(cat $KL_STATE/main)..main 2>/dev/null)" 0
+    check_match "its message starts with the PR's title" "$(g log -1 --format=%s main 2>/dev/null)" '^Tidy the README'
+    check "README.md on main has the final text" 'g show main:README.md | grep -q "Run: \`app serve\`"'
+    check_not "branch tidy-readme was deleted" 'g rev-parse -q --verify refs/heads/tidy-readme'
+    rm -rf "$M"
+  solve: |
+    A=(-fsS -u dev:"$(cat /lab/dev-password.txt)" -H 'Content-Type: application/json')
+    curl "${A[@]}" -X PATCH http://localhost:3000/api/v1/repos/dev/app -d '{"allow_merge_commits":false,"allow_rebase":false,"allow_rebase_explicit":false,"allow_fast_forward_only_merge":false,"allow_manual_merge":false,"allow_squash_merge":true,"default_merge_style":"squash","default_delete_branch_after_merge":true}' >/dev/null
+    curl "${A[@]}" -X POST http://localhost:3000/api/v1/repos/dev/app/pulls/1/merge -d '{"Do":"squash","delete_branch_after_merge":true}' >/dev/null
+
+# ===== Capstone =====
+
+- id: git-275
+  title: "Capstone: the release through a protected main"
+  difficulty: 5
+  kind: fix
+  tags: [git, pull-request, branch-protection, codeowners, status-check, capstone]
+  tutorial: |
+    **What you're learning.** How the whole pull-request process fits together under strict protection: update the branch, make CI green, get the owner's approval **for the final version**, and merge in the team's style.
+
+    ### Order of work
+
+    Each step can undo the one before, so the order matters:
+
+    1. **Update the branch first** (rebase, resolve, `--force-with-lease`; git-272). Every new push gives the PR a new head commit.
+    2. **Fix and test**, then push. CI reports on **that** head (git-273).
+    3. **Get approval last.** With `dismiss_stale_approvals`, every push cancels earlier approvals (git-270). Ask for review only when nothing else will change, and once the PR page shows your latest commit: the server processes a push in the background, and an approval given before that finishes is dismissed too.
+    4. **Merge in the allowed style** (git-274).
+
+    ```bash
+    curl -s -u sam:"$PASSWORD" http://localhost:3000/api/v1/repos/sam/shop/pulls/7/reviews | jq '.[] | {user: .user.login, state, dismissed, commit_id}'
+    ```
+
+    | Blocker | Taught in |
+    |---|---|
+    | "This branch has conflicts" | git-272 |
+    | "Not all required status checks successful" | git-273 |
+    | "Does not have enough approvals" | git-270, git-271 |
+    | merge style refused (405) | git-274 |
+
+    In this lab, you can log in as the reviewer (`alice`, password in `/lab/alice-password.txt`) to approve, in the browser or with the reviews API (`{"event": "APPROVED"}`). In a real team you'd ask her.
+
+    ### Common mistakes
+
+    - Getting approval, then pushing a fix: the approval is dismissed.
+    - Posting the status on the commit before the rebase.
+    - Resolving the conflict by dropping `main`'s change.
+
+    ### Check your work
+
+    PR #1 is merged as one commit, alice's approval is for its final head, CI is green on it, and the tests pass on `main`.
+  scenario: |
+    Release **2.0** is pull request **#1** in **`dev/app`** (branch **`release-2`**). `main` is
+    protected: no direct pushes, **one approval** (stale ones dismissed), the status check
+    **`ci/tests`**, and **squash merges only**. `payments/` is owned by **alice**.
+
+    The PR has a conflict with `main`, and its tests fail. Get it merged properly:
+
+    - rebase `release-2` onto `main`, keeping both sides' changes (in **`/lab/app`**)
+    - fix the code so `./test.sh` passes (don't change the tests)
+    - report `ci/tests` for the final head, and get **alice's approval** for it (her password is
+      in `/lab/alice-password.txt`)
+    - squash-merge PR #1
+  hints:
+    - "Rebase and resolve first (main changed the currency constant), fix the failing test's code, push once with `--force-with-lease`, and only then post the status and approve."
+    - "Approve as alice: `curl -u alice:$(cat /lab/alice-password.txt) -X POST .../pulls/1/reviews -d '{\"event\":\"APPROVED\",\"body\":\"LGTM\"}'`. Then merge with `{\"Do\":\"squash\"}`."
+  solution: |
+    ```bash
+    cd /lab/app
+    git switch release-2 && git fetch origin
+    git rebase origin/main               # CONFLICT in payments/money.py: keep CURRENCY = "EUR" and the rounding
+    $EDITOR payments/money.py && git add payments/money.py && git rebase --continue
+    ./test.sh                            # fails: fix payments/money.py (round to 2 places)
+    git commit -am "Round to cents" && git push --force-with-lease
+    sha=$(git rev-parse HEAD)
+    D=(-u dev:"$(cat /lab/dev-password.txt)" -H 'Content-Type: application/json')
+    curl -s "${D[@]}" -X POST http://localhost:3000/api/v1/repos/dev/app/statuses/$sha -d '{"context":"ci/tests","state":"success"}'
+    curl -s -u alice:"$(cat /lab/alice-password.txt)" -H 'Content-Type: application/json' -X POST \
+      http://localhost:3000/api/v1/repos/dev/app/pulls/1/reviews -d '{"event":"APPROVED","body":"LGTM"}'
+    curl -s "${D[@]}" -X POST http://localhost:3000/api/v1/repos/dev/app/pulls/1/merge -d '{"Do":"squash"}'
+    ```
+  setup: |
+    git_home_guard
+    gitea_start
+    gitea_dev
+    P=$(cat $KL_STATE/dev-pass)
+    cp $KL_STATE/dev-pass /lab/dev-password.txt; chown "$(lab_user):" /lab/dev-password.txt; chmod 600 /lab/dev-password.txt
+    gitea_user alice alice-pass-1 "Alice Martin"
+    echo alice-pass-1 | lab_file /lab/alice-password.txt 0600
+    rm -rf /lab/app /lab/.seed
+    gitea_repo dev app
+    gitea_api PUT /repos/dev/app/collaborators/alice '{"permission":"write"}' >/dev/null
+    git init -q -b main /lab/.seed; cd /lab/.seed
+    c() { git -c user.name=Dev -c user.email=dev@lab.test "$@"; }
+    mkdir -p payments .gitea
+    printf 'payments/.* @alice\n' > .gitea/CODEOWNERS
+    printf '#!/bin/sh\nset -e\npython3 test_money.py\necho "tests passed"\n' > test.sh; chmod +x test.sh
+    printf 'CURRENCY = "USD"\n\ndef total(prices):\n    return sum(prices)\n' > payments/money.py
+    printf 'import sys\nsys.path.insert(0, "payments")\nimport money\n\nassert money.total([0.1, 0.2]) == 0.3, "totals must be rounded to cents"\nassert money.CURRENCY == "EUR", "the shop sells in euros"\nprint("ok")\n' > test_money.py
+    c add .; c commit -qm "Money helpers"
+    u=$(gitea_url dev/app "dev:$P")
+    git push -q "$u" main 2>/dev/null
+    c switch -qc release-2
+    printf 'CURRENCY = "USD"\nVERSION = "2.0"\n\ndef total(prices):\n    return sum(prices)\n' > payments/money.py
+    c commit -qam "Release 2.0"; git push -q "$u" release-2 2>/dev/null
+    c switch -q main
+    printf 'CURRENCY = "EUR"\n\ndef total(prices):\n    return sum(prices)\n' > payments/money.py
+    c commit -qam "Sell in euros"; git push -q "$u" main 2>/dev/null
+    gitea_api POST /repos/dev/app/pulls '{"head":"release-2","base":"main","title":"Release 2.0"}' >/dev/null
+    gitea_api PATCH /repos/dev/app '{"allow_merge_commits":false,"allow_rebase":false,"allow_rebase_explicit":false,"allow_fast_forward_only_merge":false,"allow_manual_merge":false,"allow_squash_merge":true,"default_merge_style":"squash"}' >/dev/null
+    gitea_api POST /repos/dev/app/branch_protections '{"rule_name":"main","enable_push":false,"required_approvals":1,"dismiss_stale_approvals":true,"enable_status_check":true,"status_check_contexts":["ci/tests"]}' >/dev/null
+    git rev-parse main > "$KL_STATE/main"
+    sha256sum test_money.py | awk '{print $1}' > "$KL_STATE/testsum"
+    cd /; rm -rf /lab/.seed
+    gitea_clone dev/app /lab/app
+    sudo -u "$(lab_user)" -H git -C /lab/app branch -q release-2 origin/release-2
+  check: |
+    pr=$(gitea_api GET /repos/dev/app/pulls/1)
+    check_eq "PR #1 is merged" "$(jq -r .merged <<<"$pr")" true
+    head=$(jq -r .head.sha <<<"$pr")
+    st=$(gitea_api GET "/repos/dev/app/commits/$head/status" 2>/dev/null)
+    check_eq "ci/tests is success on the PR's final head" "$(jq -r '[.statuses[]? | select(.context == "ci/tests") | .status // .state] | first // empty' <<<"$st")" success
+    rv=$(gitea_api GET /repos/dev/app/pulls/1/reviews 2>/dev/null)
+    check "alice approved the final head (not a dismissed, older version)" 'jq -e --arg h "$head" "any(.[]; .user.login == \"alice\" and .state == \"APPROVED\" and (.dismissed | not) and .commit_id == \$h)" <<<"$rv"'
+    M=$(mktemp -d); gitea_mirror dev/app $M/g; g() { git --git-dir=$M/g "$@"; }
+    check_eq "main got exactly one new commit (squash)" "$(g rev-list --count $(cat $KL_STATE/main)..main 2>/dev/null) $(g rev-list --merges --count $(cat $KL_STATE/main)..main 2>/dev/null)" "1 0"
+    g worktree add -q $M/w main 2>/dev/null
+    check "./test.sh passes on main" '(cd $M/w && ./test.sh) >/dev/null 2>&1'
+    check_eq "the tests were not changed" "$(sha256sum < $M/w/test_money.py 2>/dev/null | awk '{print $1}')" "$(cat $KL_STATE/testsum)"
+    check "main has release 2.0 and still sells in euros" 'grep -q "VERSION = \"2.0\"" $M/w/payments/money.py && grep -q "CURRENCY = \"EUR\"" $M/w/payments/money.py'
+    rm -rf "$M"
+  solve: |
+    cd /lab/app
+    git switch -q release-2 && git fetch -q origin 2>/dev/null
+    git rebase origin/main >/dev/null 2>&1 || true
+    printf 'CURRENCY = "EUR"\nVERSION = "2.0"\n\ndef total(prices):\n    return round(sum(prices), 2)\n' > payments/money.py
+    git add payments/money.py
+    GIT_EDITOR=true git rebase --continue >/dev/null 2>&1 || git commit -qam "Release 2.0"
+    ./test.sh >/dev/null
+    git push -q --force-with-lease origin release-2 2>/dev/null
+    sha=$(git rev-parse HEAD)
+    # wait until Gitea has processed the push (it dismisses older approvals when it does)
+    eventually 60 "[ \"\$(curl -fsS -u dev:\$(cat /lab/dev-password.txt) http://localhost:3000/api/v1/repos/dev/app/pulls/1 | jq -r .head.sha)\" = $sha ]"
+    sleep 3
+    D=(-fsS -u dev:"$(cat /lab/dev-password.txt)" -H 'Content-Type: application/json')
+    curl "${D[@]}" -X POST http://localhost:3000/api/v1/repos/dev/app/statuses/$sha -d '{"context":"ci/tests","state":"success"}' >/dev/null
+    curl -fsS -u alice:"$(cat /lab/alice-password.txt)" -H 'Content-Type: application/json' -X POST \
+      http://localhost:3000/api/v1/repos/dev/app/pulls/1/reviews -d '{"event":"APPROVED","body":"LGTM"}' >/dev/null
+    sleep 1
+    curl "${D[@]}" -X POST http://localhost:3000/api/v1/repos/dev/app/pulls/1/merge -d '{"Do":"squash"}' >/dev/null

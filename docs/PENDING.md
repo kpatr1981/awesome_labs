@@ -8,7 +8,7 @@ what to consolidate. The target doesn't lower the bar: a lab should carry a real
 scenario and teach a concept. The parts of this list that the existing exercises don't cover
 are not started.
 
-Exercise counts (<!-- count:total -->1,717<!-- /count --> total):
+Exercise counts (<!-- count:total -->1,724<!-- /count --> total):
 
 | Topic | Exercises | Target | Track | Module files |
 |---|---|---|---|---|
@@ -22,7 +22,7 @@ Exercise counts (<!-- count:total -->1,717<!-- /count --> total):
 | Defensive security | <!-- count:defensive -->78<!-- /count --> | 250 | `defensive` | `exercises/defensive/` |
 | Programming | <!-- count:programming -->86<!-- /count --> | 250 | `programming` | `exercises/programming/` |
 | Data science | <!-- count:datascience -->83<!-- /count --> | 250 | `datascience` | `exercises/datascience/` |
-| Git | <!-- count:git -->268<!-- /count --> | 250 | `git` | `exercises/git/` |
+| Git | <!-- count:git -->275<!-- /count --> | 250 | `git` | `exercises/git/` |
 | Terraform | <!-- count:terraform -->117<!-- /count --> | 250 | `terraform` | `exercises/terraform/` |
 | Ansible | <!-- count:ansible -->89<!-- /count --> | 250 | `ansible` | `exercises/ansible/` |
 | Algorithms | <!-- count:algorithms -->70<!-- /count --> | 250 | `algorithms` | `exercises/algorithms/` |
@@ -371,7 +371,7 @@ then GitOps for Kubernetes, then Git LFS.
 |---|---|---|---|
 | **Git LFS** | Done in `exercises/git/23-lfs.yaml` (git-256..262), on a local Gitea | | |
 | **Credential helpers and HTTPS auth** | Done in `exercises/git/24-credentials.yaml` (git-263..268) | | |
-| **Pull-request workflows** | Pull requests, CODEOWNERS, protected branches, required reviews and status checks, offline on Gitea | Docker VM; Gitea | Hosting-platform features, not Git itself; shares Gitea with the CI/CD labs |
+| **Pull-request workflows** | Done in `exercises/git/25-pull-requests.yaml` (git-269..275), on Gitea | | |
 
 ## Shared lab foundations
 
