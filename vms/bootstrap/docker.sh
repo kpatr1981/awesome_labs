@@ -3,15 +3,18 @@
 # Lines starting with "==> " are shown in the app's Output tab as progress.
 set -euxo pipefail
 export DEBIAN_FRONTEND=noninteractive
-# Tools for the Linux and Networking tracks. dnsmasq-base has no service, so it can't
+# Tools for the Linux and Networking tracks (git-lfs for the Git track). dnsmasq-base has no service, so it can't
 # clash with systemd-resolved on port 53.
-PKGS=(strace lsof lvm2 dnsmasq-base wireguard-tools traceroute acl)
+PKGS=(strace lsof lvm2 dnsmasq-base wireguard-tools traceroute acl git-lfs)
 missing=$(for p in "${PKGS[@]}"; do dpkg -s "$p" >/dev/null 2>&1 || echo "$p"; done)
 if [ -n "$missing" ]; then
   echo "==> installing packages: "$missing
   apt-get update
   apt-get install -y $missing
 fi
+# The git-lfs package turns LFS on for every user in /etc/gitconfig. The Git track teaches
+# `git lfs install`, so leave it off system-wide.
+git lfs uninstall --system >/dev/null 2>&1 || true
 # Pull 4 images at a time; an image that still fails after 3 tries is left for
 # the exercise that uses it to pull.
 imgs=$(grep -v '^#' /opt/kubelab/images.txt | awk '$2 ~ /d/ {print $1}')

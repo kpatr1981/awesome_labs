@@ -1209,6 +1209,97 @@ EOF
   case "$d" in "$LAB"/*) chown -R "$(lab_user)": "$LAB" ;; esac
 }
 
+# ---------- Gitea helpers (Git track: LFS, credentials, pull requests) ----------
+# gitea_start -> a Gitea server on http://localhost:3000 (also reachable from the host's
+# browser through Lima's port forwarding), with LFS, no self-registration, and the admin
+# account lab-admin (password in $KL_STATE/gitea-admin). Containers go with the host reset.
+gitea_start() {
+  local pw
+  docker rm -f kl-gitea >/dev/null 2>&1 || true
+  docker run -d --name kl-gitea --network host \
+    -e GITEA__security__INSTALL_LOCK=true -e GITEA__database__DB_TYPE=sqlite3 \
+    -e GITEA__server__HTTP_PORT=3000 -e GITEA__server__ROOT_URL=http://localhost:3000/ -e GITEA__server__DOMAIN=localhost \
+    -e GITEA__server__LFS_START_SERVER=true -e GITEA__server__START_SSH_SERVER=false -e GITEA__server__DISABLE_SSH=true \
+    -e GITEA__service__DISABLE_REGISTRATION=true -e GITEA__repository__DEFAULT_BRANCH=main \
+    -e GITEA__log__LEVEL=Warn -e GITEA__security__PASSWORD_COMPLEXITY=off \
+    gitea/gitea:28.2.0-rootless >/dev/null || return 1
+  eventually 90 'curl -fsS -m 2 http://localhost:3000/api/healthz >/dev/null' || return 1
+  pw="Adm-$(head -c8 /dev/urandom | od -An -tx1 | tr -d ' \n')"
+  docker exec kl-gitea gitea admin user create --username lab-admin --password "$pw" \
+    --email admin@lab.test --admin --must-change-password=false >/dev/null || return 1
+  printf '%s\n' "$pw" >"$KL_STATE/gitea-admin"; chmod 600 "$KL_STATE/gitea-admin"
+}
+# git_home_guard -> the next reset puts the lab user's ~/.gitconfig back as it is now and
+# removes ~/.git-credentials and any credential-cache daemon (the reset doesn't restore home)
+git_home_guard() {
+  local h; h=$(lab_home)
+  rm -f "$KL_STATE/gitconfig.orig"
+  [ -f "$h/.gitconfig" ] && cp -p "$h/.gitconfig" "$KL_STATE/gitconfig.orig"
+  on_reset "h=\$(lab_home); if [ -f $KL_STATE/gitconfig.orig ]; then cp -p $KL_STATE/gitconfig.orig \$h/.gitconfig; else rm -f \$h/.gitconfig; fi; rm -rf \$h/.git-credentials \$h/.cache/git/credential \$h/.config/git/credentials; pkill -u $(lab_user) -f git-credential-cache--daemon"
+}
+# gitea_api METHOD PATH [JSON] -> call the API as lab-admin (PATH after /api/v1), print the body
+gitea_api() {
+  curl -fsS -m 10 -u "lab-admin:$(cat "$KL_STATE/gitea-admin")" -X "$1" -H 'Content-Type: application/json' \
+    "http://localhost:3000/api/v1$2" ${3:+-d "$3"}
+}
+# gitea_as USER PASS METHOD PATH [JSON] -> the same, as another user
+gitea_as() {
+  curl -fsS -m 10 -u "$1:$2" -X "$3" -H 'Content-Type: application/json' "http://localhost:3000/api/v1$4" ${5:+-d "$5"}
+}
+# gitea_user NAME PASSWORD [FULL NAME] -> a user account (email NAME@lab.test)
+gitea_user() {
+  gitea_api POST /admin/users "$(jq -nc --arg u "$1" --arg p "$2" --arg f "${3:-$1}" \
+    '{username: $u, password: $p, email: "\($u)@lab.test", full_name: $f, must_change_password: false}')" >/dev/null
+}
+# gitea_repo OWNER NAME [private] -> an empty repository owned by a user or an organisation
+gitea_repo() {
+  local p=false; [ "${3:-}" = private ] && p=true
+  gitea_api POST "/admin/users/$1/repos" "{\"name\":\"$2\",\"default_branch\":\"main\",\"private\":$p}" >/dev/null 2>&1 ||
+    gitea_api POST "/orgs/$1/repos" "{\"name\":\"$2\",\"default_branch\":\"main\",\"private\":$p}" >/dev/null
+}
+# gitea_url OWNER/REPO [USER:PASS] -> its clone URL (with credentials only when given, for setups)
+gitea_url() { if [ -n "${2:-}" ]; then echo "http://${2}@localhost:3000/$1.git"; else echo "http://localhost:3000/$1.git"; fi; }
+# gitea_token USER PASS NAME -> create an access token (scopes: repository read/write, user read)
+gitea_token() {
+  gitea_as "$1" "$2" POST "/users/$1/tokens" "{\"name\":\"$3\",\"scopes\":[\"write:repository\",\"read:user\"]}" | jq -r .sha1
+}
+
+# gitea_dev -> the learner's Gitea account "dev" (password in $KL_STATE/dev-pass), and
+# /lab/.gitea-credentials, a credential-store file the lab's clones use (see gitea_clone)
+gitea_dev() {
+  local pw="dev-$(head -c6 /dev/urandom | od -An -tx1 | tr -d ' \n')"
+  gitea_user dev "$pw" "Lab Developer" || return 1
+  printf '%s\n' "$pw" >"$KL_STATE/dev-pass"
+  printf 'http://dev:%s@localhost:3000\n' "$pw" | lab_file /lab/.gitea-credentials 0600
+}
+# gitea_clone OWNER/REPO DIR [git clone options] -> a clone as the lab user that authenticates
+# with /lab/.gitea-credentials (repo-local credential.helper), with a lab identity
+gitea_clone() {
+  local r=$1 d=$2; shift 2
+  sudo -u "$(lab_user)" -H git -c credential.helper="store --file=/lab/.gitea-credentials" \
+    clone -q "$@" "http://localhost:3000/$r.git" "$d" || return 1
+  sudo -u "$(lab_user)" -H git -C "$d" config credential.helper "store --file=/lab/.gitea-credentials"
+  sudo -u "$(lab_user)" -H git -C "$d" config user.name "Lab Developer"
+  sudo -u "$(lab_user)" -H git -C "$d" config user.email dev@lab.test
+}
+# gitea_mirror OWNER/REPO DIR -> a bare mirror of the server's repository, as lab-admin (for checks)
+gitea_mirror() {
+  rm -rf "$2"
+  git clone -q --mirror "$(gitea_url "$1" "lab-admin:$(cat "$KL_STATE/gitea-admin")")" "$2" 2>/dev/null
+}
+# gitea_media OWNER/REPO PATH [REF] -> the file's real content as served by Gitea (LFS resolved)
+gitea_media() {
+  curl -fsS -m 20 -u "lab-admin:$(cat "$KL_STATE/gitea-admin")" "http://localhost:3000/api/v1/repos/$1/media/$2?ref=${3:-main}"
+}
+# is_lfs_pointer GITDIR REV:PATH -> the blob is a Git LFS pointer
+is_lfs_pointer() { git --git-dir="$1" cat-file -p "$2" 2>/dev/null | head -1 | grep -qx 'version https://git-lfs.github.com/spec/v1'; }
+# max_blob GITDIR -> the size in bytes of the biggest blob reachable from any ref
+max_blob() {
+  git --git-dir="$1" rev-list --objects --all 2>/dev/null |
+    git --git-dir="$1" cat-file --batch-check='%(objecttype) %(objectsize)' 2>/dev/null |
+    awk '$1 == "blob" && $2 > m {m = $2} END {print m + 0}'
+}
+
 # ---------- cert-manager helpers ----------
 CM_VERSION=v1.21.3
 CM_CHART=/opt/kubelab/cert-manager-$CM_VERSION.tgz
