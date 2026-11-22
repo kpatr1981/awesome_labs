@@ -27,6 +27,7 @@ Exercise counts (<!-- count:total -->1,756<!-- /count --> total):
 | Ansible | <!-- count:ansible -->89<!-- /count --> | 250 | `ansible` | `exercises/ansible/` |
 | Algorithms | <!-- count:algorithms -->70<!-- /count --> | 250 | `algorithms` | `exercises/algorithms/` |
 
+- [Open follow-ups](#open-follow-ups)
 - [Suggested order](#suggested-order)
 - [Deepen every module](#deepen-every-module)
 - [Gaps in Kubernetes, Terraform and Git](#gaps-in-kubernetes-terraform-and-git)
@@ -46,6 +47,22 @@ Exercise counts (<!-- count:total -->1,756<!-- /count --> total):
 - [awesome_labs features](#awesome_labs-features)
 - [More lab ideas](#more-lab-ideas)
 - [Left out for now](#left-out-for-now)
+
+## Open follow-ups
+
+Work left over from shipped modules, as of v0.25.0 (2026-11-22). These come before new labs.
+
+- **Re-verify the pull-request exercises on the Docker VM:** `git-256..275` (LFS, credentials,
+  pull requests) and `tf-118..120` (plan and apply from pull requests).
+- **Turn Git LFS off in the Docker VM's saved copy.** It's still on there, so a fresh start
+  from the copy doesn't match a clean build.
+- **Rebuild the k8s lab with `env rebuild k8s`.** The saved copies `klbase-cp` and
+  `klbase-worker` still have the old memory (3 GiB and 2.5 GiB) rather than the new 3.5 GiB and
+  4 GiB. The memory notes further down (Linkerd, Kubernetes OIDC, *Left out for now*) still
+  quote the old sizes too.
+- **Kyverno and Prometheus Operator add-ons** for the k8s lab aren't written. Their lab ideas
+  are *Policy engines* and *Prometheus and Grafana in the cluster* in
+  [Kubernetes gaps](#kubernetes-gaps).
 
 ## Suggested order
 
@@ -1019,6 +1036,9 @@ which other sites already cover well. SQL is under [Data](#data).
 |---|---|---|
 | **Python** | Automation scripts, boto3 against moto, the Kubernetes client, packaging and virtualenv breakage, `pytest`, async bugs | Docker VM; ties into AWS CLI |
 | **Go** | Goroutine leaks and data races, `pprof`, small static builds, `client-go`, writing a Kubernetes controller | Docker VM; k8s lab for controllers |
+
+Good practices and design patterns, in Python and Go, are done in
+`exercises/programming/08-good-practices-patterns.yaml` (prog-087..107).
 
 - **Checks:** run a hidden test suite plus real behaviour, such as "the service stays up
   under load" or "memory no longer grows". Keep tests outside `/lab` so they can't be
