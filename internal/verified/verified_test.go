@@ -63,7 +63,7 @@ func TestHashIgnoresTextAndPlace(t *testing.T) {
 	head, one := parts[0][:strings.Index(parts[0], "- id: d-1")], parts[0][strings.Index(parts[0], "- id: d-1"):]
 	moved = head + "- id: d-2" + parts[1] + one
 	cat2 := load(t, map[string]string{"z.yaml": moved})
-	if cat2.Get("d-1").Title == cat.Get("d-1").Title || cat2.Exercises[0].ID != "d-2" {
+	if cat2.Get("d-1").Title == cat.Get("d-1").Title || strings.Index(moved, "id: d-2") > strings.Index(moved, "id: d-1") {
 		t.Fatal("test setup: the exercise was not reworded and moved")
 	}
 	if got := Hash(cat2.Get("d-1")); got != h {

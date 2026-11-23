@@ -10,6 +10,7 @@ import (
 	"path"
 	"regexp"
 	"sort"
+	"strconv"
 	"strings"
 
 	"gopkg.in/yaml.v3"
@@ -86,6 +87,47 @@ type Catalog struct {
 // Get returns an exercise by id.
 func (c *Catalog) Get(id string) *Exercise { return c.byID[id] }
 
+// Tier is the level group an exercise is listed under in its module:
+// 0 Beginner (difficulty 1-2), 1 Intermediate (3), 2 Advanced (4-5) and
+// 3 for the module's capstone or incident lab, which always comes last.
+func (e *Exercise) Tier() int {
+	for _, t := range e.Tags {
+		if t == "capstone" || t == "incident" {
+			return 3
+		}
+	}
+	switch {
+	case e.Difficulty <= 2:
+		return 0
+	case e.Difficulty == 3:
+		return 1
+	}
+	return 2
+}
+
+// idLess orders ids like "k8s-003" < "k8s-010" < "prog-100": by prefix, then
+// by the trailing number.
+func idLess(a, b string) bool {
+	pa, na := splitID(a)
+	pb, nb := splitID(b)
+	if pa != pb {
+		return pa < pb
+	}
+	if na != nb {
+		return na < nb
+	}
+	return a < b
+}
+
+func splitID(id string) (string, int) {
+	i := strings.LastIndexByte(id, '-')
+	n, err := strconv.Atoi(id[i+1:])
+	if i < 0 || err != nil {
+		return id, -1
+	}
+	return id[:i], n
+}
+
 // DifficultyLabel turns 1..5 into a word.
 func DifficultyLabel(d int) string {
 	switch d {
@@ -146,6 +188,14 @@ func Load(fsys fs.FS, root string) (*Catalog, error) {
 		return mods[i].Order < mods[j].Order
 	})
 	for _, m := range mods {
+		// within a module: Beginner → Intermediate → Advanced → capstone, then by id
+		sort.SliceStable(m.Exercises, func(i, j int) bool {
+			a, b := &m.Exercises[i], &m.Exercises[j]
+			if ta, tb := a.Tier(), b.Tier(); ta != tb {
+				return ta < tb
+			}
+			return idLess(a.ID, b.ID)
+		})
 		for i := range m.Exercises {
 			e := m.Exercises[i]
 			e.Module, e.Track, e.Profile, e.Order, e.Notebook = m.Module, m.Track, m.Profile, i, m.Notebook

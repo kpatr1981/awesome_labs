@@ -134,8 +134,9 @@ function renderList() {
     const hay = `${e.id} ${e.title} ${e.module} ${e.kind} ${(e.tags || []).join(" ")} ${diffWords[e.difficulty]} ${TIERS[tierOf(e)]}`.toLowerCase();
     return words.every((w) => hay.includes(w));
   });
-  // within a module, easy to hard by tier (stable: a module's own order otherwise)
-  S.filtered.sort((a, b) => (S.modRank.get(a.track + "/" + a.module) - S.modRank.get(b.track + "/" + b.module)) || (tierOf(a) - tierOf(b)));
+  // within a module, easy to hard by tier, then by id (k8s-001 before k8s-003)
+  S.filtered.sort((a, b) => (S.modRank.get(a.track + "/" + a.module) - S.modRank.get(b.track + "/" + b.module)) ||
+    (tierOf(a) - tierOf(b)) || a.id.localeCompare(b.id, undefined, { numeric: true }));
   const list = $("#list");
   list.replaceChildren();
   const solved = S.filtered.filter((e) => S.progress[e.id] === "solved").length;
