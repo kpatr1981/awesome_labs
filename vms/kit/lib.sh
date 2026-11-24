@@ -674,6 +674,147 @@ py_test() {
   return "$rc"
 }
 
+# ---------- pull-request review helpers (programming: reviewing AI-written code) ----------
+# The PR lives in the git repo /lab/repo: main holds the base and the PR branch adds one
+# commit by code-assistant[bot], tagged `pr`. /lab/PR.md is its description, /lab/PR.diff
+# `git diff main pr`. Findings in /lab/findings.txt cite lines of the PR version
+# (`git show pr:FILE`), so they don't move while the learner edits the working tree.
+PR_REPO=/lab/repo
+_pr_git() { git -C "$PR_REPO" -c safe.directory='*' -c color.ui=never "$@"; }
+
+# pr_base [MESSAGE] -> commit everything in /lab/repo as the base on main
+pr_base() {
+  git -c init.defaultBranch=main init -q "$PR_REPO"
+  _pr_git add -A
+  GIT_AUTHOR_DATE='2026-11-02T10:00:00Z' GIT_COMMITTER_DATE='2026-11-02T10:00:00Z' \
+    _pr_git -c user.name='Dana Okafor' -c user.email=dana@lab.test commit -qm "${1:-Initial version}"
+  chown -R "$(lab_user)": "$PR_REPO"
+}
+
+# pr_open BRANCH TITLE <<'MD' ... MD -> commit the working tree on BRANCH as the assistant,
+# tag it `pr`, write /lab/PR.diff and /lab/PR.md (the title, then stdin as the description)
+pr_open() {
+  local br=$1 title=$2
+  _pr_git checkout -qb "$br"
+  _pr_git add -A
+  GIT_AUTHOR_DATE='2026-11-20T15:42:00Z' GIT_COMMITTER_DATE='2026-11-20T15:42:00Z' \
+    _pr_git -c user.name='code-assistant[bot]' -c user.email=assistant@lab.test commit -qm "$title"
+  _pr_git tag pr
+  _pr_git config user.name 'Lab Reviewer'
+  _pr_git config user.email reviewer@lab.test
+  _pr_git diff main pr >/lab/PR.diff
+  { printf '# %s\n\nOpened by **code-assistant[bot]** · `%s` → `main` · 1 commit\n\n' "$title" "$br"; cat; } >/lab/PR.md
+  chown -R "$(lab_user)": "$LAB"
+}
+
+# pr_line FILE 'TEXT' -> the line number(s) of TEXT (a fixed string) in the PR version of FILE
+pr_line() { _pr_git show "pr:$1" 2>/dev/null | grep -nF -- "$2" | cut -d: -f1 | tr '\n' ' '; }
+
+# pr_finding FILE LINE... -> true when a line of /lab/findings.txt starts with FILE:N, N being
+# one of LINE... ("- " or "./" in front is fine)
+pr_finding() {
+  local f=$1 alt
+  shift
+  [ $# -gt 0 ] || return 1
+  alt=$(IFS='|'; echo "$*")
+  f=${f//./\\.}
+  grep -qE "^[[:space:]]*([-*][[:space:]]*)?(\./)?$f:($alt)([^0-9]|\$)" /lab/findings.txt 2>/dev/null
+}
+
+# pr_findings_count -> how many FILE:LINE citations /lab/findings.txt holds (a review that
+# cites every line finds nothing)
+pr_findings_count() {
+  local n
+  n=$(grep -cE '^[[:space:]]*([-*][[:space:]]*)?[^[:space:]:]+:[0-9]+' /lab/findings.txt 2>/dev/null)
+  echo "${n:-0}"
+}
+
+# pr_py_test <<'PY' ... PY -> hidden unittest code (ending in unittest.main()) run from a copy
+# of /lab/repo with it on PYTHONPATH; prints the end of the output when it fails
+pr_py_test() {
+  local d rc out
+  d=$(mktemp -d)
+  cp -a "$PR_REPO" "$d/repo"
+  cat >"$d/t.py"
+  out=$(cd "$d/repo" && PYTHONPATH="$d/repo" timeout 120 python3 -B "$d/t.py" 2>&1); rc=$?
+  rm -rf "$d"
+  [ "$rc" -ne 0 ] && printf '%s\n' "$out" | tail -20
+  return "$rc"
+}
+
+# pr_unittest [DIR] -> run a repo's own tests (python3 -m unittest discover -s tests) in a
+# copy of DIR (default /lab/repo); prints the end of the output when they fail
+pr_unittest() {
+  local d rc out
+  d=$(mktemp -d)
+  cp -a "${1:-$PR_REPO}" "$d/repo"
+  out=$(cd "$d/repo" && PYTHONPATH="$d/repo" timeout 120 python3 -B -m unittest discover -s tests 2>&1); rc=$?
+  rm -rf "$d"
+  [ "$rc" -ne 0 ] && printf '%s\n' "$out" | tail -20
+  return "$rc"
+}
+
+# pr_mutant FILE <<'PY' ... PY -> true when the repo's own tests FAIL after FILE (relative to
+# /lab/repo) is replaced by stdin: the learner's tests catch that planted bug
+pr_mutant() {
+  local d rc
+  d=$(mktemp -d)
+  cp -a "$PR_REPO" "$d/repo"
+  cat >"$d/repo/$1"
+  (cd "$d/repo" && PYTHONPATH="$d/repo" timeout 120 python3 -B -m unittest discover -s tests >/dev/null 2>&1); rc=$?
+  rm -rf "$d"
+  [ "$rc" -ne 0 ]
+}
+
+# go_start [NAME=VALUE...] -> a `go` command (golang:1.24-alpine, offline: GOPROXY=off unless
+# a NAME=VALUE says otherwise) that runs as the calling user with /lab mounted, keeps its
+# build cache in volume kl-gocache-lab and passes on GO* variables. No C compiler, so no -race.
+go_start() {
+  local defaults="" kv
+  for kv in GOPROXY=off GOTOOLCHAIN=local "$@"; do defaults+=" -e $(printf '%q' "$kv")"; done
+  docker volume create kl-gocache-lab >/dev/null
+  docker run --rm -v kl-gocache-lab:/c alpine:3.22 chmod 1777 /c
+  cat >/usr/local/bin/go <<WRAP
+#!/bin/bash
+# Lab Go: golang:1.24-alpine as you, seeing /lab. Outside /lab it starts in /lab.
+wd=\$PWD
+case "\$wd/" in /lab/*) ;; *) wd=/lab ;; esac
+envs=()
+while IFS= read -r v; do envs+=(-e "\$v"); done < <(compgen -e | grep -E '^GO' | grep -vxE 'GOCACHE|GOPATH|GOROOT')
+tty=()
+[ -t 0 ] && [ -t 1 ] && tty=(-t)
+exec docker run --rm -i "\${tty[@]}" --network none -u "\$(id -u):\$(id -g)" -e HOME=/tmp \\
+  -e GOCACHE=/gocache/build -e GOPATH=/gocache/u\$(id -u) $defaults "\${envs[@]}" \\
+  -v kl-gocache-lab:/gocache -v /lab:/lab -w "\$wd" golang:1.24-alpine go "\$@"
+WRAP
+  chmod 755 /usr/local/bin/go
+  on_reset 'rm -f /usr/local/bin/go'
+}
+
+# pr_go_test [PKGDIR] <<'GO' ... GO -> add a hidden test file to PKGDIR (default .) of a copy
+# of /lab/repo (a Go module) and run `go test ./...` offline; prints the end of the output.
+# GO_ENV adds `-e NAME=VALUE` options for docker run (e.g. a module proxy).
+pr_go_test() {
+  local d rc out
+  d=$(mktemp -d)
+  cp -a "$PR_REPO" "$d/repo"
+  rm -rf "$d/repo/.git"
+  cat >"$d/repo/${1:-.}/zz_hidden_test.go"
+  # shellcheck disable=SC2086
+  out=$(timeout 240 docker run --rm -v "$d/repo:/src" -v kl-gocache:/root/.cache -w /src \
+    -e GOFLAGS=-mod=mod -e GOPROXY=off -e GOTOOLCHAIN=local ${GO_ENV:-} golang:1.24-alpine \
+    go test -count=1 ./... 2>&1); rc=$?
+  rm -rf "$d"
+  if grep -qE '^(fatal error|panic:)' <<<"$out"; then
+    # a crash: its reason, not the goroutine dump after it
+    grep -E -m3 '^(fatal error|panic:)' <<<"$out"
+    grep -E '^(FAIL|ok)[[:space:]]' <<<"$out" | tail -3
+  else
+    printf '%s\n' "$out" | tail -20
+  fi
+  return "$rc"
+}
+
 # ---------- algorithms helper ----------
 # algo_check <<'EOF' ... EOF -> stdin holds hidden Python tests, a line "---GO---", then
 # hidden Go tests. They run against /lab/solution.py and /lab/solution.go; the check

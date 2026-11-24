@@ -8,7 +8,7 @@ what to consolidate. The target doesn't lower the bar: a lab should carry a real
 scenario and teach a concept. The parts of this list that the existing exercises don't cover
 are not started.
 
-Exercise counts (<!-- count:total -->1,772<!-- /count --> total):
+Exercise counts (<!-- count:total -->1,786<!-- /count --> total):
 
 | Topic | Exercises | Target | Track | Module files |
 |---|---|---|---|---|
@@ -20,7 +20,7 @@ Exercise counts (<!-- count:total -->1,772<!-- /count --> total):
 | Cloud & platform | <!-- count:cloud -->93<!-- /count --> | 250 | `cloud` | `exercises/cloud/` |
 | Data | <!-- count:data -->78<!-- /count --> | 250 | `data` | `exercises/data/` |
 | Defensive security | <!-- count:defensive -->78<!-- /count --> | 250 | `defensive` | `exercises/defensive/` |
-| Programming | <!-- count:programming -->107<!-- /count --> | 250 | `programming` | `exercises/programming/` |
+| Programming | <!-- count:programming -->121<!-- /count --> | 250 | `programming` | `exercises/programming/` |
 | Data science | <!-- count:datascience -->83<!-- /count --> | 250 | `datascience` | `exercises/datascience/` |
 | Git | <!-- count:git -->275<!-- /count --> | 250 | `git` | `exercises/git/` |
 | Terraform | <!-- count:terraform -->120<!-- /count --> | 250 | `terraform` | `exercises/terraform/` |
@@ -51,9 +51,12 @@ Exercise counts (<!-- count:total -->1,772<!-- /count --> total):
 
 ### Build next (decided 2026-11-24)
 
-These come **before** everything else on this page, in this order. None is started.
+These come **before** everything else on this page, in this order. Item 1 is done; the
+others aren't started.
 
-1. **Reviewing AI-written code** (Programming track, new module). *"An AI wrote this PR:
+1. ~~**Reviewing AI-written code**~~ (Programming track, new module). **Done** in
+   `exercises/programming/09-reviewing-ai-code.yaml` (prog-108..121, 14 labs). The lab Go
+   image has no C compiler, so Go races are caught by stress tests rather than `-race`. *"An AI wrote this PR:
    find what's wrong before it merges."* Each lab is a plausible-looking diff in Python or
    Go with one planted defect: a data race (`go test -race`, a Python counter shared by
    threads), a silent logic error (an off-by-one in pagination, wrong rounding, a timezone
@@ -321,6 +324,7 @@ Tracks still under 250 after that reach it with new modules on topics they don't
 | Concurrency & I/O | 11 | 15 | 2 / 0 / 3 |
 | Pitfalls & idioms | 21 | 15 | 0 / 0 / 4 |
 | Secure coding | 15 | 15 | 2 / 0 / 0 |
+| Reviewing AI-written code | 14 | 15 | 0 / 0 / 1 |
 
 **Data science**
 
@@ -1108,6 +1112,9 @@ which other sites already cover well. SQL is under [Data](#data).
 
 Good practices and design patterns, in Python and Go, are done in
 `exercises/programming/08-good-practices-patterns.yaml` (prog-087..107).
+Reviewing AI-written pull requests (planted defects, `findings.txt`, mutation-tested
+learner tests, a typo-squatted wheel and a look-alike Go module) is done in
+`exercises/programming/09-reviewing-ai-code.yaml` (prog-108..121).
 
 - **Checks:** run a hidden test suite plus real behaviour, such as "the service stays up
   under load" or "memory no longer grows". Keep tests outside `/lab` so they can't be
