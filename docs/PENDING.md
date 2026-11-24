@@ -49,6 +49,56 @@ Exercise counts (<!-- count:total -->1,772<!-- /count --> total):
 
 ## Suggested order
 
+### Build next (decided 2026-11-24)
+
+These come **before** everything else on this page, in this order. None is started.
+
+1. **Reviewing AI-written code** (Programming track, new module). *"An AI wrote this PR:
+   find what's wrong before it merges."* Each lab is a plausible-looking diff in Python or
+   Go with one planted defect: a data race (`go test -race`, a Python counter shared by
+   threads), a silent logic error (an off-by-one in pagination, wrong rounding, a timezone
+   slip), a leak (goroutines, file handles, an unbounded cache), a **made-up or
+   typo-squatted package** in `requirements.txt`/`go.mod` (the offline mirror holds a
+   malicious look-alike), an insecure default, a test that passes without testing
+   anything. Checks: hidden tests and the race detector on the learner's fixed code, plus a
+   `findings.txt` naming the defect's file and line. No models and no new infrastructure.
+2. **MCP servers** (Programming track, new module). Build Model Context Protocol tool
+   servers in Python (official `mcp` SDK) or Go, over stdio and HTTP: expose a read-only
+   database query tool, a service-status tool, a file reader limited to one directory.
+   Practise input schemas, an allow-list of tools and arguments, refusing path traversal
+   and SQL outside a fixed set of queries, timeouts, an audit log of every call, a secret
+   that must never appear in a tool result. Checks: a scripted MCP client lists the tools,
+   calls them with good and hostile arguments, and inspects the replies and the audit log.
+   No model needed, so it's fully repeatable. Pre-pull the SDKs into the image.
+3. **AI engineering: *Serving a model*** (see
+   [AI engineering with tiny models](#ai-engineering-with-tiny-models)), **with a LiteLLM
+   gateway added**: two llama.cpp servers (a 0.5B "cheap" model and a 1.5B "expensive"
+   one) plus a deliberately failing upstream behind LiteLLM's proxy. Labs: virtual keys,
+   rate limits and per-key budgets, a fallback chain when the upstream fails, routing short
+   requests to the cheap model, reading LiteLLM's spend logs. Also cover Ollama beside
+   llama.cpp, GGUF quantization levels (Q8 vs Q4: RSS, tokens/s, `llama-perplexity`) and the
+   KV-cache settings (`--ctx-size`, `-np` parallel slots, `--cache-type-k`). vLLM, AWQ and
+   FP8 need a GPU: explain them in the tutorial only. **Test memory first**: two models
+   plus LiteLLM on the 4GiB Docker VM.
+4. **AI engineering: *Retrieval*** (same section), including **hybrid search** (PostgreSQL
+   full-text or BM25 plus pgvector), a small cross-encoder re-ranker, and **knowledge
+   hygiene**: near-duplicate documents, a stale version that wins the search, metadata
+   filters, re-indexing on change.
+5. **Sandboxing untrusted code with gVisor** (Defensive security or Docker track). Run
+   generated code under `runsc` (arm64 works) in the Docker VM: no network or an egress
+   allow-list in nftables, seccomp, read-only root, CPU/memory/pids limits, no secrets
+   mounted. Checks attempt escapes, network calls, fork bombs and reading host files.
+   Firecracker needs nested virtualization (Apple M3 or newer only), so at most an optional
+   lab.
+6. **Durable workflows** (Programming track, new module): Temporal's dev server (single
+   binary) with Python or Go workers. Retries with backoff, activity timeouts,
+   idempotent activities, a human-approval step via a signal, a worker killed mid-run that
+   resumes where it left off, a workflow change that breaks determinism. Optionally
+   LangGraph with SQLite checkpoints and a fake model. Checks read workflow history through
+   the Temporal CLI.
+
+### Earlier order
+
 1. **Quick wins, no new infrastructure:** Linux admin first, then Git and Shell. They run
    on the existing VMs and are easy to check.
 2. **Networking & IP routing**, which the rest of the networking group builds on.
