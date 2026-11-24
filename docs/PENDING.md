@@ -96,6 +96,30 @@ These come **before** everything else on this page, in this order. None is start
    resumes where it left off, a workflow change that breaks determinism. Optionally
    LangGraph with SQLite checkpoints and a fake model. Checks read workflow history through
    the Temporal CLI.
+7. **Model supply chain** (Defensive security or Offensive security track). Model files
+   can run code when loaded: a pickle-based `.pt`/`.bin` that opens a shell on
+   `torch.load`, found with `fickling`/`modelscan`-style inspection (or a small stdlib
+   `pickletools` scanner), and converted to **safetensors**. Also: pinning model files by
+   SHA-256 in a manifest, a typo-squatted model name in a config, a model swapped on a
+   mirror after the hash was recorded, provenance notes (who published it, which
+   licence). Checks: the loader refuses unpinned or pickle files, the safe copy loads with
+   identical tensors, the malicious file never executes (a canary file stays absent).
+8. **When LLM APIs fail** (Programming track, beside *Serving a model*). A mock
+   OpenAI-compatible upstream that the lab controls: 429s with `Retry-After`, 5xx bursts,
+   a stream that stops mid-answer, a slow first token, a tool call that times out. The
+   learner's client must back off with jitter and honour `Retry-After`, retry without doing
+   the work twice (idempotency keys on the side-effecting tool), resume or cleanly fail a
+   broken stream, open a circuit breaker, and keep a deadline across a multi-step tool
+   chain. Checks read the mock's request log (counts, timing, duplicate side effects).
+   Deterministic, no model needed.
+9. **Running coding agents safely** (Defensive security track; overlaps item 5). A coding
+   agent is untrusted code with your credentials. Labs: a devcontainer with no host home
+   directory and no SSH agent, an egress allow-list (package mirror and Git server only),
+   a scoped short-lived CI token instead of a personal token, a secrets scan that blocks a
+   commit, a hook/permission policy that refuses `rm -rf`, `curl | sh` and pushes to
+   `main`, and an audit log of every command. Checks replay a scripted "agent" session
+   with hostile steps and confirm each is refused and logged. The real agent tools need
+   accounts, so the agent is a script.
 
 ### Earlier order
 
@@ -1059,6 +1083,18 @@ behave just like big ones, and their mistakes make the lessons easier to see.
   OpenAI-compatible client, so the code learners write works unchanged against a hosted model.
 - **Start with** *Serving a model* and *Retrieval*; nearly every later module builds on a
   served model and a working index.
+- **Also cover (added 2026-11-24):**
+  - **Statistics for evals**, in *Evaluation* (ties into the Statistics modules): is 82%
+    → 85% on 50 questions real or noise? Confidence intervals for an eval score, a paired
+    comparison of two prompts on the same questions, how many questions you need,
+    measuring how often a grader disagrees with itself.
+  - **Inference on Kubernetes**, as a module of its own or in the Kubernetes track:
+    llama.cpp behind a Service, readiness that waits for the model to load, getting a
+    large model file onto the nodes (init container, a PVC, an OCI artifact), scaling on
+    queue depth with KEDA instead of CPU, a pod OOM-killed by a too-large context.
+  - **Context and cost**, in *Operations & cost*: what goes into the context, token
+    budgets per request, prompt caching (a stable prefix first), why quality drops in
+    very long contexts, trimming conversation history.
 
 ## Programming
 
