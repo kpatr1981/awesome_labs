@@ -8,12 +8,12 @@ what to consolidate. The target doesn't lower the bar: a lab should carry a real
 scenario and teach a concept. The parts of this list that the existing exercises don't cover
 are not started.
 
-Exercise counts (<!-- count:total -->1,756<!-- /count --> total):
+Exercise counts (<!-- count:total -->1,772<!-- /count --> total):
 
 | Topic | Exercises | Target | Track | Module files |
 |---|---|---|---|---|
 | Docker | <!-- count:docker -->186<!-- /count --> | 250 | `docker` | `exercises/docker/` |
-| Kubernetes | <!-- count:kubernetes -->302<!-- /count --> | 250 | `kubernetes` | `exercises/kubernetes/` |
+| Kubernetes | <!-- count:kubernetes -->318<!-- /count --> | 250 | `kubernetes` | `exercises/kubernetes/` |
 | Offensive security | <!-- count:offsec -->83<!-- /count --> | 250 | `offsec` | `exercises/offsec/` |
 | Linux & systems | <!-- count:linux -->86<!-- /count --> | 250 | `linux` | `exercises/linux/` |
 | Networking | <!-- count:networking -->106<!-- /count --> | 250 | `networking` | `exercises/networking/` |
@@ -27,7 +27,6 @@ Exercise counts (<!-- count:total -->1,756<!-- /count --> total):
 | Ansible | <!-- count:ansible -->89<!-- /count --> | 250 | `ansible` | `exercises/ansible/` |
 | Algorithms | <!-- count:algorithms -->70<!-- /count --> | 250 | `algorithms` | `exercises/algorithms/` |
 
-- [Open follow-ups](#open-follow-ups)
 - [Suggested order](#suggested-order)
 - [Deepen every module](#deepen-every-module)
 - [Gaps in Kubernetes, Terraform and Git](#gaps-in-kubernetes-terraform-and-git)
@@ -47,22 +46,6 @@ Exercise counts (<!-- count:total -->1,756<!-- /count --> total):
 - [awesome_labs features](#awesome_labs-features)
 - [More lab ideas](#more-lab-ideas)
 - [Left out for now](#left-out-for-now)
-
-## Open follow-ups
-
-Work left over from shipped modules, as of v0.25.0 (2026-11-22). These come before new labs.
-
-- **Re-verify the pull-request exercises on the Docker VM:** `git-256..275` (LFS, credentials,
-  pull requests) and `tf-118..120` (plan and apply from pull requests).
-- **Turn Git LFS off in the Docker VM's saved copy.** It's still on there, so a fresh start
-  from the copy doesn't match a clean build.
-- **Rebuild the k8s lab with `env rebuild k8s`.** The saved copies `klbase-cp` and
-  `klbase-worker` still have the old memory (3 GiB and 2.5 GiB) rather than the new 3.5 GiB and
-  4 GiB. The memory notes further down (Linkerd, Kubernetes OIDC, *Left out for now*) still
-  quote the old sizes too.
-- **Kyverno and Prometheus Operator add-ons** for the k8s lab aren't written. Their lab ideas
-  are *Policy engines* and *Prometheus and Grafana in the cluster* in
-  [Kubernetes gaps](#kubernetes-gaps).
 
 ## Suggested order
 
@@ -372,8 +355,8 @@ then GitOps for Kubernetes, then Git LFS.
 | Gap | The lab | Runs on | Notes |
 |---|---|---|---|
 | **GitOps with Argo CD or Flux** | Done with Argo CD in `exercises/kubernetes/24-gitops-argocd.yaml` (k8s-394..401), on an in-cluster Gitea | | |
-| **Prometheus and Grafana in the cluster** | Prometheus with kube-state-metrics, a ServiceMonitor that scrapes nothing, an alert that never fires, a Grafana dashboard with no data | k8s lab; may need more memory | See *Observability* (Cloud & platform) and *Prometheus and alerting* (Shared lab foundations). kube-prometheus-stack is probably too heavy; plain Prometheus first |
-| **Policy engines** | Kyverno validate, mutate and generate rules, audit vs enforce, a policy exception; or Gatekeeper constraint templates | k8s lab | Built-in CEL policies are covered already; *Supply chain* (Security) mentions Kyverno |
+| **Prometheus and Grafana in the cluster** | Prometheus Operator part done in `exercises/kubernetes/26-prometheus-operator.yaml` (k8s-410..417). Still open: a Grafana dashboard with no data (the image is already cached) | k8s lab | See *Observability* (Cloud & platform) and *Prometheus and alerting* (Shared lab foundations) |
+| **Policy engines** | Kyverno done in `exercises/kubernetes/25-kyverno.yaml` (k8s-402..409). Still open: Gatekeeper constraint templates, Kyverno image verification (see *Supply chain*) | k8s lab | Built-in CEL policies are covered already |
 | **CKS-level security** | AppArmor profiles on pods, custom seccomp profiles from the kubelet's directory, Falco catching a shell in a container, cosign-signed images with signature checks at admission, Trivy scans, kube-bench findings | k8s lab | seccomp has two exercises so far. See *Supply chain* (Security) |
 | **Autoscaling beyond the HPA** | VPA recommendations, an HPA on a custom metric (prometheus-adapter), scaling from zero | k8s lab | KEDA already has a row in *Even more ideas* |
 | **Volume snapshots and expansion** | Snapshot a PVC, restore it to a new claim, clone a volume, grow one that's full | k8s lab; csi-driver-host-path | local-path supports neither, so this needs a CSI driver |
@@ -1394,7 +1377,7 @@ limit, and is OOM-killed at 500MiB, so give it 800MiB. The image is 684MB, so pr
 | **401 versus 403** | A valid token that lacks the right role | Keycloak |
 | **Service-to-service auth** | Client credentials and token validation | Keycloak |
 | **LDAP federation** | Connect a directory and fix a failing bind or group mapping | Keycloak, lldap |
-| **Kubernetes OIDC** | Log in to the API server and map groups to RBAC | Dex, because Keycloak is too heavy for the 3GiB and 2.5GiB nodes |
+| **Kubernetes OIDC** | Log in to the API server and map groups to RBAC | Dex, because Keycloak is too heavy for the 3.5GiB and 4GiB nodes |
 
 ### Microservices labs
 
@@ -1432,5 +1415,5 @@ partway there.
 
 ## Left out for now
 
-- **Service mesh:** Istio would strain the 3GiB and 2.5GiB nodes for relatively little
+- **Service mesh:** Istio would strain the 3.5GiB and 4GiB nodes for relatively little
   payoff.

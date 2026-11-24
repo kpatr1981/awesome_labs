@@ -1,0 +1,973 @@
+track: kubernetes
+module: Monitoring with the Prometheus Operator
+profile: k8s
+order: 26
+exercises:
+
+# ===== Beginner =====
+
+- id: k8s-410
+  title: Scrape your app with a ServiceMonitor
+  difficulty: 1
+  kind: build
+  tags: [prometheus, operator, servicemonitor, scraping, metrics]
+  tutorial: |
+    **What you're learning.** How Prometheus collects metrics, what the **Prometheus Operator** adds, and how a **`ServiceMonitor`** tells it to scrape your app.
+
+    ### Prometheus from zero
+
+    **Prometheus** is a time-series database that **pulls**: every few seconds it fetches `http://<pod>:<port>/metrics` from each **target** and stores what comes back:
+
+    ```text
+    # HELP http_requests_total Number of HTTP requests.
+    # TYPE http_requests_total counter
+    http_requests_total{status="200"} 1027
+    http_requests_total{status="500"} 3
+    ```
+    Each line is a **series**: a metric name, **labels** in braces, and a value. For every target it also records **`up`**: 1 if the scrape worked, 0 if it failed.
+
+    ### The Operator
+
+    Writing Prometheus's scrape configuration by hand for pods that come and go is painful. The **Prometheus Operator** runs Prometheus for you and builds that configuration from Kubernetes objects:
+
+    | Object | Means |
+    |---|---|
+    | `Prometheus` | a Prometheus server, and which monitors and rules it picks up |
+    | `ServiceMonitor` | "scrape the pods behind these Services, on this port" |
+    | `PodMonitor` | "scrape these pods" (no Service needed, k8s-415) |
+    | `PrometheusRule` | recording and alerting rules (k8s-411, k8s-412) |
+
+    In this lab, the Prometheus `lab` in namespace `monitoring` picks up monitors and rules **labelled `release: lab`**, in any namespace.
+
+    ### A ServiceMonitor
+
+    ```yaml
+    apiVersion: monitoring.coreos.com/v1
+    kind: ServiceMonitor
+    metadata:
+      name: billing
+      namespace: billing
+      labels:
+        release: lab                 # or this Prometheus ignores it
+    spec:
+      selector:
+        matchLabels:
+          app: billing               # the labels of the Service, not the pods
+      endpoints:
+      - port: http                   # the Service port's NAME
+        path: /metrics
+        interval: 15s
+    ```
+    The operator follows Service ➜ EndpointSlices ➜ pods, so each pod becomes one target.
+
+    ### Commands you'll use
+
+    Prometheus answers on Service `prometheus` port 9090. From the control plane:
+    ```bash
+    kubectl -n monitoring port-forward svc/prometheus 9090 &
+    curl -s 'localhost:9090/api/v1/query?query=up{namespace="billing"}' | jq '.data.result[] | [.metric.pod, .value[1]]'
+    ```
+    ```text
+    ["billing-7d9c6b5f4-2kqzx", "1"]
+    ["billing-7d9c6b5f4-x8mfj", "1"]
+    ```
+    The **Targets** page (`/targets` in a browser, or `/api/v1/targets`) shows every target and the error of each failing one.
+
+    ### Common mistakes
+
+    - No `release: lab` label on the ServiceMonitor.
+    - `port: 9898` instead of the port's **name**.
+    - Selecting the **pods'** labels when the Service is labelled differently.
+
+    ### Check your work
+
+    `up{namespace="..."}` shows one series per pod, each with value `1`.
+  scenario: |
+    The Prometheus Operator runs in namespace **`monitoring`**, with a Prometheus that picks up
+    monitors labelled **`release: lab`**. Namespace **`shop`** runs **podinfo** (2 pods) behind
+    the Service **`podinfo`**, which serves metrics at **`/metrics`** on its port named
+    **`http`**.
+
+    Create a **`ServiceMonitor`** named **`podinfo`** in namespace `shop` so that Prometheus
+    scrapes both pods every **15 seconds**.
+  hints:
+    - "`kubectl -n shop get svc podinfo --show-labels -o yaml` gives you the labels to select and the port's name."
+    - "Label the ServiceMonitor `release: lab`, then look for `up{namespace=\"shop\"}` in Prometheus."
+  solution: |
+    ```bash
+    kubectl -n shop get svc podinfo -o yaml | grep -A3 -E 'labels:|ports:'
+    kubectl apply -f - <<'EOF'
+    apiVersion: monitoring.coreos.com/v1
+    kind: ServiceMonitor
+    metadata:
+      name: podinfo
+      namespace: shop
+      labels:
+        release: lab
+    spec:
+      selector:
+        matchLabels:
+          app: podinfo
+      endpoints:
+      - port: http
+        path: /metrics
+        interval: 15s
+    EOF
+    kubectl -n monitoring port-forward svc/prometheus 9090 &
+    sleep 60; curl -s 'localhost:9090/api/v1/query?query=up{namespace="shop"}' | jq '.data.result[].value[1]'
+    ```
+  setup: |
+    prom_install
+    podinfo_app shop podinfo 2
+  check: |
+    sm=$(kubectl -n shop get servicemonitor podinfo -o json 2>/dev/null)
+    check "ServiceMonitor podinfo exists in shop" '[ -n "$sm" ]'
+    check_eq "it is labelled release=lab" "$(jq -r '.metadata.labels.release // empty' <<<"$sm" 2>/dev/null)" lab
+    check_eq "it scrapes every 15s" "$(jq -r '.spec.endpoints[0].interval // empty' <<<"$sm" 2>/dev/null)" 15s
+    check "Prometheus scrapes both podinfo pods, and both are up" 'prom_wait 150 "up{namespace=\"shop\",service=\"podinfo\"} == 1" = 2'
+    check "podinfo's own metrics arrive" '[ "$(prom_count "http_requests_total{namespace=\"shop\"}")" -gt 0 ]'
+  solve: |
+    kubectl apply -f - >/dev/null <<'EOF'
+    apiVersion: monitoring.coreos.com/v1
+    kind: ServiceMonitor
+    metadata:
+      name: podinfo
+      namespace: shop
+      labels:
+        release: lab
+    spec:
+      selector:
+        matchLabels:
+          app: podinfo
+      endpoints:
+      - port: http
+        path: /metrics
+        interval: 15s
+    EOF
+
+- id: k8s-411
+  title: Record what you ask every day
+  difficulty: 2
+  kind: build
+  tags: [prometheus, promql, recording-rules, prometheusrule, rate]
+  tutorial: |
+    **What you're learning.** The PromQL you need every day (selectors, `rate`, `sum by`) and how to save a query as a **recording rule** in a `PrometheusRule`.
+
+    ### PromQL in five steps
+
+    ```promql
+    http_requests_total                               # every series of this metric
+    http_requests_total{namespace="billing"}          # filtered by labels (=, !=, =~ regex, !~)
+    rate(http_requests_total{namespace="billing"}[5m])   # per-second increase over the last 5 minutes
+    sum(rate(http_requests_total{namespace="billing"}[5m]))              # one number: all pods together
+    sum by (status) (rate(http_requests_total{namespace="billing"}[5m])) # one number per status
+    ```
+
+    - A **counter** (`_total`) only goes up, and restarts at 0 when the pod restarts. Its raw value means little; **`rate()`** turns it into "per second" and copes with restarts.
+    - **`sum by (label)`** adds up the series and keeps only the labels you name. `sum without (pod, instance)` keeps all but those.
+    - The range (`[5m]`) must cover several scrapes; with a 15s interval, `[1m]` is the shortest that's safe.
+
+    ### Recording rules
+
+    A dashboard that runs the same heavy query every 10 seconds for 20 people is wasteful. A **recording rule** runs it once per evaluation and stores the result as a **new series**:
+
+    ```yaml
+    apiVersion: monitoring.coreos.com/v1
+    kind: PrometheusRule
+    metadata:
+      name: billing-recording
+      namespace: billing
+      labels:
+        release: lab
+    spec:
+      groups:
+      - name: billing
+        rules:
+        - record: billing:http_requests:rate5m       # level:metric:operations
+          expr: sum by (status) (rate(http_requests_total{namespace="billing"}[5m]))
+    ```
+    The name follows the convention **`level:metric:operations`**: what it's aggregated to, what it measures, what was done to it.
+
+    ### Commands you'll use
+
+    ```bash
+    curl -s localhost:9090/api/v1/rules | jq '.data.groups[].rules[] | {name, health, lastError}'
+    curl -s 'localhost:9090/api/v1/query' --data-urlencode 'query=billing:http_requests:rate5m' | jq '.data.result'
+    ```
+    ```text
+    [ { "metric": { "__name__": "billing:http_requests:rate5m", "status": "200" }, "value": [ 1795412345.1, "1.98" ] } ]
+    ```
+    The **Graph** page of the web UI is the quickest way to try a query before saving it.
+
+    ### Common mistakes
+
+    - `sum(...)` without `by`: the `status` label is gone.
+    - `rate()` on a value that isn't a counter.
+    - Forgetting `release: lab` on the PrometheusRule, so it's never loaded.
+
+    ### Check your work
+
+    The rule shows `health: ok`, and querying the new name gives one series per status.
+  scenario: |
+    Prometheus already scrapes **podinfo** in namespace **`shop`** (ServiceMonitor `podinfo`),
+    and a load generator sends it traffic. The team keeps asking "how many requests per second
+    does the shop serve, by status code?".
+
+    Create a **`PrometheusRule`** named **`shop-recording`** in namespace `shop` with a
+    recording rule **`shop:http_requests:rate1m`**: the per-second rate of
+    **`http_requests_total`** in namespace `shop` over **1 minute**, summed over all pods, one
+    series per **`status`** label and no other labels.
+  hints:
+    - "`sum by (status) (rate(http_requests_total{namespace=\"shop\"}[1m]))`: try it in Prometheus first."
+    - "The PrometheusRule needs the label `release: lab`; its rule goes under `spec.groups[].rules[]` as `record:` and `expr:`."
+  solution: |
+    ```bash
+    kubectl apply -f - <<'EOF'
+    apiVersion: monitoring.coreos.com/v1
+    kind: PrometheusRule
+    metadata:
+      name: shop-recording
+      namespace: shop
+      labels:
+        release: lab
+    spec:
+      groups:
+      - name: shop
+        rules:
+        - record: shop:http_requests:rate1m
+          expr: sum by (status) (rate(http_requests_total{namespace="shop"}[1m]))
+    EOF
+    curl -s 'localhost:9090/api/v1/query' --data-urlencode 'query=shop:http_requests:rate1m' | jq '.data.result'
+    ```
+  setup: |
+    prom_install
+    podinfo_app shop podinfo 2
+    podinfo_monitor shop podinfo
+    podinfo_load shop podinfo
+  check: |
+    rec=shop:http_requests:rate1m
+    check "PrometheusRule shop-recording exists in shop, labelled release=lab" '[ "$(kj -n shop prometheusrule shop-recording "{.metadata.labels.release}")" = lab ]'
+    loaded() { prom_rule $rec | jq -e '.type == "recording" and .health == "ok"' >/dev/null; }
+    near() { prom_value "abs(sum($rec) - sum(rate(http_requests_total{namespace=\"shop\"}[1m]))) < 0.2" | grep -q .; }
+    busy() { prom_value "$rec{status=\"200\"} > 0.5" | grep -q .; }
+    check "Prometheus loaded the rule $rec, healthy" 'eventually 120 loaded'
+    check "it produces data" 'prom_wait 120 "$rec" -gt 0'
+    check_eq "its only label is status" "$(prom_query "$rec" | jq -c '[.data.result[].metric | del(.__name__) | keys] | unique')" '[["status"]]'
+    check "it covers all pods: it matches the sum of their rates" 'eventually 60 near'
+    check "the load generator's traffic shows up (status 200 above 0.5/s)" 'eventually 120 busy'
+  solve: |
+    kubectl apply -f - >/dev/null <<'EOF'
+    apiVersion: monitoring.coreos.com/v1
+    kind: PrometheusRule
+    metadata:
+      name: shop-recording
+      namespace: shop
+      labels:
+        release: lab
+    spec:
+      groups:
+      - name: shop
+        rules:
+        - record: shop:http_requests:rate1m
+          expr: sum by (status) (rate(http_requests_total{namespace="shop"}[1m]))
+    EOF
+
+- id: k8s-412
+  title: An alert for a shrinking Deployment
+  difficulty: 2
+  kind: build
+  tags: [prometheus, alerting, prometheusrule, kube-state-metrics]
+  tutorial: |
+    **What you're learning.** How to write an **alerting rule**: the expression, the `for` that stops it from flapping, labels for routing, and how to watch it go *pending* and *firing*.
+
+    ### Where the numbers come from
+
+    Prometheus can't see Kubernetes objects by itself. **kube-state-metrics** turns them into metrics, for example:
+
+    | Metric | Means |
+    |---|---|
+    | `kube_deployment_spec_replicas` | replicas asked for |
+    | `kube_deployment_status_replicas_available` | replicas available |
+    | `kube_pod_container_status_restarts_total` | container restarts |
+    | `kube_pod_container_status_waiting_reason` | why a container is waiting (`CrashLoopBackOff`, …) |
+
+    ### An alerting rule
+
+    ```yaml
+    - alert: ApiReplicasLow
+      expr: kube_deployment_status_replicas_available{namespace="api", deployment="gateway"} < 3
+      for: 2m
+      labels:
+        severity: page
+      annotations:
+        summary: "gateway has only {{ $value }} replicas available"
+    ```
+    - **`expr`** returns series when something is wrong. Every series it returns is an alert.
+    - **`for`**: it must stay true that long. Until then the alert is **pending**; after that it's **firing**.
+    - **`labels`** are added to the alert; Alertmanager routes on them (`severity` is the usual one).
+    - **`annotations`** are text for people. `{{ $value }}` and `{{ $labels.pod }}` are filled in.
+
+    ### Commands you'll use
+
+    ```bash
+    curl -s localhost:9090/api/v1/rules | jq '.data.groups[].rules[] | select(.type == "alerting") | {name, state, health}'
+    curl -s localhost:9090/api/v1/alerts | jq '.data.alerts[] | {name: .labels.alertname, state}'
+    ```
+    ```text
+    { "name": "ApiReplicasLow", "state": "pending" }
+    ```
+    To test an alert, make it true: `kubectl -n api scale deploy gateway --replicas=1`, and put it back afterwards.
+
+    ### Common mistakes
+
+    - No `for`: one slow scrape and someone gets paged.
+    - Comparing `spec` replicas with themselves, or forgetting the `deployment` label so every Deployment is covered.
+    - Quoting: `{{ $value }}` in YAML needs the whole string in quotes.
+
+    ### Check your work
+
+    The rule loads as `inactive`; scale the Deployment down and it goes `pending`, then `firing`; scale it back and it clears.
+  scenario: |
+    In namespace **`shop`**, Deployment **`podinfo`** should run **2** replicas.
+    kube-state-metrics is scraped by Prometheus.
+
+    Create a **`PrometheusRule`** named **`shop-alerts`** in namespace `shop` with an alert
+    **`ShopReplicasLow`** that fires when **fewer than 2** replicas of `podinfo` in `shop` are
+    **available** for **30 seconds**. Give it the label **`severity: warning`** and a
+    **`summary`** annotation.
+  hints:
+    - "`kube_deployment_status_replicas_available{namespace=\"shop\", deployment=\"podinfo\"} < 2`"
+    - "`for: 30s` and `labels: {severity: warning}`; don't forget `release: lab` on the PrometheusRule."
+  solution: |
+    ```bash
+    kubectl apply -f - <<'EOF'
+    apiVersion: monitoring.coreos.com/v1
+    kind: PrometheusRule
+    metadata:
+      name: shop-alerts
+      namespace: shop
+      labels:
+        release: lab
+    spec:
+      groups:
+      - name: shop-alerts
+        rules:
+        - alert: ShopReplicasLow
+          expr: kube_deployment_status_replicas_available{namespace="shop", deployment="podinfo"} < 2
+          for: 30s
+          labels:
+            severity: warning
+          annotations:
+            summary: "podinfo has only {{ $value }} available replicas"
+    EOF
+    kubectl -n shop scale deploy podinfo --replicas=1     # test it...
+    sleep 90; curl -s localhost:9090/api/v1/alerts | jq '.data.alerts[].state'
+    kubectl -n shop scale deploy podinfo --replicas=2     # ...and put it back
+    ```
+  setup: |
+    prom_install
+    podinfo_app shop podinfo 2
+  check: |
+    r=$(kubectl -n shop get prometheusrule shop-alerts -o json 2>/dev/null)
+    a=$(jq -c '[.spec.groups[].rules[] | select(.alert == "ShopReplicasLow")] | first // empty' <<<"$r" 2>/dev/null)
+    check "PrometheusRule shop-alerts has an alert ShopReplicasLow" '[ -n "$a" ]'
+    check_eq "it has severity warning" "$(jq -r '.labels.severity // empty' <<<"$a" 2>/dev/null)" warning
+    check_eq "it waits 30s" "$(jq -r '.for // empty' <<<"$a" 2>/dev/null)" 30s
+    check "it has a summary annotation" 'jq -e ".annotations.summary | length > 0" <<<"$a"'
+    check "Prometheus loaded it, and it is quiet while podinfo has 2 replicas" 'prom_wait_alert 120 ShopReplicasLow inactive'
+    fired=no
+    if [ "$(prom_alert ShopReplicasLow)" = inactive ]; then
+      kubectl -n shop scale deploy podinfo --replicas=1 >/dev/null
+      eventually 150 '[ "$(prom_alert ShopReplicasLow)" = firing ]' && fired=yes
+      kubectl -n shop scale deploy podinfo --replicas=2 >/dev/null
+    fi
+    check_eq "with 1 replica it fires (after its 30s)" "$fired" yes
+    check "with 2 again it clears" 'prom_wait_alert 150 ShopReplicasLow inactive'
+    check "it is about podinfo only: it ignores other Deployments" 'jq -e ".expr | test(\"deployment *= *\\\"podinfo\\\"\")" <<<"$a"'
+  solve: |
+    kubectl apply -f - >/dev/null <<'EOF'
+    apiVersion: monitoring.coreos.com/v1
+    kind: PrometheusRule
+    metadata:
+      name: shop-alerts
+      namespace: shop
+      labels:
+        release: lab
+    spec:
+      groups:
+      - name: shop-alerts
+        rules:
+        - alert: ShopReplicasLow
+          expr: kube_deployment_status_replicas_available{namespace="shop", deployment="podinfo"} < 2
+          for: 30s
+          labels:
+            severity: warning
+          annotations:
+            summary: "podinfo has only {{ $value }} available replicas"
+    EOF
+
+# ===== Intermediate =====
+
+- id: k8s-413
+  title: The ServiceMonitor that scrapes nothing
+  difficulty: 3
+  kind: fix
+  tags: [prometheus, servicemonitor, troubleshooting, selectors]
+  tutorial: |
+    **What you're learning.** How to follow the chain **ServiceMonitor ➜ Service ➜ EndpointSlices ➜ pods** and find the link that's broken when a target never appears.
+
+    ### The chain
+
+    ```
+    Prometheus "lab" ── serviceMonitorSelector / NamespaceSelector ──► ServiceMonitor
+       ServiceMonitor ── namespaceSelector + selector (Service labels) ──► Service
+       Service ── endpoints ──► pods, on the port NAMED in the ServiceMonitor
+    ```
+    Every link fails **silently**: no error, the target is simply not there. Check them one by one:
+
+    1. **Is the ServiceMonitor picked up?** It needs the label the Prometheus selects (`release: lab` here).
+    2. **Which namespaces does it look in?** Without `namespaceSelector`, **only its own**. A ServiceMonitor in `monitoring` for a Service in `billing` needs:
+       ```yaml
+       namespaceSelector:
+         matchNames: [billing]
+       ```
+    3. **Does `selector` match the Service's labels?** Not the pods', not the Deployment's.
+    4. **Is `port` the name of a port of the Service?** A number doesn't match; use `targetPort` for a container port number.
+
+    ### Commands you'll use
+
+    ```bash
+    kubectl -n billing get svc --show-labels
+    kubectl -n billing get svc billing-api -o jsonpath='{.spec.ports}'
+    ```
+    ```text
+    [{"name":"metrics","port":8080,"protocol":"TCP","targetPort":8080}]
+    ```
+    The operator writes the scrape configuration into a Secret; each ServiceMonitor endpoint becomes a job named `serviceMonitor/<namespace>/<name>/<index>`:
+    ```bash
+    kubectl -n monitoring get secret prometheus-lab -o jsonpath='{.data.prometheus\.yaml\.gz}' | base64 -d | gunzip | grep job_name
+    curl -s localhost:9090/api/v1/targets | jq -r '.data.activeTargets[] | "\(.scrapePool) \(.health) \(.lastError)"'
+    ```
+
+    ### Common mistakes
+
+    - Fixing one link and stopping: often two are broken.
+    - Moving the ServiceMonitor instead of adding `namespaceSelector`.
+    - Changing the Service's labels to fit a wrong selector, and breaking whatever else used them.
+
+    ### Check your work
+
+    The Targets page lists one target per pod for `serviceMonitor/monitoring/<name>/0`, all **up**.
+  scenario: |
+    The platform team keeps all ServiceMonitors in namespace **`monitoring`**. The one for
+    **`checkout-api`** (namespace **`checkout`**, 2 pods) is called **`checkout-api`**, but
+    Prometheus has never scraped it.
+
+    Fix the **ServiceMonitor** so both pods are scraped and up. Keep it in `monitoring` and
+    don't change the Service or the Deployment.
+  hints:
+    - "Which namespaces does a ServiceMonitor look in when it has no `namespaceSelector`?"
+    - "Compare its `selector` with `kubectl -n checkout get svc checkout-api --show-labels`, and its `port` with the Service's port names."
+  solution: |
+    ```bash
+    kubectl -n monitoring get servicemonitor checkout-api -o yaml
+    kubectl -n checkout get svc checkout-api --show-labels -o jsonpath='{.metadata.labels} {.spec.ports}'
+    # a JSON patch, not a merge patch: a merge patch would keep the old app: checkout-api
+    # next to the new label in matchLabels, and the Service has no app label any more
+    kubectl -n monitoring patch servicemonitor checkout-api --type=json -p '[
+      {"op": "add", "path": "/spec/namespaceSelector", "value": {"matchNames": ["checkout"]}},
+      {"op": "replace", "path": "/spec/selector", "value": {"matchLabels": {"app.kubernetes.io/name": "checkout-api"}}},
+      {"op": "replace", "path": "/spec/endpoints/0/port", "value": "web"}]'
+    ```
+    (`kubectl -n monitoring edit servicemonitor checkout-api` works just as well.)
+  setup: |
+    prom_install
+    podinfo_app checkout checkout-api 2 web
+    kubectl -n checkout label svc checkout-api app- app.kubernetes.io/name=checkout-api --overwrite >/dev/null
+    kubectl -n checkout get svc,deploy checkout-api -o json | jq -S '[.items[] | {kind, labels: .metadata.labels, spec: (.spec | del(.clusterIP, .clusterIPs, .template.metadata.annotations))}]' > $KL_STATE/objs.json
+    kapply <<'EOF'
+    apiVersion: monitoring.coreos.com/v1
+    kind: ServiceMonitor
+    metadata:
+      name: checkout-api
+      namespace: monitoring
+      labels:
+        release: lab
+    spec:
+      selector:
+        matchLabels:
+          app: checkout-api
+      endpoints:
+      - port: "9898"
+        path: /metrics
+        interval: 15s
+    EOF
+  check: |
+    check_eq "the Service and Deployment are unchanged" "$(kubectl -n checkout get svc,deploy checkout-api -o json 2>/dev/null | jq -S '[.items[] | {kind, labels: .metadata.labels, spec: (.spec | del(.clusterIP, .clusterIPs, .template.metadata.annotations))}]')" "$(cat $KL_STATE/objs.json)"
+    check "ServiceMonitor checkout-api is still in monitoring, labelled release=lab" '[ "$(kj -n monitoring servicemonitor checkout-api "{.metadata.labels.release}")" = lab ]'
+    check "both checkout-api pods are scraped and up" 'prom_wait 180 "up{namespace=\"checkout\",job=\"checkout-api\"} == 1" = 2'
+    check "its metrics arrive" '[ "$(prom_count "http_requests_total{namespace=\"checkout\"}")" -gt 0 ]'
+  solve: |
+    kubectl -n monitoring patch servicemonitor checkout-api --type=json -p '[
+      {"op": "add", "path": "/spec/namespaceSelector", "value": {"matchNames": ["checkout"]}},
+      {"op": "replace", "path": "/spec/selector", "value": {"matchLabels": {"app.kubernetes.io/name": "checkout-api"}}},
+      {"op": "replace", "path": "/spec/endpoints/0/port", "value": "web"}]' >/dev/null
+
+- id: k8s-414
+  title: The alert that never fires
+  difficulty: 3
+  kind: fix
+  tags: [prometheus, alerting, prometheusrule, troubleshooting, crashloop]
+  tutorial: |
+    **What you're learning.** Why an alert can stay silent while the thing it watches is plainly broken, and how to test an alert's expression on its own.
+
+    ### Three ways to stay silent
+
+    1. **The rule never loaded.** The Prometheus only picks up PrometheusRules that match its `ruleSelector` (and `ruleNamespaceSelector`). A rule that isn't loaded doesn't show up in `/api/v1/rules` at all.
+    2. **The expression matches nothing.** Label values are **case-sensitive** and exact: `namespace="Billing"` is not `billing`. A typo in a metric name returns nothing, not an error.
+    3. **`for` is longer than the problem lasts**, or the expression asks for the wrong thing.
+       A crash-looping container is a good example: `kube_pod_container_status_waiting_reason{reason="CrashLoopBackOff"}`
+       is only `1` while the kubelet reports the container as *waiting*. For most of each back-off it reports the
+       last *terminated* state instead, so the series keeps disappearing, the alert drops back from pending to
+       inactive, and a `for: 1m` never completes. Counting restarts doesn't flicker:
+       `increase(kube_pod_container_status_restarts_total[10m]) > 0` stays true for as long as the pod keeps
+       restarting (the back-off tops out at 5 minutes).
+
+    ### Test the expression by itself
+
+    Paste the `expr` into the Graph page, or:
+    ```bash
+    curl -s localhost:9090/api/v1/query --data-urlencode 'query=increase(kube_pod_container_status_restarts_total{namespace="billing"}[10m])' |
+      jq -r '.data.result[] | "\(.metric.pod) \(.value[1])"'
+    ```
+    ```text
+    invoicer-5f7d8c9b6-q2xkz 3.2
+    ```
+    Remove one label matcher at a time until something comes back: the last one you removed is the wrong one.
+
+    ### Is it loaded?
+
+    ```bash
+    kubectl -n monitoring get prometheus lab -o jsonpath='{.spec.ruleSelector}'
+    curl -s localhost:9090/api/v1/rules | jq -r '.data.groups[] | .name as $g | .rules[] | "\($g) \(.name) \(.state // "-") \(.health)"'
+    ```
+
+    ### Common mistakes
+
+    - Editing the Prometheus's `ruleSelector` to fit one rule, and changing what every other team's rules need.
+    - Testing with the full expression only: you can't see which matcher is wrong.
+    - Changing what the alert means (its name, its severity) while fixing it.
+
+    ### Check your work
+
+    The rule is listed, its expression returns the broken pod, and after its `for` the alert is **firing**.
+  scenario: |
+    In namespace **`batch`**, Deployment **`importer`** has been crash-looping for an hour.
+    The team has a **`PrometheusRule`** named **`batch-alerts`** with the alert
+    **`ImporterCrashLooping`**, yet nobody was alerted.
+
+    Fix the **PrometheusRule** so the alert works and is **firing** now. Keep the alert's
+    name, its labels and its `for`, and don't change the Prometheus or the Deployment.
+  hints:
+    - "Is the rule loaded at all? Compare its labels with `kubectl -n monitoring get prometheus lab -o jsonpath='{.spec.ruleSelector}'`."
+    - "Run its `expr` in Prometheus, then remove the label matchers one at a time."
+  solution: |
+    ```bash
+    kubectl -n batch get prometheusrule batch-alerts -o yaml       # no release label; namespace="Batch"
+    kubectl -n batch label prometheusrule batch-alerts release=lab
+    kubectl -n batch get prometheusrule batch-alerts -o yaml | sed 's/namespace="Batch"/namespace="batch"/' | kubectl apply -f -
+    sleep 90; curl -s localhost:9090/api/v1/alerts | jq '.data.alerts[] | {a: .labels.alertname, state}'
+    ```
+  setup: |
+    prom_install
+    k_ns batch
+    kapply <<'EOF'
+    apiVersion: apps/v1
+    kind: Deployment
+    metadata: {name: importer, namespace: batch}
+    spec:
+      replicas: 1
+      selector: {matchLabels: {app: importer}}
+      template:
+        metadata: {labels: {app: importer}}
+        spec:
+          containers:
+          - name: importer
+            image: busybox:1.37
+            command: [sh, -c, 'echo "connecting to db..."; sleep 2; echo "FATAL: password authentication failed"; exit 1']
+    ---
+    apiVersion: monitoring.coreos.com/v1
+    kind: PrometheusRule
+    metadata:
+      name: batch-alerts
+      namespace: batch
+      labels:
+        team: batch
+    spec:
+      groups:
+      - name: batch
+        rules:
+        - alert: ImporterCrashLooping
+          expr: increase(kube_pod_container_status_restarts_total{namespace="Batch", container="importer"}[10m]) > 0
+          for: 1m
+          labels:
+            severity: critical
+            team: batch
+          annotations:
+            summary: "{{ $labels.pod }} is crash-looping"
+    EOF
+    kubectl get prometheus -n monitoring lab -o json | jq -S .spec > $KL_STATE/prom.json
+    eventually 180 '[ "$(kubectl -n batch get pods -l app=importer -o jsonpath="{.items[0].status.containerStatuses[0].restartCount}")" -ge 1 ]'
+  check: |
+    a=$(kubectl -n batch get prometheusrule batch-alerts -o json 2>/dev/null | jq -c '[.spec.groups[].rules[] | select(.alert == "ImporterCrashLooping")] | first // empty')
+    check "batch-alerts still has the alert ImporterCrashLooping" '[ -n "$a" ]'
+    check_eq "its labels and for are unchanged" "$(jq -c '[.for, .labels]' <<<"$a" 2>/dev/null)" '["1m",{"severity":"critical","team":"batch"}]'
+    check_eq "the Prometheus is unchanged" "$(kubectl get prometheus -n monitoring lab -o json | jq -S .spec)" "$(cat $KL_STATE/prom.json)"
+    check "the Deployment importer is still there" 'k_exists -n batch deploy importer'
+    check "Prometheus loaded the alert" 'eventually 120 "[ -n \"\$(prom_alert ImporterCrashLooping)\" ]"'
+    check "the alert is firing" 'prom_wait_alert 180 ImporterCrashLooping firing'
+  solve: |
+    kubectl -n batch label prometheusrule batch-alerts release=lab --overwrite >/dev/null
+    kubectl -n batch get prometheusrule batch-alerts -o yaml | sed 's/namespace="Batch"/namespace="batch"/' | kubectl apply -f - >/dev/null
+
+- id: k8s-415
+  title: Pods without a Service
+  difficulty: 3
+  kind: build
+  tags: [prometheus, podmonitor, scraping, metrics-port]
+  tutorial: |
+    **What you're learning.** When to use a **`PodMonitor`** instead of a ServiceMonitor, and how it finds the port to scrape.
+
+    ### No Service, no ServiceMonitor
+
+    A ServiceMonitor finds pods **through a Service**. Plenty of workloads have none: queue workers, batch jobs, agents. Creating a Service just to be scraped works, but a **PodMonitor** selects the pods directly:
+
+    ```yaml
+    apiVersion: monitoring.coreos.com/v1
+    kind: PodMonitor
+    metadata:
+      name: mailer
+      namespace: mail
+      labels:
+        release: lab
+    spec:
+      selector:
+        matchLabels:
+          app: mailer                # the pods' labels
+      podMetricsEndpoints:
+      - port: prom                   # a container port's NAME
+        path: /metrics
+        interval: 15s
+    ```
+
+    Note the differences: `podMetricsEndpoints` instead of `endpoints`, and `port` is the **name of a container port** in the pod spec:
+    ```yaml
+    ports:
+    - name: prom
+      containerPort: 9100
+    ```
+    Many apps serve metrics on a **separate port** from their traffic, so the metrics stay private. Scraping the traffic port of such an app returns a 404, and the target shows as **down**.
+
+    ### Commands you'll use
+
+    ```bash
+    kubectl -n mail get pod -l app=mailer -o jsonpath='{.items[0].spec.containers[0].ports}'
+    curl -s localhost:9090/api/v1/targets | jq -r '.data.activeTargets[] | select(.scrapePool | startswith("podMonitor/")) | "\(.labels.pod) \(.scrapeUrl) \(.health)"'
+    ```
+    ```text
+    mailer-6d5f8b7c9-4vxqp http://10.244.1.23:9100/metrics up
+    ```
+
+    ### Common mistakes
+
+    - Writing `endpoints:` (a ServiceMonitor field): the PodMonitor scrapes nothing.
+    - Picking the app's traffic port instead of its metrics port.
+    - A container port with no `name`: give it one (that's a change to the Deployment).
+
+    ### Check your work
+
+    One target per pod under `podMonitor/<namespace>/<name>/0`, scraping the metrics port, all up.
+  scenario: |
+    In namespace **`jobs`**, Deployment **`worker`** (2 pods) has no Service. Its containers
+    serve traffic on port `9898`, and metrics at **`/metrics`** on a separate port named
+    **`metrics`** (9797).
+
+    Create a **`PodMonitor`** named **`worker`** in namespace `jobs` that scrapes the
+    **metrics** port of both pods every **15s**. Don't add a Service.
+  hints:
+    - "`kubectl -n jobs get deploy worker -o yaml` shows the pods' labels and the named container ports."
+    - "A PodMonitor uses `podMetricsEndpoints: [{port: metrics, ...}]`, and the label `release: lab`."
+  solution: |
+    ```bash
+    kubectl -n jobs get deploy worker -o jsonpath='{.spec.template.metadata.labels} {.spec.template.spec.containers[0].ports}'
+    kubectl apply -f - <<'EOF'
+    apiVersion: monitoring.coreos.com/v1
+    kind: PodMonitor
+    metadata:
+      name: worker
+      namespace: jobs
+      labels:
+        release: lab
+    spec:
+      selector:
+        matchLabels:
+          app: worker
+      podMetricsEndpoints:
+      - port: metrics
+        path: /metrics
+        interval: 15s
+    EOF
+    ```
+  setup: |
+    prom_install
+    podinfo_app jobs worker 2 http noservice
+  check: |
+    check_not "there is still no Service in jobs" '[ -n "$(kubectl -n jobs get svc -o name)" ]'
+    check_eq "PodMonitor worker exists, labelled release=lab" "$(kj -n jobs podmonitor worker '{.metadata.labels.release}')" lab
+    check "both worker pods are scraped and up" 'prom_wait 180 "up{namespace=\"jobs\",pod=~\"worker-.*\"} == 1" = 2'
+    check "on the metrics port 9797" '[ "$(prom_query "up{namespace=\"jobs\",pod=~\"worker-.*\"}" | jq -r "[.data.result[].metric.instance | endswith(\":9797\")] | all")" = true ]'
+  solve: |
+    kubectl apply -f - >/dev/null <<'EOF'
+    apiVersion: monitoring.coreos.com/v1
+    kind: PodMonitor
+    metadata:
+      name: worker
+      namespace: jobs
+      labels:
+        release: lab
+    spec:
+      selector:
+        matchLabels:
+          app: worker
+      podMetricsEndpoints:
+      - port: metrics
+        path: /metrics
+        interval: 15s
+    EOF
+
+# ===== Advanced =====
+
+- id: k8s-416
+  title: Relabeling - add the team, drop the noise
+  difficulty: 4
+  kind: build
+  tags: [prometheus, relabeling, cardinality, servicemonitor]
+  tutorial: |
+    **What you're learning.** **Relabeling**: copying Kubernetes labels onto every series of a target, and dropping metrics at scrape time so they never reach the database.
+
+    ### Two kinds of relabeling
+
+    | Field | Runs | Works on |
+    |---|---|---|
+    | `relabelings` | **before** the scrape, once per target | the target's labels, including Kubernetes metadata in `__meta_kubernetes_*` |
+    | `metricRelabelings` | **after** the scrape, on every sample | the scraped series (`__name__` is the metric name) |
+
+    Each step has `sourceLabels`, a `regex` (default `(.*)`) and an `action`: **`replace`** (the default: write `targetLabel`), **`keep`** / **`drop`** (keep or throw away what matches), `labeldrop`, `labelmap`, …
+
+    ### Copy a pod label onto the series
+
+    Before the scrape, a pod's labels are visible as `__meta_kubernetes_pod_label_<name>` (non-alphanumeric characters become `_`):
+    ```yaml
+    endpoints:
+    - port: http
+      relabelings:
+      - sourceLabels: [__meta_kubernetes_pod_label_tier]
+        targetLabel: tier
+    ```
+    The operator also has a short form for this, on the ServiceMonitor's spec: `podTargetLabels: [tier]` (and `targetLabels` for the Service's labels).
+
+    ### Drop metrics you don't use
+
+    Every series costs memory, and some exporters send hundreds you never look at:
+    ```yaml
+      metricRelabelings:
+      - sourceLabels: [__name__]
+        regex: 'process_.*'
+        action: drop
+    ```
+    Dropped series get a **staleness marker**, so they disappear from queries within a scrape or two.
+
+    ### Commands you'll use
+
+    ```bash
+    curl -s localhost:9090/api/v1/targets | jq '.data.activeTargets[0].discoveredLabels' | grep pod_label
+    curl -s localhost:9090/api/v1/query --data-urlencode 'query=count by (__name__) ({namespace="api"})' | jq -r '.data.result[].metric.__name__' | sort | head
+    ```
+
+    ### Common mistakes
+
+    - Putting a `__name__` drop in `relabelings`: before the scrape there's no `__name__`, so nothing is dropped.
+    - A regex that's not anchored the way you think: Prometheus anchors it at both ends, so `go_` alone matches nothing.
+    - Dropping `up`-related or `http_*` series you still need.
+
+    ### Check your work
+
+    Every series from the target has the new label, and the dropped metrics return nothing.
+  scenario: |
+    Prometheus scrapes **podinfo** in namespace **`shop`** through the ServiceMonitor
+    **`podinfo`**. Its pods carry the label **`team: checkout`**.
+
+    Change the **ServiceMonitor** so that:
+
+    1. every series scraped from these pods gets a **`team`** label with the pod's `team` label
+       (`checkout`), and
+    2. all of the Go runtime's metrics (names starting with **`go_`**) are dropped at scrape
+       time.
+
+    podinfo's own metrics, such as `http_requests_total`, must still arrive.
+  hints:
+    - "`podTargetLabels: [team]` on the ServiceMonitor's spec, or a `relabelings` step from `__meta_kubernetes_pod_label_team`."
+    - "`metricRelabelings: [{sourceLabels: [__name__], regex: 'go_.*', action: drop}]` on the endpoint."
+  solution: |
+    ```bash
+    kubectl -n shop patch servicemonitor podinfo --type=merge -p '{
+      "spec": {"podTargetLabels": ["team"],
+               "endpoints": [{"port": "http", "path": "/metrics", "interval": "15s",
+                              "metricRelabelings": [{"sourceLabels": ["__name__"], "regex": "go_.*", "action": "drop"}]}]}}'
+    sleep 60
+    curl -s localhost:9090/api/v1/query --data-urlencode 'query=count(go_goroutines{namespace="shop"})'
+    curl -s localhost:9090/api/v1/query --data-urlencode 'query=up{namespace="shop"}' | jq '.data.result[].metric.team'
+    ```
+  setup: |
+    prom_install
+    podinfo_app shop podinfo 2
+    kubectl -n shop patch deploy podinfo --type=merge -p '{"spec":{"template":{"metadata":{"labels":{"team":"checkout"}}}}}' >/dev/null
+    wait_deploy shop podinfo 120
+    podinfo_monitor shop podinfo
+    podinfo_load shop podinfo
+    eventually 150 '[ "$(prom_count "go_goroutines{namespace=\"shop\"}")" = 2 ]'
+  check: |
+    check_eq "the ServiceMonitor is still labelled release=lab" "$(kj -n shop servicemonitor podinfo '{.metadata.labels.release}')" lab
+    check "both pods' up series carry team=checkout" 'prom_wait 150 "up{namespace=\"shop\",team=\"checkout\"} == 1" = 2'
+    check "http_requests_total arrives, with team=checkout" '[ "$(prom_count "http_requests_total{namespace=\"shop\",team=\"checkout\"}")" -gt 0 ]'
+    check "no go_* metrics from shop are left" 'prom_wait 120 "{namespace=\"shop\",__name__=~\"go_.*\"}" = 0'
+    check "other podinfo metrics are still there (process_*)" '[ "$(prom_count "{namespace=\"shop\",__name__=~\"process_.*\"}")" -gt 0 ]'
+  solve: |
+    kubectl -n shop patch servicemonitor podinfo --type=merge -p '{
+      "spec": {"podTargetLabels": ["team"],
+               "endpoints": [{"port": "http", "path": "/metrics", "interval": "15s",
+                              "metricRelabelings": [{"sourceLabels": ["__name__"], "regex": "go_.*", "action": "drop"}]}]}}' >/dev/null
+
+# ===== Capstone =====
+
+- id: k8s-417
+  title: "Incident: the monitoring went dark"
+  difficulty: 5
+  kind: fix
+  tags: [prometheus, incident, rbac, selectors, troubleshooting]
+  tutorial: |
+    **What you're learning.** How to bring a broken monitoring stack back, working from the outside in: is Prometheus allowed to discover anything, does it pick up the right objects, and does each target answer?
+
+    ### Outside in
+
+    1. **Can Prometheus see the cluster?** It discovers targets by **listing** Services, EndpointSlices and Pods through the API, as its **ServiceAccount**. Without that, every Kubernetes job is empty. Its log says so:
+       ```bash
+       kubectl -n monitoring logs prometheus-lab-0 -c prometheus | grep -i forbidden | tail -3
+       ```
+       ```text
+       ... "failed to list *v1.EndpointSlice: endpointslices.discovery.k8s.io is forbidden: User \"system:serviceaccount:monitoring:prometheus\" cannot list ..."
+       ```
+       ```bash
+       kubectl auth can-i list endpointslices.discovery.k8s.io --as=system:serviceaccount:monitoring:prometheus -A
+       ```
+    2. **Does it pick up the right objects?** The `Prometheus` object's `serviceMonitorSelector`, `podMonitorSelector` and `ruleSelector` (and their `NamespaceSelector`s) decide which monitors and rules are used.
+       ```bash
+       kubectl -n monitoring get prometheus lab -o yaml | grep -A3 Selector
+       ```
+    3. **Does each target answer?** `/api/v1/targets` gives the `lastError` of every target: `404 Not Found`, `connection refused`, `context deadline exceeded`.
+
+    Fix them in that order: a broken step 1 hides everything below it.
+
+    ### Common mistakes
+
+    - Giving the ServiceAccount `cluster-admin` "to be sure".
+    - Fixing a monitor's labels to fit a broken Prometheus selector, instead of fixing the selector.
+    - Stopping when `up` returns something: check the alert rules are loaded too.
+
+    ### Check your work
+
+    All targets are up, the rules are loaded, and an alert you trigger goes firing.
+  scenario: |
+    Since the weekend, the shop's dashboards are empty and the **`ShopReplicasLow`** alert
+    (PrometheusRule **`shop-alerts`** in **`shop`**) is gone from Prometheus. Someone "tidied up"
+    the monitoring stack in **`monitoring`**.
+
+    Bring it back:
+
+    - Prometheus scrapes **kube-state-metrics** and both **podinfo** pods in `shop` (ServiceMonitor
+      **`podinfo`**), and all of them are **up**.
+    - The alert **`ShopReplicasLow`** is loaded and works: it fires when `podinfo` has fewer
+      than 2 replicas.
+    - The Prometheus **`lab`** again selects monitors and rules labelled **`release: lab`** (and
+      only that), as every team expects. Don't change the PrometheusRule, and don't give
+      Prometheus more access than it had.
+  hints:
+    - "Start with the Prometheus log in `prometheus-lab-0` and `kubectl auth can-i ... --as=system:serviceaccount:monitoring:prometheus`."
+    - "`kubectl -n monitoring get prometheus lab -o yaml`: what do its selectors ask for?"
+    - "Once targets show up, `/api/v1/targets` gives each one's `lastError`."
+  solution: |
+    ```bash
+    kubectl -n monitoring logs prometheus-lab-0 -c prometheus | grep -i forbidden | tail -2
+    kubectl get clusterrolebinding lab-prometheus -o yaml        # subject in namespace default
+    kubectl patch clusterrolebinding lab-prometheus --type=json -p '[{"op":"replace","path":"/subjects/0/namespace","value":"monitoring"}]'
+    kubectl -n monitoring get prometheus lab -o yaml | grep -A2 -E 'serviceMonitorSelector|ruleSelector'
+    kubectl -n monitoring patch prometheus lab --type=json -p '[{"op":"replace","path":"/spec/ruleSelector","value":{"matchLabels":{"release":"lab"}}}]'
+    kubectl -n monitoring port-forward svc/prometheus 9090 &
+    curl -s localhost:9090/api/v1/targets | jq -r '.data.activeTargets[] | "\(.labels.job) \(.health) \(.lastError)"'
+    kubectl -n shop patch servicemonitor podinfo --type=json -p '[{"op":"replace","path":"/spec/endpoints/0/path","value":"/metrics"}]'
+    ```
+  setup: |
+    prom_install
+    podinfo_app shop podinfo 2
+    podinfo_monitor shop podinfo
+    kapply <<'EOF'
+    apiVersion: monitoring.coreos.com/v1
+    kind: PrometheusRule
+    metadata:
+      name: shop-alerts
+      namespace: shop
+      labels:
+        release: lab
+    spec:
+      groups:
+      - name: shop-alerts
+        rules:
+        - alert: ShopReplicasLow
+          expr: kube_deployment_status_replicas_available{namespace="shop", deployment="podinfo"} < 2
+          for: 30s
+          labels:
+            severity: warning
+          annotations:
+            summary: "podinfo has only {{ $value }} available replicas"
+    EOF
+    eventually 150 '[ "$(prom_alert ShopReplicasLow)" = inactive ] && [ "$(prom_count "up{namespace=\"shop\"} == 1")" = 2 ]'
+    kubectl -n shop get prometheusrule shop-alerts -o json | jq -S .spec > $KL_STATE/rule.json
+    kubectl get clusterrole lab-prometheus -o json | jq -S .rules > $KL_STATE/role.json
+    # the "tidy-up"
+    kubectl patch clusterrolebinding lab-prometheus --type=json -p '[{"op":"replace","path":"/subjects/0/namespace","value":"default"}]' >/dev/null
+    kubectl -n monitoring patch prometheus lab --type=merge -p '{"spec":{"ruleSelector":{"matchLabels":{"release":"lab","tier":"platform"}}}}' >/dev/null
+    kubectl -n shop patch servicemonitor podinfo --type=json -p '[{"op":"replace","path":"/spec/endpoints/0/path","value":"/metric"}]' >/dev/null
+    kubectl -n monitoring delete pod prometheus-lab-0 --wait=false >/dev/null
+    eventually 120 '[ "$(prom_count "up{namespace=\"shop\"} == 1")" = 0 ]'
+  check: |
+    sel() { kj -n monitoring prometheus lab "{.spec.$1.matchLabels}" | jq -cS . 2>/dev/null; }
+    check_eq "the Prometheus selects ServiceMonitors labelled release=lab" "$(sel serviceMonitorSelector)" '{"release":"lab"}'
+    check_eq "and PrometheusRules labelled release=lab" "$(sel ruleSelector)" '{"release":"lab"}'
+    check_eq "shop-alerts is unchanged" "$(kubectl -n shop get prometheusrule shop-alerts -o json 2>/dev/null | jq -S .spec)" "$(cat $KL_STATE/rule.json)"
+    check_eq "Prometheus's ClusterRole is unchanged" "$(kubectl get clusterrole lab-prometheus -o json 2>/dev/null | jq -S .rules)" "$(cat $KL_STATE/role.json)"
+    check_not "Prometheus has no cluster-admin" 'kubectl auth can-i create pods --as=system:serviceaccount:monitoring:prometheus -A | grep -qx yes'
+    check "kube-state-metrics is scraped and up" 'prom_wait 180 "up{job=\"kube-state-metrics\"} == 1" -ge 1'
+    check "both podinfo pods are scraped and up" 'prom_wait 120 "up{namespace=\"shop\",service=\"podinfo\"} == 1" = 2'
+    check "ShopReplicasLow is loaded and quiet" 'prom_wait_alert 120 ShopReplicasLow inactive'
+    fired=no
+    if [ "$(prom_alert ShopReplicasLow)" = inactive ]; then
+      kubectl -n shop scale deploy podinfo --replicas=1 >/dev/null
+      eventually 150 '[ "$(prom_alert ShopReplicasLow)" = firing ]' && fired=yes
+      kubectl -n shop scale deploy podinfo --replicas=2 >/dev/null
+      wait_deploy shop podinfo 120 >/dev/null 2>&1
+    fi
+    check_eq "with 1 replica of podinfo, ShopReplicasLow fires" "$fired" yes
+  solve: |
+    kubectl patch clusterrolebinding lab-prometheus --type=json -p '[{"op":"replace","path":"/subjects/0/namespace","value":"monitoring"}]' >/dev/null
+    kubectl -n monitoring patch prometheus lab --type=json -p '[{"op":"replace","path":"/spec/ruleSelector","value":{"matchLabels":{"release":"lab"}}}]' >/dev/null
+    kubectl -n shop patch servicemonitor podinfo --type=json -p '[{"op":"replace","path":"/spec/endpoints/0/path","value":"/metrics"}]' >/dev/null

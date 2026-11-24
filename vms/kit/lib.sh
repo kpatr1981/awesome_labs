@@ -1393,8 +1393,10 @@ argo_ok() { eventually "${2:-90}" "[ \"\$(argo_status $1)\" = 'Synced Healthy' ]
 # ---------- Kyverno and Prometheus helpers ----------
 # kyverno_install -> Kyverno v1.19.2 (bundled manifest) in namespace kyverno, webhooks answering
 kyverno_install() {
-  # policy exceptions are off by default; the exceptions exercise needs them
-  zcat /opt/kubelab/kyverno-v1.19.2.yaml.gz | sed 's/--enablePolicyException=false/--enablePolicyException=true/' |
+  # policy exceptions are off by default, and since 1.19 they're ignored unless
+  # --exceptionNamespace says where they may live: allow them in any namespace
+  zcat /opt/kubelab/kyverno-v1.19.2.yaml.gz |
+    sed -E 's/^( *)- --enablePolicyException=false/\1- --enablePolicyException=true\n\1- --exceptionNamespace=*/' |
     kubectl apply --server-side --force-conflicts -f - >/dev/null || return 1
   local d
   for d in kyverno-admission-controller kyverno-background-controller kyverno-cleanup-controller kyverno-reports-controller; do
@@ -1412,6 +1414,22 @@ spec:
     validate: {message: probe, pattern: {metadata: {name: "?*"}}}
 EOF'
 }
+# kyv_denied POLICY NS NAME [kubectl run flags...] -> a pod like that is refused at admission,
+# naming POLICY in the error (retried for a while: new policies take a few seconds to load)
+kyv_denied() {
+  local p=$1 ns=$2 n=$3; shift 3
+  eventually "${KYV_WAIT:-60}" "kubectl -n $ns run $n --restart=Never --dry-run=server $(printf '%q ' "$@") 2>&1 >/dev/null | grep -q -- '$p'"
+}
+# kyv_allowed NS NAME [kubectl run flags...] -> a pod like that is admitted (server-side dry run)
+kyv_allowed() { local ns=$1 n=$2; shift 2; kubectl -n "$ns" run "$n" --restart=Never --dry-run=server "$@" >/dev/null 2>&1; }
+# kyv_mode POLICY -> "enforce" when every validate rule of ClusterPolicy POLICY enforces, else "audit"
+kyv_mode() {
+  kubectl get clusterpolicy "$1" -o json 2>/dev/null | jq -r '(.spec.validationFailureAction // "Audit") as $d |
+    [.spec.rules[] | select(.validate) | (.validate.failureAction // $d) | ascii_downcase] |
+    if length > 0 and all(. == "enforce") then "enforce" else "audit" end'
+}
+# kyv_ready POLICY -> ClusterPolicy POLICY is Ready
+kyv_ready() { eventually "${2:-60}" "[ \"\$(kubectl get clusterpolicy $1 -o jsonpath='{.status.conditions[?(@.type==\"Ready\")].status}' 2>/dev/null)\" = True ]"; }
 # prom_install -> the Prometheus Operator v0.94.2 and kube-state-metrics in namespace
 # monitoring, plus a Prometheus "lab" (v3.15.1) that picks up ServiceMonitors and
 # PrometheusRules labelled release=lab in any namespace, reachable as Service prometheus:9090
@@ -1493,6 +1511,98 @@ prom_value() { prom_query "$1" | jq -r '.data.result[0].value[1] // empty'; }
 prom_api() {
   local ip; ip=$(kubectl -n monitoring get svc prometheus -o jsonpath='{.spec.clusterIP}' 2>/dev/null) || return 1
   curl -fsS -m 10 "http://$ip:9090$1" 2>/dev/null
+}
+# prom_count 'PROMQL' -> how many series the query returns (0 when none or on error)
+prom_count() { local n; n=$(prom_query "$1" | jq -r '.data.result | length' 2>/dev/null); echo "${n:-0}"; }
+# prom_rule NAME -> the loaded alerting or recording rule NAME as JSON (one line), or nothing
+prom_rule() { prom_api /api/v1/rules | jq -c --arg n "$1" '[.data.groups[].rules[] | select(.name == $n)] | first // empty' 2>/dev/null; }
+# prom_alert NAME -> the alert's state: inactive, pending or firing (nothing when not loaded)
+prom_alert() { prom_rule "$1" | jq -r '.state // empty' 2>/dev/null; }
+# prom_wait SECONDS 'PROMQL' OP N -> wait until the query returns OP N series (OP: = -ge -gt ...)
+prom_wait() {
+  local end=$((SECONDS + $1))
+  while :; do
+    [ "$(prom_count "$2")" "$3" "$4" ] && return 0
+    [ $SECONDS -ge $end ] && return 1
+    sleep 3
+  done
+}
+# prom_wait_alert SECONDS NAME STATE -> wait until alert NAME is in STATE (inactive, pending, firing)
+prom_wait_alert() {
+  local end=$((SECONDS + $1))
+  while :; do
+    [ "$(prom_alert "$2")" = "$3" ] && return 0
+    [ $SECONDS -ge $end ] && return 1
+    sleep 3
+  done
+}
+# podinfo_app NS NAME [REPLICAS] [PORTNAME] [noservice] -> podinfo (traffic on 9898, port PORTNAME,
+# default http; metrics also on 9797, port "metrics"), labelled app=NAME, behind Service NAME
+podinfo_app() {
+  local ns=$1 n=$2 r=${3:-2} pn=${4:-http}
+  k_ns "$ns"
+  kapply <<EOF
+apiVersion: apps/v1
+kind: Deployment
+metadata: {name: $n, namespace: $ns, labels: {app: $n}}
+spec:
+  replicas: $r
+  selector: {matchLabels: {app: $n}}
+  template:
+    metadata: {labels: {app: $n}}
+    spec:
+      containers:
+      - name: podinfo
+        image: ghcr.io/stefanprodan/podinfo:6.16.0
+        command: [./podinfo, --port=9898, --port-metrics=9797, --level=warn]
+        ports:
+        - {name: $pn, containerPort: 9898}
+        - {name: metrics, containerPort: 9797}
+        readinessProbe: {httpGet: {path: /readyz, port: 9898}, periodSeconds: 5}
+        resources: {requests: {memory: 16Mi, cpu: 10m}, limits: {memory: 64Mi}}
+EOF
+  if [ "${5:-}" != noservice ]; then
+    kapply <<EOF
+apiVersion: v1
+kind: Service
+metadata: {name: $n, namespace: $ns, labels: {app: $n}}
+spec:
+  selector: {app: $n}
+  ports: [{name: $pn, port: 9898, targetPort: 9898}]
+EOF
+  fi
+  wait_deploy "$ns" "$n" 180
+}
+# podinfo_monitor NS NAME -> ServiceMonitor NAME (release=lab) for podinfo_app's Service, every 15s
+podinfo_monitor() {
+  kapply <<EOF
+apiVersion: monitoring.coreos.com/v1
+kind: ServiceMonitor
+metadata: {name: $2, namespace: $1, labels: {release: lab}}
+spec:
+  selector: {matchLabels: {app: $2}}
+  endpoints: [{port: http, path: /metrics, interval: 15s}]
+EOF
+}
+# podinfo_load NS NAME -> Deployment "load": about 2 requests a second to Service NAME
+podinfo_load() {
+  kapply <<EOF
+apiVersion: apps/v1
+kind: Deployment
+metadata: {name: load, namespace: $1}
+spec:
+  replicas: 1
+  selector: {matchLabels: {app: load}}
+  template:
+    metadata: {labels: {app: load}}
+    spec:
+      containers:
+      - name: load
+        image: busybox:1.37
+        command: [sh, -c, 'while true; do wget -q -O /dev/null http://$2:9898/ 2>/dev/null; sleep 0.5; done']
+        resources: {requests: {memory: 8Mi, cpu: 5m}, limits: {memory: 32Mi}}
+EOF
+  wait_deploy "$1" load 120
 }
 
 # ---------- cert-manager helpers ----------

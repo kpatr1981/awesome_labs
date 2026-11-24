@@ -100,6 +100,24 @@ reset() {
   for n in $(comm -13 "$P/namespaces.txt" /tmp/kl-now) namespace/default namespace/kube-public; do
     kubectl -n "${n#namespace/}" delete pods --all --grace-period=0 --force --wait=false >/dev/null 2>&1
   done
+  # admission webhooks served from exercise namespaces (Kyverno, cert-manager, …) fail closed
+  # once their pods are gone, and then refuse deleting the other namespaces: drop the webhooks,
+  # stop the controllers that would register them again, and drop whatever they re-registered
+  local wh
+  drop_webhooks() {
+    for wh in validatingwebhookconfigurations mutatingwebhookconfigurations; do
+      kubectl get "$wh" -o name 2>/dev/null | sort >/tmp/kl-wh
+      comm -13 "$P/$wh.txt" /tmp/kl-wh | xargs -r kubectl delete --wait=false >/dev/null 2>&1
+    done
+  }
+  drop_webhooks
+  for n in $(comm -13 "$P/namespaces.txt" /tmp/kl-now); do
+    kubectl -n "${n#namespace/}" delete deploy,statefulset,daemonset --all --wait=false >/dev/null 2>&1
+  done
+  for n in $(comm -13 "$P/namespaces.txt" /tmp/kl-now); do
+    kubectl -n "${n#namespace/}" wait --for=delete pod --all --timeout=60s >/dev/null 2>&1
+  done
+  drop_webhooks
   # namespaced junk in default + kube-public (never the objects the cluster itself owns)
   for n in default kube-public; do
     kubectl -n "$n" get "$NS_KINDS" -o name 2>/dev/null |
@@ -130,6 +148,11 @@ reset() {
     [ $SECONDS -ge $end ] && { echo "warning: namespaces still terminating: $extra"; break; }
     sleep 3
   done
+  # CRDs an exercise installed must be gone, or the next exercise installing them again is
+  # refused ("create not allowed while custom resource definition is terminating")
+  kubectl get crd -o name | sort >/tmp/kl-now
+  comm -13 "$P/customresourcedefinitions.txt" /tmp/kl-now | xargs -r kubectl wait --for=delete --timeout=120s >/dev/null 2>&1 ||
+    echo "warning: custom resource definitions still terminating"
   # PVs left behind (Retain policy etc.)
   kubectl get pv -o name | sort >/tmp/kl-now
   comm -13 "$P/persistentvolumes.txt" /tmp/kl-now | xargs -r kubectl patch --type=merge -p '{"metadata":{"finalizers":null}}' >/dev/null 2>&1
