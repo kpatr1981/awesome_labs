@@ -3,13 +3,13 @@ package exercise
 // TrackOrder is the order the tracks are listed in; tracks not in it come
 // after, as they appear in the catalogue.
 var TrackOrder = []string{"docker", "kubernetes", "offsec", "linux", "networking", "cloud", "data", "defensive",
-	"programming", "datascience", "git", "terraform", "ansible", "algorithms"}
+	"programming", "datascience", "git", "terraform", "ansible", "algorithms", "ai"}
 
 var trackNames = map[string]string{
 	"docker": "Docker", "kubernetes": "Kubernetes", "offsec": "Offensive Security", "linux": "Linux",
 	"networking": "Networking", "cloud": "Cloud", "data": "Data", "defensive": "Defensive Security",
 	"programming": "Programming", "datascience": "Data Science", "git": "Git", "terraform": "Terraform",
-	"ansible": "Ansible", "algorithms": "Algorithms",
+	"ansible": "Ansible", "algorithms": "Algorithms", "ai": "AI Engineering",
 }
 
 // TrackName is a track's full display name (the id itself for an unknown track).

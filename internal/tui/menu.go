@@ -1007,7 +1007,7 @@ const aboutText = `awesome_labs %s
 
 Hands-on labs on your own machine for Docker, Kubernetes, Linux,
 networking, cloud, data, security, programming, algorithms, data
-science, Git, Terraform and Ansible.
+science, Git, Terraform, Ansible and AI engineering.
 Real Lima VMs, real breakage, automatic grading.
 
 https://github.com/kpatr1981/awesome_labs`

@@ -121,6 +121,23 @@ RUN set -e; apt-get update; \
 CMD ["/usr/sbin/sshd", "-D", "-e"]
 DOCKERFILE
 fi
+# llama.cpp's server with small local models, for the AI engineering track: chat models
+# (Qwen2.5 Instruct 0.5B at Q4 and Q8, 1.5B at Q4) and an embedding model (bge-small),
+# pinned by Hugging Face revision and SHA-256. ~5.8 GB on disk; the labs then run offline.
+if ! docker image inspect kl-llm:1 >/dev/null 2>&1; then
+  echo "==> building the LLM image (llama.cpp server b12124 and four small models, ~2.3 GB to download)"
+  hf=https://huggingface.co
+  if ! docker build -q -t kl-llm:1 - <<DOCKERFILE; then
+FROM ghcr.io/ggml-org/llama.cpp:server-b12124
+ADD --chmod=644 --checksum=sha256:74a4da8c9fdbcd15bd1f6d01d621410d31c6fc00986f5eb687824e7b93d7a9db $hf/Qwen/Qwen2.5-0.5B-Instruct-GGUF/resolve/9217f5db79a29953eb74d5343926648285ec7e67/qwen2.5-0.5b-instruct-q4_k_m.gguf /models/qwen2.5-0.5b-instruct-q4_k_m.gguf
+ADD --chmod=644 --checksum=sha256:ca59ca7f13d0e15a8cfa77bd17e65d24f6844b554a7b6c12e07a5f89ff76844e $hf/Qwen/Qwen2.5-0.5B-Instruct-GGUF/resolve/9217f5db79a29953eb74d5343926648285ec7e67/qwen2.5-0.5b-instruct-q8_0.gguf /models/qwen2.5-0.5b-instruct-q8_0.gguf
+ADD --chmod=644 --checksum=sha256:6a1a2eb6d15622bf3c96857206351ba97e1af16c30d7a74ee38970e434e9407e $hf/Qwen/Qwen2.5-1.5B-Instruct-GGUF/resolve/91cad51170dc346986eccefdc2dd33a9da36ead9/qwen2.5-1.5b-instruct-q4_k_m.gguf /models/qwen2.5-1.5b-instruct-q4_k_m.gguf
+ADD --chmod=644 --checksum=sha256:ec38e8da142596baa913124ae50550de284b6916bf59577ef2f0cb9660c2f514 $hf/CompendiumLabs/bge-small-en-v1.5-gguf/resolve/d32f8c040ea3b516330eeb75b72bcc2d3a780ab7/bge-small-en-v1.5-q8_0.gguf /models/bge-small-en-v1.5-q8_0.gguf
+DOCKERFILE
+    echo "==> could not build the LLM image: the AI engineering exercises need it (env rebuild docker retries)"
+  fi
+fi
+docker builder prune -af >/dev/null 2>&1 || true
 echo "==> taking the pristine snapshot"
 mkdir -p /var/lib/kubelab/pristine
 /opt/kubelab/state.sh snapshot docker

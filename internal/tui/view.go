@@ -80,6 +80,8 @@ func trackLabel(t string) string {
 		return "Ansible"
 	case "algorithms":
 		return "Algorithms"
+	case "ai":
+		return "AI Eng"
 	}
 	return t
 }

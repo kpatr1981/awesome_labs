@@ -815,6 +815,125 @@ pr_go_test() {
   return "$rc"
 }
 
+# ---------- AI engineering helpers (kl-llm: llama.cpp's server and small local models) ----------
+LLM_IMAGE=kl-llm:1
+LLM_SMALL=/models/qwen2.5-0.5b-instruct-q4_k_m.gguf
+LLM_SMALL_Q8=/models/qwen2.5-0.5b-instruct-q8_0.gguf
+LLM_BIG=/models/qwen2.5-1.5b-instruct-q4_k_m.gguf
+LLM_EMBED=/models/bge-small-en-v1.5-q8_0.gguf
+LITELLM_IMAGE=ghcr.io/berriai/litellm:v1.105.7
+
+# llm_serve NAME PORT MODEL [llama-server options...] -> container NAME (image kl-llm:1)
+# serving MODEL on 127.0.0.1:PORT; also reachable as NAME:8080 on Docker network kl-llm
+llm_serve() {
+  local n=$1 p=$2 m=$3
+  shift 3
+  docker network create kl-llm >/dev/null 2>&1 || true
+  docker rm -f "$n" >/dev/null 2>&1
+  docker run -d --name "$n" --network kl-llm -p "127.0.0.1:$p:8080" "$LLM_IMAGE" \
+    -m "$m" --host 0.0.0.0 --port 8080 "$@" >/dev/null
+}
+
+# llm_wait PORT [SECONDS] -> wait until 127.0.0.1:PORT/health says 200 (the model is loaded)
+llm_wait() {
+  local i
+  for i in $(seq $((${2:-60} * 2))); do
+    [ "$(curl -s -o /dev/null -m 2 -w '%{http_code}' "127.0.0.1:$1/health")" = 200 ] && return 0
+    sleep 0.5
+  done
+  return 1
+}
+
+# llm_props PORT [JQ] -> the server's /props (through a jq filter)
+llm_props() { curl -s -m 5 "127.0.0.1:$1/props" | jq -r "${2:-.}" 2>/dev/null; }
+
+# llm_slots_ctx PORT -> the context size of each slot, one per line (/slots)
+llm_slots_ctx() { curl -s -m 5 "127.0.0.1:$1/slots" | jq -r '.[].n_ctx' 2>/dev/null; }
+
+# llm_tokens PORT FILE -> how many tokens the model on PORT makes of FILE's text
+llm_tokens() {
+  jq -Rs '{content: .}' "$2" | curl -s -m 30 "127.0.0.1:$1/tokenize" -H 'Content-Type: application/json' -d @- |
+    jq '.tokens | length' 2>/dev/null
+}
+
+# llm_ask PORT 'PROMPT' [MAX_TOKENS] -> the answer's text (temperature 0)
+llm_ask() {
+  jq -n --arg p "$2" --argjson m "${3:-64}" '{messages: [{role: "user", content: $p}], temperature: 0, max_tokens: $m}' |
+    curl -s -m 120 "127.0.0.1:$1/v1/chat/completions" -H 'Content-Type: application/json' -d @- |
+    jq -r '.choices[0].message.content // empty' 2>/dev/null
+}
+
+# llm_on_port PORT -> the name of the running container that publishes 127.0.0.1:PORT
+llm_on_port() { docker ps --format '{{.Names}}	{{.Ports}}' | awk -F'\t' -v p="127.0.0.1:$1->" 'index($2, p) {print $1}'; }
+
+# llm_model_of NAME -> the model file container NAME serves (the value after -m / --model)
+llm_model_of() {
+  docker inspect -f '{{json .Args}}' "$1" 2>/dev/null |
+    jq -r '. as $a | [range(length) | select($a[.] == "-m" or $a[.] == "--model")] | first // empty | $a[. + 1]'
+}
+
+# flaky_app DIR [CODE] -> write DIR/app.py, an OpenAI-compatible upstream on port 8080 that
+# answers every request with CODE (default 500) and logs it to DIR/hits.log. Run it with
+# `python /data/app.py` in python:3.12-alpine with DIR mounted at /data (a Compose service).
+flaky_app() {
+  mkdir -p "$1"
+  : >"$1/hits.log"
+  chmod 666 "$1/hits.log"
+  cat >"$1/app.py" <<'PYAPP'
+import http.server, json, os, time
+CODE = int(os.environ.get("CODE", "500"))
+class H(http.server.BaseHTTPRequestHandler):
+    def _any(self):
+        n = int(self.headers.get("Content-Length", 0))
+        self.rfile.read(n)
+        with open("/data/hits.log", "a") as f:
+            f.write(f"{time.time():.3f} {self.command} {self.path}\n")
+        self.send_response(CODE)
+        self.send_header("Content-Type", "application/json")
+        self.end_headers()
+        self.wfile.write(json.dumps({"error": {"message": "upstream overloaded", "type": "server_error"}}).encode())
+    do_GET = do_POST = _any
+    def log_message(self, *a):
+        pass
+http.server.ThreadingHTTPServer(("0.0.0.0", 8080), H).serve_forever()
+PYAPP
+  sed -i "s/os.environ.get(\"CODE\", \"500\")/os.environ.get(\"CODE\", \"${2:-500}\")/" "$1/app.py"
+}
+
+# flaky_upstream NAME [CODE] -> flaky_app in $KL_STATE/NAME, run as container NAME on Docker
+# network kl-llm (NAME:8080)
+flaky_upstream() {
+  docker network create kl-llm >/dev/null 2>&1 || true
+  flaky_app "$KL_STATE/$1" "${2:-500}"
+  docker rm -f "$1" >/dev/null 2>&1
+  docker run -d --name "$1" --network kl-llm -v "$KL_STATE/$1:/data" python:3.12-alpine python /data/app.py >/dev/null
+}
+
+# flaky_hits NAME -> how many requests the upstream in $KL_STATE/NAME has had
+flaky_hits() { local n; n=$(grep -c . "$KL_STATE/$1/hits.log" 2>/dev/null); echo "${n:-0}"; }
+
+# gw_wait [PORT] [SECONDS] -> wait until a LiteLLM gateway on 127.0.0.1:PORT (4000) is live
+gw_wait() {
+  local i
+  for i in $(seq "${2:-180}"); do
+    curl -sf -m 2 "127.0.0.1:${1:-4000}/health/liveliness" >/dev/null && return 0
+    sleep 1
+  done
+  return 1
+}
+
+# gw_chat KEY MODEL [PORT] -> a short chat request through the gateway; prints the HTTP status,
+# leaves the headers in $GW_HEADERS and the body in $GW_BODY (files)
+gw_chat() {
+  GW_HEADERS=${GW_HEADERS:-$(mktemp)} GW_BODY=${GW_BODY:-$(mktemp)}
+  curl -s -m "${GW_TIMEOUT:-120}" -D "$GW_HEADERS" -o "$GW_BODY" -w '%{http_code}' "127.0.0.1:${3:-4000}/v1/chat/completions" \
+    -H "Authorization: Bearer $1" -H 'Content-Type: application/json' \
+    -d "{\"model\": \"$2\", \"messages\": [{\"role\": \"user\", \"content\": \"Reply with the word ok.\"}], \"max_tokens\": 8, \"temperature\": 0}"
+}
+
+# env_get FILE NAME -> the value of NAME in a .env file (quotes stripped)
+env_get() { sed -n "s/^[[:space:]]*$2[[:space:]]*=[[:space:]]*//p" "$1" 2>/dev/null | tail -1 | sed -e 's/^"\(.*\)"$/\1/' -e "s/^'\(.*\)'$/\1/"; }
+
 # ---------- algorithms helper ----------
 # algo_check <<'EOF' ... EOF -> stdin holds hidden Python tests, a line "---GO---", then
 # hidden Go tests. They run against /lab/solution.py and /lab/solution.go; the check

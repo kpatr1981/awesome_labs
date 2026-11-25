@@ -3,7 +3,7 @@
 Exercises live in `exercises/<track>/NN-<module>.yaml`. One file is one module:
 
 ```yaml
-track: kubernetes          # docker | kubernetes | offsec | linux | networking | cloud | data | defensive | programming | datascience | git | terraform | ansible | algorithms
+track: kubernetes          # docker | kubernetes | offsec | linux | networking | cloud | data | defensive | programming | datascience | git | terraform | ansible | algorithms | ai
 module: Services & DNS     # module title
 profile: k8s               # docker | k8s | offsec — which lab environment
 order: 3                   # module order within the track
@@ -177,6 +177,8 @@ not fit. It commits nothing: download the `verify-results` artifact (the updated
 | `pr_base [MSG]`, `pr_open BRANCH TITLE <<'MD'` | a PR to review in git repo `/lab/repo`: commit the files there as `main`, then commit the PR's changes as code-assistant[bot] on BRANCH, tagged `pr`, with `/lab/PR.md` (stdin is the description) and `/lab/PR.diff` |
 | `pr_line FILE 'TEXT'`, `pr_finding FILE LINE...`, `pr_findings_count` | line numbers of TEXT in the PR version of FILE; `/lab/findings.txt` cites `FILE:N` for one of them; how many `FILE:LINE` citations it holds (cap it, so citing everything fails) |
 | `pr_py_test <<'PY'`, `pr_unittest`, `pr_mutant FILE <<'PY'` | hidden unittest code against a copy of `/lab/repo`; the repo's own tests (`unittest discover -s tests`); true when the repo's tests FAIL with FILE replaced by stdin (the learner's tests catch that bug) |
+| `llm_serve NAME PORT MODEL [opts]`, `llm_wait PORT`, `llm_props PORT [JQ]`, `llm_slots_ctx PORT`, `llm_tokens PORT FILE`, `llm_ask PORT 'PROMPT' [N]`, `llm_on_port PORT`, `llm_model_of NAME` | AI track: a llama.cpp server from `kl-llm:1` (`$LLM_SMALL`, `$LLM_SMALL_Q8`, `$LLM_BIG`, `$LLM_EMBED`), wait for `/health`, read `/props` and `/slots`, count tokens, ask at temperature 0, which container publishes a port, which model file a container serves |
+| `flaky_app DIR [CODE]`, `flaky_upstream NAME [CODE]`, `flaky_hits NAME`, `gw_wait [PORT]`, `gw_chat KEY MODEL [PORT]`, `env_get FILE NAME` | an OpenAI-compatible upstream that always fails (a Compose service or a container), its request count; a LiteLLM gateway (`$LITELLM_IMAGE`) is live; one chat request through it (status printed, headers in `$GW_HEADERS`, body in `$GW_BODY`); a value from a `.env` file |
 | `go_start [NAME=VALUE...]`, `pr_go_test [PKGDIR] <<'GO'` | a `go` command for the lab user (golang:1.24-alpine, offline, no cgo so no `-race`); a hidden test file added to PKGDIR of a copy of `/lab/repo`, `go test ./...` (`GO_ENV` adds docker options, e.g. a file module proxy) |
 | `tf_aws_start` | Moto plus `terraform`, `tofu`, `terragrunt` and `conftest` from the kl-terraform-aws image (aws provider 6.72.0). AWS calls always go to Moto; don't tag `aws_s3_bucket` (Moto drops tags sent at creation) |
 | `tf_s3_state BUCKET KEY` | print a state file kept in S3 (Moto), to feed `tf_has`/`tf_get` |

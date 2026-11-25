@@ -1,7 +1,7 @@
 # awesome_labs
 
 **Hands-on labs on your own machine** for Docker, Kubernetes, Linux, networking, cloud,
-databases, security, programming, algorithms, data science, Git, Terraform and Ansible — real VMs,
+databases, security, programming, algorithms, data science, Git, Terraform, Ansible and AI engineering — real VMs,
 real breakage, automatic grading.
 
 awesome_labs creates [Lima](https://lima-vm.io) virtual machines, puts each exercise's
@@ -34,8 +34,9 @@ command line (`awesome_labs start/check <id>`).
 | **Terraform** | the basics (init, plan, apply, outputs, provider versions) · variables, expressions & meta-arguments (`count`, `for_each`, templates, validation) · working with state (moved, removed, import, workspaces, backends, recovery) · modules (local, Git-pinned, refactoring into modules) · real Docker infrastructure with the `kreuzwerker/docker` provider · functions, lifecycle & testing (dynamic blocks, `lifecycle`, `check`, `import`, `terraform test`) *(growing)* · Terraform in automation (saved plans, exit codes, JSON plan gates, state locks, mock-provider tests, pipelines) · Terraform on AWS against an emulator (VPCs, S3, IAM, drift, import, provider aliases, write-only secrets) · remote state & locking (S3 `use_lockfile`, `pg` backend, recovery from versioning) · OpenTofu, Terragrunt & Conftest policy gates · plan and apply from pull requests | <!-- count:terraform -->120<!-- /count --> |
 | **Ansible** | inventories & ad-hoc commands · playbooks (handlers, loops, conditionals, idempotence) · templates, files & variables (Jinja2, precedence, Vault) · roles & reuse (role design, dependencies, Galaxy from Git, ansible-lint) · operations & incidents (check mode, validate, block/rescue, become, constructed inventories) against SSH-managed nodes · control flow & extending Ansible (tags, blockinfile, delegation, handlers, vault IDs, collections, custom filters/modules) *(growing)* · data structures & types (dicts, merging, JSON in and out, type errors) | <!-- count:ansible -->89<!-- /count --> |
 | **Algorithms** | searching & sorting · data structures · graphs · dynamic programming · strings, greedy & maths — each exercise solvable in **Python or Go** *(growing)* · recursion & backtracking | <!-- count:algorithms -->70<!-- /count --> |
+| **AI Engineering** | serving a model with llama.cpp (context, parallel slots, quantization, health checks) and a LiteLLM gateway (virtual keys, rate limits, fallbacks, budgets), with small local models and no API keys *(growing)* | <!-- count:ai -->11<!-- /count --> |
 
-That's <!-- count:total -->1786<!-- /count --> exercises so far, with a target of 250 per track; ideas for what comes next are
+That's <!-- count:total -->1797<!-- /count --> exercises so far, with a target of 250 per track; ideas for what comes next are
 in [docs/PENDING.md](docs/PENDING.md).
 
 Every module goes **beginner → intermediate → advanced** (difficulty 1 = beginner … 5 =

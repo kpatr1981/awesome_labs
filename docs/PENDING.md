@@ -3,12 +3,12 @@
 Ideas for future labs. Each topic has one home; where tracks touch, the row says which
 track it relies on.
 
-**Target: 250 labs in each of the 14 tracks, 3,500 in total.** Once tracks reach it, review
+**Target: 250 labs in each of the 15 tracks, 3,750 in total.** Once tracks reach it, review
 what to consolidate. The target doesn't lower the bar: a lab should carry a real multi-step
 scenario and teach a concept. The parts of this list that the existing exercises don't cover
 are not started.
 
-Exercise counts (<!-- count:total -->1,786<!-- /count --> total):
+Exercise counts (<!-- count:total -->1,797<!-- /count --> total):
 
 | Topic | Exercises | Target | Track | Module files |
 |---|---|---|---|---|
@@ -26,6 +26,7 @@ Exercise counts (<!-- count:total -->1,786<!-- /count --> total):
 | Terraform | <!-- count:terraform -->120<!-- /count --> | 250 | `terraform` | `exercises/terraform/` |
 | Ansible | <!-- count:ansible -->89<!-- /count --> | 250 | `ansible` | `exercises/ansible/` |
 | Algorithms | <!-- count:algorithms -->70<!-- /count --> | 250 | `algorithms` | `exercises/algorithms/` |
+| AI engineering | <!-- count:ai -->11<!-- /count --> | 250 | `ai` | `exercises/ai/` |
 
 - [Suggested order](#suggested-order)
 - [Deepen every module](#deepen-every-module)
@@ -51,8 +52,8 @@ Exercise counts (<!-- count:total -->1,786<!-- /count --> total):
 
 ### Build next (decided 2026-11-24)
 
-These come **before** everything else on this page, in this order. Item 1 is done; the
-others aren't started.
+These come **before** everything else on this page, in this order. Items 1 and 3 are
+done; the others aren't started.
 
 1. ~~**Reviewing AI-written code**~~ (Programming track, new module). **Done** in
    `exercises/programming/09-reviewing-ai-code.yaml` (prog-108..121, 14 labs). The lab Go
@@ -73,7 +74,10 @@ others aren't started.
    that must never appear in a tool result. Checks: a scripted MCP client lists the tools,
    calls them with good and hostile arguments, and inspects the replies and the audit log.
    No model needed, so it's fully repeatable. Pre-pull the SDKs into the image.
-3. **AI engineering: *Serving a model*** (see
+3. ~~**AI engineering: *Serving a model***~~ **Done** in `exercises/ai/01-serving.yaml`
+   (ai-001..011, the new `ai` track; image `kl-llm:1` = llama.cpp server b12124 plus
+   Qwen2.5 0.5B Q4/Q8, 1.5B Q4 and bge-small; LiteLLM v1.105.7). Ollama, `llama-perplexity`
+   and `--cache-type-k` are still to do. Original plan: (see
    [AI engineering with tiny models](#ai-engineering-with-tiny-models)), **with a LiteLLM
    gateway added**: two llama.cpp servers (a 0.5B "cheap" model and a 1.5B "expensive"
    one) plus a deliberately failing upstream behind LiteLLM's proxy. Labs: virtual keys,
