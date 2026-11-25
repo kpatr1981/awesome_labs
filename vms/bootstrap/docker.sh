@@ -145,6 +145,25 @@ DOCKERFILE
     echo "==> could not build the LLM image: the AI engineering exercises need it (env rebuild docker retries)"
   fi
 fi
+# Python for the Retrieval labs of the AI engineering track: psycopg, pgvector, numpy, openai.
+if ! docker image inspect kl-rag:1 >/dev/null 2>&1; then
+  echo "==> building the retrieval image (python 3.12, psycopg, pgvector, openai)"
+  docker build -q -t kl-rag:1 - <<'DOCKERFILE'
+FROM python:3.12-slim
+RUN pip install --no-cache-dir "psycopg[binary]==3.3.8" pgvector==0.5.1 numpy==2.5.4 openai==3.48.0
+DOCKERFILE
+fi
+# llama.cpp's server with a cross-encoder re-ranker (bge-reranker-v2-m3, Q4_K_M, ~440 MB),
+# pinned by Hugging Face revision and SHA-256; shares its base layers with kl-llm:1.
+if ! docker image inspect kl-rerank:1 >/dev/null 2>&1; then
+  echo "==> building the re-ranker image (llama.cpp server b12124 and bge-reranker-v2-m3, ~440 MB to download)"
+  if ! docker build -q -t kl-rerank:1 - <<DOCKERFILE; then
+FROM ghcr.io/ggml-org/llama.cpp:server-b12124
+ADD --chmod=644 --checksum=sha256:e186a244ed455b4ab66ec64339ce7427a6ae13f5c0b5e544de96e50f0f8b3673 https://huggingface.co/gpustack/bge-reranker-v2-m3-GGUF/resolve/3093af03b1a635e67b084b1d8c03c5f5e020fd05/bge-reranker-v2-m3-Q4_K_M.gguf /models/bge-reranker-v2-m3-q4_k_m.gguf
+DOCKERFILE
+    echo "==> could not build the re-ranker image: the Retrieval exercises need it (env rebuild docker retries)"
+  fi
+fi
 docker builder prune -af >/dev/null 2>&1 || true
 echo "==> taking the pristine snapshot"
 mkdir -p /var/lib/kubelab/pristine

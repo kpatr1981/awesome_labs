@@ -8,7 +8,7 @@ what to consolidate. The target doesn't lower the bar: a lab should carry a real
 scenario and teach a concept. The parts of this list that the existing exercises don't cover
 are not started.
 
-Exercise counts (<!-- count:total -->1,807<!-- /count --> total):
+Exercise counts (<!-- count:total -->1,819<!-- /count --> total):
 
 | Topic | Exercises | Target | Track | Module files |
 |---|---|---|---|---|
@@ -26,7 +26,7 @@ Exercise counts (<!-- count:total -->1,807<!-- /count --> total):
 | Terraform | <!-- count:terraform -->120<!-- /count --> | 250 | `terraform` | `exercises/terraform/` |
 | Ansible | <!-- count:ansible -->89<!-- /count --> | 250 | `ansible` | `exercises/ansible/` |
 | Algorithms | <!-- count:algorithms -->70<!-- /count --> | 250 | `algorithms` | `exercises/algorithms/` |
-| AI engineering | <!-- count:ai -->11<!-- /count --> | 250 | `ai` | `exercises/ai/` |
+| AI engineering | <!-- count:ai -->23<!-- /count --> | 250 | `ai` | `exercises/ai/` |
 
 - [Suggested order](#suggested-order)
 - [Deepen every module](#deepen-every-module)
@@ -52,7 +52,7 @@ Exercise counts (<!-- count:total -->1,807<!-- /count --> total):
 
 ### Build next (decided 2026-11-24)
 
-These come **before** everything else on this page, in this order. Items 1, 2 and 3
+These come **before** everything else on this page, in this order. Items 1 to 4
 are done; the others aren't started.
 
 1. ~~**Reviewing AI-written code**~~ (Programming track, new module). **Done** in
@@ -90,10 +90,14 @@ are done; the others aren't started.
    KV-cache settings (`--ctx-size`, `-np` parallel slots, `--cache-type-k`). vLLM, AWQ and
    FP8 need a GPU: explain them in the tutorial only. **Test memory first**: two models
    plus LiteLLM on the 4GiB Docker VM.
-4. **AI engineering: *Retrieval*** (same section), including **hybrid search** (PostgreSQL
-   full-text or BM25 plus pgvector), a small cross-encoder re-ranker, and **knowledge
-   hygiene**: near-duplicate documents, a stale version that wins the search, metadata
-   filters, re-indexing on change.
+4. ~~**AI engineering: *Retrieval***~~ **Done** in `exercises/ai/02-retrieval.yaml`
+   (ai-012..023, 12 labs: embeddings, pgvector, chunking, BM25, hybrid RRF, stale and
+   duplicate pages, incremental re-indexing, a bge-reranker-v2-m3 re-ranker, per-team
+   filters, cited answers with abstention, capstone with a golden-set eval). Images
+   `kl-rag:1` and `kl-rerank:1`, `pgvector/pgvector:0.8.7-pg16-bookworm`; kit in
+   `vms/kit/rag/`. PostgreSQL's `ts_rank` has no IDF and splits `AB-1234`, so keyword search
+   is BM25 in Python. Still to do: HNSW with filters (`hnsw.iterative_scan`) needs a much
+   bigger table to show; Qdrant.
 5. **Sandboxing untrusted code with gVisor** (Defensive security or Docker track). Run
    generated code under `runsc` (arm64 works) in the Docker VM: no network or an egress
    allow-list in nftables, seccomp, read-only root, CPU/memory/pids limits, no secrets

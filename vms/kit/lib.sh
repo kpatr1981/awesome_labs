@@ -934,6 +934,139 @@ gw_chat() {
 # env_get FILE NAME -> the value of NAME in a .env file (quotes stripped)
 env_get() { sed -n "s/^[[:space:]]*$2[[:space:]]*=[[:space:]]*//p" "$1" 2>/dev/null | tail -1 | sed -e 's/^"\(.*\)"$/\1/' -e "s/^'\(.*\)'$/\1/"; }
 
+# ---------- Retrieval helpers (AI engineering: runbook search with pgvector, BM25 and a re-ranker) ----------
+RAG_IMAGE=kl-rag:1
+RERANK_IMAGE=kl-rerank:1
+PGV_IMAGE=pgvector/pgvector:0.8.7-pg16-bookworm
+LLM_RERANK=/models/bge-reranker-v2-m3-q4_k_m.gguf
+RAG_KIT=/opt/kubelab/rag
+RAG_FACTS=$KL_STATE/rag.json
+
+# rag_start [nokit] -> `ragpy` for the lab user: python in kl-rag:1 (psycopg, pgvector, numpy,
+# openai) as the caller, with /lab mounted and the VM's network, from the current folder under
+# /lab; RAG_* variables pass through. Also copies ragkit.py to /lab (not with nokit).
+rag_start() {
+  cat >/usr/local/bin/ragpy <<'WRAP'
+#!/bin/bash
+# Lab Python for the Retrieval labs: kl-rag:1 (python 3.12, psycopg, pgvector, numpy, openai).
+wd=$PWD
+case "$wd/" in /lab/*) ;; *) wd=/lab ;; esac
+envs=()
+while IFS= read -r v; do envs+=(-e "$v"); done < <(compgen -e | grep -E '^RAG_')
+tty=()
+[ -t 0 ] && [ -t 1 ] && tty=(-t)
+exec docker run --rm -i "${tty[@]}" --network host -u "$(id -u):$(id -g)" -e HOME=/tmp -e PYTHONDONTWRITEBYTECODE=1 \
+  "${envs[@]}" -v /lab:/lab -w "$wd" kl-rag:1 python "$@"
+WRAP
+  chmod 755 /usr/local/bin/ragpy
+  on_reset 'rm -f /usr/local/bin/ragpy'
+  mkdir -p /lab
+  [ "${1:-}" = nokit ] || install -o "$(lab_user)" -m 644 "$RAG_KIT/ragkit.py" /lab/ragkit.py
+}
+
+# rag_corpus [--long] [--stale] [--dups] [--acl] -> this run's runbooks in /lab/runbooks
+# (corpus.py), their facts in $RAG_FACTS
+rag_corpus() {
+  python3 "$RAG_KIT/corpus.py" write /lab/runbooks "$RAG_FACTS" "$@"
+  chown -R "$(lab_user)": /lab/runbooks
+}
+
+# rag_give FILE... -> copy the team's scripts from the kit to /lab (owned by the lab user):
+# index.py (one chunk per ## section, table chunks), bm25.py (keyword search), search.py (hybrid)
+rag_give() {
+  local f
+  for f in "$@"; do install -o "$(lab_user)" -m 644 "$RAG_KIT/lab/$f" "/lab/$f"; done
+}
+
+# rag_fact NAME -> one of this run's facts (standby, vaultpath, ...); rag_code ID -> a page's error code
+rag_fact() { jq -r --arg k "$1" '.[$k] // empty' "$RAG_FACTS"; }
+rag_code() { jq -r --arg k "$1" '.codes[$k] // empty' "$RAG_FACTS"; }
+
+# rag_emb -> container emb: bge-small embeddings on 127.0.0.1:8081, /metrics on
+rag_emb() { llm_serve emb 8081 "$LLM_EMBED" --embeddings --metrics && llm_wait 8081 60; }
+
+# rag_pg -> container pg: PostgreSQL 16 with pgvector on 127.0.0.1:5432, database rag, password lab
+rag_pg() {
+  docker rm -f pg >/dev/null 2>&1
+  docker run -d --name pg -p 127.0.0.1:5432:5432 -e POSTGRES_PASSWORD=lab -e POSTGRES_DB=rag "$PGV_IMAGE" >/dev/null &&
+    rag_pg_wait
+}
+# rag_pg_wait [SECONDS] -> wait until container pg accepts TCP connections (not just the init server)
+rag_pg_wait() {
+  local i
+  for i in $(seq "${1:-60}"); do
+    docker exec pg pg_isready -h 127.0.0.1 -U postgres -q 2>/dev/null && return 0
+    sleep 1
+  done
+  return 1
+}
+
+# rag_sql 'SQL' -> run SQL in database rag of container pg (tab-separated, no headers)
+rag_sql() { docker exec -i pg psql -U postgres -d rag -tAX -F $'\t' -c "$1" 2>/dev/null; }
+
+# rag_rerank -> container rerank: bge-reranker-v2-m3 (kl-rerank:1) on 127.0.0.1:8082, /metrics on
+rag_rerank() {
+  docker network create kl-llm >/dev/null 2>&1 || true
+  docker rm -f rerank >/dev/null 2>&1
+  docker run -d --name rerank --network kl-llm -p 127.0.0.1:8082:8080 "$RERANK_IMAGE" \
+    -m "$LLM_RERANK" --reranking --metrics --host 0.0.0.0 --port 8080 >/dev/null && llm_wait 8082 90
+}
+
+# rag_chat -> container chat: Qwen2.5 0.5B on 127.0.0.1:8080 (4096-token context, one slot, /metrics on)
+rag_chat() { llm_serve chat 8080 "$LLM_SMALL" -c 4096 -np 1 --metrics && llm_wait 8080 90; }
+
+# rag_tokens PORT -> prompt tokens the llama.cpp server on PORT has processed so far (/metrics)
+rag_tokens() { curl -s -m 5 "127.0.0.1:$1/metrics" | awk '$1 == "llamacpp:prompt_tokens_total" {printf "%d\n", $2}'; }
+
+# rag_as_user CMD... -> run CMD in /lab as the lab user (with ragpy on the PATH)
+rag_as_user() { as_user "cd /lab && $*"; }
+
+# rag_eval KINDS|FILE [CMD...] -> run CMD (default: python search.py) in /lab, in kl-rag:1 as the
+# lab user, once per hidden question of KINDS (corpus.py questions, comma-separated) or of the
+# JSON-lines FILE (an absolute path); a question's "args" go before it.
+# Scores in $RAG_OUT (eval.py's JSON): results[].{q,kind,want,got,rank,rc,raw}.
+rag_eval() {
+  local kinds=$1 d u
+  shift
+  [ $# -gt 0 ] || set -- python search.py
+  d=$(mktemp -d)
+  chmod 777 "$d"
+  u=$(lab_user)
+  case "$kinds" in
+    /*) cp "$kinds" "$d/q.jsonl" ;; # a questions file of its own (JSON lines: q, want)
+    *) python3 "$RAG_KIT/corpus.py" questions "$RAG_FACTS" "$kinds" >"$d/q.jsonl" ;;
+  esac
+  RAG_OUT=$KL_STATE/rag-eval.json
+  docker run --rm --network host -u "$(id -u "$u"):$(id -g "$u")" -e HOME=/tmp -e PYTHONDONTWRITEBYTECODE=1 \
+    -v /lab:/lab -v "$d:/kl" -v "$RAG_KIT/eval.py:/kl-eval.py:ro" -w /lab "$RAG_IMAGE" \
+    python /kl-eval.py /kl/q.jsonl /kl/out.json -- "$@" >/dev/null 2>&1
+  cp "$d/out.json" "$RAG_OUT" 2>/dev/null || echo '{"results": []}' >"$RAG_OUT"
+  rm -rf "$d"
+}
+
+# rag_rate KIND hit1|hit3 -> the percentage (integer) of KIND's questions in $RAG_OUT whose
+# wanted runbook came first (hit1) or in the top 3 (hit3); KIND "all" = every scored question
+rag_rate() {
+  jq -r --arg k "$1" --arg m "$2" '
+    [.results[] | select(($k == "all" or .kind == $k) and (.want | length) > 0)] as $r
+    | if ($r | length) == 0 then 0
+      else ([$r[] | select(if $m == "hit1" then .rank == 1 else (.rank >= 1 and .rank <= 3) end)] | length) * 100 / ($r | length) | floor
+      end' "$RAG_OUT" 2>/dev/null || echo 0
+}
+
+# rj 'JQ' -> true when the jq expression holds for $RAG_OUT
+rj() { jq -e "$1" "$RAG_OUT" >/dev/null 2>&1; }
+
+# rag_ran_ok -> every question in $RAG_OUT ran, exited 0 and printed a JSON list
+rag_ran_ok() { rj '(.results | length) > 0 and all(.results[]; .rc == 0 and .got != null)'; }
+
+# rag_misses [KIND] -> one info line per question (of KIND) whose wanted runbook missed the top 3
+rag_misses() {
+  jq -r --arg k "${1:-all}" '.results[] | select(($k == "all" or .kind == $k) and (.want | length) > 0 and (.rank < 1 or .rank > 3))
+    | "missed: \(.q[0:70]) -> wanted \(.want[0]), got \(.got // ["(error)"] | join(", "))"' "$RAG_OUT" 2>/dev/null |
+    head -"${RAG_MISSES:-6}" | while IFS= read -r l; do info "$l"; done
+}
+
 # ---------- MCP helpers (programming: MCP tool servers; image kl-mcp:1 = python:3.12-slim + mcp 2.3.0) ----------
 MCP_IMAGE=kl-mcp:1
 
