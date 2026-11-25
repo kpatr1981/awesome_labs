@@ -1,0 +1,1967 @@
+track: programming
+module: MCP tool servers
+profile: docker
+order: 10
+exercises:
+
+# ===== Beginner =====
+
+- id: prog-122
+  title: Your first MCP server
+  difficulty: 1
+  kind: build
+  tags: [mcp, python, tools, ai-agents]
+  tutorial: |
+    **What you're learning.** What the Model Context Protocol is, and how to write a server that gives an AI assistant one tool.
+
+    ### MCP from zero
+
+    An AI assistant (Claude, an IDE agent, a chat bot) can't see your systems. **MCP** is a standard way to give it **tools** it may call: the assistant's *host* starts an MCP **server**, asks it which tools exist, and when the model decides to use one, sends a call with JSON arguments and shows the model the result.
+
+    ```text
+    model  --"call service_status(name=db)"-->  host/client  --JSON-RPC-->  your MCP server  -->  your systems
+           <-------------- "degraded" ------------------------------------------------------
+    ```
+
+    | MCP piece | What it is |
+    |---|---|
+    | **tool** | a function the model may call: a name, a description, a JSON Schema for its arguments |
+    | **resource** | data the host can read by URI (a file, a record) |
+    | **transport** | how client and server talk: **stdio** (the host starts the server as a subprocess) or **HTTP** |
+
+    The description and the schema are what the model reads to decide **whether and how** to call a tool, so write them for a reader who knows nothing about your system. And the server is the **security boundary**: the model can be talked into calling any tool with any arguments, so the server must only do what is safe.
+
+    ### Commands you'll use
+
+    The Python SDK (`mcp` 2.x) builds the schema from type hints and the description from the docstring:
+
+    ```python
+    from mcp.server.mcpserver import MCPServer
+    from mcp.server.mcpserver.exceptions import ToolError
+
+    mcp = MCPServer("weather")
+
+    @mcp.tool()
+    def forecast(city: str) -> str:
+        """Tomorrow's forecast for a city, e.g. "Athens"."""
+        if city not in FORECASTS:
+            raise ToolError(f"no forecast for {city!r}")   # the model sees this message
+        return FORECASTS[city]
+
+    if __name__ == "__main__":
+        mcp.run()          # stdio: read requests on stdin, answer on stdout
+    ```
+
+    On this VM the SDK lives in a container. `mcpy` is its Python, and `mcp-call` is a small client that starts `python server.py` (in the current folder) and talks to it:
+
+    ```bash
+    cd /lab
+    mcp-call list                                # the tools, their descriptions and schemas
+    mcp-call call forecast '{"city": "Athens"}'  # OK / ERROR, then the result
+    ```
+
+    ### Common mistakes
+
+    - `print()` in a stdio server: stdout **is** the protocol, so a stray print corrupts it. Log to stderr.
+    - Reading data once at start-up when it changes: read it on each call.
+    - A generic exception for a normal "not found": the SDK hides unexpected errors behind "Error executing tool"; raise `ToolError` with a message the model can act on.
+
+    ### Check your work
+
+    `mcp-call list` shows `service_status` with a description and a required string `name`; calls return the statuses in the file, and an unknown service is an error.
+  scenario: |
+    The on-call assistant should be able to look up service health.
+    **`/lab/services.json`** maps each service to `up`, `degraded` or
+    `down`; the monitoring system rewrites it every minute.
+
+    Write **`/lab/server.py`**, an MCP server (stdio) named **`ops`** with
+    one tool:
+
+    - **`service_status(name: str)`**, with a description, returns the
+      service's status from `services.json` as **read at the time of the
+      call**, e.g. `degraded`;
+    - an unknown service is a **tool error** that names it.
+
+    `mcpy` runs Python with the `mcp` SDK; `mcp-call` tries your server.
+  hints:
+    - "Start from the example in the tutorial: `MCPServer(\"ops\")`, `@mcp.tool()`, `mcp.run()`."
+    - "Open and `json.load` the file inside the tool, not at import time."
+    - "`raise ToolError(f\"unknown service {name!r}\")` for a name that isn't in the file."
+  solution: |
+    ```python
+    import json
+
+    from mcp.server.mcpserver import MCPServer
+    from mcp.server.mcpserver.exceptions import ToolError
+
+    mcp = MCPServer("ops")
+
+
+    @mcp.tool()
+    def service_status(name: str) -> str:
+        """Current health of one service: up, degraded or down."""
+        with open("/lab/services.json") as f:
+            services = json.load(f)
+        if name not in services:
+            raise ToolError(f"unknown service {name!r}; known: {', '.join(sorted(services))}")
+        return services[name]
+
+
+    if __name__ == "__main__":
+        mcp.run()
+    ```
+  setup: |
+    mcp_start
+    python3 - <<'PY' >/lab/services.json
+    import json, random
+    print(json.dumps({s: random.choice(["up", "degraded", "down"]) for s in ["api", "db", "queue", "search"]}, indent=2))
+    PY
+    chown "$(lab_user)": /lab/services.json
+  check: |
+    cp /lab/services.json "$KL_STATE/services.json"
+    mcp_test <<'PY'
+    import json
+    async def test(s):
+        t = tools(await s.list_tools())
+        before = {n: await call(s, "service_status", {"name": n}) for n in ["api", "db", "queue", "search"]}
+        data = json.load(open("/lab/services.json"))
+        data["api"] = "down" if data["api"] != "down" else "up"
+        json.dump(data, open("/lab/services.json", "w"))
+        after = await call(s, "service_status", {"name": "api"})
+        unknown = await call(s, "service_status", {"name": "payments"})
+        return {"name": INIT.server_info.name, "tools": t, "before": before, "after": after, "want_after": data["api"], "unknown": unknown}
+    PY
+    rc=$?
+    cp "$KL_STATE/services.json" /lab/services.json
+    check "the server starts and answers MCP" '[ "$rc" -eq 0 ]'
+    check "it's named ops" 'mj ".name == \"ops\""'
+    check "it has a tool service_status with a description" 'mj ".tools.service_status.description | length > 5"'
+    check "its argument is a required string, name" 'mj ".tools.service_status.schema | (.properties.name.type == \"string\") and (.required | index(\"name\"))"'
+    for n in api db queue search; do
+      want=$(jq -r --arg n "$n" '.[$n]' "$KL_STATE/services.json")
+      got=$(jq -r ".before.$n.text // empty" "$MCP_OUT" 2>/dev/null | tr '[:upper:]' '[:lower:]'); err=$(jq -r ".before.$n.error" "$MCP_OUT" 2>/dev/null)
+      check "service_status($n) says $want" '[ "$err" = false ] && [[ $got == *"$want"* ]]'
+    done
+    check "it reads the file at the time of the call" 'mj ".after.error | not" && mj ".want_after as \$w | .after.text | contains(\$w)"'
+    check "an unknown service is a tool error that names it" 'mj ".unknown.error and (.unknown.text | contains(\"payments\"))"'
+  solve: |
+    cat > /lab/server.py <<'PY'
+    import json
+
+    from mcp.server.mcpserver import MCPServer
+    from mcp.server.mcpserver.exceptions import ToolError
+
+    mcp = MCPServer("ops")
+
+
+    @mcp.tool()
+    def service_status(name: str) -> str:
+        """Current health of one service: up, degraded or down."""
+        with open("/lab/services.json") as f:
+            services = json.load(f)
+        if name not in services:
+            raise ToolError(f"unknown service {name!r}; known: {', '.join(sorted(services))}")
+        return services[name]
+
+
+    if __name__ == "__main__":
+        mcp.run()
+    PY
+
+- id: prog-123
+  title: Arguments the model can't get wrong
+  difficulty: 2
+  kind: fix
+  tags: [mcp, python, json-schema, validation, pydantic]
+  tutorial: |
+    **What you're learning.** Typing tool arguments so the schema the model sees is precise and bad calls are refused before your code runs.
+
+    ### The idea
+
+    A model fills in tool arguments from a schema and a description. Loose schemas get loose calls: `"7; rm -rf /"` for an id, `limit: 100000`, a status the backend doesn't know. The SDK turns **type hints** into **JSON Schema** and **validates every call** against it with Pydantic, so the tighter the hints, the less your code has to defend:
+
+    ```python
+    from typing import Annotated, Literal
+    from pydantic import Field
+
+    @mcp.tool()
+    def list_orders(
+        customer_id: Annotated[int, Field(ge=1, le=10_000_000, description="numeric customer id")],
+        state: Literal["new", "shipped", "returned"] | None = None,
+        limit: Annotated[int, Field(ge=1, le=100)] = 20,
+    ) -> dict:
+        """Orders of one customer, newest first."""
+    ```
+
+    becomes
+
+    ```json
+    {"properties": {
+       "customer_id": {"type": "integer", "minimum": 1, "maximum": 10000000, "description": "numeric customer id"},
+       "state": {"anyOf": [{"enum": ["new", "shipped", "returned"], "type": "string"}, {"type": "null"}], "default": null},
+       "limit": {"type": "integer", "minimum": 1, "maximum": 100, "default": 20}},
+     "required": ["customer_id"]}
+    ```
+
+    A call that breaks the schema never reaches your function; the client gets an error that says which argument was wrong, and the server carries on.
+
+    ### Commands you'll use
+
+    ```bash
+    mcp-call list
+    mcp-call call list_orders '{"customer_id": "12 OR 1=1"}'    # ERROR: Input should be a valid integer
+    mcp-call call list_orders '{"customer_id": 12, "limit": 5}'
+    ```
+
+    ### Common mistakes
+
+    - No type hint: the argument is `Any`, the schema says nothing, anything gets through.
+    - Validating by hand inside the function *instead of* in the schema: the model never learns the rules.
+    - `str` for something with a fixed set of values: use `Literal[...]`.
+
+    ### Check your work
+
+    `mcp-call list` shows integer bounds and an enum; bad calls come back as errors and good calls still work.
+  scenario: |
+    **`/lab/server.py`** is the ticket server the support assistant uses
+    (data in `/lab/tickets.json`). Its arguments are untyped: the assistant
+    has sent ids like `"7; DROP TABLE"`, a limit of 100000 and statuses
+    that don't exist, and some calls crash.
+
+    Type the arguments so the schema is exact and bad calls are refused:
+
+    - **`get_ticket(ticket_id)`**: an **integer from 1 to 99999**; a ticket
+      that doesn't exist is a tool error that names the id.
+    - **`search_tickets(query, status, limit)`**: `query` a string of at
+      most **100** characters; `status` **`open` or `closed`**, optional;
+      `limit` an **integer from 1 to 50**, default 10.
+
+    Keep the tool names and what they return.
+  hints:
+    - "`mcp-call list` shows the schemas now: no types at all."
+    - "`Annotated[int, Field(ge=1, le=99999)]` and `Literal[\"open\", \"closed\"] | None = None`."
+    - "`Annotated[str, Field(max_length=100)]`; for a missing ticket `raise ToolError(f\"no ticket {ticket_id}\")`."
+  solution: |
+    ```python
+    from typing import Annotated, Literal
+    from pydantic import Field
+
+    @mcp.tool()
+    def get_ticket(ticket_id: Annotated[int, Field(ge=1, le=99999)]) -> dict:
+        """One ticket by its number."""
+        t = _tickets().get(str(ticket_id))
+        if t is None:
+            raise ToolError(f"no ticket {ticket_id}")
+        return t
+
+    @mcp.tool()
+    def search_tickets(query: Annotated[str, Field(max_length=100)],
+                       status: Literal["open", "closed"] | None = None,
+                       limit: Annotated[int, Field(ge=1, le=50)] = 10) -> dict:
+        ...
+    ```
+  setup: |
+    mcp_start
+    python3 - <<'PY' >/lab/tickets.json
+    import json, random
+    words = ["disk", "login", "timeout", "invoice", "deploy", "certificate", "backup", "dns"]
+    t = {}
+    for i in range(1, 121):
+        w = random.choice(words)
+        t[str(i)] = {"id": i, "title": f"{w.capitalize()} problem on host {random.randint(1, 40)}", "status": random.choice(["open", "closed"])}
+    print(json.dumps(t))
+    PY
+    chown "$(lab_user)": /lab/tickets.json
+    lab_file /lab/server.py <<'EOF'
+    import json
+
+    from mcp.server.mcpserver import MCPServer
+
+    mcp = MCPServer("tickets")
+
+
+    def _tickets():
+        with open("/lab/tickets.json") as f:
+            return json.load(f)
+
+
+    @mcp.tool()
+    def get_ticket(ticket_id):
+        """One ticket by its number."""
+        return _tickets()[str(ticket_id)]
+
+
+    @mcp.tool()
+    def search_tickets(query, status=None, limit=10):
+        """Tickets whose title contains the query (any case), optionally only open or closed ones."""
+        hits = [t for t in _tickets().values()
+                if query.lower() in t["title"].lower() and (status is None or t["status"] == status)]
+        return {"count": len(hits), "tickets": hits[:limit]}
+
+
+    if __name__ == "__main__":
+        mcp.run()
+    EOF
+  check: |
+    mcp_test <<'PY'
+    import json
+    async def test(s):
+        t = tools(await s.list_tools())
+        data = json.load(open("/lab/tickets.json"))
+        some = next(v for v in data.values() if v["status"] == "open")
+        word = some["title"].split()[0].lower()
+        r = {"tools": t, "id": some["id"], "word": word,
+             "want_open": sum(1 for v in data.values() if word in v["title"].lower() and v["status"] == "open")}
+        r["good"] = await call(s, "get_ticket", {"ticket_id": some["id"]})
+        r["inject"] = await call(s, "get_ticket", {"ticket_id": "7; DROP TABLE tickets"})
+        r["zero"] = await call(s, "get_ticket", {"ticket_id": 0})
+        r["missing"] = await call(s, "get_ticket", {"ticket_id": 5000})
+        r["huge"] = await call(s, "search_tickets", {"query": word, "limit": 100000})
+        r["badstatus"] = await call(s, "search_tickets", {"query": word, "status": "deleted"})
+        r["longq"] = await call(s, "search_tickets", {"query": "x" * 500})
+        r["search"] = await call(s, "search_tickets", {"query": word, "status": "open", "limit": 50})
+        r["after"] = await call(s, "get_ticket", {"ticket_id": 1})
+        return r
+    PY
+    rc=$?
+    check "the server starts and answers MCP" '[ "$rc" -eq 0 ]'
+    check "ticket_id is an integer from 1 to 99999" 'mj ".tools.get_ticket.schema.properties.ticket_id | .type == \"integer\" and .minimum == 1 and .maximum == 99999"'
+    check "query is a string of at most 100 characters" 'mj ".tools.search_tickets.schema.properties.query | .type == \"string\" and .maxLength == 100"'
+    check "status is open or closed, optional" 'mj ".tools.search_tickets.schema | (.properties.status | tostring | (contains(\"open\") and contains(\"closed\") and contains(\"enum\"))) and ((.required // []) | index(\"status\") | not)"'
+    check "limit is an integer from 1 to 50, default 10" 'mj ".tools.search_tickets.schema.properties.limit | .type == \"integer\" and .minimum == 1 and .maximum == 50 and .default == 10"'
+    check "a good get_ticket call works" 'mj ".good.error | not" && mj ".id as \$i | .good.text | fromjson | .id == \$i"'
+    check "an id with SQL in it is refused" 'mj ".inject.error"'
+    check "id 0 is refused" 'mj ".zero.error"'
+    check "a missing ticket is a tool error that names the id" 'mj ".missing.error and (.missing.text | contains(\"5000\"))"'
+    check "limit 100000 and an unknown status are refused" 'mj ".huge.error and .badstatus.error"'
+    check "a 500-character query is refused" 'mj ".longq.error"'
+    check "a good search still works" 'mj ".search.error | not" && mj ".want_open as \$w | .search.text | fromjson | .count == \$w"'
+    check "the server keeps working after bad calls" 'mj ".after.error | not"'
+  solve: |
+    cat > /lab/server.py <<'PY'
+    import json
+    from typing import Annotated, Literal
+
+    from pydantic import Field
+    from mcp.server.mcpserver import MCPServer
+    from mcp.server.mcpserver.exceptions import ToolError
+
+    mcp = MCPServer("tickets")
+
+
+    def _tickets():
+        with open("/lab/tickets.json") as f:
+            return json.load(f)
+
+
+    @mcp.tool()
+    def get_ticket(ticket_id: Annotated[int, Field(ge=1, le=99999)]) -> dict:
+        """One ticket by its number."""
+        t = _tickets().get(str(ticket_id))
+        if t is None:
+            raise ToolError(f"no ticket {ticket_id}")
+        return t
+
+
+    @mcp.tool()
+    def search_tickets(query: Annotated[str, Field(max_length=100)],
+                       status: Literal["open", "closed"] | None = None,
+                       limit: Annotated[int, Field(ge=1, le=50)] = 10) -> dict:
+        """Tickets whose title contains the query (any case), optionally only open or closed ones."""
+        hits = [t for t in _tickets().values()
+                if query.lower() in t["title"].lower() and (status is None or t["status"] == status)]
+        return {"count": len(hits), "tickets": hits[:limit]}
+
+
+    if __name__ == "__main__":
+        mcp.run()
+    PY
+
+- id: prog-124
+  title: Runbooks as resources
+  difficulty: 2
+  kind: build
+  tags: [mcp, python, resources, uri-templates]
+  tutorial: |
+    **What you're learning.** MCP **resources**: data a host can list and read by URI, and how they differ from tools.
+
+    ### The idea
+
+    | | Tool | Resource |
+    |---|---|---|
+    | who decides to use it | the **model**, during a conversation | the **host or user** (attach a file, pick a document) |
+    | addressed by | name + JSON arguments | a **URI** |
+    | typical use | actions and lookups | documents, records, files to put in context |
+
+    A **static** resource has a fixed URI; a **resource template** has parameters in it:
+
+    ```python
+    @mcp.resource("policy://index")
+    def policy_index() -> str:
+        """Every policy, one name per line."""
+        return "\n".join(sorted(p.stem for p in POLICIES.glob("*.md")))
+
+    @mcp.resource("policy://{name}")
+    def policy(name: str) -> str:
+        """One policy document, as Markdown."""
+        path = POLICIES / f"{name}.md"
+        if not path.is_file():
+            raise ResourceError(f"no policy {name!r}")
+        return path.read_text()
+    ```
+
+    Clients list them with `resources/list` and `resources/templates/list`, and read one with `resources/read` and the URI. The SDK refuses URIs with `..`, absolute paths or null bytes in a template parameter, but your function still decides what a name maps to: build the path from a known folder, never take a path from the URI.
+
+    ### Commands you'll use
+
+    ```bash
+    mcp-call resources                     # static resources and templates
+    mcp-call read policy://index
+    mcp-call read policy://travel
+    ```
+
+    `ResourceError` is in `mcp.server.mcpserver.exceptions`.
+
+    ### Common mistakes
+
+    - Making documents tools ("get_runbook") when the host is meant to attach them: it works, but the user can't browse them.
+    - Returning `None` for a missing document instead of an error.
+    - Listing files from a folder that contains other things (backups, drafts): filter on what you mean to publish.
+
+    ### Check your work
+
+    `mcp-call resources` shows `runbook://index` and the template `runbook://{name}`; every runbook reads back exactly as the file, and a missing one is an error.
+  scenario: |
+    The team's runbooks are Markdown files in **`/lab/runbooks`**. The
+    assistant's host should be able to browse and attach them.
+
+    Write **`/lab/server.py`**, an MCP server (stdio) named **`runbooks`**
+    with:
+
+    - a resource **`runbook://index`**: the runbook names (file names
+      without `.md`), sorted, one per line;
+    - a resource template **`runbook://{name}`**: the content of
+      `/lab/runbooks/<name>.md`, exactly as in the file;
+    - a name with no runbook is an **error**. Only `.md` files count
+      (there's a backup file in the folder too).
+  hints:
+    - "`@mcp.resource(\"runbook://index\")` and `@mcp.resource(\"runbook://{name}\")`."
+    - "`sorted(p.stem for p in Path('/lab/runbooks').glob('*.md'))`."
+    - "`raise ResourceError(...)` when `(DIR / f\"{name}.md\").is_file()` is false."
+  solution: |
+    ```python
+    from pathlib import Path
+
+    from mcp.server.mcpserver import MCPServer
+    from mcp.server.mcpserver.exceptions import ResourceError
+
+    DIR = Path("/lab/runbooks")
+    mcp = MCPServer("runbooks")
+
+
+    @mcp.resource("runbook://index")
+    def index() -> str:
+        """Every runbook, one name per line."""
+        return "\n".join(sorted(p.stem for p in DIR.glob("*.md")))
+
+
+    @mcp.resource("runbook://{name}")
+    def runbook(name: str) -> str:
+        """One runbook, as Markdown."""
+        path = DIR / f"{name}.md"
+        if not path.is_file():
+            raise ResourceError(f"no runbook {name!r}")
+        return path.read_text()
+    ```
+  setup: |
+    mcp_start
+    mkdir -p /lab/runbooks
+    for n in db-failover cache-flush cert-rotation dns-cutover; do
+      {
+        echo "# ${n//-/ }"
+        echo
+        echo "Owner: team-$((RANDOM % 9 + 1)). Last reviewed $((RANDOM % 28 + 1)) days ago."
+        echo
+        for i in 1 2 3; do echo "$i. Step $i of $n: check $((RANDOM % 500)) before continuing."; done
+      } >"/lab/runbooks/$n.md"
+    done
+    echo "old draft" >/lab/runbooks/db-failover.md.bak
+    chown -R "$(lab_user)": /lab/runbooks
+  check: |
+    mcp_test <<'PY'
+    from pathlib import Path
+    async def test(s):
+        res = [str(r.uri) for r in (await s.list_resources()).resources]
+        tpl = [t.uri_template for t in (await s.list_resource_templates()).resource_templates]
+        async def read(uri):
+            try:
+                return {"ok": True, "text": "".join(getattr(c, "text", "") for c in (await s.read_resource(uri)).contents)}
+            except Exception as e:
+                return {"ok": False, "text": str(e)}
+        names = sorted(p.stem for p in Path("/lab/runbooks").glob("*.md"))
+        return {"name": INIT.server_info.name, "resources": res, "templates": tpl, "names": names,
+                "index": await read("runbook://index"),
+                "docs": {n: await read(f"runbook://{n}") for n in names},
+                "want": {n: Path(f"/lab/runbooks/{n}.md").read_text() for n in names},
+                "missing": await read("runbook://payroll"),
+                "bak": await read("runbook://db-failover.md")}
+    PY
+    rc=$?
+    check "the server starts and answers MCP" '[ "$rc" -eq 0 ]'
+    check "it's named runbooks" 'mj ".name == \"runbooks\""'
+    check "it lists the resource runbook://index" 'mj ".resources | index(\"runbook://index\")"'
+    check "it lists the template runbook://{name}" 'mj ".templates | index(\"runbook://{name}\")"'
+    check "the index holds the runbook names, sorted, one per line" 'mj ".index.ok and ((.index.text | rtrimstr(\"\n\") | split(\"\n\")) == .names)"'
+    check "every runbook reads back exactly as its file" 'mj ".names | length == 4" && mj ". as \$r | all(.names[]; \$r.docs[.].ok and \$r.docs[.].text == \$r.want[.])"'
+    check "a missing runbook is an error" 'mj ".missing.ok | not"'
+    check "the backup file isn't a runbook" 'mj ".bak.ok | not" && mj ".index.text | contains(\"bak\") | not"'
+  solve: |
+    cat > /lab/server.py <<'PY'
+    from pathlib import Path
+
+    from mcp.server.mcpserver import MCPServer
+    from mcp.server.mcpserver.exceptions import ResourceError
+
+    DIR = Path("/lab/runbooks")
+    mcp = MCPServer("runbooks")
+
+
+    @mcp.resource("runbook://index")
+    def index() -> str:
+        """Every runbook, one name per line."""
+        return "\n".join(sorted(p.stem for p in DIR.glob("*.md")))
+
+
+    @mcp.resource("runbook://{name}")
+    def runbook(name: str) -> str:
+        """One runbook, as Markdown."""
+        path = DIR / f"{name}.md"
+        if not path.is_file():
+            raise ResourceError(f"no runbook {name!r}")
+        return path.read_text()
+
+
+    if __name__ == "__main__":
+        mcp.run()
+    PY
+
+# ===== Intermediate =====
+
+- id: prog-125
+  title: A file reader that stays in its folder
+  difficulty: 3
+  kind: fix
+  tags: [mcp, python, path-traversal, symlinks, security]
+  tutorial: |
+    **What you're learning.** Confining a file-reading tool to one folder, against `..`, absolute paths and symlinks, when the arguments come from a model that can be manipulated.
+
+    ### The idea
+
+    A model's tool arguments are **untrusted input**: anyone who can get text in front of the model (a ticket, a web page, a file it reads) can try to steer it into calling `read_file("../../home/dev/.ssh/id_ed25519")`. This is *prompt injection*, and the defence is not a better prompt but a server that **can't** do the harmful thing.
+
+    For files, that means: resolve the path the OS would really open, symlinks included, then check it is inside the folder:
+
+    ```python
+    ROOT = Path("/srv/docs").resolve()
+
+    def safe(path: str) -> Path:
+        target = (ROOT / path).resolve()            # follows .. and symlinks
+        if not target.is_relative_to(ROOT):
+            raise ToolError("outside the docs folder")
+        if not target.is_file():
+            raise ToolError("no such document")
+        return target
+    ```
+
+    `ROOT / "/etc/passwd"` is `/etc/passwd` (an absolute part replaces everything before it), which the check catches. Limit the size too: a 2 GB log in the context is a denial of service on the model.
+
+    ### Commands you'll use
+
+    ```bash
+    ls -la /lab/docs                         # look for symlinks: the -> arrows
+    mcp-call call read_doc '{"path": "guides/deploy.md"}'
+    mcp-call call read_doc '{"path": "../private/keys.txt"}'      # must be ERROR
+    python3 -c 'from pathlib import Path; print((Path("/srv/docs") / "a/../../etc").resolve())'
+    ```
+
+    ### Common mistakes
+
+    - Checking the string (`".." in path`, `startswith`) instead of the resolved path: symlinks and `/srv/docs-old` slip through.
+    - `os.path.abspath`, which doesn't follow symlinks.
+    - Error messages that echo the resolved target path back: they map your file system for the attacker. Say "outside the docs folder".
+
+    ### Check your work
+
+    Every escape attempt is an error and the private file's content never shows up; normal documents still read; the big log is refused.
+  scenario: |
+    **`/lab/server.py`** gives the assistant **`read_doc(path)`** for the
+    team's documents in **`/lab/docs`**. A red-team test got it to print
+    `/lab/private/keys.txt`.
+
+    Fix `read_doc` so that it:
+
+    - reads only **files inside `/lab/docs`**, after following `..` and
+      **symlinks** (one in `docs` points outside), and refuses absolute
+      paths that lead elsewhere;
+    - refuses files larger than **64 KiB**;
+    - reports refusals and missing files as **tool errors**, and still
+      reads normal documents such as `guides/deploy.md`.
+  hints:
+    - "`ls -la /lab/docs` and try `mcp-call call read_doc '{\"path\": \"shared/keys.txt\"}'`."
+    - "`(ROOT / path).resolve()` then `.is_relative_to(ROOT)`."
+    - "`target.stat().st_size > 64 * 1024`."
+  solution: |
+    ```python
+    ROOT = Path("/lab/docs").resolve()
+    LIMIT = 64 * 1024
+
+    @mcp.tool()
+    def read_doc(path: str) -> str:
+        """Read one of the team's documents, by its path inside the docs folder (e.g. guides/deploy.md)."""
+        target = (ROOT / path).resolve()
+        if not target.is_relative_to(ROOT):
+            raise ToolError("that path is outside the docs folder")
+        if not target.is_file():
+            raise ToolError(f"no document {path!r}")
+        if target.stat().st_size > LIMIT:
+            raise ToolError("document is larger than 64 KiB")
+        return target.read_text(errors="replace")
+    ```
+  setup: |
+    mcp_start
+    mkdir -p /lab/docs/guides /lab/docs/notes /lab/private
+    flag=$(rand_flag)
+    echo "$flag" >"$KL_STATE/flag"
+    printf 'deploy key: %s\n' "$flag" >/lab/private/keys.txt
+    printf '# Deploying\n\nRun the pipeline, then check the dashboard (build %s).\n' "$RANDOM" >/lab/docs/guides/deploy.md
+    printf 'Standup notes %s\n' "$RANDOM" >/lab/docs/notes/standup.txt
+    python3 -c 'print("x" * 100000)' >/lab/docs/notes/big.log
+    ln -s /lab/private /lab/docs/shared
+    mkdir -p /lab/docs-old && echo "$flag" >/lab/docs-old/keys.txt
+    chown -R "$(lab_user)": /lab/docs /lab/private /lab/docs-old
+    lab_file /lab/server.py <<'EOF'
+    import os
+
+    from mcp.server.mcpserver import MCPServer
+    from mcp.server.mcpserver.exceptions import ToolError
+
+    ROOT = "/lab/docs"
+    mcp = MCPServer("docs")
+
+
+    @mcp.tool()
+    def read_doc(path: str) -> str:
+        """Read one of the team's documents, by its path inside the docs folder (e.g. guides/deploy.md)."""
+        if path.startswith("/") and not path.startswith(ROOT):
+            raise ToolError("absolute paths must be inside the docs folder")
+        full = os.path.join(ROOT, path.replace("../", ""))
+        if not os.path.isfile(full):
+            raise ToolError(f"no document {path!r}")
+        with open(full) as f:
+            return f.read()
+
+
+    if __name__ == "__main__":
+        mcp.run()
+    EOF
+  check: |
+    flag=$(cat "$KL_STATE/flag")
+    mcp_test <<'PY'
+    ATTACKS = ["../private/keys.txt", "/lab/private/keys.txt", "shared/keys.txt", "....//private/keys.txt",
+               "guides/../../private/keys.txt", "/lab/docs/../private/keys.txt", "/lab/docs-old/keys.txt",
+               "../docs-old/keys.txt", "/etc/passwd", "shared"]
+    async def test(s):
+        r = {"attacks": {a: await call(s, "read_doc", {"path": a}) for a in ATTACKS}}
+        r["deploy"] = await call(s, "read_doc", {"path": "guides/deploy.md"})
+        r["abs_inside"] = await call(s, "read_doc", {"path": "/lab/docs/notes/standup.txt"})
+        r["dotted"] = await call(s, "read_doc", {"path": "notes/../guides/deploy.md"})
+        r["big"] = await call(s, "read_doc", {"path": "notes/big.log"})
+        r["missing"] = await call(s, "read_doc", {"path": "guides/nothing.md"})
+        r["want_deploy"] = open("/lab/docs/guides/deploy.md").read()
+        return r
+    PY
+    rc=$?
+    check "the server starts and answers MCP" '[ "$rc" -eq 0 ]'
+    check "every escape attempt is a tool error" 'mj "[.attacks[] | .error] | all"'
+    check "the private key never appears in a result" '! grep -qF "$flag" "$MCP_OUT"'
+    check "/etc/passwd doesn't leak" '! grep -q "root:x:0" "$MCP_OUT"'
+    check "guides/deploy.md still reads" 'mj ".deploy.error | not" && mj ".deploy.text == .want_deploy"'
+    check "an absolute path inside /lab/docs and a harmless .. still work" 'mj "(.abs_inside.error | not) and (.dotted.error | not)"'
+    check "files over 64 KiB are refused" 'mj ".big.error"'
+    check "a missing document is a tool error" 'mj ".missing.error"'
+  solve: |
+    cat > /lab/server.py <<'PY'
+    from pathlib import Path
+
+    from mcp.server.mcpserver import MCPServer
+    from mcp.server.mcpserver.exceptions import ToolError
+
+    ROOT = Path("/lab/docs").resolve()
+    LIMIT = 64 * 1024
+    mcp = MCPServer("docs")
+
+
+    @mcp.tool()
+    def read_doc(path: str) -> str:
+        """Read one of the team's documents, by its path inside the docs folder (e.g. guides/deploy.md)."""
+        target = (ROOT / path).resolve()
+        if not target.is_relative_to(ROOT):
+            raise ToolError("that path is outside the docs folder")
+        if not target.is_file():
+            raise ToolError(f"no document {path!r}")
+        if target.stat().st_size > LIMIT:
+            raise ToolError("document is larger than 64 KiB")
+        return target.read_text(errors="replace")
+
+
+    if __name__ == "__main__":
+        mcp.run()
+    PY
+
+- id: prog-126
+  title: No SQL from the model
+  difficulty: 3
+  kind: fix
+  tags: [mcp, python, sqlite, sql-injection, allow-list]
+  tutorial: |
+    **What you're learning.** Replacing a "run any SQL" tool with a fixed set of named, parameterised, read-only queries.
+
+    ### The idea
+
+    A `query(sql)` tool is the most tempting MCP tool to write and the worst one to ship. The model writes the SQL, so whoever can influence the model can run `DELETE`, read the password table, or lock the database with a cross join. Prompts like "only run SELECT" are not a control.
+
+    Give the model **named reports** instead: you write each query once, with placeholders, and the model only picks a name and fills in typed parameters:
+
+    ```python
+    REPORTS = {
+        "late_orders": "SELECT id, customer, due FROM orders WHERE due < date('now') AND shipped = 0 ORDER BY due LIMIT ?",
+        "orders_for":  "SELECT id, due, shipped FROM orders WHERE customer = ? ORDER BY due DESC LIMIT ?",
+    }
+
+    @mcp.tool()
+    def run_report(name: Literal["late_orders", "orders_for"], customer: str | None = None,
+                   limit: Annotated[int, Field(ge=1, le=100)] = 20) -> dict:
+        ...
+        conn = sqlite3.connect("file:/srv/shop.db?mode=ro", uri=True)    # read-only, at the driver
+        rows = conn.execute(REPORTS[name], params).fetchall()
+    ```
+
+    Three layers: the **allow-list** (only these statements exist), **placeholders** (parameters are data, never SQL), and a **read-only connection** (even a mistake can't write).
+
+    ### Commands you'll use
+
+    ```bash
+    sqlite3 /lab/ops.db '.schema'               # if sqlite3 is installed; or:
+    mcpy -c 'import sqlite3; print(sqlite3.connect("/lab/ops.db").execute("select sql from sqlite_master").fetchall())'
+    mcp-call call run_report '{"name": "late_orders", "limit": 5}'
+    mcp-call call run_report '{"name": "orders_for", "customer": "x'"'"' OR 1=1 --"}'   # no extra rows
+    ```
+
+    ### Common mistakes
+
+    - f-strings or `%` to put a value into the SQL: that's injection again, one level down.
+    - A read-write connection "because the queries only read": defence in depth costs one URI parameter.
+    - A report without a `LIMIT`: the model asks for "everything" and fills its context.
+
+    ### Check your work
+
+    No tool takes SQL any more; the three reports return the right rows; injection in a parameter returns nothing extra; the database is byte-for-byte unchanged after the hostile calls.
+  scenario: |
+    **`/lab/server.py`** gives the ops assistant **`query(sql)`** on the
+    incident database **`/lab/ops.db`** (tables `incidents` and
+    `deploys`). Someone asked the assistant to "clean up old incidents",
+    and it ran a `DELETE`.
+
+    Replace `query` with **`run_report(name, service, limit)`**:
+
+    - `name` is one of **`open_incidents`** (incidents whose `status` is
+      `open`), **`incidents_for_service`** (all incidents of `service`) and
+      **`recent_deploys`** (the latest deploys, newest first);
+    - `service` is a string, needed only by `incidents_for_service`;
+      `limit` an integer from **1 to 100**, default 20;
+    - it returns **`{"rows": [...]}`**, each row an object with the
+      table's columns, newest first (highest `id` first);
+    - the database is opened **read-only**, values are passed as
+      **parameters**, and **no tool accepts SQL**.
+  hints:
+    - "`mcp-call call query '{\"sql\": \"select * from incidents limit 3\"}'` shows the columns."
+    - "A dict of name -> SQL with `?` placeholders; `name: Literal[...]`."
+    - "`sqlite3.connect(\"file:/lab/ops.db?mode=ro\", uri=True)`, `conn.row_factory = sqlite3.Row`, then `[dict(r) for r in rows]`."
+  solution: |
+    ```python
+    REPORTS = {
+        "open_incidents": ("SELECT * FROM incidents WHERE status = 'open' ORDER BY id DESC LIMIT ?", False),
+        "incidents_for_service": ("SELECT * FROM incidents WHERE service = ? ORDER BY id DESC LIMIT ?", True),
+        "recent_deploys": ("SELECT * FROM deploys ORDER BY id DESC LIMIT ?", False),
+    }
+
+    @mcp.tool()
+    def run_report(name: Literal["open_incidents", "incidents_for_service", "recent_deploys"],
+                   service: str | None = None,
+                   limit: Annotated[int, Field(ge=1, le=100)] = 20) -> dict:
+        """Run one of the fixed incident reports."""
+        sql, needs_service = REPORTS[name]
+        if needs_service and not service:
+            raise ToolError(f"{name} needs a service")
+        params = (service, limit) if needs_service else (limit,)
+        conn = sqlite3.connect("file:/lab/ops.db?mode=ro", uri=True)
+        conn.row_factory = sqlite3.Row
+        try:
+            return {"rows": [dict(r) for r in conn.execute(sql, params)]}
+        finally:
+            conn.close()
+    ```
+  setup: |
+    mcp_start
+    python3 - <<'PY'
+    import random, sqlite3
+    c = sqlite3.connect("/lab/ops.db")
+    c.execute("CREATE TABLE incidents (id INTEGER PRIMARY KEY, service TEXT, title TEXT, status TEXT)")
+    c.execute("CREATE TABLE deploys (id INTEGER PRIMARY KEY, service TEXT, version TEXT, who TEXT)")
+    services = ["api", "db", "queue", "search", "billing"]
+    for i in range(1, 61):
+        s = random.choice(services)
+        c.execute("INSERT INTO incidents (service, title, status) VALUES (?, ?, ?)",
+                  (s, f"{s} incident {i}: {random.choice(['latency', 'errors', 'disk', 'certificate'])}", random.choice(["open", "closed", "closed"])))
+    for i in range(1, 41):
+        c.execute("INSERT INTO deploys (service, version, who) VALUES (?, ?, ?)",
+                  (random.choice(services), f"v1.{i}.{random.randint(0, 9)}", random.choice(["ana", "bo", "chen", "dee"])))
+    c.commit()
+    PY
+    chown "$(lab_user)": /lab/ops.db
+    sha256sum /lab/ops.db >"$KL_STATE/db.sum"
+    lab_file /lab/server.py <<'EOF'
+    import sqlite3
+
+    from mcp.server.mcpserver import MCPServer
+
+    mcp = MCPServer("incidents")
+
+
+    @mcp.tool()
+    def query(sql: str) -> dict:
+        """Run SQL against the incident database (tables incidents and deploys)."""
+        conn = sqlite3.connect("/lab/ops.db")
+        conn.row_factory = sqlite3.Row
+        rows = [dict(r) for r in conn.execute(sql)]
+        conn.commit()
+        return {"rows": rows}
+
+
+    if __name__ == "__main__":
+        mcp.run()
+    EOF
+  check: |
+    cp /lab/ops.db "$KL_STATE/ops.db"
+    mcp_test <<'PY'
+    import json, sqlite3
+    async def test(s):
+        t = tools(await s.list_tools())
+        c = sqlite3.connect("file:/lab/ops.db?mode=ro", uri=True)
+        c.row_factory = sqlite3.Row
+        q = lambda sql, p=(): [dict(r) for r in c.execute(sql, p)]
+        svc = q("SELECT service FROM incidents GROUP BY service ORDER BY count(*) DESC LIMIT 1")[0]["service"]
+        want = {"open": q("SELECT * FROM incidents WHERE status = 'open' ORDER BY id DESC LIMIT 20"),
+                "svc": q("SELECT * FROM incidents WHERE service = ? ORDER BY id DESC LIMIT 5", (svc,)),
+                "deploys": q("SELECT * FROM deploys ORDER BY id DESC LIMIT 7")}
+        rows = lambda r: None if r["error"] else json.loads(r["text"]).get("rows")
+        r = {"tools": t, "svc": svc, "want": want}
+        r["open"] = rows(await call(s, "run_report", {"name": "open_incidents"}))
+        r["svc_rows"] = rows(await call(s, "run_report", {"name": "incidents_for_service", "service": svc, "limit": 5}))
+        r["deploys"] = rows(await call(s, "run_report", {"name": "recent_deploys", "limit": 7}))
+        inj = await call(s, "run_report", {"name": "incidents_for_service", "service": "api' OR '1'='1", "limit": 100})
+        r["inject"] = rows(inj) if not inj["error"] else []
+        r["unknown"] = await call(s, "run_report", {"name": "drop_everything"})
+        r["huge"] = await call(s, "run_report", {"name": "recent_deploys", "limit": 100000})
+        hostile = []
+        for name in t:
+            for arg in ["sql", "query", "statement"]:
+                hostile.append(await call(s, name, {arg: "DELETE FROM incidents"}))
+        hostile.append(await call(s, "query", {"sql": "DELETE FROM incidents"}))
+        r["hostile_any_ok"] = any(not h["error"] for h in hostile)
+        return r
+    PY
+    rc=$?
+    check "the server starts and answers MCP" '[ "$rc" -eq 0 ]'
+    check "the query tool is gone" 'mj ".tools | has(\"query\") | not"'
+    check "no tool has an argument for SQL" 'mj "[.tools[].schema.properties // {} | keys[]] | map(ascii_downcase | test(\"sql|query|statement\")) | any | not"'
+    check "run_report's name is one of the three reports" 'mj ".tools.run_report.schema.properties.name | tostring | (contains(\"open_incidents\") and contains(\"incidents_for_service\") and contains(\"recent_deploys\") and contains(\"enum\"))"'
+    check "limit is an integer from 1 to 100, default 20" 'mj ".tools.run_report.schema.properties.limit | .type == \"integer\" and .minimum == 1 and .maximum == 100 and .default == 20"'
+    check "open_incidents returns the open incidents, newest first" 'mj ".open == .want.open"'
+    check "incidents_for_service returns that service's incidents" 'mj ".svc_rows == .want.svc"'
+    check "recent_deploys returns the latest deploys" 'mj ".deploys == .want.deploys"'
+    check "SQL in the service parameter returns nothing extra" 'mj "(.inject // []) | length == 0"'
+    check "an unknown report and limit 100000 are refused" 'mj ".unknown.error and .huge.error"'
+    check "nothing accepted a DELETE" 'mj ".hostile_any_ok | not"'
+    check "ops.db is unchanged" 'sha256sum -c --quiet "$KL_STATE/db.sum"'
+    cmp -s /lab/ops.db "$KL_STATE/ops.db" || cp "$KL_STATE/ops.db" /lab/ops.db
+  solve: |
+    cat > /lab/server.py <<'PY'
+    import sqlite3
+    from typing import Annotated, Literal
+
+    from pydantic import Field
+    from mcp.server.mcpserver import MCPServer
+    from mcp.server.mcpserver.exceptions import ToolError
+
+    mcp = MCPServer("incidents")
+
+    REPORTS = {
+        "open_incidents": ("SELECT * FROM incidents WHERE status = 'open' ORDER BY id DESC LIMIT ?", False),
+        "incidents_for_service": ("SELECT * FROM incidents WHERE service = ? ORDER BY id DESC LIMIT ?", True),
+        "recent_deploys": ("SELECT * FROM deploys ORDER BY id DESC LIMIT ?", False),
+    }
+
+
+    @mcp.tool()
+    def run_report(name: Literal["open_incidents", "incidents_for_service", "recent_deploys"],
+                   service: str | None = None,
+                   limit: Annotated[int, Field(ge=1, le=100)] = 20) -> dict:
+        """Run one of the fixed incident reports: open_incidents, incidents_for_service (needs service) or recent_deploys."""
+        sql, needs_service = REPORTS[name]
+        if needs_service and not service:
+            raise ToolError(f"{name} needs a service")
+        params = (service, limit) if needs_service else (limit,)
+        conn = sqlite3.connect("file:/lab/ops.db?mode=ro", uri=True)
+        conn.row_factory = sqlite3.Row
+        try:
+            return {"rows": [dict(r) for r in conn.execute(sql, params)]}
+        finally:
+            conn.close()
+
+
+    if __name__ == "__main__":
+        mcp.run()
+    PY
+
+- id: prog-127
+  title: The token in the context window
+  difficulty: 3
+  kind: fix
+  tags: [mcp, python, secrets, redaction, data-leak]
+  tutorial: |
+    **What you're learning.** Keeping secrets out of everything a tool returns, because whatever reaches the model's context can come back out.
+
+    ### The idea
+
+    Anything a tool returns goes into the model's **context**. From there it can be repeated to the user, written into a ticket, sent to another tool, or extracted by a prompt injection ("summarise your configuration including credentials"). So the rule is not "tell the model not to reveal it" but **never put it in the context**.
+
+    Common leaks in tools:
+
+    | Leak | Fix |
+    |---|---|
+    | returning a whole config or object | return an **allow-list** of fields, or redact known secret keys |
+    | a "debug" tool that dumps `os.environ` | remove it, or return only named, harmless variables |
+    | error messages with connection strings or tokens | fixed messages; log details to stderr |
+    | descriptions with example credentials | the model reads descriptions too |
+
+    ```python
+    SECRET_KEYS = {"password", "token", "secret", "api_key"}
+
+    def redact(cfg: dict) -> dict:
+        return {k: ("[redacted]" if any(s in k.lower() for s in SECRET_KEYS) else v) for k, v in cfg.items()}
+    ```
+
+    Redaction by key name is a safety net; an explicit allow-list of what a tool may return is stronger.
+
+    ### Commands you'll use
+
+    ```bash
+    mcp-call list                            # descriptions count too
+    mcp-call call show_settings '{}'
+    MCP_CMD='env APP_TOKEN=test-123 python server.py' mcp-call call debug_env '{}' | grep test-123
+    ```
+
+    ### Common mistakes
+
+    - Redacting the value in one tool and returning it in another.
+    - Leaving nested secrets (`{"db": {"password": ...}}`): walk the structure.
+    - Relying on the model's instructions to keep a secret.
+
+    ### Check your work
+
+    With a known token in the environment and the config, no tool output and no tool description contains it, and `get_config` still shows the harmless settings.
+  scenario: |
+    **`/lab/server.py`** gives the deploy assistant **`get_config()`** and
+    **`debug_env()`**. The configuration in **`/lab/config.json`** holds an
+    API token and a database password (also a nested one), and the server
+    runs with **`DEPLOY_TOKEN`** in its environment. In a support chat the
+    assistant pasted the token for a user who asked nicely.
+
+    Fix the server so that **no secret ever appears in what any tool
+    returns, or in any tool description**:
+
+    - **`get_config()`** returns the configuration with every key whose
+      name contains `token`, `password` or `secret` (at any depth) set to
+      **`"[redacted]"`**, and everything else unchanged;
+    - **`debug_env()`** returns **only** `TZ`, `LANG` and `APP_VERSION`
+      (those that are set).
+  hints:
+    - "`mcp-call call debug_env '{}'` and `mcp-call call get_config '{}'`."
+    - "A recursive function over dicts (and lists) that replaces values of secret-looking keys."
+    - "`{k: os.environ[k] for k in (\"TZ\", \"LANG\", \"APP_VERSION\") if k in os.environ}`."
+  solution: |
+    ```python
+    SECRET = ("token", "password", "secret")
+
+    def redact(v):
+        if isinstance(v, dict):
+            return {k: "[redacted]" if any(s in k.lower() for s in SECRET) else redact(x) for k, x in v.items()}
+        if isinstance(v, list):
+            return [redact(x) for x in v]
+        return v
+
+    @mcp.tool()
+    def get_config() -> dict:
+        """The deploy configuration, with secrets redacted."""
+        return redact(json.load(open("/lab/config.json")))
+
+    @mcp.tool()
+    def debug_env() -> dict:
+        """A few harmless environment settings, for debugging."""
+        return {k: os.environ[k] for k in ("TZ", "LANG", "APP_VERSION") if k in os.environ}
+    ```
+  setup: |
+    mcp_start
+    t1="tok_$(openssl rand -hex 16)"; t2="pw_$(openssl rand -hex 12)"; t3="sec_$(openssl rand -hex 12)"; t4="env_$(openssl rand -hex 16)"
+    printf '%s\n' "$t1" "$t2" "$t3" "$t4" >"$KL_STATE/secrets"
+    python3 - "$t1" "$t2" "$t3" <<'PY' >/lab/config.json
+    import json, sys
+    print(json.dumps({"region": "eu-west-1", "replicas": 3, "api_token": sys.argv[1],
+                      "database": {"host": "db.internal", "port": 5432, "user": "deploy", "Password": sys.argv[2]},
+                      "webhooks": [{"url": "https://hooks.lab.test/x", "signing_secret": sys.argv[3]}]}, indent=2))
+    PY
+    chown "$(lab_user)": /lab/config.json
+    echo "$t4" >"$KL_STATE/envtoken"
+    lab_file /lab/server.py <<'EOF'
+    import json
+    import os
+
+    from mcp.server.mcpserver import MCPServer
+
+    mcp = MCPServer("deploy")
+
+
+    @mcp.tool()
+    def get_config() -> dict:
+        """The deploy configuration (region, replicas, database, webhooks...)."""
+        with open("/lab/config.json") as f:
+            return json.load(f)
+
+
+    @mcp.tool()
+    def debug_env() -> dict:
+        """The server's environment, for debugging."""
+        return dict(os.environ)
+
+
+    if __name__ == "__main__":
+        mcp.run()
+    EOF
+  check: |
+    envtok=$(cat "$KL_STATE/envtoken")
+    MCP_DOCKER_OPTS="-e DEPLOY_TOKEN=$envtok -e TZ=UTC -e APP_VERSION=4.2.0" mcp_test <<'PY'
+    async def test(s):
+        listing = await s.list_tools()
+        t = tools(listing)
+        r = {"tools": t, "results": {}}
+        for name, info in t.items():
+            if not (info["schema"].get("required") or []):
+                r["results"][name] = await call(s, name, {})
+        return r
+    PY
+    rc=$?
+    check "the server starts and answers MCP" '[ "$rc" -eq 0 ]'
+    leak=no
+    while read -r sec; do grep -qF "$sec" "$MCP_OUT" && leak=yes; done <"$KL_STATE/secrets"
+    check "no secret appears in any tool result or description" '[ "$leak" = no ]'
+    check "get_config still returns the harmless settings" 'mj ".results.get_config.text | fromjson | .region == \"eu-west-1\" and .replicas == 3 and .database.host == \"db.internal\" and .database.port == 5432 and .webhooks[0].url == \"https://hooks.lab.test/x\""'
+    check "secret keys are \"[redacted]\" at every depth" 'mj ".results.get_config.text | fromjson | .api_token == \"[redacted]\" and .database.Password == \"[redacted]\" and .webhooks[0].signing_secret == \"[redacted]\""'
+    check "debug_env returns only TZ, LANG and APP_VERSION" 'mj ".results.debug_env.text | fromjson | (keys - [\"TZ\", \"LANG\", \"APP_VERSION\"] | length == 0) and .TZ == \"UTC\" and .APP_VERSION == \"4.2.0\""'
+  solve: |
+    cat > /lab/server.py <<'PY'
+    import json
+    import os
+
+    from mcp.server.mcpserver import MCPServer
+
+    mcp = MCPServer("deploy")
+    SECRET = ("token", "password", "secret")
+
+
+    def redact(v):
+        if isinstance(v, dict):
+            return {k: "[redacted]" if any(s in k.lower() for s in SECRET) else redact(x) for k, x in v.items()}
+        if isinstance(v, list):
+            return [redact(x) for x in v]
+        return v
+
+
+    @mcp.tool()
+    def get_config() -> dict:
+        """The deploy configuration (region, replicas, database, webhooks), with secrets redacted."""
+        with open("/lab/config.json") as f:
+            return redact(json.load(f))
+
+
+    @mcp.tool()
+    def debug_env() -> dict:
+        """A few harmless environment settings (TZ, LANG, APP_VERSION), for debugging."""
+        return {k: os.environ[k] for k in ("TZ", "LANG", "APP_VERSION") if k in os.environ}
+
+
+    if __name__ == "__main__":
+        mcp.run()
+    PY
+
+- id: prog-128
+  title: Every call on the record
+  difficulty: 3
+  kind: build
+  tags: [mcp, python, audit-log, decorators, observability]
+  tutorial: |
+    **What you're learning.** Writing an audit log of every tool call, including the refused ones, with a decorator.
+
+    ### The idea
+
+    When an assistant restarts the wrong service at 03:00, the first question is "what exactly did it call, with what, and what happened?". An **audit log** answers it: one line per call, written by the server, in a format a machine can query. JSON Lines (one JSON object per line) works with `jq`, log shippers and SIEMs alike:
+
+    ```json
+    {"ts": "2026-11-20T03:12:44.120Z", "tool": "restart_service", "args": {"name": "db"}, "ok": false, "error": "'db' is not on the restart allow-list"}
+    ```
+
+    The refused and failed calls matter most: they're where an attack or a confused model shows up.
+
+    A decorator wraps every tool the same way. `functools.wraps` keeps the function's name, docstring and signature, which the SDK reads to build the schema:
+
+    ```python
+    import functools, json, time
+
+    def audited(fn):
+        @functools.wraps(fn)
+        def wrapper(*args, **kwargs):
+            entry = {"ts": ..., "tool": fn.__name__, "args": kwargs}
+            try:
+                result = fn(*args, **kwargs)
+                entry.update(ok=True, error=None)
+                return result
+            except Exception as e:
+                entry.update(ok=False, error=str(e))
+                raise
+            finally:
+                with open(LOG, "a") as f:
+                    f.write(json.dumps(entry) + "\n")
+        return wrapper
+
+    @mcp.tool()
+    @audited                    # the tool decorator goes outermost
+    def deploy(service: str) -> str: ...
+    ```
+
+    ### Commands you'll use
+
+    ```bash
+    mcp-call call restart_service '{"name": "api"}'
+    tail -n 3 /lab/audit.jsonl | jq -c .
+    jq -r 'select(.ok == false) | [.ts, .tool, .error] | @tsv' /lab/audit.jsonl
+    python3 -c 'from datetime import datetime, timezone; print(datetime.now(timezone.utc).isoformat())'
+    ```
+
+    ### Common mistakes
+
+    - Logging only successes.
+    - Putting `@audited` above `@mcp.tool()`: the SDK registers the unwrapped function and nothing is logged.
+    - Logging the full result: it may be large or sensitive. Log what was asked and the outcome.
+
+    ### Check your work
+
+    Four calls (two good, one refused, one error) add four lines to `audit.jsonl`, in order, with the tool, the arguments, `ok` and the error message.
+  scenario: |
+    **`/lab/server.py`** lets the ops assistant **`service_status(name)`**
+    and **`restart_service(name)`** (only `api` and `worker` may be
+    restarted). Security wants an audit trail.
+
+    Make the server append one line to **`/lab/audit.jsonl`** for **every
+    call of both tools**, successful or not, in this format:
+
+    ```json
+    {"ts": "2026-11-20T03:12:44.120000+00:00", "tool": "restart_service", "args": {"name": "db"}, "ok": false, "error": "..."}
+    ```
+
+    - `ts`: the time of the call, ISO 8601 in **UTC** (with an offset or
+      `Z`);
+    - `args`: the arguments as given;
+    - `ok`: whether the tool succeeded; `error`: the error message, or
+      `null` when it succeeded.
+
+    Keep the tools working as they do.
+  hints:
+    - "Write a decorator and put it under `@mcp.tool()` on both tools."
+    - "`datetime.now(timezone.utc).isoformat()`."
+    - "Catch the exception, record `str(e)`, and re-raise it."
+  solution: |
+    ```python
+    import functools, json
+    from datetime import datetime, timezone
+
+    LOG = "/lab/audit.jsonl"
+
+    def audited(fn):
+        @functools.wraps(fn)
+        def wrapper(**kwargs):
+            entry = {"ts": datetime.now(timezone.utc).isoformat(), "tool": fn.__name__, "args": kwargs}
+            try:
+                result = fn(**kwargs)
+                entry.update(ok=True, error=None)
+                return result
+            except Exception as e:
+                entry.update(ok=False, error=str(e))
+                raise
+            finally:
+                with open(LOG, "a") as f:
+                    f.write(json.dumps(entry) + "\n")
+        return wrapper
+    ```
+
+    Then `@mcp.tool()` above `@audited` on both tools.
+  setup: |
+    mcp_start
+    printf '{"api": "up", "worker": "degraded", "db": "up"}\n' >/lab/services.json
+    chown "$(lab_user)": /lab/services.json
+    lab_file /lab/server.py <<'EOF'
+    import json
+
+    from mcp.server.mcpserver import MCPServer
+    from mcp.server.mcpserver.exceptions import ToolError
+
+    mcp = MCPServer("ops")
+    RESTARTABLE = {"api", "worker"}
+
+
+    @mcp.tool()
+    def service_status(name: str) -> str:
+        """Current health of one service: up, degraded or down."""
+        with open("/lab/services.json") as f:
+            services = json.load(f)
+        if name not in services:
+            raise ToolError(f"unknown service {name!r}")
+        return services[name]
+
+
+    @mcp.tool()
+    def restart_service(name: str) -> str:
+        """Restart a service (only api and worker)."""
+        if name not in RESTARTABLE:
+            raise ToolError(f"{name!r} is not on the restart allow-list")
+        return f"restart of {name} requested"
+
+
+    if __name__ == "__main__":
+        mcp.run()
+    EOF
+  check: |
+    before=$(grep -c . /lab/audit.jsonl 2>/dev/null); before=${before:-0}
+    mcp_test <<'PY'
+    import time
+    async def test(s):
+        out = []
+        for tool, args in [("service_status", {"name": "worker"}), ("restart_service", {"name": "api"}),
+                           ("restart_service", {"name": "db"}), ("service_status", {"name": "payments"})]:
+            out.append(await call(s, tool, args))
+            time.sleep(0.05)
+        return {"calls": out, "t": time.time()}
+    PY
+    rc=$?
+    check "the server starts and answers MCP" '[ "$rc" -eq 0 ]'
+    check "the tools still work (worker is degraded, api restarts, db is refused)" 'mj ".calls[0].text == \"degraded\" and (.calls[1].error | not) and .calls[2].error and .calls[3].error"'
+    tail -n +"$((before + 1))" /lab/audit.jsonl 2>/dev/null >"$KL_STATE/new.jsonl"
+    info "audit.jsonl got $(grep -c . "$KL_STATE/new.jsonl") new line(s)"
+    aj() { jq -se "$1" "$KL_STATE/new.jsonl" >/dev/null 2>&1; }
+    check "four calls added four JSON lines" 'aj "length == 4"'
+    check "they name the tools and arguments, in order" 'aj "map([.tool, .args]) == [[\"service_status\", {\"name\": \"worker\"}], [\"restart_service\", {\"name\": \"api\"}], [\"restart_service\", {\"name\": \"db\"}], [\"service_status\", {\"name\": \"payments\"}]]"'
+    check "ok and error record the outcome" 'aj "map(.ok) == [true, true, false, false] and (.[0].error == null) and (.[1].error == null) and (.[2].error | test(\"allow-list\")) and (.[3].error | test(\"payments\"))"'
+    check "ts is ISO 8601 in UTC, at the time of the call" 'aj "all(.ts | test(\"^[0-9]{4}-[0-9]{2}-[0-9]{2}T[0-9:.]+(Z|\\\\+00:00)$\"))" && aj "all(.ts | sub(\"\\\\.[0-9]+\"; \"\") | sub(\"\\\\+00:00$\"; \"Z\") | fromdateiso8601 | (now - .) < 600 and (now - .) > -60)"'
+  solve: |
+    cat > /lab/server.py <<'PY'
+    import functools
+    import json
+    from datetime import datetime, timezone
+
+    from mcp.server.mcpserver import MCPServer
+    from mcp.server.mcpserver.exceptions import ToolError
+
+    mcp = MCPServer("ops")
+    RESTARTABLE = {"api", "worker"}
+    LOG = "/lab/audit.jsonl"
+
+
+    def audited(fn):
+        @functools.wraps(fn)
+        def wrapper(**kwargs):
+            entry = {"ts": datetime.now(timezone.utc).isoformat(), "tool": fn.__name__, "args": kwargs}
+            try:
+                result = fn(**kwargs)
+                entry.update(ok=True, error=None)
+                return result
+            except Exception as e:
+                entry.update(ok=False, error=str(e))
+                raise
+            finally:
+                with open(LOG, "a") as f:
+                    f.write(json.dumps(entry) + "\n")
+        return wrapper
+
+
+    @mcp.tool()
+    @audited
+    def service_status(name: str) -> str:
+        """Current health of one service: up, degraded or down."""
+        with open("/lab/services.json") as f:
+            services = json.load(f)
+        if name not in services:
+            raise ToolError(f"unknown service {name!r}")
+        return services[name]
+
+
+    @mcp.tool()
+    @audited
+    def restart_service(name: str) -> str:
+        """Restart a service (only api and worker)."""
+        if name not in RESTARTABLE:
+            raise ToolError(f"{name!r} is not on the restart allow-list")
+        return f"restart of {name} requested"
+
+
+    if __name__ == "__main__":
+        mcp.run()
+    PY
+
+# ===== Advanced =====
+
+- id: prog-129
+  title: The health check that hangs the assistant
+  difficulty: 4
+  kind: fix
+  tags: [mcp, python, timeouts, ssrf, allow-list]
+  tutorial: |
+    **What you're learning.** Bounding how long a tool may take, and not letting a model choose where your server connects.
+
+    ### The idea
+
+    Two problems hide in a tool like `check_url(url)`:
+
+    1. **No timeout.** `urllib.request.urlopen(url)` waits as long as the server on the other side likes. One stuck backend and the assistant hangs, holding a worker thread, until the host gives up, if it ever does.
+    2. **The model picks the address.** That's **SSRF** (server-side request forgery): the server, inside your network, will fetch `http://169.254.169.254/latest/meta-data/` (cloud credentials), `http://localhost:6379/`, or an internal admin page, on behalf of whoever steers the model.
+
+    Fix both by taking a **name from an allow-list** instead of a URL, and putting a **timeout** on every network call:
+
+    ```python
+    TARGETS = {"search": "http://10.0.3.7:9200/_cluster/health", "cache": "http://10.0.3.9:8080/ping"}
+
+    @mcp.tool()
+    def check_service(name: Literal["search", "cache"]) -> str:
+        """Is a backend healthy? Answers within about 2 seconds."""
+        try:
+            with urllib.request.urlopen(TARGETS[name], timeout=2) as resp:
+                return f"{name}: HTTP {resp.status}"
+        except TimeoutError:
+            raise ToolError(f"{name}: no answer within 2 seconds")
+        except OSError as e:          # URLError, connection refused...
+            raise ToolError(f"{name}: unreachable ({e.__class__.__name__})")
+    ```
+
+    `timeout=` applies to connecting and to each read. A server that trickles a byte every second can still stretch it; for a hard limit on the whole call, run it in a worker with a deadline.
+
+    ### Commands you'll use
+
+    ```bash
+    time mcp-call call check_service '{"name": "search"}'
+    curl -s -m 3 http://127.0.0.1:9911/health; echo "exit $?"       # 28 = curl's own timeout
+    ```
+
+    ### Common mistakes
+
+    - A timeout on the connect only: a backend that accepts and then never answers still hangs you.
+    - Validating URLs against a deny-list (`localhost`, `127.`): there are endless spellings (`0x7f000001`, IPv6, DNS that resolves to private ranges). Allow-list names.
+    - Catching `Exception` and returning `"ok"`.
+
+    ### Check your work
+
+    A hung backend gives a tool error in about 2 seconds, a healthy one answers, an unknown name is refused, and no tool takes a URL.
+  scenario: |
+    **`/lab/server.py`** gives the assistant **`check_url(url)`** to test
+    the health endpoints of two backends: **inventory**
+    (`http://127.0.0.1:9911/health`) and **billing**
+    (`http://127.0.0.1:9912/health`). Inventory is stuck: it accepts
+    connections and never answers, and the assistant hangs with it. A
+    pentest also used `check_url` to read internal pages.
+
+    Replace `check_url` with **`check_service(name)`**:
+
+    - `name` is **`inventory` or `billing`**, nothing else; **no tool takes
+      a URL**;
+    - it returns the HTTP status of the service's health endpoint, e.g.
+      `billing: HTTP 200`;
+    - a service that doesn't answer within **2 seconds** is a **tool
+      error** (the call returns in under 3 s), and an unreachable one too.
+  hints:
+    - "`time mcp-call call check_url '{\"url\": \"http://127.0.0.1:9911/health\"}'`: press Ctrl-C after a while."
+    - "A dict from name to URL, `name: Literal[\"inventory\", \"billing\"]`."
+    - "`urllib.request.urlopen(url, timeout=2)` and `except (TimeoutError, OSError)` -> `ToolError`."
+  solution: |
+    ```python
+    TARGETS = {"inventory": "http://127.0.0.1:9911/health", "billing": "http://127.0.0.1:9912/health"}
+
+    @mcp.tool()
+    def check_service(name: Literal["inventory", "billing"]) -> str:
+        """Check a backend's health endpoint. Answers within about 2 seconds."""
+        try:
+            with urllib.request.urlopen(TARGETS[name], timeout=2) as resp:
+                return f"{name}: HTTP {resp.status}"
+        except urllib.error.HTTPError as e:
+            return f"{name}: HTTP {e.code}"
+        except (TimeoutError, OSError) as e:
+            raise ToolError(f"{name}: no answer within 2 seconds ({e.__class__.__name__})")
+    ```
+  setup: |
+    mcp_start
+    cat >"$KL_STATE/backends.py" <<'PY'
+    import http.server, sys, threading, time
+    class Slow(http.server.BaseHTTPRequestHandler):
+        def do_GET(self):
+            time.sleep(120)
+        def log_message(self, *a):
+            pass
+    class Fast(http.server.BaseHTTPRequestHandler):
+        def do_GET(self):
+            self.send_response(200 if self.path == "/health" else 404)
+            self.end_headers()
+            self.wfile.write(b"internal admin page: SECRET-ADMIN-PAGE\n" if self.path == "/admin" else b"ok\n")
+        def log_message(self, *a):
+            pass
+    for port, h in [(9911, Slow), (9912, Fast)]:
+        s = http.server.ThreadingHTTPServer(("127.0.0.1", port), h)
+        threading.Thread(target=s.serve_forever, daemon=True).start()
+    while True:
+        time.sleep(3600)
+    PY
+    setsid nohup python3 "$KL_STATE/backends.py" kl-backends >/dev/null 2>&1 &
+    on_reset 'pkill -f "backends.py kl-backends"'
+    port_wait 9912 10
+    lab_file /lab/server.py <<'EOF'
+    import urllib.request
+
+    from mcp.server.mcpserver import MCPServer
+
+    mcp = MCPServer("health")
+
+
+    @mcp.tool()
+    def check_url(url: str) -> str:
+        """Fetch a URL and return its HTTP status (for the backends' /health endpoints)."""
+        with urllib.request.urlopen(url) as resp:
+            return f"{url}: HTTP {resp.status}"
+
+
+    if __name__ == "__main__":
+        mcp.run()
+    EOF
+  check: |
+    mcp_test <<'PY'
+    async def test(s):
+        t = tools(await s.list_tools())
+        r = {"tools": t}
+        r["billing"] = await call(s, "check_service", {"name": "billing"})
+        r["inventory"] = await call(s, "check_service", {"name": "inventory"}, timeout=20)
+        r["other"] = await call(s, "check_service", {"name": "http://127.0.0.1:9912/admin"})
+        r["leaks"] = []
+        for name, info in t.items():
+            for arg in (info["schema"].get("properties") or {}):
+                r["leaks"].append(await call(s, name, {arg: "http://127.0.0.1:9912/admin"}, timeout=10))
+        return r
+    PY
+    rc=$?
+    info "check_service(inventory) took $(jq -r .inventory.seconds "$MCP_OUT" 2>/dev/null)s"
+    check "the server starts and answers MCP" '[ "$rc" -eq 0 ]'
+    check "check_url is gone and no tool takes a URL" 'mj "(.tools | has(\"check_url\") | not) and ([.tools[].schema.properties // {} | keys[]] | map(ascii_downcase | test(\"url|host|address|endpoint\")) | any | not)"'
+    check "name is inventory or billing" 'mj ".tools.check_service.schema.properties.name | tostring | (contains(\"inventory\") and contains(\"billing\") and contains(\"enum\"))"'
+    check "billing answers with its HTTP status" 'mj "(.billing.error | not) and (.billing.text | test(\"200\"))"'
+    check "the hung inventory is a tool error" 'mj ".inventory.error and (.inventory.text | test(\"CLIENT TIMEOUT\") | not)"'
+    check "it gives up in under 3 seconds" 'mj ".inventory.seconds < 3"'
+    check "an address instead of a name is refused" 'mj ".other.error"'
+    check "the internal admin page can't be fetched" '! grep -q "SECRET-ADMIN-PAGE" "$MCP_OUT"'
+  solve: |
+    cat > /lab/server.py <<'PY'
+    import urllib.error
+    import urllib.request
+    from typing import Literal
+
+    from mcp.server.mcpserver import MCPServer
+    from mcp.server.mcpserver.exceptions import ToolError
+
+    mcp = MCPServer("health")
+    TARGETS = {"inventory": "http://127.0.0.1:9911/health", "billing": "http://127.0.0.1:9912/health"}
+
+
+    @mcp.tool()
+    def check_service(name: Literal["inventory", "billing"]) -> str:
+        """Check a backend's health endpoint (inventory or billing). Answers within about 2 seconds."""
+        try:
+            with urllib.request.urlopen(TARGETS[name], timeout=2) as resp:
+                return f"{name}: HTTP {resp.status}"
+        except urllib.error.HTTPError as e:
+            return f"{name}: HTTP {e.code}"
+        except (TimeoutError, OSError) as e:
+            raise ToolError(f"{name}: no answer within 2 seconds ({e.__class__.__name__})")
+
+
+    if __name__ == "__main__":
+        mcp.run()
+    PY
+
+- id: prog-130
+  title: An MCP server over HTTP, with a token
+  difficulty: 4
+  kind: build
+  tags: [mcp, python, http, streamable-http, authentication, docker]
+  tutorial: |
+    **What you're learning.** Serving MCP over the network with the streamable HTTP transport, and refusing clients without a token.
+
+    ### The idea
+
+    Over **stdio**, the host starts the server and only it can talk to it. A shared team server runs over **HTTP** instead (MCP's *streamable HTTP* transport: JSON-RPC in `POST /mcp`, with server-sent events for streaming). That makes it a network service like any other: it needs **authentication**, should listen only where it must, and keeps its secrets in the environment.
+
+    The SDK gives you an ASGI app; wrap it in a small middleware that checks a bearer token before anything reaches MCP:
+
+    ```python
+    import hmac, os, uvicorn
+
+    TOKEN = os.environ["REPORTS_TOKEN"]          # from the environment, not the code
+
+    class RequireToken:
+        def __init__(self, app):
+            self.app = app
+        async def __call__(self, scope, receive, send):
+            if scope["type"] == "http":
+                got = dict(scope["headers"]).get(b"authorization", b"").decode()
+                if not hmac.compare_digest(got, f"Bearer {TOKEN}"):
+                    await send({"type": "http.response.start", "status": 401, "headers": [(b"content-type", b"text/plain")]})
+                    await send({"type": "http.response.body", "body": b"unauthorized"})
+                    return
+            await self.app(scope, receive, send)
+
+    app = RequireToken(mcp.streamable_http_app())
+    uvicorn.run(app, host="127.0.0.1", port=9300)
+    ```
+
+    `hmac.compare_digest` compares in constant time, so the token can't be guessed byte by byte from response timings. Production servers use OAuth (the MCP spec defines it); a static token is the minimum.
+
+    ### Commands you'll use
+
+    ```bash
+    docker run -d --name reports --network host --env-file /lab/reports.env -u "$(id -u)" \
+      -v /lab:/lab -w /lab kl-mcp:1 python http_server.py
+    mcp-call --url http://127.0.0.1:9300/mcp --token "$TOKEN" list
+    curl -s -o /dev/null -w '%{http_code}\n' -X POST http://127.0.0.1:9300/mcp     # 401
+    ss -ltnp | grep 9300                                                          # 127.0.0.1 only
+    ```
+
+    ### Common mistakes
+
+    - Binding to `0.0.0.0` "to be safe": everyone on the network can reach it.
+    - The token in the code, a compose file or the command line (visible in `ps` and `docker inspect`): use an env file.
+    - Checking the token with `==`: works, but leaks timing.
+
+    ### Check your work
+
+    With the token, `mcp-call --url ... list` shows the tools; without one, or with a wrong one, every request gets 401; the port listens on 127.0.0.1 only.
+  scenario: |
+    The team wants one shared copy of the status server
+    **`/lab/server.py`** instead of everyone running it over stdio. The
+    token clients must send is in **`/lab/mcp.env`** (`MCP_TOKEN=...`).
+
+    1. Write **`/lab/http_server.py`**: the same server (import it or copy
+       it) over **streamable HTTP** on **`127.0.0.1:8765`**, path
+       **`/mcp`**, refusing with **401** every request without
+       `Authorization: Bearer <MCP_TOKEN>`. Read the token from the
+       environment: it must not appear in any file but `mcp.env`.
+    2. Run it as container **`mcp-ops`** from **`kl-mcp:1`**, with the
+       token from `mcp.env`.
+  hints:
+    - "`from server import mcp` gives you the existing server; `mcp.streamable_http_app()` is the ASGI app."
+    - "Wrap it in the middleware from the tutorial and `uvicorn.run(app, host=\"127.0.0.1\", port=8765)`."
+    - "`docker run -d --name mcp-ops --network host --env-file /lab/mcp.env -v /lab:/lab -w /lab kl-mcp:1 python http_server.py`."
+  solution: |
+    ```python
+    import hmac
+    import os
+
+    import uvicorn
+
+    from server import mcp
+
+    TOKEN = os.environ["MCP_TOKEN"]
+
+
+    class RequireToken:
+        def __init__(self, app):
+            self.app = app
+
+        async def __call__(self, scope, receive, send):
+            if scope["type"] == "http":
+                got = dict(scope["headers"]).get(b"authorization", b"").decode()
+                if not hmac.compare_digest(got, f"Bearer {TOKEN}"):
+                    await send({"type": "http.response.start", "status": 401, "headers": [(b"content-type", b"text/plain")]})
+                    await send({"type": "http.response.body", "body": b"unauthorized"})
+                    return
+            await self.app(scope, receive, send)
+
+
+    if __name__ == "__main__":
+        uvicorn.run(RequireToken(mcp.streamable_http_app()), host="127.0.0.1", port=8765)
+    ```
+
+    ```bash
+    docker run -d --name mcp-ops --network host --env-file /lab/mcp.env -v /lab:/lab -w /lab kl-mcp:1 python http_server.py
+    ```
+  setup: |
+    mcp_start
+    tok="mcp_$(openssl rand -hex 20)"
+    echo "$tok" >"$KL_STATE/token"
+    lab_file /lab/mcp.env <<EOF
+    MCP_TOKEN=$tok
+    EOF
+    printf '{"api": "up", "db": "degraded"}\n' >/lab/services.json
+    chown "$(lab_user)": /lab/services.json
+    lab_file /lab/server.py <<'EOF'
+    import json
+
+    from mcp.server.mcpserver import MCPServer
+    from mcp.server.mcpserver.exceptions import ToolError
+
+    mcp = MCPServer("ops")
+
+
+    @mcp.tool()
+    def service_status(name: str) -> str:
+        """Current health of one service: up, degraded or down."""
+        with open("/lab/services.json") as f:
+            services = json.load(f)
+        if name not in services:
+            raise ToolError(f"unknown service {name!r}")
+        return services[name]
+
+
+    if __name__ == "__main__":
+        mcp.run()
+    EOF
+  check: |
+    tok=$(cat "$KL_STATE/token")
+    check "container mcp-ops runs kl-mcp:1" 'c_running mcp-ops && [ "$(c_get mcp-ops "{{.Config.Image}}")" = kl-mcp:1 ]'
+    check "port 8765 listens on 127.0.0.1 only" 'eventually 20 "ss -ltnH \"sport = :8765\" | grep -q 127.0.0.1:8765" && ! ss -ltnH "sport = :8765" | grep -qvE "127\.0\.0\.1:8765"'
+    check "the token appears in no file but mcp.env" '! grep -rqF --exclude=mcp.env "$tok" /lab'
+    code() { curl -s -o /dev/null -m 5 -w '%{http_code}' -X POST http://127.0.0.1:8765/mcp -H 'Content-Type: application/json' -H 'Accept: application/json, text/event-stream' "$@" -d '{"jsonrpc": "2.0", "id": 1, "method": "tools/list"}'; }
+    check "a request without a token gets 401" '[ "$(code)" = 401 ]'
+    check "a wrong token gets 401" '[ "$(code -H "Authorization: Bearer nope")" = 401 ] && [ "$(code -H "Authorization: Bearer ${tok}x")" = 401 ]'
+    MCP_URL=http://127.0.0.1:8765/mcp MCP_TOKEN=$tok mcp_test <<'PY'
+    async def test(s):
+        return {"name": INIT.server_info.name, "tools": list(tools(await s.list_tools())), "db": await call(s, "service_status", {"name": "db"})}
+    PY
+    rc=$?
+    check "with the token, an MCP client lists the tools and calls them" '[ "$rc" -eq 0 ] && mj "(.tools | index(\"service_status\")) and .db.text == \"degraded\""'
+  solve: |
+    cat > /lab/http_server.py <<'PY'
+    import hmac
+    import os
+
+    import uvicorn
+
+    from server import mcp
+
+    TOKEN = os.environ["MCP_TOKEN"]
+
+
+    class RequireToken:
+        def __init__(self, app):
+            self.app = app
+
+        async def __call__(self, scope, receive, send):
+            if scope["type"] == "http":
+                got = dict(scope["headers"]).get(b"authorization", b"").decode()
+                if not hmac.compare_digest(got, f"Bearer {TOKEN}"):
+                    await send({"type": "http.response.start", "status": 401, "headers": [(b"content-type", b"text/plain")]})
+                    await send({"type": "http.response.body", "body": b"unauthorized"})
+                    return
+            await self.app(scope, receive, send)
+
+
+    if __name__ == "__main__":
+        uvicorn.run(RequireToken(mcp.streamable_http_app()), host="127.0.0.1", port=8765)
+    PY
+    docker run -d --name mcp-ops --network host --env-file /lab/mcp.env -u "$(id -u):$(id -g)" -e HOME=/tmp \
+      -v /lab:/lab -w /lab kl-mcp:1 python http_server.py
+    for i in $(seq 30); do ss -ltn | grep -q 127.0.0.1:8765 && break; sleep 1; done
+
+# ===== Capstone =====
+
+- id: prog-131
+  title: "Capstone: an ops MCP server you'd let an agent use"
+  difficulty: 5
+  kind: build
+  tags: [mcp, python, capstone, security, allow-list, audit-log]
+  tutorial: |
+    **What you're learning.** Building a complete, defensible MCP server: every tool typed, confined and audited, with nothing secret in reach.
+
+    ### Method
+
+    Treat every argument as written by an attacker and every result as read by one. One requirement at a time, each from an earlier lab:
+
+    | Requirement | Lab |
+    |---|---|
+    | exact schemas: integers with bounds, enums, optional with defaults | prog-123 |
+    | files only inside one folder, symlinks resolved, size cap | prog-125 |
+    | named, parameterised, read-only queries | prog-126 |
+    | nothing secret in results or descriptions | prog-127 |
+    | an audit line for every call | prog-128 |
+    | allow-lists instead of free-form targets; timeouts | prog-129 |
+
+    ### Risky actions
+
+    A tool that **changes** something deserves more than an allow-list: an explicit `confirm: bool = False` argument that must be `true` turns a single confused call into a refused one, and gives the host a chance to ask the human first. MCP's tool **annotations** (`destructiveHint`, `readOnlyHint`) tell hosts which tools need that treatment:
+
+    ```python
+    from mcp.types import ToolAnnotations
+
+    @mcp.tool(annotations=ToolAnnotations(destructiveHint=True))
+    def rollback(service: Literal["api", "web"], confirm: bool = False) -> str: ...
+    ```
+
+    ### Check your work
+
+    Write your own hostile client calls with `mcp-call` for each row above before running the check: traversal paths, SQL in parameters, unknown services, `confirm` missing, a secret search through every result.
+  scenario: |
+    Build **`/lab/server.py`**, the MCP server (stdio) named **`ops`** the
+    on-call agent will use. The data is in `/lab/ops`; the full
+    specification is in **`/lab/ops/SPEC.md`**. In short:
+
+    - **`service_status(name)`**: the status from `services.json`; unknown
+      names are tool errors.
+    - **`run_report(name, service, limit)`**: the reports
+      `open_incidents`, `incidents_for_service` and `recent_deploys` from
+      `ops.db`, read-only, `limit` 1-50 (default 10), returning
+      `{"rows": [...]}`, newest first.
+    - **`read_runbook(path)`**: a file inside `/lab/ops/runbooks` only
+      (after following symlinks), at most 32 KiB.
+    - **`restart_service(name, confirm)`**: only `api` and `worker`, and
+      only with `confirm` true; appends `<UTC ISO time> <name>` to
+      `/lab/ops/restarts.log`; marked destructive.
+    - Every call of every tool goes to **`/lab/ops/audit.jsonl`** as in
+      prog-128. **`/lab/ops/settings.json`** holds a pager token: it must
+      never appear in a result.
+  hints:
+    - "Build and test one tool at a time with `mcp-call`, then add the audit decorator to all four."
+    - "`restart_service(name: Literal[\"api\", \"worker\"], confirm: bool = False)` with `ToolAnnotations(destructiveHint=True)`."
+    - "None of the tools needs settings.json at all: the safest secret is one the server never reads."
+  solution: |
+    Combine the solutions of prog-123, prog-125, prog-126 and prog-128:
+    an `audited` decorator under `@mcp.tool()` on four tools; `Literal`
+    names for reports and restartable services; `Path.resolve()` plus
+    `is_relative_to` for runbooks; a `mode=ro` SQLite connection with `?`
+    parameters; `confirm` checked before anything is written; and
+    settings.json never opened.
+  setup: |
+    mcp_start
+    mkdir -p /lab/ops/runbooks /lab/ops/private
+    tok="pager_$(openssl rand -hex 18)"
+    echo "$tok" >"$KL_STATE/token"
+    printf '{"pager_token": "%s", "escalation": "team-sre"}\n' "$tok" >/lab/ops/settings.json
+    printf 'pager token backup: %s\n' "$tok" >/lab/ops/private/token.txt
+    ln -s /lab/ops/private /lab/ops/runbooks/old
+    python3 - <<'PY'
+    import json, random, sqlite3
+    json.dump({s: random.choice(["up", "degraded", "down"]) for s in ["api", "worker", "db", "queue"]}, open("/lab/ops/services.json", "w"))
+    c = sqlite3.connect("/lab/ops/ops.db")
+    c.execute("CREATE TABLE incidents (id INTEGER PRIMARY KEY, service TEXT, title TEXT, status TEXT)")
+    c.execute("CREATE TABLE deploys (id INTEGER PRIMARY KEY, service TEXT, version TEXT, who TEXT)")
+    for i in range(1, 51):
+        s = random.choice(["api", "worker", "db", "queue"])
+        c.execute("INSERT INTO incidents (service, title, status) VALUES (?, ?, ?)", (s, f"{s} incident {i}", random.choice(["open", "closed"])))
+    for i in range(1, 31):
+        c.execute("INSERT INTO deploys (service, version, who) VALUES (?, ?, ?)", (random.choice(["api", "worker"]), f"v2.{i}", random.choice(["ana", "bo"])))
+    c.commit()
+    for n in ["db-failover", "worker-backlog"]:
+        open(f"/lab/ops/runbooks/{n}.md", "w").write(f"# {n}\n\nStep 1: check {random.randint(1, 999)}.\n")
+    open("/lab/ops/runbooks/huge.md", "w").write("x" * 40000)
+    PY
+    cat >/lab/ops/SPEC.md <<'EOF'
+    # ops MCP server (stdio), name "ops", file /lab/server.py
+
+    | Tool | Arguments | Behaviour |
+    |---|---|---|
+    | service_status | name: string | status from /lab/ops/services.json, read per call; unknown name -> tool error |
+    | run_report | name: one of open_incidents, incidents_for_service, recent_deploys; service: string (only for incidents_for_service); limit: integer 1-50, default 10 | {"rows": [...]} from /lab/ops/ops.db, opened read-only, values as parameters, ORDER BY id DESC. open_incidents = status 'open' |
+    | read_runbook | path: string | text of a file inside /lab/ops/runbooks after resolving symlinks and ..; > 32 KiB, outside, missing -> tool error |
+    | restart_service | name: one of api, worker; confirm: boolean, default false | without confirm: tool error, nothing written; with confirm: append "<UTC ISO 8601> <name>" to /lab/ops/restarts.log, return a message; annotated destructiveHint |
+
+    Every call of every tool that reaches your code: one JSON line in /lab/ops/audit.jsonl
+    (calls the schema itself refuses never do, and needn't be logged):
+    {"ts": UTC ISO 8601, "tool": ..., "args": {...}, "ok": bool, "error": message or null}
+
+    /lab/ops/settings.json holds the pager token. It must never appear in any result or description.
+    No tool accepts SQL or a URL.
+    EOF
+    chown -R "$(lab_user)": /lab/ops
+    sha256sum /lab/ops/ops.db >"$KL_STATE/db.sum"
+  check: |
+    tok=$(cat "$KL_STATE/token")
+    before=$(grep -c . /lab/ops/audit.jsonl 2>/dev/null); before=${before:-0}
+    rbefore=$(grep -c . /lab/ops/restarts.log 2>/dev/null); rbefore=${rbefore:-0}
+    mcp_test <<'PY'
+    import json, sqlite3
+    async def test(s):
+        listing = await s.list_tools()
+        t = tools(listing)
+        ann = {x.name: (x.annotations.destructive_hint if x.annotations else None) for x in listing.tools}
+        c = sqlite3.connect("file:/lab/ops/ops.db?mode=ro", uri=True); c.row_factory = sqlite3.Row
+        q = lambda sql, p=(): [dict(r) for r in c.execute(sql, p)]
+        svc = json.load(open("/lab/ops/services.json"))
+        calls = []
+        async def C(tool, args, audited=True):
+            r = await call(s, tool, args)
+            if audited:
+                calls.append([tool, args, not r["error"]])
+            return r
+        rows = lambda r: None if r["error"] else json.loads(r["text"]).get("rows")
+        r = {"name": INIT.server_info.name, "tools": t, "ann": ann}
+        r["status_ok"] = (await C("service_status", {"name": "worker"}))["text"] == svc["worker"]
+        r["status_bad"] = (await C("service_status", {"name": "payroll"}))["error"]
+        r["open_ok"] = rows(await C("run_report", {"name": "open_incidents"})) == q("SELECT * FROM incidents WHERE status = 'open' ORDER BY id DESC LIMIT 10")
+        r["svc_ok"] = rows(await C("run_report", {"name": "incidents_for_service", "service": "db", "limit": 50})) == q("SELECT * FROM incidents WHERE service = 'db' ORDER BY id DESC LIMIT 50")
+        inj = await C("run_report", {"name": "incidents_for_service", "service": "db' OR '1'='1", "limit": 50})
+        r["inj_ok"] = inj["error"] or rows(inj) == []
+        r["limit_bad"] = (await C("run_report", {"name": "recent_deploys", "limit": 51}, False))["error"]
+        r["rb_ok"] = (await C("read_runbook", {"path": "db-failover.md"}))["text"] == open("/lab/ops/runbooks/db-failover.md").read()
+        r["rb_bad"] = all([(await C("read_runbook", {"path": p}))["error"] for p in ["old/token.txt", "../settings.json", "/lab/ops/settings.json", "huge.md", "nope.md"]])
+        r["restart_noconfirm"] = (await C("restart_service", {"name": "api"}))["error"]
+        r["restart_db"] = (await C("restart_service", {"name": "db", "confirm": True}, False))["error"]
+        r["restart_ok"] = not (await C("restart_service", {"name": "worker", "confirm": True}))["error"]
+        r["calls"] = calls
+        return r
+    PY
+    rc=$?
+    check "the server starts and answers MCP, named ops" '[ "$rc" -eq 0 ] && mj ".name == \"ops\""'
+    check "it has exactly the four tools" 'mj ".tools | keys == [\"read_runbook\", \"restart_service\", \"run_report\", \"service_status\"]"'
+    check "service_status reads the file; unknown names are errors" 'mj ".status_ok and .status_bad"'
+    check "run_report returns the right rows, newest first" 'mj ".open_ok and .svc_ok"'
+    check "run_report: SQL in a parameter gets nothing, limit 51 is refused" 'mj ".inj_ok and .limit_bad"'
+    check "run_report: name is an enum, limit 1-50 default 10" 'mj ".tools.run_report.schema.properties | (.name | tostring | contains(\"enum\")) and .limit.minimum == 1 and .limit.maximum == 50 and .limit.default == 10"'
+    check "read_runbook reads runbooks and refuses escapes, big and missing files" 'mj ".rb_ok and .rb_bad"'
+    check "restart_service needs confirm and only takes api or worker" 'mj ".restart_noconfirm and .restart_db and .restart_ok"'
+    check "restart_service is annotated destructive" 'mj ".ann.restart_service == true"'
+    after=$(grep -c . /lab/ops/restarts.log 2>/dev/null); new=$(( ${after:-0} - rbefore ))
+    check "exactly one restart was written, for worker, with a UTC time" '[ "$new" -eq 1 ] && tail -1 /lab/ops/restarts.log | grep -qE "^[0-9]{4}-[0-9]{2}-[0-9]{2}T[0-9:.]+(Z|\+00:00) worker$"'
+    tail -n +"$((before + 1))" /lab/ops/audit.jsonl 2>/dev/null >"$KL_STATE/new.jsonl"
+    check "every call is in audit.jsonl, with tool, args and outcome" 'jq -s --slurpfile r "$MCP_OUT" -e "(map([.tool, .ok]) == (\$r[0].calls | map([.[0], .[2]]))) and ([., \$r[0].calls] | transpose | all(.[]; .[0].args as \$a | .[1][1] as \$g | \$a | contains(\$g)))" "$KL_STATE/new.jsonl" >/dev/null'
+    check "the pager token appears in no result or description" '! grep -qF "$tok" "$MCP_OUT"'
+    check "ops.db is unchanged" 'sha256sum -c --quiet "$KL_STATE/db.sum"'
+  solve: |
+    cat > /lab/server.py <<'PY'
+    import functools
+    import json
+    import sqlite3
+    from datetime import datetime, timezone
+    from pathlib import Path
+    from typing import Annotated, Literal
+
+    from pydantic import Field
+    from mcp.server.mcpserver import MCPServer
+    from mcp.server.mcpserver.exceptions import ToolError
+    from mcp.types import ToolAnnotations
+
+    OPS = Path("/lab/ops")
+    RUNBOOKS = (OPS / "runbooks").resolve()
+    mcp = MCPServer("ops")
+
+    REPORTS = {
+        "open_incidents": ("SELECT * FROM incidents WHERE status = 'open' ORDER BY id DESC LIMIT ?", False),
+        "incidents_for_service": ("SELECT * FROM incidents WHERE service = ? ORDER BY id DESC LIMIT ?", True),
+        "recent_deploys": ("SELECT * FROM deploys ORDER BY id DESC LIMIT ?", False),
+    }
+
+
+    def now():
+        return datetime.now(timezone.utc).isoformat()
+
+
+    def audited(fn):
+        @functools.wraps(fn)
+        def wrapper(**kwargs):
+            entry = {"ts": now(), "tool": fn.__name__, "args": kwargs}
+            try:
+                result = fn(**kwargs)
+                entry.update(ok=True, error=None)
+                return result
+            except Exception as e:
+                entry.update(ok=False, error=str(e))
+                raise
+            finally:
+                with open(OPS / "audit.jsonl", "a") as f:
+                    f.write(json.dumps(entry) + "\n")
+        return wrapper
+
+
+    @mcp.tool()
+    @audited
+    def service_status(name: str) -> str:
+        """Current health of one service: up, degraded or down."""
+        services = json.loads((OPS / "services.json").read_text())
+        if name not in services:
+            raise ToolError(f"unknown service {name!r}")
+        return services[name]
+
+
+    @mcp.tool()
+    @audited
+    def run_report(name: Literal["open_incidents", "incidents_for_service", "recent_deploys"],
+                   service: str | None = None,
+                   limit: Annotated[int, Field(ge=1, le=50)] = 10) -> dict:
+        """Run a fixed incident report. incidents_for_service needs a service."""
+        sql, needs_service = REPORTS[name]
+        if needs_service and not service:
+            raise ToolError(f"{name} needs a service")
+        conn = sqlite3.connect("file:/lab/ops/ops.db?mode=ro", uri=True)
+        conn.row_factory = sqlite3.Row
+        try:
+            return {"rows": [dict(r) for r in conn.execute(sql, (service, limit) if needs_service else (limit,))]}
+        finally:
+            conn.close()
+
+
+    @mcp.tool()
+    @audited
+    def read_runbook(path: str) -> str:
+        """Read a runbook by its path inside the runbooks folder, e.g. db-failover.md."""
+        target = (RUNBOOKS / path).resolve()
+        if not target.is_relative_to(RUNBOOKS):
+            raise ToolError("that path is outside the runbooks folder")
+        if not target.is_file():
+            raise ToolError(f"no runbook {path!r}")
+        if target.stat().st_size > 32 * 1024:
+            raise ToolError("runbook is larger than 32 KiB")
+        return target.read_text(errors="replace")
+
+
+    @mcp.tool(annotations=ToolAnnotations(destructiveHint=True))
+    @audited
+    def restart_service(name: Literal["api", "worker"], confirm: bool = False) -> str:
+        """Restart api or worker. Needs confirm=true."""
+        if not confirm:
+            raise ToolError("restarting needs confirm=true")
+        with open(OPS / "restarts.log", "a") as f:
+            f.write(f"{now()} {name}\n")
+        return f"restart of {name} requested"
+
+
+    if __name__ == "__main__":
+        mcp.run()
+    PY

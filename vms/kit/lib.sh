@@ -934,6 +934,197 @@ gw_chat() {
 # env_get FILE NAME -> the value of NAME in a .env file (quotes stripped)
 env_get() { sed -n "s/^[[:space:]]*$2[[:space:]]*=[[:space:]]*//p" "$1" 2>/dev/null | tail -1 | sed -e 's/^"\(.*\)"$/\1/' -e "s/^'\(.*\)'$/\1/"; }
 
+# ---------- MCP helpers (programming: MCP tool servers; image kl-mcp:1 = python:3.12-slim + mcp 2.3.0) ----------
+MCP_IMAGE=kl-mcp:1
+
+# mcp_start -> `mcpy` (python in kl-mcp:1, the mcp SDK installed) and `mcp-call` (a small client:
+# list / call TOOL JSON / resources / read URI) for the lab user; both run as the caller with
+# /lab mounted and the host's network, from the current folder
+mcp_start() {
+  cat >/usr/local/bin/mcpy <<'WRAP'
+#!/bin/bash
+# Lab Python with the MCP SDK (mcp 2.3.0): runs in kl-mcp:1, sees /lab and the VM's network.
+wd=$PWD
+case "$wd/" in /lab/*) ;; *) wd=/lab ;; esac
+envs=()
+while IFS= read -r v; do envs+=(-e "$v"); done < <(compgen -e | grep -E '^MCP_')
+tty=()
+[ -t 0 ] && [ -t 1 ] && tty=(-t)
+exec docker run --rm -i "${tty[@]}" --network host -u "$(id -u):$(id -g)" -e HOME=/tmp "${envs[@]}" \
+  -v /lab:/lab -w "$wd" kl-mcp:1 python "$@"
+WRAP
+  chmod 755 /usr/local/bin/mcpy
+  on_reset 'rm -f /usr/local/bin/mcpy'
+  mkdir -p /usr/local/share/kl-mcp
+  cat >/usr/local/share/kl-mcp/mcp_call.py <<'PYCALL'
+"""mcp-call: a small MCP client for trying a server by hand.
+
+  mcp-call list                     tools, with their input schemas
+  mcp-call call TOOL '{"a": 1}'     call a tool with JSON arguments
+  mcp-call resources                resources and resource templates
+  mcp-call read URI                 read a resource
+Server: stdio, started with $MCP_CMD (default "python server.py" in the current folder);
+or HTTP with --url URL [--token TOKEN].
+"""
+import anyio, argparse, json, os, shlex, sys
+from mcp.client.session import ClientSession
+from mcp.client.stdio import StdioServerParameters, stdio_client
+from mcp.client.streamable_http import create_mcp_http_client, streamable_http_client
+
+ap = argparse.ArgumentParser(prog="mcp-call", description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
+ap.add_argument("--url")
+ap.add_argument("--token", default=os.environ.get("MCP_TOKEN"))
+ap.add_argument("what", choices=["list", "call", "resources", "read"])
+ap.add_argument("rest", nargs="*")
+a = ap.parse_args()
+
+async def run(s):
+    init = await s.initialize()
+    if a.what == "list":
+        print(f"server: {init.server_info.name}")
+        for t in (await s.list_tools()).tools:
+            print(f"\n{t.name}: {t.description or ''}\n  input: {json.dumps(t.input_schema)}")
+    elif a.what == "call":
+        res = await s.call_tool(a.rest[0], json.loads(a.rest[1]) if len(a.rest) > 1 else {})
+        print("ERROR" if res.is_error else "OK")
+        for c in res.content:
+            print(getattr(c, "text", c))
+    elif a.what == "resources":
+        for r in (await s.list_resources()).resources:
+            print("resource", r.uri, "-", r.description or r.name)
+        for t in (await s.list_resource_templates()).resource_templates:
+            print("template", t.uri_template, "-", t.description or t.name)
+    else:
+        for c in (await s.read_resource(a.rest[0])).contents:
+            print(getattr(c, "text", c))
+
+async def main():
+    if a.url:
+        headers = {"Authorization": f"Bearer {a.token}"} if a.token else {}
+        async with create_mcp_http_client(headers=headers) as http:
+            async with streamable_http_client(a.url, http_client=http) as st:
+                async with ClientSession(st[0], st[1]) as s:
+                    await run(s)
+    else:
+        cmd = shlex.split(os.environ.get("MCP_CMD") or "python server.py")
+        async with stdio_client(StdioServerParameters(command=cmd[0], args=cmd[1:], env=dict(os.environ))) as (r, w):
+            async with ClientSession(r, w) as s:
+                await run(s)
+
+try:
+    anyio.run(main)
+except Exception as e:
+    print(f"mcp-call: {type(e).__name__}: {e}", file=sys.stderr)
+    sys.exit(1)
+PYCALL
+  cat >/usr/local/bin/mcp-call <<'WRAP'
+#!/bin/bash
+# mcp-call: try an MCP server by hand (see mcp-call -h); runs in kl-mcp:1 like mcpy
+wd=$PWD
+case "$wd/" in /lab/*) ;; *) wd=/lab ;; esac
+envs=()
+while IFS= read -r v; do envs+=(-e "$v"); done < <(compgen -e | grep -E '^MCP_')
+exec docker run --rm -i --network host -u "$(id -u):$(id -g)" -e HOME=/tmp "${envs[@]}" \
+  -v /lab:/lab -v /usr/local/share/kl-mcp:/kl-mcp:ro -w "$wd" kl-mcp:1 python /kl-mcp/mcp_call.py "$@"
+WRAP
+  chmod 755 /usr/local/bin/mcp-call
+  on_reset 'rm -rf /usr/local/bin/mcp-call /usr/local/share/kl-mcp'
+}
+
+# mcp_test <<'PY' ... PY -> run hidden client code against the learner's MCP server and print
+# the JSON it returns (also left in $MCP_OUT, a file). The code defines `async def test(s)`,
+# s being an initialised ClientSession, and returns something JSON-serialisable. The server
+# is started over stdio with MCP_CMD (default "python /lab/server.py", run in kl-mcp:1 with
+# /lab mounted, as the lab user, from /lab); with MCP_URL set, the client connects there over
+# streamable HTTP instead, sending MCP_TOKEN as a bearer token when set. In the code:
+#   await call(s, tool, args) -> {"error": bool, "text": str, "structured": ..., "seconds": float}
+#   tools(listing) -> {name: {"description": ..., "schema": ...}}
+#   INIT -> the initialize result (INIT.server_info.name)
+mcp_test() {
+  local d rc
+  d=$(mktemp -d)
+  chmod 755 "$d"
+  cat >"$d/test.py"
+  cat >"$d/run.py" <<'PYRUN'
+import anyio, json, os, shlex, sys, time, traceback
+from mcp.client.session import ClientSession
+from mcp.client.stdio import StdioServerParameters, stdio_client
+from mcp.client.streamable_http import create_mcp_http_client, streamable_http_client
+
+INIT = None
+
+def text_of(res):
+    return "\n".join(getattr(c, "text", "") or "" for c in (getattr(res, "content", None) or []))
+
+async def call(s, tool, args=None, timeout=60):
+    t0 = time.monotonic()
+    try:
+        with anyio.fail_after(timeout):
+            res = await s.call_tool(tool, args or {})
+        return {"error": bool(getattr(res, "is_error", False)), "text": text_of(res),
+                "structured": getattr(res, "structured_content", None), "seconds": round(time.monotonic() - t0, 2)}
+    except TimeoutError:
+        return {"error": True, "text": "CLIENT TIMEOUT", "structured": None, "seconds": round(time.monotonic() - t0, 2)}
+    except Exception as e:
+        return {"error": True, "text": f"EXCEPTION {type(e).__name__}: {e}", "structured": None, "seconds": round(time.monotonic() - t0, 2)}
+
+def tools(listing):
+    return {t.name: {"description": t.description or "", "schema": t.input_schema} for t in listing.tools}
+
+exec(open(sys.argv[1]).read())
+
+async def session(run):
+    global INIT
+    url = os.environ.get("MCP_URL")
+    if url:
+        headers = {"Authorization": f"Bearer {os.environ['MCP_TOKEN']}"} if os.environ.get("MCP_TOKEN") else {}
+        async with create_mcp_http_client(headers=headers) as http:
+            async with streamable_http_client(url, http_client=http) as streams:
+                async with ClientSession(streams[0], streams[1]) as s:
+                    INIT = await s.initialize()
+                    return await run(s)
+    cmd = shlex.split(os.environ.get("MCP_CMD") or "python /lab/server.py")
+    params = StdioServerParameters(command=cmd[0], args=cmd[1:], cwd="/lab", env={**os.environ, "PYTHONDONTWRITEBYTECODE": "1"})
+    async with stdio_client(params, errlog=open("/tmp/server-stderr.log", "w")) as (r, w):
+        async with ClientSession(r, w) as s:
+            INIT = await s.initialize()
+            return await run(s)
+
+async def main():
+    with anyio.fail_after(float(os.environ.get("MCP_TEST_TIMEOUT", "150"))):
+        return await session(test)
+
+try:
+    out = anyio.run(main)
+except BaseException:
+    traceback.print_exc()
+    try:
+        print(open("/tmp/server-stderr.log").read()[-1500:], file=sys.stderr)
+    except OSError:
+        pass
+    sys.exit(3)
+print("MCP-RESULT " + json.dumps(out))
+PYRUN
+  local uid
+  uid=$(id -u "$(lab_user)")
+  # shellcheck disable=SC2086
+  timeout 200 docker run --rm -i --network host -u "$uid:$uid" -e HOME=/tmp \
+    -e MCP_CMD="${MCP_CMD:-}" -e MCP_URL="${MCP_URL:-}" -e MCP_TOKEN="${MCP_TOKEN:-}" ${MCP_DOCKER_OPTS:-} \
+    -v /lab:/lab -v "$d:/kltest:ro" -w /lab "$MCP_IMAGE" python /kltest/run.py /kltest/test.py >"$d/out" 2>&1
+  rc=$?
+  MCP_OUT=${MCP_OUT:-$(mktemp)}
+  sed -n 's/^MCP-RESULT //p' "$d/out" | tail -1 >"$MCP_OUT"
+  if [ "$rc" -ne 0 ] || [ ! -s "$MCP_OUT" ]; then
+    grep -v '^MCP-RESULT ' "$d/out" | tail -15
+    rc=1
+  fi
+  rm -rf "$d"
+  return "$rc"
+}
+
+# mj 'JQ' -> run a jq filter over the last mcp_test result ($MCP_OUT); true when it's truthy
+mj() { jq -e "$1" "$MCP_OUT" >/dev/null 2>&1; }
+
 # ---------- algorithms helper ----------
 # algo_check <<'EOF' ... EOF -> stdin holds hidden Python tests, a line "---GO---", then
 # hidden Go tests. They run against /lab/solution.py and /lab/solution.go; the check

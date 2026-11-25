@@ -8,7 +8,7 @@ what to consolidate. The target doesn't lower the bar: a lab should carry a real
 scenario and teach a concept. The parts of this list that the existing exercises don't cover
 are not started.
 
-Exercise counts (<!-- count:total -->1,797<!-- /count --> total):
+Exercise counts (<!-- count:total -->1,807<!-- /count --> total):
 
 | Topic | Exercises | Target | Track | Module files |
 |---|---|---|---|---|
@@ -20,7 +20,7 @@ Exercise counts (<!-- count:total -->1,797<!-- /count --> total):
 | Cloud & platform | <!-- count:cloud -->93<!-- /count --> | 250 | `cloud` | `exercises/cloud/` |
 | Data | <!-- count:data -->78<!-- /count --> | 250 | `data` | `exercises/data/` |
 | Defensive security | <!-- count:defensive -->78<!-- /count --> | 250 | `defensive` | `exercises/defensive/` |
-| Programming | <!-- count:programming -->121<!-- /count --> | 250 | `programming` | `exercises/programming/` |
+| Programming | <!-- count:programming -->131<!-- /count --> | 250 | `programming` | `exercises/programming/` |
 | Data science | <!-- count:datascience -->83<!-- /count --> | 250 | `datascience` | `exercises/datascience/` |
 | Git | <!-- count:git -->275<!-- /count --> | 250 | `git` | `exercises/git/` |
 | Terraform | <!-- count:terraform -->120<!-- /count --> | 250 | `terraform` | `exercises/terraform/` |
@@ -52,8 +52,8 @@ Exercise counts (<!-- count:total -->1,797<!-- /count --> total):
 
 ### Build next (decided 2026-11-24)
 
-These come **before** everything else on this page, in this order. Items 1 and 3 are
-done; the others aren't started.
+These come **before** everything else on this page, in this order. Items 1, 2 and 3
+are done; the others aren't started.
 
 1. ~~**Reviewing AI-written code**~~ (Programming track, new module). **Done** in
    `exercises/programming/09-reviewing-ai-code.yaml` (prog-108..121, 14 labs). The lab Go
@@ -66,7 +66,10 @@ done; the others aren't started.
    malicious look-alike), an insecure default, a test that passes without testing
    anything. Checks: hidden tests and the race detector on the learner's fixed code, plus a
    `findings.txt` naming the defect's file and line. No models and no new infrastructure.
-2. **MCP servers** (Programming track, new module). Build Model Context Protocol tool
+2. ~~**MCP servers**~~ (Programming track, new module). **Done** in
+   `exercises/programming/10-mcp-servers.yaml` (prog-122..131, Python, `mcp` 2.3.0 in image
+   `kl-mcp:1`). The Go SDK (v1.8.0) needs Go 1.25, newer than the lab's 1.24, so Go MCP
+   labs are still to do. Build Model Context Protocol tool
    servers in Python (official `mcp` SDK) or Go, over stdio and HTTP: expose a read-only
    database query tool, a service-status tool, a file reader limited to one directory.
    Practise input schemas, an allow-list of tools and arguments, refusing path traversal
@@ -329,6 +332,7 @@ Tracks still under 250 after that reach it with new modules on topics they don't
 | Pitfalls & idioms | 21 | 15 | 0 / 0 / 4 |
 | Secure coding | 15 | 15 | 2 / 0 / 0 |
 | Reviewing AI-written code | 14 | 15 | 0 / 0 / 1 |
+| MCP tool servers | 10 | 15 | 2 / 1 / 2 |
 
 **Data science**
 

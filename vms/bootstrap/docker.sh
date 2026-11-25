@@ -121,6 +121,14 @@ RUN set -e; apt-get update; \
 CMD ["/usr/sbin/sshd", "-D", "-e"]
 DOCKERFILE
 fi
+# Python with the Model Context Protocol SDK, for the MCP modules of the Programming track.
+if ! docker image inspect kl-mcp:1 >/dev/null 2>&1; then
+  echo "==> building the MCP image (python 3.12, mcp 2.3.0)"
+  docker build -q -t kl-mcp:1 - <<'DOCKERFILE'
+FROM python:3.12-slim
+RUN pip install --no-cache-dir mcp==2.3.0
+DOCKERFILE
+fi
 # llama.cpp's server with small local models, for the AI engineering track: chat models
 # (Qwen2.5 Instruct 0.5B at Q4 and Q8, 1.5B at Q4) and an embedding model (bge-small),
 # pinned by Hugging Face revision and SHA-256. ~5.8 GB on disk; the labs then run offline.
