@@ -1885,6 +1885,337 @@ exercises:
                       "sources": list(dict.fromkeys(doc for doc, _, _ in rows))}))
     PY
 
+- id: ai-026
+  title: The filter that emptied the results
+  difficulty: 3
+  kind: fix
+  tags: [rag, pgvector, hnsw, filters, iterative-scan, recall]
+  tutorial: |
+    **What you're learning.** Why an approximate index plus a `WHERE` filter can return fewer rows than `LIMIT`, or none at all, and how pgvector's iterative index scans fix it.
+
+    ### The idea
+
+    An HNSW index doesn't know about your `WHERE` clause. For `ORDER BY emb <=> $q LIMIT 10` it walks its graph and hands back the **`hnsw.ef_search`** nearest candidates (40 by default). **Then** PostgreSQL applies the filter. If only 2% of the rows belong to the team you asked for, about 2% of those 40 candidates survive: **0 or 1 rows**, from a team that owns thousands of documents. Raising `ef_search` helps only in proportion, at a cost on every query.
+
+    pgvector 0.8 added **iterative index scans**: when the filter has thrown candidates away, the scan goes back to the index for more, until `LIMIT` is met (or `hnsw.max_scan_tuples` is reached).
+
+    ```sql
+    SET hnsw.iterative_scan = relaxed_order;   -- or strict_order; default off
+    SET hnsw.ef_search = 100;                   -- candidates per round: better recall per round
+    SELECT id FROM chunks WHERE tenant = 42 ORDER BY emb <=> $1 LIMIT 10;
+    ```
+
+    | setting | returns | order |
+    |---|---|---|
+    | `off` (default) | up to `ef_search` candidates, then the filter: often fewer than 10 | by distance |
+    | `strict_order` | 10 | exactly by distance |
+    | `relaxed_order` | 10 | *nearly* by distance; faster. Re-sort in an outer query if order matters |
+
+    `SET` lasts for the **session**; `SET LOCAL` for one transaction; `ALTER DATABASE rag SET hnsw.iterative_scan = relaxed_order` makes it every new session's default.
+
+    How to know it worked: compare with the **exact** answer, which a sequential scan gives. Adding `+ 0` to the `ORDER BY` stops the planner from using the index:
+
+    ```sql
+    SELECT id FROM chunks WHERE tenant = 42 ORDER BY (emb <=> $1) + 0 LIMIT 10;   -- exact, slow on big tables
+    EXPLAIN SELECT ...                                                               -- Index Scan using ..._hnsw
+    ```
+
+    The overlap between the two lists is the query's **recall@10**.
+
+    ### Common mistakes
+
+    - "Fixing" it by dropping the index (exact, but every query is a full scan), or by `+ 0` in production.
+    - Raising `ef_search` to 1000: slower for every query, and still not enough for a team with 0.5% of the rows.
+    - Setting the option in one connection and querying in another.
+
+    ### Check your work
+
+    Every search returns 10 documents of the right team, most of them in the exact top 10, and `EXPLAIN` still shows the HNSW index.
+  scenario: |
+    The runbook index now serves **50 teams** from one table, **`docs`**
+    (`id`, `team`, `emb vector(64)`, about 100,000 rows, with an HNSW
+    index). **`/lab/search_team.py TEAM DOC`** prints the 10 documents of
+    TEAM nearest to document DOC (`ragpy search_team.py 7 123`).
+
+    Teams complain that search returns **one or two results, or none**,
+    although each team owns about 2,000 documents.
+
+    Fix `search_team.py` so that it returns **10 documents of that team**,
+    close to the exact nearest ten (most of them the same), and **still
+    uses the HNSW index**.
+  hints:
+    - "Compare `ragpy search_team.py 7 123` with the exact answer: `ORDER BY (emb <=> q) + 0` in `psql` (`docker exec -it pg psql -U postgres rag`)."
+    - "`SHOW hnsw.ef_search;`: the index hands back 40 candidates, then the team filter keeps about 2% of them."
+    - "`db.execute(\"SET hnsw.iterative_scan = relaxed_order\")` (and a larger `hnsw.ef_search`) before the query."
+  solution: |
+    ```python
+    with psycopg.connect(DSN) as db:
+        register_vector(db)
+        db.execute("SET hnsw.iterative_scan = relaxed_order")
+        db.execute("SET hnsw.ef_search = 200")
+        q = db.execute("SELECT emb FROM docs WHERE id = %s", (doc,)).fetchone()[0]
+        rows = db.execute("SELECT id FROM docs WHERE team = %s ORDER BY emb <=> %s LIMIT 10", (team, q)).fetchall()
+    ```
+  setup: |
+    rag_start nokit
+    rag_pg
+    rag_teams 100000 50
+    lab_file /lab/search_team.py <<'EOF'
+    """search_team.py TEAM DOC: the 10 documents of TEAM nearest to document DOC's vector."""
+    import sys
+
+    import psycopg
+    from pgvector.psycopg import register_vector
+
+    DSN = "postgresql://postgres:lab@127.0.0.1:5432/rag"
+    team, doc = int(sys.argv[1]), int(sys.argv[2])
+
+    with psycopg.connect(DSN) as db:
+        register_vector(db)
+        q = db.execute("SELECT emb FROM docs WHERE id = %s", (doc,)).fetchone()[0]
+        rows = db.execute("SELECT id FROM docs WHERE team = %s ORDER BY emb <=> %s LIMIT 10", (team, q)).fetchall()
+
+    for (i,) in rows:
+        print(i)
+    EOF
+  check: |
+    before=$(rag_hnsw_scans)
+    total=0; overlap=0; wrong=0; short=0; n=0
+    for k in 1 2 3 4 5 6; do
+      t=$(shuf -i 1-50 -n 1); d=$(shuf -i 1-100000 -n 1); n=$((n + 1))
+      got=$(as_user "cd /lab && timeout 60 ragpy search_team.py $t $d" 2>/dev/null | grep -E '^[0-9]+$' | sort -u)
+      c=$(printf '%s\n' "$got" | grep -c .); total=$((total + c))
+      [ "$c" -lt 10 ] && short=$((short + 1))
+      if [ "$c" -gt 0 ]; then
+        w=$(rag_sql "SELECT count(*) FROM docs WHERE id IN ($(printf '%s\n' "$got" | paste -sd,)) AND team <> $t"); wrong=$((wrong + ${w:-0}))
+      fi
+      o=$(comm -12 <(printf '%s\n' "$got") <(rag_exact "$t" "$d" | sort -u) | grep -c .); overlap=$((overlap + o))
+    done
+    info "searches: $n, results: $total, overlap with the exact top 10: $overlap of $((n * 10))"
+    check "every search returns 10 documents" '[ "$short" -eq 0 ]'
+    check "all of them from the team asked for" '[ "$total" -gt 0 ] && [ "$wrong" -eq 0 ]'
+    check "most of them are the exact nearest (recall@10 of 0.7 or more)" '[ "$overlap" -ge $((n * 7)) ]'
+    check "the searches use the HNSW index" 'eventually 15 "[ \$(rag_hnsw_scans) -ge $((before + n)) ]"'
+  solve: |
+    cat > /lab/search_team.py <<'EOF'
+    """search_team.py TEAM DOC: the 10 documents of TEAM nearest to document DOC's vector."""
+    import sys
+
+    import psycopg
+    from pgvector.psycopg import register_vector
+
+    DSN = "postgresql://postgres:lab@127.0.0.1:5432/rag"
+    team, doc = int(sys.argv[1]), int(sys.argv[2])
+
+    with psycopg.connect(DSN) as db:
+        register_vector(db)
+        # keep going back to the index until 10 rows pass the team filter
+        db.execute("SET hnsw.iterative_scan = relaxed_order")
+        db.execute("SET hnsw.ef_search = 200")
+        q = db.execute("SELECT emb FROM docs WHERE id = %s", (doc,)).fetchone()[0]
+        rows = db.execute("SELECT id FROM docs WHERE team = %s ORDER BY emb <=> %s LIMIT 10", (team, q)).fetchall()
+
+    for (i,) in rows:
+        print(i)
+    EOF
+  deliverables: [search_team.py]
+
+- id: ai-027
+  title: The same index in Qdrant
+  difficulty: 3
+  kind: build
+  tags: [rag, qdrant, vector-database, payload-index, filters]
+  tutorial: |
+    **What you're learning.** Running the same filtered vector search in Qdrant, a dedicated vector database: collections, points with payloads, payload indexes and filtered queries over its REST API.
+
+    ### The idea
+
+    pgvector keeps vectors next to the rest of your data in PostgreSQL. A **vector database** such as Qdrant is built only for this. Its **filterable HNSW** knows about the payload fields you index, so a filter is applied *while* it walks the graph, not afterwards: the problem of ai-026 doesn't arise.
+
+    | Qdrant | PostgreSQL + pgvector |
+    |---|---|
+    | collection (`size`, `distance`) | table with a `vector(N)` column and an index |
+    | point: `id`, `vector`, `payload` (JSON) | row |
+    | payload index on a field | B-tree on a column, but used *inside* the vector search |
+    | `filter: {must: [...]}` | `WHERE` |
+
+    ### Commands you'll use
+
+    Everything is JSON over HTTP on port 6333 (`curl` here; `urllib.request` from Python).
+
+    ```bash
+    curl -s -X PUT localhost:6333/collections/notes -H 'Content-Type: application/json' \
+      -d '{"vectors": {"size": 384, "distance": "Cosine"}}'
+    curl -s -X PUT localhost:6333/collections/notes/index -H 'Content-Type: application/json' \
+      -d '{"field_name": "owner", "field_schema": "integer"}'
+    curl -s -X PUT 'localhost:6333/collections/notes/points?wait=true' -H 'Content-Type: application/json' \
+      -d '{"points": [{"id": 1, "vector": [0.1, ...], "payload": {"owner": 7}}]}'      # up to ~1000 per request
+    curl -s -X POST localhost:6333/collections/notes/points/query -H 'Content-Type: application/json' \
+      -d '{"query": [0.1, ...], "filter": {"must": [{"key": "owner", "match": {"value": 7}}]}, "limit": 10}'
+    curl -s localhost:6333/collections/notes | jq '.result | {status, points_count, payload_schema}'
+    curl -s -X POST localhost:6333/collections/notes/points -H 'Content-Type: application/json' \
+      -d '{"ids": [1], "with_vector": true}'                                          # read a point back
+    ```
+
+    Upload in **batches** (hundreds to a thousand points per request) with `?wait=true`, or the last batch may not be searchable yet. A collection's `status` is `green` once its index has caught up. From Python, `pgvector`'s `Vector` values become lists with `.to_list()`.
+
+    ### Common mistakes
+
+    - Forgetting the payload index: filters still work, but slowly, on a full payload scan.
+    - `distance` that doesn't match how the vectors were compared before (`<=>` is cosine).
+    - Point ids must be unsigned integers or UUIDs; strings like `"doc-7"` are refused.
+    - One request per point: 100,000 HTTP requests.
+
+    ### Check your work
+
+    `points_count` is 100000, `payload_schema` lists `team`, and your search returns 10 documents of the team even with PostgreSQL stopped.
+  scenario: |
+    The team wants to compare pgvector with **Qdrant**, which is running at
+    **`127.0.0.1:6333`** (empty). The documents are in PostgreSQL's table
+    **`docs`** (`id`, `team`, `emb vector(64)`; `ragpy` has `psycopg` and
+    `pgvector`).
+
+    1. Create a Qdrant collection **`docs`** for these vectors (64
+       dimensions, **cosine** distance).
+    2. Load **every** document as a point: the same **id**, its vector, and
+       payload **`{"team": N}`**.
+    3. Create a **payload index** on `team`.
+    4. Write **`/lab/search_qdrant.py TEAM DOC`**: print the 10 documents
+       of TEAM nearest to document DOC's vector, one id per line, using
+       **only Qdrant** (take DOC's vector from Qdrant too).
+  hints:
+    - "`curl -s localhost:6333/collections` lists collections; the tutorial has the create, index, upsert and query calls."
+    - "Read `docs` with a server-side cursor (`db.cursor(name=\"c\")`) and send 1000 points per `PUT .../points?wait=true`."
+    - "In the search: `POST /collections/docs/points` with `{\"ids\": [DOC], \"with_vector\": true}`, then `POST /collections/docs/points/query` with a `filter` on `team`."
+  solution: |
+    ```python
+    # /lab/load_qdrant.py (run once: ragpy load_qdrant.py)
+    import json, urllib.request
+    import psycopg
+    from pgvector.psycopg import register_vector
+
+    def qd(method, path, body):
+        req = urllib.request.Request("http://127.0.0.1:6333" + path, method=method,
+                                     data=json.dumps(body).encode(), headers={"Content-Type": "application/json"})
+        with urllib.request.urlopen(req, timeout=60) as r:
+            return json.load(r)
+
+    qd("PUT", "/collections/docs", {"vectors": {"size": 64, "distance": "Cosine"}})
+    qd("PUT", "/collections/docs/index", {"field_name": "team", "field_schema": "integer"})
+    with psycopg.connect("postgresql://postgres:lab@127.0.0.1:5432/rag") as db:
+        register_vector(db)
+        batch = []
+        with db.cursor(name="all") as cur:
+            cur.execute("SELECT id, team, emb FROM docs")
+            for i, team, emb in cur:
+                batch.append({"id": i, "vector": emb.to_list(), "payload": {"team": team}})
+                if len(batch) == 1000:
+                    qd("PUT", "/collections/docs/points?wait=true", {"points": batch}); batch = []
+        if batch:
+            qd("PUT", "/collections/docs/points?wait=true", {"points": batch})
+    ```
+
+    ```python
+    # /lab/search_qdrant.py
+    import json, sys, urllib.request
+
+    def qd(path, body):
+        req = urllib.request.Request("http://127.0.0.1:6333" + path, data=json.dumps(body).encode(),
+                                     headers={"Content-Type": "application/json"})
+        with urllib.request.urlopen(req, timeout=30) as r:
+            return json.load(r)["result"]
+
+    team, doc = int(sys.argv[1]), int(sys.argv[2])
+    vec = qd("/collections/docs/points", {"ids": [doc], "with_vector": True})[0]["vector"]
+    hits = qd("/collections/docs/points/query", {"query": vec, "limit": 10,
+               "filter": {"must": [{"key": "team", "match": {"value": team}}]}})["points"]
+    for h in hits:
+        print(h["id"])
+    ```
+  setup: |
+    rag_start nokit
+    rag_pg
+    rag_teams 100000 50
+    rag_qdrant
+  check: |
+    info="$(curl -s -m 10 127.0.0.1:6333/collections/docs)"
+    check "a collection docs exists" '[ "$(jq -r .status <<<"$info")" = ok ]'
+    check_eq "its vectors have 64 dimensions and cosine distance" "$(jq -r '.result.config.params.vectors | "\(.size) \(.distance)"' <<<"$info")" "64 Cosine"
+    check_eq "it holds every document" "$(jq -r .result.points_count <<<"$info")" "$(rag_sql 'SELECT count(*) FROM docs')"
+    check "team has a payload index" 'jq -e ".result.payload_schema.team" <<<"$info" >/dev/null'
+    d=$(shuf -i 1-100000 -n 1)
+    p=$(curl -s -m 10 -X POST 127.0.0.1:6333/collections/docs/points -H 'Content-Type: application/json' -d "{\"ids\": [$d], \"with_payload\": true}" | jq -r '.result[0].payload.team // empty')
+    check_eq "points keep their document's id and team" "$p" "$(rag_sql "SELECT team FROM docs WHERE id = $d")"
+    pairs=""
+    for k in 1 2 3 4 5; do pairs+="$(shuf -i 1-50 -n 1):$(shuf -i 1-100000 -n 1) "; done
+    docker pause pg >/dev/null
+    for pr in $pairs; do
+      as_user "cd /lab && timeout 30 ragpy search_qdrant.py ${pr%%:*} ${pr##*:}" 2>/dev/null | grep -E '^[0-9]+$' | sort -u >"$KL_STATE/q-${pr/:/-}"
+    done
+    docker unpause pg >/dev/null
+    total=0; overlap=0; wrong=0; short=0
+    for pr in $pairs; do
+      t=${pr%%:*}; d=${pr##*:}; f="$KL_STATE/q-$t-$d"
+      c=$(grep -c . "$f"); total=$((total + c)); [ "$c" -lt 10 ] && short=$((short + 1))
+      if [ "$c" -gt 0 ]; then w=$(rag_sql "SELECT count(*) FROM docs WHERE id IN ($(paste -sd, "$f")) AND team <> $t"); wrong=$((wrong + ${w:-0})); fi
+      o=$(comm -12 "$f" <(rag_exact "$t" "$d" | sort -u) | grep -c .); overlap=$((overlap + o))
+    done
+    info "results: $total, overlap with the exact top 10: $overlap of 50"
+    check "with PostgreSQL paused, every search returns 10 documents" '[ "$short" -eq 0 ]'
+    check "all of them from the team asked for" '[ "$total" -gt 0 ] && [ "$wrong" -eq 0 ]'
+    check "they are the exact nearest, or nearly (recall@10 of 0.9 or more)" '[ "$overlap" -ge 45 ]'
+  solve: |
+    cat > /lab/load_qdrant.py <<'EOF'
+    import json, urllib.request
+
+    import psycopg
+    from pgvector.psycopg import register_vector
+
+
+    def qd(method, path, body):
+        req = urllib.request.Request("http://127.0.0.1:6333" + path, method=method,
+                                     data=json.dumps(body).encode(), headers={"Content-Type": "application/json"})
+        with urllib.request.urlopen(req, timeout=60) as r:
+            return json.load(r)
+
+
+    qd("PUT", "/collections/docs", {"vectors": {"size": 64, "distance": "Cosine"}})
+    qd("PUT", "/collections/docs/index", {"field_name": "team", "field_schema": "integer"})
+    with psycopg.connect("postgresql://postgres:lab@127.0.0.1:5432/rag") as db:
+        register_vector(db)
+        batch = []
+        with db.cursor(name="all") as cur:
+            cur.execute("SELECT id, team, emb FROM docs")
+            for i, team, emb in cur:
+                batch.append({"id": i, "vector": emb.to_list(), "payload": {"team": team}})
+                if len(batch) == 1000:
+                    qd("PUT", "/collections/docs/points?wait=true", {"points": batch})
+                    batch = []
+        if batch:
+            qd("PUT", "/collections/docs/points?wait=true", {"points": batch})
+    EOF
+    cat > /lab/search_qdrant.py <<'EOF'
+    import json, sys, urllib.request
+
+
+    def qd(path, body):
+        req = urllib.request.Request("http://127.0.0.1:6333" + path, data=json.dumps(body).encode(),
+                                     headers={"Content-Type": "application/json"})
+        with urllib.request.urlopen(req, timeout=30) as r:
+            return json.load(r)["result"]
+
+
+    team, doc = int(sys.argv[1]), int(sys.argv[2])
+    vec = qd("/collections/docs/points", {"ids": [doc], "with_vector": True})[0]["vector"]
+    hits = qd("/collections/docs/points/query", {"query": vec, "limit": 10,
+               "filter": {"must": [{"key": "team", "match": {"value": team}}]}})["points"]
+    for h in hits:
+        print(h["id"])
+    EOF
+    cd /lab && ragpy load_qdrant.py
+    for i in $(seq 60); do [ "$(curl -s localhost:6333/collections/docs | jq -r .result.status)" = green ] && break; sleep 2; done
+  deliverables: [search_qdrant.py]
+
 # ===== Capstone =====
 
 - id: ai-023

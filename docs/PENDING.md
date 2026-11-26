@@ -8,7 +8,7 @@ what to consolidate. The target doesn't lower the bar: a lab should carry a real
 scenario and teach a concept. The parts of this list that the existing exercises don't cover
 are not started.
 
-Exercise counts (<!-- count:total -->1,838<!-- /count --> total):
+Exercise counts (<!-- count:total -->1,840<!-- /count --> total):
 
 | Topic | Exercises | Target | Track | Module files |
 |---|---|---|---|---|
@@ -26,7 +26,7 @@ Exercise counts (<!-- count:total -->1,838<!-- /count --> total):
 | Terraform | <!-- count:terraform -->120<!-- /count --> | 250 | `terraform` | `exercises/terraform/` |
 | Ansible | <!-- count:ansible -->89<!-- /count --> | 250 | `ansible` | `exercises/ansible/` |
 | Algorithms | <!-- count:algorithms -->70<!-- /count --> | 250 | `algorithms` | `exercises/algorithms/` |
-| AI engineering | <!-- count:ai -->25<!-- /count --> | 250 | `ai` | `exercises/ai/` |
+| AI engineering | <!-- count:ai -->27<!-- /count --> | 250 | `ai` | `exercises/ai/` |
 
 - [Suggested order](#suggested-order)
 - [Deepen every module](#deepen-every-module)
@@ -97,8 +97,8 @@ are done; the others aren't started.
    filters, cited answers with abstention, capstone with a golden-set eval). Images
    `kl-rag:1` and `kl-rerank:1`, `pgvector/pgvector:0.8.7-pg16-bookworm`; kit in
    `vms/kit/rag/`. PostgreSQL's `ts_rank` has no IDF and splits `AB-1234`, so keyword search
-   is BM25 in Python. Still to do: HNSW with filters (`hnsw.iterative_scan`) needs a much
-   bigger table to show; Qdrant.
+   is BM25 in Python. Also done: filtered HNSW and `hnsw.iterative_scan` on a 100k-row
+   table (ai-026) and the same index in Qdrant v1.20.0 (ai-027).
 5. ~~**Sandboxing untrusted code with gVisor**~~ **Done** in
    `exercises/defensive/09-sandboxing.yaml` (sec-093..105, 13 labs: registering runsc, auditing
    runtimes, `--network none`, read-only root and tmpfs, non-root/no caps/no-new-privileges, memory

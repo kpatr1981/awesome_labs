@@ -1004,6 +1004,39 @@ rag_pg_wait() {
 # rag_sql 'SQL' -> run SQL in database rag of container pg (tab-separated, no headers)
 rag_sql() { docker exec -i pg psql -U postgres -d rag -tAX -F $'\t' -c "$1" 2>/dev/null; }
 
+# rag_teams [ROWS] [TEAMS] -> table docs (id, team, emb vector(64)) in container pg: ROWS (100000)
+# random unit-ish vectors spread over TEAMS (50) teams, with an HNSW cosine index; for the
+# filtered-search labs (the vectors stand in for embeddings, so no model is needed)
+rag_teams() {
+  local rows=${1:-100000} teams=${2:-50}
+  rag_sql "CREATE EXTENSION IF NOT EXISTS vector" >/dev/null
+  docker exec -i pg psql -U postgres -d rag -qtAX -v ON_ERROR_STOP=1 >/dev/null <<SQL
+DROP TABLE IF EXISTS docs;
+CREATE TABLE docs (id bigint PRIMARY KEY, team int NOT NULL, emb vector(64) NOT NULL);
+INSERT INTO docs SELECT g, (random() * ($teams - 1))::int + 1,
+  (SELECT array_agg(random() - 0.5)::vector(64) FROM generate_series(1, 64) WHERE g > 0)
+  FROM generate_series(1, $rows) g;
+SET maintenance_work_mem = '256MB';
+SET max_parallel_maintenance_workers = 0;
+CREATE INDEX docs_emb_hnsw ON docs USING hnsw (emb vector_cosine_ops);
+ANALYZE docs;
+SQL
+}
+# rag_exact TEAM DOC -> the exact 10 nearest docs of TEAM to DOC's vector (a sequential scan), one id per line
+rag_exact() { rag_sql "SELECT id FROM docs WHERE team = $1 ORDER BY (emb <=> (SELECT emb FROM docs WHERE id = $2)) + 0 LIMIT 10"; }
+# rag_hnsw_scans -> index scans so far on the HNSW indexes of table docs
+rag_hnsw_scans() {
+  rag_sql "SELECT pg_stat_clear_snapshot(); SELECT coalesce(sum(s.idx_scan), 0) FROM pg_stat_user_indexes s
+    JOIN pg_class c ON c.oid = s.indexrelid JOIN pg_am a ON a.oid = c.relam WHERE s.relname = 'docs' AND a.amname = 'hnsw'" | tail -1
+}
+QDRANT_IMAGE=qdrant/qdrant:v1.20.0
+# rag_qdrant -> container qdrant (REST on 127.0.0.1:6333), empty
+rag_qdrant() {
+  docker rm -f qdrant >/dev/null 2>&1
+  docker run -d --name qdrant -p 127.0.0.1:6333:6333 "$QDRANT_IMAGE" >/dev/null &&
+    eventually 60 'curl -sf -m 2 127.0.0.1:6333/readyz' >/dev/null
+}
+
 # rag_rerank -> container rerank: bge-reranker-v2-m3 (kl-rerank:1) on 127.0.0.1:8082, /metrics on
 rag_rerank() {
   docker network create kl-llm >/dev/null 2>&1 || true
