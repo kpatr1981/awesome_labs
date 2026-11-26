@@ -8,7 +8,7 @@ what to consolidate. The target doesn't lower the bar: a lab should carry a real
 scenario and teach a concept. The parts of this list that the existing exercises don't cover
 are not started.
 
-Exercise counts (<!-- count:total -->1,819<!-- /count --> total):
+Exercise counts (<!-- count:total -->1,832<!-- /count --> total):
 
 | Topic | Exercises | Target | Track | Module files |
 |---|---|---|---|---|
@@ -19,7 +19,7 @@ Exercise counts (<!-- count:total -->1,819<!-- /count --> total):
 | Networking | <!-- count:networking -->106<!-- /count --> | 250 | `networking` | `exercises/networking/` |
 | Cloud & platform | <!-- count:cloud -->93<!-- /count --> | 250 | `cloud` | `exercises/cloud/` |
 | Data | <!-- count:data -->78<!-- /count --> | 250 | `data` | `exercises/data/` |
-| Defensive security | <!-- count:defensive -->78<!-- /count --> | 250 | `defensive` | `exercises/defensive/` |
+| Defensive security | <!-- count:defensive -->91<!-- /count --> | 250 | `defensive` | `exercises/defensive/` |
 | Programming | <!-- count:programming -->131<!-- /count --> | 250 | `programming` | `exercises/programming/` |
 | Data science | <!-- count:datascience -->83<!-- /count --> | 250 | `datascience` | `exercises/datascience/` |
 | Git | <!-- count:git -->275<!-- /count --> | 250 | `git` | `exercises/git/` |
@@ -52,7 +52,7 @@ Exercise counts (<!-- count:total -->1,819<!-- /count --> total):
 
 ### Build next (decided 2026-11-24)
 
-These come **before** everything else on this page, in this order. Items 1 to 4
+These come **before** everything else on this page, in this order. Items 1 to 5
 are done; the others aren't started.
 
 1. ~~**Reviewing AI-written code**~~ (Programming track, new module). **Done** in
@@ -98,7 +98,13 @@ are done; the others aren't started.
    `vms/kit/rag/`. PostgreSQL's `ts_rank` has no IDF and splits `AB-1234`, so keyword search
    is BM25 in Python. Still to do: HNSW with filters (`hnsw.iterative_scan`) needs a much
    bigger table to show; Qdrant.
-5. **Sandboxing untrusted code with gVisor** (Defensive security or Docker track). Run
+5. ~~**Sandboxing untrusted code with gVisor**~~ **Done** in
+   `exercises/defensive/09-sandboxing.yaml` (sec-093..105, 13 labs: registering runsc, auditing
+   runtimes, `--network none`, read-only root and tmpfs, non-root/no caps/no-new-privileges, memory
+   and CPU, a time limit that really stops the job, pids vs `--ulimit nproc` under gVisor, secrets
+   and the Docker socket, an nftables egress allow-list, `--oci-seccomp`, runsc `--strace`
+   forensics, capstone). gVisor release 20261109.0 in the Docker bootstrap; kit in `vms/kit/gv/`.
+   Still to do: Kubernetes `RuntimeClass`, Firecracker. Original plan: (Defensive security or Docker track). Run
    generated code under `runsc` (arm64 works) in the Docker VM: no network or an egress
    allow-list in nftables, seccomp, read-only root, CPU/memory/pids limits, no secrets
    mounted. Checks attempt escapes, network calls, fork bombs and reading host files.

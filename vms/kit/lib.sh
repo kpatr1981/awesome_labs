@@ -2421,3 +2421,149 @@ for t in "bgpconfigurations.crd.projectcalico.org default kr-bgpconf" "ippools.c
   rm -f "$KL_STATE/$3.json"
 done'
 }
+
+# ===== Sandboxing untrusted code (Defensive track): gVisor's runsc beside runc =====
+# runsc is installed by the Docker bootstrap (gv_install) but not registered with Docker:
+# /etc/docker is restored on reset, so every registration a lab makes is undone.
+GV_VERSION=20261109.0
+GV_KIT=/opt/kubelab/gv
+GV_IMAGE=kl-job:1
+GV_STATE=$KL_STATE/gv
+# gv_install -> install runsc, its shim and helpers into /usr/local/bin (pinned, SHA-512 checked)
+gv_install() {
+  /usr/local/bin/runsc --version 2>/dev/null | grep -q "release-$GV_VERSION" && return 0
+  local a sum t
+  a=$(uname -m)
+  case $a in
+  aarch64) sum=a0b5d911512ef5fe70e833821e653a90c4d06c7027246ee49423f1d2fe2b2a509389a637797248958b90e49a069bb079ecde860efe1871b1d980ec0fe17e18ac ;;
+  x86_64) sum=0a0041fd862f4ea3042a9db8d41c742f48a01f909699adc2a0256e46d85e53f97b82b9fd154b3dce636f62b8d557677639f91c77d13f3f875ff9fa535275393c ;;
+  *) echo "gVisor: no build for $a" >&2; return 1 ;;
+  esac
+  t=$(mktemp -d)
+  curl -fsSL --retry 3 -o "$t/g.tar.zst" "https://storage.googleapis.com/gvisor/releases/release/$GV_VERSION/$a/gvisor.tar.zstd" &&
+    echo "$sum  $t/g.tar.zst" | sha512sum -c --quiet &&
+    tar --zstd -xf "$t/g.tar.zst" -C /usr/local/bin runsc containerd-shim-runsc-v1 gvisor-bin
+  local rc=$?
+  rm -rf "$t"
+  return $rc
+}
+# gv_ready -> runsc is installed (installs it on VMs built before it was added) and the job
+# image kl-job:1 exists: python:3.12-alpine with user "job" (1000) and a setuid-root copy of
+# python at /usr/local/bin/helper, the kind of leftover real images ship.
+gv_ready() {
+  gv_install || { echo "could not install gVisor: rebuild the docker env (env rebuild docker)" >&2; return 1; }
+  mkdir -p "$GV_STATE/jobs"
+  docker image inspect "$GV_IMAGE" >/dev/null 2>&1 && return 0
+  docker build -q -t "$GV_IMAGE" - >/dev/null <<'DF'
+FROM python:3.12-alpine
+RUN cp /usr/local/bin/python3.12 /usr/local/bin/helper && chmod 4755 /usr/local/bin/helper && adduser -D -u 1000 job
+DF
+}
+# gv_runtime NAME [RUNSC-ARG...] -> register runsc with Docker as runtime NAME and restart
+# dockerd (run it before starting any container: the restart stops them all)
+gv_runtime() {
+  local name=$1 f=/etc/docker/daemon.json
+  shift
+  [ -s $f ] || echo '{}' >$f
+  local a='[]'
+  [ $# -gt 0 ] && a=$(printf '%s\n' "$@" | jq -R . | jq -sc .) # as JSON: jq would read --flags as its own options
+  jq --arg n "$name" --argjson a "$a" '.runtimes[$n] = ({path: "/usr/local/bin/runsc"} + (if $a == [] then {} else {runtimeArgs: $a} end))' <$f >$f.kl && mv $f.kl $f ||
+    { echo "gv_runtime: could not update $f" >&2; return 1; }
+  systemctl restart docker
+  eventually 60 'docker info' >/dev/null
+}
+# gv_outside -> the world outside the sandbox: the package mirror on 10.99.0.10:8080 and an
+# attacker's server on 10.99.0.20:8080 (network namespace kl-outside, routed through the
+# host), and a metadata service with credentials on 169.254.169.254:80 (on the host).
+# Requests are logged to $GV_STATE/outside.log; tokens are in $GV_STATE/outside.json.
+gv_outside() {
+  mkdir -p "$GV_STATE"
+  pkill -f "$GV_KIT/outside.py" 2>/dev/null
+  ip netns del kl-outside 2>/dev/null
+  ip link del kl-out 2>/dev/null
+  ip link del kl-meta 2>/dev/null
+  : >"$GV_STATE/outside.log"
+  printf '{"mirror": "MIRROR-%s", "meta": "META-%s"}\n' "$(openssl rand -hex 6)" "$(openssl rand -hex 8)" >"$GV_STATE/outside.json"
+  ip netns add kl-outside
+  ip -n kl-outside link set lo up
+  ip link add kl-out type veth peer name eth0 netns kl-outside
+  ip addr add 10.99.0.1/24 dev kl-out
+  ip link set kl-out up
+  ip -n kl-outside addr add 10.99.0.10/24 dev eth0
+  ip -n kl-outside addr add 10.99.0.20/24 dev eth0
+  ip -n kl-outside link set eth0 up
+  ip -n kl-outside route add default via 10.99.0.1
+  ip link add kl-meta type dummy
+  ip addr add 169.254.169.254/32 dev kl-meta
+  ip link set kl-meta up
+  on_reset 'pkill -f /opt/kubelab/gv/outside.py; ip netns del kl-outside 2>/dev/null; ip link del kl-out 2>/dev/null; ip link del kl-meta 2>/dev/null'
+  setsid ip netns exec kl-outside python3 "$GV_KIT/outside.py" "$GV_STATE/outside.log" "$GV_STATE/outside.json" \
+    mirror=10.99.0.10:8080 exfil=10.99.0.20:8080 </dev/null >/dev/null 2>&1 &
+  setsid python3 "$GV_KIT/outside.py" "$GV_STATE/outside.log" "$GV_STATE/outside.json" \
+    meta=169.254.169.254:80 </dev/null >/dev/null 2>&1 &
+  eventually 20 'curl -fs -m 2 http://10.99.0.20:8080/ && curl -fs -m 2 http://10.99.0.10:8080/ | grep -q mirror &&
+    curl -fs -m 2 http://169.254.169.254/ | grep -q AKIAKLMETA' ||
+    echo "gv_outside: the outside servers did not start" >&2
+  : >"$GV_STATE/outside.log"
+}
+# gv_hits ROLE -> requests the outside world's ROLE (mirror, exfil, meta) received during the last gv_run
+gv_hits() { grep -c "^$1 " "$GV_STATE/outside.log" 2>/dev/null || true; }
+# gv_token mirror|meta -> this run's token served by the mirror / the metadata service
+gv_token() { jq -r ".$1" "$GV_STATE/outside.json"; }
+# gv_job NAME <<'PY' -> a job program for this exercise (overrides the kit's jobs/NAME.py)
+gv_job() { mkdir -p "$GV_STATE/jobs"; cat >"$GV_STATE/jobs/$1.py"; }
+# gv_run NAME [SECONDS] [VAR=VALUE...] -> run job NAME through the learner's runner, as the
+# lab user: /lab/run-job.sh JOBDIR OUTDIR. JOBDIR (job-XXXX, holding main.py and input.txt)
+# and OUTDIR (writable by anyone) are fresh temporary folders. Sets GV_RC (the runner's exit
+# code; 124 when the check's own limit of SECONDS, default 60, ran out), GV_SECS, GV_JOB
+# (the folder name, which is the job's JOB_ID), GV_OUT and GV_LOG (the runner's output).
+gv_run() {
+  local name=$1 t=${2:-60} src d e
+  shift 2 2>/dev/null || shift
+  src=$GV_STATE/jobs/$name.py
+  [ -f "$src" ] || src=$GV_KIT/jobs/$name.py
+  d=$(mktemp -d /tmp/kl-gv.XXXXXX)
+  GV_JOB=job-$(openssl rand -hex 3)
+  mkdir -p "$d/$GV_JOB" "$d/out"
+  cp "$src" "$d/$GV_JOB/main.py"
+  seq 1 "$(shuf -i 20-60 -n 1)" | shuf | tr '\n' ' ' >"$d/$GV_JOB/input.txt"
+  chown -R "$(lab_user)": "$d"
+  chmod 755 "$d" "$d/$GV_JOB"
+  chmod 644 "$d/$GV_JOB"/*
+  chmod 777 "$d/out"
+  GV_OUT=$d/out
+  GV_LOG=$d/log
+  [ -f "$GV_STATE/outside.log" ] && : >"$GV_STATE/outside.log" # gv_hits counts this job only
+  e=()
+  for v in "$@"; do e+=("$v"); done
+  local s=$SECONDS
+  (cd /lab && timeout -k 5 "$t" sudo -u "$(lab_user)" -H env "${e[@]}" /lab/run-job.sh "$d/$GV_JOB" "$d/out") >"$GV_LOG" 2>&1
+  GV_RC=$?
+  GV_SECS=$((SECONDS - s))
+  info "job $name: runner exit $GV_RC after ${GV_SECS}s"
+}
+# gv_sum -> the right answer for the last gv_run's input.txt
+gv_sum() { tr ' ' '\n' <"$(dirname "$GV_OUT")/$GV_JOB/input.txt" | awk '{s+=$1} END {print s}'; }
+# gj FILE 'JQ' -> query a JSON file the last job wrote to its OUTDIR
+gj() { jq -r "$2" "$GV_OUT/$1" 2>/dev/null; }
+# gv_jobs_running -> containers from the job image still running (a runner left them behind)
+gv_jobs_running() { docker ps -q --filter "ancestor=$GV_IMAGE" | wc -l; }
+# gv_inspect [NAME] -> run job NAME (default linger) through the runner in the background and
+# save `docker inspect` of its container while it runs to $GV_INSPECT; then wait for it
+gv_inspect() {
+  local name=${1:-linger} f=$GV_STATE/inspect.json
+  rm -f "$f"
+  docker ps -q --filter "ancestor=$GV_IMAGE" | xargs -r docker rm -f >/dev/null 2>&1
+  gv_run "$name" 60 &
+  local pid=$! id=
+  for _ in $(seq 1 40); do
+    id=$(docker ps -q --filter "ancestor=$GV_IMAGE" | head -1)
+    [ -n "$id" ] && break
+    sleep 0.5
+  done
+  [ -n "$id" ] && docker inspect "$id" >"$f"
+  wait $pid
+  GV_INSPECT=$f
+}
+# gi 'JQ' -> query the inspected job container (.[0] is the container)
+gi() { jq -r ".[0] | $1" "$GV_STATE/inspect.json" 2>/dev/null; }
