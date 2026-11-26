@@ -1173,6 +1173,36 @@ WRAP
 #   await call(s, tool, args) -> {"error": bool, "text": str, "structured": ..., "seconds": float}
 #   tools(listing) -> {name: {"description": ..., "schema": ...}}
 #   INIT -> the initialize result (INIT.server_info.name)
+# gomcp_start [DIR] -> a `go` command for the lab user from kl-mcp-go:1 (Go 1.25, the Go MCP SDK
+# v1.8.0 in a read-only module cache, offline, CGO off so binaries are static and run in the
+# Python test client's container too); DIR (default /lab/gomcp) gets go.mod and go.sum for it
+gomcp_start() {
+  local dir=${1:-/lab/gomcp}
+  docker volume create kl-gocache-mcp >/dev/null
+  docker run --rm -v kl-gocache-mcp:/c alpine:3.22 chmod 1777 /c
+  cat >/usr/local/bin/go <<'WRAP'
+#!/bin/bash
+# Lab Go for the MCP labs: kl-mcp-go:1 (go 1.25, go-sdk v1.8.0 offline) as you, seeing /lab.
+wd=$PWD
+case "$wd/" in /lab/*) ;; *) wd=/lab ;; esac
+tty=()
+[ -t 0 ] && [ -t 1 ] && tty=(-t)
+exec docker run --rm -i "${tty[@]}" --network none -u "$(id -u):$(id -g)" -e HOME=/tmp \
+  -e GOCACHE=/gocache/build -e GOPATH=/gocache/u$(id -u) -v kl-gocache-mcp:/gocache -v /lab:/lab -w "$wd" kl-mcp-go:1 go "$@"
+WRAP
+  chmod 755 /usr/local/bin/go
+  on_reset 'rm -f /usr/local/bin/go'
+  mkdir -p "$dir"
+  docker run --rm kl-mcp-go:1 cat /opt/mcp-template/go.mod >"$dir/go.mod"
+  docker run --rm kl-mcp-go:1 cat /opt/mcp-template/go.sum >"$dir/go.sum"
+  chown -R "$(lab_user)": "$dir"
+}
+# gomcp_build [DIR] -> build DIR (default /lab/gomcp) as the lab user into DIR/server; prints errors
+gomcp_build() {
+  local dir=${1:-/lab/gomcp}
+  rm -f "$dir/server"
+  as_user "cd '$dir' && go build -o server . 2>&1 | tail -15" && [ -x "$dir/server" ]
+}
 mcp_test() {
   local d rc
   d=$(mktemp -d)

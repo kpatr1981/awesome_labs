@@ -879,6 +879,230 @@ exercises:
             condition: service_healthy
     EOF
 
+- id: ai-024
+  title: The price of four bits
+  difficulty: 3
+  kind: build
+  tags: [llm, quantization, perplexity, kl-divergence, evaluation]
+  tutorial: |
+    **What you're learning.** Measuring what quantization costs in quality, with perplexity and KL divergence, instead of guessing from a few answers.
+
+    ### The idea
+
+    ai-006 measured what a quantization saves: memory and speed. Its cost is in **quality**, and a handful of chat answers won't show it. Two numbers do:
+
+    - **Perplexity (PPL).** The model reads a text it didn't write and, at every token, says how likely the real next token was. Perplexity is `exp(average negative log-likelihood)`: roughly, "how many tokens it was choosing between". **Lower is better**. Compare PPL only for the same text, the same context size, and models with the same tokenizer.
+    - **KL divergence (KLD).** How far a quantized model's whole probability distribution drifts from a reference (here, the same model at 8 bits). PPL can hide changes that cancel out; KLD can't. 0 means identical.
+
+    llama.cpp measures both:
+
+    ```bash
+    T="docker run --rm -v /srv/texts:/t:ro -v /var/tmp/k:/k --entrypoint /app/llama kl-llm:1 perplexity -f /t/manual.txt -c 512 --chunks 8"
+    $T -m /models/MODEL-q8_0.gguf                                     # ... Final estimate: PPL = 2.4130 +/- 0.07
+    $T -m /models/MODEL-q8_0.gguf --kl-divergence-base /k/base.kld    # also save the reference's logits
+    $T -m /models/MODEL-q4_k_m.gguf --kl-divergence-base /k/base.kld --kl-divergence
+    #   Mean PPL(Q)/PPL(base) :   1.21 ± 0.02
+    #   Mean    KLD:   0.21 ± 0.01
+    ```
+
+    `-c 512 --chunks 8` scores 8 windows of 512 tokens, enough for a comparison on 2 CPUs (a minute or less per model). The base file holds every logit (vocabulary × tokens): for this vocabulary that's over 600 MB, so put it in `/var/tmp`, not `/lab`.
+
+    Small models suffer most from quantization: a 4-bit 0.5B model loses far more than a 4-bit 70B one. A **bigger model at 4 bits** often beats a smaller one at 8 bits, *if* it fits.
+
+    ### Common mistakes
+
+    - Comparing PPL across different texts, context sizes or model families.
+    - Concluding from "the answers look fine": quality loss shows up in the long tail first.
+    - Running the KLD pass with a different `-c`/`--chunks` than the base pass.
+
+    ### Check your work
+
+    Your three PPL values and the KLD agree with a rerun to within 1%, and your choices follow from them.
+  scenario: |
+    The team must pick a model for a box whose model container gets
+    **800 MiB**. Before deciding, they want numbers on quality, not
+    impressions. **`/lab/eval/gpl-3.txt`** is the evaluation text.
+
+    Measure, always with **`-c 512 --chunks 8`** on that file:
+
+    - the **perplexity** of `qwen2.5-0.5b-instruct-q4_k_m`,
+      `qwen2.5-0.5b-instruct-q8_0` and `qwen2.5-1.5b-instruct-q4_k_m`;
+    - the mean **KL divergence** of the 0.5B **Q4_K_M** model against the
+      0.5B **Q8_0** model as the base.
+
+    Write **`/lab/quality.json`**:
+
+    ```json
+    {"ppl": {"0.5b-q4_k_m": 0, "0.5b-q8_0": 0, "1.5b-q4_k_m": 0},
+     "kld_q4_vs_q8": 0,
+     "best": "the one with the best quality",
+     "best_under_800mib": "the best one that fits in 800 MiB (ai-006 has the memory numbers)"}
+    ```
+  hints:
+    - "`docker run --rm -v /lab/eval:/t:ro --entrypoint /app/llama kl-llm:1 perplexity -m /models/FILE -f /t/gpl-3.txt -c 512 --chunks 8 2>&1 | grep 'Final estimate'`"
+    - "For KLD: one Q8 run with `--kl-divergence-base /k/q8.kld` (mount a folder in /var/tmp at /k), then a Q4 run with the same flags plus `--kl-divergence`; read `Mean    KLD`."
+    - "With weights in memory, 0.5B Q8 needs about 730 MiB and 1.5B Q4 about 1.1 GiB."
+  solution: |
+    ```bash
+    P() { docker run --rm -v /lab/eval:/t:ro -v /var/tmp/kl-kld:/k --entrypoint /app/llama kl-llm:1 \
+            perplexity -f /t/gpl-3.txt -c 512 --chunks 8 "$@" 2>&1; }
+    ppl() { P -m "/models/qwen2.5-$1.gguf" | sed -n 's/.*Final estimate: PPL = \([0-9.]*\).*/\1/p'; }
+    sudo install -d -m 777 /var/tmp/kl-kld
+    a=$(ppl 0.5b-instruct-q4_k_m); b=$(ppl 0.5b-instruct-q8_0); c=$(ppl 1.5b-instruct-q4_k_m)
+    P -m /models/qwen2.5-0.5b-instruct-q8_0.gguf --kl-divergence-base /k/q8.kld >/dev/null
+    k=$(P -m /models/qwen2.5-0.5b-instruct-q4_k_m.gguf --kl-divergence-base /k/q8.kld --kl-divergence | awk '/Mean +KLD:/ {print $3}')
+    jq -n --argjson a $a --argjson b $b --argjson c $c --argjson k $k \
+      '{ppl: {"0.5b-q4_k_m": $a, "0.5b-q8_0": $b, "1.5b-q4_k_m": $c}, kld_q4_vs_q8: $k,
+        best: "1.5b-q4_k_m", best_under_800mib: "0.5b-q8_0"}' > /lab/quality.json
+    ```
+    On this text Q4 raises the 0.5B model's perplexity by about a third
+    (about 3.0 against 2.2), and the 1.5B model at Q4 is far better than
+    either (about 1.4), but it needs over 1 GiB. Under 800 MiB the answer is the 0.5B model
+    at **Q8**, which is also the faster one on this CPU.
+  setup: |
+    install -d -o "$(lab_user)" /lab/eval
+    install -m 644 -o "$(lab_user)" /usr/share/common-licenses/GPL-3 /lab/eval/gpl-3.txt
+    # the check's own measurements, made in the background while you work (about 2 minutes)
+    rm -rf /var/tmp/kl-ppl; install -d -m 777 /var/tmp/kl-ppl
+    on_reset 'pkill -f kl-ppl-measure; rm -rf /var/tmp/kl-ppl /var/tmp/kl-kld'
+    cat >/var/tmp/kl-ppl/kl-ppl-measure.sh <<'EOF'
+    P() { docker run --rm -v /lab/eval:/t:ro -v /var/tmp/kl-ppl:/k --entrypoint /app/llama "$LLM_IMAGE" \
+            perplexity -f /t/gpl-3.txt -c 512 --chunks 8 "$@" 2>&1; }
+    ppl() { P -m "/models/qwen2.5-$1.gguf" | sed -n 's/.*Final estimate: PPL = \([0-9.]*\).*/\1/p'; }
+    a=$(ppl 0.5b-instruct-q4_k_m); b=$(ppl 0.5b-instruct-q8_0); c=$(ppl 1.5b-instruct-q4_k_m)
+    P -m /models/qwen2.5-0.5b-instruct-q8_0.gguf --kl-divergence-base /k/q8.kld >/dev/null
+    k=$(P -m /models/qwen2.5-0.5b-instruct-q4_k_m.gguf --kl-divergence-base /k/q8.kld --kl-divergence | awk '/Mean +KLD:/ {print $3}')
+    rm -f /var/tmp/kl-ppl/q8.kld
+    printf '{"a": %s, "b": %s, "c": %s, "k": %s}\n' "${a:-null}" "${b:-null}" "${c:-null}" "${k:-null}" >"$KL_STATE/ppl.json.tmp"
+    mv "$KL_STATE/ppl.json.tmp" "$KL_STATE/ppl.json"
+    EOF
+    rm -f "$KL_STATE/ppl.json"
+    setsid bash -c 'source /opt/kubelab/lib.sh; source /var/tmp/kl-ppl/kl-ppl-measure.sh' kl-ppl-measure </dev/null >/dev/null 2>&1 &
+  check: |
+    q=/lab/quality.json
+    check "quality.json is valid JSON" 'jq -e . "$q" >/dev/null'
+    eventually 300 '[ -s "$KL_STATE/ppl.json" ]' || info "the check's own measurement didn't finish"
+    m=$KL_STATE/ppl.json
+    info "measured: $(cat "$m" 2>/dev/null)"
+    near() { jq -e --slurpfile m "$m" "($1 | tonumber) as \$g | \$m[0].$2 as \$w | \$w != null and (\$g - \$w | fabs) <= \$w * 0.01" "$q" >/dev/null 2>&1; }
+    check "the perplexity of 0.5B Q4_K_M is right" 'near ".ppl[\"0.5b-q4_k_m\"]" a'
+    check "the perplexity of 0.5B Q8_0 is right" 'near ".ppl[\"0.5b-q8_0\"]" b'
+    check "the perplexity of 1.5B Q4_K_M is right" 'near ".ppl[\"1.5b-q4_k_m\"]" c'
+    check "the KL divergence of Q4 against Q8 is right" 'near .kld_q4_vs_q8 k'
+    check_eq "best is the model with the lowest perplexity" "$(jq -r .best "$q" 2>/dev/null)" 1.5b-q4_k_m
+    check_eq "best_under_800mib is the best one that fits" "$(jq -r .best_under_800mib "$q" 2>/dev/null)" 0.5b-q8_0
+  solve: |
+    P() { docker run --rm -v /lab/eval:/t:ro -v /var/tmp/kl-kld:/k --entrypoint /app/llama kl-llm:1 \
+            perplexity -f /t/gpl-3.txt -c 512 --chunks 8 "$@" 2>&1; }
+    ppl() { P -m "/models/qwen2.5-$1.gguf" | sed -n 's/.*Final estimate: PPL = \([0-9.]*\).*/\1/p'; }
+    sudo install -d -m 777 /var/tmp/kl-kld
+    a=$(ppl 0.5b-instruct-q4_k_m); b=$(ppl 0.5b-instruct-q8_0); c=$(ppl 1.5b-instruct-q4_k_m)
+    P -m /models/qwen2.5-0.5b-instruct-q8_0.gguf --kl-divergence-base /k/q8.kld >/dev/null
+    k=$(P -m /models/qwen2.5-0.5b-instruct-q4_k_m.gguf --kl-divergence-base /k/q8.kld --kl-divergence | awk '/Mean +KLD:/ {print $3}')
+    sudo rm -f /var/tmp/kl-kld/q8.kld
+    jq -n --argjson a $a --argjson b $b --argjson c $c --argjson k $k \
+      '{ppl: {"0.5b-q4_k_m": $a, "0.5b-q8_0": $b, "1.5b-q4_k_m": $c}, kld_q4_vs_q8: $k,
+        best: "1.5b-q4_k_m", best_under_800mib: "0.5b-q8_0"}' > /lab/quality.json
+  deliverables: [quality.json]
+
+- id: ai-025
+  title: A 32k context in 800 MiB
+  difficulty: 3
+  kind: fix
+  tags: [llm, kv-cache, quantization, context, memory, oom]
+  tutorial: |
+    **What you're learning.** How big the KV cache is, how it grows with the context, and how storing it in 8 bits halves it.
+
+    ### The idea
+
+    While a model reads and writes, it keeps two vectors per token per layer, a **key** and a **value**: the **KV cache**. Its size has nothing to do with the weights' quantization:
+
+    ```
+    KV bytes = 2 (K and V) × layers × KV heads × head size × bytes per number × context tokens
+    ```
+
+    For Qwen2.5-0.5B (24 layers, 2 KV heads, head size 64) at 16 bits that's 12 KiB per token, so a **32k context costs 384 MiB**, almost as much as the 4-bit weights. llama.cpp allocates the whole cache **when it starts**, so a too-large `-c` doesn't fail on the 30,000th token; the server is OOM-killed before it answers anything.
+
+    The cache can be stored in fewer bits, separately for K and V:
+
+    | `-ctk`/`-ctv` | bytes per number | 32k context, 0.5B model | quality |
+    |---|---|---|---|
+    | `f16` (default) | 2 | 384 MiB | reference |
+    | `q8_0` | ~1.06 | ~204 MiB | practically the same |
+    | `q4_0` | ~0.56 | ~108 MiB | measurably worse, especially on long contexts |
+
+    ```bash
+    docker run -d --name ctx --memory 1g --memory-swap 1g -p 127.0.0.1:9200:8080 kl-llm:1 \
+      -m /models/qwen2.5-1.5b-instruct-q4_k_m.gguf --load-mode none -c 16384 -np 1 \
+      -ctk q8_0 -ctv q8_0 --host 0.0.0.0 --port 8080
+    docker logs ctx 2>&1 | grep -i 'kv'                           # the cache's size and type
+    curl -s localhost:9200/props | jq .default_generation_settings.n_ctx   # 16384
+    docker stats --no-stream --format '{{.MemUsage}}' ctx
+    ```
+
+    A quantized **V** cache needs flash attention. This build turns it on by itself (`-fa auto`); older ones need `-fa on`.
+
+    ### Common mistakes
+
+    - Shrinking `-c` instead: the product needs 32k.
+    - Going to `q4_0` because it's smaller: quality drops, and 8 bits already fits.
+    - Forgetting `-np`: with 4 slots the context is split four ways (ai-005).
+
+    ### Check your work
+
+    The container stays up under its limit, `/props` says 32768, and it answers.
+  scenario: |
+    Support wants the assistant to read whole incident timelines, so
+    **`support-llm`** (on `127.0.0.1:8080`) was restarted with a **32k
+    context**. Its box gives it **800 MiB** (`--memory 800m
+    --memory-swap 800m`), and since then it's OOM-killed at start.
+
+    Re-create **`support-llm`** so that it runs within those **800 MiB**,
+    with a context of **32768** tokens in **one** slot, the same model
+    (`qwen2.5-0.5b-instruct-q4_k_m`, weights in memory with
+    `--load-mode none`), and its **KV cache in 8 bits** (K and V). It must
+    answer requests.
+  hints:
+    - "`docker inspect -f '{{.State.OOMKilled}}' support-llm` and `docker logs support-llm`: how big is the KV cache?"
+    - "`-ctk` and `-ctv` choose the cache's number type."
+    - "`-ctk q8_0 -ctv q8_0`"
+  solution: |
+    The f16 cache for 32768 tokens is 384 MiB; with the 4-bit weights
+    that's about 920 MiB. In 8 bits it's about 204 MiB, about 730 MiB in all.
+
+    ```bash
+    docker rm -f support-llm
+    docker run -d --name support-llm --memory 800m --memory-swap 800m -p 127.0.0.1:8080:8080 kl-llm:1 \
+      -m /models/qwen2.5-0.5b-instruct-q4_k_m.gguf --load-mode none -c 32768 -np 1 \
+      -ctk q8_0 -ctv q8_0 --host 0.0.0.0 --port 8080
+    ```
+  setup: |
+    docker run -d --name support-llm --memory 800m --memory-swap 800m -p 127.0.0.1:8080:8080 "$LLM_IMAGE" \
+      -m "$LLM_SMALL" --load-mode none -c 32768 -np 1 --host 0.0.0.0 --port 8080 >/dev/null
+  check: |
+    args() { docker inspect -f '{{json .Args}}' support-llm 2>/dev/null; }
+    arg() { args | jq -r --arg a "$1" --arg b "$2" '. as $x | [range(length) | select($x[.] == $a or $x[.] == $b)] | last // empty | $x[. + 1]'; }
+    llm_wait 8080 90 >/dev/null
+    check "support-llm is running" 'c_running support-llm'
+    check "it hasn't been OOM-killed" '[ "$(c_get support-llm "{{.State.OOMKilled}} {{.RestartCount}}")" = "false 0" ]'
+    check "it's limited to 800 MiB without swap" '[ "$(c_get support-llm "{{.HostConfig.Memory}} {{.HostConfig.MemorySwap}}")" = "838860800 838860800" ]'
+    check_eq "it serves the 0.5B Q4_K_M model" "$(llm_model_of support-llm)" "$LLM_SMALL"
+    check_eq "with weights in memory" "$(arg --load-mode -lm)" none
+    check_eq "its slot has a 32768-token context" "$(llm_slots_ctx 8080 | tr '\n' ' ')" "32768 "
+    check_eq "the K cache is 8-bit" "$(arg --cache-type-k -ctk)" q8_0
+    check_eq "the V cache is 8-bit" "$(arg --cache-type-v -ctv)" q8_0
+    head -c 4000 /usr/share/common-licenses/GPL-3 >"$KL_STATE/ctx.txt"
+    a=$(jq -Rs '{messages: [{role: "user", content: (. + "\n\nWhich license is this? Answer in five words.")}], max_tokens: 16, temperature: 0}' "$KL_STATE/ctx.txt" |
+      curl -s -m 120 127.0.0.1:8080/v1/chat/completions -H 'Content-Type: application/json' -d @- | jq -r '.choices[0].message.content // empty')
+    check "it answers a request about a long text" '[ -n "$a" ]'
+    check "and is still up afterwards" 'c_running support-llm && [ "$(c_get support-llm "{{.State.OOMKilled}}")" = false ]'
+  solve: |
+    docker rm -f support-llm
+    docker run -d --name support-llm --memory 800m --memory-swap 800m -p 127.0.0.1:8080:8080 kl-llm:1 \
+      -m /models/qwen2.5-0.5b-instruct-q4_k_m.gguf --load-mode none -c 32768 -np 1 \
+      -ctk q8_0 -ctv q8_0 --host 0.0.0.0 --port 8080
+    for i in $(seq 120); do curl -sf localhost:8080/health >/dev/null && break; sleep 1; done
+
 # ===== Advanced: an API gateway in front of the models =====
 
 - id: ai-008

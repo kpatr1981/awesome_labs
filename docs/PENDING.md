@@ -8,7 +8,7 @@ what to consolidate. The target doesn't lower the bar: a lab should carry a real
 scenario and teach a concept. The parts of this list that the existing exercises don't cover
 are not started.
 
-Exercise counts (<!-- count:total -->1,832<!-- /count --> total):
+Exercise counts (<!-- count:total -->1,838<!-- /count --> total):
 
 | Topic | Exercises | Target | Track | Module files |
 |---|---|---|---|---|
@@ -20,13 +20,13 @@ Exercise counts (<!-- count:total -->1,832<!-- /count --> total):
 | Cloud & platform | <!-- count:cloud -->93<!-- /count --> | 250 | `cloud` | `exercises/cloud/` |
 | Data | <!-- count:data -->78<!-- /count --> | 250 | `data` | `exercises/data/` |
 | Defensive security | <!-- count:defensive -->91<!-- /count --> | 250 | `defensive` | `exercises/defensive/` |
-| Programming | <!-- count:programming -->131<!-- /count --> | 250 | `programming` | `exercises/programming/` |
+| Programming | <!-- count:programming -->135<!-- /count --> | 250 | `programming` | `exercises/programming/` |
 | Data science | <!-- count:datascience -->83<!-- /count --> | 250 | `datascience` | `exercises/datascience/` |
 | Git | <!-- count:git -->275<!-- /count --> | 250 | `git` | `exercises/git/` |
 | Terraform | <!-- count:terraform -->120<!-- /count --> | 250 | `terraform` | `exercises/terraform/` |
 | Ansible | <!-- count:ansible -->89<!-- /count --> | 250 | `ansible` | `exercises/ansible/` |
 | Algorithms | <!-- count:algorithms -->70<!-- /count --> | 250 | `algorithms` | `exercises/algorithms/` |
-| AI engineering | <!-- count:ai -->23<!-- /count --> | 250 | `ai` | `exercises/ai/` |
+| AI engineering | <!-- count:ai -->25<!-- /count --> | 250 | `ai` | `exercises/ai/` |
 
 - [Suggested order](#suggested-order)
 - [Deepen every module](#deepen-every-module)
@@ -68,8 +68,8 @@ are done; the others aren't started.
    `findings.txt` naming the defect's file and line. No models and no new infrastructure.
 2. ~~**MCP servers**~~ (Programming track, new module). **Done** in
    `exercises/programming/10-mcp-servers.yaml` (prog-122..131, Python, `mcp` 2.3.0 in image
-   `kl-mcp:1`). The Go SDK (v1.8.0) needs Go 1.25, newer than the lab's 1.24, so Go MCP
-   labs are still to do. Build Model Context Protocol tool
+   `kl-mcp:1`), plus Go labs prog-132..135 (Go 1.25 and go-sdk v1.8.0 offline in image
+   `kl-mcp-go:1`: a stdio server, schema constraints, `os.Root`, streamable HTTP with a token). Build Model Context Protocol tool
    servers in Python (official `mcp` SDK) or Go, over stdio and HTTP: expose a read-only
    database query tool, a service-status tool, a file reader limited to one directory.
    Practise input schemas, an allow-list of tools and arguments, refusing path traversal
@@ -79,8 +79,9 @@ are done; the others aren't started.
    No model needed, so it's fully repeatable. Pre-pull the SDKs into the image.
 3. ~~**AI engineering: *Serving a model***~~ **Done** in `exercises/ai/01-serving.yaml`
    (ai-001..011, the new `ai` track; image `kl-llm:1` = llama.cpp server b12124 plus
-   Qwen2.5 0.5B Q4/Q8, 1.5B Q4 and bge-small; LiteLLM v1.105.7). Ollama, `llama-perplexity`
-   and `--cache-type-k` are still to do. Original plan: (see
+   Qwen2.5 0.5B Q4/Q8, 1.5B Q4 and bge-small; LiteLLM v1.105.7). `llama-perplexity` (perplexity and KL divergence, ai-024) and `--cache-type-k`/`-v`
+   (ai-025) are done; Ollama is still to do (its arm64 image is 2.5 to 2.9 GB, too heavy to
+   pre-pull for one lab). Original plan: (see
    [AI engineering with tiny models](#ai-engineering-with-tiny-models)), **with a LiteLLM
    gateway added**: two llama.cpp servers (a 0.5B "cheap" model and a 1.5B "expensive"
    one) plus a deliberately failing upstream behind LiteLLM's proxy. Labs: virtual keys,

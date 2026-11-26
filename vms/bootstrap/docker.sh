@@ -129,6 +129,21 @@ FROM python:3.12-slim
 RUN pip install --no-cache-dir mcp==2.3.0
 DOCKERFILE
 fi
+# Go 1.25 with the official Go MCP SDK (v1.8.0) in a module cache baked into the image, for the
+# Go MCP labs of the Programming track: builds then work offline (GOPROXY=off).
+if ! docker image inspect kl-mcp-go:1 >/dev/null 2>&1; then
+  echo "==> building the Go MCP image (go 1.25.14, go-sdk v1.8.0)"
+  docker build -q -t kl-mcp-go:1 - <<'DOCKERFILE'
+FROM golang:1.25.14-alpine
+ENV GOMODCACHE=/opt/gomod GOTOOLCHAIN=local CGO_ENABLED=0 GOFLAGS=-mod=mod
+RUN set -e; mkdir -p /opt/mcp-template && cd /opt/mcp-template; \
+    go mod init lab/mcpserver; \
+    printf 'package main\n\nimport _ "github.com/modelcontextprotocol/go-sdk/mcp"\n\nfunc main() {}\n' >main.go; \
+    go get github.com/modelcontextprotocol/go-sdk@v1.8.0; go mod tidy; go build -o /dev/null .; rm main.go; \
+    chmod -R a+rX /opt/gomod /opt/mcp-template
+ENV GOPROXY=off GOSUMDB=off
+DOCKERFILE
+fi
 # llama.cpp's server with small local models, for the AI engineering track: chat models
 # (Qwen2.5 Instruct 0.5B at Q4 and Q8, 1.5B at Q4) and an embedding model (bge-small),
 # pinned by Hugging Face revision and SHA-256. ~5.8 GB on disk; the labs then run offline.
