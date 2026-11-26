@@ -1462,6 +1462,331 @@ exercises:
     kubectl config --kubeconfig $K use-context alice@kubelab
     kubectl create rolebinding developers-edit -n dev --clusterrole=edit --group=developers
 
+- id: k8s-418
+  title: A RuntimeClass for untrusted pods
+  difficulty: 3
+  kind: build
+  tags: [runtimeclass, gvisor, runsc, containerd, sandbox, security]
+  tutorial: |
+    **What you're learning.** How Kubernetes runs some pods under a different container runtime: a containerd runtime handler on the node, a `RuntimeClass` in the cluster, and `runtimeClassName` in the pod.
+
+    ### The idea
+
+    Every pod's containers share their node's kernel. For untrusted code (a customer's job, a PR's tests) you can run it under **gVisor** instead (the Docker sandboxing module, sec-093), without touching the rest of the cluster. Three pieces, from the bottom up:
+
+    1. **The node's containerd** gets a *runtime handler*, a name for "start containers with this shim". gVisor's shim is `containerd-shim-runsc-v1` (installed in `/usr/local/bin`), and its runtime type is `io.containerd.runsc.v1`.
+    2. A **`RuntimeClass`** (cluster-scoped) maps a name pods can use to that `handler`. It can also:
+       - `scheduling.nodeSelector`: send these pods only to nodes that have the handler (others would fail with *no runtime for "runsc" is configured*);
+       - `overhead.podFixed`: the extra CPU and memory the sandbox itself costs (the Sentry), added to every such pod's requests for scheduling and quotas.
+    3. A **pod** chooses it with `spec.runtimeClassName`.
+
+    ```toml
+    # /etc/containerd/config.toml (config version 3/4, containerd 2.x): beside the runc entry,
+    # or as a new table at the end of the file
+            [plugins.'io.containerd.cri.v1.runtime'.containerd.runtimes.kata]
+              runtime_type = 'io.containerd.kata.v2'
+    ```
+
+    ```yaml
+    apiVersion: node.k8s.io/v1
+    kind: RuntimeClass
+    metadata: {name: kata}
+    handler: kata                     # the containerd runtime name
+    overhead: {podFixed: {cpu: 250m, memory: 160Mi}}
+    scheduling: {nodeSelector: {runtime.example.com/kata: "yes"}}
+    ```
+
+    ```bash
+    sudo systemctl restart containerd          # on the node, after editing its config
+    sudo crictl info | jq '.config.containerd.runtimes | keys'      # ["kata", "runc"]
+    kubectl label node worker-3 runtime.example.com/kata=yes
+    kubectl get pod p -o jsonpath='{.spec.overhead} {.spec.nodeSelector}'   # filled in by the RuntimeClass
+    kubectl exec p -- uname -r                  # the sandbox's kernel, not the node's
+    ```
+
+    The kubelet doesn't need a restart; containerd does. Restarting containerd leaves running containers alone.
+
+    ### Common mistakes
+
+    - The TOML table at the wrong level, or a typo in `runtime_type`: pods stay in `ContainerCreating` with *no runtime for "..." is configured*.
+    - A RuntimeClass without `scheduling`: pods land on nodes that don't have the handler.
+    - Editing the control plane's containerd: workloads run on node01 here.
+
+    ### Check your work
+
+    `kubectl -n sandbox exec report-render -- uname -r` prints gVisor's kernel, and the pod's spec shows the overhead.
+  scenario: |
+    The platform team wants untrusted batch pods in **gVisor**, on
+    **node01** only. `runsc` and `containerd-shim-runsc-v1` are installed in
+    `/usr/local/bin` on node01 (`awesome_labs shell node01`), but neither
+    containerd nor the cluster know about them.
+
+    1. On **node01**, add a containerd runtime handler named **`runsc`**
+       for gVisor.
+    2. Label node01 **`sandbox.gvisor.dev/runtime=runsc`**.
+    3. Create a RuntimeClass **`gvisor`** for that handler that schedules
+       its pods only onto nodes with that label, and accounts for the
+       sandbox's own cost: **64Mi** of memory and **100m** of CPU per pod.
+    4. Run pod **`report-render`** in namespace **`sandbox`** (image
+       `busybox:1.37`, `sleep 3600`) under that RuntimeClass.
+  hints:
+    - "In node01's `/etc/containerd/config.toml`, copy the line `[plugins.'io.containerd.cri.v1.runtime'.containerd.runtimes.runc]`, rename it `...runtimes.runsc` and give it `runtime_type = 'io.containerd.runsc.v1'`; restart containerd."
+    - "`sudo crictl info | jq '.config.containerd.runtimes | keys'` should list runsc."
+    - "RuntimeClass: `handler: runsc`, `overhead.podFixed`, `scheduling.nodeSelector`; the pod sets `runtimeClassName: gvisor`."
+  solution: |
+    On node01 (a new TOML table can go at the end of the file):
+
+    ```bash
+    ssh node01 sudo bash -s <<'EOF'
+    printf '%s\n' '' "[plugins.'io.containerd.cri.v1.runtime'.containerd.runtimes.runsc]" \
+      "  runtime_type = 'io.containerd.runsc.v1'" >> /etc/containerd/config.toml
+    systemctl restart containerd
+    EOF
+    ```
+
+    On the control plane:
+
+    ```bash
+    kubectl label node node01 sandbox.gvisor.dev/runtime=runsc
+    kubectl apply -f - <<'EOF'
+    apiVersion: node.k8s.io/v1
+    kind: RuntimeClass
+    metadata: {name: gvisor}
+    handler: runsc
+    overhead: {podFixed: {memory: 64Mi, cpu: 100m}}
+    scheduling: {nodeSelector: {sandbox.gvisor.dev/runtime: runsc}}
+    ---
+    apiVersion: v1
+    kind: Pod
+    metadata: {name: report-render, namespace: sandbox}
+    spec:
+      runtimeClassName: gvisor
+      containers: [{name: render, image: busybox:1.37, command: [sleep, "3600"]}]
+    EOF
+    ```
+  setup_worker: |
+    gv_install
+  setup: |
+    kubectl create namespace sandbox >/dev/null
+  check: |
+    check_eq "RuntimeClass gvisor uses the handler runsc" "$(kj runtimeclass gvisor '{.handler}')" runsc
+    check_eq "it schedules onto nodes labelled sandbox.gvisor.dev/runtime=runsc" "$(kj runtimeclass gvisor '{.scheduling.nodeSelector.sandbox\.gvisor\.dev/runtime}')" runsc
+    check "it accounts for 64Mi and 100m of overhead per pod" '[ "$(kj runtimeclass gvisor "{.overhead.podFixed.memory} {.overhead.podFixed.cpu}")" = "64Mi 100m" ]'
+    check_eq "node01 has the label" "$(kj node node01 '{.metadata.labels.sandbox\.gvisor\.dev/runtime}')" runsc
+    check_not "the control plane doesn't" '[ -n "$(kj node controlplane "{.metadata.labels.sandbox\.gvisor\.dev/runtime}")" ]'
+    check "pod report-render is running" 'wait_pod sandbox report-render 90'
+    check_eq "under the RuntimeClass gvisor" "$(kj -n sandbox pod report-render '{.spec.runtimeClassName}')" gvisor
+    check_eq "on node01" "$(kj -n sandbox pod report-render '{.spec.nodeName}')" node01
+    check_eq "with the sandbox's overhead in its spec" "$(kj -n sandbox pod report-render '{.spec.overhead.memory}')" 64Mi
+    check_match "its kernel is gVisor's" "$(kubectl -n sandbox exec report-render -- uname -r 2>/dev/null)" gvisor
+    check_eq "it runs busybox:1.37" "$(kj -n sandbox pod report-render '{.spec.containers[0].image}')" busybox:1.37
+  check_worker: |
+    check "node01's containerd has a runtime handler runsc for gVisor" \
+      'crictl info 2>/dev/null | jq -e ".config.containerd.runtimes.runsc.runtimeType == \"io.containerd.runsc.v1\"" >/dev/null'
+  solve: |
+    ssh -o BatchMode=yes node01 sudo bash -s <<'EOF'
+    printf '%s\n' '' "[plugins.'io.containerd.cri.v1.runtime'.containerd.runtimes.runsc]" \
+      "  runtime_type = 'io.containerd.runsc.v1'" >> /etc/containerd/config.toml
+    systemctl restart containerd
+    EOF
+    kubectl label node node01 sandbox.gvisor.dev/runtime=runsc --overwrite
+    kubectl apply -f - <<'EOF'
+    apiVersion: node.k8s.io/v1
+    kind: RuntimeClass
+    metadata: {name: gvisor}
+    handler: runsc
+    overhead: {podFixed: {memory: 64Mi, cpu: 100m}}
+    scheduling: {nodeSelector: {sandbox.gvisor.dev/runtime: runsc}}
+    ---
+    apiVersion: v1
+    kind: Pod
+    metadata: {name: report-render, namespace: sandbox}
+    spec:
+      runtimeClassName: gvisor
+      containers: [{name: render, image: busybox:1.37, command: [sleep, "3600"]}]
+    EOF
+    kubectl -n sandbox wait --for=condition=Ready pod/report-render --timeout=120s
+
+- id: k8s-419
+  title: No runc in the sandbox namespace
+  difficulty: 3
+  kind: build
+  tags: [runtimeclass, gvisor, validatingadmissionpolicy, cel, admission, security]
+  tutorial: |
+    **What you're learning.** Making a RuntimeClass mandatory for a namespace with a ValidatingAdmissionPolicy, and moving existing workloads into it.
+
+    ### The idea
+
+    `runtimeClassName` is a field anyone who can create pods can leave out, and then the pod runs on the node's kernel like any other. "Untrusted pods use gVisor" becomes a rule only when the **API server refuses** pods that break it.
+
+    A **ValidatingAdmissionPolicy** (built in, no webhook to run) holds CEL expressions over the object being created; a **binding** says where it applies and what to do when an expression is false. Selecting namespaces by **label** lets a team opt a namespace in with one `kubectl label`:
+
+    ```yaml
+    apiVersion: admissionregistration.k8s.io/v1
+    kind: ValidatingAdmissionPolicy
+    metadata: {name: require-kata}
+    spec:
+      failurePolicy: Fail
+      matchConstraints:
+        resourceRules: [{apiGroups: [""], apiVersions: [v1], operations: [CREATE], resources: [pods]}]
+      validations:
+      - expression: "has(object.spec.runtimeClassName) && object.spec.runtimeClassName == 'kata'"
+        message: "pods here must use runtimeClassName kata"
+    ---
+    apiVersion: admissionregistration.k8s.io/v1
+    kind: ValidatingAdmissionPolicyBinding
+    metadata: {name: require-kata}
+    spec:
+      policyName: require-kata
+      validationActions: [Deny]
+      matchResources:
+        namespaceSelector: {matchLabels: {isolation.example.com/level: vm}}
+    ```
+
+    ```bash
+    kubectl label namespace builds isolation.example.com/level=vm
+    kubectl -n builds run t --image=busybox:1.37 --dry-run=server -- sleep 1   # denied: ... must use runtimeClassName kata
+    ```
+
+    `--dry-run=server` runs admission without creating anything: the quickest test of a policy. A new policy takes a few seconds to be enforced.
+
+    **Existing workloads.** A policy only judges *new* pods. A Deployment created earlier keeps running under `runc`, and the next rollout's pods are **refused**: its ReplicaSet reports `FailedCreate` and the Deployment quietly stops making progress. Add `runtimeClassName` to the pod **template** (`spec.template.spec.runtimeClassName`) so the new pods are allowed and replace the old ones.
+
+    ### Common mistakes
+
+    - `object.spec.runtimeClassName == 'gvisor'` without `has(...)`: on pods without the field, the expression errors instead of being false (with `failurePolicy: Fail`, still a denial, but with a confusing message).
+    - Matching `deployments` instead of `pods`: pods created by other controllers (Jobs, StatefulSets) slip through.
+    - Binding to every namespace: `kube-system` pods are refused too.
+
+    ### Check your work
+
+    A plain pod in `sandbox` is denied, the same pod with `runtimeClassName: gvisor` is allowed, other namespaces are unaffected, and `pdf-worker`'s pods run on gVisor.
+  scenario: |
+    gVisor works on node01 through RuntimeClass **`gvisor`** (k8s-418);
+    RuntimeClass `runc` is the plain runtime, explicitly. In
+    namespace **`sandbox`**, the Deployment **`pdf-worker`** still runs on
+    `runc`, and nothing stops the next one doing the same.
+
+    1. Create a ValidatingAdmissionPolicy **`require-gvisor`** and a binding
+       for it, so that in every namespace labelled
+       **`security.lab/sandbox=required`**, a pod without
+       `runtimeClassName: gvisor` is **denied**, with a message that names
+       `gvisor`.
+    2. Label namespace **`sandbox`** that way.
+    3. Move **`pdf-worker`** into gVisor: all of its pods run under the
+       RuntimeClass `gvisor`, and none of the old ones are left.
+
+    Pods in other namespaces must not be affected.
+  hints:
+    - "`kubectl explain validatingadmissionpolicy.spec` and `...binding.spec.matchResources.namespaceSelector`."
+    - "The expression: `has(object.spec.runtimeClassName) && object.spec.runtimeClassName == 'gvisor'`."
+    - "`kubectl -n sandbox patch deploy pdf-worker -p '{\"spec\":{\"template\":{\"spec\":{\"runtimeClassName\":\"gvisor\"}}}}'`"
+  solution: |
+    ```bash
+    kubectl apply -f - <<'EOF'
+    apiVersion: admissionregistration.k8s.io/v1
+    kind: ValidatingAdmissionPolicy
+    metadata: {name: require-gvisor}
+    spec:
+      failurePolicy: Fail
+      matchConstraints:
+        resourceRules: [{apiGroups: [""], apiVersions: [v1], operations: [CREATE, UPDATE], resources: [pods]}]
+      validations:
+      - expression: "has(object.spec.runtimeClassName) && object.spec.runtimeClassName == 'gvisor'"
+        message: "pods in this namespace must use runtimeClassName gvisor"
+    ---
+    apiVersion: admissionregistration.k8s.io/v1
+    kind: ValidatingAdmissionPolicyBinding
+    metadata: {name: require-gvisor}
+    spec:
+      policyName: require-gvisor
+      validationActions: [Deny]
+      matchResources:
+        namespaceSelector: {matchLabels: {security.lab/sandbox: required}}
+    EOF
+    kubectl label namespace sandbox security.lab/sandbox=required
+    kubectl -n sandbox patch deploy pdf-worker -p '{"spec":{"template":{"spec":{"runtimeClassName":"gvisor"}}}}'
+    kubectl -n sandbox rollout status deploy pdf-worker
+    ```
+  setup_worker: |
+    gv_install
+    printf '%s\n' '' "[plugins.'io.containerd.cri.v1.runtime'.containerd.runtimes.runsc]" \
+      "  runtime_type = 'io.containerd.runsc.v1'" >>/etc/containerd/config.toml
+    systemctl restart containerd
+  setup: |
+    kubectl label node node01 sandbox.gvisor.dev/runtime=runsc --overwrite >/dev/null
+    kubectl apply -f - >/dev/null <<'EOF'
+    apiVersion: node.k8s.io/v1
+    kind: RuntimeClass
+    metadata: {name: gvisor}
+    handler: runsc
+    overhead: {podFixed: {memory: 64Mi, cpu: 100m}}
+    scheduling: {nodeSelector: {sandbox.gvisor.dev/runtime: runsc}}
+    ---
+    apiVersion: node.k8s.io/v1
+    kind: RuntimeClass
+    metadata: {name: runc}
+    handler: runc
+    ---
+    apiVersion: v1
+    kind: Namespace
+    metadata: {name: sandbox}
+    ---
+    apiVersion: apps/v1
+    kind: Deployment
+    metadata: {name: pdf-worker, namespace: sandbox}
+    spec:
+      replicas: 2
+      selector: {matchLabels: {app: pdf-worker}}
+      template:
+        metadata: {labels: {app: pdf-worker}}
+        spec:
+          containers: [{name: worker, image: busybox:1.37, command: [sleep, "86400"]}]
+    EOF
+    wait_deploy sandbox pdf-worker 120 >/dev/null 2>&1 || true
+  check: |
+    probe() { kubectl -n "$1" run "kl-probe-$RANDOM" --image=busybox:1.37 --restart=Never --dry-run=server "${@:2}" -- sleep 1 2>&1; }
+    check "a ValidatingAdmissionPolicy require-gvisor exists, with a binding that denies" \
+      'k_exists validatingadmissionpolicy require-gvisor && kubectl get validatingadmissionpolicybinding -o json | jq -e "[.items[] | select(.spec.policyName == \"require-gvisor\" and (.spec.validationActions | index(\"Deny\")))] | length > 0" >/dev/null'
+    check_eq "namespace sandbox is labelled security.lab/sandbox=required" "$(kj namespace sandbox '{.metadata.labels.security\.lab/sandbox}')" required
+    check "a pod without runtimeClassName gvisor is denied in sandbox, naming gvisor" \
+      'eventually 30 "probe sandbox | grep -qi denied" && probe sandbox | grep -qi gvisor'
+    check "a pod with another RuntimeClass is denied too" 'probe sandbox --overrides="{\"spec\": {\"runtimeClassName\": \"runc\"}}" | grep -qi denied'
+    check "a pod with runtimeClassName gvisor is allowed" '! probe sandbox --overrides="{\"spec\": {\"runtimeClassName\": \"gvisor\"}}" | grep -qiE "denied|error"'
+    check "pods in other namespaces are unaffected" '! probe default | grep -qiE "denied|error"'
+    check "pdf-worker is rolled out" 'eventually 120 "deploy_ready sandbox pdf-worker"'
+    pods=$(kubectl -n sandbox get pods -l app=pdf-worker -o json 2>/dev/null)
+    check_eq "its pod template uses RuntimeClass gvisor" "$(kj -n sandbox deploy pdf-worker '{.spec.template.spec.runtimeClassName}')" gvisor
+    check "every pdf-worker pod runs under gvisor, none under runc" \
+      'jq -e "[.items[] | select(.metadata.deletionTimestamp == null)] | length >= 2 and all(.spec.runtimeClassName == \"gvisor\")" <<<"$pods" >/dev/null'
+    p=$(jq -r '[.items[] | select(.metadata.deletionTimestamp == null)][0].metadata.name // empty' <<<"$pods")
+    check_match "and its kernel is gVisor's" "$(kubectl -n sandbox exec "$p" -- uname -r 2>/dev/null)" gvisor
+  solve: |
+    kubectl apply -f - <<'EOF'
+    apiVersion: admissionregistration.k8s.io/v1
+    kind: ValidatingAdmissionPolicy
+    metadata: {name: require-gvisor}
+    spec:
+      failurePolicy: Fail
+      matchConstraints:
+        resourceRules: [{apiGroups: [""], apiVersions: [v1], operations: [CREATE, UPDATE], resources: [pods]}]
+      validations:
+      - expression: "has(object.spec.runtimeClassName) && object.spec.runtimeClassName == 'gvisor'"
+        message: "pods in this namespace must use runtimeClassName gvisor"
+    ---
+    apiVersion: admissionregistration.k8s.io/v1
+    kind: ValidatingAdmissionPolicyBinding
+    metadata: {name: require-gvisor}
+    spec:
+      policyName: require-gvisor
+      validationActions: [Deny]
+      matchResources:
+        namespaceSelector: {matchLabels: {security.lab/sandbox: required}}
+    EOF
+    kubectl label namespace sandbox security.lab/sandbox=required --overwrite
+    kubectl -n sandbox patch deploy pdf-worker -p '{"spec":{"template":{"spec":{"runtimeClassName":"gvisor"}}}}'
+    kubectl -n sandbox rollout status deploy pdf-worker --timeout=180s
+
 # ===== Capstone: a real-world lab =====
 
 - id: k8s-220

@@ -8,12 +8,12 @@ what to consolidate. The target doesn't lower the bar: a lab should carry a real
 scenario and teach a concept. The parts of this list that the existing exercises don't cover
 are not started.
 
-Exercise counts (<!-- count:total -->1,840<!-- /count --> total):
+Exercise counts (<!-- count:total -->1,842<!-- /count --> total):
 
 | Topic | Exercises | Target | Track | Module files |
 |---|---|---|---|---|
 | Docker | <!-- count:docker -->186<!-- /count --> | 250 | `docker` | `exercises/docker/` |
-| Kubernetes | <!-- count:kubernetes -->318<!-- /count --> | 250 | `kubernetes` | `exercises/kubernetes/` |
+| Kubernetes | <!-- count:kubernetes -->320<!-- /count --> | 250 | `kubernetes` | `exercises/kubernetes/` |
 | Offensive security | <!-- count:offsec -->83<!-- /count --> | 250 | `offsec` | `exercises/offsec/` |
 | Linux & systems | <!-- count:linux -->86<!-- /count --> | 250 | `linux` | `exercises/linux/` |
 | Networking | <!-- count:networking -->106<!-- /count --> | 250 | `networking` | `exercises/networking/` |
@@ -105,7 +105,9 @@ are done; the others aren't started.
    and CPU, a time limit that really stops the job, pids vs `--ulimit nproc` under gVisor, secrets
    and the Docker socket, an nftables egress allow-list, `--oci-seccomp`, runsc `--strace`
    forensics, capstone). gVisor release 20261109.0 in the Docker bootstrap; kit in `vms/kit/gv/`.
-   Still to do: Kubernetes `RuntimeClass`, Firecracker. Original plan: (Defensive security or Docker track). Run
+   Kubernetes: a gVisor `RuntimeClass` (k8s-418) and a ValidatingAdmissionPolicy that makes it
+   mandatory per namespace (k8s-419); the k8s nodes get runsc in `k8s-prepull.sh`. Still to do:
+   Firecracker (needs nested virtualization: Apple M3 or newer). Original plan: (Defensive security or Docker track). Run
    generated code under `runsc` (arm64 works) in the Docker VM: no network or an egress
    allow-list in nftables, seccomp, read-only root, CPU/memory/pids limits, no secrets
    mounted. Checks attempt escapes, network calls, fork bombs and reading host files.
