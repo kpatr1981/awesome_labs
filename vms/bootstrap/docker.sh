@@ -196,6 +196,23 @@ RUN set -e; case "$TARGETARCH" in \
 ENV TEMPORAL_ADDRESS=127.0.0.1:7233
 DOCKERFILE
 fi
+# Keycloak for the Defensive track's identity module: built once (`kc.sh build`) so each lab's
+# server starts in ~20 s instead of ~50 s; dev-file database, health endpoints on :9000.
+if ! docker image inspect kl-keycloak:1 >/dev/null 2>&1; then
+  echo "==> building the Keycloak image (keycloak 26.8.2, ~270 MB to download)"
+  docker build -q -t kl-keycloak:1 - <<'DOCKERFILE'
+FROM quay.io/keycloak/keycloak:26.8.2
+RUN /opt/keycloak/bin/kc.sh build --health-enabled=true --db=dev-file
+DOCKERFILE
+fi
+# Python with PyJWT and requests, for the identity labs' APIs and clients.
+if ! docker image inspect kl-idp:1 >/dev/null 2>&1; then
+  echo "==> building the identity-labs Python image (pyjwt 2.15.1, cryptography, requests)"
+  docker build -q -t kl-idp:1 - <<'DOCKERFILE'
+FROM python:3.12-slim
+RUN pip install --no-cache-dir "pyjwt[crypto]==2.15.1" cryptography==50.0.2 requests==2.34.2
+DOCKERFILE
+fi
 # gVisor's runsc (pinned, SHA-512 checked) and the job image kl-job:1, for the Defensive
 # track's sandboxing module. runsc is not registered with Docker: the labs do that.
 if ! /usr/local/bin/runsc --version 2>/dev/null | grep -q release- || ! docker image inspect kl-job:1 >/dev/null 2>&1; then

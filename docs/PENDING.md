@@ -8,7 +8,7 @@ what to consolidate. The target doesn't lower the bar: a lab should carry a real
 scenario and teach a concept. The parts of this list that the existing exercises don't cover
 are not started.
 
-Exercise counts (<!-- count:total -->1,854<!-- /count --> total):
+Exercise counts (<!-- count:total -->1,866<!-- /count --> total):
 
 | Topic | Exercises | Target | Track | Module files |
 |---|---|---|---|---|
@@ -19,7 +19,7 @@ Exercise counts (<!-- count:total -->1,854<!-- /count --> total):
 | Networking | <!-- count:networking -->106<!-- /count --> | 250 | `networking` | `exercises/networking/` |
 | Cloud & platform | <!-- count:cloud -->93<!-- /count --> | 250 | `cloud` | `exercises/cloud/` |
 | Data | <!-- count:data -->78<!-- /count --> | 250 | `data` | `exercises/data/` |
-| Defensive security | <!-- count:defensive -->91<!-- /count --> | 250 | `defensive` | `exercises/defensive/` |
+| Defensive security | <!-- count:defensive -->103<!-- /count --> | 250 | `defensive` | `exercises/defensive/` |
 | Programming | <!-- count:programming -->147<!-- /count --> | 250 | `programming` | `exercises/programming/` |
 | Data science | <!-- count:datascience -->83<!-- /count --> | 250 | `datascience` | `exercises/datascience/` |
 | Git | <!-- count:git -->275<!-- /count --> | 250 | `git` | `exercises/git/` |
@@ -1520,9 +1520,17 @@ still be pinned and pulled. If not, consider Garage or SeaweedFS, though the com
 
 ### Authentication and authorization labs
 
-Today only basics and token attacks are covered: no OAuth2, OIDC, SSO, Keycloak or LDAP. Keycloak
-is the main tool, because it's the most common self-hosted identity provider. The OIDC concepts
-carry over to Okta, Entra ID and Auth0, which can't run in a lab.
+**Done** (2026-11-27) in `exercises/defensive/10-identity.yaml` (sec-106..117, 12 labs): a realm,
+reading a token, an API that validates tokens (alg none, HS256 with the public key, other realm,
+wrong audience, expiry), 401 vs 403 with roles, the audience mapper, oauth2-proxy in front of a
+tool with a group, debugging a broken login, a service account with token reuse, LDAP federation
+with lldap, offboarding (sessions, refresh-token rotation), brute-force and password policy, and a
+realm-as-code capstone. Images `kl-keycloak:1`, `kl-idp:1`, oauth2-proxy v7.15.6, lldap v0.6.3;
+kit in `vms/kit/kc/`. Still to do: **Kubernetes OIDC with Dex** (below), SAML, MFA/OTP, token
+exchange. Original notes:
+
+Keycloak is the main tool, because it's the most common self-hosted identity provider. The OIDC
+concepts carry over to Okta, Entra ID and Auth0, which can't run in a lab.
 
 **Tested on the 3GiB Docker VM with Keycloak 26.4.7 in `start-dev`:** ready in about 18s, 475MiB idle
 and about 515MiB after creating a realm, client and user and logging in. Works under an 800MiB

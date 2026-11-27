@@ -2782,3 +2782,227 @@ tw_give() {
   local f
   for f in "$@"; do install -o "$(lab_user)" -m 644 "$TW_KIT/lab/$f" "/lab/$f"; done
 }
+
+# ---------- identity helpers (defensive: Keycloak, OIDC and SSO; images kl-keycloak:1 =
+# keycloak 26.8.2 pre-built, kl-idp:1 = python 3.12 + pyjwt + requests) ----------
+KC_IMAGE=kl-keycloak:1
+IDP_IMAGE=kl-idp:1
+KC_URL=http://127.0.0.1:8080
+KC_KIT=/opt/kubelab/kc
+KC_DIR=/var/lib/kubelab/kc
+O2P_IMAGE=quay.io/oauth2-proxy/oauth2-proxy:v7.15.6
+LLDAP_IMAGE=lldap/lldap:v0.6.3-alpine
+
+# kc_start -> Keycloak in container kc (http://127.0.0.1:8080, admin console /admin, user admin /
+# password admin; health on :9000), and for the lab user: `kcadm` (Keycloak's admin CLI, run in
+# the container), `idpy` (Python with pyjwt and requests, as you, /lab mounted, the VM's network)
+# and `kc-login URL USER PASSWORD` (a scripted browser login, see vms/kit/kc/login.py)
+kc_start() {
+  mkdir -p "$KC_DIR"
+  chmod 755 "$KC_DIR"
+  docker rm -f kc >/dev/null 2>&1
+  docker run -d --name kc --network host -m 900m -e KC_BOOTSTRAP_ADMIN_USERNAME=admin -e KC_BOOTSTRAP_ADMIN_PASSWORD=admin \
+    "$KC_IMAGE" start --optimized --http-enabled=true --hostname-strict=false --http-port 8080 >/dev/null
+  on_reset 'docker rm -f kc o2p whoami lldap kc-api >/dev/null 2>&1; rm -rf /var/lib/kubelab/kc /usr/local/bin/kcadm /usr/local/bin/idpy /usr/local/bin/kc-login'
+  cat >/usr/local/bin/kcadm <<'WRAP'
+#!/bin/bash
+# kcadm: Keycloak's admin CLI (kcadm.sh), run inside the kc container. Log in first:
+#   kcadm config credentials --server http://127.0.0.1:8080 --realm master --user admin --password admin
+tty=()
+[ -t 0 ] && [ -t 1 ] && tty=(-t)
+exec docker exec -i "${tty[@]}" kc /opt/keycloak/bin/kcadm.sh "$@"
+WRAP
+  cat >/usr/local/bin/idpy <<WRAP
+#!/bin/bash
+# idpy: Python 3.12 with pyjwt, cryptography and requests ($IDP_IMAGE), as you, seeing /lab.
+wd=\$PWD
+case "\$wd/" in /lab/*) ;; *) wd=/lab ;; esac
+tty=()
+[ -t 0 ] && [ -t 1 ] && tty=(-t)
+exec docker run --rm -i "\${tty[@]}" --init --label kl-idp=user --network host -u "\$(id -u):\$(id -g)" -e HOME=/tmp \\
+  -e PYTHONUNBUFFERED=1 -v /lab:/lab -w "\$wd" $IDP_IMAGE python "\$@"
+WRAP
+  cat >/usr/local/bin/kc-login <<WRAP
+#!/bin/bash
+# kc-login URL USER PASSWORD: log in through Keycloak like a browser; prints where it ended up
+[ \$# -eq 3 ] || { echo "usage: kc-login URL USER PASSWORD" >&2; exit 2; }
+docker run --rm --network host -v $KC_KIT:/kc:ro $IDP_IMAGE python /kc/login.py "\$@" |
+  jq -r '"status: \(.status)\nurl:    \(.url)\nlogin form shown: \(.login_page)" + (if .kc_error != "" then "\nKeycloak says: \(.kc_error)" else "" end) + (if .error then "\nerror: \(.error)" else "" end) + "\n--- page (Cookie lines cut) ---\n" + (.body | split("\n") | map(if test("^Cookie:") then .[0:60] + "..." else . end) | join("\n") | .[0:1500])'
+WRAP
+  chmod 755 /usr/local/bin/kcadm /usr/local/bin/idpy /usr/local/bin/kc-login
+  if ! eventually 150 'curl -sf http://127.0.0.1:9000/health/ready >/dev/null'; then
+    echo "Keycloak did not come up"; docker logs --tail 20 kc; return 1
+  fi
+}
+
+# kc_admin_token -> an admin access token (master realm, admin-cli)
+kc_admin_token() {
+  curl -s -d grant_type=password -d client_id=admin-cli -d username=admin -d password=admin \
+    "$KC_URL/realms/master/protocol/openid-connect/token" | jq -r '.access_token // empty'
+}
+# kc_api METHOD PATH [JSON] -> the admin REST API: kc_api GET shop/users?username=alice
+# (PATH is below /admin/realms/; an empty PATH is the realm list)
+kc_api() {
+  local m=$1 p=$2 t
+  t=$(kc_admin_token)
+  if [ $# -ge 3 ]; then
+    curl -s -X "$m" -H "Authorization: Bearer $t" -H 'Content-Type: application/json' -d "$3" "$KC_URL/admin/realms/$p"
+  else
+    curl -s -X "$m" -H "Authorization: Bearer $t" "$KC_URL/admin/realms/$p"
+  fi
+}
+# kc_realm [JQ-FILTER] <<'JSON' -> create a realm from its JSON representation (users with
+# credentials, roles, groups, clients and their mappers), after passing it through JQ-FILTER;
+# replaces a realm of the same name
+kc_realm() {
+  local j name
+  j=$(jq -c "${1:-.}") || return 1
+  name=$(jq -r .realm <<<"$j")
+  kc_api DELETE "$name" >/dev/null 2>&1
+  kc_api POST "" "$j" >/dev/null
+  [ "$(kc_api GET "$name" | jq -r '.realm // empty')" = "$name" ] || { echo "could not create realm $name"; return 1; }
+}
+# kc_realm_file NAME [JQ-FILTER] -> kc_realm with vms/kit/kc/realms/NAME.json
+kc_realm_file() { kc_realm "${2:-.}" <"$KC_KIT/realms/$1.json"; }
+
+# kc_tokens REALM CLIENT SECRET [USER PASSWORD] -> the token endpoint's JSON answer: client
+# credentials without USER, the password grant with it (SECRET may be "" for a public client)
+kc_tokens() {
+  local r=$1 c=$2 s=$3 args=()
+  [ -n "$s" ] && args+=(-d "client_secret=$s")
+  if [ $# -ge 5 ]; then args+=(-d grant_type=password -d "username=$4" -d "password=$5"); else args+=(-d grant_type=client_credentials); fi
+  curl -s -d "client_id=$c" "${args[@]}" "$KC_URL/realms/$r/protocol/openid-connect/token"
+}
+# kc_token ... -> just the access token of kc_tokens
+kc_token() { kc_tokens "$@" | jq -r '.access_token // empty'; }
+# kc_claims TOKEN -> the token's payload as JSON; kc_header TOKEN -> its header
+kc_b64() { local s; s=$(tr '_-' '/+'); while [ $(( ${#s} % 4 )) -ne 0 ]; do s="$s="; done; base64 -d <<<"$s" 2>/dev/null; }
+kc_claims() { cut -d. -f2 <<<"$1" | kc_b64; }
+kc_header() { cut -d. -f1 <<<"$1" | kc_b64; }
+
+# kc_login URL USER PASSWORD -> a scripted browser login (vms/kit/kc/login.py); its JSON is left
+# in $KC_OUT: status, url, body, login_page, kc_error, first.{status,location}, hops
+kc_login() {
+  mkdir -p "$KC_DIR"
+  KC_OUT=$KC_DIR/login.json
+  docker run --rm --network host -v "$KC_KIT:/kc:ro" "$IDP_IMAGE" python /kc/login.py "$@" >"$KC_OUT" 2>/dev/null
+}
+# kj 'JQ' -> query the last kc_login (or kc_py) JSON
+kj() { jq -e "$1" "$KC_OUT" >/dev/null 2>&1; }
+
+# kc_whoami -> traefik/whoami on 127.0.0.1:8081: the internal tool behind the login; it echoes
+# the request, headers included (X-Forwarded-Email, X-Forwarded-User from oauth2-proxy)
+kc_whoami() {
+  docker rm -f whoami >/dev/null 2>&1
+  docker run -d --name whoami --network host traefik/whoami:v1.10 --port 8081 >/dev/null
+}
+# kc_proxy [CFG] -> (re)start oauth2-proxy (container o2p) from CFG (default
+# /lab/oauth2-proxy.cfg) and wait until it listens on 127.0.0.1:4180; prints its log on failure
+kc_proxy() {
+  local cfg=${1:-/lab/oauth2-proxy.cfg}
+  docker rm -f o2p >/dev/null 2>&1
+  [ -f "$cfg" ] || { info "no $cfg"; return 1; }
+  docker run -d --name o2p --network host -v "$cfg:/etc/oauth2-proxy.cfg:ro" "$O2P_IMAGE" --config /etc/oauth2-proxy.cfg >/dev/null
+  if ! eventually 20 'curl -s -o /dev/null http://127.0.0.1:4180/ping'; then
+    info "oauth2-proxy didn't start; its log:"
+    docker logs --tail 8 o2p 2>&1 | while IFS= read -r l; do info "  $l"; done
+    return 1
+  fi
+}
+
+# kc_py <<'PY' ... PY -> hidden client code in kl-idp:1 (as root, /lab mounted, the kit at /kc);
+# it defines test() returning something JSON-serialisable, left in $KC_OUT. Helpers in the
+# code: token(realm, client, secret, user=None, pw=None), claims(tok), call(method, url, tok),
+# forge(claims, alg="none"|"HS256", key=b"") (a token signed with HMAC or not at all), PUBKEY(realm)
+kc_py() {
+  local d rc
+  mkdir -p "$KC_DIR"
+  d=$(mktemp -d)
+  chmod 755 "$d"
+  cat >"$d/test.py"
+  KC_OUT=$KC_DIR/out.json
+  docker run --rm --network host -v /lab:/lab -v "$d:/t:ro" -v "$KC_KIT:/kc:ro" -w /lab "$IDP_IMAGE" \
+    timeout 300 python -c 'import sys; sys.path.insert(0, "/kc"); from kchelp import *; exec(open("/t/test.py").read()); import json; print(json.dumps(test(), default=str))' \
+    >"$d/out" 2>"$d/err"; rc=$?
+  tail -1 "$d/out" >"$KC_OUT"
+  [ $rc -ne 0 ] && tail -5 "$d/err" | while IFS= read -r l; do info "$l"; done
+  rm -rf "$d"
+  return $rc
+}
+
+# kc_api_run [FILE] [PORT] -> run the learner's API (default /lab/api.py) in container kc-api as
+# the lab user, waiting until it listens on 127.0.0.1:PORT (default 5000); prints its log if not
+kc_api_run() {
+  local f=${1:-/lab/api.py} port=${2:-5000}
+  docker rm -f kc-api >/dev/null 2>&1
+  docker ps -q --filter label=kl-idp | xargs -r docker rm -f >/dev/null 2>&1
+  docker run -d --name kc-api --label kl-idp=check --network host -u "$(id -u "$(lab_user)"):$(id -g "$(lab_user)")" \
+    -e HOME=/tmp -e PYTHONUNBUFFERED=1 -v /lab:/lab -v "$KC_KIT:/kc:ro" -w "$(dirname "$f")" "$IDP_IMAGE" python "$f" >/dev/null || return 1
+  if ! eventually 20 "curl -s -o /dev/null http://127.0.0.1:$port/"; then
+    info "the API isn't listening on 127.0.0.1:$port; its output:"
+    docker logs --tail 12 kc-api 2>&1 | while IFS= read -r l; do info "  $l"; done
+    return 1
+  fi
+}
+
+# kc_lldap -> lldap (container lldap): LDAP on ldap://127.0.0.1:3890, base dc=example,dc=com,
+# admin uid=admin,ou=people,dc=example,dc=com / password $LLDAP_PASS, web UI :17170
+LLDAP_PASS=ldap-admin-pw
+kc_lldap() {
+  docker rm -f lldap >/dev/null 2>&1
+  docker run -d --name lldap --network host -m 200m -e LLDAP_JWT_SECRET="$(head -c 24 /dev/urandom | base64)" \
+    -e LLDAP_KEY_SEED="$(head -c 24 /dev/urandom | base64)" -e LLDAP_LDAP_USER_PASS="$LLDAP_PASS" \
+    -e LLDAP_LDAP_BASE_DN=dc=example,dc=com "$LLDAP_IMAGE" >/dev/null
+  eventually 30 'curl -sf http://127.0.0.1:17170/health >/dev/null'
+}
+_lldap_gql() {
+  local t
+  t=$(curl -s -H 'Content-Type: application/json' -d "{\"username\":\"admin\",\"password\":\"$LLDAP_PASS\"}" http://127.0.0.1:17170/auth/simple/login | jq -r .token)
+  curl -s -H "Authorization: Bearer $t" -H 'Content-Type: application/json' -d "$(jq -nc --arg q "$1" '{query: $q}')" http://127.0.0.1:17170/api/graphql
+}
+# kc_ldap_user ID PASSWORD FIRST LAST [GROUP...] -> an LDAP user (email ID@example.com) in those groups
+kc_ldap_user() {
+  local id=$1 pw=$2 fn=$3 ln=$4 g gid
+  shift 4
+  _lldap_gql "mutation { createUser(user: {id: \"$id\", email: \"$id@example.com\", displayName: \"$fn $ln\", firstName: \"$fn\", lastName: \"$ln\"}) { id } }" >/dev/null
+  docker exec lldap /app/lldap_set_password --base-url http://127.0.0.1:17170 --admin-username admin \
+    --admin-password "$LLDAP_PASS" --username "$id" --password "$pw" >/dev/null 2>&1
+  for g in "$@"; do
+    gid=$(_lldap_gql '{ groups { id displayName } }' | jq -r --arg g "$g" '.data.groups[] | select(.displayName == $g) | .id')
+    [ -n "$gid" ] || gid=$(_lldap_gql "mutation { createGroup(name: \"$g\") { id } }" | jq -r .data.createGroup.id)
+    _lldap_gql "mutation { addUserToGroup(userId: \"$id\", groupId: $gid) { ok } }" >/dev/null
+  done
+}
+# kc_ref_api [PORT] [NAME=VALUE...] -> the reference orders API (vms/kit/kc/orders_api.py) in
+# container kc-api on 127.0.0.1:PORT (default 5000), with environment overrides (ISSUER, AUDIENCE,
+# READ_ROLE, WRITE_ROLE); requests logged to $KC_DIR/api.jsonl (kc_api_log 'JQ' reads it)
+kc_ref_api() {
+  local port=${1:-5000} envs=() kv
+  shift $(( $# > 0 ? 1 : 0 ))
+  for kv in "$@"; do envs+=(-e "$kv"); done
+  docker rm -f kc-api >/dev/null 2>&1
+  : >"$KC_DIR/api.jsonl"
+  chmod 666 "$KC_DIR/api.jsonl"
+  docker run -d --name kc-api --network host -e PORT="$port" -e PYTHONUNBUFFERED=1 "${envs[@]}" -v "$KC_KIT:/kc:ro" -v "$KC_DIR:/log" \
+    "$IDP_IMAGE" python /kc/orders_api.py >/dev/null
+  eventually 20 "curl -s -o /dev/null http://127.0.0.1:$port/"
+}
+kc_api_log() { jq -c "$1" "$KC_DIR/api.jsonl" 2>/dev/null; }
+# kc_o2p_tools -> `o2p-run` for the lab user: (re)start oauth2-proxy (container o2p, on
+# 127.0.0.1:4180) from /lab/oauth2-proxy.cfg and show its first log lines; `o2p-logs` follows them
+kc_o2p_tools() {
+  cat >/usr/local/bin/o2p-run <<WRAP
+#!/bin/bash
+# o2p-run: (re)start oauth2-proxy $O2P_IMAGE from /lab/oauth2-proxy.cfg on 127.0.0.1:4180
+cfg=\${1:-/lab/oauth2-proxy.cfg}
+[ -f "\$cfg" ] || { echo "no \$cfg" >&2; exit 1; }
+docker rm -f o2p >/dev/null 2>&1
+docker run -d --name o2p --network host -v "\$(realpath "\$cfg"):/etc/oauth2-proxy.cfg:ro" $O2P_IMAGE --config /etc/oauth2-proxy.cfg >/dev/null || exit 1
+sleep 2
+docker logs o2p 2>&1 | tail -5
+docker ps -q --filter name=^o2p\$ --filter status=running | grep -q . && echo "oauth2-proxy is running on http://127.0.0.1:4180 (o2p-logs to follow its log)" || { echo "oauth2-proxy exited"; exit 1; }
+WRAP
+  printf '#!/bin/bash\n# o2p-logs: follow the oauth2-proxy log\nexec docker logs -f --tail 20 o2p\n' >/usr/local/bin/o2p-logs
+  chmod 755 /usr/local/bin/o2p-run /usr/local/bin/o2p-logs
+  on_reset 'rm -f /usr/local/bin/o2p-run /usr/local/bin/o2p-logs'
+}
