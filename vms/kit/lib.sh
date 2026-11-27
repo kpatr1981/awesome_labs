@@ -2630,3 +2630,155 @@ gv_inspect() {
 }
 # gi 'JQ' -> query the inspected job container (.[0] is the container)
 gi() { jq -r ".[0] | $1" "$GV_STATE/inspect.json" 2>/dev/null; }
+
+# ---------- Temporal helpers (programming: durable workflows; image kl-temporal:1 =
+# python:3.12-slim + temporalio 1.36.1 + the temporal CLI 1.10.1) ----------
+TW_IMAGE=kl-temporal:1
+TW_KIT=/opt/kubelab/tw
+TW_DIR=/var/lib/kubelab/tw
+
+# tw CLI-ARGS... -> the temporal CLI as root, for setups and checks (sees /lab and $TW_DIR)
+tw() { docker run --rm -i --network host -v /lab:/lab -v "$TW_DIR:$TW_DIR" "$TW_IMAGE" temporal "$@"; }
+# twt SECONDS CLI-ARGS... -> the same, given up after SECONDS (`timeout` can't run a shell function)
+twt() { local t=$1; shift; docker run --rm -i --network host -v /lab:/lab -v "$TW_DIR:$TW_DIR" "$TW_IMAGE" timeout "$t" temporal "$@"; }
+
+# tw_start -> the Temporal dev server (container kl-temporal: gRPC 127.0.0.1:7233, web UI
+# http://127.0.0.1:8233, history kept in volume kl-temporal-data so a server restart keeps it),
+# the fake services on 127.0.0.1:9100 (tw_svc), and for the lab user: `temporal` (the CLI) and
+# `tpy` (Python with the temporalio SDK), both run in kl-temporal:1 as the caller with /lab mounted
+tw_start() {
+  mkdir -p "$TW_DIR"
+  docker rm -f kl-temporal >/dev/null 2>&1
+  docker volume rm kl-temporal-data >/dev/null 2>&1
+  docker volume create kl-temporal-data >/dev/null
+  docker run -d --name kl-temporal --network host -v kl-temporal-data:/data "$TW_IMAGE" \
+    temporal server start-dev --ip 0.0.0.0 --db-filename /data/temporal.db --log-level error >/dev/null
+  on_reset 'docker ps -aq --filter label=kl-tw | xargs -r docker rm -f >/dev/null 2>&1; docker rm -f kl-temporal >/dev/null 2>&1; docker volume rm kl-temporal-data >/dev/null 2>&1; rm -f /usr/local/bin/temporal /usr/local/bin/tpy'
+  local w
+  for w in temporal tpy; do
+    cat >/usr/local/bin/$w <<WRAP
+#!/bin/bash
+# $w for the durable-workflow labs: runs in $TW_IMAGE as you, sees /lab and the VM's network.
+wd=\$PWD
+case "\$wd/" in /lab/*) ;; *) wd=/lab ;; esac
+envs=()
+while IFS= read -r v; do envs+=(-e "\$v"); done < <(compgen -e | grep -E '^(TEMPORAL_|LAB_)')
+tty=()
+[ -t 0 ] && [ -t 1 ] && tty=(-t)
+exec docker run --rm -i "\${tty[@]}" --init --label kl-tw=user --network host -u "\$(id -u):\$(id -g)" -e HOME=/tmp \\
+  -e PYTHONUNBUFFERED=1 "\${envs[@]}" -v /lab:/lab -w "\$wd" $TW_IMAGE $([ $w = tpy ] && echo python || echo temporal) "\$@"
+WRAP
+    chmod 755 /usr/local/bin/$w
+  done
+  tw_svc
+  eventually 90 'tw operator cluster health 2>/dev/null | grep -qi serving' ||
+    { echo "the Temporal dev server did not come up"; docker logs --tail 20 kl-temporal; return 1; }
+}
+
+# tw_svc ['CONFIG-JSON'] -> (re)start the fake services (vms/kit/tw/svc.py) on 127.0.0.1:9100
+# with that behaviour (default {}), counters and the call log ($TW_DIR/calls.jsonl) cleared
+tw_svc() {
+  mkdir -p "$TW_DIR"
+  [ -f "$TW_DIR/svc.pid" ] && kill "$(cat "$TW_DIR/svc.pid")" 2>/dev/null
+  pkill -f "$TW_KIT/svc.py" 2>/dev/null
+  local cfg=${1:-}
+  [ -n "$cfg" ] || cfg='{}'
+  printf '%s\n' "$cfg" >"$TW_DIR/svc.json"
+  : >"$TW_DIR/calls.jsonl"
+  chmod 755 "$TW_DIR"
+  chmod 644 "$TW_DIR/calls.jsonl" "$TW_DIR/svc.json"
+  setsid python3 "$TW_KIT/svc.py" 9100 "$TW_DIR/svc.json" "$TW_DIR/calls.jsonl" </dev/null >/dev/null 2>&1 &
+  echo $! >"$TW_DIR/svc.pid"
+  on_reset "kill \$(cat $TW_DIR/svc.pid 2>/dev/null) 2>/dev/null; pkill -f $TW_KIT/svc.py 2>/dev/null; rm -rf $TW_DIR"
+  eventually 20 'curl -sf http://127.0.0.1:9100/calls >/dev/null'
+}
+# tw_svc_set 'CONFIG-JSON' -> change the fake services' behaviour without clearing counters
+tw_svc_set() { printf '%s\n' "$1" >"$TW_DIR/svc.json"; }
+
+# tw_calls 'JQ-FILTER' -> the fake services' calls (one JSON object per line) that match, e.g.
+#   tw_calls 'select(.path == "/charge" and .effect)' | wc -l
+tw_calls() { jq -c "$1" "$TW_DIR/calls.jsonl" 2>/dev/null; }
+tw_count() { tw_calls "$1" | wc -l; }
+
+# tw_stop_workers -> stop every worker or tpy the learner left running, so the check's own
+# worker is the only one on the task queue (an old worker would take half of the tasks)
+tw_stop_workers() {
+  local n
+  n=$(docker ps -q --filter label=kl-tw | wc -l)
+  [ "$n" -gt 0 ] && info "stopping $n worker/tpy container(s) you left running, the check starts its own"
+  docker ps -aq --filter label=kl-tw | xargs -r docker rm -f >/dev/null 2>&1
+  true
+}
+
+# tw_worker QUEUE [FILE] -> run the learner's worker (default /lab/worker.py; or a file under
+# $TW_DIR, mounted read-only) as the lab user in container kl-tw-worker and wait until it polls
+# QUEUE; fails (printing its log) if it doesn't
+tw_worker() {
+  local q=$1 f=${2:-/lab/worker.py}
+  tw_stop_workers >/dev/null
+  docker run -d --name kl-tw-worker --label kl-tw=check --init --network host -u "$(id -u "$(lab_user)"):$(id -g "$(lab_user)")" \
+    -e HOME=/tmp -e PYTHONUNBUFFERED=1 -v /lab:/lab -v "$TW_DIR:$TW_DIR:ro" -w "$(dirname "$f")" "$TW_IMAGE" python "$f" >/dev/null || return 1
+  if ! eventually 40 "tw_pollers $q | grep -q ."; then
+    info "your worker isn't polling task queue $q; its output:"
+    docker logs --tail 15 kl-tw-worker 2>&1 | while IFS= read -r l; do info "  $l"; done
+    return 1
+  fi
+}
+# tw_pollers QUEUE -> the identities polling QUEUE for workflow tasks, one per line
+tw_pollers() { tw task-queue describe --task-queue "$1" -o json 2>/dev/null | jq -r '.. | .pollers? // empty | .[]? | .identity' 2>/dev/null; }
+# tw_worker_log -> the check worker's output
+tw_worker_log() { docker logs kl-tw-worker 2>&1; }
+# tw_kill_worker -> SIGKILL the check's worker (a crash: no graceful shutdown)
+tw_kill_worker() { docker kill kl-tw-worker >/dev/null 2>&1; docker rm -f kl-tw-worker >/dev/null 2>&1; true; }
+
+# tw_hist ID [RUN] -> the workflow's event history as JSON in $TW_DIR/hist-ID.json (TW_HIST)
+tw_hist() {
+  TW_HIST=$TW_DIR/hist-$1.json
+  tw workflow show -w "$1" ${2:+-r "$2"} -o json >"$TW_HIST" 2>/dev/null
+}
+# th 'JQ' -> query the last tw_hist (events are .events[], eventType like "ActivityTaskScheduled")
+th() { jq -e "$1" "$TW_HIST" >/dev/null 2>&1; }
+# tw_events -> the last tw_hist's event types, one per line, without the EVENT_TYPE_ prefix
+tw_events() { jq -r '.events[].eventType' "$TW_HIST" 2>/dev/null | sed 's/^EVENT_TYPE_//'; }
+# tw_status ID -> the workflow's status: Running, Completed, Failed, TimedOut, ...
+tw_status() { tw workflow describe -w "$1" -o json 2>/dev/null | jq -r '.workflowExecutionInfo.status // empty' | sed 's/^WORKFLOW_EXECUTION_STATUS_//'; }
+# tw_wait ID [SECONDS] -> wait until the workflow is no longer Running
+tw_wait() { eventually "${2:-60}" "s=\$(tw_status $1); [ -n \"\$s\" ] && [ \"\$s\" != Running ] && [ \"\$s\" != RUNNING ]"; }
+
+# tw_py <<'PY' ... PY -> run hidden client code (temporalio SDK, as root, /lab mounted, the kit
+# at /kl) and leave the JSON it prints last in $TW_OUT. The code defines `async def test(c)`, c a
+# connected temporalio Client, returning something JSON-serialisable.
+tw_py() {
+  local d rc
+  d=$(mktemp -d)
+  chmod 755 "$d"
+  cat >"$d/test.py"
+  cat >"$d/run.py" <<'PYRUN'
+import asyncio, json, sys, traceback
+sys.path.insert(0, "/lab")
+from temporalio.client import Client
+exec(open("/t/test.py").read())
+async def main():
+    c = await Client.connect("127.0.0.1:7233")
+    return await test(c)
+try:
+    print(json.dumps(asyncio.run(main()), default=str))
+except Exception:
+    traceback.print_exc()
+    sys.exit(1)
+PYRUN
+  TW_OUT=$TW_DIR/out.json
+  docker run --rm --network host -v /lab:/lab -v "$d:/t:ro" -v "$TW_KIT:/kl:ro" -w /lab "$TW_IMAGE" \
+    timeout 300 python /t/run.py >"$d/out" 2>"$d/err"; rc=$?
+  tail -1 "$d/out" >"$TW_OUT"
+  [ $rc -ne 0 ] && tail -5 "$d/err" | while IFS= read -r l; do info "$l"; done
+  rm -rf "$d"
+  return $rc
+}
+# tj 'JQ' -> query the last tw_py result
+tj() { jq -e "$1" "$TW_OUT" >/dev/null 2>&1; }
+# tw_give FILE... -> copy files from vms/kit/tw/lab/ (shop.py: the services' client) into /lab
+tw_give() {
+  local f
+  for f in "$@"; do install -o "$(lab_user)" -m 644 "$TW_KIT/lab/$f" "/lab/$f"; done
+}

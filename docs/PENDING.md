@@ -8,7 +8,7 @@ what to consolidate. The target doesn't lower the bar: a lab should carry a real
 scenario and teach a concept. The parts of this list that the existing exercises don't cover
 are not started.
 
-Exercise counts (<!-- count:total -->1,842<!-- /count --> total):
+Exercise counts (<!-- count:total -->1,854<!-- /count --> total):
 
 | Topic | Exercises | Target | Track | Module files |
 |---|---|---|---|---|
@@ -20,7 +20,7 @@ Exercise counts (<!-- count:total -->1,842<!-- /count --> total):
 | Cloud & platform | <!-- count:cloud -->93<!-- /count --> | 250 | `cloud` | `exercises/cloud/` |
 | Data | <!-- count:data -->78<!-- /count --> | 250 | `data` | `exercises/data/` |
 | Defensive security | <!-- count:defensive -->91<!-- /count --> | 250 | `defensive` | `exercises/defensive/` |
-| Programming | <!-- count:programming -->135<!-- /count --> | 250 | `programming` | `exercises/programming/` |
+| Programming | <!-- count:programming -->147<!-- /count --> | 250 | `programming` | `exercises/programming/` |
 | Data science | <!-- count:datascience -->83<!-- /count --> | 250 | `datascience` | `exercises/datascience/` |
 | Git | <!-- count:git -->275<!-- /count --> | 250 | `git` | `exercises/git/` |
 | Terraform | <!-- count:terraform -->120<!-- /count --> | 250 | `terraform` | `exercises/terraform/` |
@@ -52,7 +52,7 @@ Exercise counts (<!-- count:total -->1,842<!-- /count --> total):
 
 ### Build next (decided 2026-11-24)
 
-These come **before** everything else on this page, in this order. Items 1 to 5
+These come **before** everything else on this page, in this order. Items 1 to 6
 are done; the others aren't started.
 
 1. ~~**Reviewing AI-written code**~~ (Programming track, new module). **Done** in
@@ -113,7 +113,13 @@ are done; the others aren't started.
    mounted. Checks attempt escapes, network calls, fork bombs and reading host files.
    Firecracker needs nested virtualization (Apple M3 or newer only), so at most an optional
    lab.
-6. **Durable workflows** (Programming track, new module): Temporal's dev server (single
+6. ~~**Durable workflows**~~ **Done** in `exercises/programming/11-durable-workflows.yaml`
+   (prog-136..147, 12 labs: first workflow, retries and non-retryable errors, timeouts, an
+   idempotency key against a double charge, heartbeats that resume a copy after the worker is
+   killed, approval by signal with a query and a timer, a saga with compensations, schedules,
+   replay tests, `workflow.patched()` with runs in flight, continue-as-new, an order-pipeline
+   capstone). Image `kl-temporal:1` (temporal CLI 1.10.1, temporalio 1.36.1); kit in
+   `vms/kit/tw/`. LangGraph and the Go SDK are not done. Original plan: Temporal's dev server (single
    binary) with Python or Go workers. Retries with backoff, activity timeouts,
    idempotent activities, a human-approval step via a signal, a worker killed mid-run that
    resumes where it left off, a workflow change that breaks determinism. Optionally

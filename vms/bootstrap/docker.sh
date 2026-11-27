@@ -179,6 +179,23 @@ DOCKERFILE
     echo "==> could not build the re-ranker image: the Retrieval exercises need it (env rebuild docker retries)"
   fi
 fi
+# Temporal for the Programming track's durable-workflows module: the Temporal CLI (its dev
+# server is a single process with an in-memory store) pinned by SHA-256, and the Python SDK.
+if ! docker image inspect kl-temporal:1 >/dev/null 2>&1; then
+  echo "==> building the Temporal image (temporal CLI 1.10.1, python 3.12, temporalio 1.36.1)"
+  docker build -q -t kl-temporal:1 - <<'DOCKERFILE'
+FROM python:3.12-slim
+ARG TARGETARCH
+ADD https://github.com/temporalio/cli/releases/download/v1.10.1/temporal_cli_1.10.1_linux_${TARGETARCH}.tar.gz /tmp/t.tgz
+RUN set -e; case "$TARGETARCH" in \
+      arm64) sum=2f748e9411b37c9cabb57f1f08e37765388c12b5534432c7aea28b593df9145d ;; \
+      amd64) sum=4c1500e2ce2d4de136e5fe8852d9b7f82eb62f19b6b383b3e0c040519a9d20b1 ;; \
+      *) echo "no temporal CLI for $TARGETARCH"; exit 1 ;; esac; \
+    echo "$sum  /tmp/t.tgz" | sha256sum -c -; tar -xzf /tmp/t.tgz -C /usr/local/bin temporal; rm /tmp/t.tgz; \
+    pip install --no-cache-dir temporalio==1.36.1
+ENV TEMPORAL_ADDRESS=127.0.0.1:7233
+DOCKERFILE
+fi
 # gVisor's runsc (pinned, SHA-512 checked) and the job image kl-job:1, for the Defensive
 # track's sandboxing module. runsc is not registered with Docker: the labs do that.
 if ! /usr/local/bin/runsc --version 2>/dev/null | grep -q release- || ! docker image inspect kl-job:1 >/dev/null 2>&1; then
