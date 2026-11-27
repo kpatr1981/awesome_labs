@@ -2887,8 +2887,8 @@ kc_login() {
   KC_OUT=$KC_DIR/login.json
   docker run --rm --network host -v "$KC_KIT:/kc:ro" "$IDP_IMAGE" python /kc/login.py "$@" >"$KC_OUT" 2>/dev/null
 }
-# kj 'JQ' -> query the last kc_login (or kc_py) JSON
-kj() { jq -e "$1" "$KC_OUT" >/dev/null 2>&1; }
+# kcj 'JQ' -> query the last kc_login (or kc_py) JSON
+kcj() { jq -e "$1" "$KC_OUT" >/dev/null 2>&1; }
 
 # kc_whoami -> traefik/whoami on 127.0.0.1:8081: the internal tool behind the login; it echoes
 # the request, headers included (X-Forwarded-Email, X-Forwarded-User from oauth2-proxy)
