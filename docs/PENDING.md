@@ -463,6 +463,11 @@ then GitOps for Kubernetes, then Git LFS.
 | **Write your own controller** | A small operator with controller-runtime (Go) or kopf (Python): the reconcile loop, finalizers, status conditions, a controller that hot-loops | k8s lab | CRDs are covered; nothing writes a controller yet |
 | **Already queued** | | | *Linkerd service mesh* and *Cluster backup with Velero* in *Next round*; *Canary releases with Argo Rollouts* in *Even more ideas* |
 | **Smaller** | kube-proxy in IPVS or nftables mode, dual-stack Services | k8s lab | |
+| **Quiesce a namespace and put it back exactly** | Before maintenance, suspend the CronJobs, pause the HPAs, scale the Deployments to 0 and wait until every Job pod has finished, all recorded in a state file. Then restore the original settings. Traps: a CronJob that was already suspended stays suspended, a Deployment that was meant to be at 0 stays at 0, and an app that was unready *before* you started (Deployment status plus ready EndpointSlices) is recorded as a baseline and not blamed on the maintenance. Incident version: a half-finished run left everything at 0, so restore it from the state file. Checks compare the end state with the snapshot | k8s lab | Added 2026-11-26 from an ops-tool review, like the next four rows. KEDA's `autoscaling.keda.sh/paused` annotation is an optional extension (see the *KEDA* row in *Even more ideas*) |
+| **Plan, then apply, with a drift guard** | A maintenance script records each object's `metadata.uid` and a hash of its spec (`jq -cS .spec \| sha256sum`) at plan time and refuses to act when the object was recreated or edited in between. The check recreates one Deployment and edits another between plan and execute. Also: the plan is bound to a hash of the script's own code, so a changed script needs a new plan | k8s lab | The capstone for the row above |
+| **A lock in the cluster** | A ConfigMap or `coordination.k8s.io` Lease as a maintenance lock: `create` fails if it already exists, an owner token proves who holds it, a stale lock whose PID is dead, and a takeover with `replace` on the fetched `resourceVersion`, so two rescuers racing each other conflict and only one wins | k8s lab | |
+| **Report across many clusters with deadlines** | A version report (image tag × environment) over three contexts: one healthy, one unreachable, one where RBAC denies access. Parallel jobs, a temp kubeconfig per job, `--request-timeout`, results published by atomic rename, stragglers killed at a deadline. The report must tell "not deployed" (`-`) apart from "couldn't read" (`?`), and a failed `kubectl` must not read as "no Deployments" (`pipefail`) | k8s lab; extra contexts can point at bad endpoints or restricted ServiceAccounts | |
+| **Matching label selectors properly** | A cleanup script that matches pods with jq's `contains()` (a substring match), so `app=cds` also matches the `cds-job-*` pods and deletes them. Fix it with exact `matchLabels` plus `matchExpressions` (`In`, `NotIn`, `Exists`, `DoesNotExist`), or with `kubectl -l` | k8s lab | Could also be a planted defect in *Reviewing AI-written code* |
 
 ### Git gaps
 
@@ -471,6 +476,7 @@ then GitOps for Kubernetes, then Git LFS.
 | **Git LFS** | Done in `exercises/git/23-lfs.yaml` (git-256..262), on a local Gitea | | |
 | **Credential helpers and HTTPS auth** | Done in `exercises/git/24-credentials.yaml` (git-263..268) | | |
 | **Pull-request workflows** | Done in `exercises/git/25-pull-requests.yaml` (git-269..275), on Gitea | | |
+| **A config directory with its own repo** | A tool "versions" `~/.aws/config` with `git -C ~/.aws`, but `$HOME` is already a dotfiles repo, so the commits (and `credentials`) land in the home repo. Fix it with its own `git init`, `env -u GIT_DIR -u GIT_WORK_TREE`, and a deny-all `.gitignore` that allows only `config`. Then restore an earlier config from that history | Any VM | Added 2026-11-26 from an ops-tool review |
 
 ## Shared lab foundations
 
@@ -662,6 +668,26 @@ with the real tools:
 - **Relies on:** the QEMU modules for the guest and QMP helpers, the `mdadm` RAID idea, and
   *Prometheus and alerting* for the monitoring lab.
 
+### Operational shell tools module
+
+Added 2026-11-26 from a review of a large Bash ops tool (cloud logins, tunnels, cluster
+maintenance). Not started. Every lab is a broken but realistic tool script to fix. It is the home
+for *Shell & text processing* bugs that only bite in long-lived tools. Runs on any VM, and the
+checks are cheap.
+
+| Level | Lab | What breaks and what to do |
+|---|---|---|
+| Beginner | **`grep -q` says the port is free** | Under `set -o pipefail`, `lsof … \| grep -q LISTEN` makes `grep` exit early, so the upstream command gets SIGPIPE and a busy port reads as free. The same family: `head -1` causing "Broken pipe" when SIGPIPE is ignored, and `:5432` matching `:54320`. Fix the port check and a `find_free_port` that skips dual-stack IPv6 listeners |
+| Beginner | **Quote what you send to a remote shell** | A file name like `x; rm -rf ~` goes into a command that runs under `sh` on another host. Fix it with a quoting function and test it with hostile names (spaces, `$( )`, `'`, newlines) |
+| Intermediate | **Secrets off argv and out of the log** | A token shows up in `ps` and `/proc/*/cmdline` and in a log people attach to bug reports. Pass it in a 0600 file (`umask 077`; `--cli-input-json file://…` for the `aws` CLI), and wrap `aws`/`kubectl` so failures get logged with redacted arguments (`--token=…`, `--password val`). Stdout must stay untouched, so `$(…)` and pipes still work |
+| Intermediate | **A background tunnel that survives Ctrl+C** | Ctrl+C in psql also kills the tunnel started in the same process group. Fix it with `set -m` or `setsid` and `</dev/null`, add an EXIT trap that kills the whole process tree, and handle SIGINT. The check sends SIGINT to the foreground group: the tunnel must survive it and be gone after exit |
+| Intermediate | **Wait for a tunnel that accepts and then dies** | A fake tunnel accepts connections and then exits 4 seconds later. The wait has to poll the port while the process is alive, require it to stay up through a short settle period, and pull the error lines from the log written since launch (remember the log's byte offset) |
+| Intermediate | **Replace a config without breaking it** | A script turns a symlinked config into a plain file, or leaves it truncated when the disk fills up. Resolve the symlink chain, write a temp file next to the real target with the same mode, then `mv` it over. Then do the same for JSON state edited with `jq` |
+| Advanced | **Make a destructive script resumable** | Record completed stages in `state.json` and skip them on a rerun, bind execute to a hash of the plan and of the script's own code, and refuse `resume` when a stage's outcome is uncertain. The check kills it mid-run, reruns it, and nothing runs twice. A shell-sized step toward *Durable workflows* (Build next 6) |
+| Advanced | **Retry the right failures** | Decide which errors are worth retrying on another node (target offline, the session died, the port never came up) and which would fail everywhere (access denied, expired credentials, an invalid document or parameters). Back off after a failed token refresh, so a menu that redraws doesn't hammer it. Overlaps *When LLM APIs fail* (Build next 8) |
+| Advanced | **Unit-test the tool with bats** | No lab uses bats yet. Pull the pure functions out (error classification, failover order, argument redaction, `.pgpass` escaping) and pin their behaviour with bats tests. Mutation checks: the hidden mutants must fail the learner's suite |
+| Capstone | **Harden the ops tool** | One script with all of the above planted. The check runs a hostile session against it |
+
 ## Networking
 
 | Track | What you'd practise | Runs on | Relies on |
@@ -795,6 +821,17 @@ Moto only emulates the API, so these limits apply:
   `123456789012.localhost`: S3 Control puts the account id in front of the host name, and Moto
   reads an unknown host's first label as a bucket name.
 
+### Cloud ops-tooling labs
+
+Added 2026-11-26 from an ops-tool review. Not started. **Check Moto's coverage first** for each
+one (`verify` before writing the tutorial).
+
+| Lab | What it covers | Moto support to confirm |
+|---|---|---|
+| **Lint and roll back SSM documents** | Three broken port-forwarding documents: a parameter the session passes but the document doesn't declare, a hardcoded `host=localhost` (the agent refuses loopback forwarding), and an `allowedPattern` that rejects the value. Fix them as new versions, or roll back with `update-document-default-version` to the last version that worked. Write a pre-flight that checks a document against the parameters before starting a session | `create-document`, `get-document`, `list-document-versions`, `update-document-default-version` |
+| **SSO config at scale, offline** | Generate one shared `[sso-session]` block plus profiles for N accounts × roles from a JSON listing, with stable names and a region per account, then migrate old profiles that carry their own `sso_start_url`. Read the token cache, whose file name is the SHA-1 of the session name, and report how long `expiresAt` has left (fractional seconds, `+00:00`, `UTC`). Checks: `aws configure list-profiles` and `aws configure get` | None: the files are local. The SSO portal API isn't needed |
+| **A role × action permission matrix** | For three roles (read-only, power user, admin), call each action with fake resource IDs and classify the error: AccessDenied means denied, while NotFound or a validation error means *allowed*. Output a TSV matrix and compare two environments | IAM enforcement (`INITIAL_NO_AUTH_ACTION_COUNT`) or `iam simulate-principal-policy`; unproven |
+
 ## Data
 
 | Track | What you'd practise | Runs on |
@@ -810,7 +847,9 @@ Moto only emulates the API, so these limits apply:
 | **Query performance** | Reading query plans, fixing slow queries with indexes, locks |
 | **Backup & restore** | Point-in-time restore is done in `data-046` |
 | **Replication** | Done in `data-047` to `data-049`: a lagging replica and its slot, failover, stalled synchronous commits |
-| **Migrations** | A failed migration is done in `data-052` |
+| **Migrations** | A failed migration is done in `data-052`. See *Schema migrations with Flyway* below |
+| **Schema migrations with Flyway** | Added 2026-11-26; no lab uses Flyway yet. Read `flyway_schema_history`, recover from a failed migration (`success = false`, then `repair`), a checksum mismatch after someone edited an applied file (`validate`), an out-of-order version, `baseline` on an existing database, and comparing the repo's latest version with the database's current one. Runs on the pinned `flyway/flyway` image against Postgres |
+| **Roles and privileges** | Added 2026-11-26. Drop an app's roles cleanly: `DROP ROLE` fails because of grants in *other* databases, so revoke in every database and use `REASSIGN OWNED` / `DROP OWNED`. Inspect inside `BEGIN READ ONLY` first, terminate the app's sessions and wait until none remain, and sort catalog output before diffing it, because PostgreSQL doesn't guarantee row order. Also: SQL scripts that take values through `psql -v` (`:'value'` for literals, `:"value"` for identifiers, `\if :{?var}`) and not through string building, and a `.pgpass` that psql silently ignores (an unescaped `:` or `\`, or a mode other than 0600) |
 
 ### Statistics modules (Data science track)
 
@@ -1265,7 +1304,7 @@ infrastructure and build on the networking and Terraform modules.
 
 | Idea | The lab | Runs on | Builds on |
 |---|---|---|---|
-| **SSH tunnels & pivoting** | Reach a database two hops away with `-L`, `-R`, `-D` and `ProxyJump`, then lock the jump host down (`PermitOpen`, `AllowTcpForwarding`) | Docker or offsec VM; namespaces or containers as hosts | Networking essentials |
+| **SSH tunnels & pivoting** | Reach a database two hops away with `-L`, `-R`, `-D` and `ProxyJump`, then lock the jump host down (`PermitOpen`, `AllowTcpForwarding`). Added 2026-11-26: **the localhost trap**, where forwarding to `localhost:5432` reaches a decoy Postgres on the bastion itself, not the real database (the check reads `inet_server_addr()` through the tunnel); **failover** to a second bastion when the first is down, without retrying auth or config errors that would fail on every bastion; a local port that's already taken, so pick a free one | Docker or offsec VM; namespaces or containers as hosts | Networking essentials |
 | **Purging secrets from Git** | gitleaks finds a key in history; remove it with `git filter-repo`, force-push to a bare remote, and prove no ref, tag or reflog still holds it | Docker VM | Git recovery & plumbing |
 | **Linkerd service mesh** | Turn on mTLS between two apps, find the pod without its proxy, add retries and timeouts. Much lighter than Istio (see *Left out*), but **test the memory on the nodes first** | k8s lab | Services & DNS |
 | **Cluster backup with Velero** | Back up a namespace, delete it, restore it, then find why the volume data didn't come back | k8s lab + MinIO | The MinIO labs |
