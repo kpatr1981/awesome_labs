@@ -1,0 +1,1195 @@
+track: kubernetes
+module: "Cyclops: a developer portal"
+profile: k8s
+order: 27
+exercises:
+
+# ===== Beginner =====
+
+- id: k8s-420
+  title: Install a developer portal
+  difficulty: 1
+  kind: build
+  tags: [cyclops, developer-portal, crds, platform-engineering]
+  tutorial: |
+    **What you're learning.** What an internal developer portal is, and how Cyclops is built: a controller, a UI and three custom resources.
+
+    ### Developer portals from zero
+
+    Writing Deployments, Services and Helm values by hand is a lot to ask of every developer. A **developer portal** lets the platform team publish **templates** ("a web app", "a worker", "a database") and lets developers create apps from them by filling in a form. **Cyclops** is a small open-source portal for Kubernetes:
+
+    ```text
+    developer -> Cyclops UI (form built from the chart's values.schema.json)
+                   | creates
+                   v
+               Module (custom resource: template + values + target namespace)
+                   | cyclops-ctrl renders the Helm chart and applies the result
+                   v
+               Deployment, Service, ... in the target namespace
+    ```
+
+    | Piece | What it is |
+    |---|---|
+    | `cyclops-ctrl` | the controller: watches Modules, fetches templates (Git, Helm or OCI), renders and applies them. It also serves the API the UI uses |
+    | `cyclops-ui` | the web UI; its nginx forwards `/api/...` to the controller |
+    | `Module` | one app made from a template |
+    | `TemplateStore` | a template listed in the UI's catalogue |
+    | `TemplateAuthRule` | credentials for a private template repository |
+
+    ### Commands you'll use
+
+    ```bash
+    zcat /opt/kubelab/cyclops-v0.21.1.yaml.gz | less        # what you're about to install: read it first
+    zcat /opt/kubelab/cyclops-v0.21.1.yaml.gz | kubectl apply --server-side -f -
+    kubectl -n cyclops get deploy,svc,networkpolicy
+    kubectl get crd | grep cyclops-ui.com
+    kubectl api-resources --api-group=cyclops-ui.com
+    kubectl -n cyclops port-forward --address 0.0.0.0 svc/cyclops-ui 3000:3000   # then open http://localhost:3000 if Lima forwards it
+    ```
+
+    ### Common mistakes
+
+    - Applying a manifest you haven't read. This one gives the controller **every permission in the cluster**: look at its ClusterRole. A later exercise fixes that.
+    - Waiting on the UI only: the UI comes up even when the controller can't, and then every page says "Error fetching".
+
+    ### Check your work
+
+    `kubectl -n cyclops get deploy` shows `cyclops-ctrl` and `cyclops-ui` 1/1, and the three CRDs exist.
+  scenario: |
+    Install **Cyclops v0.21.1** from the bundled manifest
+    **`/opt/kubelab/cyclops-v0.21.1.yaml.gz`** (offline; its images are
+    already on the nodes). Then read what you installed and write
+    **`/lab/answers.txt`**:
+
+    ```text
+    crds=...          the three CRDs it adds, comma-separated, e.g. a.example.com,b.example.com
+    ctrl_role=...     the name of the ClusterRole bound to the controller's service account
+    ui_proxies_to=... the URL the UI's /api requests are forwarded to
+    ```
+  hints:
+    - "`zcat ... | kubectl apply --server-side -f -`, then `kubectl -n cyclops rollout status deploy/cyclops-ctrl`."
+    - "`kubectl get crd -o name | grep cyclops-ui.com`; `kubectl get clusterrolebinding -o wide | grep cyclops`."
+    - "The UI's target is in its Deployment's environment (`kubectl -n cyclops get deploy cyclops-ui -o yaml`)."
+  solution: |
+    ```bash
+    zcat /opt/kubelab/cyclops-v0.21.1.yaml.gz | kubectl apply --server-side -f -
+    kubectl -n cyclops rollout status deploy/cyclops-ctrl
+    kubectl -n cyclops rollout status deploy/cyclops-ui
+    cat > /lab/answers.txt <<'EOF'
+    crds=modules.cyclops-ui.com,templateauthrules.cyclops-ui.com,templatestores.cyclops-ui.com
+    ctrl_role=cyclops-ctrl
+    ui_proxies_to=http://cyclops-ctrl.cyclops:8080
+    EOF
+    ```
+  setup: |
+    true
+  check: |
+    check "cyclops-ctrl is running in namespace cyclops" 'deploy_ready cyclops cyclops-ctrl'
+    check "cyclops-ui is running" 'deploy_ready cyclops cyclops-ui'
+    check "the three CRDs exist" 'for c in modules templateauthrules templatestores; do kubectl get crd $c.cyclops-ui.com >/dev/null 2>&1 || exit 1; done'
+    check "the UI answers and reaches the controller (/api/namespaces)" 'cy_api namespaces | grep -q "\"cyclops\""'
+    ans() { sed -n "s/^$1=//p" /lab/answers.txt 2>/dev/null | head -1 | tr -d ' \r'; }
+    check_eq "crds=" "$(ans crds | tr ',' '\n' | sort | paste -sd, -)" "modules.cyclops-ui.com,templateauthrules.cyclops-ui.com,templatestores.cyclops-ui.com"
+    check_eq "ctrl_role=" "$(ans ctrl_role)" "$(kubectl get clusterrolebinding -o json | jq -r '.items[] | select(any(.subjects[]?; .name == "cyclops-ctrl" and .namespace == "cyclops")) | .roleRef.name' | head -1)"
+    check_eq "ui_proxies_to=" "$(ans ui_proxies_to | sed 's|/$||')" "http://cyclops-ctrl.cyclops:8080"
+  solve: |
+    cy_install
+    lab_file answers.txt <<'EOF'
+    crds=modules.cyclops-ui.com,templateauthrules.cyclops-ui.com,templatestores.cyclops-ui.com
+    ctrl_role=cyclops-ctrl
+    ui_proxies_to=http://cyclops-ctrl.cyclops:8080
+    EOF
+
+- id: k8s-421
+  title: Deploy an app from a template
+  difficulty: 1
+  kind: build
+  tags: [cyclops, modules, helm, templates]
+  tutorial: |
+    **What you're learning.** How a Cyclops Module turns a template and a few values into running workloads, and where to look when it doesn't.
+
+    ### The idea
+
+    A **Module** says: take the Helm chart at this Git repo, path and version, render it with these values, apply the result in this namespace. It's what the UI's "Add module" form creates, and you can write one with `kubectl` too:
+
+    ```yaml
+    apiVersion: cyclops-ui.com/v1alpha1
+    kind: Module
+    metadata:
+      name: catalogue            # also the Helm release name, so .Release.Name in the chart
+      namespace: cyclops         # Modules live in Cyclops' namespace
+    spec:
+      targetNamespace: library   # where the rendered objects go
+      template:
+        repo: http://gitea.gitea.svc:3000/books/templates
+        path: web                # the chart's folder in the repo
+        version: main            # a branch, a tag or a commit
+        sourceType: git
+      values:
+        image: httpd:2.4-alpine
+        replicas: 3
+    ```
+
+    The controller writes what happened to `status.reconciliationStatus`: `succeeded`, or `failed` with the errors (a template that can't be fetched, an object Kubernetes refused).
+
+    ### Commands you'll use
+
+    ```bash
+    kubectl -n cyclops get modules
+    kubectl -n cyclops get module catalogue -o jsonpath='{.status.reconciliationStatus}' | jq .
+    kubectl -n library get deploy,svc
+    kubectl -n cyclops logs deploy/cyclops-ctrl --tail=20
+    git clone http://node01:30300/books/templates && ls templates/web   # the chart itself
+    ```
+
+    ### Common mistakes
+
+    - The Module in the target namespace: it belongs in `cyclops`.
+    - A target namespace that doesn't exist: create it first.
+    - Expecting the chart's `values.yaml` defaults to fill in what you left out: Cyclops renders with the Module's values (the UI fills the form from the defaults when you create one). Give every value the template needs.
+
+    ### Check your work
+
+    The Module's status says `succeeded`, and `kubectl -n team-a get deploy shop` shows 2/2.
+  scenario: |
+    Cyclops is installed. The platform team's template repo is
+    **`http://gitea.gitea.svc:3000/dev/templates`** (from the nodes:
+    `http://node01:30300/dev/templates`; your clone is in
+    `/lab/templates`). Its chart **`app`** makes a Deployment and a Service.
+
+    Create a Module **`shop`** that deploys `app` into namespace
+    **`team-a`** with image **`nginx:1.29-alpine`** and **2 replicas**.
+    Use the UI or `kubectl`.
+  hints:
+    - "Look at `/lab/templates/app/values.yaml` and `values.schema.json` for the values the chart takes."
+    - "Create namespace team-a, then apply a Module like the tutorial's in namespace cyclops."
+  solution: |
+    ```bash
+    kubectl create namespace team-a
+    kubectl apply -f - <<'EOF'
+    apiVersion: cyclops-ui.com/v1alpha1
+    kind: Module
+    metadata:
+      name: shop
+      namespace: cyclops
+    spec:
+      targetNamespace: team-a
+      template:
+        repo: http://gitea.gitea.svc:3000/dev/templates
+        path: app
+        version: main
+        sourceType: git
+      values:
+        image: nginx:1.29-alpine
+        replicas: 2
+    EOF
+    kubectl -n cyclops get module shop -o jsonpath='{.status.reconciliationStatus.status}'
+    ```
+  setup: |
+    cy_install
+    cy_templates
+    gitea_clone dev/templates /lab/templates
+  check: |
+    m=$(kubectl -n cyclops get module shop -o json 2>/dev/null)
+    check "Module shop exists in namespace cyclops" '[ -n "$m" ]'
+    check "it uses chart app from dev/templates" 'jq -e ".spec.template | (.repo | test(\"dev/templates(\\\\.git)?$\")) and .path == \"app\"" <<<"$m"'
+    check_eq "into namespace team-a" "$(jq -r .spec.targetNamespace <<<"$m" 2>/dev/null)" team-a
+    cy_wait shop 60
+    check "its reconciliation succeeded" '[ "$(cy_status shop)" = succeeded ]'
+    check "Deployment shop runs 2 ready pods in team-a" 'eventually 90 "[ \"\$(kubectl -n team-a get deploy shop -o jsonpath={.status.readyReplicas} 2>/dev/null)\" = 2 ]"'
+    check_eq "with image nginx:1.29-alpine" "$(kubectl -n team-a get deploy shop -o jsonpath='{.spec.template.spec.containers[0].image}' 2>/dev/null)" nginx:1.29-alpine
+    check "and a Service shop" 'kubectl -n team-a get svc shop >/dev/null 2>&1'
+  solve: |
+    k_ns team-a
+    cy_module shop team-a "$CY_REPO/dev/templates" app '{image: "nginx:1.29-alpine", replicas: 2}'
+    cy_wait shop 60
+
+# ===== Intermediate =====
+
+- id: k8s-422
+  title: A template with a form that can't be bypassed
+  difficulty: 2
+  kind: build
+  tags: [cyclops, helm, json-schema, templates, validation]
+  tutorial: |
+    **What you're learning.** How a chart's `values.schema.json` becomes the portal's form, and why limits must also be enforced in the template itself.
+
+    ### The idea
+
+    Cyclops reads the chart's **`values.schema.json`** (JSON Schema) to draw the form: `title` and `description` become labels and help text, `enum` becomes a drop-down, `minimum`/`maximum` and `required` are checked before the Module is created.
+
+    ```json
+    {"type": "object",
+     "properties": {
+       "size":    {"type": "string", "title": "Size", "enum": ["small", "large"]},
+       "workers": {"type": "integer", "title": "Workers", "minimum": 1, "maximum": 8}},
+     "required": ["size"]}
+    ```
+
+    But the form is only the **UI's** check. Cyclops 0.21's controller renders whatever values a Module holds, and anyone with `kubectl` (or a script calling the API) can write a Module with `workers: 50`. Limits that matter go into the template too, with Helm's `fail`:
+
+    ```yaml
+    {{- if or (lt (int .Values.workers) 1) (gt (int .Values.workers) 8) }}
+    {{- fail (printf "workers must be 1 to 8, not %v" .Values.workers) }}
+    {{- end }}
+    {{- if not (has .Values.size (list "small" "large")) }}
+    {{- fail (printf "size must be small or large, not %q" .Values.size) }}
+    {{- end }}
+    ```
+
+    A `fail` stops the rendering: nothing is applied, and the Module's status says `failed` with your message.
+
+    ### Commands you'll use
+
+    ```bash
+    cd /lab/templates && mkdir -p batch/templates && $EDITOR batch/Chart.yaml batch/values.schema.json ...
+    helm template t ./batch --set size=small --set workers=2     # render locally (if helm is installed)
+    jq . batch/values.schema.json >/dev/null                     # valid JSON?
+    git add batch && git commit -m "batch template" && git push
+    kubectl -n cyclops get module m -o jsonpath='{.status.reconciliationStatus}' | jq .
+    ```
+
+    ### Common mistakes
+
+    - Trusting the form: the schema is advice to the UI, not a rule the controller enforces.
+    - `gt .Values.workers 8` on a value that arrives as a float: convert with `int` first.
+    - Forgetting `"type": "object"` and `properties` at the top level: the UI then shows no fields.
+
+    ### Check your work
+
+    Push, then create a Module with `replicas: 5`: its status is `failed` with your message, and no Deployment appears.
+  scenario: |
+    Add a template **`worker`** to the platform repo (**`/lab/templates`**,
+    push to `main` of `dev/templates`). It's a Helm chart that makes a
+    Deployment named after the release, running the given **`image`**,
+    with **`replicas`** pods and an environment variable **`QUEUE`** set to
+    the **`queue`** value. Its **`values.schema.json`** must give the form:
+
+    - `image`: a string, required;
+    - `replicas`: an integer from **1 to 3**, required;
+    - `queue`: one of **`orders`** or **`emails`**, required;
+    - a `title` for each field.
+
+    Because the controller doesn't apply the schema, the **template itself
+    must refuse** `replicas` outside 1 to 3 and any other `queue`, so a
+    Module with bad values fails and creates nothing.
+  hints:
+    - "Copy `app/` to `worker/` and change it: `Chart.yaml` name `worker`, the env var in the Deployment, a new schema."
+    - "The schema: `{\"type\": \"object\", \"properties\": {...}, \"required\": [\"image\", \"replicas\", \"queue\"]}`; `queue` gets `\"enum\": [\"orders\", \"emails\"]`."
+    - "At the top of the Deployment template, `{{- if or (lt (int .Values.replicas) 1) (gt (int .Values.replicas) 3) }}{{- fail \"...\" }}{{- end }}`, and the same idea with `has` for queue."
+  solution: |
+    ```yaml
+    # worker/Chart.yaml
+    apiVersion: v2
+    name: worker
+    version: 1.0.0
+    ```
+
+    ```json
+    // worker/values.schema.json
+    {"type": "object", "title": "Queue worker",
+     "properties": {
+       "image":    {"type": "string",  "title": "Image"},
+       "replicas": {"type": "integer", "title": "Replicas", "minimum": 1, "maximum": 3},
+       "queue":    {"type": "string",  "title": "Queue", "enum": ["orders", "emails"]}},
+     "required": ["image", "replicas", "queue"]}
+    ```
+
+    ```yaml
+    # worker/templates/deployment.yaml
+    {{- if or (lt (int .Values.replicas) 1) (gt (int .Values.replicas) 3) }}
+    {{- fail (printf "replicas must be 1 to 3, not %v" .Values.replicas) }}
+    {{- end }}
+    {{- if not (has .Values.queue (list "orders" "emails")) }}
+    {{- fail (printf "queue must be orders or emails, not %q" .Values.queue) }}
+    {{- end }}
+    apiVersion: apps/v1
+    kind: Deployment
+    metadata:
+      name: {{ .Release.Name }}
+    spec:
+      replicas: {{ .Values.replicas }}
+      selector: {matchLabels: {app: {{ .Release.Name }}}}
+      template:
+        metadata: {labels: {app: {{ .Release.Name }}}}
+        spec:
+          containers:
+          - name: worker
+            image: {{ .Values.image }}
+            env: [{name: QUEUE, value: {{ .Values.queue | quote }}}]
+    ```
+
+    Then `git add worker && git commit -m worker && git push` in `/lab/templates`.
+  setup: |
+    cy_install
+    cy_templates
+    gitea_clone dev/templates /lab/templates
+  check: |
+    S=$(mktemp -d)
+    git clone -q "$(gitea_url dev/templates "dev:$(cat "$KL_STATE/dev-pass")")" "$S/r" 2>/dev/null
+    sch=$S/r/worker/values.schema.json
+    check "dev/templates has a chart worker on main" '[ -f "$S/r/worker/Chart.yaml" ] && [ -d "$S/r/worker/templates" ]'
+    check "its values.schema.json is valid JSON with titles for image, replicas and queue" 'jq -e ".type == \"object\" and ([.properties.image.title, .properties.replicas.title, .properties.queue.title] | all(. != null))" "$sch"'
+    check "the schema requires image, replicas and queue" 'jq -e "(.required // []) | (index(\"image\") and index(\"replicas\") and index(\"queue\"))" "$sch"'
+    check "replicas: an integer from 1 to 3" 'jq -e ".properties.replicas | .type == \"integer\" and .minimum == 1 and .maximum == 3" "$sch"'
+    check "queue: orders or emails" 'jq -e ".properties.queue.enum | sort == [\"emails\", \"orders\"]" "$sch"'
+    rm -rf "$S"
+    k_ns team-a
+    p=w$RANDOM
+    cy_module "$p-good" team-a "$CY_REPO/dev/templates" worker '{image: "busybox:1.37", replicas: 2, queue: "emails"}'
+    cy_module "$p-many" team-a "$CY_REPO/dev/templates" worker '{image: "busybox:1.37", replicas: 5, queue: "orders"}'
+    cy_module "$p-zero" team-a "$CY_REPO/dev/templates" worker '{image: "busybox:1.37", replicas: 0, queue: "orders"}'
+    cy_module "$p-sms" team-a "$CY_REPO/dev/templates" worker '{image: "busybox:1.37", replicas: 1, queue: "sms"}'
+    for m in good many zero sms; do cy_wait "$p-$m" 60; done
+    info "good: $(cy_status $p-good); replicas 5: $(cy_status $p-many) ($(cy_reason $p-many | cut -c1-90))"
+    check "a Module with good values succeeds" '[ "$(cy_status $p-good)" = succeeded ]'
+    check "its Deployment has 2 replicas and QUEUE=emails" 'd=$(kubectl -n team-a get deploy $p-good -o json); jq -e ".spec.replicas == 2 and (.spec.template.spec.containers[0].env[] | select(.name == \"QUEUE\") | .value == \"emails\")" <<<"$d"'
+    check "replicas 5 fails and creates nothing" '[ "$(cy_status $p-many)" = failed ] && ! kubectl -n team-a get deploy $p-many >/dev/null 2>&1'
+    check "replicas 0 fails and creates nothing" '[ "$(cy_status $p-zero)" = failed ] && ! kubectl -n team-a get deploy $p-zero >/dev/null 2>&1'
+    check "queue sms fails and creates nothing" '[ "$(cy_status $p-sms)" = failed ] && ! kubectl -n team-a get deploy $p-sms >/dev/null 2>&1'
+    kubectl -n cyclops delete module "$p-good" "$p-many" "$p-zero" "$p-sms" --wait=false >/dev/null 2>&1
+  solve: |
+    d=/lab/templates/worker
+    mkdir -p "$d/templates"
+    printf 'apiVersion: v2\nname: worker\ndescription: A queue worker\nversion: 1.0.0\n' >"$d/Chart.yaml"
+    printf 'image: busybox:1.37\nreplicas: 1\nqueue: orders\n' >"$d/values.yaml"
+    cat >"$d/values.schema.json" <<'EOF'
+    {"type": "object", "title": "Queue worker",
+     "properties": {
+       "image": {"type": "string", "title": "Image"},
+       "replicas": {"type": "integer", "title": "Replicas", "minimum": 1, "maximum": 3},
+       "queue": {"type": "string", "title": "Queue", "enum": ["orders", "emails"]}},
+     "required": ["image", "replicas", "queue"]}
+    EOF
+    cat >"$d/templates/deployment.yaml" <<'EOF'
+    {{- if or (lt (int .Values.replicas) 1) (gt (int .Values.replicas) 3) }}
+    {{- fail (printf "replicas must be 1 to 3, not %v" .Values.replicas) }}
+    {{- end }}
+    {{- if not (has .Values.queue (list "orders" "emails")) }}
+    {{- fail (printf "queue must be orders or emails, not %q" .Values.queue) }}
+    {{- end }}
+    apiVersion: apps/v1
+    kind: Deployment
+    metadata:
+      name: {{ .Release.Name }}
+    spec:
+      replicas: {{ .Values.replicas }}
+      selector: {matchLabels: {app: {{ .Release.Name }}}}
+      template:
+        metadata: {labels: {app: {{ .Release.Name }}}}
+        spec:
+          containers:
+          - name: worker
+            image: {{ .Values.image }}
+            command: [sleep, "3600"]
+            env: [{name: QUEUE, value: {{ .Values.queue | quote }}}]
+    EOF
+    chown -R "$(lab_user)": /lab/templates
+    as_user "cd /lab/templates && git add worker && git commit -qm 'worker template' && git push -q"
+
+- id: k8s-423
+  title: Templates from a private repository
+  difficulty: 2
+  kind: fix
+  tags: [cyclops, templateauthrule, secrets, git, credentials]
+  tutorial: |
+    **What you're learning.** How Cyclops authenticates to a private template repository with a `TemplateAuthRule`, and how to give it a token instead of a person's password.
+
+    ### The idea
+
+    A private repo answers "authentication required" to Cyclops, and the Module fails. A **TemplateAuthRule** tells the controller which credentials to use for which repositories:
+
+    ```yaml
+    apiVersion: cyclops-ui.com/v1alpha1
+    kind: TemplateAuthRule
+    metadata:
+      name: books-git
+      namespace: cyclops              # next to the controller
+    spec:
+      repo: http://gitea.gitea.svc:3000/books/     # a URL prefix: every repo under it
+      username: {name: books-git, key: username}   # keys of a Secret in namespace cyclops
+      password: {name: books-git, key: token}
+    ```
+
+    Before fetching a template, the controller looks for a rule whose `repo` is a **prefix** of the template's repo URL, reads the two keys from the Secret, and uses them as HTTP basic auth.
+
+    | Put in the Secret | Not |
+    |---|---|
+    | a **token** made for Cyclops, read-only, that you can revoke on its own | a person's password: it opens everything they can do, and leaves with them |
+
+    ### Commands you'll use
+
+    ```bash
+    # a read-only Gitea token for an account (Gitea UI: Settings, Applications; or the API)
+    curl -s -u books:"$PASS" -H 'Content-Type: application/json' \
+      -d '{"name": "cyclops", "scopes": ["read:repository"]}' http://node01:30300/api/v1/users/books/tokens | jq -r .sha1
+    kubectl -n cyclops create secret generic books-git --from-literal=username=books --from-literal=token="$TOKEN"
+    kubectl -n cyclops get templateauthrules
+    kubectl -n cyclops logs deploy/cyclops-ctrl --tail=5 | grep -i auth
+    ```
+
+    A Module that already failed is retried by the controller. To force it, change its spec or delete and recreate it.
+
+    ### Common mistakes
+
+    - The Secret or the rule in another namespace: both go in `cyclops`.
+    - A `repo` prefix that doesn't match the Module's URL (`node01:30300` vs `gitea.gitea.svc:3000`, `https` vs `http`).
+    - The key names in the rule not matching the Secret's keys.
+
+    ### Check your work
+
+    `kubectl -n cyclops get module billing -o jsonpath='{.status.reconciliationStatus.status}'` says `succeeded`.
+  scenario: |
+    The billing team's templates moved to a **private** repo,
+    **`http://gitea.gitea.svc:3000/dev/private-templates`**, and Module
+    **`billing`** now fails with "authentication required".
+
+    Give Cyclops access with a **TemplateAuthRule** that covers every
+    repository of account **`dev`** (`http://gitea.gitea.svc:3000/dev/...`).
+    Its Secret must hold a **Gitea access token** for `dev` (create one), not
+    `dev`'s password, which is in `/lab/.gitea-credentials`. Then make sure
+    `billing` deploys.
+  hints:
+    - "Create the token with the API call from the tutorial, using account dev and the password from /lab/.gitea-credentials; the scope `read:repository` is enough."
+    - "Secret and TemplateAuthRule both go in namespace cyclops; the rule's `repo` is `http://gitea.gitea.svc:3000/dev/`."
+    - "After creating the rule, nudge the Module (for example add a label) or wait for the controller to retry."
+  solution: |
+    ```bash
+    PASS=$(sed -E 's|http://dev:([^@]*)@.*|\1|' /lab/.gitea-credentials)
+    TOKEN=$(curl -s -u dev:"$PASS" -H 'Content-Type: application/json' \
+      -d '{"name": "cyclops", "scopes": ["read:repository"]}' http://node01:30300/api/v1/users/dev/tokens | jq -r .sha1)
+    kubectl -n cyclops create secret generic gitea-dev --from-literal=username=dev --from-literal=token="$TOKEN"
+    kubectl apply -f - <<'EOF'
+    apiVersion: cyclops-ui.com/v1alpha1
+    kind: TemplateAuthRule
+    metadata:
+      name: gitea-dev
+      namespace: cyclops
+    spec:
+      repo: http://gitea.gitea.svc:3000/dev/
+      username: {name: gitea-dev, key: username}
+      password: {name: gitea-dev, key: token}
+    EOF
+    kubectl -n cyclops label module billing retry=1 --overwrite
+    ```
+  setup: |
+    cy_install
+    cy_templates dev/private-templates private
+    k_ns billing
+    cy_module billing billing "$CY_REPO/dev/private-templates" app '{image: "nginx:1.29-alpine", replicas: 1}'
+    cy_wait billing 60
+  check: |
+    r=$(kubectl -n cyclops get templateauthrules -o json 2>/dev/null | jq -c '[.items[] | select(.spec.repo as $r | "http://gitea.gitea.svc:3000/dev/private-templates" | startswith($r))] | .[0] // {}')
+    check "a TemplateAuthRule in namespace cyclops covers dev/private-templates" 'jq -e ".spec.repo" <<<"$r"'
+    check "its repo prefix covers every repo of dev (http://gitea.gitea.svc:3000/dev/)" '[ "$(jq -r .spec.repo <<<"$r")" = "http://gitea.gitea.svc:3000/dev/" ]'
+    sn=$(jq -r '.spec.password.name // empty' <<<"$r"); pk=$(jq -r '.spec.password.key // empty' <<<"$r"); un=$(jq -r '.spec.username.name // empty' <<<"$r"); uk=$(jq -r '.spec.username.key // empty' <<<"$r")
+    pw=$(kubectl -n cyclops get secret "$sn" -o json 2>/dev/null | jq -r --arg k "$pk" '.data[$k] // empty' | base64 -d 2>/dev/null)
+    user=$(kubectl -n cyclops get secret "$un" -o json 2>/dev/null | jq -r --arg k "$uk" '.data[$k] // empty' | base64 -d 2>/dev/null)
+    check "the Secret it points to has the username dev" '[ "$user" = dev ]'
+    check "and a token, not dev's password" '[ -n "$pw" ] && [ "$pw" != "$(cat "$KL_STATE/dev-pass")" ]'
+    check "the token opens the private repo" 'git ls-remote "http://dev:$pw@${GITEA_URL#http://}/dev/private-templates.git" >/dev/null 2>&1'
+    kubectl -n cyclops label module billing kl-check=$RANDOM --overwrite >/dev/null 2>&1
+    check "Module billing reconciles successfully" 'eventually 90 "[ \"\$(cy_status billing)\" = succeeded ]"'
+    check "and its Deployment runs in namespace billing" 'eventually 90 "[ \"\$(kubectl -n billing get deploy billing -o jsonpath={.status.readyReplicas} 2>/dev/null)\" = 1 ]"'
+  solve: |
+    tok=$(gitea_as dev "$(cat "$KL_STATE/dev-pass")" POST /users/dev/tokens '{"name": "cyclops", "scopes": ["read:repository"]}' | jq -r .sha1)
+    kubectl -n cyclops create secret generic gitea-dev --from-literal=username=dev --from-literal=token="$tok" >/dev/null
+    kubectl apply -f - >/dev/null <<'EOF'
+    apiVersion: cyclops-ui.com/v1alpha1
+    kind: TemplateAuthRule
+    metadata: {name: gitea-dev, namespace: cyclops}
+    spec:
+      repo: http://gitea.gitea.svc:3000/dev/
+      username: {name: gitea-dev, key: username}
+      password: {name: gitea-dev, key: token}
+    EOF
+    kubectl -n cyclops label module billing retry=1 --overwrite >/dev/null
+    eventually 90 '[ "$(cy_status billing)" = succeeded ]'
+
+# ===== Advanced =====
+
+- id: k8s-424
+  title: The portal is cluster-admin
+  difficulty: 3
+  kind: fix
+  tags: [cyclops, rbac, least-privilege, serviceaccounts, security]
+  tutorial: |
+    **What you're learning.** How to cut a controller's permissions down to what it needs, find out what that is, and prove it with `kubectl auth can-i`.
+
+    ### The idea
+
+    The stock install binds `cyclops-ctrl` to a ClusterRole allowing `*` on `*` in every API group, plus every non-resource URL: **cluster-admin**. And the UI forwards `/api` to the controller with no login. So anyone who reaches the UI can, through a template, run anything anywhere, read every Secret, and give themselves admin.
+
+    What does it really need?
+
+    | Need | Scope | Rule |
+    |---|---|---|
+    | its own resources | cluster | `cyclops-ui.com`: modules, modules/status, templatestores, templateauthrules: all verbs |
+    | the UI's namespace list and app views | cluster, **read-only** | namespaces; deployments, statefulsets, daemonsets, replicasets, pods, services, configmaps, PVCs, jobs, cronjobs, ingresses, events: get, list, watch |
+    | template credentials | **only namespace cyclops** | secrets: get, list, watch (a Role, not a ClusterRole) |
+    | applying what templates render | **only the team namespaces** | deployments, services, configmaps...: all verbs, through a RoleBinding per namespace to one ClusterRole |
+
+    A **ClusterRole bound with a RoleBinding** grants its rules in that namespace only. That's the standard way to reuse one set of rules for many namespaces.
+
+    ### Commands you'll use
+
+    ```bash
+    SA=system:serviceaccount:cyclops:cyclops-ctrl
+    kubectl auth can-i --list --as=$SA -n team-x | head -20
+    kubectl auth can-i create deployments -n team-x --as=$SA         # yes / no
+    kubectl auth can-i get secrets -n kube-system --as=$SA
+    kubectl create rolebinding cyclops-ctrl -n team-x --clusterrole=portal-deployer --serviceaccount=cyclops:cyclops-ctrl
+    kubectl -n cyclops logs deploy/cyclops-ctrl --tail=30 | grep -i forbidden    # what it was refused
+    ```
+
+    ### Common mistakes
+
+    - Editing the wildcard ClusterRole but leaving its ClusterRoleBinding (or another one) in place: `can-i` will tell you.
+    - Granting `secrets` cluster-wide "for the UI": it doesn't need them, and that's the most valuable permission there is.
+    - Forgetting `modules/status`: the controller can't record results.
+
+    ### Check your work
+
+    `kubectl auth can-i '*' '*' --as=$SA` says `no`, and a Module into team-a still deploys.
+  scenario: |
+    Cyclops' controller (`cyclops-ctrl`, service account
+    `cyclops:cyclops-ctrl`) is cluster-admin. Cut it down so that:
+
+    - it can **manage its own resources** (`cyclops-ui.com`) everywhere;
+    - it can **read**, cluster-wide, the workloads the UI shows (pods,
+      deployments, services, ...), and list namespaces, but **no Secrets**
+      outside namespace **`cyclops`** (where it may read them, for
+      template credentials);
+    - it can **create and change** deployments, services and configmaps
+      **only in `team-a` and `team-b`**;
+    - nothing else: no `*`, no RBAC objects, nothing in `kube-system`.
+
+    Modules into `team-a` and `team-b` must still deploy, and the UI's
+    module list must still work.
+  hints:
+    - "Start with `kubectl get clusterrolebinding -o wide | grep cyclops` and delete the binding to the wildcard role."
+    - "One ClusterRole for its CRDs and namespaces, one read-only ClusterRole for workloads, one Role for Secrets in cyclops, and one ClusterRole for writing that you bind in team-a and team-b with RoleBindings."
+    - "Restart the controller afterwards (`kubectl -n cyclops rollout restart deploy/cyclops-ctrl`) so it starts its watches with the new rights."
+  solution: |
+    ```bash
+    kubectl delete clusterrolebinding cyclops-ctrl
+    kubectl delete clusterrole cyclops-ctrl
+    kubectl apply -f - <<'EOF'
+    apiVersion: rbac.authorization.k8s.io/v1
+    kind: ClusterRole
+    metadata: {name: cyclops-ctrl-core}
+    rules:
+    - apiGroups: [cyclops-ui.com]
+      resources: [modules, modules/status, templatestores, templateauthrules]
+      verbs: [get, list, watch, create, update, patch, delete]
+    - apiGroups: [""]
+      resources: [namespaces]
+      verbs: [get, list, watch]
+    - apiGroups: ["", apps, batch, networking.k8s.io]
+      resources: [deployments, statefulsets, daemonsets, replicasets, pods, services, configmaps,
+                  persistentvolumeclaims, jobs, cronjobs, ingresses, events]
+      verbs: [get, list, watch]
+    ---
+    apiVersion: rbac.authorization.k8s.io/v1
+    kind: ClusterRoleBinding
+    metadata: {name: cyclops-ctrl-core}
+    roleRef: {apiGroup: rbac.authorization.k8s.io, kind: ClusterRole, name: cyclops-ctrl-core}
+    subjects: [{kind: ServiceAccount, name: cyclops-ctrl, namespace: cyclops}]
+    ---
+    apiVersion: rbac.authorization.k8s.io/v1
+    kind: Role
+    metadata: {name: cyclops-ctrl-secrets, namespace: cyclops}
+    rules:
+    - apiGroups: [""]
+      resources: [secrets]
+      verbs: [get, list, watch]
+    ---
+    apiVersion: rbac.authorization.k8s.io/v1
+    kind: RoleBinding
+    metadata: {name: cyclops-ctrl-secrets, namespace: cyclops}
+    roleRef: {apiGroup: rbac.authorization.k8s.io, kind: Role, name: cyclops-ctrl-secrets}
+    subjects: [{kind: ServiceAccount, name: cyclops-ctrl, namespace: cyclops}]
+    ---
+    apiVersion: rbac.authorization.k8s.io/v1
+    kind: ClusterRole
+    metadata: {name: cyclops-deployer}
+    rules:
+    - apiGroups: ["", apps]
+      resources: [deployments, services, configmaps]
+      verbs: [get, list, watch, create, update, patch, delete]
+    EOF
+    for ns in team-a team-b; do
+      kubectl create rolebinding cyclops-ctrl -n $ns --clusterrole=cyclops-deployer --serviceaccount=cyclops:cyclops-ctrl
+    done
+    kubectl -n cyclops rollout restart deploy/cyclops-ctrl
+    ```
+  setup: |
+    cy_install
+    cy_templates
+    k_ns team-a
+    k_ns team-b
+    cy_module web-a team-a "$CY_REPO/dev/templates" app '{image: "nginx:1.29-alpine", replicas: 1}'
+  check: |
+    can() { cy_can "$@"; }
+    check "it can manage Modules" 'can create modules.cyclops-ui.com -n cyclops && can update modules.cyclops-ui.com/status -n cyclops'
+    check "it can list namespaces and read deployments and pods cluster-wide" 'can list namespaces && can list deployments.apps && can watch pods'
+    check "it can read Secrets in cyclops" 'can get secrets -n cyclops'
+    check "it can't read Secrets in team-a or kube-system" '! can get secrets -n team-a && ! can list secrets -n kube-system && ! can list secrets'
+    check "it can create and delete deployments and services in team-a and team-b" 'for ns in team-a team-b; do can create deployments.apps -n $ns && can delete services -n $ns || exit 1; done'
+    check "it can't change anything in kube-system" '! can create deployments.apps -n kube-system && ! can delete pods -n kube-system && ! can create configmaps -n kube-system'
+    check "it can't write in a namespace that isn't a team's (default)" '! can create deployments.apps -n default'
+    check "it isn't cluster-admin: no * on *, no RBAC changes" '! can "*" "*" && ! can create clusterrolebindings.rbac.authorization.k8s.io && ! can create rolebindings.rbac.authorization.k8s.io -n team-a && ! can escalate clusterroles.rbac.authorization.k8s.io'
+    p=r$RANDOM
+    cy_module "$p-a" team-a "$CY_REPO/dev/templates" app '{image: "nginx:1.29-alpine", replicas: 1}'
+    cy_module "$p-b" team-b "$CY_REPO/dev/templates" app '{image: "nginx:1.29-alpine", replicas: 1}'
+    cy_module "$p-sys" kube-system "$CY_REPO/dev/templates" app '{image: "nginx:1.29-alpine", replicas: 1}'
+    for m in a b sys; do cy_wait "$p-$m" 60; done
+    check "a Module into team-a still deploys" 'eventually 60 "[ \"\$(cy_status $p-a)\" = succeeded ]" && kubectl -n team-a get deploy $p-a >/dev/null 2>&1'
+    check "a Module into team-b still deploys" 'eventually 60 "[ \"\$(cy_status $p-b)\" = succeeded ]" && kubectl -n team-b get deploy $p-b >/dev/null 2>&1'
+    check "a Module into kube-system is refused" '[ "$(cy_status $p-sys)" = failed ] && ! kubectl -n kube-system get deploy $p-sys >/dev/null 2>&1'
+    check "the UI's module list still works" 'cy_api modules/list | jq -e "type == \"array\" and length >= 1"'
+    kubectl -n cyclops delete module "$p-a" "$p-b" "$p-sys" --wait=false >/dev/null 2>&1
+  solve: |
+    kubectl delete clusterrolebinding cyclops-ctrl --ignore-not-found >/dev/null
+    kubectl delete clusterrole cyclops-ctrl --ignore-not-found >/dev/null
+    kubectl apply -f - >/dev/null <<'EOF'
+    apiVersion: rbac.authorization.k8s.io/v1
+    kind: ClusterRole
+    metadata: {name: cyclops-ctrl-core}
+    rules:
+    - apiGroups: [cyclops-ui.com]
+      resources: [modules, modules/status, templatestores, templateauthrules]
+      verbs: [get, list, watch, create, update, patch, delete]
+    - apiGroups: [""]
+      resources: [namespaces]
+      verbs: [get, list, watch]
+    - apiGroups: ["", apps, batch, networking.k8s.io]
+      resources: [deployments, statefulsets, daemonsets, replicasets, pods, services, configmaps, persistentvolumeclaims, jobs, cronjobs, ingresses, events]
+      verbs: [get, list, watch]
+    ---
+    apiVersion: rbac.authorization.k8s.io/v1
+    kind: ClusterRoleBinding
+    metadata: {name: cyclops-ctrl-core}
+    roleRef: {apiGroup: rbac.authorization.k8s.io, kind: ClusterRole, name: cyclops-ctrl-core}
+    subjects: [{kind: ServiceAccount, name: cyclops-ctrl, namespace: cyclops}]
+    ---
+    apiVersion: rbac.authorization.k8s.io/v1
+    kind: Role
+    metadata: {name: cyclops-ctrl-secrets, namespace: cyclops}
+    rules:
+    - apiGroups: [""]
+      resources: [secrets]
+      verbs: [get, list, watch]
+    ---
+    apiVersion: rbac.authorization.k8s.io/v1
+    kind: RoleBinding
+    metadata: {name: cyclops-ctrl-secrets, namespace: cyclops}
+    roleRef: {apiGroup: rbac.authorization.k8s.io, kind: Role, name: cyclops-ctrl-secrets}
+    subjects: [{kind: ServiceAccount, name: cyclops-ctrl, namespace: cyclops}]
+    ---
+    apiVersion: rbac.authorization.k8s.io/v1
+    kind: ClusterRole
+    metadata: {name: cyclops-deployer}
+    rules:
+    - apiGroups: ["", apps]
+      resources: [deployments, services, configmaps]
+      verbs: [get, list, watch, create, update, patch, delete]
+    EOF
+    for ns in team-a team-b; do
+      kubectl create rolebinding cyclops-ctrl -n $ns --clusterrole=cyclops-deployer --serviceaccount=cyclops:cyclops-ctrl --dry-run=client -o yaml | kubectl apply -f - >/dev/null
+    done
+    kubectl -n cyclops rollout restart deploy/cyclops-ctrl >/dev/null
+    kubectl -n cyclops rollout status deploy/cyclops-ctrl --timeout=120s >/dev/null
+
+- id: k8s-425
+  title: A login in front of the portal
+  difficulty: 3
+  kind: build
+  tags: [cyclops, oidc, dex, oauth2-proxy, networkpolicy, sso]
+  tutorial: |
+    **What you're learning.** How to put single sign-on in front of a UI that has none (Cyclops 0.21), with Dex and oauth2-proxy inside the cluster, and how to close the back door with a NetworkPolicy.
+
+    ### The idea
+
+    ```text
+    browser -> cyclops-auth (oauth2-proxy :4180) --login--> Dex (OIDC, dex.dex.svc:5556)
+                     | only allowed emails
+                     v
+               cyclops-ui :3000 --/api--> cyclops-ctrl
+    ```
+
+    **Dex** is a small OIDC provider, light enough for the cluster nodes, that can front LDAP, GitHub or a static user list. **oauth2-proxy** does the login dance and lets through only the users you list. Its `--authenticated-emails-file` is a file with one allowed email per line.
+
+    A proxy is only a gate if it's the **only** way in. Today any pod can reach `cyclops-ui:3000` directly. The stock install ships a NetworkPolicy for the UI that allows **all** ingress (`ingress: [{}]`). NetworkPolicies **add up**: a second, stricter policy changes nothing while the allow-all one exists. Change or replace it so that only the proxy's pods may connect.
+
+    ### Commands you'll use
+
+    oauth2-proxy as a Deployment, configured with flags:
+
+    ```yaml
+    args:
+    - --provider=oidc
+    - --oidc-issuer-url=http://dex.dex.svc:5556/dex
+    - --client-id=wiki
+    - --client-secret=$(CLIENT_SECRET)        # from a Secret, via env
+    - --redirect-url=http://wiki-auth.wiki.svc:4180/oauth2/callback
+    - --http-address=0.0.0.0:4180
+    - --upstream=http://wiki.wiki.svc:8080/
+    - --cookie-secret=$(COOKIE_SECRET)
+    - --cookie-secure=false
+    - --authenticated-emails-file=/etc/auth/emails
+    - --skip-provider-button=true
+    ```
+
+    ```yaml
+    # only pods labelled app=wiki-auth may reach the wiki's pods
+    spec:
+      podSelector: {matchLabels: {app: wiki}}
+      policyTypes: [Ingress]
+      ingress:
+      - from: [{podSelector: {matchLabels: {app: wiki-auth}}}]
+        ports: [{port: 80}]
+    ```
+
+    ```bash
+    kubectl -n cyclops get networkpolicy cyclops-ui -o yaml     # the allow-all one
+    kubectl -n cyclops logs deploy/cyclops-auth --tail=10       # [AuthFailure] lines
+    cy-login http://cyclops-auth.cyclops.svc:4180/ ana@example.com 'Ana-pass-1'   # a scripted login from a pod
+    kubectl run t --rm -i --image=curlimages/curl:8.11.1 --restart=Never -- curl -m 5 -sI http://cyclops-ui.cyclops.svc:3000/
+    ```
+
+    The issuer, the proxy and the UI use cluster DNS names here, so a browser in a pod can follow the redirects. A real setup gives Dex and the proxy public host names.
+
+    ### Common mistakes
+
+    - The container port: cyclops-ui's pods listen on **80** (its Service maps 3000 to 80). A policy for port 3000 blocks the proxy too.
+    - Adding a deny policy next to the allow-all one: nothing changes.
+    - Secrets as plain flags in the Deployment: put them in a Secret.
+
+    ### Check your work
+
+    A scripted login as ana reaches the module list through the proxy, cleo gets 403, and a curl from another namespace straight to `cyclops-ui` times out.
+  scenario: |
+    Anyone who can reach `cyclops-ui` controls the cluster's deployments,
+    and there's no login. **Dex** runs at `http://dex.dex.svc:5556/dex` with
+    a client **`cyclops`** (secret in **`/lab/dex-client.secret`**, redirect
+    URI `http://cyclops-auth.cyclops.svc:4180/oauth2/callback`) and users
+    ana, ben and cleo (`@example.com`, passwords `Ana-pass-1`,
+    `Ben-pass-1`, `Cleo-pass-1`).
+
+    In namespace **`cyclops`**:
+
+    1. deploy **oauth2-proxy** (image
+       `quay.io/oauth2-proxy/oauth2-proxy:v7.15.6`) as Deployment and Service
+       **`cyclops-auth`** on port **4180**, in front of
+       `http://cyclops-ui.cyclops.svc:3000`, letting in only **ana and ben**,
+       with its secrets in a Kubernetes **Secret**;
+    2. make **cyclops-ui** reachable **only from the proxy's pods**.
+  hints:
+    - "Put the client secret and a 32-byte cookie secret in a Secret, pass them as env vars, and refer to them in the args as `$(CLIENT_SECRET)`."
+    - "The allowed emails go in a ConfigMap mounted as a file for `--authenticated-emails-file`."
+    - "Edit the existing NetworkPolicy `cyclops-ui` so its ingress only allows `podSelector: {matchLabels: {app: cyclops-auth}}` on port 80."
+  solution: |
+    ```bash
+    kubectl -n cyclops create secret generic cyclops-auth \
+      --from-literal=client-secret="$(cat /lab/dex-client.secret)" \
+      --from-literal=cookie-secret="$(head -c 32 /dev/urandom | base64 | tr -dc A-Za-z0-9 | head -c 32)"
+    kubectl -n cyclops create configmap cyclops-auth-emails --from-literal=emails="$(printf 'ana@example.com\nben@example.com')"
+    kubectl apply -f - <<'EOF'
+    apiVersion: apps/v1
+    kind: Deployment
+    metadata: {name: cyclops-auth, namespace: cyclops}
+    spec:
+      selector: {matchLabels: {app: cyclops-auth}}
+      template:
+        metadata: {labels: {app: cyclops-auth}}
+        spec:
+          containers:
+          - name: oauth2-proxy
+            image: quay.io/oauth2-proxy/oauth2-proxy:v7.15.6
+            env:
+            - {name: CLIENT_SECRET, valueFrom: {secretKeyRef: {name: cyclops-auth, key: client-secret}}}
+            - {name: COOKIE_SECRET, valueFrom: {secretKeyRef: {name: cyclops-auth, key: cookie-secret}}}
+            args:
+            - --provider=oidc
+            - --oidc-issuer-url=http://dex.dex.svc:5556/dex
+            - --client-id=cyclops
+            - --client-secret=$(CLIENT_SECRET)
+            - --redirect-url=http://cyclops-auth.cyclops.svc:4180/oauth2/callback
+            - --http-address=0.0.0.0:4180
+            - --upstream=http://cyclops-ui.cyclops.svc:3000/
+            - --cookie-secret=$(COOKIE_SECRET)
+            - --cookie-secure=false
+            - --authenticated-emails-file=/etc/auth/emails
+            - --skip-provider-button=true
+            ports: [{containerPort: 4180}]
+            volumeMounts: [{name: emails, mountPath: /etc/auth}]
+          volumes: [{name: emails, configMap: {name: cyclops-auth-emails}}]
+    ---
+    apiVersion: v1
+    kind: Service
+    metadata: {name: cyclops-auth, namespace: cyclops}
+    spec: {selector: {app: cyclops-auth}, ports: [{port: 4180}]}
+    ---
+    apiVersion: networking.k8s.io/v1
+    kind: NetworkPolicy
+    metadata: {name: cyclops-ui, namespace: cyclops}
+    spec:
+      podSelector: {matchLabels: {app: cyclops-ui}}
+      policyTypes: [Ingress, Egress]
+      ingress:
+      - from: [{podSelector: {matchLabels: {app: cyclops-auth}}}]
+        ports: [{port: 80}]
+      egress: [{}]
+    EOF
+    ```
+  setup: |
+    cy_install
+    cy_templates
+    k_ns team-a
+    cy_module web-a team-a "$CY_REPO/dev/templates" app '{image: "nginx:1.29-alpine", replicas: 1}'
+    sec=$(head -c 18 /dev/urandom | base64 | tr -dc A-Za-z0-9 | head -c 24)
+    cy_dex "$sec" http://cyclops-auth.cyclops.svc:4180/oauth2/callback ana:Ana-pass-1 ben:Ben-pass-1 cleo:Cleo-pass-1
+    echo "$sec" | lab_file dex-client.secret 600
+    cat >/usr/local/bin/cy-login <<'WRAP'
+    #!/bin/bash
+    # cy-login URL USER PASSWORD: a scripted browser login from a pod (cluster DNS names work)
+    [ $# -eq 3 ] || { echo "usage: cy-login URL USER PASSWORD" >&2; exit 2; }
+    source /opt/kubelab/lib.sh
+    CY_OUT=$(mktemp)
+    cy_login "$@"
+    jq -r '"status: \(.status)\nurl:    \(.url)\nlogin form shown: \(.login_page)" + (if .kc_error != "" then "\nthe login page says: \(.kc_error)" else "" end) + (if .error then "\nerror: \(.error)" else "" end) + "\n--- page ---\n" + (.body[0:800])' "$CY_OUT"
+    WRAP
+    chmod 755 /usr/local/bin/cy-login
+    on_reset 'rm -f /usr/local/bin/cy-login'
+  check: |
+    check "Deployment cyclops-auth runs oauth2-proxy v7.15.6" 'deploy_ready cyclops cyclops-auth && [ "$(kubectl -n cyclops get deploy cyclops-auth -o jsonpath="{.spec.template.spec.containers[0].image}")" = quay.io/oauth2-proxy/oauth2-proxy:v7.15.6 ]'
+    check "Service cyclops-auth listens on 4180" '[ "$(kubectl -n cyclops get svc cyclops-auth -o jsonpath="{.spec.ports[0].port}" 2>/dev/null)" = 4180 ]'
+    sec=$(cat /lab/dex-client.secret)
+    check "the client secret isn't written in the Deployment itself" '! kubectl -n cyclops get deploy cyclops-auth -o yaml | grep -qF "$sec"'
+    cy_login http://cyclops-auth.cyclops.svc:4180/api/modules/list ana@example.com Ana-pass-1
+    check "an anonymous visitor is sent to Dex's login" 'cyj ".first.status == 302 and (.first.location | startswith(\"http://dex.dex.svc:5556/dex/auth\"))"'
+    check "ana logs in and gets the module list through the proxy" 'cyj ".status == 200 and (.body | test(\"web-a\"))"'
+    cy_login http://cyclops-auth.cyclops.svc:4180/api/modules/list ben@example.com Ben-pass-1
+    check "ben too" 'cyj ".status == 200 and (.body | test(\"web-a\"))"'
+    cy_login http://cyclops-auth.cyclops.svc:4180/api/modules/list cleo@example.com Cleo-pass-1
+    check "cleo signs in but is refused (403)" 'cyj ".login_page and .status == 403"'
+    direct=$(cy_probe kl-outsider http://cyclops-ui.cyclops.svc:3000/api/modules/list)
+    check "a pod in another namespace can't reach cyclops-ui directly (got ${direct:-none})" '[ "$direct" = 000 ]'
+    same=$(cy_probe cyclops http://cyclops-ui.cyclops.svc:3000/api/modules/list)
+    check "nor can another pod in namespace cyclops (got ${same:-none})" '[ "$same" = 000 ]'
+  solve: |
+    kubectl -n cyclops create secret generic cyclops-auth --from-literal=client-secret="$(cat /lab/dex-client.secret)" \
+      --from-literal=cookie-secret="$(head -c 32 /dev/urandom | base64 | tr -dc A-Za-z0-9 | head -c 32)" >/dev/null
+    kubectl -n cyclops create configmap cyclops-auth-emails --from-literal=emails="$(printf 'ana@example.com\nben@example.com')" >/dev/null
+    kubectl apply -f - >/dev/null <<'EOF'
+    apiVersion: apps/v1
+    kind: Deployment
+    metadata: {name: cyclops-auth, namespace: cyclops}
+    spec:
+      selector: {matchLabels: {app: cyclops-auth}}
+      template:
+        metadata: {labels: {app: cyclops-auth}}
+        spec:
+          containers:
+          - name: oauth2-proxy
+            image: quay.io/oauth2-proxy/oauth2-proxy:v7.15.6
+            env:
+            - {name: CLIENT_SECRET, valueFrom: {secretKeyRef: {name: cyclops-auth, key: client-secret}}}
+            - {name: COOKIE_SECRET, valueFrom: {secretKeyRef: {name: cyclops-auth, key: cookie-secret}}}
+            args:
+            - --provider=oidc
+            - --oidc-issuer-url=http://dex.dex.svc:5556/dex
+            - --client-id=cyclops
+            - --client-secret=$(CLIENT_SECRET)
+            - --redirect-url=http://cyclops-auth.cyclops.svc:4180/oauth2/callback
+            - --http-address=0.0.0.0:4180
+            - --upstream=http://cyclops-ui.cyclops.svc:3000/
+            - --cookie-secret=$(COOKIE_SECRET)
+            - --cookie-secure=false
+            - --authenticated-emails-file=/etc/auth/emails
+            - --skip-provider-button=true
+            ports: [{containerPort: 4180}]
+            volumeMounts: [{name: emails, mountPath: /etc/auth}]
+          volumes: [{name: emails, configMap: {name: cyclops-auth-emails}}]
+    ---
+    apiVersion: v1
+    kind: Service
+    metadata: {name: cyclops-auth, namespace: cyclops}
+    spec: {selector: {app: cyclops-auth}, ports: [{port: 4180}]}
+    ---
+    apiVersion: networking.k8s.io/v1
+    kind: NetworkPolicy
+    metadata: {name: cyclops-ui, namespace: cyclops}
+    spec:
+      podSelector: {matchLabels: {app: cyclops-ui}}
+      policyTypes: [Ingress, Egress]
+      ingress:
+      - from: [{podSelector: {matchLabels: {app: cyclops-auth}}}]
+        ports: [{port: 80}]
+      egress: [{}]
+    EOF
+    wait_deploy cyclops cyclops-auth 120
+
+# ===== Capstone =====
+
+- id: k8s-426
+  title: "Capstone: self-service for the payments team"
+  difficulty: 4
+  kind: build
+  tags: [cyclops, capstone, rbac, templateauthrule, sso, platform-engineering]
+  tutorial: |
+    **What you're learning.** Onboarding a new team onto the portal end to end: their namespace, the controller's rights there, their private template, and their people in the login.
+
+    ### Method
+
+    | Step | How | Exercise |
+    |---|---|---|
+    | a namespace for the team | `kubectl create namespace` | |
+    | the controller may deploy there, and only there | a RoleBinding to the deployer ClusterRole | k8s-424 |
+    | Cyclops can read the team's private repo | a token in a Secret plus a `TemplateAuthRule` | k8s-423 |
+    | the template refuses bad values | `fail` in the chart | k8s-422 |
+    | the team's people can log in | the proxy's allowed emails | k8s-425 |
+    | the app runs | a Module | k8s-421 |
+
+    Check each step on its own before the next one. When the Module fails, its `status.reconciliationStatus` says whether it was the fetch (auth rule), the rendering (the template's `fail`) or the apply (RBAC).
+
+    ### Commands you'll use
+
+    ```bash
+    SA=system:serviceaccount:cyclops:cyclops-ctrl
+    kubectl auth can-i create deployments -n payments --as=$SA
+    kubectl -n cyclops get module payments-api -o jsonpath='{.status.reconciliationStatus}' | jq .
+    kubectl -n cyclops rollout restart deploy/cyclops-auth      # re-read a changed emails file
+    cy-login http://cyclops-auth.cyclops.svc:4180/api/modules/list dana@example.com 'Dana-pass-1'
+    ```
+  scenario: |
+    The portal is locked down: the controller may deploy only to `team-a`,
+    and `cyclops-auth` (oauth2-proxy with Dex) lets in only ana. Onboard the
+    **payments** team:
+
+    1. namespace **`payments`**, where the controller may deploy (still
+       nowhere else new);
+    2. their template **`api`** is in the **private** repo
+       **`http://gitea.gitea.svc:3000/payments/templates`**. Give Cyclops a
+       **token** for account `payments` (password in
+       **`/lab/payments-git.txt`**) through a TemplateAuthRule;
+    3. that template must refuse **more than 4 replicas** (it doesn't
+       yet). Fix it in the repo;
+    4. deploy Module **`payments-api`** from it into `payments`, with
+       image `nginx:1.29-alpine` and **3 replicas**;
+    5. **dana** (`dana@example.com`, `Dana-pass-1`, already in Dex) can
+       log in to the portal; ana still can; nobody else.
+  hints:
+    - "RBAC: `kubectl create rolebinding cyclops-ctrl -n payments --clusterrole=cyclops-deployer --serviceaccount=cyclops:cyclops-ctrl`."
+    - "Token: `curl -u payments:PASS -H 'Content-Type: application/json' -d '{\"name\": \"cyclops\", \"scopes\": [\"read:repository\"]}' http://node01:30300/api/v1/users/payments/tokens`; the rule's repo prefix is `http://gitea.gitea.svc:3000/payments/`."
+    - "Clone the repo with the payments account, add the `fail` for replicas > 4 to `api/templates/deployment.yaml`, push. The allowed emails are in ConfigMap `cyclops-auth-emails`; restart the proxy after changing it."
+  solution: |
+    ```bash
+    kubectl create namespace payments
+    kubectl create rolebinding cyclops-ctrl -n payments --clusterrole=cyclops-deployer --serviceaccount=cyclops:cyclops-ctrl
+    PASS=$(sed -n 's/^password=//p' /lab/payments-git.txt)
+    TOKEN=$(curl -s -u payments:"$PASS" -H 'Content-Type: application/json' \
+      -d '{"name": "cyclops", "scopes": ["read:repository"]}' http://node01:30300/api/v1/users/payments/tokens | jq -r .sha1)
+    kubectl -n cyclops create secret generic gitea-payments --from-literal=username=payments --from-literal=token="$TOKEN"
+    kubectl apply -f - <<'EOF'
+    apiVersion: cyclops-ui.com/v1alpha1
+    kind: TemplateAuthRule
+    metadata: {name: gitea-payments, namespace: cyclops}
+    spec:
+      repo: http://gitea.gitea.svc:3000/payments/
+      username: {name: gitea-payments, key: username}
+      password: {name: gitea-payments, key: token}
+    EOF
+    git clone "http://payments:$PASS@node01:30300/payments/templates.git" /tmp/pt && cd /tmp/pt
+    sed -i '1i {{- if gt (int .Values.replicas) 4 }}{{- fail "replicas must be 4 or fewer" }}{{- end }}' api/templates/deployment.yaml
+    git commit -qam "refuse more than 4 replicas" && git push -q
+    kubectl apply -f - <<'EOF'
+    apiVersion: cyclops-ui.com/v1alpha1
+    kind: Module
+    metadata: {name: payments-api, namespace: cyclops}
+    spec:
+      targetNamespace: payments
+      template: {repo: "http://gitea.gitea.svc:3000/payments/templates", path: api, version: main, sourceType: git}
+      values: {image: "nginx:1.29-alpine", replicas: 3}
+    EOF
+    kubectl -n cyclops create configmap cyclops-auth-emails --from-literal=emails="$(printf 'ana@example.com\ndana@example.com')" \
+      --dry-run=client -o yaml | kubectl apply -f -
+    kubectl -n cyclops rollout restart deploy/cyclops-auth
+    ```
+  setup: |
+    cy_install
+    cy_templates
+    k_ns team-a
+    ppw="pay-$(head -c6 /dev/urandom | od -An -tx1 | tr -d ' \n')"
+    gitea_user payments "$ppw" "Payments Team" >/dev/null
+    printf 'url=http://node01:30300/payments/templates\nusername=payments\npassword=%s\n' "$ppw" | lab_file payments-git.txt 600
+    t=$(mktemp -d); cp -r "$CY_KIT/templates/app" "$t/api"; sed -i 's/^name: app/name: api/' "$t/api/Chart.yaml"
+    gitea_repo payments templates private
+    git -C "$t" init -q -b main && git -C "$t" add -A && git -C "$t" -c user.name="Payments" -c user.email=pay@lab.test commit -qm "api template" &&
+      git -C "$t" push -q "$(gitea_url payments/templates "payments:$ppw")" main 2>/dev/null
+    rm -rf "$t"
+    kubectl delete clusterrolebinding cyclops-ctrl >/dev/null; kubectl delete clusterrole cyclops-ctrl >/dev/null
+    kubectl apply -f - >/dev/null <<'EOF'
+    apiVersion: rbac.authorization.k8s.io/v1
+    kind: ClusterRole
+    metadata: {name: cyclops-ctrl-core}
+    rules:
+    - apiGroups: [cyclops-ui.com]
+      resources: [modules, modules/status, templatestores, templateauthrules]
+      verbs: [get, list, watch, create, update, patch, delete]
+    - apiGroups: [""]
+      resources: [namespaces]
+      verbs: [get, list, watch]
+    - apiGroups: ["", apps, batch, networking.k8s.io]
+      resources: [deployments, statefulsets, daemonsets, replicasets, pods, services, configmaps, persistentvolumeclaims, jobs, cronjobs, ingresses, events]
+      verbs: [get, list, watch]
+    ---
+    apiVersion: rbac.authorization.k8s.io/v1
+    kind: ClusterRoleBinding
+    metadata: {name: cyclops-ctrl-core}
+    roleRef: {apiGroup: rbac.authorization.k8s.io, kind: ClusterRole, name: cyclops-ctrl-core}
+    subjects: [{kind: ServiceAccount, name: cyclops-ctrl, namespace: cyclops}]
+    ---
+    apiVersion: rbac.authorization.k8s.io/v1
+    kind: Role
+    metadata: {name: cyclops-ctrl-secrets, namespace: cyclops}
+    rules:
+    - apiGroups: [""]
+      resources: [secrets]
+      verbs: [get, list, watch]
+    ---
+    apiVersion: rbac.authorization.k8s.io/v1
+    kind: RoleBinding
+    metadata: {name: cyclops-ctrl-secrets, namespace: cyclops}
+    roleRef: {apiGroup: rbac.authorization.k8s.io, kind: Role, name: cyclops-ctrl-secrets}
+    subjects: [{kind: ServiceAccount, name: cyclops-ctrl, namespace: cyclops}]
+    ---
+    apiVersion: rbac.authorization.k8s.io/v1
+    kind: ClusterRole
+    metadata: {name: cyclops-deployer}
+    rules:
+    - apiGroups: ["", apps]
+      resources: [deployments, services, configmaps]
+      verbs: [get, list, watch, create, update, patch, delete]
+    ---
+    apiVersion: rbac.authorization.k8s.io/v1
+    kind: RoleBinding
+    metadata: {name: cyclops-ctrl, namespace: team-a}
+    roleRef: {apiGroup: rbac.authorization.k8s.io, kind: ClusterRole, name: cyclops-deployer}
+    subjects: [{kind: ServiceAccount, name: cyclops-ctrl, namespace: cyclops}]
+    EOF
+    kubectl -n cyclops rollout restart deploy/cyclops-ctrl >/dev/null
+    sec=$(head -c 18 /dev/urandom | base64 | tr -dc A-Za-z0-9 | head -c 24)
+    cy_dex "$sec" http://cyclops-auth.cyclops.svc:4180/oauth2/callback ana:Ana-pass-1 dana:Dana-pass-1 cleo:Cleo-pass-1
+    kubectl -n cyclops create secret generic cyclops-auth --from-literal=client-secret="$sec" \
+      --from-literal=cookie-secret="$(head -c 32 /dev/urandom | base64 | tr -dc A-Za-z0-9 | head -c 32)" >/dev/null
+    kubectl -n cyclops create configmap cyclops-auth-emails --from-literal=emails=ana@example.com >/dev/null
+    kubectl apply -f - >/dev/null <<'EOF'
+    apiVersion: apps/v1
+    kind: Deployment
+    metadata: {name: cyclops-auth, namespace: cyclops}
+    spec:
+      selector: {matchLabels: {app: cyclops-auth}}
+      template:
+        metadata: {labels: {app: cyclops-auth}}
+        spec:
+          containers:
+          - name: oauth2-proxy
+            image: quay.io/oauth2-proxy/oauth2-proxy:v7.15.6
+            env:
+            - {name: CLIENT_SECRET, valueFrom: {secretKeyRef: {name: cyclops-auth, key: client-secret}}}
+            - {name: COOKIE_SECRET, valueFrom: {secretKeyRef: {name: cyclops-auth, key: cookie-secret}}}
+            args:
+            - --provider=oidc
+            - --oidc-issuer-url=http://dex.dex.svc:5556/dex
+            - --client-id=cyclops
+            - --client-secret=$(CLIENT_SECRET)
+            - --redirect-url=http://cyclops-auth.cyclops.svc:4180/oauth2/callback
+            - --http-address=0.0.0.0:4180
+            - --upstream=http://cyclops-ui.cyclops.svc:3000/
+            - --cookie-secret=$(COOKIE_SECRET)
+            - --cookie-secure=false
+            - --authenticated-emails-file=/etc/auth/emails
+            - --skip-provider-button=true
+            ports: [{containerPort: 4180}]
+            volumeMounts: [{name: emails, mountPath: /etc/auth}]
+          volumes: [{name: emails, configMap: {name: cyclops-auth-emails}}]
+    ---
+    apiVersion: v1
+    kind: Service
+    metadata: {name: cyclops-auth, namespace: cyclops}
+    spec: {selector: {app: cyclops-auth}, ports: [{port: 4180}]}
+    ---
+    apiVersion: networking.k8s.io/v1
+    kind: NetworkPolicy
+    metadata: {name: cyclops-ui, namespace: cyclops}
+    spec:
+      podSelector: {matchLabels: {app: cyclops-ui}}
+      policyTypes: [Ingress, Egress]
+      ingress:
+      - from: [{podSelector: {matchLabels: {app: cyclops-auth}}}]
+        ports: [{port: 80}]
+      egress: [{}]
+    EOF
+    wait_deploy cyclops cyclops-auth 120
+    wait_deploy cyclops cyclops-ctrl 120
+    cat >/usr/local/bin/cy-login <<'WRAP'
+    #!/bin/bash
+    # cy-login URL USER PASSWORD: a scripted browser login from a pod (cluster DNS names work)
+    [ $# -eq 3 ] || { echo "usage: cy-login URL USER PASSWORD" >&2; exit 2; }
+    source /opt/kubelab/lib.sh
+    CY_OUT=$(mktemp)
+    cy_login "$@"
+    jq -r '"status: \(.status)\nurl:    \(.url)\nlogin form shown: \(.login_page)" + (if .kc_error != "" then "\nthe login page says: \(.kc_error)" else "" end) + (if .error then "\nerror: \(.error)" else "" end) + "\n--- page ---\n" + (.body[0:800])' "$CY_OUT"
+    WRAP
+    chmod 755 /usr/local/bin/cy-login
+    on_reset 'rm -f /usr/local/bin/cy-login'
+  check: |
+    SA=system:serviceaccount:cyclops:cyclops-ctrl
+    check "the controller may deploy in payments" 'cy_can create deployments.apps payments && cy_can create services payments'
+    check "and still not in default or kube-system, nor read Secrets in payments" '! cy_can create deployments.apps default && ! cy_can create deployments.apps kube-system && ! cy_can get secrets payments'
+    r=$(kubectl -n cyclops get templateauthrules -o json 2>/dev/null | jq -c '[.items[] | select(.spec.repo as $r | "http://gitea.gitea.svc:3000/payments/templates" | startswith($r))] | .[0] // {}')
+    pw=$(kubectl -n cyclops get secret "$(jq -r '.spec.password.name // "none"' <<<"$r")" -o json 2>/dev/null | jq -r --arg k "$(jq -r '.spec.password.key // ""' <<<"$r")" '.data[$k] // empty' | base64 -d 2>/dev/null)
+    check "a TemplateAuthRule covers payments/templates, with a token (not the account's password)" '[ -n "$pw" ] && [ "$pw" != "$(sed -n "s/^password=//p" /lab/payments-git.txt)" ] && git ls-remote "http://payments:$pw@${GITEA_URL#http://}/payments/templates.git" >/dev/null 2>&1'
+    m=$(kubectl -n cyclops get module payments-api -o json 2>/dev/null)
+    check "Module payments-api uses api from payments/templates, into payments" 'jq -e ".spec.targetNamespace == \"payments\" and .spec.template.path == \"api\" and (.spec.template.repo | test(\"payments/templates(\\\\.git)?$\"))" <<<"$m"'
+    check "it succeeds, with 3 ready replicas of nginx:1.29-alpine" 'eventually 90 "[ \"\$(cy_status payments-api)\" = succeeded ] && [ \"\$(kubectl -n payments get deploy payments-api -o jsonpath={.status.readyReplicas} 2>/dev/null)\" = 3 ]" && [ "$(kubectl -n payments get deploy payments-api -o jsonpath="{.spec.template.spec.containers[0].image}")" = nginx:1.29-alpine ]'
+    p=pay$RANDOM
+    cy_module "$p" payments "$CY_REPO/payments/templates" api '{image: "nginx:1.29-alpine", replicas: 5}'
+    cy_wait "$p" 60
+    check "the template refuses 5 replicas (nothing is created)" '[ "$(cy_status $p)" = failed ] && ! kubectl -n payments get deploy $p >/dev/null 2>&1'
+    kubectl -n cyclops delete module "$p" --wait=false >/dev/null 2>&1
+    cy_login http://cyclops-auth.cyclops.svc:4180/api/modules/list dana@example.com Dana-pass-1
+    check "dana logs in to the portal and sees payments-api" 'cyj ".status == 200 and (.body | test(\"payments-api\"))"'
+    cy_login http://cyclops-auth.cyclops.svc:4180/api/modules/list ana@example.com Ana-pass-1
+    check "ana still can" 'cyj ".status == 200"'
+    cy_login http://cyclops-auth.cyclops.svc:4180/api/modules/list cleo@example.com Cleo-pass-1
+    check "cleo can't (403)" 'cyj ".login_page and .status == 403"'
+    direct=$(cy_probe payments http://cyclops-ui.cyclops.svc:3000/api/modules/list)
+    check "cyclops-ui is still reachable only through the proxy (got ${direct:-none})" '[ "$direct" = 000 ]'
+  solve: |
+    k_ns payments
+    kubectl create rolebinding cyclops-ctrl -n payments --clusterrole=cyclops-deployer --serviceaccount=cyclops:cyclops-ctrl >/dev/null
+    ppw=$(sed -n 's/^password=//p' /lab/payments-git.txt)
+    tok=$(gitea_as payments "$ppw" POST /users/payments/tokens '{"name": "cyclops", "scopes": ["read:repository"]}' | jq -r .sha1)
+    kubectl -n cyclops create secret generic gitea-payments --from-literal=username=payments --from-literal=token="$tok" >/dev/null
+    kubectl apply -f - >/dev/null <<'EOF'
+    apiVersion: cyclops-ui.com/v1alpha1
+    kind: TemplateAuthRule
+    metadata: {name: gitea-payments, namespace: cyclops}
+    spec:
+      repo: http://gitea.gitea.svc:3000/payments/
+      username: {name: gitea-payments, key: username}
+      password: {name: gitea-payments, key: token}
+    EOF
+    t=$(mktemp -d)
+    git clone -q "$(gitea_url payments/templates "payments:$ppw")" "$t/r"
+    sed -i '1i {{- if gt (int .Values.replicas) 4 }}{{- fail "replicas must be 4 or fewer" }}{{- end }}' "$t/r/api/templates/deployment.yaml"
+    git -C "$t/r" -c user.name=Payments -c user.email=pay@lab.test commit -qam "refuse more than 4 replicas" && git -C "$t/r" push -q
+    rm -rf "$t"
+    cy_module payments-api payments "$CY_REPO/payments/templates" api '{image: "nginx:1.29-alpine", replicas: 3}'
+    kubectl -n cyclops create configmap cyclops-auth-emails --from-literal=emails="$(printf 'ana@example.com\ndana@example.com')" --dry-run=client -o yaml | kubectl apply -f - >/dev/null
+    kubectl -n cyclops rollout restart deploy/cyclops-auth >/dev/null
+    kubectl -n cyclops rollout status deploy/cyclops-auth --timeout=120s >/dev/null
+    eventually 90 '[ "$(cy_status payments-api)" = succeeded ]'

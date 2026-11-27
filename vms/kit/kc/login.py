@@ -121,6 +121,16 @@ try:
             target = urllib.parse.urljoin(p.url, html.unescape(f["action"])) if f["action"] else p.url
             p = go("POST", target, data)
             break
+    for f in forms(p.text):
+        # a consent page ("Grant access", Dex's approval screen): press approve, as the user would
+        approve = [(n, v) for n, t, v in f["inputs"] if n == "approval" and v == "approve"]
+        if approve:
+            out["consent"] = True
+            data = {n: v for n, t, v in f["inputs"] if t == "hidden"}
+            data["approval"] = "approve"
+            target = urllib.parse.urljoin(p.url, html.unescape(f["action"])) if f["action"] else p.url
+            p = go("POST", target, data)
+            break
     out.update(status=p.status, url=p.url, body=p.text[:30000])
     if not out["kc_error"] and (any(t == "password" for f in forms(p.text) for _, t, _ in f["inputs"]) or p.status >= 400):
         out["kc_error"] = error_text(p.text)

@@ -3006,3 +3006,127 @@ WRAP
   chmod 755 /usr/local/bin/o2p-run /usr/local/bin/o2p-logs
   on_reset 'rm -f /usr/local/bin/o2p-run /usr/local/bin/o2p-logs'
 }
+
+# ---------- Cyclops helpers (kubernetes: a developer portal; cyclops v0.21.1 bundled in
+# vms/kit/cyclops-v0.21.1.yaml.gz, templates in vms/kit/cyclops/templates) ----------
+CY_KIT=/opt/kubelab/cyclops
+CY_REPO=http://gitea.gitea.svc:3000
+
+# cy_install -> Cyclops (controller cyclops-ctrl, UI cyclops-ui on svc :3000) in namespace cyclops
+cy_install() {
+  zcat /opt/kubelab/cyclops-v0.21.1.yaml.gz | kubectl apply --server-side --force-conflicts -f - >/dev/null || return 1
+  wait_deploy cyclops cyclops-ctrl 180 && wait_deploy cyclops cyclops-ui 180
+}
+# cy_templates [OWNER/REPO] [private] -> Gitea with the learner's account dev, and a template repo
+# (default dev/templates) holding the app chart from vms/kit/cyclops/templates
+cy_templates() {
+  local r=${1:-dev/templates} t
+  kgitea_start >/dev/null && gitea_dev || return 1
+  t=$(mktemp -d)
+  cp -r "$CY_KIT/templates/app" "$t/app"
+  gitea_repo "${r%%/*}" "${r#*/}" "${2:-}"
+  git -C "$t" init -q -b main && git -C "$t" add -A &&
+    git -C "$t" -c user.name="Platform Team" -c user.email=platform@lab.test commit -qm "app template" &&
+    git -C "$t" push -q "$(gitea_url "$r" "dev:$(cat "$KL_STATE/dev-pass")")" main 2>/dev/null
+  rm -rf "$t"
+}
+# cy_module NAME TARGET-NS REPO PATH 'VALUES-JSON' [VERSION] -> apply a Module in namespace cyclops
+cy_module() {
+  kubectl apply -f - >/dev/null <<EOF2
+apiVersion: cyclops-ui.com/v1alpha1
+kind: Module
+metadata: {name: $1, namespace: cyclops}
+spec:
+  targetNamespace: $2
+  template: {repo: "$3", path: "$4", version: "${6:-main}", sourceType: git}
+  values: $5
+EOF2
+}
+# cy_status NAME -> succeeded / failed / empty; cy_reason NAME -> the reason and errors, one line
+cy_status() { kubectl -n cyclops get module "$1" -o jsonpath='{.status.reconciliationStatus.status}' 2>/dev/null; }
+cy_reason() { kubectl -n cyclops get module "$1" -o json 2>/dev/null | jq -r '.status.reconciliationStatus | [.reason, (.errors // [])[]] | map(select(. != null)) | join("; ")'; }
+# cy_wait NAME [SECONDS] -> wait until the Module has a reconciliation status
+cy_wait() { eventually "${2:-60}" "[ -n \"\$(cy_status $1)\" ]"; }
+# cy_api PATH -> GET the UI's API (http://cyclops-ui.cyclops.svc:3000/api/PATH) from the node
+cy_api() { svc_get cyclops cyclops-ui "/api/$1" 3000; }
+# cy_can VERB RESOURCE [NAMESPACE | -n NAMESPACE] -> can the cyclops-ctrl service account do it?
+cy_can() {
+  local v=$1 r=$2
+  shift 2
+  [ $# -eq 1 ] && set -- -n "$1"
+  kubectl auth can-i "$v" "$r" "$@" --as=system:serviceaccount:cyclops:cyclops-ctrl >/dev/null 2>&1
+}
+
+# cy_hash PASSWORD -> a bcrypt hash (htpasswd in httpd:2.4-alpine, as a pod)
+cy_hash() { kubectl run "hp$RANDOM" -n default --rm -i --quiet --image=httpd:2.4-alpine --restart=Never -- htpasswd -bnBC 10 "" "$1" 2>/dev/null | tr -d ':\n\r'; }
+# cy_dex CLIENT-SECRET REDIRECT-URI USER:PASSWORD... -> Dex v2.46.1 in namespace dex
+# (issuer http://dex.dex.svc:5556/dex, static client "cyclops"), users USER@example.com
+cy_dex() {
+  local sec=$1 redir=$2 users="" u n=0
+  shift 2
+  for u in "$@"; do
+    n=$((n + 1))
+    users+="    - {email: ${u%%:*}@example.com, username: ${u%%:*}, userID: \"$n\", hash: \"$(cy_hash "${u#*:}")\"}"$'\n'
+  done
+  k_ns dex
+  kapply <<EOF2
+apiVersion: v1
+kind: ConfigMap
+metadata: {name: dex, namespace: dex}
+data:
+  config.yaml: |
+    issuer: http://dex.dex.svc:5556/dex
+    storage: {type: memory}
+    web: {http: 0.0.0.0:5556}
+    oauth2: {skipApprovalScreen: true}
+    enablePasswordDB: true
+    staticClients:
+    - {id: cyclops, name: Cyclops, secret: "$sec", redirectURIs: ["$redir"]}
+    staticPasswords:
+$users
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata: {name: dex, namespace: dex}
+spec:
+  selector: {matchLabels: {app: dex}}
+  template:
+    metadata: {labels: {app: dex}}
+    spec:
+      containers:
+      - name: dex
+        image: ghcr.io/dexidp/dex:v2.46.1
+        args: [dex, serve, /etc/dex/config.yaml]
+        ports: [{containerPort: 5556}]
+        volumeMounts: [{name: cfg, mountPath: /etc/dex}]
+        readinessProbe: {httpGet: {path: /dex/healthz, port: 5556}}
+        resources: {requests: {memory: 32Mi}, limits: {memory: 128Mi}}
+      volumes: [{name: cfg, configMap: {name: dex}}]
+---
+apiVersion: v1
+kind: Service
+metadata: {name: dex, namespace: dex}
+spec: {selector: {app: dex}, ports: [{port: 5556}]}
+EOF2
+  wait_deploy dex dex 120
+}
+# cy_login URL USER PASSWORD [NAMESPACE] -> the scripted browser login (vms/kit/kc/login.py) from a
+# pod (python:3.12-alpine) in NAMESPACE (default kl-browser), so cluster DNS names work; its JSON
+# is left in $CY_OUT (default $KL_STATE/cy-login.json): status, url, body, login_page, kc_error, first, consent
+cy_login() {
+  local ns=${4:-kl-browser}
+  k_ns "$ns"
+  kubectl -n "$ns" create configmap kl-login --from-file=login.py=/opt/kubelab/kc/login.py --dry-run=client -o yaml | kubectl apply -f - >/dev/null
+  CY_OUT=${CY_OUT:-$KL_STATE/cy-login.json}
+  kubectl -n "$ns" run "kl-browser-$RANDOM" --rm -i --quiet --image=python:3.12-alpine --restart=Never \
+    --overrides="$(jq -nc --arg u "$1" --arg n "$2" --arg p "$3" '{spec: {containers: [{name: "b", image: "python:3.12-alpine", command: ["python", "/l/login.py", $u, $n, $p], volumeMounts: [{name: "l", mountPath: "/l"}]}], volumes: [{name: "l", configMap: {name: "kl-login"}}]}}')" \
+    2>/dev/null | tail -1 >"$CY_OUT"
+}
+# cyj 'JQ' -> query the last cy_login
+cyj() { jq -e "$1" "$CY_OUT" >/dev/null 2>&1; }
+# cy_probe NAMESPACE URL -> HTTP status of URL fetched from a throwaway curl pod in NAMESPACE (000 = no answer)
+cy_probe() {
+  k_ns "$1"
+  kubectl -n "$1" run "probe-$RANDOM" --rm -i --quiet --image=curlimages/curl:8.11.1 --restart=Never -- \
+    curl -s -m 5 -o /dev/null -w '%{http_code}' "$2" 2>/dev/null | tail -c 3
+}
